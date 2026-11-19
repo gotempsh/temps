@@ -140,7 +140,10 @@ verify_signature() {
     local bundle="$file.sigstore.json" identity status output
     identity="https://github.com/$release_workflow@refs/tags/$tag"
 
-    status=$(curl --silent --location --output "$bundle" --write-out '%{http_code}' \
+    # Bounded: 15 s to connect and 60 s per attempt, with up to 3 retries
+    # (exponential backoff) on timeouts, HTTP 408/429 and 5xx.
+    status=$(curl --silent --location --connect-timeout 15 --max-time 60 --retry 3 \
+        --output "$bundle" --write-out '%{http_code}' \
         "$url.sigstore.json" 2>/dev/null) || status=000
     if [[ "$status" = "404" ]]; then
         rm -f "$bundle"

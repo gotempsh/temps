@@ -13,6 +13,7 @@ import { StartError as StartErrorClass, localPaths, type LocalState } from './ru
 import {
   acquireLock,
   destroySandboxes,
+  fetchSigstoreBundle,
   findBundledSkill,
   installSkill,
   isLocalServer,
@@ -434,6 +435,83 @@ describe('removeWorkloads', () => {
       cleanup()
     }
   }, 180_000)
+})
+
+describe('fetchSigstoreBundle', () => {
+  /** Answer with `statuses` in turn (the last one repeats); 200 sends `body`. */
+  async function bundleServer(statuses: number[], body = '{"bundle":true}') {
+    let requests = 0
+    const server = createHttpServer((_req, res) => {
+      const status = statuses[Math.min(requests, statuses.length - 1)] as number
+      requests++
+      res.writeHead(status).end(status === 200 ? body : '')
+    })
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+    const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}/bundle`
+    return {
+      url,
+      requests: () => requests,
+      close: () => new Promise((resolve) => server.close(resolve)),
+    }
+  }
+  const fast = { baseDelayMs: 1 }
+
+  test('retries transient failures, then returns the bundle', async () => {
+    const server = await bundleServer([503, 429, 200])
+    try {
+      expect(await fetchSigstoreBundle(server.url, fast)).toBe('{"bundle":true}')
+      expect(server.requests()).toBe(3)
+    } finally {
+      await server.close()
+    }
+  })
+
+  test('gives up after the last attempt with the status', async () => {
+    const server = await bundleServer([502])
+    try {
+      const error = await fetchSigstoreBundle(server.url, fast).catch((e) => e)
+      expect(error).toBeInstanceOf(StartErrorClass)
+      expect(error.reason).toBe('http_error')
+      expect(error.message).toContain('HTTP 502')
+      expect(error.message).toContain('after 3 attempts')
+      expect(server.requests()).toBe(3)
+    } finally {
+      await server.close()
+    }
+  })
+
+  test('a 404 means no bundle, without retrying', async () => {
+    const server = await bundleServer([404])
+    try {
+      expect(await fetchSigstoreBundle(server.url, fast)).toBeNull()
+      expect(server.requests()).toBe(1)
+    } finally {
+      await server.close()
+    }
+  })
+
+  test('another client error fails at once', async () => {
+    const server = await bundleServer([403])
+    try {
+      const error = await fetchSigstoreBundle(server.url, fast).catch((e) => e)
+      expect(error.message).toContain('HTTP 403')
+      expect(server.requests()).toBe(1)
+    } finally {
+      await server.close()
+    }
+  })
+
+  test('refuses an oversized bundle without buffering or retrying it', async () => {
+    const server = await bundleServer([200], 'x'.repeat(4096))
+    try {
+      const error = await fetchSigstoreBundle(server.url, { ...fast, maxBytes: 1024 }).catch((e) => e)
+      expect(error).toBeInstanceOf(StartErrorClass)
+      expect(error.reason).toBe('bundle_too_large')
+      expect(server.requests()).toBe(1)
+    } finally {
+      await server.close()
+    }
+  })
 })
 
 describe('verifyArchiveOrigin', () => {

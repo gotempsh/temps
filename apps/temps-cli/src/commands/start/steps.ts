@@ -396,24 +396,86 @@ export interface OriginDeps {
   runTool(command: string, args: readonly string[]): Promise<RunResult | null>
 }
 
-const originDeps: OriginDeps = {
-  async fetchBundle(url) {
+export interface BundleFetchOptions {
+  /** Attempts in total; transient failures (network, 408, 429, 5xx) are retried. */
+  attempts?: number
+  /** First pause between attempts, doubled each retry. */
+  baseDelayMs?: number
+  /** Deadline for each attempt, body included. */
+  timeoutMs?: number
+  /** A bundle larger than this is refused rather than buffered. */
+  maxBytes?: number
+}
+
+/** A bundle is about 10 KB; anything near this is not a Sigstore bundle. */
+export const MAX_BUNDLE_BYTES = 1024 * 1024
+
+/**
+ * Download a Sigstore bundle: null on 404 (the release publishes none),
+ * otherwise its body, read in chunks and refused past `maxBytes`. Network
+ * errors, timeouts and HTTP 408/429/5xx are retried with exponential
+ * backoff; any other status, or an oversized body, fails at once.
+ */
+export async function fetchSigstoreBundle(url: string, options: BundleFetchOptions = {}): Promise<string | null> {
+  const { attempts = 3, baseDelayMs = 1000, timeoutMs = 30_000, maxBytes = MAX_BUNDLE_BYTES } = options
+  let failure: StartError | undefined
+  for (let attempt = 0; attempt < Math.max(1, attempts); attempt++) {
+    if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, baseDelayMs * 2 ** (attempt - 1)))
     let response: Response
     try {
       response = await fetch(url, {
         headers: { 'User-Agent': 'temps-cli' },
-        signal: AbortSignal.timeout(30_000),
+        signal: AbortSignal.timeout(timeoutMs),
         redirect: 'follow',
       })
     } catch (error) {
-      throw new StartError('download', 'network', `Could not reach ${url}: ${(error as Error).message}`)
+      failure = new StartError('download', 'network', `Could not reach ${url}: ${(error as Error).message}`)
+      continue
     }
     if (response.status === 404) return null
     if (!response.ok) {
-      throw new StartError('download', 'http_error', `GET ${url} returned HTTP ${response.status}.`)
+      const error = new StartError('download', 'http_error', `GET ${url} returned HTTP ${response.status}.`)
+      if (response.status >= 500 || response.status === 408 || response.status === 429) {
+        failure = error
+        continue
+      }
+      throw error
     }
-    return response.text()
-  },
+    try {
+      return await readBounded(response, url, maxBytes)
+    } catch (error) {
+      if (error instanceof StartError) throw error
+      failure = new StartError('download', 'network', `Could not read ${url}: ${(error as Error).message}`)
+    }
+  }
+  throw new StartError(
+    'download',
+    failure?.reason ?? 'network',
+    `${failure?.message ?? `Could not download ${url}.`} Gave up after ${Math.max(1, attempts)} attempts.`,
+  )
+}
+
+async function readBounded(response: Response, url: string, maxBytes: number): Promise<string> {
+  const chunks: Uint8Array[] = []
+  let size = 0
+  if (response.body) {
+    const reader = response.body.getReader()
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      size += value.byteLength
+      if (size > maxBytes) {
+        await reader.cancel()
+        throw new StartError('download', 'bundle_too_large', `${url} is larger than ${maxBytes} bytes; refusing it as a signature bundle.`)
+      }
+      chunks.push(value)
+    }
+  }
+  return Buffer.concat(chunks).toString('utf8')
+}
+
+const originDeps: OriginDeps = {
+  fetchBundle: (url) => fetchSigstoreBundle(url),
   async runTool(command, args) {
     try {
       return await run(command, args, { timeoutMs: 120_000 })

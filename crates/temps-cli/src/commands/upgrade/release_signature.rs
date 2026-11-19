@@ -63,6 +63,16 @@ const BUNDLE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(60);
 /// A bundle larger than this is refused rather than buffered.
 const MAX_BUNDLE_BYTES: usize = 1024 * 1024;
 
+/// Attempts at downloading a bundle. A connection error, a timeout, HTTP 408,
+/// 429 or 5xx is retried with backoff; anything else fails at once.
+const BUNDLE_DOWNLOAD_ATTEMPTS: u32 = 3;
+
+/// First backoff delay between bundle download attempts (then doubled).
+#[cfg(not(test))]
+const BUNDLE_RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
+#[cfg(test)]
+const BUNDLE_RETRY_BASE_DELAY: Duration = Duration::from_millis(10);
+
 /// The certificate identity a genuine signature on `tag` carries.
 pub(crate) fn expected_release_identity(tag: &str) -> String {
     format!("{RELEASE_REPOSITORY_URL}/{RELEASE_WORKFLOW_PATH}@refs/tags/{tag}")
@@ -490,29 +500,94 @@ pub(crate) async fn verify_release_asset(
         .map(SignatureCheck::Verified)
 }
 
-/// Fetch a bundle body, bounded in time and size.
+/// Why one bundle download attempt failed, and whether another may succeed.
+#[derive(Debug)]
+struct BundleFetchFailure {
+    reason: String,
+    transient: bool,
+}
+
+impl BundleFetchFailure {
+    fn transient(reason: String) -> Self {
+        Self {
+            reason,
+            transient: true,
+        }
+    }
+
+    fn permanent(reason: String) -> Self {
+        Self {
+            reason,
+            transient: false,
+        }
+    }
+}
+
+impl fmt::Display for BundleFetchFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
+/// Fetch a bundle body, bounded in time and size, retrying transient
+/// failures (connection errors, timeouts, HTTP 408/429/5xx) with backoff.
 async fn download_bundle(url: &str) -> Result<String, String> {
     let client = reqwest::Client::builder()
         .timeout(BUNDLE_DOWNLOAD_TIMEOUT)
         .build()
         .map_err(|e| format!("could not build an HTTP client: {e}"))?;
+    temps_core::retry::RetryConfig::new(BUNDLE_DOWNLOAD_ATTEMPTS)
+        .with_base_delay(BUNDLE_RETRY_BASE_DELAY)
+        .retry_if(
+            || fetch_bundle_once(&client, url),
+            |failure: &BundleFetchFailure| failure.transient,
+        )
+        .await
+        .map_err(|failure| {
+            if failure.transient {
+                format!(
+                    "{} (after {BUNDLE_DOWNLOAD_ATTEMPTS} attempts)",
+                    failure.reason
+                )
+            } else {
+                failure.reason
+            }
+        })
+}
+
+async fn fetch_bundle_once(
+    client: &reqwest::Client,
+    url: &str,
+) -> Result<String, BundleFetchFailure> {
     let mut response = client
         .get(url)
         .header("User-Agent", "temps-self-upgrade")
         .send()
         .await
-        .map_err(|e| e.to_string())?;
-    if !response.status().is_success() {
-        return Err(format!("HTTP {}", response.status()));
+        .map_err(|e| BundleFetchFailure::transient(e.to_string()))?;
+    let status = response.status();
+    if !status.is_success() {
+        let reason = format!("HTTP {status}");
+        let transient = status.is_server_error()
+            || status == reqwest::StatusCode::REQUEST_TIMEOUT
+            || status == reqwest::StatusCode::TOO_MANY_REQUESTS;
+        return Err(BundleFetchFailure { reason, transient });
     }
     let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| BundleFetchFailure::transient(e.to_string()))?
+    {
         if body.len() + chunk.len() > MAX_BUNDLE_BYTES {
-            return Err(format!("bundle is larger than {MAX_BUNDLE_BYTES} bytes"));
+            return Err(BundleFetchFailure::permanent(format!(
+                "bundle is larger than {MAX_BUNDLE_BYTES} bytes"
+            )));
         }
         body.extend_from_slice(&chunk);
     }
-    String::from_utf8(body).map_err(|e| format!("bundle is not UTF-8: {e}"))
+    String::from_utf8(body)
+        .map_err(|e| BundleFetchFailure::permanent(format!("bundle is not UTF-8: {e}")))
 }
 
 #[cfg(test)]

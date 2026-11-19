@@ -441,6 +441,101 @@ async fn listed_but_unreachable_bundle_fails_closed() {
     );
 }
 
+/// Serve `/bundle` with HTTP `failing_status` for the first `failures`
+/// requests, then `body`; returns the URL and a request counter.
+async fn serve_flaky_bundle(
+    failing_status: axum::http::StatusCode,
+    failures: usize,
+    body: String,
+) -> (
+    String,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let requests = std::sync::Arc::new(AtomicUsize::new(0));
+    let counter = requests.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/bundle", listener.local_addr().unwrap());
+    let app = axum::Router::new().route(
+        "/bundle",
+        axum::routing::get(move || {
+            let counter = counter.clone();
+            let body = body.clone();
+            async move {
+                if counter.fetch_add(1, Ordering::SeqCst) < failures {
+                    (failing_status, String::new())
+                } else {
+                    (axum::http::StatusCode::OK, body)
+                }
+            }
+        }),
+    );
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (url, requests, server)
+}
+
+#[tokio::test]
+async fn transient_bundle_download_failure_is_retried() {
+    let (url, requests, server) = serve_flaky_bundle(
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        2,
+        BETA_BUNDLE.to_string(),
+    )
+    .await;
+    let body = download_bundle(&url).await;
+    server.abort();
+    assert_eq!(body.unwrap(), BETA_BUNDLE);
+    assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn persistent_server_errors_give_up_after_the_last_attempt() {
+    let (url, requests, server) = serve_flaky_bundle(
+        axum::http::StatusCode::BAD_GATEWAY,
+        usize::MAX,
+        String::new(),
+    )
+    .await;
+    let reason = download_bundle(&url).await.unwrap_err();
+    server.abort();
+    assert!(reason.contains("502"), "{reason}");
+    assert!(
+        reason.contains(&format!("after {BUNDLE_DOWNLOAD_ATTEMPTS} attempts")),
+        "{reason}"
+    );
+    assert_eq!(
+        requests.load(std::sync::atomic::Ordering::SeqCst),
+        BUNDLE_DOWNLOAD_ATTEMPTS as usize
+    );
+}
+
+#[tokio::test]
+async fn permanent_bundle_download_failure_is_not_retried() {
+    let (url, requests, server) =
+        serve_flaky_bundle(axum::http::StatusCode::FORBIDDEN, usize::MAX, String::new()).await;
+    let reason = download_bundle(&url).await.unwrap_err();
+    server.abort();
+    assert_eq!(reason, "HTTP 403 Forbidden");
+    assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn oversized_bundle_is_refused_without_retrying() {
+    let (url, requests, server) = serve_flaky_bundle(
+        axum::http::StatusCode::OK,
+        0,
+        "x".repeat(MAX_BUNDLE_BYTES + 1),
+    )
+    .await;
+    let reason = download_bundle(&url).await.unwrap_err();
+    server.abort();
+    assert!(reason.contains("larger than"), "{reason}");
+    assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
 #[test]
 fn plan_says_whether_a_release_is_signed() {
     let signed = test_release(

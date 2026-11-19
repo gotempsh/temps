@@ -41,6 +41,9 @@ if "api.github.com" not in url:
         sys.exit(22)
     output = sys.argv[sys.argv.index("--output") + 1]
     if url.endswith(".sigstore.json"):
+        if os.environ.get("FAKE_CURL_ARGS"):
+            with open(os.environ["FAKE_CURL_ARGS"], "a") as recorded:
+                recorded.write("\t".join(sys.argv[1:]) + "\n")
         bundle = os.environ.get("FAKE_BUNDLE")
         if bundle is None:
             sys.stdout.write("404")
@@ -503,6 +506,17 @@ class SignatureVerificationTests(unittest.TestCase):
         # The manual command carries the pinned identity for this tag.
         self.assertIn(f"--certificate-identity {RELEASE_IDENTITY}", result.output)
         self.assertEqual(result.tool_calls, [])
+
+    def test_signature_download_is_bounded_in_time_and_retried(self):
+        with tempfile.TemporaryDirectory(prefix="temps-install-curl-args-") as temporary:
+            recorded = Path(temporary) / "curl-args"
+            result = run_install(environment_extra={"FAKE_CURL_ARGS": str(recorded)})
+            (line,) = recorded.read_text().splitlines()
+        self.assert_installed(result)
+        arguments = line.split("\t")
+        self.assertEqual(arguments[arguments.index("--connect-timeout") + 1], "15")
+        self.assertEqual(arguments[arguments.index("--max-time") + 1], "60")
+        self.assertEqual(arguments[arguments.index("--retry") + 1], "3")
 
     def test_cosign_verifies_with_the_pinned_identity_and_issuer(self):
         result = run_install(tools=("cosign", "gh"))
