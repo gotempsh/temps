@@ -17,6 +17,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -30,14 +31,27 @@ PRUNE = SCRIPTS / "prune-cargo-build-cache.py"
 REPO = SCRIPTS.parent.parent
 
 # The pruner reads the target-directory layout of the toolchain the real
-# musl build uses, which is the repository's pinned one. The fixture
-# workspace lives in a temp directory outside the repository, where
-# rust-toolchain.toml does not apply, so without this the test would run on
-# whatever cargo the CI runner image ships: Cargo 1.100 moved build outputs
-# from target/<profile>/deps to target/<profile>/build/<package>/, and an
-# image update alone failed this test. Bumping the pin to such a toolchain
+# musl build uses. That build runs inside the Dockerfile's toolchain stage,
+# which may stay on its own compiler through `ENV RUSTUP_TOOLCHAIN=...`
+# (check-toolchain-pin.py allows exactly that) rather than the version in
+# rust-toolchain.toml. The fixture workspace lives in a temp directory
+# outside the repository, where rust-toolchain.toml does not apply, so
+# without an explicit toolchain the test would run on whatever cargo the CI
+# runner image ships: Cargo 1.100 moved build outputs from
+# target/<profile>/deps to target/<profile>/build/<package>/, and an image
+# update alone failed this test. Moving the musl build to such a toolchain
 # fails it as well, which is the signal that the pruner needs the new layout.
-PINNED_TOOLCHAIN = tomllib.loads((REPO / "rust-toolchain.toml").read_text())["toolchain"]["channel"]
+def musl_build_toolchain(repo: Path) -> str:
+    """The compiler version the Dockerfile's musl build actually runs."""
+    dockerfile = (repo / "Dockerfile").read_text(encoding="utf-8")
+    override = re.search(r"^ENV\s+RUSTUP_TOOLCHAIN=(\S+)\s*$", dockerfile, re.M)
+    if override:
+        return override.group(1)
+    pinned = tomllib.loads((repo / "rust-toolchain.toml").read_text(encoding="utf-8"))
+    return pinned["toolchain"]["channel"]
+
+
+MUSL_BUILD_TOOLCHAIN = musl_build_toolchain(REPO)
 
 WORKSPACE = {
     "Cargo.toml": """\
@@ -98,9 +112,9 @@ def cargo_build(workspace: Path, target: Path) -> list[dict]:
             "CARGO_TARGET_DIR": str(target),
             "CARGO_INCREMENTAL": "1",
             "RUSTC_WRAPPER": "",
-            # rustup installs the pinned toolchain on first use if the
-            # runner lacks it.
-            "RUSTUP_TOOLCHAIN": PINNED_TOOLCHAIN,
+            # rustup installs this toolchain on first use if the runner
+            # lacks it.
+            "RUSTUP_TOOLCHAIN": MUSL_BUILD_TOOLCHAIN,
         },
         check=True,
         capture_output=True,
