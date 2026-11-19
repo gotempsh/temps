@@ -5,6 +5,7 @@
 
 pub mod dns_provider;
 pub mod domain_service;
+pub mod failure_cause;
 pub mod handlers;
 pub mod plugin;
 pub mod tls;
@@ -31,6 +32,7 @@ pub use handlers::{
 
 // Export domain service
 pub use domain_service::{ChallengeData, DomainService, DomainServiceError};
+pub use failure_cause::CertFailureCause;
 
 // Keep the old TlsService available temporarily for backward compatibility
 // This can be removed once all code is migrated to use the new abstracted version

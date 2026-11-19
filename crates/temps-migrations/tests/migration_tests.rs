@@ -10215,3 +10215,98 @@ async fn test_domains_on_demand_failure_streak_defaults_to_zero_and_is_reversibl
     assert_eq!(kept.try_get::<i32>("", "count")?, 1);
     Ok(())
 }
+
+async fn domain_failure_cause_column(
+    db: &DatabaseConnection,
+) -> Result<Option<sea_orm::QueryResult>, sea_orm::DbErr> {
+    db.query_one(sea_orm::Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        "SELECT is_nullable, column_default, data_type \
+         FROM information_schema.columns \
+         WHERE table_schema = 'public' \
+           AND table_name = 'domains' \
+           AND column_name = 'failure_cause'"
+            .to_string(),
+    ))
+    .await
+}
+
+/// `domains.failure_cause` is added nullable with no default, so existing
+/// domains read "no recorded cause" until their next attempt, and `down`
+/// removes it without touching the rows.
+#[tokio::test]
+async fn test_domains_failure_cause_is_nullable_and_reversible() -> anyhow::Result<()> {
+    const MIGRATION: &str = "m20261119_000004_add_domain_failure_cause";
+    if external_db_configured() {
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            eprintln!("Skipping domains.failure_cause migration test: Docker unavailable: {error}");
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    // An existing database with a failed domain, one migration short.
+    Migrator::up(&db, None).await?;
+    Migrator::down(&db, Some(steps_back_to(MIGRATION))).await?;
+    assert!(
+        domain_failure_cause_column(&db).await?.is_none(),
+        "column exists before the migration"
+    );
+    db.execute_unprepared(
+        "INSERT INTO domains (domain, status, is_wildcard, verification_method, last_error, created_at, updated_at) \
+         VALUES ('app.example.com', 'failed', false, 'http-01', 'Connection refused', now(), now())",
+    )
+    .await?;
+
+    Migrator::up(&db, None).await?;
+    let row = domain_failure_cause_column(&db)
+        .await?
+        .expect("failure_cause exists after up");
+    assert_eq!(row.try_get::<String>("", "is_nullable")?, "YES");
+    assert_eq!(row.try_get::<Option<String>>("", "column_default")?, None);
+    assert_eq!(row.try_get::<String>("", "data_type")?, "text");
+    let existing = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT count(*)::int AS count FROM domains WHERE failure_cause IS NULL".to_string(),
+        ))
+        .await?
+        .expect("count row");
+    assert_eq!(existing.try_get::<i32>("", "count")?, 1);
+
+    Migrator::down(&db, Some(steps_back_to(MIGRATION))).await?;
+    assert!(
+        domain_failure_cause_column(&db).await?.is_none(),
+        "down leaves the column in place"
+    );
+    let kept = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT count(*)::int AS count FROM domains".to_string(),
+        ))
+        .await?
+        .expect("count row");
+    assert_eq!(kept.try_get::<i32>("", "count")?, 1);
+    Ok(())
+}

@@ -53,6 +53,12 @@ pub struct Model {
     /// When the last on-demand failure in the streak happened; a streak older
     /// than the quiet gap starts over. `None` when there is no streak.
     pub on_demand_last_failure_at: Option<DBDateTime>,
+    /// Why the last certificate attempt failed, as a typed cause
+    /// (`unreachable`, `dns_lookup`, `upstream_answered`, `rate_limited`, ...;
+    /// `temps_domains::CertFailureCause`). Cleared when a certificate is
+    /// issued or imported, or a new order starts. `None` for rows that have not failed
+    /// since the column was added.
+    pub failure_cause: Option<String>,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
 }
@@ -79,8 +85,8 @@ impl Related<super::project_custom_domains::Entity> for Entity {
 
 impl ActiveModel {
     /// Forget why earlier certificate attempts failed, for a domain that now
-    /// holds a certificate (issued by the CA or imported): the error, and the
-    /// on-demand backoff and failure streak, so a later failure starts the
+    /// holds a certificate (issued by the CA or imported): the error and its
+    /// typed cause, and the on-demand backoff and failure streak, so a later failure starts the
     /// ladder from the bottom. Every path that installs a certificate calls
     /// this, so a new failure field cannot be cleared on one and missed on
     /// another.
@@ -90,6 +96,7 @@ impl ActiveModel {
         self.on_demand_backoff_until = Set(None);
         self.on_demand_failure_streak = Set(0);
         self.on_demand_last_failure_at = Set(None);
+        self.failure_cause = Set(None);
     }
 }
 
@@ -142,6 +149,7 @@ mod tests {
             on_demand_backoff_until: None,
             on_demand_failure_streak: 0,
             on_demand_last_failure_at: None,
+            failure_cause: None,
             created_at: now,
             updated_at: now,
         };
@@ -153,7 +161,7 @@ mod tests {
     }
 
     #[test]
-    fn clearing_certificate_failure_resets_the_error_and_the_on_demand_streak() {
+    fn clearing_certificate_failure_resets_the_error_its_cause_and_the_on_demand_streak() {
         let now = chrono::Utc::now();
         let failed = Model {
             id: 7,
@@ -174,6 +182,7 @@ mod tests {
             on_demand_backoff_until: Some(now + chrono::Duration::hours(4)),
             on_demand_failure_streak: 4,
             on_demand_last_failure_at: Some(now),
+            failure_cause: Some("unreachable".to_string()),
             created_at: now,
             updated_at: now,
         };
@@ -186,6 +195,7 @@ mod tests {
         assert_eq!(active.on_demand_backoff_until, Set(None));
         assert_eq!(active.on_demand_failure_streak, Set(0));
         assert_eq!(active.on_demand_last_failure_at, Set(None));
+        assert_eq!(active.failure_cause, Set(None));
         // Only failure state: the status and the rest are the caller's.
         assert_eq!(
             active.status,
