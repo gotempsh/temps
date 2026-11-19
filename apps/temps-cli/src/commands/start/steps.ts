@@ -31,6 +31,7 @@ import {
   cosignVerifyArgs,
   databaseUrl,
   ghAttestationArgs,
+  manualVerifyCommands,
   isLocalServerCommand,
   isLocalState,
   localUrls,
@@ -389,6 +390,34 @@ export type OriginCheck =
   /** No signature published, accepted because of --allow-unsigned. */
   | { kind: 'unsigned' }
 
+/**
+ * The warning to print when the archive just installed was not checked for
+ * origin, or null when it was. It goes to stderr whatever the output mode,
+ * so `--json` and quiet runs cannot hide it, and names the digest that was
+ * installed so the manual check can be tied to it.
+ */
+export function originWarning(
+  version: string,
+  target: string,
+  origin: OriginCheck | undefined,
+  sha256: string | undefined,
+): string | null {
+  const digest = sha256 ? ` (SHA-256 ${sha256})` : ''
+  if (origin?.kind === 'unsigned') {
+    return (
+      `Warning: Temps ${version} publishes no Sigstore signature; it was installed${digest} on its checksum alone ` +
+      'because --allow-unsigned was passed. Its origin was NOT verified.'
+    )
+  }
+  if (origin?.kind !== 'unverified') return null
+  return [
+    `Warning: the origin of Temps ${version} was NOT verified; only its checksum was${digest}. ` +
+      'Neither cosign nor a signed-in gh was available to check its signature.',
+    'Verify it yourself; the last command must print the same SHA-256:',
+    ...manualVerifyCommands(version, target).map((command) => `  ${command}`),
+  ].join('\n')
+}
+
 export interface OriginDeps {
   /** The bundle body, or null when the release does not publish one (404). */
   fetchBundle(url: string): Promise<string | null>
@@ -558,7 +587,7 @@ export async function ensureBinary(
   version: string,
   target: string,
   allowUnsigned = false,
-): Promise<{ path: string; downloaded: boolean; bytes: number; origin?: OriginCheck }> {
+): Promise<{ path: string; downloaded: boolean; bytes: number; origin?: OriginCheck; sha256?: string }> {
   const bin = binaryPath(paths, version)
   if (existsSync(bin)) return { path: bin, downloaded: false, bytes: 0 }
 
@@ -596,7 +625,7 @@ export async function ensureBinary(
     await chmod(join(staging, 'temps'), 0o755)
     await rm(dir, { recursive: true, force: true })
     await rename(staging, dir)
-    return { path: bin, downloaded: true, bytes: statSync(bin).size, origin }
+    return { path: bin, downloaded: true, bytes: statSync(bin).size, origin, sha256: actual }
   } catch (error) {
     await rm(staging, { recursive: true, force: true })
     throw error

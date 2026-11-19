@@ -18,6 +18,7 @@ import {
   installSkill,
   isLocalServer,
   isPortFree,
+  originWarning,
   pickPort,
   processAlive,
   readState,
@@ -435,6 +436,30 @@ describe('removeWorkloads', () => {
       cleanup()
     }
   }, 180_000)
+})
+
+describe('originWarning', () => {
+  const identity = 'https://github.com/gotempsh/temps/.github/workflows/release.yml@refs/tags/v1.2.3'
+
+  test('nothing to say when the origin was verified or the binary was cached', () => {
+    expect(originWarning('v1.2.3', 'temps-linux-amd64', { kind: 'cosign', identity }, 'ab')).toBeNull()
+    expect(originWarning('v1.2.3', 'temps-linux-amd64', { kind: 'gh', identity }, 'ab')).toBeNull()
+    expect(originWarning('v1.2.3', 'temps-linux-amd64', undefined, undefined)).toBeNull()
+  })
+
+  test('an unverified origin gives the digest and the commands to check it', () => {
+    const warning = originWarning('v1.2.3', 'temps-linux-amd64', { kind: 'unverified', identity }, 'c0ffee')
+    expect(warning).toContain('NOT verified')
+    expect(warning).toContain('SHA-256 c0ffee')
+    expect(warning).toContain(`--certificate-identity ${identity}`)
+    expect(warning).toContain('gh release download v1.2.3')
+  })
+
+  test('an unsigned release says --allow-unsigned let it in', () => {
+    const warning = originWarning('v0.0.8', 'temps-linux-amd64', { kind: 'unsigned' }, 'c0ffee')
+    expect(warning).toContain('--allow-unsigned')
+    expect(warning).toContain('NOT verified')
+  })
 })
 
 describe('fetchSigstoreBundle', () => {

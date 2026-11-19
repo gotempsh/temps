@@ -74,6 +74,7 @@ import {
   waitForServer,
   withLock,
   writeState,
+  originWarning,
   type OriginCheck,
   type RemovedWorkloads,
 } from './steps.js'
@@ -354,6 +355,9 @@ async function startLocked(options: StartOptions, paths: LocalPaths): Promise<vo
         : Promise.resolve(null),
     ])
 
+    const warning = originWarning(current.version, target, binary.origin, binary.sha256)
+    if (warning) console.error(colors.warning(warning))
+
     const setupRan = !current.setupComplete
     if (setupRan) {
       await steps.time('Setting up Temps', () => runSetup(binary.path, current, paths), () => 'Temps set up')
@@ -409,6 +413,12 @@ async function startLocked(options: StartOptions, paths: LocalPaths): Promise<vo
             api_key_created: cli.minted,
             admin_email: current.adminEmail,
             credentials_file: paths.state,
+            binary: {
+              path: binary.path,
+              downloaded: binary.downloaded,
+              sha256: binary.sha256 ?? null,
+              origin: binary.origin ?? null,
+            },
             skill: skills ? { scope, name: BUNDLED_SKILL, directories: skills } : { scope, name: null, directories: [] },
             elapsed_ms: elapsed,
           },
