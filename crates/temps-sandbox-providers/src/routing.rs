@@ -432,6 +432,38 @@ impl SandboxProvider for RoutingSandboxProvider {
         self.get(self.default)?.rebuild_image().await
     }
 
+    async fn prepare_image(
+        &self,
+        image: Option<&str>,
+        backend: Option<SandboxBackend>,
+    ) -> Result<crate::ImagePrepareStatus, AgentError> {
+        let backend = backend.unwrap_or(self.default);
+        match self.backends.get(&backend) {
+            Some(provider) => provider.prepare_image(image, Some(backend)).await,
+            None => Ok(unregistered_backend_status(image, backend)),
+        }
+    }
+
+    async fn image_prepare_status(
+        &self,
+        image: Option<&str>,
+        backend: Option<SandboxBackend>,
+    ) -> Result<crate::ImagePrepareStatus, AgentError> {
+        let backend = backend.unwrap_or(self.default);
+        match self.backends.get(&backend) {
+            Some(provider) => provider.image_prepare_status(image, Some(backend)).await,
+            None => Ok(unregistered_backend_status(image, backend)),
+        }
+    }
+
+    async fn remove_prepared_image(&self, image: &str) -> Result<crate::ImageRemoval, AgentError> {
+        // Prepared images are Docker images.
+        match self.backends.get(&SandboxBackend::Docker) {
+            Some(provider) => provider.remove_prepared_image(image).await,
+            None => Ok(crate::ImageRemoval::Unsupported),
+        }
+    }
+
     async fn rebuild_image_with_progress(
         &self,
         on_progress: tokio::sync::mpsc::Sender<String>,
@@ -463,6 +495,17 @@ impl SandboxProvider for RoutingSandboxProvider {
         }
         Ok(merged)
     }
+}
+
+/// Status for a prepare asked of a backend this host has not registered.
+fn unregistered_backend_status(
+    image: Option<&str>,
+    backend: SandboxBackend,
+) -> crate::ImagePrepareStatus {
+    crate::ImagePrepareStatus::unsupported(
+        image.unwrap_or_default(),
+        format!("the '{backend}' sandbox backend is not available on this host"),
+    )
 }
 
 #[cfg(test)]

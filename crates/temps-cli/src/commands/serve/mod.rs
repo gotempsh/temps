@@ -14,6 +14,7 @@ mod shutdown;
 pub(crate) mod startup_failure;
 pub(crate) mod stateless;
 mod static_files;
+mod tunnel_connectors;
 pub(crate) mod upgrade_telemetry;
 
 use clap::{Args, ValueEnum};
@@ -307,8 +308,11 @@ pub struct ServeCommand {
     /// `--console-address` listener only serves public ingest routes and the
     /// admin/UI surface (auth, projects, settings, dashboard) binds here.
     ///
-    /// Combine with `--admin-allowed-ips` / `--admin-allowed-hosts` to add a
+    /// Combine with the admin access gate (Settings → Security → Admin
+    /// access gate, or the TEMPS_ADMIN_ALLOWED_IPS /
+    /// TEMPS_ADMIN_ALLOWED_HOSTS environment variables) to add a
     /// defense-in-depth allowlist on top of the network-layer isolation.
+    /// See https://temps.sh/docs/admin-listener#admin-gate.
     #[arg(long, env = "TEMPS_CONSOLE_ADMIN_ADDRESS")]
     pub console_admin_address: Option<String>,
 
@@ -1402,6 +1406,26 @@ impl ServeCommand {
         let console_startup_state =
             Arc::new(temps_core::console_startup::ConsoleStartupState::new());
 
+        // ADR-107 D2/D3: only a proxy in this process can carry a tunnel the
+        // control plane runs, so the origin exists for `--role=all` only.
+        // The connectors start here, not in the console: a console that
+        // fails to start must not take a tunnel-only install offline.
+        let tunnel_origin = (self.role == ServeRole::All)
+            .then(temps_core::tunnel_origin::ControlPlaneTunnelOrigin::new);
+        let control_plane_tunnels = tunnel_origin
+            .clone()
+            .map(temps_ingress::control_plane::ControlPlaneHandle::for_origin);
+        if let Some(handle) = control_plane_tunnels.clone() {
+            let _runtime = rt.enter();
+            tunnel_connectors::start_control_plane_connectors(
+                db.clone(),
+                encryption_service.clone(),
+                route_table.clone(),
+                serve_config.data_dir.clone(),
+                handle,
+            );
+        }
+
         // Build the console params once; both roles consume them.
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let params = console::ConsoleApiParams {
@@ -1434,6 +1458,7 @@ impl ServeCommand {
             external_plugin_registry,
             profile: self.profile,
             startup_state: console_startup_state.clone(),
+            control_plane_tunnels,
         };
 
         if self.role == ServeRole::Console {
@@ -1585,6 +1610,7 @@ impl ServeCommand {
             docker_handle,
             self.profile.local_workloads_enabled(),
             console_startup_state,
+            tunnel_origin,
         )
     }
 }

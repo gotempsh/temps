@@ -46,6 +46,11 @@ pub struct ProxyConfig {
     /// also the only process a console-only deployment runs, and a split
     /// proxy reports just its own file descriptors.
     pub host_metrics: bool,
+    /// The control plane's tunnel origin (ADR-107 D3): a loopback listener
+    /// the control plane's own tunnel connectors forward to. Only the
+    /// single-process `temps serve` sets it; the proxy binds the listener
+    /// at startup and records the port here.
+    pub tunnel_origin: Option<Arc<temps_core::tunnel_origin::ControlPlaneTunnelOrigin>>,
 }
 
 impl Default for ProxyConfig {
@@ -61,6 +66,7 @@ impl Default for ProxyConfig {
             on_demand_cert_manager: None,
             console_startup: None,
             host_metrics: false,
+            tunnel_origin: None,
         }
     }
 }

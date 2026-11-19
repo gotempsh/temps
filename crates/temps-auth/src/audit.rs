@@ -198,6 +198,16 @@ pub struct ApiKeyRotatedAudit {
     pub api_key_name: String,
 }
 
+// API key deletion audit. Deleting a key revokes it permanently; the id, name
+// and prefix tie the event to the credential without exposing its secret.
+#[derive(Debug, Clone, Serialize)]
+pub struct ApiKeyDeletedAudit {
+    pub context: AuditContext,
+    pub api_key_id: i32,
+    pub api_key_name: String,
+    pub key_prefix: String,
+}
+
 // OIDC provider configuration audits. SSO provider config is one of
 // the highest-impact settings in the system — it controls who can log
 // in and with what role — so every mutation gets a row. The diff-shape
@@ -731,6 +741,28 @@ impl AuditOperation for ApiKeyCreatedAudit {
 impl AuditOperation for ApiKeyRotatedAudit {
     fn operation_type(&self) -> String {
         "API_KEY_ROTATED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
+    }
+}
+
+impl AuditOperation for ApiKeyDeletedAudit {
+    fn operation_type(&self) -> String {
+        "API_KEY_DELETED".to_string()
     }
 
     fn user_id(&self) -> Option<i32> {

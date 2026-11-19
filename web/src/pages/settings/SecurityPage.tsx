@@ -179,7 +179,7 @@ export function SecurityPage() {
       <PageHeader title="Security" />
       <SettingsSection
         title="Admin access gate"
-        description="Require additional verification for sensitive administrative actions"
+        description="Choose which hostnames and IP addresses can reach the console"
         icon={LockKeyhole}
       >
         <AdminGateCard />

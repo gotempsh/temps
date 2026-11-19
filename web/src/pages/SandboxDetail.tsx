@@ -2,6 +2,13 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { SandboxDetailTabs } from '@/components/sandboxes/SandboxDetailTabs'
+import { SandboxCreationCard } from '@/components/sandboxes/SandboxCreationCard'
+import { problemDetail } from '@/lib/api-problem'
+import {
+  CREATION_POLL_MS,
+  keepPollingStartingSandbox,
+  showStartingSandboxSteps,
+} from '@/components/sandboxes/sandbox-creation'
 import { SandboxVaultAccess } from '@/components/service-access/SandboxVaultAccess'
 import { SandboxInternalAddressesCard } from '@/components/sandboxes/SandboxInternalAddressesCard'
 import { useEffect, useMemo, useRef, useState } from 'react'
@@ -70,6 +77,7 @@ import {
   execMutation,
   extendTimeoutMutation,
   getSandboxOptions,
+  getSandboxCreationBySandboxOptions,
   getSandboxQueryKey,
   listEventsOptions,
   listEventsQueryKey,
@@ -277,9 +285,30 @@ export default function SandboxDetail() {
   } = useQuery({
     ...sandboxQuery,
     enabled: sandboxId.length > 0,
-    refetchInterval: 10_000,
+    // Faster while the create runs, so the page flips to running promptly.
+    refetchInterval: (query) =>
+      query.state.data?.sandbox.status === 'starting' ? 2_000 : 10_000,
   })
   const sandbox = sandboxResp ? toSandboxView(sandboxResp.sandbox) : undefined
+
+  // The create's steps, while it runs. A 404 with nothing read yet means this
+  // server no longer tracks it (restarted, or finished long ago): the page
+  // just says Starting. Any other failed poll shows the error with a retry,
+  // keeps the steps already read, and keeps polling.
+  const starting = sandbox?.status === 'starting'
+  const creationQuery = useQuery({
+    ...getSandboxCreationBySandboxOptions({ path: { id: sandboxId } }),
+    enabled: starting,
+    retry: false,
+    refetchInterval: (query) =>
+      keepPollingStartingSandbox(
+        starting,
+        query.state.data,
+        query.state.status === 'error' ? query.state.error : null
+      )
+        ? CREATION_POLL_MS
+        : false,
+  })
 
   const now = useNow(!!sandbox && sandbox.status !== 'destroyed')
 
@@ -790,6 +819,25 @@ export default function SandboxDetail() {
                 cached
                 onRetry={() => refetch()}
                 retrying={isFetching}
+              />
+            )}
+            {showStartingSandboxSteps(
+              starting,
+              creationQuery.data,
+              creationQuery.isError ? creationQuery.error : null
+            ) && (
+              <SandboxCreationCard
+                creation={creationQuery.data}
+                refreshError={
+                  creationQuery.isError
+                    ? problemDetail(
+                        creationQuery.error,
+                        'the server did not answer'
+                      )
+                    : null
+                }
+                onRetry={() => void creationQuery.refetch()}
+                retrying={creationQuery.isFetching}
               />
             )}
             {!destroyed && (

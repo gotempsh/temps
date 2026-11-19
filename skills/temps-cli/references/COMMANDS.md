@@ -827,6 +827,7 @@ Add a custom domain
 |------|-------------|---------|----------|
 | `-d, --domain <domain>` | Domain name | - | Yes |
 | `-c, --challenge <type>` | Challenge type (http-01 or dns-01) | `http-01` | No |
+| `--manual-dns` | With dns-01, print the TXT record to add by hand even when a DNS provider in Temps manages the zone | - | No |
 | `-y, --yes` | Skip confirmation prompts | - | No |
 
 ### `domains verify`
@@ -10241,6 +10242,7 @@ Run Temps on this computer, sign in the CLI and add the Temps skill for your cod
 |------|-------------|---------|----------|
 | `--channel <channel>` | Release channel for a fresh install: stable, beta or nightly | `beta` | No |
 | `--runtime-version <tag>` | Run this exact Temps release | - | No |
+| `--allow-unsigned` | Run a release that publishes no Sigstore signature (only releases from before signing), trusting its checksum alone | - | No |
 | `--skills <scope>` | Where to add the Temps agent skill: project, global or none (default: project inside a project, otherwise global) | - | No |
 | `--port <port>` | Port for your apps and the console on a fresh install (default: 8080 or the next free port) | - | No |
 | `--make-default` | Make "local" the default CLI context even if another one is active | - | No |

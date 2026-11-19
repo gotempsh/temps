@@ -16,13 +16,14 @@ use temps_service_protocol::{
     MariadbDumpBackupResult, MariadbPhysicalBackupRequest, MariadbPhysicalBackupResult,
     MariadbRestoreRequest, MariadbRestoreResult, MongodbBackupRequest, MongodbBackupResult,
     MongodbRestoreRequest, MongodbRestoreResult, NodeAttachment, NodeServiceError,
-    NodeServiceRuntime, PostgresWalgArchiveRequest, PostgresWalgArchiveResult,
-    PostgresWalgBackupRequest, PostgresWalgBackupResult, PostgresWalgCredentialsRequest,
-    PostgresWalgCredentialsResult, PostgresWalgRestoreRequest, PostgresWalgRestoreResult,
-    RecreateHook, RedisRdbBackupRequest, RedisRdbBackupResult, RedisRestoreRequest,
-    RedisRestoreResult, RedisWalgBackupRequest, RedisWalgBackupResult, RemoteServiceBackupRequest,
-    RemoteServiceBackupResponse, RemoteServiceRestoreRequest, RemoteServiceRestoreResponse,
-    RemoteWalHealthResponse, ServiceConfig, ServiceType, TargetWriteBoundary,
+    NodeServiceRuntime, PostgresClusterWalgBackupRequest, PostgresWalgArchiveRequest,
+    PostgresWalgArchiveResult, PostgresWalgBackupRequest, PostgresWalgBackupResult,
+    PostgresWalgCredentialsRequest, PostgresWalgCredentialsResult, PostgresWalgRestoreRequest,
+    PostgresWalgRestoreResult, RecreateHook, RedisRdbBackupRequest, RedisRdbBackupResult,
+    RedisRestoreRequest, RedisRestoreResult, RedisWalgBackupRequest, RedisWalgBackupResult,
+    RemoteServiceBackupRequest, RemoteServiceBackupResponse, RemoteServiceRestoreRequest,
+    RemoteServiceRestoreResponse, RemoteWalHealthResponse, ServiceConfig, ServiceType,
+    TargetWriteBoundary,
 };
 
 use crate::externalsvc;
@@ -199,6 +200,19 @@ impl NodeServiceRuntime for ProvidersNodeRuntime {
             published_address,
         )
         .await)
+    }
+
+    async fn postgres_cluster_walg_backup(
+        &self,
+        request: PostgresClusterWalgBackupRequest,
+        docker: Arc<Docker>,
+    ) -> Result<PostgresWalgBackupResult, NodeServiceError> {
+        Ok(
+            externalsvc::postgres_cluster_walg_backup::cluster_walg_base_backup_on_node(
+                request, docker,
+            )
+            .await,
+        )
     }
 
     async fn postgres_walg_archive(

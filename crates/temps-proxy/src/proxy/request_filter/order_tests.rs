@@ -1371,6 +1371,202 @@ async fn the_https_redirect_answers_before_the_domain_redirect() {
         .assert_answered("http_to_https_redirect", "301");
 }
 
+/// Runs the request hooks over a real loopback socket, so the session knows
+/// the listener it arrived on: what tells the control plane's tunnel origin
+/// (ADR-107 D3) from the public listeners.
+async fn send_on_socket(
+    lb: &LoadBalancer,
+    listener: &tokio::net::TcpListener,
+    raw_request: &str,
+    ip: &str,
+) -> Reply {
+    use pingora_core::protocols::GetSocketDigest;
+    use std::os::fd::AsRawFd;
+    let mut client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+        .await
+        .unwrap();
+    let (server, _) = listener.accept().await.unwrap();
+    client.write_all(raw_request.as_bytes()).await.unwrap();
+    let digest = pingora_core::protocols::SocketDigest::from_raw_fd(server.as_raw_fd());
+    let mut stream = pingora_core::protocols::l4::stream::Stream::from(server);
+    stream.set_socket_digest(digest);
+    let mut session = Session::new_h1(Box::new(stream));
+    assert!(session.read_request().await.unwrap(), "request must parse");
+    let mut ctx = lb.new_ctx();
+    lb.early_request_filter(&mut session, &mut ctx)
+        .await
+        .expect("early_request_filter");
+    ctx.ip_address = Some(ip.to_string());
+    let answered = lb
+        .request_filter(&mut session, &mut ctx)
+        .await
+        .expect("request_filter");
+    let request = session.req_header().clone();
+    drop(session);
+    let mut raw = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.read_to_end(&mut raw),
+    )
+    .await
+    .expect("response in time")
+    .expect("read response");
+    let response = String::from_utf8_lossy(&raw).to_string();
+    let (head, body) = response
+        .split_once("\r\n\r\n")
+        .map(|(head, body)| (head.to_string(), body.to_string()))
+        .unwrap_or((response.clone(), String::new()));
+    Reply {
+        answered,
+        head,
+        body,
+        ctx,
+        request,
+    }
+}
+
+/// A proxy whose tunnel origin is bound on `port`.
+fn with_tunnel_origin(lb: LoadBalancer, port: u16) -> LoadBalancer {
+    let origin = temps_core::tunnel_origin::ControlPlaneTunnelOrigin::new();
+    origin.mark_bound(port);
+    lb.with_tunnel_origin(Some(origin))
+}
+
+/// ADR-107 D3: a tunnel's visitor reached the provider's edge over HTTPS and
+/// arrives here in plain HTTP on loopback. Redirecting it to HTTPS would
+/// send it back to the same URL forever.
+#[tokio::test]
+async fn a_request_through_the_control_planes_tunnel_is_not_redirected_to_https() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let f = fixture();
+    f.route_host(|_, env| env.force_https = Some(true));
+    let lb = with_tunnel_origin(f.lb, port);
+    let reply = send_on_socket(&lb, &listener, &get("/"), CLEAN_IP).await;
+    reply.assert_forwarded("routed");
+    assert_eq!(reply.upstream_header("x-forwarded-proto"), Some("https"));
+}
+
+/// The exception is the listener's, never the request's: plain HTTP on any
+/// other listener is still upgraded.
+#[tokio::test]
+async fn plain_http_off_the_tunnel_origin_is_still_redirected_to_https() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let f = fixture();
+    f.route_host(|_, env| env.force_https = Some(true));
+    let lb = with_tunnel_origin(f.lb, port.wrapping_add(1).max(1));
+    send_on_socket(&lb, &listener, &get("/"), CLEAN_IP)
+        .await
+        .assert_answered("http_to_https_redirect", "301");
+}
+
+fn get_forwarded_as(proto: &str) -> String {
+    format!(
+        "GET / HTTP/1.1\r\nHost: {HOST}\r\nAccept: text/html\r\nX-Forwarded-Proto: {proto}\r\n\r\n"
+    )
+}
+
+/// A hostname whose edge policy lets plain HTTP through forwards the
+/// visitor's `http` scheme through the tunnel: that visitor still gets the
+/// app's HTTPS redirect (ADR-107 D3). The header can only downgrade.
+#[tokio::test]
+async fn a_plain_http_visitor_through_the_control_planes_tunnel_is_redirected_to_https() {
+    for proto in ["http", "HTTP", "http, https"] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let f = fixture();
+        f.route_host(|_, env| env.force_https = Some(true));
+        let lb = with_tunnel_origin(f.lb, port);
+        send_on_socket(&lb, &listener, &get_forwarded_as(proto), CLEAN_IP)
+            .await
+            .assert_answered("http_to_https_redirect", "301");
+    }
+}
+
+/// The edge's `https`, or any value that is not `http`, keeps the tunnel's
+/// request secure: no redirect back to the URL the visitor already used.
+#[tokio::test]
+async fn an_https_visitor_through_the_control_planes_tunnel_is_forwarded_as_https() {
+    for proto in ["https", "wss", ""] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let f = fixture();
+        f.route_host(|_, env| env.force_https = Some(true));
+        let lb = with_tunnel_origin(f.lb, port);
+        let reply = send_on_socket(&lb, &listener, &get_forwarded_as(proto), CLEAN_IP).await;
+        reply.assert_forwarded("routed");
+        assert_eq!(
+            reply.upstream_header("x-forwarded-proto"),
+            Some("https"),
+            "{proto}"
+        );
+    }
+}
+
+/// A forged `X-Forwarded-Proto: https` on a public plain-HTTP listener is
+/// still ignored (SEC-12): only the tunnel origin reads the header.
+#[tokio::test]
+async fn a_forged_https_scheme_off_the_tunnel_origin_is_still_redirected() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let f = fixture();
+    f.route_host(|_, env| env.force_https = Some(true));
+    let lb = with_tunnel_origin(f.lb, port.wrapping_add(1).max(1));
+    send_on_socket(&lb, &listener, &get_forwarded_as("https"), CLEAN_IP)
+        .await
+        .assert_answered("http_to_https_redirect", "301");
+}
+
+/// Shield's clearance cookie is `Secure`: a tunnel's HTTPS visitor gets the
+/// challenge, where plain HTTP is told to use HTTPS first (ADR-107 D3).
+#[tokio::test]
+async fn shield_challenges_a_visitor_through_the_control_planes_tunnel() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let f = fixture();
+    f.route_host(|project, _| project.shield_mode = "attack".to_string());
+    send(&f.lb, &get("/"), CLEAN_IP)
+        .await
+        .assert_answered("shield_https_required", "426");
+
+    let f = fixture();
+    f.route_host(|project, _| project.shield_mode = "attack".to_string());
+    let lb = with_tunnel_origin(f.lb, port);
+    let reply = send_on_socket(&lb, &listener, &get("/"), CLEAN_IP).await;
+    assert!(reply.answered, "{}", reply.head);
+    assert_eq!(reply.status(), "shield_challenge", "{}", reply.head);
+}
+
+/// A published status page loads through the control plane's tunnel: the
+/// visitor is on HTTPS already, so no upgrade, and the console is told so.
+#[tokio::test]
+async fn a_status_page_host_through_the_control_planes_tunnel_is_not_redirected() {
+    let ingress = || ProxyConfig {
+        console_ingress_address: Some("127.0.0.1:1".to_string()),
+        ..ProxyConfig::default()
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let f = fixture_with(ingress());
+    f.routes
+        .insert_status_page_host_for_test(HOST, Some("my-app"));
+    send(&f.lb, &get("/"), CLEAN_IP)
+        .await
+        .assert_answered("status_page_host_https_redirect", "301");
+
+    let f = fixture_with(ingress());
+    f.routes
+        .insert_status_page_host_for_test(HOST, Some("my-app"));
+    let lb = with_tunnel_origin(f.lb, port);
+    let reply = send_on_socket(&lb, &listener, &get("/"), CLEAN_IP).await;
+    assert!(!reply.answered, "{} {}", reply.status(), reply.head);
+    assert!(reply.ctx.status_page_host);
+    assert_eq!(reply.upstream_header("x-forwarded-proto"), Some("https"));
+}
+
 /// The redirect keeps a request from ever reaching the upstream preparation.
 #[tokio::test]
 async fn a_redirect_answers_before_the_upstream_request_is_prepared() {

@@ -24,7 +24,7 @@ import { deleteApiKey, activateApiKey, deactivateApiKey } from '@/api/client'
 import { useApiKeyPermissions } from '@/components/api-keys/useApiKeyPermissions'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { isVerifiedNotFound } from '@/lib/read-failure'
-import { listApiKeysQueryKey } from '@/api/client/@tanstack/react-query.gen'
+import { invalidateApiKeyQueries } from '@/lib/api-key-queries'
 import {
   Button,
   Callout,
@@ -200,6 +200,7 @@ export default function ApiKeyDetail() {
       errorTitle: 'Failed to delete API key',
     },
     onSuccess: () => {
+      invalidateApiKeyQueries(queryClient)
       toast.success('API key deleted successfully')
       navigate('/settings/keys')
     },
@@ -213,7 +214,7 @@ export default function ApiKeyDetail() {
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: apiKeyKey })
-      queryClient.invalidateQueries({ queryKey: listApiKeysQueryKey() })
+      invalidateApiKeyQueries(queryClient)
       toast.success('API key activated')
     },
   })
@@ -226,7 +227,7 @@ export default function ApiKeyDetail() {
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: apiKeyKey })
-      queryClient.invalidateQueries({ queryKey: listApiKeysQueryKey() })
+      invalidateApiKeyQueries(queryClient)
       toast.success('API key deactivated')
     },
   })

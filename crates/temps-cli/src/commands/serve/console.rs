@@ -2125,6 +2125,12 @@ pub struct ConsoleApiParams {
     /// listeners start; the caller records the failure if this function
     /// returns an error, so the proxy can explain it on the console URL.
     pub startup_state: Arc<temps_core::console_startup::ConsoleStartupState>,
+    /// The control plane's own tunnel connectors (ADR-107 D2), which
+    /// `temps serve` runs beside the in-process proxy. Attached to the
+    /// console's ingress service so it accepts node `0` and wakes them on a
+    /// placement change. `None` with `--role console`, where the proxy is
+    /// another process.
+    pub control_plane_tunnels: Option<temps_ingress::control_plane::ControlPlaneHandle>,
 }
 
 /// The backlog `TcpListener::bind` uses, so a reserved port behaves the same.

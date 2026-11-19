@@ -43,6 +43,9 @@ pub(crate) struct StubRuntime {
             Option<std::net::IpAddr>,
         )>,
     >,
+    /// The cluster WAL-G base backups asked for.
+    pub(crate) cluster_walg_backups:
+        Mutex<Vec<temps_service_protocol::PostgresClusterWalgBackupRequest>>,
     /// When set, a WAL-G base backup waits for a permit here and then
     /// completes, so a test can keep one running.
     pub(crate) walg_backup_hold: Option<Arc<tokio::sync::Semaphore>>,
@@ -240,6 +243,29 @@ impl NodeServiceRuntime for StubRuntime {
             );
         }
         Err(not_available("postgres_walg_backup"))
+    }
+
+    async fn postgres_cluster_walg_backup(
+        &self,
+        request: temps_service_protocol::PostgresClusterWalgBackupRequest,
+        _docker: Arc<Docker>,
+    ) -> Result<temps_service_protocol::PostgresWalgBackupResult, NodeServiceError> {
+        self.cluster_walg_backups
+            .lock()
+            .expect("cluster_walg_backups")
+            .push(request);
+        if let Some(hold) = &self.walg_backup_hold {
+            let _released = hold.acquire().await;
+            return Ok(
+                temps_service_protocol::PostgresWalgBackupResult::Completed {
+                    restarted: false,
+                    stdout: "Wrote backup with name base_000000010000000000000006".to_string(),
+                    stderr: String::new(),
+                    lsn: Some("0/6000100".to_string()),
+                },
+            );
+        }
+        Err(not_available("postgres_cluster_walg_backup"))
     }
 
     async fn postgres_walg_archive(

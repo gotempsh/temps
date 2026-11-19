@@ -829,6 +829,7 @@ async fn create_dns_provider(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<DnsAppState>>,
     Extension(metadata): Extension<RequestMetadata>,
+    ai_call: Option<Extension<temps_core::ai_tool_call::AiToolCall>>,
     Json(request): Json<CreateDnsProviderRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_check!(auth, Permission::DnsProvidersWrite);
@@ -879,10 +880,12 @@ async fn create_dns_provider(
         provider.id,
         "",
         "DNS_PROVIDER_CREATED",
-        serde_json::json!({
-            "provider_name": provider.name,
-            "provider_type": provider.provider_type,
-        }),
+        provider_write_audit_details(
+            &provider.name,
+            &provider.provider_type,
+            ai_call.is_some(),
+            None,
+        ),
     )
     .await;
 
@@ -959,6 +962,7 @@ async fn update_provider(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<DnsAppState>>,
     Extension(metadata): Extension<RequestMetadata>,
+    ai_call: Option<Extension<temps_core::ai_tool_call::AiToolCall>>,
     Path(id): Path<i32>,
     Json(request): Json<UpdateDnsProviderRequest>,
 ) -> Result<impl IntoResponse, Problem> {
@@ -1021,7 +1025,12 @@ async fn update_provider(
         provider.id,
         "",
         "DNS_PROVIDER_UPDATED",
-        changed_fields,
+        provider_write_audit_details(
+            &response.name,
+            &response.provider_type,
+            ai_call.is_some(),
+            Some(changed_fields),
+        ),
     )
     .await;
 
@@ -1609,6 +1618,27 @@ fn hostname_mode_failure_audit_details(
     })
 }
 
+/// What a DNS provider create or update records: which provider, whether the
+/// AI assistant issued it (its user agent says so too, but a field can be
+/// filtered on), and for an update which fields changed. Never a credential:
+/// `changed` holds booleans only.
+fn provider_write_audit_details(
+    provider_name: &str,
+    provider_type: &str,
+    via_ai_assistant: bool,
+    changed: Option<serde_json::Value>,
+) -> serde_json::Value {
+    let mut details = serde_json::json!({
+        "provider_name": provider_name,
+        "provider_type": provider_type,
+        "via_ai_assistant": via_ai_assistant,
+    });
+    if let Some(changed) = changed {
+        details["changed_fields"] = changed;
+    }
+    details
+}
+
 async fn log_dns_governance_audit(
     state: &Arc<DnsAppState>,
     auth: &temps_authz::AuthContext,
@@ -1844,6 +1874,7 @@ pub struct DnsApiDoc;
 #[cfg(test)]
 mod tests {
     use super::managed_domain_automation_enabled;
+    use super::{provider_write_audit_details, CreateDnsProviderRequest};
     use crate::errors::DnsError;
     use axum::http::StatusCode;
     use temps_core::problemdetails::Problem;
@@ -2196,6 +2227,28 @@ mod tests {
         assert!(detail.contains("zone 'example.com'"), "{detail}");
         assert!(detail.contains("DNS provider 7"), "{detail}");
         assert!(detail.contains("retry"), "{detail}");
+    }
+
+    #[test]
+    fn provider_write_audit_names_the_provider_and_the_assistant_never_the_secret() {
+        let request: CreateDnsProviderRequest = serde_json::from_value(serde_json::json!({
+            "name": "Edge zone",
+            "provider_type": "cloudflare",
+            "credentials": {"type": "cloudflare", "api_token": "fixture-token-value"},
+        }))
+        .expect("request parses");
+        let details = provider_write_audit_details(&request.name, "cloudflare", true, None);
+        assert_eq!(details["provider_name"], "Edge zone");
+        assert_eq!(details["provider_type"], "cloudflare");
+        assert_eq!(details["via_ai_assistant"], true);
+        assert!(!details.to_string().contains("fixture-token-value"));
+        assert!(!format!("{request:?}").contains("fixture-token-value"));
+
+        let changed = serde_json::json!({"credentials": true, "name": false});
+        let details =
+            provider_write_audit_details("Edge zone", "cloudflare", false, Some(changed.clone()));
+        assert_eq!(details["via_ai_assistant"], false);
+        assert_eq!(details["changed_fields"], changed);
     }
 
     #[test]

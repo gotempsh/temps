@@ -4036,6 +4036,457 @@ async fn a_control_plane_redis_is_backed_up_and_restored_by_the_same_node_half()
     drop(s3);
 }
 
+const DRAGONFLY_IMAGE: &str = "docker.dragonflydb.io/dragonflydb/dragonfly:v2.1.0@sha256:94891bb22ce2fb0f7a5a3ff1bb3b2fbbc5830e2523293e47723d87fa3e5b1184";
+
+/// Start a Dragonfly container `name` on `network` with its data on volume
+/// `volume`, as a replica of `primary` when given, with `extra` flags.
+async fn start_dragonfly(
+    docker: &Docker,
+    name: &str,
+    volume: &str,
+    network: &str,
+    password: &str,
+    primary: Option<&str>,
+    extra: &[&str],
+) {
+    let mut cmd = vec![
+        "dragonfly".to_string(),
+        "--logtostderr".to_string(),
+        "--proactor_threads=1".to_string(),
+        "--maxmemory=512mb".to_string(),
+        "--requirepass".to_string(),
+        password.to_string(),
+    ];
+    if let Some(primary) = primary {
+        cmd.extend([
+            "--masterauth".to_string(),
+            password.to_string(),
+            "--replicaof".to_string(),
+            format!("{primary}:6379"),
+        ]);
+    }
+    cmd.extend(extra.iter().map(|flag| flag.to_string()));
+    docker
+        .create_container(
+            Some(
+                bollard::query_parameters::CreateContainerOptionsBuilder::default()
+                    .name(name)
+                    .build(),
+            ),
+            bollard::models::ContainerCreateBody {
+                image: Some(DRAGONFLY_IMAGE.to_string()),
+                cmd: Some(cmd),
+                host_config: Some(bollard::models::HostConfig {
+                    network_mode: Some(network.to_string()),
+                    mounts: Some(vec![bollard::models::Mount {
+                        target: Some("/data".to_string()),
+                        source: Some(volume.to_string()),
+                        typ: Some(bollard::models::MountType::VOLUME),
+                        ..Default::default()
+                    }]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_or_else(|e| panic!("create Dragonfly {name}: {e}"));
+    docker
+        .start_container(
+            name,
+            None::<bollard::query_parameters::StartContainerOptions>,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("start Dragonfly {name}: {e}"));
+}
+
+/// The `temps-backup-*` files on `container`'s `/data`, one per line.
+async fn backup_snapshots(docker: &Docker, container: &str) -> String {
+    backup_snapshots_in(docker, container, "/data").await
+}
+
+/// The `temps-backup-*` files in `dir` of `container`, one per line. A
+/// listing that fails fails the test rather than reading as empty.
+async fn backup_snapshots_in(docker: &Docker, container: &str, dir: &str) -> String {
+    let (code, listing) = exec(docker, container, &["ls", "-a", dir]).await;
+    assert_eq!(code, 0, "listing {dir} in {container}: {listing}");
+    listing
+        .lines()
+        .filter(|file| file.starts_with("temps-backup"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Issue #1953: Dragonfly does not serve `redis-cli --rdb`'s replication
+/// handshake ("Replicating a replica is unsupported" on a replica), which
+/// failed every RDB backup of a Dragonfly service. The RDB backup has it
+/// save its own snapshot instead, in either role, and the object it
+/// uploads is that snapshot, holding the replica's data, with nothing left
+/// behind on the service's volume.
+///
+/// A helper killed midway leaves its `SAVE` running in Dragonfly, which
+/// writes the file after the helper is gone; removing the snapshot waits
+/// for that save and leaves nothing behind either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dragonfly_replica_and_primary_are_backed_up_by_the_rdb_engine() {
+    use std::io::Read as _;
+    use temps_providers::externalsvc::redis_node::{
+        redis_rdb_backup, remove_rdb_snapshot, RdbSnapshot, RedisRdbBackup, RDB_HELPER_IMAGE,
+    };
+
+    let docker = match Docker::connect_with_defaults() {
+        Ok(docker) if docker.ping().await.is_ok() => docker,
+        _ => {
+            println!("Docker not available (set DOCKER_HOST), skipping the Dragonfly proof");
+            return;
+        }
+    };
+    // Pulled when missing, so a clean CI runner runs the proof rather than
+    // skipping it.
+    for image in [DRAGONFLY_IMAGE, RUSTFS_IMAGE, RDB_HELPER_IMAGE] {
+        if docker.inspect_image(image).await.is_ok() {
+            continue;
+        }
+        if let Err(error) =
+            temps_docker_util::pull_image(&docker, temps_docker_util::PullSpec::new(image)).await
+        {
+            println!("pulling {image} failed ({error}), skipping the Dragonfly proof");
+            return;
+        }
+    }
+    let network = temps_core::NETWORK_NAME.as_str();
+    temps_docker_util::ensure_bridge_network(&docker, network)
+        .await
+        .expect("the service network");
+    let suffix = std::process::id();
+    let primary = format!("redis-dfprimary{suffix}");
+    let replica = format!("redis-dfreplica{suffix}");
+    let outside = format!("redis-dfoutside{suffix}");
+    let s3_name = format!("dfredis3{suffix}");
+    let password = "local-dragonfly-proof";
+    let _cleanup = Cleanup {
+        docker: docker.clone(),
+        containers: vec![
+            replica.clone(),
+            primary.clone(),
+            outside.clone(),
+            s3_name.clone(),
+        ],
+        volumes: vec![
+            format!("{primary}-data"),
+            format!("{replica}-data"),
+            format!("{outside}-data"),
+        ],
+    };
+    start_dragonfly(
+        &docker,
+        &primary,
+        &format!("{primary}-data"),
+        network,
+        password,
+        None,
+        &[],
+    )
+    .await;
+    wait_redis(&docker, &primary, password).await;
+    start_dragonfly(
+        &docker,
+        &replica,
+        &format!("{replica}-data"),
+        network,
+        password,
+        Some(&primary),
+        &[],
+    )
+    .await;
+    wait_redis(&docker, &replica, password).await;
+    redis_cli(&docker, &primary, password, &["SET", "proof", "replicated"]).await;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while redis_cli(&docker, &replica, password, &["GET", "proof"]).await != "replicated" {
+        assert!(Instant::now() < deadline, "the replica never synced");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(
+        redis_cli(&docker, &replica, password, &["INFO", "replication"])
+            .await
+            .contains("role:slave"),
+        "the backed-up container is a replica"
+    );
+    let (s3, s3_port) = redis_bucket(&docker, &s3_name, network).await;
+
+    for (container, service) in [(&replica, "dfreplica"), (&primary, "dfprimary")] {
+        let key = format!(
+            "{WALG_BUCKET_PATH}/external_services/redis/{service}/2026/11/19/local-{suffix}/dump.rdb.gz"
+        );
+        let size = redis_rdb_backup(
+            Arc::new(docker.clone()),
+            RedisRdbBackup {
+                service_id: 1,
+                service: service.to_string(),
+                container_name: container.clone(),
+                password: password.to_string(),
+                destination: redis_destination(format!("http://127.0.0.1:{s3_port}")),
+                key: key.clone(),
+            },
+        )
+        .await
+        .unwrap_or_else(|e| panic!("the RDB backup of Dragonfly {container}: {e}"));
+        assert!(size > 0, "{container}");
+
+        let object = s3
+            .get_object()
+            .bucket(REDIS_WALG_BUCKET)
+            .key(&key)
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("download {key}: {e:?}"))
+            .body
+            .collect()
+            .await
+            .expect("the object's body")
+            .into_bytes();
+        let mut rdb = Vec::new();
+        flate2::read::GzDecoder::new(object.as_ref())
+            .read_to_end(&mut rdb)
+            .expect("a gzipped snapshot");
+        assert!(rdb.starts_with(b"REDIS"), "{container}: an RDB snapshot");
+        assert!(
+            rdb.windows(b"replicated".len()).any(|w| w == b"replicated"),
+            "{container}: the snapshot holds the data"
+        );
+        assert_eq!(
+            backup_snapshots(&docker, container).await,
+            "",
+            "{container}: the snapshot file is removed"
+        );
+    }
+
+    // A `dir` outside every volume: the snapshot would land in the
+    // container's own filesystem, out of the helper's reach, so the backup
+    // is refused before Dragonfly saves anything.
+    start_dragonfly(
+        &docker,
+        &outside,
+        &format!("{outside}-data"),
+        network,
+        password,
+        None,
+        // `..` must not let the snapshot out of the volume.
+        &["--dir=/data/../tmp"],
+    )
+    .await;
+    wait_redis(&docker, &outside, password).await;
+    let error = redis_rdb_backup(
+        Arc::new(docker.clone()),
+        RedisRdbBackup {
+            service_id: 1,
+            service: "dfoutside".to_string(),
+            container_name: outside.clone(),
+            password: password.to_string(),
+            destination: redis_destination(format!("http://127.0.0.1:{s3_port}")),
+            key: format!(
+                "{WALG_BUCKET_PATH}/external_services/redis/dfoutside/2026/11/19/local-{suffix}/dump.rdb.gz"
+            ),
+        },
+    )
+    .await
+    .expect_err("a snapshot dir outside the volumes is refused");
+    assert!(
+        error
+            .to_string()
+            .contains("saves snapshots to /tmp, which is not on a volume of its container"),
+        "{error}"
+    );
+    assert_eq!(
+        backup_snapshots_in(&docker, &outside, "/tmp").await,
+        "",
+        "nothing is saved outside the volumes"
+    );
+
+    // A helper killed while its SAVE runs. Dragonfly is paused as soon as
+    // the save's `.tmp` appears, so however fast this host is, the save is
+    // still unfinished when its client is killed and when the removal
+    // starts. The removal finds that `.tmp` on the volume without asking
+    // the frozen Dragonfly anything, so it can only return by polling until
+    // the save ends.
+    redis_cli(
+        &docker,
+        &primary,
+        password,
+        &["DEBUG", "POPULATE", "1000000", "bulk", "100"],
+    )
+    .await;
+    let saver = format!("dfsaver{suffix}");
+    // Shares the primary's volume, to look at it while the primary is
+    // paused: a paused container cannot be exec'd into.
+    let observer = format!("dfobserver{suffix}");
+    let _helpers_cleanup = Cleanup {
+        docker: docker.clone(),
+        containers: vec![saver.clone(), observer.clone()],
+        volumes: Vec::new(),
+    };
+    run_helper(
+        &docker,
+        &observer,
+        vec!["sleep".to_string(), "600".to_string()],
+        bollard::models::HostConfig {
+            volumes_from: Some(vec![primary.clone()]),
+            ..Default::default()
+        },
+        Vec::new(),
+    )
+    .await;
+    let snapshot = |name: &str| RdbSnapshot {
+        container_name: primary.clone(),
+        mounts: vec!["/data".to_string()],
+        name: name.to_string(),
+        password: password.to_string(),
+    };
+    let mut caught = None;
+    for attempt in 1..=5 {
+        let name = format!("temps-backup-abandoned-{attempt}");
+        let in_progress = format!("{name}.rdb.tmp");
+        let finished = format!("{name}.rdb");
+        run_helper(
+            &docker,
+            &saver,
+            ["redis-cli", "-h", &primary, "SAVE", "RDB", &name]
+                .map(str::to_string)
+                .to_vec(),
+            bollard::models::HostConfig {
+                network_mode: Some(network.to_string()),
+                ..Default::default()
+            },
+            vec![format!("REDISCLI_AUTH={password}")],
+        )
+        .await;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let started = loop {
+            let files = backup_snapshots(&docker, &observer).await;
+            if files.lines().any(|file| file == in_progress) {
+                break true;
+            }
+            if files.lines().any(|file| file == finished) {
+                break false;
+            }
+            assert!(Instant::now() < deadline, "SAVE {name} never started");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        if started {
+            docker
+                .pause_container(&primary)
+                .await
+                .expect("pause Dragonfly mid-save");
+        }
+        docker
+            .remove_container(
+                &saver,
+                Some(bollard::query_parameters::RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("kill the saving client");
+        if started
+            && backup_snapshots(&docker, &observer)
+                .await
+                .lines()
+                .any(|file| file == in_progress)
+        {
+            caught = Some(name);
+            break;
+        }
+        // The save ended before Dragonfly was frozen: clear it, try again.
+        if started {
+            docker
+                .unpause_container(&primary)
+                .await
+                .expect("unpause Dragonfly");
+        }
+        remove_rdb_snapshot(&docker, &snapshot(&name))
+            .await
+            .expect("clear a save that ended too early");
+    }
+    let name = caught.expect("no SAVE was caught in progress in 5 attempts");
+    const PAUSED: Duration = Duration::from_secs(3);
+    let unpause = {
+        let docker = docker.clone();
+        let primary = primary.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(PAUSED).await;
+            docker.unpause_container(&primary).await
+        })
+    };
+    let removing = Instant::now();
+    remove_rdb_snapshot(&docker, &snapshot(&name))
+        .await
+        .expect("the abandoned snapshot is removed");
+    assert!(
+        removing.elapsed() >= PAUSED,
+        "the removal returned while the save was frozen"
+    );
+    unpause
+        .await
+        .expect("the unpause task")
+        .expect("unpause Dragonfly");
+    assert!(
+        redis_cli(&docker, &primary, password, &["INFO", "persistence"])
+            .await
+            .contains("saving:0"),
+        "the removal waited for the save to end"
+    );
+    assert_eq!(
+        backup_snapshots(&docker, &primary).await,
+        "",
+        "the abandoned snapshot is removed"
+    );
+}
+
+/// Create and start a one-off container `name` from the RDB helper image
+/// running `cmd`, replacing any earlier container of that name.
+async fn run_helper(
+    docker: &Docker,
+    name: &str,
+    cmd: Vec<String>,
+    host_config: bollard::models::HostConfig,
+    env: Vec<String>,
+) {
+    let _ = docker
+        .remove_container(
+            name,
+            Some(bollard::query_parameters::RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            }),
+        )
+        .await;
+    docker
+        .create_container(
+            Some(
+                bollard::query_parameters::CreateContainerOptionsBuilder::default()
+                    .name(name)
+                    .build(),
+            ),
+            bollard::models::ContainerCreateBody {
+                image: Some(temps_providers::externalsvc::redis_node::RDB_HELPER_IMAGE.to_string()),
+                cmd: Some(cmd),
+                env: Some(env),
+                host_config: Some(host_config),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_or_else(|e| panic!("create helper {name}: {e}"));
+    docker
+        .start_container(
+            name,
+            None::<bollard::query_parameters::StartContainerOptions>,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("start helper {name}: {e}"));
+}
+
 // ── MariaDB (ADR-099): the control plane's engines, run by the agent ────────
 
 /// `mariadb` as root in `container`, batch output without a header.

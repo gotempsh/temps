@@ -3158,6 +3158,107 @@
         },
         "type": "object"
       },
+      "AiHarnessCredential": {
+        "description": "The credential that authenticated the harness. Never carries the secret,\nonly the identifiers the API-key list already shows.",
+        "properties": {
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "key_prefix": {
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/AiHarnessCredentialKind"
+          },
+          "last_used_at": {
+            "example": "2026-01-01T00:00:00Z",
+            "format": "date-time",
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "key_prefix",
+          "kind",
+          "last_used_at"
+        ],
+        "type": "object"
+      },
+      "AiHarnessCredentialKind": {
+        "description": "Which credential proved the harness connected.",
+        "enum": [
+          "dedicated_key",
+          "cli_login"
+        ],
+        "type": "string"
+      },
+      "AiHarnessState": {
+        "description": "Where the harness onboarding stands for the calling user.",
+        "enum": [
+          "missing",
+          "waiting",
+          "connected"
+        ],
+        "type": "string"
+      },
+      "AiHarnessStatusResponse": {
+        "description": "`GET /api-keys/ai-harness/status`: the caller's AI harness connection.",
+        "properties": {
+          "connected_via": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/AiHarnessCredential",
+                "description": "Set when `status` is `connected`."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "key_created_at": {
+            "example": "2026-01-01T00:00:00Z",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "key_id": {
+            "description": "The dedicated harness key, when one exists (active or not).",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "reason": {
+            "description": "Why the status is not `connected`, in words the console can show.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "setup_path": {
+            "description": "Console route that resolves `reason`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "$ref": "#/components/schemas/AiHarnessState"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "type": "object"
+      },
       "AiModelOptionDto": {
         "properties": {
           "default_thinking_option_id": {
@@ -9498,6 +9599,7 @@
           "dns_lookup",
           "unreachable",
           "upstream_answered",
+          "dns_record_mismatch",
           "caa_forbids",
           "rate_limited",
           "ca_transient",
@@ -16802,6 +16904,16 @@
             "description": "The provider's `kind`, from `GET /ingress/providers`.",
             "type": "string"
           },
+          "secrets": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/SecretString"
+            },
+            "description": "Answers to the provider's credential fields (kind `secret`, such as an\nOAuth client secret), by field key. Same as giving them in `values`,\nbut published as credentials, so the AI assistant passes a\n`secret_ref:` handle here and never sees the value. The assistant may\nnot put a credential field in `values`. A key cannot be in both.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
           "values": {
             "description": "Answers to the provider's setup fields, by field key. DNS provider\nfields take the provider's id; every other field takes a string.",
             "type": "object"
@@ -16933,9 +17045,14 @@
       "CreateDeliveryProfileRequest": {
         "properties": {
           "bunny_api_key": {
-            "type": [
-              "string",
-              "null"
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/SecretString",
+                "description": "The Bunny account API key, for `bunny` profiles. Write-only: checked\nagainst the Pull Zone, then stored encrypted and never returned. A\ncredential, so the AI assistant passes it through a secret slot."
+              },
+              {
+                "type": "null"
+              }
             ]
           },
           "bunny_pull_zone_id": {
@@ -19099,6 +19216,14 @@
               "null"
             ]
           },
+          "creation_id": {
+            "description": "Id the client gives this create, so it can read the create's steps\nfrom `GET /v1/sandboxes/creations/{creation_id}` while it waits for\nthis request: 8 to 64 letters, digits, `-` or `_`, new for every\ncreate (a UUID works). Optional.",
+            "example": "6f1c2a9e-3b7d-4e0a-9c55-0d2f8a1b7e43",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "disk_size_mb": {
             "description": "Root disk size in MB, `[1, 65536]` (Firecracker only; Docker ignores\nit). Omit for the platform default (1 GiB).",
             "format": "int64",
@@ -19728,6 +19853,104 @@
           }
         ],
         "description": "A new bypass token. `secret` is shown this once and never again."
+      },
+      "CreationStatus": {
+        "enum": [
+          "running",
+          "succeeded",
+          "failed"
+        ],
+        "type": "string"
+      },
+      "CreationStep": {
+        "description": "One step and where it stands.",
+        "properties": {
+          "bytes_done": {
+            "description": "Image download progress (`pull_image` only), when the registry\nreports sizes.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "bytes_total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "detail": {
+            "description": "What the step did or is doing (`already present`, `on node\nworker-1`, `downloading`), or why it was skipped.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "error": {
+            "description": "Why the step failed, with the node, image or sandbox involved.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "finished_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "kind": {
+            "$ref": "#/components/schemas/CreationStepKind"
+          },
+          "started_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "$ref": "#/components/schemas/CreationStepStatus"
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "title",
+          "status"
+        ],
+        "type": "object"
+      },
+      "CreationStepKind": {
+        "description": "One step of a sandbox create, in the order the create runs them.",
+        "enum": [
+          "check_request",
+          "select_node",
+          "record_sandbox",
+          "pull_image",
+          "create_container",
+          "start_container",
+          "wait_ready",
+          "seed_source",
+          "ready"
+        ],
+        "type": "string"
+      },
+      "CreationStepStatus": {
+        "enum": [
+          "pending",
+          "running",
+          "done",
+          "failed",
+          "skipped"
+        ],
+        "type": "string"
       },
       "CredentialDelivery": {
         "additionalProperties": false,
@@ -38126,6 +38349,92 @@
         ],
         "type": "object"
       },
+      "HostImagePreparation": {
+        "description": "One host's sandbox image preparation, as the API reports it.",
+        "properties": {
+          "eligible": {
+            "description": "The host can take new sandboxes, so it is worth preparing.",
+            "type": "boolean"
+          },
+          "ineligible_reason": {
+            "description": "Why the host is not eligible, when it is not.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "is_control_plane": {
+            "type": "boolean"
+          },
+          "keep_prepared": {
+            "description": "Temps keeps this host's default sandbox image pulled, re-pulling it\nwhen the default changes. Turned on by \"prepare\".",
+            "type": "boolean"
+          },
+          "last_error": {
+            "description": "Why the last preparation failed.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_error_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "node_id": {
+            "description": "Node id; `0` for the control plane.",
+            "format": "int32",
+            "type": "integer"
+          },
+          "node_name": {
+            "type": "string"
+          },
+          "prepared_image": {
+            "description": "The image Temps last prepared on this host.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "stale_images": {
+            "description": "Previously prepared images still to remove (a container used them).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "status": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ImagePrepareStatus",
+                "description": "Where the host stands with its default image right now. `None` when\nthe host was not asked (not eligible) or could not be reached, with\nthe reason in `status_error`."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "status_error": {
+            "description": "Why the status could not be read.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "node_id",
+          "node_name",
+          "is_control_plane",
+          "eligible",
+          "keep_prepared",
+          "stale_images"
+        ],
+        "type": "object"
+      },
       "Hosting": {
         "description": "Whether Temps runs a project's app.\n\n`External` projects run elsewhere (Vercel, Netlify, a VPS) and only send\nTemps their analytics, errors and traces; they are never deployed.",
         "enum": [
@@ -38720,6 +39029,86 @@
           "platform",
           "size_bytes",
           "tags"
+        ],
+        "type": "object"
+      },
+      "ImagePrepareState": {
+        "description": "Where one host stands with one sandbox image.",
+        "enum": [
+          "not_pulled",
+          "pulling",
+          "ready",
+          "failed",
+          "unsupported"
+        ],
+        "type": "string"
+      },
+      "ImagePrepareStatus": {
+        "description": "One host's status for one sandbox image.",
+        "properties": {
+          "already_present": {
+            "description": "The image was already on the host when the attempt started: nothing\nwas downloaded.",
+            "type": "boolean"
+          },
+          "bytes_done": {
+            "description": "Bytes downloaded so far, summed over the layers the registry\nreported. `None` before the registry reports any size.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "bytes_total": {
+            "description": "Total bytes to download, summed over the layers reported so far (it\ngrows while the registry announces layers).",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "detail": {
+            "description": "What a running pull is doing right now (`downloading`, `extracting`,\n`building locally`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "error": {
+            "description": "Why the last attempt failed, or why the host cannot prepare images.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "finished_at": {
+            "description": "When the last attempt finished.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "image": {
+            "description": "The exact reference a create on this host would use (tag or\n`@sha256:` digest), so the pre-pull and the create cannot disagree.",
+            "type": "string"
+          },
+          "started_at": {
+            "description": "When the running or last attempt started.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state": {
+            "$ref": "#/components/schemas/ImagePrepareState"
+          }
+        },
+        "required": [
+          "image",
+          "state"
         ],
         "type": "object"
       },
@@ -53809,6 +54198,38 @@
         ],
         "type": "object"
       },
+      "PrepareSandboxImagesBody": {
+        "additionalProperties": false,
+        "description": "Start preparing sandbox hosts.",
+        "properties": {
+          "node_id": {
+            "description": "The host to prepare: a node id, or `0` for the control plane.\nOmitted or `null`: every host eligible for sandbox placement.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "PrepareSandboxImagesResponse": {
+        "description": "The hosts a \"prepare\" was accepted for.",
+        "properties": {
+          "node_ids": {
+            "description": "The hosts now kept prepared and asked to pull (node id, `0` for the\ncontrol plane). Their progress is read from\n`GET /v1/sandboxes/image-preparation`.",
+            "items": {
+              "format": "int32",
+              "type": "integer"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "node_ids"
+        ],
+        "type": "object"
+      },
       "PresetConfigSchema": {
         "description": "Union type for preset configurations\nUse the appropriate configuration type based on your preset",
         "oneOf": [
@@ -63952,6 +64373,57 @@
         ],
         "type": "object"
       },
+      "SandboxCreation": {
+        "description": "A sandbox create and its steps.",
+        "properties": {
+          "creation_id": {
+            "description": "The id the client gave the create (or one the server generated).",
+            "type": "string"
+          },
+          "error": {
+            "description": "Why the create failed.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "finished_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sandbox_id": {
+            "description": "The sandbox's public id, once its row exists.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "started_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/CreationStatus"
+          },
+          "steps": {
+            "description": "Every step, in order.",
+            "items": {
+              "$ref": "#/components/schemas/CreationStep"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "creation_id",
+          "status",
+          "steps",
+          "started_at"
+        ],
+        "type": "object"
+      },
       "SandboxDirectory": {
         "description": "One directory of the chat's sandbox: folders first, then files, by name.",
         "properties": {
@@ -64158,6 +64630,27 @@
           "size",
           "binary",
           "truncated"
+        ],
+        "type": "object"
+      },
+      "SandboxImagePreparationResponse": {
+        "description": "Every host that can run sandboxes and its image preparation.",
+        "properties": {
+          "all_ready": {
+            "description": "Every eligible host has its default image: the next create on any of\nthem starts without a download.",
+            "type": "boolean"
+          },
+          "hosts": {
+            "description": "Control plane first, then workers by name.",
+            "items": {
+              "$ref": "#/components/schemas/HostImagePreparation"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "hosts",
+          "all_ready"
         ],
         "type": "object"
       },
@@ -79239,6 +79732,20 @@
         },
         "type": "object"
       },
+      "UpdateHostImagePreparationBody": {
+        "additionalProperties": false,
+        "description": "Turn keeping one host prepared on or off.",
+        "properties": {
+          "keep_prepared": {
+            "description": "Keep this host's default sandbox image pulled, re-pulling it when an\nupgrade changes the default. `false` stops that; it removes nothing.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "keep_prepared"
+        ],
+        "type": "object"
+      },
       "UpdateIncidentRequest": {
         "description": "Change the public heading of an incident.",
         "properties": {
@@ -83703,13 +84210,13 @@
         "type": "object"
       },
       "WebhookConfig": {
-        "description": "Configuration for a generic webhook notification provider",
+        "description": "Configuration for a generic webhook notification provider\n\nRequest-side config. Not `Serialize`: every header value is a\n`SecretString` (reads mask them all, because they are where a webhook's\ncredential goes), so use [`WebhookConfig::into_stored_value`].",
         "properties": {
           "headers": {
             "additionalProperties": {
-              "type": "string"
+              "$ref": "#/components/schemas/SecretString"
             },
-            "description": "Custom headers to include in the request (e.g., for authentication tokens)",
+            "description": "Custom headers to include in the request (e.g., for authentication\ntokens). Every value is treated as a credential: write-only, masked on\nread, and taken by the AI assistant through a secret slot.",
             "example": {
               "Authorization": "Bearer your-token",
               "X-Custom-Header": "custom-value"
@@ -101744,6 +102251,42 @@
             "bearer_auth": []
           }
         ],
+        "tags": [
+          "API Keys"
+        ]
+      }
+    },
+    "/api-keys/ai-harness/status": {
+      "get": {
+        "description": "Backs the console's \"Let your AI operate Temps\" onboarding and its\napp-wide \"finish connecting\" banner. `connected` when the dedicated\n`Temps AI harness` key has authenticated a request, or when a key minted\nby a browser-approved `temps login` after it has: the CLI falls back to\nthat flow when it is not handed a usable key, so the harness works\nwithout ever sending the dedicated key.",
+        "operationId": "get_ai_harness_status",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AiHarnessStatusResponse"
+                }
+              }
+            },
+            "description": "AI harness connection status for the caller"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Whether the caller's external AI harness has connected.",
         "tags": [
           "API Keys"
         ]
@@ -179896,6 +180439,210 @@
         "x-maturity": "experimental"
       }
     },
+    "/v1/sandboxes/creations/{creation_id}": {
+      "get": {
+        "operationId": "get_sandbox_creation",
+        "parameters": [
+          {
+            "description": "The `creation_id` sent with the create",
+            "in": "path",
+            "name": "creation_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SandboxCreation"
+                }
+              }
+            },
+            "description": "The create and its ordered steps"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "No create with this id is tracked for the caller (unknown, or finished more than 15 minutes ago)"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Read a create's steps by the `creation_id` its `POST /v1/sandboxes` sent.\nOnly the user who started the create can read it.",
+        "tags": [
+          "Sandboxes"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/v1/sandboxes/image-preparation": {
+      "get": {
+        "operationId": "get_sandbox_image_preparation",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SandboxImagePreparationResponse"
+                }
+              }
+            },
+            "description": "Image preparation of every sandbox host"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "description": "The hosts could not be listed"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Every host that can run sandboxes, with whether its default sandbox\nimage is pulled (with download progress while it pulls), and whether\nTemps keeps it prepared.",
+        "tags": [
+          "Sandboxes"
+        ],
+        "x-maturity": "experimental"
+      },
+      "post": {
+        "operationId": "prepare_sandbox_images",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/PrepareSandboxImagesBody"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            }
+          },
+          "description": "Optional; an empty body prepares every eligible host"
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PrepareSandboxImagesResponse"
+                }
+              }
+            },
+            "description": "Preparation started on these hosts"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Administrator role required"
+          },
+          "404": {
+            "description": "No such host"
+          },
+          "415": {
+            "description": "A body was sent without a JSON Content-Type"
+          },
+          "422": {
+            "description": "The body is not valid, or the host (or every host) cannot take sandboxes"
+          },
+          "500": {
+            "description": "The preparation could not be recorded"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Pull the default sandbox image on every eligible host (or one), so the\nfirst sandbox there starts without a multi-gigabyte download, and keep\nthose hosts prepared across upgrades. Saves the policy of every host at\nonce and returns; the hosts are asked to pull in the background and\ntheir progress is read from the GET. Admin only.",
+        "tags": [
+          "Sandboxes"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/v1/sandboxes/image-preparation/nodes/{node_id}": {
+      "put": {
+        "operationId": "update_host_image_preparation",
+        "parameters": [
+          {
+            "description": "Node id, or `0` for the control plane",
+            "in": "path",
+            "name": "node_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateHostImagePreparationBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SandboxImagePreparationResponse"
+                }
+              }
+            },
+            "description": "Updated image preparation of every host"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Administrator role required"
+          },
+          "404": {
+            "description": "No such host"
+          },
+          "500": {
+            "description": "The change could not be saved"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Turn keeping one host's sandbox image prepared on or off. Admin only.",
+        "tags": [
+          "Sandboxes"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
     "/v1/sandboxes/placement": {
       "get": {
         "operationId": "get_sandbox_placement",
@@ -180326,6 +181073,53 @@
           }
         ],
         "summary": "Stream a command's stdout/stderr as `application/x-ndjson`\n(`@vercel/sandbox`-compatible). Each line is either\n`{stream:\"stdout\"|\"stderr\", data:\"...\"}` or\n`{stream:\"error\", data:{code, message}}`.",
+        "tags": [
+          "Sandboxes"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/v1/sandboxes/{id}/creation": {
+      "get": {
+        "operationId": "get_sandbox_creation_by_sandbox",
+        "parameters": [
+          {
+            "description": "Sandbox id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SandboxCreation"
+                }
+              }
+            },
+            "description": "The create and its ordered steps"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "No such sandbox for the caller, or its create is no longer tracked"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Read the steps of the create that made a sandbox, while this server still\ntracks it (it is running, or finished less than 15 minutes ago).",
         "tags": [
           "Sandboxes"
         ],

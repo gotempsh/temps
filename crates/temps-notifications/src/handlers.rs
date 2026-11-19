@@ -377,7 +377,11 @@ pub struct UpdateNotificationEmailProviderRequest {
 }
 
 /// Configuration for a generic webhook notification provider
-#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
+///
+/// Request-side config. Not `Serialize`: every header value is a
+/// `SecretString` (reads mask them all, because they are where a webhook's
+/// credential goes), so use [`WebhookConfig::into_stored_value`].
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct WebhookConfig {
     /// The URL to send webhook requests to
     #[schema(example = "https://api.example.com/notifications")]
@@ -386,14 +390,34 @@ pub struct WebhookConfig {
     #[serde(default = "default_http_method")]
     #[schema(example = "POST")]
     pub method: String,
-    /// Custom headers to include in the request (e.g., for authentication tokens)
+    /// Custom headers to include in the request (e.g., for authentication
+    /// tokens). Every value is treated as a credential: write-only, masked on
+    /// read, and taken by the AI assistant through a secret slot.
     #[serde(default)]
     #[schema(example = json!({"Authorization": "Bearer your-token", "X-Custom-Header": "custom-value"}))]
-    pub headers: std::collections::HashMap<String, String>,
+    pub headers: std::collections::BTreeMap<String, SecretString>,
     /// Request timeout in seconds. Defaults to 30.
     #[serde(default = "default_timeout_secs")]
     #[schema(example = 30)]
     pub timeout_secs: u64,
+}
+
+impl WebhookConfig {
+    /// The JSON persisted (encrypted) for this provider, with the header
+    /// values exposed.
+    pub fn into_stored_value(self) -> serde_json::Value {
+        let headers: serde_json::Map<String, serde_json::Value> = self
+            .headers
+            .into_iter()
+            .map(|(name, value)| (name, serde_json::Value::String(value.into_exposed())))
+            .collect();
+        serde_json::json!({
+            "url": self.url,
+            "method": self.method,
+            "headers": headers,
+            "timeout_secs": self.timeout_secs,
+        })
+    }
 }
 
 fn default_http_method() -> String {
@@ -404,14 +428,14 @@ fn default_timeout_secs() -> u64 {
     30
 }
 
-#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct CreateWebhookProviderRequest {
     pub name: String,
     pub config: WebhookConfig,
     pub enabled: Option<bool>,
 }
 
-#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct UpdateWebhookProviderRequest {
     pub name: Option<String>,
     pub config: WebhookConfig,
@@ -1339,7 +1363,7 @@ async fn create_webhook_provider(
     }
 
     let enabled = request.enabled.unwrap_or(true);
-    let config = serde_json::to_value(&request.config).unwrap_or_default();
+    let config = request.config.into_stored_value();
     match app_state
         .notification_service
         .add_provider(request.name, "webhook".to_string(), config, enabled)
@@ -1433,7 +1457,7 @@ async fn update_webhook_provider(
             .build());
     }
 
-    let config = serde_json::to_value(request.config).unwrap_or_default();
+    let config = request.config.into_stored_value();
     let update_request = UpdateProviderRequest {
         name: request.name,
         config: Some(config),
@@ -3654,5 +3678,30 @@ mod tests {
         let stored = cloudflare.into_stored_value();
         assert_eq!(stored["api_token"], "real-cf-token");
         assert_eq!(stored["account_id"], "acct");
+
+        let webhook: WebhookConfig = serde_json::from_value(serde_json::json!({
+            "url": "https://hooks.example.com/incident",
+            "headers": {"Authorization": "Bearer real-hook-token"},
+        }))
+        .unwrap();
+        assert!(!format!("{webhook:?}").contains("real-hook-token"));
+        let stored = webhook.into_stored_value();
+        assert_eq!(stored["headers"]["Authorization"], "Bearer real-hook-token");
+        assert_eq!(stored["url"], "https://hooks.example.com/incident");
+        assert_eq!(stored["method"], "POST");
+        assert_eq!(stored["timeout_secs"], 30);
+    }
+
+    /// Webhook header values are where a webhook's credential goes, so the
+    /// spec flags them `x-temps-secret`: the assistant then has to pass a
+    /// `secret_ref:` handle and can never type a token into the chat.
+    #[test]
+    fn webhook_header_values_are_published_as_secrets() {
+        let spec = serde_json::to_value(NotificationProvidersApiDoc::openapi()).unwrap();
+        let headers = &spec["components"]["schemas"]["WebhookConfig"]["properties"]["headers"];
+        let values = &headers["additionalProperties"];
+        let flagged = values["x-temps-secret"] == true
+            || values["$ref"] == "#/components/schemas/SecretString";
+        assert!(flagged, "header values must be SecretString: {headers}");
     }
 }

@@ -144,7 +144,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Temps Contributors"]
@@ -289,6 +289,12 @@ base64 = "0.23"
 # Signs and verifies signed-in gate tokens (ADR 065 D8).
 ed25519-dalek = "3.0"
 hex = "0.4.3"
+# Verifies the keyless Sigstore bundle of a release tarball before
+# `temps upgrade` or the console's self-update installs it. Maintained by the
+# Sigstore project (sigstore/sigstore-rust), verification only: no signing,
+# OIDC or OCI client. `tuf` refreshes the trusted root from Sigstore's TUF
+# repository; the root embedded in the crate is the offline fallback.
+sigstore-verify = { version = "0.16.0", default-features = false, features = ["rustls", "aws-lc-rs", "tuf"] }
 # openidconnect 4.x — bumped from 3.x to clear three transitive
 # rustls-webpki CVEs (RUSTSEC-2026-0098/0099/0104) that came in via
 # oauth2 4 → reqwest 0.11 → rustls 0.21 → rustls-webpki 0.101. 4.x

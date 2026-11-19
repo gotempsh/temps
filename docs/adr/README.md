@@ -77,7 +77,7 @@ the number of the ADR they belong to; they do not take a number of their own.
 | [055](./055-workload-plane-and-runtime-drivers.md) | A workload plane with pluggable runtime drivers | Proposed | supersedes in part [052](./052-common-workload-model.md); amended by [099](./099-worker-backups-run-the-local-engines.md) |
 | [056](./056-compute-pool-that-avoids-collisions.md) | A Compute Pool That Avoids Collisions and Can Be Changed | Accepted |  |
 | [057](./057-removing-a-node-that-is-gone.md) | Removing a worker node that is gone | Accepted |  |
-| [058](./058-ingress-modes-and-a-shared-app-domain.md) | Ingress modes, edge nodes and a shared app domain | Proposed |  |
+| [058](./058-ingress-modes-and-a-shared-app-domain.md) | Ingress modes, edge nodes and a shared app domain | Proposed | amended by [107](./107-control-plane-tunnel-connectors.md) |
 | [059](./059-configurable-overlay-network-name.md) | A configurable overlay network name, and a join that looks first | Accepted |  |
 | [060](./060-rejoining-the-same-control-plane.md) | Re-joining the same control plane, and removing an empty node | Accepted |  |
 | [061](./061-worker-metrics.md) | Worker proxy and host metrics, pulled by the control plane | Accepted |  |
@@ -125,6 +125,7 @@ the number of the ADR they belong to; they do not take a number of their own.
 | [104](./104-single-server-internal-routing.md) | A single-server control plane serves its own containers' `*.temps.local` names | Proposed |  |
 | [105](./105-sandbox-internal-access.md) | A sandbox can call a project's internal address when that project allows it | Proposed | amends [101](./101-internal-access-grants.md) |
 | [106](./106-durable-workflows.md) | Durable workflows orchestrated by Temps | Proposed |  |
+| [107](./107-control-plane-tunnel-connectors.md) | The control plane runs tunnel connectors for the apps it serves | Proposed | amends [058](./058-ingress-modes-and-a-shared-app-domain.md) |
 
 ## Supporting documents
 

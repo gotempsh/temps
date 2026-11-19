@@ -5,6 +5,7 @@ mod app_settings;
 pub mod cluster_ca;
 pub mod deployment_config;
 pub mod disk_status;
+pub mod domain_ownership;
 pub mod enrollment_tokens;
 mod installation_secrets;
 pub mod loopback_reservation;

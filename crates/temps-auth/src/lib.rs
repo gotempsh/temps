@@ -8,6 +8,7 @@
         reason = "tests read fixture configuration (database/service URLs) from the environment"
     )
 )]
+mod ai_harness;
 mod apikey_handler;
 mod apikey_handler_types;
 mod apikey_plugin;

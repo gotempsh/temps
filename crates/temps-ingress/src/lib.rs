@@ -12,6 +12,7 @@
 //!   `temps_node_agent::connectors`.
 
 pub mod cloudflare;
+pub mod control_plane;
 pub mod error;
 pub mod handlers;
 pub mod plugin;
@@ -22,7 +23,8 @@ pub mod service;
 pub mod tailscale;
 pub mod wire;
 
-pub use error::IngressError;
+pub use control_plane::{ControlPlaneConnectors, LocalConnectorRuntime};
+pub use error::{ControlPlaneTunnelsUnavailable, IngressError};
 pub use handlers::{node_routes, IngressNodeState};
 pub use plugin::IngressPlugin;
 pub use service::IngressConnectorService;

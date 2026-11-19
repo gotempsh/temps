@@ -59,7 +59,11 @@ impl From<DockerUnavailable> for PlatformInfoError {
 struct CachedNetworkInfo {
     pub public_ip: Option<String>,
     pub private_ip: Option<String>,
-    pub last_updated: Instant,
+    /// When `public_ip` was last looked up. Each address keeps its own
+    /// time: refreshing one never makes the other look fresh.
+    pub public_updated: Option<Instant>,
+    /// When `private_ip` was last looked up.
+    pub private_updated: Option<Instant>,
 }
 
 // ---------------------------------------------------------------------------
@@ -372,46 +376,50 @@ impl PlatformInfoService {
         }
     }
 
-    /// Get cached network information or None if expired
+    /// Cached network information with every address whose own lookup has
+    /// expired left out; `None` when neither is still fresh.
     fn get_cached_network_info(&self) -> Option<CachedNetworkInfo> {
         let cache_read = self.network_cache.read();
-        if let Some(ref cached) = *cache_read {
-            if cached.last_updated.elapsed() < self.cache_duration {
-                debug!("Using cached network info");
-                return Some(cached.clone());
-            }
+        let cached = cache_read.as_ref()?;
+        let fresh = |at: Option<Instant>| at.is_some_and(|at| at.elapsed() < self.cache_duration);
+        let public_fresh = fresh(cached.public_updated);
+        let private_fresh = fresh(cached.private_updated);
+        if !public_fresh && !private_fresh {
+            return None;
         }
-        None
+        debug!("Using cached network info");
+        Some(CachedNetworkInfo {
+            public_ip: cached.public_ip.clone().filter(|_| public_fresh),
+            private_ip: cached.private_ip.clone().filter(|_| private_fresh),
+            public_updated: cached.public_updated.filter(|_| public_fresh),
+            private_updated: cached.private_updated.filter(|_| private_fresh),
+        })
     }
 
     /// Update cached public IP
     fn update_cache_public_ip(&self, public_ip: Option<String>) {
         let mut cache_write = self.network_cache.write();
-        if let Some(ref mut cached) = *cache_write {
-            cached.public_ip = public_ip;
-            cached.last_updated = Instant::now();
-        } else {
-            *cache_write = Some(CachedNetworkInfo {
-                public_ip,
-                private_ip: None,
-                last_updated: Instant::now(),
-            });
-        }
+        let cached = cache_write.get_or_insert_with(|| CachedNetworkInfo {
+            public_ip: None,
+            private_ip: None,
+            public_updated: None,
+            private_updated: None,
+        });
+        cached.public_ip = public_ip;
+        cached.public_updated = Some(Instant::now());
     }
 
     /// Update cached private IP
     fn update_cache_private_ip(&self, private_ip: Option<String>) {
         let mut cache_write = self.network_cache.write();
-        if let Some(ref mut cached) = *cache_write {
-            cached.private_ip = private_ip;
-            cached.last_updated = Instant::now();
-        } else {
-            *cache_write = Some(CachedNetworkInfo {
-                public_ip: None,
-                private_ip,
-                last_updated: Instant::now(),
-            });
-        }
+        let cached = cache_write.get_or_insert_with(|| CachedNetworkInfo {
+            public_ip: None,
+            private_ip: None,
+            public_updated: None,
+            private_updated: None,
+        });
+        cached.private_ip = private_ip;
+        cached.private_updated = Some(Instant::now());
     }
 
     /// Force refresh the cached information.
@@ -512,6 +520,18 @@ fn is_private_ip(ip: &str) -> bool {
         }
     } else {
         false
+    }
+}
+
+/// The control plane's public address for whoever must not guess it from
+/// DNS (*Make it reachable*): the address the public-IP lookup found,
+/// cached like every other read of it.
+#[async_trait::async_trait]
+impl temps_core::server_public_address::ServerPublicAddress for PlatformInfoService {
+    async fn detected_public_ip(&self) -> Option<IpAddr> {
+        self.get_public_ip_with_fallback()
+            .await
+            .and_then(|ip| ip.trim().parse::<IpAddr>().ok())
     }
 }
 
@@ -630,5 +650,42 @@ mod tests {
         let rendered = err.to_string();
         assert!(rendered.contains("control-plane"), "{rendered}");
         assert!(rendered.contains("temps join"), "{rendered}");
+    }
+
+    // ------------------------------------------------------------------
+    // Network cache
+    // ------------------------------------------------------------------
+
+    /// Refreshing the private address must not make an expired public one
+    /// look fresh: *Make it reachable* points DNS at the public address.
+    #[test]
+    fn a_private_ip_refresh_never_revives_an_expired_public_ip() {
+        let service = PlatformInfoService::without_docker();
+        service.update_cache_public_ip(Some("203.0.113.5".into()));
+        assert_eq!(
+            service.get_cached_public_ip().as_deref(),
+            Some("203.0.113.5")
+        );
+
+        // The public lookup expires.
+        let expired = Instant::now()
+            .checked_sub(service.cache_duration + Duration::from_secs(1))
+            .expect("the monotonic clock is past one cache period");
+        if let Some(cached) = service.network_cache.write().as_mut() {
+            cached.public_updated = Some(expired);
+        }
+        assert_eq!(service.get_cached_public_ip(), None);
+
+        // A private-address refresh afterwards keeps it expired.
+        service.update_cache_private_ip(Some("10.0.0.5".into()));
+        assert_eq!(service.get_cached_public_ip(), None);
+        assert_eq!(service.get_cached_private_ip().as_deref(), Some("10.0.0.5"));
+
+        // A fresh public lookup is served again.
+        service.update_cache_public_ip(Some("203.0.113.6".into()));
+        assert_eq!(
+            service.get_cached_public_ip().as_deref(),
+            Some("203.0.113.6")
+        );
     }
 }

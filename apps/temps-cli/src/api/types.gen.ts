@@ -1323,6 +1323,49 @@ export type AiConfigSettings = {
     config_repo_branch?: string;
 };
 
+/**
+ * The credential that authenticated the harness. Never carries the secret,
+ * only the identifiers the API-key list already shows.
+ */
+export type AiHarnessCredential = {
+    id: number;
+    key_prefix: string;
+    kind: AiHarnessCredentialKind;
+    last_used_at: string;
+    name: string;
+};
+
+/**
+ * Which credential proved the harness connected.
+ */
+export type AiHarnessCredentialKind = 'dedicated_key' | 'cli_login';
+
+/**
+ * Where the harness onboarding stands for the calling user.
+ */
+export type AiHarnessState = 'missing' | 'waiting' | 'connected';
+
+/**
+ * `GET /api-keys/ai-harness/status`: the caller's AI harness connection.
+ */
+export type AiHarnessStatusResponse = {
+    connected_via?: AiHarnessCredential | null;
+    key_created_at?: string | null;
+    /**
+     * The dedicated harness key, when one exists (active or not).
+     */
+    key_id?: number | null;
+    /**
+     * Why the status is not `connected`, in words the console can show.
+     */
+    reason?: string | null;
+    /**
+     * Console route that resolves `reason`.
+     */
+    setup_path?: string | null;
+    status: AiHarnessState;
+};
+
 export type AiModelOptionDto = {
     default_thinking_option_id?: string | null;
     id: string;
@@ -4448,7 +4491,7 @@ export type CatalogReference = {
 /**
  * Why the last certificate attempt for a domain failed.
  */
-export type CertFailureCause = 'dns_lookup' | 'unreachable' | 'upstream_answered' | 'caa_forbids' | 'rate_limited' | 'ca_transient' | 'config' | 'unknown';
+export type CertFailureCause = 'dns_lookup' | 'unreachable' | 'upstream_answered' | 'dns_record_mismatch' | 'caa_forbids' | 'rate_limited' | 'ca_transient' | 'config' | 'unknown';
 
 /**
  * Current on-demand cert status for a single hostname (ADR-018 §5). Backs
@@ -8044,6 +8087,16 @@ export type CreateConnectorRequest = {
      */
     provider: string;
     /**
+     * Answers to the provider's credential fields (kind `secret`, such as an
+     * OAuth client secret), by field key. Same as giving them in `values`,
+     * but published as credentials, so the AI assistant passes a
+     * `secret_ref:` handle here and never sees the value. The assistant may
+     * not put a credential field in `values`. A key cannot be in both.
+     */
+    secrets?: {
+        [key: string]: SecretString;
+    };
+    /**
      * Answers to the provider's setup fields, by field key. DNS provider
      * fields take the provider's id; every other field takes a string.
      */
@@ -8091,7 +8144,7 @@ export type CreateDashboardRequest = {
 };
 
 export type CreateDeliveryProfileRequest = {
-    bunny_api_key?: string | null;
+    bunny_api_key?: SecretString | null;
     bunny_pull_zone_id?: number | null;
     name: string;
     provider_kind: DeliveryProviderKind;
@@ -9246,6 +9299,13 @@ export type CreateSandboxBody = {
      */
     cpu_limit?: number | null;
     /**
+     * Id the client gives this create, so it can read the create's steps
+     * from `GET /v1/sandboxes/creations/{creation_id}` while it waits for
+     * this request: 8 to 64 letters, digits, `-` or `_`, new for every
+     * create (a UUID works). Optional.
+     */
+    creation_id?: string | null;
+    /**
      * Root disk size in MB, `[1, 65536]` (Firecracker only; Docker ignores
      * it). Omit for the platform default (1 GiB).
      */
@@ -9547,6 +9607,41 @@ export type CreatedShieldTokenResponse = ShieldTokenResponse & {
      */
     secret: string;
 };
+
+export type CreationStatus = 'running' | 'succeeded' | 'failed';
+
+/**
+ * One step and where it stands.
+ */
+export type CreationStep = {
+    /**
+     * Image download progress (`pull_image` only), when the registry
+     * reports sizes.
+     */
+    bytes_done?: number | null;
+    bytes_total?: number | null;
+    /**
+     * What the step did or is doing (`already present`, `on node
+     * worker-1`, `downloading`), or why it was skipped.
+     */
+    detail?: string | null;
+    /**
+     * Why the step failed, with the node, image or sandbox involved.
+     */
+    error?: string | null;
+    finished_at?: string | null;
+    kind: CreationStepKind;
+    started_at?: string | null;
+    status: CreationStepStatus;
+    title: string;
+};
+
+/**
+ * One step of a sandbox create, in the order the create runs them.
+ */
+export type CreationStepKind = 'check_request' | 'select_node' | 'record_sandbox' | 'pull_image' | 'create_container' | 'start_container' | 'wait_ready' | 'seed_source' | 'ready';
+
+export type CreationStepStatus = 'pending' | 'running' | 'done' | 'failed' | 'skipped';
 
 /**
  * How a stored credential is presented to the destination, plus any fixed
@@ -17779,6 +17874,49 @@ export type HistogramSummary = {
 };
 
 /**
+ * One host's sandbox image preparation, as the API reports it.
+ */
+export type HostImagePreparation = {
+    /**
+     * The host can take new sandboxes, so it is worth preparing.
+     */
+    eligible: boolean;
+    /**
+     * Why the host is not eligible, when it is not.
+     */
+    ineligible_reason?: string | null;
+    is_control_plane: boolean;
+    /**
+     * Temps keeps this host's default sandbox image pulled, re-pulling it
+     * when the default changes. Turned on by "prepare".
+     */
+    keep_prepared: boolean;
+    /**
+     * Why the last preparation failed.
+     */
+    last_error?: string | null;
+    last_error_at?: string | null;
+    /**
+     * Node id; `0` for the control plane.
+     */
+    node_id: number;
+    node_name: string;
+    /**
+     * The image Temps last prepared on this host.
+     */
+    prepared_image?: string | null;
+    /**
+     * Previously prepared images still to remove (a container used them).
+     */
+    stale_images: Array<string>;
+    status?: ImagePrepareStatus | null;
+    /**
+     * Why the status could not be read.
+     */
+    status_error?: string | null;
+};
+
+/**
  * Whether Temps runs a project's app.
  *
  * `External` projects run elsewhere (Vercel, Netlify, a VPS) and only send
@@ -18028,6 +18166,55 @@ export type ImageInfo = {
      * Working directory (WORKDIR from Dockerfile)
      */
     working_dir?: string | null;
+};
+
+/**
+ * Where one host stands with one sandbox image.
+ */
+export type ImagePrepareState = 'not_pulled' | 'pulling' | 'ready' | 'failed' | 'unsupported';
+
+/**
+ * One host's status for one sandbox image.
+ */
+export type ImagePrepareStatus = {
+    /**
+     * The image was already on the host when the attempt started: nothing
+     * was downloaded.
+     */
+    already_present?: boolean;
+    /**
+     * Bytes downloaded so far, summed over the layers the registry
+     * reported. `None` before the registry reports any size.
+     */
+    bytes_done?: number | null;
+    /**
+     * Total bytes to download, summed over the layers reported so far (it
+     * grows while the registry announces layers).
+     */
+    bytes_total?: number | null;
+    /**
+     * What a running pull is doing right now (`downloading`, `extracting`,
+     * `building locally`).
+     */
+    detail?: string | null;
+    /**
+     * Why the last attempt failed, or why the host cannot prepare images.
+     */
+    error?: string | null;
+    /**
+     * When the last attempt finished.
+     */
+    finished_at?: string | null;
+    /**
+     * The exact reference a create on this host would use (tag or
+     * `@sha256:` digest), so the pre-pull and the create cannot disagree.
+     */
+    image: string;
+    /**
+     * When the running or last attempt started.
+     */
+    started_at?: string | null;
+    state: ImagePrepareState;
 };
 
 /**
@@ -24917,6 +25104,29 @@ export type PostgresWalHealth = {
 };
 
 /**
+ * Start preparing sandbox hosts.
+ */
+export type PrepareSandboxImagesBody = {
+    /**
+     * The host to prepare: a node id, or `0` for the control plane.
+     * Omitted or `null`: every host eligible for sandbox placement.
+     */
+    node_id?: number | null;
+};
+
+/**
+ * The hosts a "prepare" was accepted for.
+ */
+export type PrepareSandboxImagesResponse = {
+    /**
+     * The hosts now kept prepared and asked to pull (node id, `0` for the
+     * control plane). Their progress is read from
+     * `GET /v1/sandboxes/image-preparation`.
+     */
+    node_ids: Array<number>;
+};
+
+/**
  * Union type for preset configurations
  * Use the appropriate configuration type based on your preset
  */
@@ -29592,6 +29802,31 @@ export type SandboxConnections = {
 };
 
 /**
+ * A sandbox create and its steps.
+ */
+export type SandboxCreation = {
+    /**
+     * The id the client gave the create (or one the server generated).
+     */
+    creation_id: string;
+    /**
+     * Why the create failed.
+     */
+    error?: string | null;
+    finished_at?: string | null;
+    /**
+     * The sandbox's public id, once its row exists.
+     */
+    sandbox_id?: string | null;
+    started_at: string;
+    status: CreationStatus;
+    /**
+     * Every step, in order.
+     */
+    steps: Array<CreationStep>;
+};
+
+/**
  * One directory of the chat's sandbox: folders first, then files, by name.
  */
 export type SandboxDirectory = {
@@ -29722,6 +29957,21 @@ export type SandboxFileView = {
      */
     size: number;
     truncated: boolean;
+};
+
+/**
+ * Every host that can run sandboxes and its image preparation.
+ */
+export type SandboxImagePreparationResponse = {
+    /**
+     * Every eligible host has its default image: the next create on any of
+     * them starts without a download.
+     */
+    all_ready: boolean;
+    /**
+     * Control plane first, then workers by name.
+     */
+    hosts: Array<HostImagePreparation>;
 };
 
 /**
@@ -36792,6 +37042,17 @@ export type UpdateGroupEnvVarRequest = {
 };
 
 /**
+ * Turn keeping one host prepared on or off.
+ */
+export type UpdateHostImagePreparationBody = {
+    /**
+     * Keep this host's default sandbox image pulled, re-pulling it when an
+     * upgrade changes the default. `false` stops that; it removes nothing.
+     */
+    keep_prepared: boolean;
+};
+
+/**
  * Change the public heading of an incident.
  */
 export type UpdateIncidentRequest = {
@@ -38561,13 +38822,19 @@ export type WayInChoice = {
 
 /**
  * Configuration for a generic webhook notification provider
+ *
+ * Request-side config. Not `Serialize`: every header value is a
+ * `SecretString` (reads mask them all, because they are where a webhook's
+ * credential goes), so use [`WebhookConfig::into_stored_value`].
  */
 export type WebhookConfig = {
     /**
-     * Custom headers to include in the request (e.g., for authentication tokens)
+     * Custom headers to include in the request (e.g., for authentication
+     * tokens). Every value is treated as a credential: write-only, masked on
+     * read, and taken by the AI assistant through a secret slot.
      */
     headers?: {
-        [key: string]: string;
+        [key: string]: SecretString;
     };
     /**
      * HTTP method to use (POST, PUT, PATCH). Defaults to POST.
@@ -48375,6 +48642,37 @@ export type CreateApiKeyResponses = {
 };
 
 export type CreateApiKeyResponse2 = CreateApiKeyResponses[keyof CreateApiKeyResponses];
+
+export type GetAiHarnessStatusData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/api-keys/ai-harness/status';
+};
+
+export type GetAiHarnessStatusErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetAiHarnessStatusResponses = {
+    /**
+     * AI harness connection status for the caller
+     */
+    200: AiHarnessStatusResponse;
+};
+
+export type GetAiHarnessStatusResponse = GetAiHarnessStatusResponses[keyof GetAiHarnessStatusResponses];
 
 export type GetApiKeyPermissionsData = {
     body?: never;
@@ -96698,6 +96996,159 @@ export type CreateSandboxResponses = {
 
 export type CreateSandboxResponse = CreateSandboxResponses[keyof CreateSandboxResponses];
 
+export type GetSandboxCreationData = {
+    body?: never;
+    path: {
+        /**
+         * The `creation_id` sent with the create
+         */
+        creation_id: string;
+    };
+    query?: never;
+    url: '/v1/sandboxes/creations/{creation_id}';
+};
+
+export type GetSandboxCreationErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * No create with this id is tracked for the caller (unknown, or finished more than 15 minutes ago)
+     */
+    404: unknown;
+};
+
+export type GetSandboxCreationResponses = {
+    /**
+     * The create and its ordered steps
+     */
+    200: SandboxCreation;
+};
+
+export type GetSandboxCreationResponse = GetSandboxCreationResponses[keyof GetSandboxCreationResponses];
+
+export type GetSandboxImagePreparationData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/v1/sandboxes/image-preparation';
+};
+
+export type GetSandboxImagePreparationErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * The hosts could not be listed
+     */
+    500: unknown;
+};
+
+export type GetSandboxImagePreparationResponses = {
+    /**
+     * Image preparation of every sandbox host
+     */
+    200: SandboxImagePreparationResponse;
+};
+
+export type GetSandboxImagePreparationResponse = GetSandboxImagePreparationResponses[keyof GetSandboxImagePreparationResponses];
+
+export type PrepareSandboxImagesData = {
+    /**
+     * Optional; an empty body prepares every eligible host
+     */
+    body?: PrepareSandboxImagesBody | null;
+    path?: never;
+    query?: never;
+    url: '/v1/sandboxes/image-preparation';
+};
+
+export type PrepareSandboxImagesErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Administrator role required
+     */
+    403: unknown;
+    /**
+     * No such host
+     */
+    404: unknown;
+    /**
+     * A body was sent without a JSON Content-Type
+     */
+    415: unknown;
+    /**
+     * The body is not valid, or the host (or every host) cannot take sandboxes
+     */
+    422: unknown;
+    /**
+     * The preparation could not be recorded
+     */
+    500: unknown;
+};
+
+export type PrepareSandboxImagesResponses = {
+    /**
+     * Preparation started on these hosts
+     */
+    202: PrepareSandboxImagesResponse;
+};
+
+export type PrepareSandboxImagesResponse2 = PrepareSandboxImagesResponses[keyof PrepareSandboxImagesResponses];
+
+export type UpdateHostImagePreparationData = {
+    body: UpdateHostImagePreparationBody;
+    path: {
+        /**
+         * Node id, or `0` for the control plane
+         */
+        node_id: number;
+    };
+    query?: never;
+    url: '/v1/sandboxes/image-preparation/nodes/{node_id}';
+};
+
+export type UpdateHostImagePreparationErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Administrator role required
+     */
+    403: unknown;
+    /**
+     * No such host
+     */
+    404: unknown;
+    /**
+     * The change could not be saved
+     */
+    500: unknown;
+};
+
+export type UpdateHostImagePreparationResponses = {
+    /**
+     * Updated image preparation of every host
+     */
+    200: SandboxImagePreparationResponse;
+};
+
+export type UpdateHostImagePreparationResponse = UpdateHostImagePreparationResponses[keyof UpdateHostImagePreparationResponses];
+
 export type GetSandboxPlacementData = {
     body?: never;
     path?: never;
@@ -96982,6 +97433,42 @@ export type CmdLogsResponses = {
      */
     200: unknown;
 };
+
+export type GetSandboxCreationBySandboxData = {
+    body?: never;
+    path: {
+        /**
+         * Sandbox id
+         */
+        id: string;
+    };
+    query?: never;
+    url: '/v1/sandboxes/{id}/creation';
+};
+
+export type GetSandboxCreationBySandboxErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * No such sandbox for the caller, or its create is no longer tracked
+     */
+    404: unknown;
+};
+
+export type GetSandboxCreationBySandboxResponses = {
+    /**
+     * The create and its ordered steps
+     */
+    200: SandboxCreation;
+};
+
+export type GetSandboxCreationBySandboxResponse = GetSandboxCreationBySandboxResponses[keyof GetSandboxCreationBySandboxResponses];
 
 export type DestroySandboxData = {
     body?: never;

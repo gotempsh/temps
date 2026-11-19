@@ -4,6 +4,7 @@
 //! Step 1: check what the plugins need before any of them is constructed.
 
 use super::*;
+use crate::commands::serve::startup_failure::error_chain_text;
 
 /// Validate the console's hard dependencies before the plugin manager exists:
 /// the Docker daemon (fatal only in the `full` profile), the GeoLite2
@@ -41,11 +42,13 @@ pub(super) async fn validate_deps(
         // reporting `docker: true` on that basis would be a lie the console
         // shows to the operator.
         let client = bollard::Docker::connect_with_defaults()
-            .map_err(|e| docker_unavailable_error(&e.to_string()))?;
+            .map_err(|e| docker_unavailable_error(&error_chain_text(&e)))?;
 
         match tokio::time::timeout(DOCKER_PROBE_TIMEOUT, client.ping()).await {
             Ok(Ok(_)) => debug!("✓ Docker daemon is accessible"),
-            Ok(Err(e)) => return Err(docker_unavailable_error(&e.to_string())),
+            // The whole chain: bollard's own message hides whether the socket
+            // was missing or refused this user (`Permission denied`).
+            Ok(Err(e)) => return Err(docker_unavailable_error(&error_chain_text(&e))),
             Err(_) => {
                 return Err(docker_unavailable_error(&format!(
                     "the daemon did not answer a ping within {}s",

@@ -383,6 +383,30 @@ impl From<DomainServiceError> for Problem {
                     "On-demand TLS issuance for {hostname} failed ({category}): {error_chain}"
                 ))
                 .build(),
+            error @ DomainServiceError::Dns01NoProvider { .. } => {
+                ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                    .title("No DNS Provider Manages This Domain")
+                    .detail(error.to_string())
+                    .build()
+            }
+            error @ DomainServiceError::Dns01Provider { .. } => {
+                ErrorBuilder::new(StatusCode::BAD_GATEWAY)
+                    .title("DNS Provider Could Not Publish the Challenge")
+                    .detail(error.to_string())
+                    .build()
+            }
+            error @ DomainServiceError::Dns01NotVisible { .. } => {
+                ErrorBuilder::new(StatusCode::GATEWAY_TIMEOUT)
+                    .title("DNS Challenge Not Visible Yet")
+                    .detail(error.to_string())
+                    .build()
+            }
+            error @ DomainServiceError::Dns01Receipt { .. } => {
+                ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .title("DNS Challenge Receipt Not Saved")
+                    .detail(error.to_string())
+                    .build()
+            }
             DomainServiceError::CertificateAlreadyActive(hostname) => {
                 // This is a no-op success path, not an error that should reach
                 // HTTP handlers. Map to 200 OK conceptually, but if it somehow
@@ -2966,6 +2990,99 @@ where
     Ok(DnsCleanupResolution::Pending {
         errors: outcome.errors,
     })
+}
+
+/// What publishing an order's DNS-01 challenge through a provider did.
+#[derive(Debug)]
+pub(crate) struct Dns01Published {
+    pub(crate) created: u32,
+    pub(crate) total: u32,
+    /// `name: why` for each record the provider did not create.
+    pub(crate) failures: Vec<String>,
+}
+
+/// Publish `order`'s DNS-01 challenge `records` through `provider`, the same
+/// way the `setup-dns` endpoint does: the order first records which records
+/// it is about to create, then exactly the ones the provider created, so
+/// [`clean_up_dns01_challenge`] later removes those and nothing else. For
+/// callers outside that endpoint (*Make it reachable*).
+pub(crate) async fn publish_dns01_challenge(
+    domain: &str,
+    provider: &dyn temps_dns::providers::DnsProvider,
+    repository: &dyn crate::CertificateRepository,
+    order: crate::tls::models::AcmeOrder,
+    provider_id: i32,
+    zone: &str,
+    records: &[(String, String)],
+) -> Result<Dns01Published, DomainServiceError> {
+    let outcome = execute_dns_setup(provider, repository, order, provider_id, zone, records)
+        .await
+        .map_err(|e| DomainServiceError::Dns01Receipt {
+            domain: domain.to_string(),
+            records_may_have_changed: e.records_may_have_changed(),
+            detail: e.to_string(),
+        })?;
+    Ok(Dns01Published {
+        created: outcome.records_created,
+        total: records.len() as u32,
+        failures: outcome
+            .results
+            .iter()
+            .filter(|r| !r.success)
+            .map(|r| format!("{}: {}", r.name, r.message))
+            .collect(),
+    })
+}
+
+/// How removing a published DNS-01 challenge went.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Dns01Cleanup {
+    /// The order records no published records.
+    Nothing,
+    Removed(u32),
+    /// Some records remain; the order keeps them for a retry.
+    Incomplete(Vec<String>),
+    /// The provider cannot remove them safely; they need removing by hand.
+    Manual(String),
+}
+
+/// Remove the DNS-01 challenge records `order` says were published through
+/// `provider` (provider `provider_id`), clearing its receipt once all are
+/// gone.
+pub(crate) async fn clean_up_dns01_challenge(
+    domain: &str,
+    provider: &dyn temps_dns::providers::DnsProvider,
+    provider_id: i32,
+    repository: &dyn crate::CertificateRepository,
+    order: crate::tls::models::AcmeOrder,
+) -> Result<Dns01Cleanup, DomainServiceError> {
+    let receipt_error = |detail: String| DomainServiceError::Dns01Receipt {
+        domain: domain.to_string(),
+        records_may_have_changed: true,
+        detail,
+    };
+    let Some(plan) = load_dns_cleanup_plan(&order).map_err(|e| receipt_error(e.to_string()))?
+    else {
+        return Ok(Dns01Cleanup::Nothing);
+    };
+    if plan.provider_id != provider_id {
+        return Ok(Dns01Cleanup::Manual(format!(
+            "the records were published through DNS provider {}, not {provider_id}",
+            plan.provider_id
+        )));
+    }
+    Ok(
+        match execute_dns_cleanup(provider, repository, order, plan)
+            .await
+            .map_err(|e| receipt_error(e.to_string()))?
+        {
+            DnsCleanupResolution::Complete { deleted } => Dns01Cleanup::Removed(deleted),
+            DnsCleanupResolution::Pending { errors } => {
+                Dns01Cleanup::Incomplete(errors.iter().map(ToString::to_string).collect())
+            }
+            DnsCleanupResolution::Manual { reason } => Dns01Cleanup::Manual(reason.to_string()),
+        },
+    )
 }
 
 /// Remove stale TXT records left over from a previous order/renewal, then create every

@@ -50,6 +50,7 @@ use temps_sandbox_providers::remote::{
     RemoteByteChannelError, RemoteByteChannelQuery, RemoteCreateRequest, RemoteDestroyRequest,
     RemoteEgressPolicyRequest, RemoteErrorBody, RemoteExecFrame, RemoteExecRequest,
     RemoteExecResponse, RemoteFileContents, RemoteHandleRequest, RemoteImageIdentityResponse,
+    RemoteImagePrepareRequest, RemoteImageRemoveRequest, RemoteImageRemoveResponse,
     RemoteKillRequest, RemoteOkResponse, RemoteReadFileRequest, RemoteRecoverHarnessRequest,
     RemoteRecoverRequest, RemoteReleaseOrphanedRequest, RemoteResizeDiskRequest,
     RemoteRuntimeCompatibility, RemoteStatusResponse, RemoteWriteDirectoryRequest,
@@ -1772,6 +1773,100 @@ pub async fn sandbox_image_identity(
         .await
         .map_err(provider_err)?;
     Ok(Json(RemoteImageIdentityResponse { image }))
+}
+
+/// `POST /agent/sandboxes/image-prepare` — start pulling the sandbox image
+/// (the one a create on this node would use, unless the body names one) in
+/// the background, or join the pull already running, and return its status.
+/// A create of that image while it pulls waits on the same pull.
+#[utoipa::path(
+    tag = "Sandboxes",
+    post,
+    path = "/agent/sandboxes/image-prepare",
+    request_body = RemoteImagePrepareRequest,
+    responses(
+        (status = 200, description = "The pull's status", body = temps_sandbox_providers::ImagePrepareStatus),
+        (status = 401, description = "Unauthorized"),
+        (status = 500, description = "The Docker daemon failed", body = RemoteErrorBody),
+        (status = 503, description = "No Docker daemon on this node", body = RemoteErrorBody)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn prepare_sandbox_image(
+    State(state): HostState,
+    Json(req): Json<RemoteImagePrepareRequest>,
+) -> ApiResult<temps_sandbox_providers::ImagePrepareStatus> {
+    let host = host(&state)?;
+    let status = host
+        .provider
+        .prepare_image(req.image.as_deref(), Some(SandboxBackend::Docker))
+        .await
+        .map_err(provider_err)?;
+    Ok(Json(status))
+}
+
+/// `POST /agent/sandboxes/image-prepare-status` — where this node stands with
+/// the sandbox image, without starting anything.
+#[utoipa::path(
+    tag = "Sandboxes",
+    post,
+    path = "/agent/sandboxes/image-prepare-status",
+    request_body = RemoteImagePrepareRequest,
+    responses(
+        (status = 200, description = "The image's status on this node", body = temps_sandbox_providers::ImagePrepareStatus),
+        (status = 401, description = "Unauthorized"),
+        (status = 500, description = "The Docker daemon failed", body = RemoteErrorBody),
+        (status = 503, description = "No Docker daemon on this node", body = RemoteErrorBody)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn sandbox_image_prepare_status(
+    State(state): HostState,
+    Json(req): Json<RemoteImagePrepareRequest>,
+) -> ApiResult<temps_sandbox_providers::ImagePrepareStatus> {
+    let host = host(&state)?;
+    let status = host
+        .provider
+        .image_prepare_status(req.image.as_deref(), Some(SandboxBackend::Docker))
+        .await
+        .map_err(provider_err)?;
+    Ok(Json(status))
+}
+
+/// `POST /agent/sandboxes/image-remove` — remove a sandbox image the control
+/// plane prepared earlier and no longer uses as the default. Never forced:
+/// an image a container still uses is left alone (`in_use`).
+#[utoipa::path(
+    tag = "Sandboxes",
+    post,
+    path = "/agent/sandboxes/image-remove",
+    request_body = RemoteImageRemoveRequest,
+    responses(
+        (status = 200, description = "What the removal did", body = RemoteImageRemoveResponse),
+        (status = 400, description = "Empty image reference", body = RemoteErrorBody),
+        (status = 401, description = "Unauthorized"),
+        (status = 500, description = "The Docker daemon failed", body = RemoteErrorBody),
+        (status = 503, description = "No Docker daemon on this node", body = RemoteErrorBody)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn remove_sandbox_image(
+    State(state): HostState,
+    Json(req): Json<RemoteImageRemoveRequest>,
+) -> ApiResult<RemoteImageRemoveResponse> {
+    let host = host(&state)?;
+    if req.image.trim().is_empty() {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "image-remove needs an image reference".to_string(),
+        ));
+    }
+    let outcome = host
+        .provider
+        .remove_prepared_image(&req.image)
+        .await
+        .map_err(provider_err)?;
+    Ok(Json(RemoteImageRemoveResponse { outcome }))
 }
 
 /// `POST /agent/sandboxes/agent-runtime-check`

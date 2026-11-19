@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use super::audit::{
-    AuditContext, GitFilesCommittedAudit, GitPullRequestOpenedAudit, GitRepositoryCreatedAudit,
+    AuditContext, GitFilesCommittedAudit, GitProviderCredentialAudit, GitPullRequestOpenedAudit,
+    GitRepositoryCreatedAudit,
 };
 use super::compose_preview_problem::ComposePreviewProblemResponse;
 use super::repositories::{
@@ -2807,6 +2808,8 @@ pub struct GitProvidersApiDoc;
 pub async fn create_github_pat_provider(
     State(state): State<Arc<AppState>>,
     RequireAuth(auth): RequireAuth,
+    Extension(metadata): Extension<RequestMetadata>,
+    ai_call: Option<Extension<temps_core::ai_tool_call::AiToolCall>>,
     Json(request): Json<CreateGitHubPATRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_check!(auth, Permission::GitProvidersCreate);
@@ -2819,6 +2822,16 @@ pub async fn create_github_pat_provider(
         .await;
     report_git_provider_result(&state, Some("github"), "pat", &result);
     let provider = result?;
+    record_git_provider_credentials(
+        &state,
+        &auth,
+        &metadata,
+        ai_call.is_some(),
+        "GIT_PROVIDER_CREATED",
+        &provider,
+        vec!["token"],
+    )
+    .await;
 
     Ok((
         StatusCode::CREATED,
@@ -2834,6 +2847,42 @@ pub async fn create_github_pat_provider(
             updated_at: provider.updated_at,
         }),
     ))
+}
+
+/// Audit a git provider created with, or given, a credential. A failed write
+/// to the audit log is logged and the request still succeeds.
+async fn record_git_provider_credentials(
+    state: &AppState,
+    auth: &temps_auth::AuthContext,
+    metadata: &RequestMetadata,
+    via_ai_assistant: bool,
+    action: &'static str,
+    provider: &temps_entities::git_providers::Model,
+    credentials_set: Vec<&'static str>,
+) {
+    let audit = GitProviderCredentialAudit {
+        action,
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        provider_id: provider.id,
+        provider_name: provider.name.clone(),
+        provider_type: provider.provider_type.clone(),
+        auth_method: provider.auth_method.clone(),
+        base_url: super::audit::audited_base_url(provider.base_url.as_deref()),
+        credentials_set,
+        via_ai_assistant,
+    };
+    if let Err(error) = state.audit_service.create_audit_log(&audit).await {
+        tracing::error!(
+            provider_id = provider.id,
+            action,
+            error = %error,
+            "failed to write the git provider credential audit log"
+        );
+    }
 }
 
 /// Create a GitLab PAT provider
@@ -2855,6 +2904,8 @@ pub async fn create_github_pat_provider(
 pub async fn create_gitlab_pat_provider(
     State(state): State<Arc<AppState>>,
     RequireAuth(auth): RequireAuth,
+    Extension(metadata): Extension<RequestMetadata>,
+    ai_call: Option<Extension<temps_core::ai_tool_call::AiToolCall>>,
     Json(request): Json<CreateGitLabPATRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_check!(auth, Permission::GitProvidersCreate);
@@ -2876,6 +2927,16 @@ pub async fn create_gitlab_pat_provider(
         .await;
     report_git_provider_result(&state, Some("gitlab"), "pat", &result);
     let provider = result?;
+    record_git_provider_credentials(
+        &state,
+        &auth,
+        &metadata,
+        ai_call.is_some(),
+        "GIT_PROVIDER_CREATED",
+        &provider,
+        vec!["token"],
+    )
+    .await;
 
     Ok((
         StatusCode::CREATED,
@@ -2966,6 +3027,8 @@ pub async fn create_gitlab_oauth_provider(
 pub async fn create_gitea_pat_provider(
     State(state): State<Arc<AppState>>,
     RequireAuth(auth): RequireAuth,
+    Extension(metadata): Extension<RequestMetadata>,
+    ai_call: Option<Extension<temps_core::ai_tool_call::AiToolCall>>,
     Json(request): Json<CreateGiteaPATRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_check!(auth, Permission::GitProvidersCreate);
@@ -2999,6 +3062,16 @@ pub async fn create_gitea_pat_provider(
         .await;
     report_git_provider_result(&state, Some("gitea"), "pat", &result);
     let provider = result?;
+    record_git_provider_credentials(
+        &state,
+        &auth,
+        &metadata,
+        ai_call.is_some(),
+        "GIT_PROVIDER_CREATED",
+        &provider,
+        vec!["token"],
+    )
+    .await;
 
     info!(
         provider_id = provider.id,
@@ -3043,12 +3116,18 @@ pub async fn create_gitea_pat_provider(
 pub async fn create_bitbucket_provider(
     State(state): State<Arc<AppState>>,
     RequireAuth(auth): RequireAuth,
+    Extension(metadata): Extension<RequestMetadata>,
+    ai_call: Option<Extension<temps_core::ai_tool_call::AiToolCall>>,
     Json(request): Json<CreateBitbucketRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_check!(auth, Permission::GitProvidersCreate);
 
     let user_id = auth.user_id();
 
+    let credentials_set = match &request.auth {
+        BitbucketAuthInput::AccessToken { .. } => vec!["token"],
+        BitbucketAuthInput::AppPassword { .. } => vec!["password"],
+    };
     let auth_method = match request.auth {
         BitbucketAuthInput::AccessToken { token } => AuthMethod::PersonalAccessToken {
             token: token.into_exposed(),
@@ -3065,6 +3144,16 @@ pub async fn create_bitbucket_provider(
         .await;
     report_git_provider_result(&state, Some("bitbucket"), "pat", &result);
     let provider = result?;
+    record_git_provider_credentials(
+        &state,
+        &auth,
+        &metadata,
+        ai_call.is_some(),
+        "GIT_PROVIDER_CREATED",
+        &provider,
+        credentials_set,
+    )
+    .await;
 
     info!(
         provider_id = provider.id,
@@ -3110,6 +3199,8 @@ pub async fn create_bitbucket_provider(
 pub async fn create_generic_provider(
     State(state): State<Arc<AppState>>,
     RequireAuth(auth): RequireAuth,
+    Extension(metadata): Extension<RequestMetadata>,
+    ai_call: Option<Extension<temps_core::ai_tool_call::AiToolCall>>,
     Json(request): Json<CreateGenericRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_check!(auth, Permission::GitProvidersCreate);
@@ -3138,6 +3229,11 @@ pub async fn create_generic_provider(
         _ => "x-access-token".to_string(),
     };
 
+    let credentials_set = if request.token.is_some() {
+        vec!["token"]
+    } else {
+        Vec::new()
+    };
     let result = state
         .git_provider_manager
         .create_generic_provider(
@@ -3151,6 +3247,16 @@ pub async fn create_generic_provider(
         .await;
     report_git_provider_result(&state, Some("generic"), "manual", &result);
     let provider = result?;
+    record_git_provider_credentials(
+        &state,
+        &auth,
+        &metadata,
+        ai_call.is_some(),
+        "GIT_PROVIDER_CREATED",
+        &provider,
+        credentials_set,
+    )
+    .await;
 
     info!(
         provider_id = provider.id,
@@ -3202,10 +3308,22 @@ pub async fn update_git_provider_credentials(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<AppState>>,
     Path(provider_id): Path<i32>,
+    Extension(metadata): Extension<RequestMetadata>,
+    ai_call: Option<Extension<temps_core::ai_tool_call::AiToolCall>>,
     Json(request): Json<UpdateProviderCredentialsRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_check!(auth, Permission::GitProvidersWrite);
 
+    let credentials_set: Vec<&'static str> = [
+        ("client_secret", request.client_secret.is_some()),
+        ("app_secret", request.app_secret.is_some()),
+        ("private_key", request.private_key.is_some()),
+        ("webhook_secret", request.webhook_secret.is_some()),
+        ("token", request.token.is_some()),
+    ]
+    .into_iter()
+    .filter_map(|(name, set)| set.then_some(name))
+    .collect();
     let provider = state
         .git_provider_manager
         .update_provider_credentials(
@@ -3220,6 +3338,16 @@ pub async fn update_git_provider_credentials(
             request.token.map(SecretString::into_exposed),
         )
         .await?;
+    record_git_provider_credentials(
+        &state,
+        &auth,
+        &metadata,
+        ai_call.is_some(),
+        "GIT_PROVIDER_CREDENTIALS_UPDATED",
+        &provider,
+        credentials_set,
+    )
+    .await;
 
     Ok((
         StatusCode::OK,

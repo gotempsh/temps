@@ -79,25 +79,39 @@ Use whichever method matches how you installed Temps.
 ### `temps upgrade` (self-upgrade)
 
 ```bash
-temps upgrade            # newest release on your channel (stable by default)
+temps upgrade            # newest release on the channel you are already on
 sudo temps upgrade       # if the binary lives in a root-owned directory
 ```
 
-It downloads the release for your platform, verifies its SHA-256 checksum, and atomically replaces the binary. It does **not** restart the running server — see [Restart Temps](#restart-temps).
+It downloads the release for your platform, verifies its SHA-256 checksum and its [Sigstore signature](/docs/installation#release-signature-verification) from the Temps release workflow at that tag, and atomically replaces the binary. It does **not** restart the running server — see [Restart Temps](#restart-temps).
 
 ```bash
-temps upgrade --channel beta      # include beta pre-releases
+temps upgrade --channel beta      # switch to (or stay on) beta pre-releases
 temps upgrade --version v1.1.0    # a specific release (also how you go back to an older one)
 temps upgrade --yes               # no confirmation prompt
 temps upgrade --check             # only report whether an update is available
 temps upgrade --path /opt/temps/bin/temps
 ```
 
-`--stable` is a deprecated alias for `--channel stable`, which is already the default.
+Without `--channel`, `temps upgrade` stays on the channel of the binary you
+are running: a `-beta.N` version tracks **beta**, a `-nightly.` version tracks
+**nightly**, and a plain `vX.Y.Z` version tracks **stable**. The upgrade plan
+prints the channel and says when it was inferred. Pass `--channel` to switch;
+nothing else (no environment variable, no setting) changes the channel this
+command uses. `temps doctor` always infers the channel the same way. The
+console's **Update now** does too, unless a channel is set under
+**Settings → Version**, which only the console reads.
+
+If the stable channel has no release yet, `temps upgrade --channel stable` says
+so and suggests `--channel beta`. It never downgrades: when the newest release
+on the chosen channel is older than the running binary it stops and asks you to
+pin `--version` to roll back on purpose.
+
+`--stable` is a deprecated alias for `--channel stable`.
 
 ### From the console
 
-When an update is available, the console shows a banner with an **Update now** action. It downloads the new binary, runs `temps migrate` with it (with the pre-migration backup when the server was started with `--pre-migration-backup` or `TEMPS_PRE_MIGRATION_BACKUP=true`), and restarts. Start the server with `--disable-self-update`, or set `TEMPS_DISABLE_SELF_UPDATE=true`, to forbid this path. Unlike the toggle in **Settings → Platform**, this cannot be undone from the console: it lasts for the lifetime of the process.
+When an update is available, the console shows a banner with an **Update now** action. It downloads the new binary, runs `temps migrate` with it (with the pre-migration backup when the server was started with `--pre-migration-backup` or `TEMPS_PRE_MIGRATION_BACKUP=true`), and restarts. It verifies the release's checksum and Sigstore signature exactly as `temps upgrade` does, with no unsigned opt-out. Start the server with `--disable-self-update`, or set `TEMPS_DISABLE_SELF_UPDATE=true`, to forbid this path. Unlike the toggle in **Settings → Platform**, this cannot be undone from the console: it lasts for the lifetime of the process.
 
 ### Upgrade script (`deploy.sh` installs)
 
@@ -117,9 +131,15 @@ curl -fsSL https://temps.sh/install.sh | bash -s -- v1.1.0          # a specific
 brew update && brew upgrade temps                                   # Homebrew (macOS)
 ```
 
-The install script picks a channel the same way `temps upgrade` does: by
+The install script picks a release the same way `temps upgrade` does: by
 version, not publication date, and only among releases that ship an archive
-for your platform.
+for your platform. Unlike `temps upgrade`, it does not look at an installed
+binary: without `--channel` it installs the newest stable release. It verifies
+the checksum, refuses a release without a signature unless you pass
+`--allow-unsigned`, and checks the signature with `cosign` or an authenticated
+`gh` when either is installed. On a server with neither, it says the origin was
+not verified and prints the commands to check it yourself; see
+[Verify release downloads](/docs/installation#release-signature-verification).
 
 <CodeGroup>
 

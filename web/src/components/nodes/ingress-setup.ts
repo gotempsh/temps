@@ -197,6 +197,39 @@ export function workerEligibility(
   return { selectable: true, hasIngress, defaultOn: !hasIngress }
 }
 
+/**
+ * The control plane in a tunnel's `node_ids` (ADR-107): this server, which
+ * runs the tunnel itself next to its own proxy.
+ */
+export const CONTROL_PLANE_NODE_ID = 0
+export const CONTROL_PLANE_NAME = 'Control plane'
+
+/**
+ * Whether the control plane can take a tunnel, and whether to pick it by
+ * default: always offered, since the server says when it cannot run one,
+ * and picked when no worker is, so a single-server install needs no worker.
+ */
+export function controlPlaneEligibility(
+  tunnels: { provider: string; nodes: { node_id: number }[] }[],
+  workersPickedByDefault: number
+): WorkerEligibility {
+  const hasIngress = tunnels.some(
+    (t) =>
+      t.provider === CLOUDFLARE_TUNNEL_KIND &&
+      t.nodes.some((n) => n.node_id === CONTROL_PLANE_NODE_ID)
+  )
+  return {
+    selectable: true,
+    hasIngress,
+    defaultOn: workersPickedByDefault === 0 && !hasIngress,
+  }
+}
+
+/** A picked node's name, with the control plane named as such. */
+export function pickedNodeName(node: { id: number; name: string }): string {
+  return node.id === CONTROL_PLANE_NODE_ID ? CONTROL_PLANE_NAME : node.name
+}
+
 /** Starts a worker's agent where `temps agent service install` set it up. */
 export const START_AGENT_COMMAND = 'sudo systemctl start temps-agent'
 
@@ -410,6 +443,19 @@ export async function undoSetup(
 
 class StepFailure extends Error {}
 
+/** The first step's label: the workers checked, and the control plane. */
+export function availabilityLabel(
+  nodes: { id: number; name: string }[]
+): string {
+  const workers = nodes
+    .filter((n) => n.id !== CONTROL_PLANE_NODE_ID)
+    .map((n) => n.name)
+  const onControlPlane = workers.length < nodes.length
+  if (!onControlPlane) return `Workers ${workers.join(', ')} online`
+  if (workers.length === 0) return `${CONTROL_PLANE_NAME} ready`
+  return `${CONTROL_PLANE_NAME} ready, workers ${workers.join(', ')} online`
+}
+
 /**
  * The first of `chosen` that cannot run a tunnel now, and why. The page's
  * node list can be minutes old, so the run reads it again before it creates
@@ -421,6 +467,9 @@ export function unavailableWorker(
   nodes: Pick<NodeInfoResponse, 'id' | 'name' | 'role' | 'status'>[]
 ): string | undefined {
   for (const pick of chosen) {
+    // The control plane is not in the node list; creating the tunnel says
+    // when this server cannot run it.
+    if (pick.id === CONTROL_PLANE_NODE_ID) continue
     const node = nodes.find((n) => n.id === pick.id)
     if (!node) {
       return `Worker '${pick.name}' is no longer in this cluster. Untick it under Workers and try again.`
@@ -465,7 +514,7 @@ export async function runTunnelSetup(
     },
     {
       key: 'workers',
-      label: `Workers ${plan.nodes.map((n) => n.name).join(', ')} online`,
+      label: availabilityLabel(plan.nodes),
       status: 'pending',
     },
     { key: 'domain', label: `Domain ${plan.zone}`, status: 'pending' },
@@ -476,7 +525,7 @@ export async function runTunnelSetup(
     },
     ...plan.nodes.map((node) => ({
       key: `node-${node.id}`,
-      label: `Connected on ${node.name}`,
+      label: `Connected on ${pickedNodeName(node)}`,
       status: 'pending' as StepStatus,
     })),
   ]
@@ -628,7 +677,13 @@ export async function runTunnelSetup(
       const replica = connector.nodes.find((n) => n.node_id === node.id)
       const key = `node-${node.id}`
       if (!replica) {
-        set(key, 'running', 'Waiting for the worker to pick it up')
+        set(
+          key,
+          'running',
+          node.id === CONTROL_PLANE_NODE_ID
+            ? 'Waiting for the control plane to start it'
+            : 'Waiting for the worker to pick it up'
+        )
         continue
       }
       const state = replicaState(replica)
@@ -674,7 +729,10 @@ export async function runTunnelSetup(
     const reasons = view.nodes
       .map((n) => n.last_error)
       .filter((r): r is string => !!r)
-    const error = `No worker could run the tunnel${reasons.length ? `: ${reasons.join('; ')}` : '.'}`
+    const where = plan.nodes.some((n) => n.id === CONTROL_PLANE_NODE_ID)
+      ? 'No node'
+      : 'No worker'
+    const error = `${where} could run the tunnel${reasons.length ? `: ${reasons.join('; ')}` : '.'}`
     const undo = await undoSetup(created, api)
     return { kind: 'failed', error, created, undo }
   }

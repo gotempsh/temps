@@ -441,6 +441,28 @@ pub struct RemoteImageIdentityResponse {
     pub image: String,
 }
 
+/// `POST /agent/sandboxes/image-prepare` and `/agent/sandboxes/image-prepare-status`:
+/// the image to pull ahead of a create, or to report on.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct RemoteImagePrepareRequest {
+    /// Exact reference to prepare. `None` = the image a create on this node
+    /// uses when the request names none.
+    #[serde(default)]
+    pub image: Option<String>,
+}
+
+/// `POST /agent/sandboxes/image-remove`: remove an image the control plane
+/// prepared earlier and no longer uses as the default. Never forced.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct RemoteImageRemoveRequest {
+    pub image: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct RemoteImageRemoveResponse {
+    pub outcome: crate::ImageRemoval,
+}
+
 /// [`RuntimeCompatibility`] on the wire.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(tag = "status", rename_all = "snake_case")]
@@ -1326,6 +1348,120 @@ impl RemoteSandboxProvider {
         Ok(())
     }
 
+    /// [`Self::call`] for the image-preparation routes, which agents older
+    /// than this control plane do not have: their bare 404 is `Ok(None)`, so
+    /// the caller can say the node needs an upgrade instead of failing.
+    async fn image_call<B: Serialize + ?Sized, R: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+        operation: &str,
+    ) -> Result<Option<R>, AgentError> {
+        let url = format!("{}{}", self.agent_url, path);
+        let response = self
+            .client
+            .post(&url)
+            .bearer_auth(&self.token)
+            .timeout(SHORT_TIMEOUT)
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| self.transport_unavailable(operation, e))?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !response.status().is_success() {
+            return Err(self.error_response(response, None, operation).await);
+        }
+        let bytes = match read_body_capped(response, SMALL_RESPONSE_CAP).await {
+            Ok(bytes) => bytes,
+            Err(BodyReadError::TooLarge) => {
+                return Err(self.failed(
+                    None,
+                    operation,
+                    format!(
+                        "the node's response exceeded the {} byte limit for {}",
+                        SMALL_RESPONSE_CAP, operation
+                    ),
+                ))
+            }
+            Err(BodyReadError::Transport(e)) => {
+                return Err(self.transport_unavailable(operation, e))
+            }
+        };
+        serde_json::from_slice::<R>(&bytes).map(Some).map_err(|e| {
+            self.failed(
+                None,
+                operation,
+                format!("the node answered with an invalid response: {}", e),
+            )
+        })
+    }
+
+    /// The image a create on this node uses when the request names none:
+    /// the operator's configured image, else the node's own default.
+    fn prepare_target(&self, image: Option<&str>) -> Option<String> {
+        image
+            .filter(|image| !image.is_empty())
+            .map(str::to_string)
+            .or_else(|| self.defaults.image.clone())
+    }
+
+    /// Status for a node whose agent predates image preparation.
+    fn agent_too_old(&self, image: Option<String>) -> crate::ImagePrepareStatus {
+        crate::ImagePrepareStatus::unsupported(
+            image.unwrap_or_default(),
+            format!(
+                "node '{}' runs an agent older than this control plane and cannot pull \
+                 sandbox images ahead of a create; upgrade the node's temps binary",
+                self.node_name
+            ),
+        )
+    }
+
+    /// Ask the node to prepare (`start`) or report on an image, keeping the
+    /// node's answer within what the control plane shows.
+    async fn image_prepare_call(
+        &self,
+        image: Option<&str>,
+        backend: Option<SandboxBackend>,
+        start: bool,
+    ) -> Result<crate::ImagePrepareStatus, AgentError> {
+        let image = self.prepare_target(image);
+        if let Some(backend) = backend.filter(|b| *b != SandboxBackend::Docker) {
+            return Ok(crate::ImagePrepareStatus::unsupported(
+                image.unwrap_or_default(),
+                format!(
+                    "node '{}' runs Docker sandboxes only; the '{backend}' backend has no image to pull",
+                    self.node_name
+                ),
+            ));
+        }
+        let (path, operation) = if start {
+            ("/agent/sandboxes/image-prepare", "image prepare")
+        } else {
+            (
+                "/agent/sandboxes/image-prepare-status",
+                "image prepare status",
+            )
+        };
+        let body = RemoteImagePrepareRequest {
+            image: image.clone(),
+        };
+        match self
+            .image_call::<_, crate::ImagePrepareStatus>(path, &body, operation)
+            .await?
+        {
+            Some(mut status) => {
+                status.image = sanitize_worker_message(&status.image);
+                status.error = status.error.as_deref().map(sanitize_worker_message);
+                status.detail = status.detail.as_deref().map(sanitize_worker_message);
+                Ok(status)
+            }
+            None => Ok(self.agent_too_old(image)),
+        }
+    }
+
     async fn status(&self) -> Result<RemoteStatusResponse, AgentError> {
         self.call(
             "/agent/sandboxes/status",
@@ -2174,6 +2310,35 @@ impl SandboxProvider for RemoteSandboxProvider {
     async fn rebuild_image(&self) -> Result<String, AgentError> {
         Err(self.unsupported("", "Rebuilding the sandbox image"))
     }
+
+    async fn prepare_image(
+        &self,
+        image: Option<&str>,
+        backend: Option<SandboxBackend>,
+    ) -> Result<crate::ImagePrepareStatus, AgentError> {
+        self.image_prepare_call(image, backend, true).await
+    }
+
+    async fn image_prepare_status(
+        &self,
+        image: Option<&str>,
+        backend: Option<SandboxBackend>,
+    ) -> Result<crate::ImagePrepareStatus, AgentError> {
+        self.image_prepare_call(image, backend, false).await
+    }
+
+    async fn remove_prepared_image(&self, image: &str) -> Result<crate::ImageRemoval, AgentError> {
+        let response: Option<RemoteImageRemoveResponse> = self
+            .image_call(
+                "/agent/sandboxes/image-remove",
+                &RemoteImageRemoveRequest {
+                    image: image.to_string(),
+                },
+                "image remove",
+            )
+            .await?;
+        Ok(response.map_or(crate::ImageRemoval::Unsupported, |r| r.outcome))
+    }
 }
 
 #[cfg(test)]
@@ -2427,6 +2592,66 @@ mod tests {
             }
         });
         serve(app).await
+    }
+
+    #[tokio::test]
+    async fn preparing_an_image_sends_the_operator_default_and_relays_the_status() {
+        let (url, seen) = fake_agent(
+            200,
+            Some(serde_json::json!({
+                "image": "img:op",
+                "state": "pulling",
+                "bytes_done": 10,
+                "bytes_total": 100,
+                "detail": "downloading"
+            })),
+        )
+        .await;
+        let provider = provider_at(&url).with_defaults(RemoteSandboxDefaults {
+            image: Some("img:op".into()),
+            ..Default::default()
+        });
+        let status = provider.prepare_image(None, None).await.unwrap();
+        assert_eq!(status.state, crate::ImagePrepareState::Pulling);
+        assert_eq!(status.bytes_done, Some(10));
+        assert_eq!(
+            seen.lock().await.clone().unwrap(),
+            serde_json::json!({ "image": "img:op" }),
+            "the node must prepare exactly the image a create there would use"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_agent_without_image_preparation_is_reported_as_needing_an_upgrade() {
+        // An older agent has no such route: a bare 404.
+        let (url, _) = fake_agent(404, None).await;
+        let provider = provider_at(&url);
+        let status = provider
+            .image_prepare_status(Some("img:1"), None)
+            .await
+            .unwrap();
+        assert_eq!(status.state, crate::ImagePrepareState::Unsupported);
+        let reason = status.error.unwrap_or_default();
+        assert!(
+            reason.contains("worker-2") && reason.contains("upgrade"),
+            "{reason}"
+        );
+        assert_eq!(
+            provider.remove_prepared_image("img:0").await.unwrap(),
+            crate::ImageRemoval::Unsupported
+        );
+    }
+
+    #[tokio::test]
+    async fn a_microvm_backend_is_not_prepared_on_a_worker() {
+        let (url, seen) = fake_agent(500, None).await;
+        let provider = provider_at(&url);
+        let status = provider
+            .prepare_image(None, Some(SandboxBackend::Firecracker))
+            .await
+            .unwrap();
+        assert_eq!(status.state, crate::ImagePrepareState::Unsupported);
+        assert!(seen.lock().await.is_none(), "the node was not called");
     }
 
     #[tokio::test]

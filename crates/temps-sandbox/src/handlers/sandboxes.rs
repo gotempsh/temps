@@ -70,6 +70,12 @@ pub(crate) fn require_sandbox_admin(
     )
 }
 
+/// Gate a read of sandbox state: `sandboxes:read`, or `projects:read` for
+/// tokens minted before the sandbox scopes existed.
+pub(crate) fn require_sandbox_read(auth: &temps_auth::context::AuthContext) -> Result<(), Problem> {
+    sandbox_permission_guard(auth, Permission::SandboxesRead, Permission::ProjectsRead)
+}
+
 pub(crate) fn sandbox_permission_guard(
     auth: &temps_auth::context::AuthContext,
     primary: Permission,
@@ -113,6 +119,15 @@ impl From<SandboxError> for Problem {
                 .with_detail(error.to_string()),
             SandboxError::JobNotFound { .. } => problemdetails::new(StatusCode::NOT_FOUND)
                 .with_title("Job Not Found")
+                .with_detail(error.to_string()),
+            SandboxError::CreationNotFound { .. } => problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("Sandbox Create Not Found")
+                .with_detail(error.to_string()),
+            SandboxError::CreationIdInvalid { .. } => problemdetails::new(StatusCode::BAD_REQUEST)
+                .with_title("Invalid Creation Id")
+                .with_detail(error.to_string()),
+            SandboxError::CreationIdInUse { .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Creation Id In Use")
                 .with_detail(error.to_string()),
             SandboxError::CreateFailed { .. } => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
@@ -558,6 +573,13 @@ pub struct ResourcesBody {
 
 #[derive(Debug, Deserialize, ToSchema, Default)]
 pub struct CreateSandboxBody {
+    /// Id the client gives this create, so it can read the create's steps
+    /// from `GET /v1/sandboxes/creations/{creation_id}` while it waits for
+    /// this request: 8 to 64 letters, digits, `-` or `_`, new for every
+    /// create (a UUID works). Optional.
+    #[serde(default)]
+    #[schema(example = "6f1c2a9e-3b7d-4e0a-9c55-0d2f8a1b7e43")]
+    pub creation_id: Option<String>,
     /// Permit installing/running Docker with normal guest-root privileges.
     /// Requires backend="microsandbox". Does not install Docker or expose the host socket.
     #[serde(default)]
@@ -722,6 +744,7 @@ impl From<CreateSandboxBody> for CreateSandboxRequest {
             host_work_dir_override: None,
             node: b.node,
             egress_policy: b.egress_policy,
+            creation_id: b.creation_id,
         }
     }
 }
@@ -3185,6 +3208,24 @@ pub fn routes() -> Router<Arc<SandboxAppState>> {
             post(super::placement::evict_node_sandboxes),
         )
         .route("/v1/sandboxes/rootfs/gc", post(rootfs_gc))
+        // Host image preparation and create progress — static segments.
+        .route(
+            "/v1/sandboxes/image-preparation",
+            get(super::image_preparation::get_sandbox_image_preparation)
+                .post(super::image_preparation::prepare_sandbox_images),
+        )
+        .route(
+            "/v1/sandboxes/image-preparation/nodes/{node_id}",
+            put(super::image_preparation::update_host_image_preparation),
+        )
+        .route(
+            "/v1/sandboxes/creations/{creation_id}",
+            get(super::creation::get_sandbox_creation),
+        )
+        .route(
+            "/v1/sandboxes/{id}/creation",
+            get(super::creation::get_sandbox_creation_by_sandbox),
+        )
         .route("/v1/sandboxes/{id}", get(get_sandbox))
         .route(
             "/v1/sandboxes/{id}/terminal",
@@ -3773,12 +3814,15 @@ mod tests {
         let service = Arc::new(
             crate::services::sandbox_service::tests::preview_test_service_with_db(Arc::new(db)),
         );
+        let image_preparation =
+            crate::services::sandbox_service::tests::image_preparation_for(&service);
         let state = Arc::new(SandboxAppState {
             sandbox_service: service,
             snapshot_service: None,
             project_access_checker: None,
             audit_service: None,
             sensitive_action_authorizer: Arc::new(AllowAll),
+            image_preparation,
         });
         crate::handlers::configure_routes()
             .with_state(state)

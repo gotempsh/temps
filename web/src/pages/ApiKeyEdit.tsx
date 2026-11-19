@@ -38,7 +38,7 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { isVerifiedNotFound } from '@/lib/read-failure'
-import { listApiKeysQueryKey } from '@/api/client/@tanstack/react-query.gen'
+import { invalidateApiKeyQueries } from '@/lib/api-key-queries'
 import {
   earliestExpiryDate,
   expiryDateInput,
@@ -90,7 +90,7 @@ export default function ApiKeyEdit() {
       errorTitle: 'Failed to update API key',
     },
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: listApiKeysQueryKey() })
+      invalidateApiKeyQueries(queryClient)
       queryClient.invalidateQueries({
         queryKey: getApiKeyQueryKey({ path: { id: apiKeyId } }),
       })

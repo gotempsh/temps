@@ -14,7 +14,8 @@
 //! 5. [`bootstrap::bootstrap_after_init`]: telemetry, initial admin, SSO and
 //!    Cloud enrollment.
 //! 6. [`background::start_background_services`] and
-//!    [`nodes::start_node_control`]: background loops and node routes.
+//!    [`nodes::start_node_control`]: background loops and node routes; the
+//!    control plane's own tunnel connectors are attached here.
 //! 7. [`router::build_router`]: the routers each listener serves.
 //! 8. [`serve::serve`]: bind the listeners and serve until shutdown.
 
@@ -74,6 +75,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         external_plugin_registry,
         profile,
         startup_state,
+        control_plane_tunnels,
     } = params;
 
     // Count panics for the anonymous `error_summary` telemetry event. Only
@@ -162,6 +164,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         &traefik_discovery,
     )
     .await;
+    attach_control_plane_tunnels(service_context, control_plane_tunnels);
     let node_routes = start_node_control(service_context, &db);
 
     let routers = build_router(
@@ -195,4 +198,21 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         },
     )
     .await
+}
+
+/// Let the console's ingress service place connectors on node 0 and wake
+/// the loop `temps serve` runs them in (ADR-107 D2). Without a handle
+/// (`--role console`) it keeps refusing node 0 with the reason.
+fn attach_control_plane_tunnels(
+    service_context: &temps_core::plugin::ServiceRegistrationContext,
+    handle: Option<temps_ingress::control_plane::ControlPlaneHandle>,
+) {
+    let Some(handle) = handle else {
+        debug!("the proxy runs in another process; the control plane runs no tunnel connectors");
+        return;
+    };
+    match service_context.get_service::<temps_ingress::IngressConnectorService>() {
+        Some(service) => service.attach_control_plane(handle),
+        None => debug!("ingress connectors are not registered; nothing to attach"),
+    }
 }

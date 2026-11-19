@@ -27,6 +27,7 @@ thiserror = { workspace = true }
 # Crate-specific dependencies
 if-addrs = { workspace = true }
 parking_lot = { workspace = true }
+async-trait = { workspace = true }
 hickory-resolver = { workspace = true }
 
 # Plugin system dependencies

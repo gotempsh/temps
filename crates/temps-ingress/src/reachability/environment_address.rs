@@ -26,7 +26,10 @@ use temps_core::environment_address::{
 use temps_core::notifications::{
     NotificationData, NotificationPriority, NotificationService, NotificationType,
 };
-use temps_entities::{deployment_containers, deployments, ingress_connectors, node_public_ingress};
+use temps_entities::{
+    deployment_containers, deployments, ingress_connector_nodes, ingress_connectors,
+    node_public_ingress,
+};
 use tracing::{info, warn};
 use utoipa::ToSchema;
 
@@ -218,15 +221,28 @@ impl EnvironmentAddressService {
         let warning = if no_address.is_some() && gathered.deployed {
             let preview = self.preview_domain_status().await?.status;
             let db = reach.deps.db.as_ref();
-            // A tunnel only carries what workers serve (ADR 058), so it is
-            // offered only for an environment running on workers.
-            let connectors = if gathered.on_workers {
-                ingress_connectors::Entity::find()
-                    .filter(ingress_connectors::Column::Status.eq(CONNECTOR_READY))
-                    .all(db)
-                    .await?
+            // A tunnel carries what every one of its replicas serves
+            // (ADR-107 D4): any tunnel for an environment on workers, only
+            // one running on the control plane alone for one that is not.
+            let ready = ingress_connectors::Entity::find()
+                .filter(ingress_connectors::Column::Status.eq(CONNECTOR_READY))
+                .all(db)
+                .await?;
+            let connectors = if gathered.on_workers || ready.is_empty() {
+                ready
             } else {
-                Vec::new()
+                let placements = ingress_connector_nodes::Entity::find()
+                    .filter(
+                        ingress_connector_nodes::Column::ConnectorId
+                            .is_in(ready.iter().map(|c| c.id)),
+                    )
+                    .all(db)
+                    .await?;
+                let carriers = control_plane_only(&placements);
+                ready
+                    .into_iter()
+                    .filter(|c| carriers.contains(&c.id))
+                    .collect()
             };
             // The host a tunnel's environment hosts would give it (D3). A
             // tunnel that already has them on is preferred, and an environment
@@ -439,10 +455,59 @@ impl EnvironmentAddresses for EnvironmentAddressService {
     }
 }
 
+/// Connectors that run on the control plane and on no worker: the only
+/// ones that carry an environment the control plane serves alone
+/// (ADR-107 D4).
+fn control_plane_only(
+    placements: &[ingress_connector_nodes::Model],
+) -> std::collections::HashSet<i32> {
+    let mut on_workers = std::collections::HashSet::new();
+    let mut on_control_plane = std::collections::HashSet::new();
+    for row in placements {
+        if row.node_id == temps_core::CONTROL_PLANE_NODE_ID {
+            on_control_plane.insert(row.connector_id);
+        } else {
+            on_workers.insert(row.connector_id);
+        }
+    }
+    on_control_plane
+        .into_iter()
+        .filter(|id| !on_workers.contains(id))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use temps_core::environment_address::{ReachabilityFix, ReachabilityFixKind};
+
+    fn placement(connector_id: i32, node_id: i32) -> ingress_connector_nodes::Model {
+        ingress_connector_nodes::Model {
+            id: connector_id * 100 + node_id,
+            connector_id,
+            node_id,
+            driver: None,
+            state: "ready".into(),
+            ready_connections: None,
+            connector_ref: None,
+            last_error: None,
+            reported_at: None,
+            created_at: Utc::now(),
+        }
+    }
+
+    /// ADR-107 D4: an environment the control plane serves alone is offered
+    /// only a tunnel no worker runs a replica of.
+    #[test]
+    fn only_tunnels_on_the_control_plane_alone_carry_a_control_plane_environment() {
+        let carriers = control_plane_only(&[
+            placement(1, temps_core::CONTROL_PLANE_NODE_ID),
+            placement(2, temps_core::CONTROL_PLANE_NODE_ID),
+            placement(2, 7),
+            placement(3, 7),
+        ]);
+        assert_eq!(carriers, std::collections::HashSet::from([1]));
+    }
 
     #[test]
     fn the_episode_key_is_per_environment() {

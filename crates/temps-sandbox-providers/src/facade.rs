@@ -784,6 +784,26 @@ impl SandboxProvider for DriverSandboxProvider {
         self.product.rebuild_image().await
     }
 
+    async fn prepare_image(
+        &self,
+        image: Option<&str>,
+        backend: Option<SandboxBackend>,
+    ) -> Result<crate::ImagePrepareStatus, AgentError> {
+        self.product.prepare_image(image, backend).await
+    }
+
+    async fn image_prepare_status(
+        &self,
+        image: Option<&str>,
+        backend: Option<SandboxBackend>,
+    ) -> Result<crate::ImagePrepareStatus, AgentError> {
+        self.product.image_prepare_status(image, backend).await
+    }
+
+    async fn remove_prepared_image(&self, image: &str) -> Result<crate::ImageRemoval, AgentError> {
+        self.product.remove_prepared_image(image).await
+    }
+
     async fn rootfs_report(&self) -> Result<RootfsReport, AgentError> {
         self.product.rootfs_report().await
     }

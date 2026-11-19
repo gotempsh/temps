@@ -75,10 +75,13 @@ const HELPER_MEMORY_BYTES: i64 = 1024 * 1024 * 1024;
 const HELPER_PIDS_LIMIT: i64 = 64;
 
 /// The dump helper's host settings: on the service network, bounded in
-/// memory and processes, without new privileges.
-fn helper_host_config() -> HostConfig {
+/// memory and processes, without new privileges. `volumes_from` mounts the
+/// volumes of that container, for a helper that reads a file its service
+/// wrote rather than a stream.
+pub(crate) fn helper_host_config(volumes_from: Option<&str>) -> HostConfig {
     HostConfig {
         network_mode: Some(temps_core::NETWORK_NAME.to_string()),
+        volumes_from: volumes_from.map(|container| vec![container.to_string()]),
         memory: Some(HELPER_MEMORY_BYTES),
         memory_swap: Some(HELPER_MEMORY_BYTES),
         pids_limit: Some(HELPER_PIDS_LIMIT),
@@ -785,6 +788,8 @@ pub(crate) async fn dump_to_s3(
             image,
             script: plan.script,
             env: plan.env,
+            volumes_from: None,
+            name: None,
             sensitive,
         },
         destination,
@@ -805,6 +810,11 @@ pub(crate) struct StreamedHelper<'a> {
     pub(crate) script: String,
     /// The helper's environment, where credentials travel.
     pub(crate) env: Vec<String>,
+    /// Whether the helper mounts the service container's volumes.
+    pub(crate) volumes_from: Option<String>,
+    /// The helper's container name, when the caller needs to know it;
+    /// otherwise one is generated.
+    pub(crate) name: Option<String>,
     /// What to redact out of the helper's stderr.
     pub(crate) sensitive: SensitiveValues<'a>,
 }
@@ -826,6 +836,8 @@ pub(crate) async fn stream_helper_to_s3(
         image,
         script,
         env,
+        volumes_from,
+        name,
         sensitive,
     } = helper;
     let container = container.as_str();
@@ -839,11 +851,13 @@ pub(crate) async fn stream_helper_to_s3(
             source: Box::new(source),
         }
     };
-    let helper_name = format!(
-        "temps-worker-backup-{}-{:08x}",
-        container.trim_start_matches('/'),
-        rand::random::<u32>()
-    );
+    let helper_name = name.unwrap_or_else(|| {
+        format!(
+            "temps-worker-backup-{}-{:08x}",
+            container.trim_start_matches('/'),
+            rand::random::<u32>()
+        )
+    });
     let created = docker
         .create_container(
             Some(
@@ -867,7 +881,7 @@ pub(crate) async fn stream_helper_to_s3(
                 attach_stdout: Some(true),
                 attach_stderr: Some(true),
                 tty: Some(false),
-                host_config: Some(helper_host_config()),
+                host_config: Some(helper_host_config(volumes_from.as_deref())),
                 ..Default::default()
             },
         )
@@ -1234,7 +1248,7 @@ mod tests {
     /// node running out of memory or processes.
     #[test]
     fn the_dump_helper_is_bounded_in_memory_and_processes() {
-        let host = helper_host_config();
+        let host = helper_host_config(None);
         assert_eq!(host.memory, Some(HELPER_MEMORY_BYTES));
         assert_eq!(
             host.memory_swap, host.memory,
@@ -1248,6 +1262,11 @@ mod tests {
         assert_eq!(
             host.security_opt,
             Some(vec!["no-new-privileges:true".to_string()])
+        );
+        assert_eq!(host.volumes_from, None, "no service data unless asked");
+        assert_eq!(
+            helper_host_config(Some("redis-cache")).volumes_from,
+            Some(vec!["redis-cache".to_string()])
         );
     }
 

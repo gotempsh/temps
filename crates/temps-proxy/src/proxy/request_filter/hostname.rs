@@ -137,8 +137,9 @@ impl LoadBalancer {
                 query: header.uri.query(),
                 headers: &header.headers,
                 secure,
-                // Tunnels end at a worker's tunnel origin, never here.
-                via_tunnel: false,
+                // A worker's tunnel origin, or this proxy's own (ADR-107 D3):
+                // decided by the listener, never by the request.
+                via_tunnel: self.via_tunnel_origin(session),
             };
             gate.evaluate(&policy, &request, temps_core::gate::unix_now())
                 .await
@@ -147,6 +148,10 @@ impl LoadBalancer {
             crate::handler::gate::GateOutcome::Admit(claims) => {
                 crate::handler::gate::admit(session.req_header_mut(), &claims)?;
                 ctx.gate_identity = Some(claims);
+                Ok(Flow::Continue)
+            }
+            crate::handler::gate::GateOutcome::AdmitAccess(headers) => {
+                crate::handler::gate::admit_access(session.req_header_mut(), headers)?;
                 Ok(Flow::Continue)
             }
             crate::handler::gate::GateOutcome::Respond(answer, routing_status) => {

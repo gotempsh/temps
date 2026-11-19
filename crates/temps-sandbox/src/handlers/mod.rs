@@ -5,6 +5,8 @@
 //! shape: `RequireAuth` + `sandbox_permission_guard` + service call + typed DTO.
 //! No business logic lives here.
 
+pub mod creation;
+pub mod image_preparation;
 pub mod placement;
 pub mod preview_access;
 pub mod sandboxes;
@@ -49,6 +51,8 @@ pub struct SandboxAppState {
     /// Central sensitive-action policy (MFA step-up), gating destructive
     /// operator actions such as evicting a node's sandboxes.
     pub sensitive_action_authorizer: Arc<dyn temps_core::SensitiveActionAuthorizer>,
+    /// Pre-pulling the default sandbox image on the hosts that run sandboxes.
+    pub image_preparation: Arc<crate::services::image_preparation::ImagePreparationService>,
 }
 
 /// OpenAPI document for the `/v1/sandboxes/*` surface.
@@ -105,6 +109,12 @@ pub struct SandboxAppState {
         placement::update_sandbox_placement,
         placement::list_node_sandboxes,
         placement::evict_node_sandboxes,
+        // Sandbox host image preparation and create progress
+        image_preparation::get_sandbox_image_preparation,
+        image_preparation::prepare_sandbox_images,
+        image_preparation::update_host_image_preparation,
+        creation::get_sandbox_creation,
+        creation::get_sandbox_creation_by_sandbox,
         terminal::terminal,
         // Snapshot API (ADR-037)
         snapshots::create_snapshot,
@@ -168,6 +178,18 @@ pub struct SandboxAppState {
         placement::NodeEvictionIncompleteProblem,
         placement::EvictionFailedSandbox,
         crate::services::placement::PlacementNode,
+        image_preparation::PrepareSandboxImagesBody,
+        image_preparation::PrepareSandboxImagesResponse,
+        image_preparation::UpdateHostImagePreparationBody,
+        crate::services::image_preparation::SandboxImagePreparationResponse,
+        crate::services::image_preparation::HostImagePreparation,
+        temps_sandbox_providers::ImagePrepareStatus,
+        temps_sandbox_providers::ImagePrepareState,
+        crate::services::creation_progress::SandboxCreation,
+        crate::services::creation_progress::CreationStep,
+        crate::services::creation_progress::CreationStepKind,
+        crate::services::creation_progress::CreationStepStatus,
+        crate::services::creation_progress::CreationStatus,
         // Snapshot schemas (ADR-037)
         snapshots::CreateSnapshotBody,
         snapshots::SnapshotResponse,
@@ -307,6 +329,10 @@ mod tests {
             "/v1/sandboxes/{id}/terminal",
             "/v1/sandboxes/rootfs",
             "/v1/sandboxes/rootfs/gc",
+            "/v1/sandboxes/image-preparation",
+            "/v1/sandboxes/image-preparation/nodes/{node_id}",
+            "/v1/sandboxes/creations/{creation_id}",
+            "/v1/sandboxes/{id}/creation",
             // Snapshot API (ADR-037)
             "/v1/sandboxes/{id}/snapshots",
             "/v1/sandbox-snapshots",

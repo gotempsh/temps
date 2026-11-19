@@ -21,6 +21,36 @@ pub enum AnalyticsError {
     Other(String),
     #[error("AI summary request is rate limited: {reason}")]
     AiRateLimited { reason: &'static str },
+    /// The request-log backend refused the query for now (its per-project
+    /// budget or the server's concurrent aggregations). Retrying shortly works;
+    /// it is not a server fault.
+    #[error("API traffic {operation} is busy ({reason}); retry in a few seconds")]
+    TrafficBusy {
+        operation: &'static str,
+        reason: &'static str,
+    },
+    #[error(
+        "API traffic {operation} exceeded its {timeout_seconds}-second deadline; narrow the \
+         time range or retry"
+    )]
+    TrafficTimeout {
+        operation: &'static str,
+        timeout_seconds: u64,
+    },
+    /// The query cannot run as asked (an invalid filter, too many groups); the
+    /// detail says what to change.
+    #[error("API traffic {operation} cannot run as asked: {detail}")]
+    TrafficInvalidQuery {
+        operation: &'static str,
+        detail: String,
+    },
+    /// Any other request-log backend failure. `detail` can name internal
+    /// hosts, so it is logged and never returned to the caller.
+    #[error("API traffic {operation} failed in the request-log backend: {detail}")]
+    TrafficStorage {
+        operation: &'static str,
+        detail: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]

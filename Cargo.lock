@@ -2381,6 +2381,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c9ea0ac24bc397ab3c98583a3c9ba74fa56b09a4449bbe172b9b1ddb016027a"
 
 [[package]]
+name = "cms"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b77c319abfd5219629c45c34c89ba945ed3c5e49fcde9d16b6c3885f118a730"
+dependencies = [
+ "const-oid 0.9.6",
+ "der 0.7.10",
+ "spki 0.7.3",
+ "x509-cert",
+]
+
+[[package]]
 name = "cobs"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3671,11 +3683,11 @@ dependencies = [
 
 [[package]]
 name = "email-encoding"
-version = "0.4.1"
+version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9298e6504d9b9e780ed3f7dfd43a61be8cd0e09eb07f7706a945b0072b6670b6"
+checksum = "9f690ae2169f2ceb3f45b28b6fcd8fa16839f2f5c8818546774b9425f5f71004"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "memchr",
 ]
 
@@ -5483,10 +5495,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f00b5dbd620d61dfdcb6007c9c1f6054ebd75319f163d886a9055cec1155073d"
 dependencies = [
  "jiff-static",
+ "jiff-tzdb-platform",
  "log",
  "portable-atomic",
  "portable-atomic-util",
  "serde_core",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5498,6 +5512,21 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "jiff-tzdb"
+version = "0.1.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0980fca2cc272465bd60e82397607ba9f33add9e48defd77923301bbd03808f2"
+
+[[package]]
+name = "jiff-tzdb-platform"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "875a5a69ac2bab1a891711cf5eccbec1ce0341ea805560dcd90b7a2e925132e8"
+dependencies = [
+ "jiff-tzdb",
 ]
 
 [[package]]
@@ -5768,9 +5797,9 @@ checksum = "7a79a3332a6609480d7d0c9eab957bca6b455b91bb84e66d19f5ff66294b85b8"
 
 [[package]]
 name = "lettre"
-version = "0.11.23"
+version = "0.11.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2c646bd5cc763b1087b15493e29a64be6147ba8f19342004fa52048ee596eae"
+checksum = "f294f3d7cdb313e578acef7d7727d4e8d897e0fcd0d6d58c19959cec95073f19"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -10432,6 +10461,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
+name = "ryu-js"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "04d056b875a9d2e6cb9a61d127afee9ac5999b9f87bcb32079d1318e505be714"
+
+[[package]]
 name = "saa"
 version = "5.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11142,6 +11177,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_json_canonicalizer"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "87f7bb64f8c7e9f783fdfe883b5fe93a90bee1597c63705baa91842c5f698620"
+dependencies = [
+ "ryu-js",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "serde_path_to_error"
 version = "0.1.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11443,6 +11489,163 @@ checksum = "28d567dcbaf0049cb8ac2608a76cd95ff9e4412e1899d389ee400918ca7537f5"
 dependencies = [
  "digest 0.11.3",
  "rand_core 0.10.1",
+]
+
+[[package]]
+name = "sigstore-bundle"
+version = "0.16.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "98819125d96663ca27bc1b4fa06673da03de760f6b4d24596efd175e66ac3857"
+dependencies = [
+ "jiff",
+ "sigstore-types",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "sigstore-crypto"
+version = "0.16.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c6164a3fe384de936dbf73c7141f56c017a3fe02ec7107e67297e61b235fdd9"
+dependencies = [
+ "aws-lc-rs",
+ "const-oid 0.9.6",
+ "der 0.7.10",
+ "futures-io",
+ "jiff",
+ "rustls-pki-types",
+ "sigstore-types",
+ "spki 0.7.3",
+ "thiserror 2.0.21",
+ "x509-cert",
+]
+
+[[package]]
+name = "sigstore-merkle"
+version = "0.16.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "90821ce3bed8dec1862a4283848b724aba892b5af02155f1c0d8052c925726e1"
+dependencies = [
+ "sigstore-crypto",
+ "sigstore-types",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "sigstore-rekor"
+version = "0.16.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9abc878eed02e46c130bf5c2a48633144eb0a95ec93d47124bf51b931cf20e1f"
+dependencies = [
+ "base64 0.23.1",
+ "hex",
+ "jiff",
+ "serde",
+ "serde_json",
+ "sigstore-merkle",
+ "sigstore-types",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "sigstore-trust-root"
+version = "0.16.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6111e00e097bb764b6fe9e6205bce3d582c3594512450ee69837753f759c55e2"
+dependencies = [
+ "directories",
+ "jiff",
+ "serde",
+ "serde_json",
+ "sigstore-crypto",
+ "sigstore-tuf",
+ "sigstore-types",
+ "thiserror 2.0.21",
+ "tokio",
+]
+
+[[package]]
+name = "sigstore-tsa"
+version = "0.16.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "34e319615ab084c5a5e29ab451a6f717d989db4ce2d68a1c116f5038d33f448b"
+dependencies = [
+ "cms",
+ "const-oid 0.9.6",
+ "der 0.7.10",
+ "hex",
+ "jiff",
+ "rustls-pki-types",
+ "rustls-webpki",
+ "sigstore-crypto",
+ "sigstore-types",
+ "thiserror 2.0.21",
+ "tracing",
+ "x509-cert",
+]
+
+[[package]]
+name = "sigstore-tuf"
+version = "0.16.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0ef81a8257fcb3873e1e85f29d33d642f962c9faa7d69a05ac2c754dcd460301"
+dependencies = [
+ "glob",
+ "hex",
+ "jiff",
+ "reqwest 0.13.4",
+ "serde",
+ "serde_json",
+ "sigstore-crypto",
+ "sigstore-types",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tracing",
+ "url",
+]
+
+[[package]]
+name = "sigstore-types"
+version = "0.16.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b4f0e9a87bcaf654b5d3b8540eaf78040cae72eb59157bb1765f56684fb0e3e9"
+dependencies = [
+ "base64 0.23.1",
+ "hex",
+ "jiff",
+ "pem 4.0.0",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "sigstore-verify"
+version = "0.16.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cea78eadb03e9ddb079e6af3d464f2e0a98a84fa2b6fa5522bc1e5da88f688b2"
+dependencies = [
+ "base64 0.23.1",
+ "const-oid 0.9.6",
+ "futures-io",
+ "hex",
+ "jiff",
+ "rustls-pki-types",
+ "rustls-webpki",
+ "serde",
+ "serde_json",
+ "serde_json_canonicalizer",
+ "sigstore-bundle",
+ "sigstore-crypto",
+ "sigstore-merkle",
+ "sigstore-rekor",
+ "sigstore-trust-root",
+ "sigstore-tsa",
+ "sigstore-types",
+ "thiserror 2.0.21",
+ "tls_codec",
+ "tracing",
+ "x509-cert",
 ]
 
 [[package]]
@@ -12403,7 +12606,7 @@ dependencies = [
 
 [[package]]
 name = "temps-agent-core"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "http 1.5.0",
  "sea-orm 1.1.20",
@@ -12430,7 +12633,7 @@ dependencies = [
 
 [[package]]
 name = "temps-agents-mcp-proxy"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "serde",
  "serde_json",
@@ -12438,7 +12641,7 @@ dependencies = [
 
 [[package]]
 name = "temps-ai"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "async-trait",
  "futures",
@@ -12452,7 +12655,7 @@ dependencies = [
 
 [[package]]
 name = "temps-ai-agent-cli"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "async-trait",
  "axum",
@@ -12481,7 +12684,7 @@ dependencies = [
 
 [[package]]
 name = "temps-ai-agents"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -12530,7 +12733,7 @@ dependencies = [
 
 [[package]]
 name = "temps-ai-api-tools"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -12556,7 +12759,7 @@ dependencies = [
 
 [[package]]
 name = "temps-ai-chat"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -12612,7 +12815,7 @@ dependencies = [
 
 [[package]]
 name = "temps-ai-cli"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -12634,7 +12837,7 @@ dependencies = [
 
 [[package]]
 name = "temps-ai-gateway"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -12676,7 +12879,7 @@ dependencies = [
 
 [[package]]
 name = "temps-alarms"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "async-trait",
  "axum",
@@ -12697,7 +12900,7 @@ dependencies = [
 
 [[package]]
 name = "temps-analytics"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -12737,7 +12940,7 @@ dependencies = [
 
 [[package]]
 name = "temps-analytics-backend"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "async-trait",
  "bollard",
@@ -12756,7 +12959,7 @@ dependencies = [
 
 [[package]]
 name = "temps-analytics-events"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -12791,7 +12994,7 @@ dependencies = [
 
 [[package]]
 name = "temps-analytics-funnels"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "axum",
  "chrono",
@@ -12809,7 +13012,7 @@ dependencies = [
 
 [[package]]
 name = "temps-analytics-performance"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -12836,7 +13039,7 @@ dependencies = [
 
 [[package]]
 name = "temps-analytics-session-replay"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -12864,7 +13067,7 @@ dependencies = [
 
 [[package]]
 name = "temps-audit"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "anyhow",
  "axum",
@@ -12887,7 +13090,7 @@ dependencies = [
 
 [[package]]
 name = "temps-auth"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "argon2 0.6.0",
  "async-trait",
@@ -12927,7 +13130,7 @@ dependencies = [
 
 [[package]]
 name = "temps-authz"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "async-trait",
  "axum",
@@ -12943,7 +13146,7 @@ dependencies = [
 
 [[package]]
 name = "temps-backup"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -13002,7 +13205,7 @@ dependencies = [
 
 [[package]]
 name = "temps-blob"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "async-trait",
  "aws-sdk-s3",
@@ -13042,7 +13245,7 @@ dependencies = [
 
 [[package]]
 name = "temps-ci-tokens"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "async-trait",
  "axum",
@@ -13078,7 +13281,7 @@ dependencies = [
 
 [[package]]
 name = "temps-cli"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "anyhow",
  "argon2 0.6.0",
@@ -13110,6 +13313,7 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "rand 0.10.3",
+ "rcgen",
  "reqwest 0.12.28",
  "reqwest 0.13.4",
  "rustls",
@@ -13118,6 +13322,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.1",
+ "sigstore-verify",
  "sqlx 0.8.6",
  "sysinfo",
  "tar",
@@ -13219,7 +13424,7 @@ dependencies = [
 
 [[package]]
 name = "temps-clickhouse"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "chrono",
  "clickhouse",
@@ -13236,7 +13441,7 @@ dependencies = [
 
 [[package]]
 name = "temps-cloud"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "async-trait",
  "aws-sdk-s3",
@@ -13264,7 +13469,7 @@ dependencies = [
 
 [[package]]
 name = "temps-cloud-client"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "async-trait",
  "axum",
@@ -13299,7 +13504,7 @@ dependencies = [
 
 [[package]]
 name = "temps-cloud-protocol"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "bytes",
  "chrono",
@@ -13311,7 +13516,7 @@ dependencies = [
 
 [[package]]
 name = "temps-config"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "anyhow",
  "chrono",
@@ -13345,7 +13550,7 @@ dependencies = [
 
 [[package]]
 name = "temps-config-handlers"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "axum",
  "chrono",
@@ -13369,7 +13574,7 @@ dependencies = [
 
 [[package]]
 name = "temps-core"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "aes-gcm 0.11.1",
  "anyhow",
@@ -13415,7 +13620,7 @@ dependencies = [
 
 [[package]]
 name = "temps-credential-checks"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -13436,7 +13641,7 @@ dependencies = [
 
 [[package]]
 name = "temps-database"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "anyhow",
  "log",
@@ -13452,7 +13657,7 @@ dependencies = [
 
 [[package]]
 name = "temps-deployer"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -13509,7 +13714,7 @@ dependencies = [
 
 [[package]]
 name = "temps-deployment-logs"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -13532,7 +13737,7 @@ dependencies = [
 
 [[package]]
 name = "temps-deployments"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -13615,7 +13820,7 @@ dependencies = [
 
 [[package]]
 name = "temps-dns"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "async-trait",
  "axum",
@@ -13661,7 +13866,7 @@ dependencies = [
 
 [[package]]
 name = "temps-docker-capture"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "axum",
  "bollard",
@@ -13671,7 +13876,7 @@ dependencies = [
 
 [[package]]
 name = "temps-docker-housekeeping"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "async-trait",
  "axum",
@@ -13706,7 +13911,7 @@ dependencies = [
 
 [[package]]
 name = "temps-docker-util"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "bollard",
  "bytes",
@@ -13725,7 +13930,7 @@ dependencies = [
 
 [[package]]
 name = "temps-domains"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -13778,7 +13983,7 @@ dependencies = [
 
 [[package]]
 name = "temps-edge"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -13817,7 +14022,7 @@ dependencies = [
 
 [[package]]
 name = "temps-edge-rules"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "percent-encoding",
  "regex",
@@ -13829,7 +14034,7 @@ dependencies = [
 
 [[package]]
 name = "temps-email"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -13867,7 +14072,7 @@ dependencies = [
 
 [[package]]
 name = "temps-email-tracking"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -13901,7 +14106,7 @@ dependencies = [
 
 [[package]]
 name = "temps-entities"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "chrono",
  "sea-orm 1.1.20",
@@ -13916,7 +14121,7 @@ dependencies = [
 
 [[package]]
 name = "temps-environments"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "argon2 0.6.0",
  "axum",
@@ -13944,7 +14149,7 @@ dependencies = [
 
 [[package]]
 name = "temps-error-tracking"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -14015,7 +14220,7 @@ dependencies = [
 
 [[package]]
 name = "temps-external-plugins"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "async-trait",
  "axum",
@@ -14060,7 +14265,7 @@ dependencies = [
 
 [[package]]
 name = "temps-file-store"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "async-trait",
  "aws-sdk-s3",
@@ -14078,7 +14283,7 @@ dependencies = [
 
 [[package]]
 name = "temps-flags"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "async-trait",
  "axum",
@@ -14100,7 +14305,7 @@ dependencies = [
 
 [[package]]
 name = "temps-geo"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -14129,7 +14334,7 @@ dependencies = [
 
 [[package]]
 name = "temps-git"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "async-trait",
  "axum",
@@ -14179,7 +14384,7 @@ dependencies = [
 
 [[package]]
 name = "temps-git-credential"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "nix 0.31.3",
  "reqwest 0.12.28",
@@ -14218,7 +14423,7 @@ dependencies = [
 
 [[package]]
 name = "temps-import"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "axum",
  "bollard",
@@ -14256,7 +14461,7 @@ dependencies = [
 
 [[package]]
 name = "temps-import-caprover"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "async-trait",
  "chrono",
@@ -14277,7 +14482,7 @@ dependencies = [
 
 [[package]]
 name = "temps-import-coolify"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "async-trait",
  "chrono",
@@ -14298,7 +14503,7 @@ dependencies = [
 
 [[package]]
 name = "temps-import-docker"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "async-trait",
  "bollard",
@@ -14318,7 +14523,7 @@ dependencies = [
 
 [[package]]
 name = "temps-import-dokploy"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "async-trait",
  "chrono",
@@ -14340,7 +14545,7 @@ dependencies = [
 
 [[package]]
 name = "temps-import-kamal"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "async-trait",
  "chrono",
@@ -14359,7 +14564,7 @@ dependencies = [
 
 [[package]]
 name = "temps-import-kubernetes"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -14382,7 +14587,7 @@ dependencies = [
 
 [[package]]
 name = "temps-import-portainer"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "async-trait",
  "chrono",
@@ -14403,7 +14608,7 @@ dependencies = [
 
 [[package]]
 name = "temps-import-types"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "async-trait",
  "chrono",
@@ -14438,9 +14643,10 @@ dependencies = [
 
 [[package]]
 name = "temps-infra"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "bollard",
  "chrono",
@@ -14464,7 +14670,7 @@ dependencies = [
 
 [[package]]
 name = "temps-ingress"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "async-trait",
  "axum",
@@ -14496,7 +14702,7 @@ dependencies = [
 
 [[package]]
 name = "temps-kv"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "async-trait",
  "axum",
@@ -14540,7 +14746,7 @@ dependencies = [
 
 [[package]]
 name = "temps-log-aggregator"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -14586,7 +14792,7 @@ dependencies = [
 
 [[package]]
 name = "temps-mcp-server"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "async-trait",
  "axum",
@@ -14607,7 +14813,7 @@ dependencies = [
 
 [[package]]
 name = "temps-memory"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "async-trait",
  "thiserror 2.0.21",
@@ -14616,7 +14822,7 @@ dependencies = [
 
 [[package]]
 name = "temps-metrics"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -14651,7 +14857,7 @@ dependencies = [
 
 [[package]]
 name = "temps-migrations"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "anyhow",
  "bollard",
@@ -14667,7 +14873,7 @@ dependencies = [
 
 [[package]]
 name = "temps-monitoring"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -14710,7 +14916,7 @@ dependencies = [
 
 [[package]]
 name = "temps-netpol-probe"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -14731,7 +14937,7 @@ dependencies = [
 
 [[package]]
 name = "temps-network"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -14763,7 +14969,7 @@ dependencies = [
 
 [[package]]
 name = "temps-network-policy"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -14789,7 +14995,7 @@ dependencies = [
 
 [[package]]
 name = "temps-node-agent"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -14858,7 +15064,7 @@ dependencies = [
 
 [[package]]
 name = "temps-node-dns"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -14881,7 +15087,7 @@ dependencies = [
 
 [[package]]
 name = "temps-nodes"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "async-trait",
  "axum",
@@ -14934,7 +15140,7 @@ dependencies = [
 
 [[package]]
 name = "temps-notifications"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "async-trait",
  "axum",
@@ -14964,7 +15170,7 @@ dependencies = [
 
 [[package]]
 name = "temps-observability"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -14992,7 +15198,7 @@ dependencies = [
 
 [[package]]
 name = "temps-otel"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -15074,7 +15280,7 @@ dependencies = [
 
 [[package]]
 name = "temps-presets"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -15103,7 +15309,7 @@ dependencies = [
 
 [[package]]
 name = "temps-preview-gateway"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "anyhow",
  "tokio",
@@ -15113,7 +15319,7 @@ dependencies = [
 
 [[package]]
 name = "temps-product-telemetry"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "async-trait",
  "axum",
@@ -15136,7 +15342,7 @@ dependencies = [
 
 [[package]]
 name = "temps-project-groups"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "async-trait",
  "axum",
@@ -15165,7 +15371,7 @@ dependencies = [
 
 [[package]]
 name = "temps-projects"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -15202,7 +15408,7 @@ dependencies = [
 
 [[package]]
 name = "temps-providers"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -15265,7 +15471,7 @@ dependencies = [
 
 [[package]]
 name = "temps-providers-core"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -15312,7 +15518,7 @@ dependencies = [
 
 [[package]]
 name = "temps-providers-mariadb"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -15346,7 +15552,7 @@ dependencies = [
 
 [[package]]
 name = "temps-providers-mongodb"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -15377,7 +15583,7 @@ dependencies = [
 
 [[package]]
 name = "temps-providers-postgres"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -15419,7 +15625,7 @@ dependencies = [
 
 [[package]]
 name = "temps-providers-redis"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -15451,7 +15657,7 @@ dependencies = [
 
 [[package]]
 name = "temps-providers-s3"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -15484,7 +15690,7 @@ dependencies = [
 
 [[package]]
 name = "temps-proxy"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -15555,7 +15761,7 @@ dependencies = [
 
 [[package]]
 name = "temps-pty-agent"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "bytes",
  "clap",
@@ -15574,7 +15780,7 @@ dependencies = [
 
 [[package]]
 name = "temps-queue"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "sea-orm 1.1.20",
  "serde_json",
@@ -15589,7 +15795,7 @@ dependencies = [
 
 [[package]]
 name = "temps-revenue"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -15617,7 +15823,7 @@ dependencies = [
 
 [[package]]
 name = "temps-routes"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -15651,7 +15857,7 @@ dependencies = [
 
 [[package]]
 name = "temps-runtime-health"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "async-trait",
  "bollard",
@@ -15670,7 +15876,7 @@ dependencies = [
 
 [[package]]
 name = "temps-sandbox"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "argon2 0.6.0",
  "async-stream",
@@ -15712,7 +15918,7 @@ dependencies = [
 
 [[package]]
 name = "temps-sandbox-providers"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -15759,7 +15965,7 @@ dependencies = [
 
 [[package]]
 name = "temps-schema"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "anyhow",
  "sea-orm 1.1.20",
@@ -15777,7 +15983,7 @@ dependencies = [
 
 [[package]]
 name = "temps-screenshots"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -15811,7 +16017,7 @@ dependencies = [
 
 [[package]]
 name = "temps-service-access"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "async-trait",
  "axum",
@@ -15846,7 +16052,7 @@ dependencies = [
 
 [[package]]
 name = "temps-service-access-runtime"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -15874,7 +16080,7 @@ dependencies = [
 
 [[package]]
 name = "temps-service-protocol"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "async-trait",
  "bollard",
@@ -15889,7 +16095,7 @@ dependencies = [
 
 [[package]]
 name = "temps-shield"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -15915,11 +16121,11 @@ dependencies = [
 
 [[package]]
 name = "temps-signatures"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 
 [[package]]
 name = "temps-status-page"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -15953,7 +16159,7 @@ dependencies = [
 
 [[package]]
 name = "temps-teams"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "async-trait",
  "axum",
@@ -15972,7 +16178,7 @@ dependencies = [
 
 [[package]]
 name = "temps-test-utils"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "anyhow",
  "bollard",
@@ -15988,7 +16194,7 @@ dependencies = [
 
 [[package]]
 name = "temps-traefik-discovery"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "async-trait",
  "axum",
@@ -16018,7 +16224,7 @@ dependencies = [
 
 [[package]]
 name = "temps-vm-agent"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "hex",
  "libc",
@@ -16029,7 +16235,7 @@ dependencies = [
 
 [[package]]
 name = "temps-vulnerability-scanner"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "async-trait",
  "axum",
@@ -16057,7 +16263,7 @@ dependencies = [
 
 [[package]]
 name = "temps-webhooks"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "axum",
  "chrono",
@@ -16082,7 +16288,7 @@ dependencies = [
 
 [[package]]
 name = "temps-wireguard"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "base64 0.23.1",
  "defguard_wireguard_rs",
@@ -16101,7 +16307,7 @@ dependencies = [
 
 [[package]]
 name = "temps-workflows"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "async-trait",
  "axum",
@@ -16158,7 +16364,7 @@ dependencies = [
 
 [[package]]
 name = "temps-workload"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "async-trait",
  "bytes",
@@ -16173,7 +16379,7 @@ dependencies = [
 
 [[package]]
 name = "temps-workload-activator"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -16184,7 +16390,7 @@ dependencies = [
 
 [[package]]
 name = "temps-workload-docker"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "async-trait",
  "bollard",
@@ -16203,7 +16409,7 @@ dependencies = [
 
 [[package]]
 name = "temps-workload-env"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "async-trait",
  "temps-workload",
@@ -16213,7 +16419,7 @@ dependencies = [
 
 [[package]]
 name = "temps-workload-ingress"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "base64 0.23.1",
  "hmac 0.13.0",
@@ -16225,7 +16431,7 @@ dependencies = [
 
 [[package]]
 name = "temps-workload-netpol"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -16249,7 +16455,7 @@ dependencies = [
 
 [[package]]
 name = "temps-workload-node"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "async-trait",
  "chrono",
@@ -16266,7 +16472,7 @@ dependencies = [
 
 [[package]]
 name = "temps-workload-plane"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "async-trait",
  "bollard",
@@ -16292,7 +16498,7 @@ dependencies = [
 
 [[package]]
 name = "temps-workload-volumes"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.63"
 dependencies = [
  "async-trait",
  "serde",

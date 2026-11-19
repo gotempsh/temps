@@ -61,8 +61,8 @@ pub use index::{
     PluginToolAccess, PluginToolsError, PluginToolsIndex, ReadOnlyApiIndex,
 };
 pub use secrets::{
-    is_secret_ref, pointer_is_credential, SecretPath, SecretPathSegment, SecretResolveError,
-    SecretResolver, SecretUse, SECRET_REF_PREFIX,
+    is_secret_ref, pointer_is_credential, secret_paths_for_request_body, SecretPath,
+    SecretPathSegment, SecretResolveError, SecretResolver, SecretUse, SECRET_REF_PREFIX,
 };
 
 /// Build the request path+query string+optional body from a flat params object.

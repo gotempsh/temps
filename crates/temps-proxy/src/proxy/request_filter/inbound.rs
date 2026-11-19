@@ -44,7 +44,23 @@ impl LoadBalancer {
             .unwrap_or_default();
 
         // Extract client IP address early (needed for Shield)
-        if let Some(client_ip) = resolve_session_client_ip(
+        if self.via_tunnel_origin(session) {
+            // ADR-107 D3: on the tunnel origin the connector's header is
+            // the visitor's address, and no other forwarding header is.
+            if let (Some(origin), Some(peer)) = (
+                self.tunnel_origin.as_deref(),
+                session
+                    .client_addr()
+                    .and_then(|a| a.as_inet())
+                    .map(|a| a.ip()),
+            ) {
+                ctx.ip_address = Some(
+                    origin
+                        .client_ip(peer, &session.req_header().headers)
+                        .to_string(),
+                );
+            }
+        } else if let Some(client_ip) = resolve_session_client_ip(
             session,
             self.trust_loopback_forwarded_ip.load(Ordering::Relaxed),
         ) {
