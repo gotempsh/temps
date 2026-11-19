@@ -6,7 +6,8 @@ import { SandboxCreationCard } from '@/components/sandboxes/SandboxCreationCard'
 import { problemDetail } from '@/lib/api-problem'
 import {
   CREATION_POLL_MS,
-  creationRunning,
+  keepPollingStartingSandbox,
+  showStartingSandboxSteps,
 } from '@/components/sandboxes/sandbox-creation'
 import { SandboxVaultAccess } from '@/components/service-access/SandboxVaultAccess'
 import { SandboxInternalAddressesCard } from '@/components/sandboxes/SandboxInternalAddressesCard'
@@ -292,17 +293,19 @@ export default function SandboxDetail() {
 
   // The create's steps, while it runs. A 404 with nothing read yet means this
   // server no longer tracks it (restarted, or finished long ago): the page
-  // just says Starting. A failed poll after steps were read keeps them on
-  // screen with the error and a retry.
+  // just says Starting. Any other failed poll shows the error with a retry,
+  // keeps the steps already read, and keeps polling.
   const starting = sandbox?.status === 'starting'
   const creationQuery = useQuery({
     ...getSandboxCreationBySandboxOptions({ path: { id: sandboxId } }),
     enabled: starting,
     retry: false,
     refetchInterval: (query) =>
-      starting &&
-      query.state.status !== 'error' &&
-      creationRunning(query.state.data)
+      keepPollingStartingSandbox(
+        starting,
+        query.state.data,
+        query.state.status === 'error' ? query.state.error : null
+      )
         ? CREATION_POLL_MS
         : false,
   })
@@ -818,22 +821,25 @@ export default function SandboxDetail() {
                 retrying={isFetching}
               />
             )}
-            {starting &&
-              (!creationQuery.isError || creationQuery.data !== undefined) && (
-                <SandboxCreationCard
-                  creation={creationQuery.data}
-                  refreshError={
-                    creationQuery.isError
-                      ? problemDetail(
-                          creationQuery.error,
-                          'the server did not answer'
-                        )
-                      : null
-                  }
-                  onRetry={() => void creationQuery.refetch()}
-                  retrying={creationQuery.isFetching}
-                />
-              )}
+            {showStartingSandboxSteps(
+              starting,
+              creationQuery.data,
+              creationQuery.isError ? creationQuery.error : null
+            ) && (
+              <SandboxCreationCard
+                creation={creationQuery.data}
+                refreshError={
+                  creationQuery.isError
+                    ? problemDetail(
+                        creationQuery.error,
+                        'the server did not answer'
+                      )
+                    : null
+                }
+                onRetry={() => void creationQuery.refetch()}
+                retrying={creationQuery.isFetching}
+              />
+            )}
             {!destroyed && (
               <div
                 className={`flex flex-wrap items-center justify-between gap-3 rounded-md border px-4 py-3 ${expired ? 'border-destructive/40' : 'bg-muted/20'}`}

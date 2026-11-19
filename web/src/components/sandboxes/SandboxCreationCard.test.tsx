@@ -28,10 +28,13 @@ const creation: SandboxCreation = {
   ],
 }
 
-function render(refreshError: string | null) {
+function render(
+  refreshError: string | null,
+  current: SandboxCreation | undefined
+) {
   return renderToStaticMarkup(
     <SandboxCreationCard
-      creation={creation}
+      creation={current}
       refreshError={refreshError}
       onRetry={() => {}}
       retrying={false}
@@ -41,15 +44,24 @@ function render(refreshError: string | null) {
 
 describe('SandboxCreationCard', () => {
   test('a failed refresh keeps the steps and download progress, with the error and a retry', () => {
-    const html = render('network down')
+    const html = render('network down', creation)
     expect(html).toContain('The steps could not be refreshed: network down')
     expect(html).toContain('Try again')
     expect(html).toContain('Download the sandbox image')
     expect(html).toContain('role="progressbar"')
   })
 
+  test('a failed first read shows the error and a retry, not a loading skeleton', () => {
+    const html = render('the server did not answer', undefined)
+    expect(html).toContain(
+      'The steps could not be read: the server did not answer'
+    )
+    expect(html).toContain('Try again')
+    expect(html).not.toContain('aria-busy="true"')
+  })
+
   test('no error, no alert', () => {
-    const html = render(null)
+    const html = render(null, creation)
     expect(html).not.toContain('could not be refreshed')
     expect(html).toContain('Download the sandbox image')
   })

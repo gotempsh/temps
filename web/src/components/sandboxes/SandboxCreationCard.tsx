@@ -12,7 +12,7 @@ import { SandboxCreationSteps } from './SandboxCreationSteps'
 interface SandboxCreationCardProps {
   /** The last steps read; `undefined` until the first poll answers. */
   creation: SandboxCreation | undefined
-  /** Why the last poll failed, or `null` when it did not. */
+  /** Why the last read failed, or `null` when it did not. */
   refreshError: string | null
   onRetry: () => void
   retrying: boolean
@@ -42,7 +42,7 @@ export function SandboxCreationCard({
             <AlertTriangle className="size-4" />
             <AlertDescription className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
               <span className="[overflow-wrap:anywhere]">
-                The steps could not be refreshed: {refreshError}
+                {`${creation ? 'The steps could not be refreshed' : 'The steps could not be read'}: ${refreshError}`}
               </span>
               <Button
                 variant="outline"
@@ -58,7 +58,11 @@ export function SandboxCreationCard({
             </AlertDescription>
           </Alert>
         )}
-        <SandboxCreationSteps creation={creation} />
+        {/* Nothing read yet and the read failed: the error says so; a
+            skeleton would claim it is still loading. */}
+        {(creation !== undefined || !refreshError) && (
+          <SandboxCreationSteps creation={creation} />
+        )}
       </CardContent>
     </Card>
   )

@@ -9,6 +9,7 @@ import type {
 } from '@/api/client'
 import type { QueryClient } from '@tanstack/react-query'
 import { getSandboxImagePreparationQueryKey } from '@/api/client/@tanstack/react-query.gen'
+import { httpStatusOf } from '@/lib/http-error-status'
 
 /**
  * Mark the sandbox image status stale so the card showing it reads it again
@@ -121,6 +122,37 @@ export function keepPolling(
 ): boolean {
   if (creation) return creation.status === 'running'
   return !(lastPollFailed && requestSettled)
+}
+
+/**
+ * Whether a starting sandbox's step poll runs again. Only a 404 (this
+ * server no longer tracks the create: restarted, or it finished long ago)
+ * stops it; a network or server error keeps polling, so the steps come back
+ * once the server answers.
+ */
+export function keepPollingStartingSandbox(
+  starting: boolean,
+  creation: SandboxCreation | undefined,
+  error: unknown
+): boolean {
+  if (!starting) return false
+  if (error) return httpStatusOf(error) !== 404
+  return creationRunning(creation)
+}
+
+/**
+ * Whether a starting sandbox shows its steps card. It is left out only when
+ * the server confirmed it does not track the create and nothing was read;
+ * any other failure shows the card with the error and a retry.
+ */
+export function showStartingSandboxSteps(
+  starting: boolean,
+  creation: SandboxCreation | undefined,
+  error: unknown
+): boolean {
+  if (!starting) return false
+  if (creation !== undefined) return true
+  return !error || httpStatusOf(error) !== 404
 }
 
 /** One line for a host's image state. */

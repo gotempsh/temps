@@ -209,6 +209,23 @@ pub(crate) fn images_to_retire(
     retire
 }
 
+/// What a newly ready `ready` image does to the host's older images:
+/// `(remove now, keep pending removal)`. A host kept prepared tries to
+/// remove all of them. A host whose policy was turned off removes nothing,
+/// but every older image (the one prepared before included) stays recorded,
+/// so turning the policy back on can still clean them up.
+pub(crate) fn outgoing_images(
+    row: &sandbox_image_preparations::Model,
+    ready: &str,
+) -> (Vec<String>, Vec<String>) {
+    let outgoing = images_to_retire(row, ready);
+    if row.keep_prepared {
+        (outgoing, Vec::new())
+    } else {
+        (Vec::new(), outgoing)
+    }
+}
+
 /// Upsert a host's row with `keep_prepared = keep`.
 async fn upsert_keep<C: ConnectionTrait>(
     conn: &C,
@@ -594,18 +611,12 @@ impl ImagePreparationService {
     /// A host whose operator turned `keep_prepared` off while the pull ran
     /// gets the result recorded and nothing removed: retiring images is
     /// part of keeping a host prepared, and that is no longer asked for.
+    /// The older images stay in `stale_images` (see [`outgoing_images`]).
     async fn record_ready(&self, host: &str, row: &sandbox_image_preparations::Model, image: &str) {
-        let retire = if row.keep_prepared {
-            images_to_retire(row, image)
-        } else {
-            tracing::info!(host = %host, image = %image, "sandbox image ready on a host no longer kept prepared; previous images left in place");
-            Vec::new()
-        };
-        let mut still_used = if row.keep_prepared {
-            Vec::new()
-        } else {
-            row.stale_images.clone()
-        };
+        let (retire, mut still_used) = outgoing_images(row, image);
+        if !still_used.is_empty() && retire.is_empty() {
+            tracing::info!(host = %host, image = %image, kept = ?still_used, "sandbox image ready on a host no longer kept prepared; previous images left in place and recorded");
+        }
         for old in retire {
             match self
                 .provider
@@ -939,6 +950,23 @@ mod tests {
             pending_removal("control plane", retire),
             vec!["img:2", "img:1", "img:0"]
         );
+    }
+
+    #[test]
+    fn a_host_no_longer_kept_prepared_keeps_every_older_image_recorded() {
+        // The policy was turned off while an upgrade pull ran: nothing is
+        // removed, and the image prepared before is not forgotten.
+        let mut off = row(false, Some("img:1"));
+        off.stale_images = vec!["img:0".into()];
+        let (remove, keep) = outgoing_images(&off, "img:2");
+        assert!(remove.is_empty());
+        assert_eq!(keep, vec!["img:1", "img:0"]);
+
+        let mut on = row(true, Some("img:1"));
+        on.stale_images = vec!["img:0".into()];
+        let (remove, keep) = outgoing_images(&on, "img:2");
+        assert_eq!(remove, vec!["img:1", "img:0"]);
+        assert!(keep.is_empty());
     }
 
     #[test]

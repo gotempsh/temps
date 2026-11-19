@@ -20,6 +20,8 @@ import {
   hostsToPrepare,
   imageStateLabel,
   keepPolling,
+  keepPollingStartingSandbox,
+  showStartingSandboxSteps,
   refreshSandboxImageStatus,
   newCreationId,
   stepDurationMs,
@@ -203,5 +205,36 @@ describe('refreshSandboxImageStatus', () => {
     expect(client.getQueryState(queryKey)?.isInvalidated).toBe(false)
     await refreshSandboxImageStatus(client)
     expect(client.getQueryState(queryKey)?.isInvalidated).toBe(true)
+  })
+})
+
+describe('a starting sandbox on its detail page', () => {
+  const running = { status: 'running' } as SandboxCreation
+  const succeeded = { status: 'succeeded' } as SandboxCreation
+  const notFound = { status: 404, title: 'Not Found' }
+  const serverError = { status: 503, title: 'Service Unavailable' }
+  const networkError = new TypeError('Failed to fetch')
+
+  test('polls while it runs and stops once it ends or the sandbox started', () => {
+    expect(keepPollingStartingSandbox(true, undefined, null)).toBe(true)
+    expect(keepPollingStartingSandbox(true, running, null)).toBe(true)
+    expect(keepPollingStartingSandbox(true, succeeded, null)).toBe(false)
+    expect(keepPollingStartingSandbox(false, running, null)).toBe(false)
+  })
+
+  test('only a 404 stops the poll; network and server errors keep it going', () => {
+    expect(keepPollingStartingSandbox(true, undefined, notFound)).toBe(false)
+    expect(keepPollingStartingSandbox(true, undefined, serverError)).toBe(true)
+    expect(keepPollingStartingSandbox(true, undefined, networkError)).toBe(true)
+    expect(keepPollingStartingSandbox(true, running, serverError)).toBe(true)
+  })
+
+  test('the card is left out only for a confirmed 404 with nothing read', () => {
+    expect(showStartingSandboxSteps(true, undefined, null)).toBe(true)
+    expect(showStartingSandboxSteps(true, undefined, notFound)).toBe(false)
+    expect(showStartingSandboxSteps(true, undefined, serverError)).toBe(true)
+    expect(showStartingSandboxSteps(true, undefined, networkError)).toBe(true)
+    expect(showStartingSandboxSteps(true, running, notFound)).toBe(true)
+    expect(showStartingSandboxSteps(false, running, null)).toBe(false)
   })
 })
