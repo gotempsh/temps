@@ -60,6 +60,143 @@ pub struct SourceFilesDeletedAudit {
     pub deleted_count: u64,
 }
 
+/// Audit event for a bulk triage update on many error groups at once.
+/// Records the selection as requested and the groups that actually changed,
+/// so a filter that matched more than the caller expected is reconstructible.
+#[derive(Debug, Clone, Serialize)]
+pub struct ErrorGroupsBulkUpdatedAudit {
+    pub context: AuditContext,
+    pub project_id: i32,
+    pub action: crate::handlers::group_workflow_handler::BulkErrorGroupAction,
+    /// `error_groups.status` the action wrote.
+    pub status: String,
+    /// Explicit ids the request named, when it used them.
+    pub requested_group_ids: Option<Vec<i32>>,
+    /// Filter the request used, when it used one.
+    pub filter: Option<crate::handlers::group_workflow_handler::BulkErrorGroupFilter>,
+    /// Ignore conditions the request set, when it set any.
+    pub ignore: Option<crate::handlers::group_workflow_handler::IgnoreConditionsRequest>,
+    /// Groups whose status actually changed.
+    pub updated_group_ids: Vec<i32>,
+    /// Selected groups already in the target status.
+    pub skipped: u64,
+    /// Matching groups left for a follow-up request.
+    pub remaining: u64,
+}
+
+impl AuditOperation for ErrorGroupsBulkUpdatedAudit {
+    fn operation_type(&self) -> String {
+        "ERROR_GROUPS_BULK_UPDATED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
+    }
+}
+
+/// Audit event for merging error groups into one.
+#[derive(Debug, Clone, Serialize)]
+pub struct ErrorGroupsMergedAudit {
+    pub context: AuditContext,
+    pub project_id: i32,
+    /// The group that survived the merge.
+    pub target_group_id: i32,
+    pub merged_group_ids: Vec<i32>,
+    pub moved_fingerprints: u64,
+}
+
+impl AuditOperation for ErrorGroupsMergedAudit {
+    fn operation_type(&self) -> String {
+        "ERROR_GROUPS_MERGED".to_string()
+    }
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
+    }
+}
+
+/// Audit event for taking an error group back out of a merge.
+#[derive(Debug, Clone, Serialize)]
+pub struct ErrorGroupUnmergedAudit {
+    pub context: AuditContext,
+    pub project_id: i32,
+    pub group_id: i32,
+    /// The group it had been merged into.
+    pub target_group_id: i32,
+    pub moved_fingerprints: u64,
+}
+
+impl AuditOperation for ErrorGroupUnmergedAudit {
+    fn operation_type(&self) -> String {
+        "ERROR_GROUP_UNMERGED".to_string()
+    }
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
+    }
+}
+
+/// Audit event for splitting fingerprints out of an error group.
+///
+/// The fingerprints themselves are hashes of a stack signature, not user
+/// data, but they are not needed to understand the change: the group ids and
+/// the number moved are.
+#[derive(Debug, Clone, Serialize)]
+pub struct ErrorGroupSplitAudit {
+    pub context: AuditContext,
+    pub project_id: i32,
+    pub group_id: i32,
+    /// The group created for the fingerprints that were moved out.
+    pub new_group_id: i32,
+    pub moved_fingerprints: u64,
+}
+
+impl AuditOperation for ErrorGroupSplitAudit {
+    fn operation_type(&self) -> String {
+        "ERROR_GROUP_SPLIT".to_string()
+    }
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
+    }
+}
+
 /// Audit event for a triage update on an error group (status and/or assignee).
 #[derive(Debug, Clone, Serialize)]
 pub struct ErrorGroupUpdatedAudit {
@@ -71,6 +208,8 @@ pub struct ErrorGroupUpdatedAudit {
     /// Assignee change as requested: `None` leaves it unchanged, `Some("")`
     /// clears it, any other value sets it.
     pub assigned_to: Option<String>,
+    /// Ignore conditions set with an `ignored` status.
+    pub ignore: Option<crate::handlers::group_workflow_handler::IgnoreConditionsRequest>,
 }
 
 impl AuditOperation for ErrorGroupUpdatedAudit {
@@ -403,6 +542,7 @@ mod tests {
             group_id: 42,
             status: "resolved".to_string(),
             assigned_to: Some(String::new()),
+            ignore: None,
         };
 
         assert_eq!(audit.operation_type(), "ERROR_GROUP_UPDATED");

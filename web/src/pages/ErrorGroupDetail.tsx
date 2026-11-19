@@ -22,6 +22,14 @@ import { AutofixIncidentCard } from '@/components/autofix/AutofixIncidentCard'
 import { SentryEventDetail } from '@/components/error-tracking/SentryEventDetail'
 import { SentryListItem } from '@/components/error-tracking/SentryListItem'
 import { updateErrorGroupMutation } from '@/api/client/@tanstack/react-query.gen'
+import { GroupMergeActions } from '@/components/error-tracking/GroupMergeActions'
+import { IgnoreMenu } from '@/components/error-tracking/IgnoreMenu'
+import {
+  IGNORE_PRESETS,
+  describeIgnoreState,
+  ignorePresetConditions,
+  type IgnoreConditions,
+} from '@/components/error-tracking/ignore-presets'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import { Badge } from '@/components/ui/badge'
@@ -118,10 +126,10 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
     },
   })
 
-  const updateStatus = (status: string) => {
+  const updateStatus = (status: string, ignore?: IgnoreConditions) => {
     statusMutation.mutate({
       path: { group_id: parseInt(errorGroupId!), project_id: project.id },
-      body: { status },
+      body: { status, ignore },
     })
   }
 
@@ -328,6 +336,19 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
           {errorGroup.title}
         </PageTitle>
 
+        <GroupMergeActions
+          projectId={project.id}
+          projectSlug={project.slug}
+          groupId={errorGroup.id}
+          mergedIntoGroupId={errorGroup.merged_into_group_id}
+        />
+
+        {errorGroup.ignore && (
+          <p className="text-sm text-muted-foreground">
+            {describeIgnoreState(errorGroup.ignore, errorGroup.total_count ?? 0)}
+          </p>
+        )}
+
         {/* The actions stay one group: when they do not fit beside the
             details they move below them together. */}
         <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-3">
@@ -396,18 +417,12 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
                   Resolve
                 </Button>
               )}
-              {(errorGroup as any).status !== 'ignored' &&
-                (errorGroup as any).status !== 'resolved' && (
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={() => updateStatus('ignored')}
-                    disabled={statusMutation.isPending}
-                  >
-                    <EyeOff className="h-4 w-4 mr-1.5" />
-                    Ignore
-                  </Button>
-                )}
+              {(errorGroup as any).status !== 'resolved' && (
+                <IgnoreMenu
+                  onIgnore={(conditions) => updateStatus('ignored', conditions)}
+                  disabled={statusMutation.isPending}
+                />
+              )}
               {((errorGroup as any).status === 'resolved' ||
                 (errorGroup as any).status === 'ignored') && (
                 <Button
@@ -442,13 +457,21 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
                       Resolve
                     </DropdownMenuItem>
                   )}
-                  {(errorGroup as any).status !== 'ignored' &&
-                    (errorGroup as any).status !== 'resolved' && (
-                      <DropdownMenuItem onClick={() => updateStatus('ignored')}>
+                  {(errorGroup as any).status !== 'resolved' &&
+                    IGNORE_PRESETS.map(({ preset, label }) => (
+                      <DropdownMenuItem
+                        key={preset}
+                        onClick={() =>
+                          updateStatus(
+                            'ignored',
+                            ignorePresetConditions(preset)
+                          )
+                        }
+                      >
                         <EyeOff className="mr-2 h-4 w-4" />
-                        Ignore
+                        Ignore {label.charAt(0).toLowerCase() + label.slice(1)}
                       </DropdownMenuItem>
-                    )}
+                    ))}
                   {((errorGroup as any).status === 'resolved' ||
                     (errorGroup as any).status === 'ignored') && (
                     <DropdownMenuItem

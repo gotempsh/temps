@@ -158,6 +158,10 @@ pub(super) struct IngestedError {
     pub group_id: i32,
     pub created: bool,
     pub previous_status: String,
+    /// The group's status after this event was counted. Equal to
+    /// `previous_status` unless the event reopened the group; an ignored group
+    /// whose conditions are not met yet stays `ignored` (ADR 074, D1.3).
+    pub current_status: String,
     pub inserted: bool,
 }
 
@@ -293,6 +297,7 @@ impl ErrorIngestionService {
                     group_id,
                     created: false,
                     previous_status: String::new(),
+                    current_status: String::new(),
                     inserted: false,
                 });
             }
@@ -340,15 +345,7 @@ impl ErrorIngestionService {
                 }
             }
         };
-        let previous_status: String = tx
-            .query_one(Statement::from_sql_and_values(
-                DatabaseBackend::Postgres,
-                "SELECT status FROM error_groups WHERE id=$1 FOR UPDATE",
-                [group_id.into()],
-            ))
-            .await?
-            .ok_or(ErrorTrackingError::GroupNotFound)?
-            .try_get("", "status")?;
+        let (group_id, previous_status) = Self::lock_group_following_merge(&tx, group_id).await?;
         tx.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,
             "INSERT INTO error_group_fingerprints(project_id,fingerprint_hash,error_group_id) VALUES($1,$2,$3) ON CONFLICT DO NOTHING",
             [error_data.project_id.into(),fingerprint.into(),group_id.into()])).await?;
@@ -360,9 +357,14 @@ impl ErrorIngestionService {
                 "INSERT INTO error_event_source_keys(project_id,sdk_event_id,environment_id,deployment_id,error_group_id,error_event_id,received_at) VALUES($1,$2,$3,$4,$5,$6,NOW()) ON CONFLICT(project_id,sdk_event_id) DO UPDATE SET environment_id=EXCLUDED.environment_id,deployment_id=EXCLUDED.deployment_id,error_group_id=EXCLUDED.error_group_id,error_event_id=EXCLUDED.error_event_id,received_at=EXCLUDED.received_at",
                 [error_data.project_id.into(),id.into(),error_data.environment_id.into(),error_data.deployment_id.into(),group_id.into(),event_id.into()])).await?;
         }
-        tx.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,
-            "UPDATE error_groups SET total_count = total_count + 1, last_seen = GREATEST(last_seen, $2), updated_at = NOW(), status = CASE WHEN status IN ('resolved','ignored') THEN 'unresolved' ELSE status END WHERE id = $1",
-            [group_id.into(),event_time.into()])).await?;
+        let current_status = super::group_workflow::count_event::count_event_in_group(
+            &tx,
+            group_id,
+            &previous_status,
+            event_time,
+            error_data,
+        )
+        .await?;
         let observed_chunk = if refresh_chunk {
             Self::lookup_chunk(&tx, event_time).await?
         } else {
@@ -376,8 +378,47 @@ impl ErrorIngestionService {
             group_id,
             created,
             previous_status,
+            current_status,
             inserted: true,
         })
+    }
+
+    /// Lock the group an event is about to be counted in, and return its id
+    /// and status.
+    ///
+    /// The fingerprint lookup happens before the row lock, so a merge (ADR
+    /// 074, D1.2) can commit in between: the alias read a moment ago then
+    /// names a group that has just been merged away. Merges are one level
+    /// deep (a merge target cannot itself be merged away), so following
+    /// `merged_into_group_id` once reaches the surviving group, which keeps
+    /// the merged group's count frozen and the survivor's count exact. The
+    /// common path is the same single locking read as before.
+    pub(crate) async fn lock_group_following_merge<C: ConnectionTrait>(
+        tx: &C,
+        group_id: i32,
+    ) -> Result<(i32, String), ErrorTrackingError> {
+        let row = tx
+            .query_one(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT status, merged_into_group_id FROM error_groups WHERE id=$1 FOR UPDATE",
+                [group_id.into()],
+            ))
+            .await?
+            .ok_or(ErrorTrackingError::GroupNotFound)?;
+        let merged_into: Option<i32> = row.try_get("", "merged_into_group_id")?;
+        let Some(target) = merged_into else {
+            return Ok((group_id, row.try_get("", "status")?));
+        };
+        let status: String = tx
+            .query_one(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT status FROM error_groups WHERE id=$1 FOR UPDATE",
+                [target.into()],
+            ))
+            .await?
+            .ok_or(ErrorTrackingError::GroupNotFound)?
+            .try_get("", "status")?;
+        Ok((target, status))
     }
 
     // error_events also hash-partitions on id. A time range is warm only

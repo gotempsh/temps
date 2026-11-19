@@ -9494,6 +9494,146 @@
         ],
         "type": "object"
       },
+      "BulkErrorGroupAction": {
+        "description": "Status transition a bulk request applies.",
+        "enum": [
+          "resolve",
+          "unresolve",
+          "ignore"
+        ],
+        "type": "string"
+      },
+      "BulkErrorGroupFilter": {
+        "description": "Filters selecting \"every group matching\", with the same meaning they have\non the list endpoint. `{}` selects every group of the project that is not\nalready in the target status.",
+        "properties": {
+          "end_date": {
+            "description": "With `start_date`: only groups with at least one event in the window.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "environment_id": {
+            "description": "Only groups first seen in this environment.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "search": {
+            "description": "Case-insensitive substring of the title, error type or message.\nWildcards are matched literally.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "start_date": {
+            "description": "With `end_date`: only groups with at least one event in the window.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "description": "Only groups currently in this status.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "BulkErrorGroupRequest": {
+        "description": "Request body for `POST .../error-groups/bulk`. Provide exactly one of\n`group_ids` or `filter`.",
+        "properties": {
+          "action": {
+            "$ref": "#/components/schemas/BulkErrorGroupAction"
+          },
+          "filter": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/BulkErrorGroupFilter",
+                "description": "Update every group matching these filters, up to 1000 per request."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "group_ids": {
+            "description": "Explicit groups to update; every one must be in this project.",
+            "items": {
+              "format": "int32",
+              "type": "integer"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "ignore": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/IgnoreConditionsRequest",
+                "description": "With `action: ignore`: when the groups come back. Omitted, the next\nevent reopens them."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "type": "object"
+      },
+      "BulkErrorGroupResponse": {
+        "description": "Result of a bulk group update.",
+        "properties": {
+          "action": {
+            "$ref": "#/components/schemas/BulkErrorGroupAction"
+          },
+          "remaining": {
+            "description": "Matching groups left for a follow-up request because this one hit the\nper-request limit. Always 0 when `group_ids` was used.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "skipped": {
+            "description": "Selected groups already in the target status.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "updated": {
+            "description": "Number of groups whose status changed.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "updated_ids": {
+            "description": "Ids of the groups whose status changed.",
+            "items": {
+              "format": "int32",
+              "type": "integer"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "action",
+          "updated",
+          "updated_ids",
+          "skipped",
+          "remaining"
+        ],
+        "type": "object"
+      },
       "BulkJobProjectStatus": {
         "description": "Where one project has got to inside a bulk job.\n\n`switching` and `backfilling` are separate on purpose: the switch is cheap,\natomic and egresses nothing, while the backfill can run for hours and costs\nmoney. An operator watching a stuck job needs to know which of the two it is\nstuck in, and a project that failed after switching is *not* rolled back\n(ADR-042 §7) — so the two must be distinguishable after the fact too.",
         "enum": [
@@ -30091,6 +30231,55 @@
         ],
         "type": "object"
       },
+      "ErrorGroupFingerprintResponse": {
+        "description": "One fingerprint routing to a group.",
+        "properties": {
+          "fingerprint_hash": {
+            "type": "string"
+          },
+          "merged_from_group_id": {
+            "description": "Set when a merge moved this fingerprint here; unmerging that group\nmoves it back, and a split cannot take it.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "fingerprint_hash"
+        ],
+        "type": "object"
+      },
+      "ErrorGroupFingerprintsResponse": {
+        "description": "The fingerprints of one group.",
+        "properties": {
+          "fingerprints": {
+            "items": {
+              "$ref": "#/components/schemas/ErrorGroupFingerprintResponse"
+            },
+            "type": "array"
+          },
+          "group_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "merged_group_ids": {
+            "description": "Groups merged into this one.",
+            "items": {
+              "format": "int32",
+              "type": "integer"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "group_id",
+          "fingerprints",
+          "merged_group_ids"
+        ],
+        "type": "object"
+      },
       "ErrorGroupResponse": {
         "properties": {
           "affected_users": {
@@ -30153,8 +30342,27 @@
             "format": "int32",
             "type": "integer"
           },
+          "ignore": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/GroupIgnoreState",
+                "description": "While the group is ignored with conditions: when it comes back."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "last_seen": {
             "type": "string"
+          },
+          "merged_into_group_id": {
+            "description": "Set when this group was merged into another one. Its events and count\nstay with it so the merge can be undone, it is left out of lists, and\nits future events land in the group named here.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "message_template": {
             "type": [
@@ -36905,6 +37113,49 @@
         ],
         "type": "object"
       },
+      "GroupIgnoreState": {
+        "description": "The ignore conditions of an ignored group and how far along they are.",
+        "properties": {
+          "forever": {
+            "description": "Stays ignored whatever happens.",
+            "type": "boolean"
+          },
+          "until": {
+            "description": "Stays ignored until this time.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "until_event_count": {
+            "description": "Reopens when `total_count` reaches this value.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "until_user_count": {
+            "description": "Reopens when this many new distinct users are affected.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "user_count": {
+            "description": "New distinct users seen since it was ignored.",
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "user_count",
+          "forever"
+        ],
+        "type": "object"
+      },
       "GroupKey": {
         "description": "What to group or facet by.",
         "oneOf": [
@@ -38928,6 +39179,40 @@
           "allow_all"
         ],
         "type": "string"
+      },
+      "IgnoreConditionsRequest": {
+        "description": "When an ignored error group comes back. With no field set the next event\nreopens it; with fields set it stays ignored until any one is met.",
+        "properties": {
+          "event_count": {
+            "description": "Stay ignored for this many more occurrences (1 to 1,000,000).",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "forever": {
+            "description": "Stay ignored whatever happens. Excludes the other fields.",
+            "type": "boolean"
+          },
+          "until": {
+            "description": "Stay ignored until this time (at most 366 days ahead).",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "user_count": {
+            "description": "Stay ignored until this many new distinct users are affected\n(1 to 10,000).",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
       },
       "ImageConfig": {
         "description": "Runtime configuration baked into an image, read on the node that owns it.\n\nA worker build returns this so the control plane never needs a local copy\nof the image to learn which port it listens on.",
@@ -44951,6 +45236,58 @@
           "project_id",
           "name",
           "slug"
+        ],
+        "type": "object"
+      },
+      "MergeErrorGroupsRequest": {
+        "description": "Request body for `POST .../error-groups/{group_id}/merge`. The path group\nis the one that survives.",
+        "properties": {
+          "source_group_ids": {
+            "description": "Groups to merge into the path group; at most 50 per request.",
+            "items": {
+              "format": "int32",
+              "type": "integer"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "source_group_ids"
+        ],
+        "type": "object"
+      },
+      "MergeErrorGroupsResponse": {
+        "description": "Result of a merge.",
+        "properties": {
+          "merged_group_ids": {
+            "items": {
+              "format": "int32",
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "moved_fingerprints": {
+            "description": "Fingerprints now routing to the surviving group.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "target_group_id": {
+            "description": "The group that survived; future events of every merged fingerprint\nland here.",
+            "format": "int32",
+            "type": "integer"
+          },
+          "total_count": {
+            "description": "Events the surviving group accounts for after the merge.",
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "target_group_id",
+          "merged_group_ids",
+          "moved_fingerprints",
+          "total_count"
         ],
         "type": "object"
       },
@@ -72720,6 +73057,54 @@
         },
         "type": "object"
       },
+      "SplitErrorGroupRequest": {
+        "description": "Request body for `POST .../error-groups/{group_id}/split`.",
+        "properties": {
+          "fingerprints": {
+            "description": "Fingerprints to move out; at most 200 per request, and the group must\nkeep at least one.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "title": {
+            "description": "Title for the new group. Defaults to the original title with\n\"(split)\" appended.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "fingerprints"
+        ],
+        "type": "object"
+      },
+      "SplitErrorGroupResponse": {
+        "description": "Result of a split.",
+        "properties": {
+          "group_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "moved_fingerprints": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "new_group_id": {
+            "description": "The new group; future events of the moved fingerprints land here.",
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "group_id",
+          "new_group_id",
+          "moved_fingerprints"
+        ],
+        "type": "object"
+      },
       "StaleSlot": {
         "properties": {
           "active": {
@@ -78044,6 +78429,31 @@
         ],
         "type": "object"
       },
+      "UnmergeErrorGroupResponse": {
+        "description": "Result of taking a group back out of a merge.",
+        "properties": {
+          "group_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "moved_fingerprints": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "target_group_id": {
+            "description": "The group it had been merged into.",
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "group_id",
+          "target_group_id",
+          "moved_fingerprints"
+        ],
+        "type": "object"
+      },
       "UnsupportedFeature": {
         "description": "A feature from the source platform that cannot be migrated",
         "properties": {
@@ -79587,6 +79997,17 @@
             "type": [
               "string",
               "null"
+            ]
+          },
+          "ignore": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/IgnoreConditionsRequest",
+                "description": "With `status: ignored`: when the group comes back. Omitted, the next\nevent reopens it."
+              },
+              {
+                "type": "null"
+              }
             ]
           },
           "status": {
@@ -159401,6 +159822,70 @@
         "x-maturity": "beta"
       }
     },
+    "/projects/{project_id}/error-groups/bulk": {
+      "post": {
+        "operationId": "bulkUpdateErrorGroups",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BulkErrorGroupRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BulkErrorGroupResponse"
+                }
+              }
+            },
+            "description": "Groups updated"
+          },
+          "400": {
+            "description": "Invalid selection or filter"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "A group in group_ids is not in this project"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Resolve, reopen or ignore many error groups of a project at once — either\nthe explicit `group_ids` or every group matching `filter`.",
+        "tags": [
+          "error-tracking"
+        ],
+        "x-maturity": "beta"
+      }
+    },
     "/projects/{project_id}/error-groups/{group_id}": {
       "get": {
         "operationId": "get_error_group",
@@ -159664,6 +160149,286 @@
           }
         },
         "summary": "Get a specific error event",
+        "tags": [
+          "error-tracking"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/projects/{project_id}/error-groups/{group_id}/fingerprints": {
+      "get": {
+        "operationId": "listErrorGroupFingerprints",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Error group ID",
+            "in": "path",
+            "name": "group_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorGroupFingerprintsResponse"
+                }
+              }
+            },
+            "description": "Fingerprints of the group"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "The group is not in this project"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "The fingerprints routing to this group, and the groups merged into it.",
+        "tags": [
+          "error-tracking"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/projects/{project_id}/error-groups/{group_id}/merge": {
+      "post": {
+        "description": "Stored events keep the group they were ingested into, so nothing is\nrewritten and unmerging restores both groups exactly.",
+        "operationId": "mergeErrorGroups",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Surviving error group ID",
+            "in": "path",
+            "name": "group_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MergeErrorGroupsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MergeErrorGroupsResponse"
+                }
+              }
+            },
+            "description": "Groups merged"
+          },
+          "400": {
+            "description": "Invalid selection"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "A named group is not in this project"
+          },
+          "409": {
+            "description": "A named group is already merged, or has groups merged into it"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Merge other groups into this one: their fingerprints route here, so their\nfuture events land here, and their counts are added to this group's.",
+        "tags": [
+          "error-tracking"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/projects/{project_id}/error-groups/{group_id}/split": {
+      "post": {
+        "operationId": "splitErrorGroup",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Error group ID",
+            "in": "path",
+            "name": "group_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SplitErrorGroupRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SplitErrorGroupResponse"
+                }
+              }
+            },
+            "description": "Fingerprints split out"
+          },
+          "400": {
+            "description": "Invalid selection"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "The group or a fingerprint is not in this project"
+          },
+          "409": {
+            "description": "The group is merged into another group"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Split named fingerprints out of this group into a new one, so their future\nevents are tracked separately. Stored events stay with this group.",
+        "tags": [
+          "error-tracking"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/projects/{project_id}/error-groups/{group_id}/unmerge": {
+      "post": {
+        "operationId": "unmergeErrorGroup",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Merged-away error group ID",
+            "in": "path",
+            "name": "group_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnmergeErrorGroupResponse"
+                }
+              }
+            },
+            "description": "Group taken out of the merge"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "The group is not in this project"
+          },
+          "409": {
+            "description": "The group is not merged into another group"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Take this group back out of the merge it is part of: its fingerprints\nroute to it again and the count it contributed is subtracted from the\ngroup it was merged into.",
         "tags": [
           "error-tracking"
         ],
@@ -184756,6 +185521,10 @@
     {
       "description": "Release correlation across native telemetry",
       "name": "releases"
+    },
+    {
+      "description": "Error tracking issue workflow endpoints",
+      "name": "error-tracking"
     },
     {
       "description": "Approximate SDK-reported telemetry discards",

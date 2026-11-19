@@ -17,6 +17,8 @@ import {
   listErrorGroupsQueryKey,
   listDsnsOptions,
   listUsersOptions,
+  bulkUpdateErrorGroupsMutation,
+  mergeErrorGroupsMutation,
   updateErrorGroupMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import { ErrorTimeSeriesChart } from '@/components/error-tracking/ErrorTimeSeriesChart'
@@ -38,6 +40,8 @@ import { FixErrorWithAgentButton } from '@/components/ai/FixErrorWithAgentButton
 import { offersFixInList } from '@/components/ai/fix-error-with-agent'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader } from '@/components/ui/card'
+import { Checkbox } from '@/components/ui/checkbox'
+import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import {
   Dialog,
   DialogContent,
@@ -84,6 +88,8 @@ import { useEffect, useMemo, useState } from 'react'
 import { Link, useNavigate, useSearchParams } from 'react-router'
 import { toast } from 'sonner'
 import { TimeAgo } from '../utils/TimeAgo'
+import { BulkTriageBar } from './BulkTriageBar'
+import type { IgnoreConditions } from '@/components/error-tracking/ignore-presets'
 import { errorGroupSortQuery, EVENT_COUNT_SORT } from './error-group-sort'
 import { errorRowText } from './error-row-text'
 import { useWindowQuery } from '@/hooks/useWindowQuery'
@@ -234,11 +240,20 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
   // Determine if we have errors
   const hasErrors = hasErrorGroupsData?.has_error_groups || false
 
+  // Bulk triage selection, by group id. Cleared whenever the visible page
+  // changes, so a resolve can never land on a group the user cannot see.
+  const [selectedGroupIds, setSelectedGroupIds] = useState<number[]>([])
   const pageScope = `${statusFilter}\u0000${groupSort}\u0000${environmentFilter}\u0000${dateFilter.quickFilter}\u0000${dateFilter.dateRange?.from?.getTime() ?? ''}\u0000${dateFilter.dateRange?.to?.getTime() ?? ''}`
   const [previousPageScope, setPreviousPageScope] = useState(pageScope)
   if (pageScope !== previousPageScope) {
     setPreviousPageScope(pageScope)
     setPage(1)
+    setSelectedGroupIds([])
+  }
+  const [previousListPage, setPreviousListPage] = useState(page)
+  if (page !== previousListPage) {
+    setPreviousListPage(page)
+    setSelectedGroupIds([])
   }
 
   // Fetch error groups for the project (only if we have errors)
@@ -301,6 +316,76 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
       })
     },
   })
+
+  // One request for the whole selection; the console never loops over the
+  // single-group endpoint.
+  const bulkMutation = useMutation({
+    ...bulkUpdateErrorGroupsMutation(),
+    meta: { errorTitle: 'Failed to update the selected error groups' },
+    onSuccess: (response) => {
+      setSelectedGroupIds([])
+      const updated = response.updated
+      const verb =
+        response.action === 'resolve'
+          ? 'resolved'
+          : response.action === 'ignore'
+            ? 'ignored'
+            : 'reopened'
+      toast.success(
+        updated === 1
+          ? `1 error group ${verb}`
+          : `${updated.toLocaleString()} error groups ${verb}`,
+        response.skipped > 0
+          ? {
+              description: `${response.skipped.toLocaleString()} already ${verb}.`,
+            }
+          : undefined
+      )
+      queryClient.invalidateQueries({
+        queryKey: queryKeyPrefix(listErrorGroupsQueryKey, {
+          path: projectPath,
+        }),
+      })
+      queryClient.invalidateQueries({
+        queryKey: queryKeyPrefix(getErrorDashboardStatsQueryKey, {
+          path: projectPath,
+        }),
+      })
+    },
+  })
+
+  // The oldest selected group survives a merge: it carries the issue's
+  // history, and a stable rule keeps the dialog's promise exact.
+  const [mergeTarget, setMergeTarget] = useState<number | null>(null)
+  const mergeMutation = useMutation({
+    ...mergeErrorGroupsMutation(),
+    meta: { errorTitle: 'Failed to merge the selected error groups' },
+    onSuccess: (response) => {
+      setSelectedGroupIds([])
+      setMergeTarget(null)
+      toast.success(
+        `${response.merged_group_ids.length + 1} error groups merged`,
+        {
+          description: `Future events land in #${response.target_group_id}.`,
+        }
+      )
+      queryClient.invalidateQueries({
+        queryKey: queryKeyPrefix(listErrorGroupsQueryKey, {
+          path: projectPath,
+        }),
+      })
+    },
+    onError: () => setMergeTarget(null),
+  })
+
+  const applyBulkAction = (
+    action: 'resolve' | 'unresolve' | 'ignore',
+    ignore?: IgnoreConditions
+  ) =>
+    bulkMutation.mutate({
+      path: { project_id: project.id },
+      body: { action, group_ids: selectedGroupIds, ignore },
+    })
 
   // Fetch DSN for the selected environment (always fetch when environment is selected)
   const { data: dsnInfo, refetch: refetchDsn } = useQuery({
@@ -426,6 +511,7 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
     )
   }
 
+  const visibleGroupIds = (errorGroupsResponse?.data ?? []).map((g) => g.id)
   const trendDelta = dashboardStats?.total_errors_change_percent ?? 0
   const trendUp = trendDelta > 0
 
@@ -483,6 +569,19 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
         )}
         onClick={onClick}
       >
+        <Checkbox
+          className="shrink-0"
+          checked={selectedGroupIds.includes(group.id)}
+          onClick={(e) => e.stopPropagation()}
+          onCheckedChange={(checked) =>
+            setSelectedGroupIds((current) =>
+              checked === true
+                ? [...current, group.id]
+                : current.filter((id) => id !== group.id)
+            )
+          }
+          aria-label={`Select ${text.headline}`}
+        />
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2 flex-wrap">
             <Badge
@@ -799,6 +898,39 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
           ) : errorGroupsResponse?.pagination?.total_count &&
             errorGroupsResponse.pagination.total_count > 0 ? (
             <>
+              <BulkTriageBar
+                pageGroupIds={visibleGroupIds}
+                selectedGroupIds={selectedGroupIds}
+                onSelectionChange={setSelectedGroupIds}
+                onAction={applyBulkAction}
+                onMerge={() =>
+                  setMergeTarget(Math.min(...selectedGroupIds))
+                }
+                isPending={bulkMutation.isPending || mergeMutation.isPending}
+              />
+              <ConfirmDialog
+                open={mergeTarget !== null}
+                onOpenChange={(open) => !open && setMergeTarget(null)}
+                title={`Merge ${selectedGroupIds.length} error groups`}
+                description={
+                  mergeTarget !== null
+                    ? `Group #${mergeTarget} survives. The others keep their events and stop being listed, and their future events land in #${mergeTarget}. You can undo this from the surviving group.`
+                    : ''
+                }
+                confirmLabel="Merge"
+                destructive={false}
+                onConfirm={() => {
+                  if (mergeTarget === null) return
+                  mergeMutation.mutate({
+                    path: { project_id: project.id, group_id: mergeTarget },
+                    body: {
+                      source_group_ids: selectedGroupIds.filter(
+                        (id) => id !== mergeTarget
+                      ),
+                    },
+                  })
+                }}
+              />
               <div className="rounded-md border border-border/60 bg-card px-3">
                 {errorGroupsResponse.data?.map((group, idx) =>
                   renderErrorRow(group, idx)

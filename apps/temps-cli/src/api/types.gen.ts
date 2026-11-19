@@ -4420,6 +4420,78 @@ export type BulkAlarmResponse = {
 };
 
 /**
+ * Status transition a bulk request applies.
+ */
+export type BulkErrorGroupAction = 'resolve' | 'unresolve' | 'ignore';
+
+/**
+ * Filters selecting "every group matching", with the same meaning they have
+ * on the list endpoint. `{}` selects every group of the project that is not
+ * already in the target status.
+ */
+export type BulkErrorGroupFilter = {
+    /**
+     * With `start_date`: only groups with at least one event in the window.
+     */
+    end_date?: string | null;
+    /**
+     * Only groups first seen in this environment.
+     */
+    environment_id?: number | null;
+    /**
+     * Case-insensitive substring of the title, error type or message.
+     * Wildcards are matched literally.
+     */
+    search?: string | null;
+    /**
+     * With `end_date`: only groups with at least one event in the window.
+     */
+    start_date?: string | null;
+    /**
+     * Only groups currently in this status.
+     */
+    status?: string | null;
+};
+
+/**
+ * Request body for `POST .../error-groups/bulk`. Provide exactly one of
+ * `group_ids` or `filter`.
+ */
+export type BulkErrorGroupRequest = {
+    action: BulkErrorGroupAction;
+    filter?: BulkErrorGroupFilter | null;
+    /**
+     * Explicit groups to update; every one must be in this project.
+     */
+    group_ids?: Array<number> | null;
+    ignore?: IgnoreConditionsRequest | null;
+};
+
+/**
+ * Result of a bulk group update.
+ */
+export type BulkErrorGroupResponse = {
+    action: BulkErrorGroupAction;
+    /**
+     * Matching groups left for a follow-up request because this one hit the
+     * per-request limit. Always 0 when `group_ids` was used.
+     */
+    remaining: number;
+    /**
+     * Selected groups already in the target status.
+     */
+    skipped: number;
+    /**
+     * Number of groups whose status changed.
+     */
+    updated: number;
+    /**
+     * Ids of the groups whose status changed.
+     */
+    updated_ids: Array<number>;
+};
+
+/**
  * Where one project has got to inside a bulk job.
  *
  * `switching` and `backfilling` are separate on purpose: the switch is cheap,
@@ -14167,6 +14239,30 @@ export type ErrorGroupDeploymentResponse = {
     id: number;
 };
 
+/**
+ * One fingerprint routing to a group.
+ */
+export type ErrorGroupFingerprintResponse = {
+    fingerprint_hash: string;
+    /**
+     * Set when a merge moved this fingerprint here; unmerging that group
+     * moves it back, and a split cannot take it.
+     */
+    merged_from_group_id?: number | null;
+};
+
+/**
+ * The fingerprints of one group.
+ */
+export type ErrorGroupFingerprintsResponse = {
+    fingerprints: Array<ErrorGroupFingerprintResponse>;
+    group_id: number;
+    /**
+     * Groups merged into this one.
+     */
+    merged_group_ids: Array<number>;
+};
+
 export type ErrorGroupResponse = {
     /**
      * Count of distinct affected visitors/users within the requested time window.
@@ -14186,7 +14282,14 @@ export type ErrorGroupResponse = {
     events_in_range?: number | null;
     first_seen: string;
     id: number;
+    ignore?: GroupIgnoreState | null;
     last_seen: string;
+    /**
+     * Set when this group was merged into another one. Its events and count
+     * stay with it so the merge can be undone, it is left out of lists, and
+     * its future events land in the group named here.
+     */
+    merged_into_group_id?: number | null;
     message_template?: string | null;
     project_id: number;
     status: string;
@@ -17172,6 +17275,32 @@ export type GroupEnvVarResponse = {
 };
 
 /**
+ * The ignore conditions of an ignored group and how far along they are.
+ */
+export type GroupIgnoreState = {
+    /**
+     * Stays ignored whatever happens.
+     */
+    forever: boolean;
+    /**
+     * Stays ignored until this time.
+     */
+    until?: string | null;
+    /**
+     * Reopens when `total_count` reaches this value.
+     */
+    until_event_count?: number | null;
+    /**
+     * Reopens when this many new distinct users are affected.
+     */
+    until_user_count?: number | null;
+    /**
+     * New distinct users seen since it was ignored.
+     */
+    user_count: number;
+};
+
+/**
  * What to group or facet by.
  */
 export type GroupKey = {
@@ -18105,6 +18234,30 @@ export type HttpChecksCapabilities = {
  * for such an address until a run records a choice.
  */
 export type HttpPolicy = 'https_only' | 'allow_http' | 'allow_all';
+
+/**
+ * When an ignored error group comes back. With no field set the next event
+ * reopens it; with fields set it stays ignored until any one is met.
+ */
+export type IgnoreConditionsRequest = {
+    /**
+     * Stay ignored for this many more occurrences (1 to 1,000,000).
+     */
+    event_count?: number | null;
+    /**
+     * Stay ignored whatever happens. Excludes the other fields.
+     */
+    forever?: boolean;
+    /**
+     * Stay ignored until this time (at most 366 days ahead).
+     */
+    until?: string | null;
+    /**
+     * Stay ignored until this many new distinct users are affected
+     * (1 to 10,000).
+     */
+    user_count?: number | null;
+};
 
 /**
  * Runtime configuration baked into an image, read on the node that owns it.
@@ -20799,6 +20952,37 @@ export type MemberSyncResult = {
     name: string;
     project_id: number;
     slug: string;
+};
+
+/**
+ * Request body for `POST .../error-groups/{group_id}/merge`. The path group
+ * is the one that survives.
+ */
+export type MergeErrorGroupsRequest = {
+    /**
+     * Groups to merge into the path group; at most 50 per request.
+     */
+    source_group_ids: Array<number>;
+};
+
+/**
+ * Result of a merge.
+ */
+export type MergeErrorGroupsResponse = {
+    merged_group_ids: Array<number>;
+    /**
+     * Fingerprints now routing to the surviving group.
+     */
+    moved_fingerprints: number;
+    /**
+     * The group that survived; future events of every merged fingerprint
+     * land here.
+     */
+    target_group_id: number;
+    /**
+     * Events the surviving group accounts for after the merge.
+     */
+    total_count: number;
 };
 
 /**
@@ -33712,6 +33896,34 @@ export type SpeedSegmentFilters = {
     filter_region?: string | null;
 };
 
+/**
+ * Request body for `POST .../error-groups/{group_id}/split`.
+ */
+export type SplitErrorGroupRequest = {
+    /**
+     * Fingerprints to move out; at most 200 per request, and the group must
+     * keep at least one.
+     */
+    fingerprints: Array<string>;
+    /**
+     * Title for the new group. Defaults to the original title with
+     * "(split)" appended.
+     */
+    title?: string | null;
+};
+
+/**
+ * Result of a split.
+ */
+export type SplitErrorGroupResponse = {
+    group_id: number;
+    moved_fingerprints: number;
+    /**
+     * The new group; future events of the moved fingerprints land here.
+     */
+    new_group_id: number;
+};
+
 export type StaleSlot = {
     active: boolean;
     retained_bytes: number;
@@ -36214,6 +36426,18 @@ export type UniqueCountsResponse = {
 };
 
 /**
+ * Result of taking a group back out of a merge.
+ */
+export type UnmergeErrorGroupResponse = {
+    group_id: number;
+    moved_fingerprints: number;
+    /**
+     * The group it had been merged into.
+     */
+    target_group_id: number;
+};
+
+/**
  * A feature from the source platform that cannot be migrated
  */
 export type UnsupportedFeature = {
@@ -36987,6 +37211,7 @@ export type UpdateErrorGroupRequest = {
      * - `null` / field omitted — leaves the existing value unchanged.
      */
     assigned_to?: string | null;
+    ignore?: IgnoreConditionsRequest | null;
     status: string;
 };
 
@@ -83854,6 +84079,50 @@ export type ListErrorGroupsResponses = {
 
 export type ListErrorGroupsResponse = ListErrorGroupsResponses[keyof ListErrorGroupsResponses];
 
+export type BulkUpdateErrorGroupsData = {
+    body: BulkErrorGroupRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/error-groups/bulk';
+};
+
+export type BulkUpdateErrorGroupsErrors = {
+    /**
+     * Invalid selection or filter
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * A group in group_ids is not in this project
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type BulkUpdateErrorGroupsResponses = {
+    /**
+     * Groups updated
+     */
+    200: BulkErrorGroupResponse;
+};
+
+export type BulkUpdateErrorGroupsResponse = BulkUpdateErrorGroupsResponses[keyof BulkUpdateErrorGroupsResponses];
+
 export type GetErrorGroupData = {
     body?: never;
     path: {
@@ -84015,6 +84284,202 @@ export type GetErrorEventResponses = {
 };
 
 export type GetErrorEventResponse = GetErrorEventResponses[keyof GetErrorEventResponses];
+
+export type ListErrorGroupFingerprintsData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Error group ID
+         */
+        group_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/error-groups/{group_id}/fingerprints';
+};
+
+export type ListErrorGroupFingerprintsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * The group is not in this project
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListErrorGroupFingerprintsResponses = {
+    /**
+     * Fingerprints of the group
+     */
+    200: ErrorGroupFingerprintsResponse;
+};
+
+export type ListErrorGroupFingerprintsResponse = ListErrorGroupFingerprintsResponses[keyof ListErrorGroupFingerprintsResponses];
+
+export type MergeErrorGroupsData = {
+    body: MergeErrorGroupsRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Surviving error group ID
+         */
+        group_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/error-groups/{group_id}/merge';
+};
+
+export type MergeErrorGroupsErrors = {
+    /**
+     * Invalid selection
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * A named group is not in this project
+     */
+    404: unknown;
+    /**
+     * A named group is already merged, or has groups merged into it
+     */
+    409: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type MergeErrorGroupsResponses = {
+    /**
+     * Groups merged
+     */
+    200: MergeErrorGroupsResponse;
+};
+
+export type MergeErrorGroupsResponse2 = MergeErrorGroupsResponses[keyof MergeErrorGroupsResponses];
+
+export type SplitErrorGroupData = {
+    body: SplitErrorGroupRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Error group ID
+         */
+        group_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/error-groups/{group_id}/split';
+};
+
+export type SplitErrorGroupErrors = {
+    /**
+     * Invalid selection
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * The group or a fingerprint is not in this project
+     */
+    404: unknown;
+    /**
+     * The group is merged into another group
+     */
+    409: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type SplitErrorGroupResponses = {
+    /**
+     * Fingerprints split out
+     */
+    200: SplitErrorGroupResponse;
+};
+
+export type SplitErrorGroupResponse2 = SplitErrorGroupResponses[keyof SplitErrorGroupResponses];
+
+export type UnmergeErrorGroupData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Merged-away error group ID
+         */
+        group_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/error-groups/{group_id}/unmerge';
+};
+
+export type UnmergeErrorGroupErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * The group is not in this project
+     */
+    404: unknown;
+    /**
+     * The group is not merged into another group
+     */
+    409: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UnmergeErrorGroupResponses = {
+    /**
+     * Group taken out of the merge
+     */
+    200: UnmergeErrorGroupResponse;
+};
+
+export type UnmergeErrorGroupResponse2 = UnmergeErrorGroupResponses[keyof UnmergeErrorGroupResponses];
 
 export type GetErrorStatsData = {
     body?: never;

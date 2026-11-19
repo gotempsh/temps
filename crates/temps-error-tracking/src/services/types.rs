@@ -32,6 +32,48 @@ pub enum ErrorTrackingError {
     #[error("Error group not found")]
     GroupNotFound,
 
+    /// One or more group ids in a bulk request do not belong to the project.
+    /// Maps to HTTP 404 Not Found.
+    #[error(
+        "Error groups {group_ids:?} are not in project {project_id}; a bulk request must name only this project's groups"
+    )]
+    GroupsNotFound {
+        project_id: i32,
+        group_ids: Vec<i32>,
+    },
+
+    /// A merge or split names a group that is already merged into another.
+    /// Maps to HTTP 409 Conflict.
+    #[error(
+        "Error group {group_id} is already merged into group {merged_into_group_id}; unmerge it first"
+    )]
+    GroupAlreadyMerged {
+        group_id: i32,
+        merged_into_group_id: i32,
+    },
+
+    /// A merge would move a group that has itself absorbed other groups,
+    /// which would make unmerging ambiguous. Maps to HTTP 409 Conflict.
+    #[error(
+        "Error group {group_id} has other groups merged into it; unmerge those before merging it away"
+    )]
+    GroupIsMergeTarget { group_id: i32 },
+
+    /// Unmerge was asked for a group that is not part of a merge.
+    /// Maps to HTTP 409 Conflict.
+    #[error("Error group {group_id} is not merged into another group")]
+    GroupNotMerged { group_id: i32 },
+
+    /// A split names fingerprints that do not route to the group.
+    /// Maps to HTTP 404 Not Found.
+    #[error(
+        "Fingerprints {fingerprints:?} do not belong to error group {group_id}, or belong to a merge"
+    )]
+    FingerprintsNotInGroup {
+        group_id: i32,
+        fingerprints: Vec<String>,
+    },
+
     #[error("Error event not found")]
     EventNotFound,
 
@@ -289,6 +331,12 @@ pub struct ErrorGroupDomain {
     pub total_count: i32,
     pub status: String,
     pub assigned_to: Option<String>,
+    /// Set when this group was merged into another one: its fingerprints and
+    /// future events belong to that group now (ADR 074, D1.2).
+    pub merged_into_group_id: Option<i32>,
+    /// While the group is ignored with conditions: when it comes back
+    /// (ADR 074, D1.3). `None` for any other group.
+    pub ignore: Option<GroupIgnoreState>,
     pub project_id: i32,
     pub environment_id: Option<i32>,
     pub deployment_id: Option<i32>,
@@ -517,5 +565,38 @@ mod without_nul_tests {
             Some("literal \\u0000 text")
         );
         assert_eq!(event.screen_width, Some(1920));
+    }
+}
+
+/// The ignore conditions of an ignored group and how far along they are.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct GroupIgnoreState {
+    /// Stays ignored until this time.
+    #[schema(value_type = Option<String>, format = DateTime)]
+    pub until: Option<chrono::DateTime<chrono::Utc>>,
+    /// Reopens when `total_count` reaches this value.
+    pub until_event_count: Option<i32>,
+    /// Reopens when this many new distinct users are affected.
+    pub until_user_count: Option<i32>,
+    /// New distinct users seen since it was ignored.
+    pub user_count: i32,
+    /// Stays ignored whatever happens.
+    pub forever: bool,
+}
+
+impl GroupIgnoreState {
+    /// The state of an ignored group with conditions; `None` otherwise.
+    pub fn from_group(group: &temps_entities::error_groups::Model) -> Option<Self> {
+        let has_conditions = group.ignore_forever
+            || group.ignore_until.is_some()
+            || group.ignore_until_event_count.is_some()
+            || group.ignore_until_user_count.is_some();
+        (group.status == "ignored" && has_conditions).then_some(Self {
+            until: group.ignore_until,
+            until_event_count: group.ignore_until_event_count,
+            until_user_count: group.ignore_until_user_count,
+            user_count: group.ignore_user_count,
+            forever: group.ignore_forever,
+        })
     }
 }

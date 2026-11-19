@@ -61,6 +61,7 @@ pub struct ErrorTrackingApiDoc;
 pub fn configure_routes() -> Router<Arc<AppState>> {
     Router::new()
         .merge(super::feedback_handler::routes())
+        .merge(super::group_workflow_handler::routes())
         .merge(super::release_handler::routes())
         .merge(super::client_outcome_handler::routes())
         .route("/error-groups", get(list_global_error_groups))
@@ -133,6 +134,9 @@ pub struct UpdateErrorGroupRequest {
     /// - `Some("")` (empty string) — clears the current assignment (sets to null).
     /// - `null` / field omitted — leaves the existing value unchanged.
     pub assigned_to: Option<String>,
+    /// With `status: ignored`: when the group comes back. Omitted, the next
+    /// event reopens it.
+    pub ignore: Option<super::group_workflow_handler::IgnoreConditionsRequest>,
 }
 
 #[derive(Debug, Deserialize, ToSchema, IntoParams)]
@@ -195,6 +199,12 @@ pub struct ErrorGroupResponse {
     pub total_count: i32,
     pub status: String,
     pub assigned_to: Option<String>,
+    /// Set when this group was merged into another one. Its events and count
+    /// stay with it so the merge can be undone, it is left out of lists, and
+    /// its future events land in the group named here.
+    pub merged_into_group_id: Option<i32>,
+    /// While the group is ignored with conditions: when it comes back.
+    pub ignore: Option<crate::services::types::GroupIgnoreState>,
     pub project_id: i32,
     pub environment_id: Option<i32>,
     pub deployment_id: Option<i32>,
@@ -284,6 +294,8 @@ impl From<ErrorGroupDomain> for ErrorGroupResponse {
             total_count: group.total_count,
             status: group.status,
             assigned_to: group.assigned_to,
+            merged_into_group_id: group.merged_into_group_id,
+            ignore: group.ignore,
             project_id: group.project_id,
             environment_id: group.environment_id,
             deployment_id: group.deployment_id,
@@ -332,6 +344,52 @@ impl From<ErrorTrackingError> for temps_core::problemdetails::Problem {
             | ErrorTrackingError::ProjectNotFound => problemdetails::new(StatusCode::NOT_FOUND)
                 .with_title("Not Found")
                 .with_detail(err.to_string()),
+            ErrorTrackingError::GroupsNotFound {
+                project_id,
+                ref group_ids,
+            } => temps_core::error_builder::ErrorBuilder::new(StatusCode::NOT_FOUND)
+                .type_("https://temps.sh/probs/error-groups-not-found")
+                .title("Error Groups Not Found")
+                .detail(err.to_string())
+                .value("project_id", project_id)
+                .value("group_ids", group_ids.clone())
+                .build(),
+            ErrorTrackingError::FingerprintsNotInGroup {
+                group_id,
+                ref fingerprints,
+            } => temps_core::error_builder::ErrorBuilder::new(StatusCode::NOT_FOUND)
+                .type_("https://temps.sh/probs/fingerprints-not-in-error-group")
+                .title("Fingerprints Not In Error Group")
+                .detail(err.to_string())
+                .value("group_id", group_id)
+                .value("fingerprints", fingerprints.clone())
+                .build(),
+            ErrorTrackingError::GroupAlreadyMerged {
+                group_id,
+                merged_into_group_id,
+            } => temps_core::error_builder::ErrorBuilder::new(StatusCode::CONFLICT)
+                .type_("https://temps.sh/probs/error-group-already-merged")
+                .title("Error Group Already Merged")
+                .detail(err.to_string())
+                .value("group_id", group_id)
+                .value("merged_into_group_id", merged_into_group_id)
+                .build(),
+            ErrorTrackingError::GroupIsMergeTarget { group_id } => {
+                temps_core::error_builder::ErrorBuilder::new(StatusCode::CONFLICT)
+                    .type_("https://temps.sh/probs/error-group-is-merge-target")
+                    .title("Error Group Is A Merge Target")
+                    .detail(err.to_string())
+                    .value("group_id", group_id)
+                    .build()
+            }
+            ErrorTrackingError::GroupNotMerged { group_id } => {
+                temps_core::error_builder::ErrorBuilder::new(StatusCode::CONFLICT)
+                    .type_("https://temps.sh/probs/error-group-not-merged")
+                    .title("Error Group Is Not Merged")
+                    .detail(err.to_string())
+                    .value("group_id", group_id)
+                    .build()
+            }
             ErrorTrackingError::InvalidFingerprint | ErrorTrackingError::Validation(_) => {
                 problemdetails::new(StatusCode::BAD_REQUEST)
                     .with_title("Validation Error")
@@ -370,6 +428,13 @@ impl axum::response::IntoResponse for ErrorTrackingError {
             ErrorTrackingError::GroupNotFound => {
                 (StatusCode::NOT_FOUND, "Error group not found".to_string())
             }
+            ErrorTrackingError::GroupsNotFound { .. }
+            | ErrorTrackingError::FingerprintsNotInGroup { .. } => {
+                (StatusCode::NOT_FOUND, self.to_string())
+            }
+            ErrorTrackingError::GroupAlreadyMerged { .. }
+            | ErrorTrackingError::GroupIsMergeTarget { .. }
+            | ErrorTrackingError::GroupNotMerged { .. } => (StatusCode::CONFLICT, self.to_string()),
             ErrorTrackingError::EventNotFound => {
                 (StatusCode::NOT_FOUND, "Error event not found".to_string())
             }
@@ -538,6 +603,7 @@ pub async fn update_error_group(
             project_id,
             request.status.clone(),
             request.assigned_to.clone(),
+            request.ignore.clone().map(Into::into),
         )
         .await?;
 
@@ -551,6 +617,7 @@ pub async fn update_error_group(
         group_id,
         status: request.status,
         assigned_to: request.assigned_to,
+        ignore: request.ignore,
     };
     if let Err(e) = state.audit_service.create_audit_log(&audit).await {
         tracing::error!(
@@ -1097,6 +1164,7 @@ mod tests {
             Path((project_id, group_id)),
             Extension(metadata()),
             Json(UpdateErrorGroupRequest {
+                ignore: None,
                 status: "resolved".to_string(),
                 assigned_to: Some("owner@example.com".to_string()),
             }),
@@ -1132,6 +1200,7 @@ mod tests {
             Path((project_id + 10_000, group_id)),
             Extension(metadata()),
             Json(UpdateErrorGroupRequest {
+                ignore: None,
                 status: "ignored".to_string(),
                 assigned_to: None,
             }),

@@ -34,8 +34,28 @@ pub struct Model {
     pub total_count: i32,
 
     // Status management
-    pub status: String, // 'unresolved', 'resolved', 'ignored', 'assigned'
+    pub status: String,              // 'unresolved', 'resolved', 'ignored'
     pub assigned_to: Option<String>, // User ID or email
+
+    /// Set when this group was merged into another one (ADR 074, D1.2): its
+    /// fingerprints now route to that group and new events land there. The
+    /// row keeps its own events and `total_count` so unmerging restores both
+    /// exactly, and lists and status counts skip it while this is set.
+    pub merged_into_group_id: Option<i32>,
+
+    // Ignore conditions (ADR 074, D1.3), read only while `status` is
+    // 'ignored'. With none set, the next event reopens the group; otherwise
+    // it stays ignored until any condition is met.
+    /// Stay ignored until this time.
+    pub ignore_until: Option<DBDateTime>,
+    /// Stay ignored until `total_count` reaches this value.
+    pub ignore_until_event_count: Option<i32>,
+    /// Stay ignored until this many new distinct users are affected.
+    pub ignore_until_user_count: Option<i32>,
+    /// New distinct users seen since the group was ignored.
+    pub ignore_user_count: i32,
+    /// Stay ignored whatever happens.
+    pub ignore_forever: bool,
 
     // Relations
     pub project_id: i32,

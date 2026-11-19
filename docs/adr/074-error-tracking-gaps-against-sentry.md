@@ -2,7 +2,10 @@
 
 ## Status
 
-Proposed — 2026-11-19
+Proposed — 2026-11-19. Being implemented in the order of the Decision
+section. D1.1 (bulk actions), D1.2 (merge and split) and D1.3 (ignore
+until) have shipped; the questions they settled are recorded under
+"Settled while implementing".
 
 Related: ADR 016 (ClickHouse traces backend), ADR 027 (cross-project trace
 linking), ADR 033 (release identity for symbolication), ADR 054 (autofix
@@ -57,8 +60,10 @@ The gaps, most important first.
 2. **Merge and split.** Two groups that are one bug cannot be combined; a
    group that hides two bugs cannot be divided. The only tool is an SDK
    fingerprint, which changes future events only.
-3. **Ignore until.** `ignored` is permanent. No "until it happens 100 more
-   times", "until it affects 10 users" or "for a week".
+3. **Ignore until.** `ignored` has no condition. (This said `ignored` was
+   permanent; the code reopens an ignored group on its next event, exactly
+   as it reopens a resolved one.) No "until it happens 100 more times",
+   "until it affects 10 users" or "for a week", and no "forever".
 4. **Server-side inbound filters.** Noise (browser extensions, known crawlers,
    a message pattern, an old release) can only be dropped in the SDK with
    `ignoreErrors`. The server stores everything it is sent.
@@ -188,3 +193,59 @@ deploys, which is web services. It comes last and may never be worth building.
   with different detail views.
 - Whether D3 should wait until there is demand from mobile or desktop users,
   given how little it adds for web services.
+
+## Settled while implementing
+
+### D1.1 Bulk actions
+
+- `POST /projects/{project_id}/error-groups/bulk` takes either explicit
+  `group_ids` or a `filter` (status, environment, event window, text
+  search), never both. At most 1,000 groups per request; a filter reports
+  how many matching groups are `remaining` for a follow-up request. An id
+  from another project fails the whole request before anything is written.
+- One audit entry per request, with the selection and the groups changed.
+  `status_change` alert rules are evaluated for the changed groups with one
+  query per rule, and at most 50 notifications are delivered per request;
+  the groups beyond that are not recorded as fired.
+
+### D1.2 Merge and split
+
+- The alias table is the existing `error_group_fingerprints`: a merge
+  repoints the merged groups' fingerprints at the survivor and records
+  where each came from (`merged_from_group_id`), so ingest needs no change
+  to follow it. Merged groups keep their events and `total_count`
+  (`merged_into_group_id` marks them and hides them from lists); the
+  survivor adds their counts. Unmerge is the exact reverse; events
+  ingested while merged stay in the survivor with the count that covers
+  them.
+- Merges are one level deep: a merged-away group cannot be merged again
+  and a group that absorbed others cannot be merged away. That keeps
+  unmerge unambiguous and lets ingest follow `merged_into_group_id` once
+  when an event read the alias just before a merge committed, so counts
+  stay exact under that race.
+- Neither operation changes a status, so a merge cannot reopen a group or
+  fire an alert. A retried SDK event after a merge resolves through its
+  retry receipt to the group it was first stored in, and is not counted
+  again.
+- Split moves named fingerprints to a new group that starts at zero
+  events; stored events stay where they are. A fingerprint that arrived
+  through a merge belongs to that merge and cannot be split out.
+
+### D1.3 Ignore until
+
+- A plain ignore keeps today's behaviour (the next event reopens it), so
+  no stored group changes meaning. Conditions are columns on the group:
+  `ignore_until`, `ignore_until_event_count` (stored as the absolute
+  `total_count` that reopens it), `ignore_until_user_count` with
+  `ignore_user_count`, and `ignore_forever`. A group with conditions stays
+  ignored until any one is met.
+- They are evaluated in the statement that already increments the group's
+  counter. New distinct users are counted exactly in
+  `error_group_ignore_users`, written only while a user condition is
+  active and capped by the threshold (at most 10,000); the rows are
+  deleted when the ignore ends. Users are keyed by the first of user id,
+  email, username, IP address and visitor.
+- Every status write sets the conditions (an ignore records them, any
+  other status clears them), and ignoring an ignored group with conditions
+  replaces them. A group that stays ignored fires no alerts; when it comes
+  back it is a regression like any other.

@@ -117,8 +117,8 @@ These checks use synthetic applications, real HTTP endpoints, native storage que
 | DSN and transport | Adapted: project-scoped public DSNs, gzip, byte-length envelope framing, mixed items and authenticated tunnels | Public DSNs are write-only. OTLP and management endpoints still require server authentication. |
 | Errors, messages and stacks | Adapted: native error events, groups and stack details | Symbolication depends on available native source artifacts; native crash decoding is separate. |
 | Breadcrumbs, users, tags and contexts | Adapted: error detail payload and native metadata | User/request/browser/runtime fields populate native details; exact user/tag filtering is available on native event queries. Other typed contexts stay in JSON metadata and the original source event. Not every field has a separate index. |
-| Fingerprints and grouping | Adapted: native fingerprints and grouping; concurrent insertion and counts reconciled | Explicit SDK fingerprints and `{{ default }}` are supported. Default grouping uses Temps stack/message normalization, not Sentry server algorithm versions. Grouping configuration APIs are not provided. |
-| Issue APIs and triage | Existing native error list, detail and resolution APIs/UI | Sentry issue APIs are not implemented. |
+| Fingerprints and grouping | Adapted: native fingerprints and grouping; concurrent insertion and counts reconciled; native extension: reversible group merge and fingerprint split | Explicit SDK fingerprints and `{{ default }}` are supported. Default grouping uses Temps stack/message normalization, not Sentry server algorithm versions. Grouping configuration APIs are not provided. A merge or split redirects future events and never rewrites stored ones. |
+| Issue APIs and triage | Existing native error list, detail and resolution APIs/UI; native extension: bulk resolve/reopen/ignore by ID or filter (`POST /projects/{project_id}/error-groups/bulk`, `temps errors bulk`) | Sentry issue APIs are not implemented. Bulk requests are capped at 1,000 groups and 50 status-change notifications each. |
 | Alert APIs and alerts | Existing Temps alert rules and alarms; cron health feeds native alarms | Sentry alert APIs are not implemented. Delivery requires a configured provider; external delivery was not verified in the synthetic run. |
 | Debug ID source maps and artifact bundles | Adapted: CLI artifact bundles imported into native source maps; exact Debug ID lookup without a release, including maps uploaded after an error | Full-access project build credential required; public DSNs cannot access artifacts. SYSB v2, stored/deflated ZIP entries, 50 MiB compressed/expanded bundle, 256 files, 128 maps. Symbolication loads at most 32 maps/50 MiB per event; staged chunks expire after one hour (64 MiB/project, 256 MiB globally). Indexed/Hermes/native debug artifacts are outside this contract. |
 | Releases | Native extension: correlate retained errors, logs, spans, metric points, feedback and check-ins by SDK release version | Errors → Releases shows exact counts and native example links in a bounded 1–31 day window. Deployment/finalization, commits and release health are separate workflows. |
@@ -442,7 +442,45 @@ with sentry_sdk.configure_scope() as scope:
 
 ### Merge & Split Groups
 
-Groups cannot be merged or split after the fact. To change how future events group, send a [custom fingerprint](#custom-fingerprinting) from your SDK: events with the same fingerprint land in one group, and events with different fingerprints are kept apart.
+Two groups that are one bug can be merged, and a group holding two bugs can be split. Both work on the fingerprint aliases ingest already follows, so they change where future events land without rewriting a single stored event.
+
+**Merging** picks one surviving group. The other groups' fingerprints route to it, their counts are added to its own, and they stop appearing in lists. Each merged group keeps its own events and its own count, which is what makes the merge exactly reversible: unmerging moves its fingerprints back and subtracts the count it contributed. Events ingested while it was merged stay in the surviving group, together with the count that covers them. A merge never changes a group's status, so it cannot reopen an issue or fire a regression alert.
+
+**Splitting** moves named fingerprints into a new group, which receives their events from then on. Events already stored stay with the original group, where their stack traces are; the new group starts at zero. List a group's fingerprints first to see what there is to split, and keep at least one behind.
+
+<CodeGroup title="Merge and Split">
+```bash {{ title: 'CLI' }}
+# Merge groups 124 and 131 into group 123
+temps errors merge --project-id 42 --group-id 123 --source-group-ids 124,131
+
+# Undo that for group 124 only
+temps errors unmerge --project-id 42 --group-id 124
+
+# See what a group is made of, then split one fingerprint out
+temps errors fingerprints --project-id 42 --group-id 123
+temps errors split --project-id 42 --group-id 123 \
+  --fingerprints 9f2c... --title "Checkout timeout"
+```
+
+```typescript {{ title: 'API' }}
+// Merge 124 and 131 into 123
+await fetch('https://your-temps-instance.com/api/projects/42/error-groups/123/merge', {
+  method: 'POST',
+  headers: { 'Authorization': `Bearer ${API_KEY}`, 'Content-Type': 'application/json' },
+  body: JSON.stringify({ source_group_ids: [124, 131] })
+});
+
+// Take 124 back out
+await fetch('https://your-temps-instance.com/api/projects/42/error-groups/124/unmerge', {
+  method: 'POST',
+  headers: { 'Authorization': `Bearer ${API_KEY}` }
+});
+```
+</CodeGroup>
+
+A merge takes at most 50 groups per request and a split at most 200 fingerprints. A group that was merged away cannot be merged again, and a group that has absorbed others cannot itself be merged away until those are taken back out, which keeps every alias one step from its original group and unmerging unambiguous. A fingerprint that arrived through a merge belongs to that merge: unmerging moves it back, and a split cannot take it. In the console, select groups on **Errors** and choose Merge; the surviving group's page shows what was merged into it, offers Split, and a merged-away group's page links to its survivor with an Unmerge button.
+
+To change how *future* events group without touching existing groups, send a [custom fingerprint](#custom-fingerprinting) from your SDK: events with the same fingerprint land in one group, and events with different fingerprints are kept apart.
 
 ---
 
@@ -614,7 +652,9 @@ Manage error lifecycle from discovery to resolution.
     Marked as fixed (manually or automatically)
   </Property>
   <Property name="Ignored">
-    Known errors that should be suppressed
+    Known errors that should be suppressed. A plain ignore lasts until the
+    next event, which reopens the group; [ignore conditions](#ignore-until)
+    keep it ignored longer
   </Property>
   <Property name="Regressed">
     Error recurred after being resolved
@@ -648,7 +688,40 @@ await fetch('https://your-temps-instance.com/api/projects/42/error-groups/123', 
 ```
 </CodeGroup>
 
-The CLI and API change one group at a time; to resolve several, run the command once per group ID.
+### Triage Many Groups at Once
+
+One request resolves, reopens or ignores up to 1,000 groups. Select them by ID, or by the same filters the list uses — status, environment, event window and a text search over the title, error type and message. A request carries either IDs or filters, never both.
+
+<CodeGroup title="Bulk Triage">
+```bash {{ title: 'CLI' }}
+# Resolve three groups
+temps errors bulk --project-id 42 --action resolve --group-ids 123,124,131
+
+# Ignore every unresolved group whose message mentions a known-noisy library
+temps errors bulk --project-id 42 --action ignore --status unresolved --search "ResizeObserver"
+
+# Reopen everything that was resolved during the last bad deploy window
+temps errors bulk --project-id 42 --action unresolve \
+  --start-date 2026-11-18T09:00:00Z --end-date 2026-11-18T10:00:00Z
+```
+
+```typescript {{ title: 'API' }}
+// Resolve groups 123, 124 and 131 in project 42
+const response = await fetch('https://your-temps-instance.com/api/projects/42/error-groups/bulk', {
+  method: 'POST',
+  headers: {
+    'Authorization': `Bearer ${API_KEY}`,
+    'Content-Type': 'application/json'
+  },
+  body: JSON.stringify({ action: 'resolve', group_ids: [123, 124, 131] })
+});
+const { updated, updated_ids, skipped, remaining } = await response.json();
+```
+</CodeGroup>
+
+The response says what changed: `updated_ids` are the groups whose status moved, `skipped` counts selected groups that were already in that state, and `remaining` counts matching groups left for a follow-up request because this one hit the 1,000-group cap (always `0` when IDs were given). An ID that belongs to another project fails the whole request with a 404 and writes nothing. In the console, select groups with the checkboxes on **Errors** and use the bar above the list.
+
+A bulk request is audit-logged once, with the selection it was given and the groups it changed. `status_change` alert rules are evaluated for the groups that changed, and at most 50 notifications are delivered per request so a single triage click cannot fan out into thousands; the groups beyond that cap are not recorded as fired and stay eligible next time.
 
 ### Auto-Resolution
 
@@ -710,6 +783,38 @@ Sentry.init({
 temps errors update --project-id 42 --group-id 123 --status ignored
 ```
 </CodeGroup>
+
+### Ignore Until {{ anchor: true, id: 'ignore-until' }}
+
+A plain ignore lasts until the next event: that event reopens the group, exactly as a resolved group reopens. To keep a group quiet for longer, ignore it with conditions. It then stays ignored, still counting every event, until **any one** of them is met:
+
+| Condition | API field | CLI flag | Comes back when |
+|---|---|---|---|
+| For a while | `until` (time, at most 366 days ahead) | `--ignore-for 7d` or `--ignore-until <ISO 8601>` | the first event after that time |
+| N more times | `event_count` (1–1,000,000) | `--ignore-count 100` | the Nth event after the ignore |
+| N new users | `user_count` (1–10,000) | `--ignore-users 10` | the Nth distinct user affected after the ignore |
+| Forever | `forever: true` | `--ignore-forever` | never on its own; reopen it by hand |
+
+<CodeGroup title="Ignore Until">
+```bash {{ title: 'CLI' }}
+# Quiet for a week, or until it happens 100 more times
+temps errors update --project-id 42 --group-id 123 --status ignored \
+  --ignore-for 7d --ignore-count 100
+
+# Ignore every match until it reaches 10 new users
+temps errors bulk --project-id 42 --action ignore --search "ResizeObserver" --ignore-users 10
+```
+
+```typescript {{ title: 'API' }}
+await fetch('https://your-temps-instance.com/api/projects/42/error-groups/123', {
+  method: 'PUT',
+  headers: { 'Authorization': `Bearer ${API_KEY}`, 'Content-Type': 'application/json' },
+  body: JSON.stringify({ status: 'ignored', ignore: { event_count: 100, until: '2026-12-01T00:00:00Z' } })
+});
+```
+</CodeGroup>
+
+The conditions are checked in the statement that already counts the event in its group, so they cost nothing per event. Users are counted under the first of the event's user ID, email, username, IP address and visitor, exactly and only while a user condition is active; the count and the users behind it are forgotten when the group comes back or its status changes. While a group stays ignored it fires no alerts. When a condition is met the group reopens as `unresolved`, which is a regression like any other: regression alert rules fire once. Any status change clears the conditions, and ignoring an ignored group again replaces them. The group's `ignore` field shows the conditions and progress; the console shows them on the group page and offers the presets from the Ignore menu.
 
 Ignoring by message pattern is done in the SDK with `ignoreErrors`, as shown above; the server has no pattern rules.
 

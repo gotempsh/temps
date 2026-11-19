@@ -518,6 +518,10 @@ impl TempsPlugin for ErrorTrackingPlugin {
             .merge(<crate::handlers::feedback_handler::FeedbackApiDoc as OpenApiTrait>::openapi());
         schema.merge(<crate::handlers::release_handler::ReleaseApiDoc as OpenApiTrait>::openapi());
         schema.merge(
+            <crate::handlers::group_workflow_handler::GroupWorkflowApiDoc as OpenApiTrait>::openapi(
+            ),
+        );
+        schema.merge(
             <crate::handlers::client_outcome_handler::ClientOutcomeApiDoc as OpenApiTrait>::openapi(
             ),
         );

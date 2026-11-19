@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use chrono::{DateTime, Utc};
-use sea_orm::{DatabaseConnection, EntityTrait};
+use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 use std::sync::Arc;
 use temps_core::UtcDateTime;
 use temps_entities::{environments, error_groups, projects};
@@ -12,6 +12,9 @@ use super::error_alert_service::{AlertNotification, ErrorAlertService};
 use super::error_analytics_service::{ErrorAnalyticsService, ErrorDashboardStats};
 use super::error_crud_service::ErrorCRUDService;
 use super::error_ingestion_service::ErrorIngestionService;
+use super::group_workflow::{
+    BulkGroupAction, BulkGroupOutcome, BulkGroupSelector, GroupWorkflowService, IgnoreConditions,
+};
 use super::source_map_service::SourceMapService;
 use super::types::*;
 
@@ -37,6 +40,7 @@ pub struct ErrorTrackingService {
     pub feedback: super::feedback_service::FeedbackService,
     pub client_outcomes: super::client_outcome_service::ClientOutcomeService,
     pub releases: super::release_service::ReleaseService,
+    pub workflow: GroupWorkflowService,
     source_map_service: OnceCell<Arc<SourceMapService>>,
     notification_callback: OnceCell<NotificationCallback>,
     autopilot_callback: OnceCell<NotificationCallback>,
@@ -53,6 +57,7 @@ impl ErrorTrackingService {
             feedback: super::feedback_service::FeedbackService::new(db.clone()),
             client_outcomes: super::client_outcome_service::ClientOutcomeService::new(db.clone()),
             releases: super::release_service::ReleaseService::new(db.clone()),
+            workflow: GroupWorkflowService::new(db.clone()),
             alerts: ErrorAlertService::new(db),
             source_map_service: OnceCell::new(),
             notification_callback: OnceCell::new(),
@@ -233,13 +238,28 @@ impl ErrorTrackingService {
                 stored: false,
             });
         }
-        let pre_ingestion_status = outcome.previous_status;
+        // A group that stays ignored (its ignore conditions are not met yet,
+        // ADR 074 D1.3) or stays resolved is silent: counting the event is
+        // all that happens. Alerts and the regression announcement are for
+        // groups that are open after this event.
+        if outcome.current_status == "ignored" || outcome.current_status == "resolved" {
+            return Ok(super::types::ErrorIngestReceipt {
+                group_id,
+                stored: true,
+            });
+        }
+        let reopened = outcome.previous_status != outcome.current_status;
+        let pre_ingestion_status = if reopened {
+            outcome.previous_status
+        } else {
+            outcome.current_status
+        };
 
         // Evaluate alert rules (fire-and-forget, don't fail the ingestion)
         if let Some(group) = self.load_group(group_id).await {
             let is_new_group = outcome.created;
-            let is_regression =
-                pre_ingestion_status == "resolved" || pre_ingestion_status == "ignored";
+            let is_regression = reopened
+                && (pre_ingestion_status == "resolved" || pre_ingestion_status == "ignored");
 
             tracing::debug!(
                 "Evaluating alert rules for group {} (project={}, is_new={}, is_regression={})",
@@ -349,9 +369,10 @@ impl ErrorTrackingService {
         project_id: i32,
         status: String,
         assigned_to: Option<String>,
+        ignore: Option<IgnoreConditions>,
     ) -> Result<(), ErrorTrackingError> {
         self.crud
-            .update_error_group_status(group_id, project_id, status.clone(), assigned_to)
+            .update_error_group_status(group_id, project_id, status.clone(), assigned_to, ignore)
             .await?;
 
         // Evaluate status change alert rules
@@ -362,6 +383,49 @@ impl ErrorTrackingService {
         }
 
         Ok(())
+    }
+
+    /// Change the status of many error groups of one project (ADR 074, D1).
+    ///
+    /// Delegates the write to the workflow service, then evaluates
+    /// `status_change` alert rules for the groups that actually changed. The
+    /// alert work is bounded by the project's rule count, and its delivery by
+    /// `BULK_STATUS_CHANGE_NOTIFICATION_LIMIT`.
+    pub async fn bulk_update_error_group_status(
+        &self,
+        project_id: i32,
+        selector: BulkGroupSelector,
+        action: BulkGroupAction,
+        ignore: Option<IgnoreConditions>,
+    ) -> Result<BulkGroupOutcome, ErrorTrackingError> {
+        let outcome = self
+            .workflow
+            .bulk_update_status(project_id, selector, action, ignore)
+            .await?;
+        if outcome.updated_ids.is_empty() {
+            return Ok(outcome);
+        }
+        // One read for the page of groups that changed, never one per group.
+        let groups = error_groups::Entity::find()
+            .filter(error_groups::Column::Id.is_in(outcome.updated_ids.clone()))
+            .filter(error_groups::Column::ProjectId.eq(project_id))
+            .all(self.db.as_ref())
+            .await
+            .unwrap_or_else(|error| {
+                tracing::error!(
+                    project_id,
+                    "Failed to load bulk-updated error groups for alert evaluation: {}",
+                    error
+                );
+                Vec::new()
+            });
+        let notifications = self
+            .alerts
+            .evaluate_status_change_many(project_id, &groups, action.target_status())
+            .await;
+        let enriched = self.enrich_notifications(notifications, project_id).await;
+        self.send_alert_notifications(enriched).await;
+        Ok(outcome)
     }
 
     /// List error events (delegates to CRUD service)

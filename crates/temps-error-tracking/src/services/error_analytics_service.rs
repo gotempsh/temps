@@ -63,8 +63,11 @@ impl ErrorAnalyticsService {
         project_id: i32,
         environment_id: Option<i32>,
     ) -> Result<ErrorGroupStats, ErrorTrackingError> {
-        let mut query =
-            error_groups::Entity::find().filter(error_groups::Column::ProjectId.eq(project_id));
+        // Merged-away groups are counted through the group that survived
+        // them, never twice (ADR 074, D1.2).
+        let mut query = error_groups::Entity::find()
+            .filter(error_groups::Column::ProjectId.eq(project_id))
+            .filter(error_groups::Column::MergedIntoGroupId.is_null());
 
         if let Some(env_id) = environment_id {
             query = query.filter(error_groups::Column::EnvironmentId.eq(env_id));
@@ -465,8 +468,10 @@ impl ErrorAnalyticsService {
     ) -> Result<Vec<ErrorGroupDomain>, ErrorTrackingError> {
         let limit = std::cmp::min(limit.unwrap_or(20), 100);
 
-        let mut query =
-            error_groups::Entity::find().filter(error_groups::Column::ProjectId.eq(project_id));
+        // A group merged into another is listed through the survivor only.
+        let mut query = error_groups::Entity::find()
+            .filter(error_groups::Column::ProjectId.eq(project_id))
+            .filter(error_groups::Column::MergedIntoGroupId.is_null());
 
         if let Some(env_id) = environment_id {
             query = query.filter(error_groups::Column::EnvironmentId.eq(env_id));
@@ -493,6 +498,7 @@ impl ErrorAnalyticsService {
         Ok(groups
             .into_iter()
             .map(|group| ErrorGroupDomain {
+                ignore: super::types::GroupIgnoreState::from_group(&group),
                 id: group.id,
                 title: group.title,
                 error_type: group.error_type,
@@ -502,6 +508,7 @@ impl ErrorAnalyticsService {
                 total_count: group.total_count,
                 status: group.status,
                 assigned_to: group.assigned_to,
+                merged_into_group_id: group.merged_into_group_id,
                 project_id: group.project_id,
                 environment_id: group.environment_id,
                 deployment_id: group.deployment_id,
