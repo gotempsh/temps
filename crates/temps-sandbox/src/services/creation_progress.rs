@@ -383,11 +383,13 @@ impl CreationProgress {
             step.status = CreationStepStatus::Done;
             step.started_at.get_or_insert(now);
             step.finished_at = Some(now);
-            if detail.is_some() {
-                step.detail = detail;
-            }
             if let Some(total) = step.bytes_total {
                 step.bytes_done = Some(total);
+                // "downloading"/"extracting" described the pull in flight.
+                step.detail = Some(format!("downloaded {}", human_bytes(total)));
+            }
+            if detail.is_some() {
+                step.detail = detail;
             }
         });
     }
@@ -548,6 +550,23 @@ impl CreationProgress {
     /// The create's current record (tests and logging).
     pub fn snapshot(&self) -> Option<SandboxCreation> {
         self.tracker.lock().creations.get(&self.key).cloned()
+    }
+}
+
+/// `512 MB`, `1.11 GB`: decimal units, as registries and the console report sizes.
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    // A display value: two decimals are all that is shown.
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1000.0 && unit < UNITS.len() - 1 {
+        value /= 1000.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.2} {}", UNITS[unit])
     }
 }
 
@@ -715,5 +734,32 @@ mod tests {
             .contains_key(&(1, "still-running".to_string())));
         drop(inner);
         drop(running);
+    }
+
+    #[test]
+    fn a_finished_download_says_what_was_downloaded() {
+        let tracker = Arc::new(CreationTracker::default());
+        let progress = tracker.begin(1, Some("create-dl-01")).expect("begin");
+        progress.start(CreationStepKind::PullImage);
+        let mut status = temps_sandbox_providers::ImagePrepareStatus::new(
+            "img:1",
+            temps_sandbox_providers::ImagePrepareState::Pulling,
+        );
+        status.detail = Some("extracting".to_string());
+        status.bytes_done = Some(900_000_000);
+        status.bytes_total = Some(1_113_929_288);
+        progress.image_progress(&status);
+        progress.done(CreationStepKind::PullImage, None);
+
+        let creation = progress.snapshot().expect("tracked");
+        let pull = creation
+            .steps
+            .iter()
+            .find(|s| s.kind == CreationStepKind::PullImage)
+            .expect("pull step");
+        assert_eq!(pull.detail.as_deref(), Some("downloaded 1.11 GB"));
+        assert_eq!(pull.bytes_done, Some(1_113_929_288));
+        assert_eq!(human_bytes(512), "512 B");
+        assert_eq!(human_bytes(2_500_000), "2.50 MB");
     }
 }
