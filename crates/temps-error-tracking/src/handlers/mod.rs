@@ -16,4 +16,6 @@ pub mod feedback_handler;
 
 pub mod release_handler;
 
+pub mod saved_search_handler;
+
 pub mod client_outcome_handler;

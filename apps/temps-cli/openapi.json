@@ -17703,6 +17703,25 @@
         ],
         "type": "object"
       },
+      "CreateErrorSavedSearchRequest": {
+        "properties": {
+          "filters": {
+            "$ref": "#/components/schemas/SavedSearchFilters"
+          },
+          "name": {
+            "description": "At most 100 characters, unique among your saved searches in the project.",
+            "type": "string"
+          },
+          "shared": {
+            "description": "Share with everyone who can open the project.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
       "CreateExternalServiceRequest": {
         "properties": {
           "members": {
@@ -30839,6 +30858,96 @@
           "error_class",
           "stacktrace_preview",
           "stacktrace_truncated"
+        ],
+        "type": "object"
+      },
+      "ErrorSavedSearchPageResponse": {
+        "properties": {
+          "data": {
+            "description": "Yours and the shared ones, newest first.",
+            "items": {
+              "$ref": "#/components/schemas/ErrorSavedSearchResponse"
+            },
+            "type": "array"
+          },
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total_count": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "data",
+          "page",
+          "page_size",
+          "total_count"
+        ],
+        "type": "object"
+      },
+      "ErrorSavedSearchResponse": {
+        "description": "A saved search: a name and the list filters it applies.",
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "filters": {
+            "$ref": "#/components/schemas/SavedSearchFilters"
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "is_owner": {
+            "description": "Whether the caller owns it, and so may change it.",
+            "type": "boolean"
+          },
+          "name": {
+            "type": "string"
+          },
+          "owner_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "owner_user_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "shared": {
+            "description": "Visible to everyone who can open the project, not only its owner.",
+            "type": "boolean"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "project_id",
+          "name",
+          "shared",
+          "owner_user_id",
+          "is_owner",
+          "filters",
+          "created_at",
+          "updated_at"
         ],
         "type": "object"
       },
@@ -66286,6 +66395,55 @@
         ],
         "type": "object"
       },
+      "SavedSearchFilters": {
+        "description": "The list filters a saved search applies. Every field is optional; an\nempty set is \"all groups, newest first\".",
+        "properties": {
+          "assignee": {
+            "description": "`me`, `none`, `user:<id>` or `team:<id>`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "environment_id": {
+            "description": "An environment of the project.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "search": {
+            "description": "Text in the title, error type or message.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sort_by": {
+            "description": "`last_seen` (default), `first_seen`, `total_count` or `events_in_range`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sort_order": {
+            "description": "`asc` or `desc` (default).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "description": "`unresolved`, `resolved` or `ignored`; omitted for every status.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "ScalewayCredentialsRequest": {
         "properties": {
           "api_key": {
@@ -80535,6 +80693,34 @@
         "required": [
           "status"
         ],
+        "type": "object"
+      },
+      "UpdateErrorSavedSearchRequest": {
+        "properties": {
+          "filters": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/SavedSearchFilters",
+                "description": "Replaces every filter when present."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "shared": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
         "type": "object"
       },
       "UpdateExternalServiceRequest": {
@@ -161670,6 +161856,327 @@
         "x-maturity": "beta"
       }
     },
+    "/projects/{project_id}/error-saved-searches": {
+      "get": {
+        "operationId": "list_error_saved_searches",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Page number, from 1.",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Searches per page, 1 to 100.",
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorSavedSearchPageResponse"
+                }
+              }
+            },
+            "description": "A page of saved searches"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Missing error_tracking:read or project access"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "List your saved searches and the shared ones, newest first",
+        "tags": [
+          "error-tracking"
+        ],
+        "x-maturity": "beta"
+      },
+      "post": {
+        "operationId": "create_error_saved_search",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateErrorSavedSearchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorSavedSearchResponse"
+                }
+              }
+            },
+            "description": "Search saved"
+          },
+          "400": {
+            "description": "An invalid name or filter, or 50 saved searches already"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Missing error_tracking:write or project access"
+          },
+          "409": {
+            "description": "You already have a saved search with that name"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Save a search over the project's error groups",
+        "tags": [
+          "error-tracking"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/projects/{project_id}/error-saved-searches/{saved_search_id}": {
+      "delete": {
+        "description": "Its owner may, and an administrator may delete a shared one.",
+        "operationId": "delete_error_saved_search",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Saved search ID",
+            "in": "path",
+            "name": "saved_search_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Saved search deleted"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Neither its owner nor an administrator"
+          },
+          "404": {
+            "description": "No such saved search you can see in the project"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Delete a saved search",
+        "tags": [
+          "error-tracking"
+        ],
+        "x-maturity": "beta"
+      },
+      "get": {
+        "operationId": "get_error_saved_search",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Saved search ID",
+            "in": "path",
+            "name": "saved_search_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorSavedSearchResponse"
+                }
+              }
+            },
+            "description": "The saved search"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Missing error_tracking:read or project access"
+          },
+          "404": {
+            "description": "No such saved search you can see in the project"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Get one saved search: yours, or a shared one",
+        "tags": [
+          "error-tracking"
+        ],
+        "x-maturity": "beta"
+      },
+      "patch": {
+        "operationId": "update_error_saved_search",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Saved search ID",
+            "in": "path",
+            "name": "saved_search_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateErrorSavedSearchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorSavedSearchResponse"
+                }
+              }
+            },
+            "description": "Saved search changed"
+          },
+          "400": {
+            "description": "An invalid name or filter"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Not its owner, or missing error_tracking:write"
+          },
+          "404": {
+            "description": "No such saved search you can see in the project"
+          },
+          "409": {
+            "description": "You already have a saved search with that name"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Rename, share or change the filters of your saved search",
+        "tags": [
+          "error-tracking"
+        ],
+        "x-maturity": "beta"
+      }
+    },
     "/projects/{project_id}/error-stats": {
       "get": {
         "operationId": "get_error_stats",
@@ -186771,6 +187278,10 @@
     },
     {
       "description": "Error group comments and activity",
+      "name": "error-tracking"
+    },
+    {
+      "description": "Saved searches over error groups",
       "name": "error-tracking"
     },
     {

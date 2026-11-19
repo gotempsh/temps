@@ -260,6 +260,36 @@ impl AuditOperation for ErrorGroupCommentAudit {
     }
 }
 
+/// Audit event for a saved search over error groups (ADR 074, D1.8).
+#[derive(Debug, Clone, Serialize)]
+pub struct ErrorSavedSearchAudit {
+    pub context: AuditContext,
+    pub project_id: i32,
+    pub saved_search_id: i32,
+    pub name: String,
+    pub shared: bool,
+    /// `created`, `updated` or `deleted`.
+    pub action: &'static str,
+}
+
+impl AuditOperation for ErrorSavedSearchAudit {
+    fn operation_type(&self) -> String {
+        format!("ERROR_SAVED_SEARCH_{}", self.action.to_ascii_uppercase())
+    }
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
+    }
+}
+
 /// Audit event for a triage update on an error group (status and/or assignee).
 #[derive(Debug, Clone, Serialize)]
 pub struct ErrorGroupUpdatedAudit {

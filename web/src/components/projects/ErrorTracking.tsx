@@ -24,6 +24,10 @@ import { AnalyticsFilters } from '@/components/project/ProjectAnalytics'
 import { queryKeyPrefix } from '@/lib/refresh'
 import { useProjectTourActive } from '@/components/project/ProjectTour'
 import { useAuth } from '@/contexts/AuthContext'
+import { SavedSearchMenu } from '@/components/error-tracking/SavedSearchMenu'
+import type { GroupStatusView } from '@/components/error-tracking/saved-search-view'
+import { Input } from '@/components/ui/input'
+import { useDebounce } from '@/hooks/useDebounce'
 import { useAdvancingDateRange } from '@/hooks/useAdvancingDateRange'
 import {
   QUICK_FILTERS,
@@ -142,14 +146,14 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
     })
   }
   const [environmentFilter, setEnvironmentFilter] = useEnvironmentFilter()
-  const [statusFilter, setStatusFilter] = useState<
-    'unresolved' | 'resolved' | 'all'
-  >('unresolved')
-  // "Assigned to me" covers the user's teams too (ADR 074, D1.6).
-  const [assigneeFilter, setAssigneeFilter] = useState<'any' | 'me' | 'none'>(
-    'any'
-  )
+  const [statusFilter, setStatusFilter] =
+    useState<GroupStatusView>('unresolved')
+  // "Assigned to me" covers the user's teams too (ADR 074, D1.6). A saved
+  // search can also hold `user:<id>` or `team:<id>`.
+  const [assigneeFilter, setAssigneeFilter] = useState<string>('any')
   const [groupSort, setGroupSort] = useState('last_seen:desc')
+  const [searchText, setSearchText] = useState('')
+  const search = useDebounce(searchText.trim(), 300)
   const [page, setPage] = useState(1)
   const pageSize = 25
 
@@ -215,7 +219,7 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
   // Bulk triage selection, by group id. Cleared whenever the visible page
   // changes, so a resolve can never land on a group the user cannot see.
   const [selectedGroupIds, setSelectedGroupIds] = useState<number[]>([])
-  const pageScope = `${statusFilter}\u0000${assigneeFilter}\u0000${groupSort}\u0000${environmentFilter}\u0000${dateFilter.quickFilter}\u0000${dateFilter.dateRange?.from?.getTime() ?? ''}\u0000${dateFilter.dateRange?.to?.getTime() ?? ''}`
+  const pageScope = `${statusFilter}\u0000${assigneeFilter}\u0000${search}\u0000${groupSort}\u0000${environmentFilter}\u0000${dateFilter.quickFilter}\u0000${dateFilter.dateRange?.from?.getTime() ?? ''}\u0000${dateFilter.dateRange?.to?.getTime() ?? ''}`
   const [previousPageScope, setPreviousPageScope] = useState(pageScope)
   if (pageScope !== previousPageScope) {
     setPreviousPageScope(pageScope)
@@ -241,6 +245,7 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
         page_size: pageSize,
         status: statusFilter === 'all' ? null : statusFilter,
         assignee: assigneeFilter === 'any' ? null : assigneeFilter,
+        search: search || null,
         start_date: timeRange.startTime,
         end_date: timeRange.endTime,
         environment_id: environmentFilter,
@@ -731,12 +736,36 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
           ]}
           onRefresh={advance}
           leftActions={
-            <div className="flex gap-2">
+            <div className="flex flex-wrap gap-2">
+              <SavedSearchMenu
+                projectId={project.id}
+                canModerate={currentUser?.role === 'admin'}
+                view={{
+                  status: statusFilter,
+                  assignee: assigneeFilter,
+                  sort: groupSort,
+                  environmentId: environmentFilter,
+                  search: searchText,
+                }}
+                onApply={(view) => {
+                  setStatusFilter(view.status)
+                  setAssigneeFilter(view.assignee)
+                  setGroupSort(view.sort)
+                  setEnvironmentFilter(view.environmentId)
+                  setSearchText(view.search)
+                }}
+              />
+              <Input
+                value={searchText}
+                onChange={(e) => setSearchText(e.target.value)}
+                placeholder="Search title or message"
+                aria-label="Search error groups by title, type or message"
+                className="h-9 w-[200px]"
+                maxLength={256}
+              />
               <Select
                 value={statusFilter}
-                onValueChange={(v) =>
-                  setStatusFilter(v as 'unresolved' | 'resolved' | 'all')
-                }
+                onValueChange={(v) => setStatusFilter(v as GroupStatusView)}
               >
                 <SelectTrigger className="w-[130px]">
                   <SelectValue />
@@ -744,15 +773,11 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
                 <SelectContent>
                   <SelectItem value="unresolved">Unresolved</SelectItem>
                   <SelectItem value="resolved">Resolved</SelectItem>
+                  <SelectItem value="ignored">Ignored</SelectItem>
                   <SelectItem value="all">All</SelectItem>
                 </SelectContent>
               </Select>
-              <Select
-                value={assigneeFilter}
-                onValueChange={(v) =>
-                  setAssigneeFilter(v as 'any' | 'me' | 'none')
-                }
-              >
+              <Select value={assigneeFilter} onValueChange={setAssigneeFilter}>
                 <SelectTrigger
                   className="w-[160px]"
                   aria-label="Filter error groups by assignee"
@@ -763,6 +788,13 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
                   <SelectItem value="any">Anyone</SelectItem>
                   <SelectItem value="me">Assigned to me</SelectItem>
                   <SelectItem value="none">Unassigned</SelectItem>
+                  {!['any', 'me', 'none'].includes(assigneeFilter) && (
+                    <SelectItem value={assigneeFilter}>
+                      {assigneeFilter.startsWith('team:')
+                        ? 'A specific team'
+                        : 'A specific person'}
+                    </SelectItem>
+                  )}
                 </SelectContent>
               </Select>
               <Select value={groupSort} onValueChange={setGroupSort}>

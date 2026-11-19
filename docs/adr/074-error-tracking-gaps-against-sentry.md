@@ -5,8 +5,8 @@
 Proposed — 2026-11-19. Being implemented in the order of the Decision
 section. D1.1 (bulk actions), D1.2 (merge and split), D1.3 (ignore
 until), D1.4 (inbound filters), D1.5 (resolve in the next release),
-D1.6 (assignment) and D1.7 (comments and activity) have shipped; the
-questions they settled
+D1.6 (assignment), D1.7 (comments and activity) and D1.8 (saved searches)
+have shipped, so D1 is complete; the questions they settled
 are recorded under "Settled while implementing".
 
 Related: ADR 016 (ClickHouse traces backend), ADR 027 (cross-project trace
@@ -366,3 +366,31 @@ deploys, which is web services. It comes last and may never be worth building.
   entries store the assignee's name as it was when assigned.
 - No mentions and no notification on a comment yet: a mention needs the
   same "who may be told" check as assignment and is left for later.
+
+### D1.8 Saved searches
+
+- A saved search is a row of `error_saved_searches`: an owner, a project, a
+  name unique per owner ignoring case, `shared`, and the list filters as
+  columns (status, environment, assignee, text, sort). Columns rather than
+  JSON so a deleted environment clears that filter (`ON DELETE SET NULL`)
+  instead of leaving a search that points at nothing. A search goes with its
+  owner and its project.
+- The time range is not saved: a search answers "which groups", and the
+  range stays whatever the viewer has open. A saved absolute range would go
+  stale the day after it was saved.
+- `assignee: me` is stored as written and resolved for the viewer, so a
+  shared "assigned to me" search shows each person their own groups.
+- Private by default. Shared searches are visible to everyone who can open
+  the project. Only the owner changes a search; the owner or an
+  administrator deletes a shared one. Someone else's private search is a
+  404, administrators included.
+- Saving, changing and deleting a search needs `error_tracking:write`, the
+  same as other triage writes, though a private search affects only its
+  owner; the conservative choice keeps one permission for every write here.
+  A deployment token cannot save one, because a search needs an owner.
+- At most 50 saved searches per user per project, enforced under a per-owner
+  transaction lock so concurrent requests cannot pass it. Writes are
+  audit-logged with the name and `shared`, not the filters.
+- The console's error list gains a text search box and an "Ignored" status
+  option, so every filter a saved search can hold is visible and editable
+  on the page that applies it.

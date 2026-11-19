@@ -30,6 +30,7 @@ import { existsSync, statSync } from 'node:fs'
 import { resolve, basename, join } from 'node:path'
 import { registerActivityCommands } from './activity.js'
 import { registerInboundFilterCommands } from './filters.js'
+import { applySavedSearch, loadSavedSearch, registerSavedSearchCommands } from './saved-searches.js'
 
 interface ListOptions {
   projectId: string
@@ -43,6 +44,7 @@ interface ListOptions {
   sortOrder?: string
   assignee?: string
   search?: string
+  savedSearch?: string
   json?: boolean
 }
 
@@ -446,6 +448,7 @@ export function registerErrorsCommands(program: Command): void {
     .option('--sort-order <order>', 'Sort order: asc or desc')
     .option('--assignee <who>', 'Only groups assigned to: me (you or your teams), none, user:<id> or team:<id>')
     .option('--search <text>', 'Only groups whose title, type or message contains this text')
+    .option('--saved-search <id>', 'Apply a saved search; flags given here override its filters')
     .option('--json', 'Output in JSON format')
     .action(listErrorGroupsAction)
 
@@ -531,6 +534,7 @@ export function registerErrorsCommands(program: Command): void {
 
   registerInboundFilterCommands(errors)
   registerActivityCommands(errors)
+  registerSavedSearchCommands(errors)
 
   errors
     .command('events')
@@ -665,14 +669,23 @@ export function registerErrorsCommands(program: Command): void {
     .action(deleteSourceFilesAction)
 }
 
-async function listErrorGroupsAction(options: ListOptions): Promise<void> {
+async function listErrorGroupsAction(flags: ListOptions): Promise<void> {
   await requireAuth()
   await setupClient()
 
-  const projectId = parseInt(options.projectId, 10)
+  const projectId = parseInt(flags.projectId, 10)
   if (isNaN(projectId)) {
     warning('Invalid project ID')
     return
+  }
+  let options = flags
+  if (flags.savedSearch) {
+    try {
+      options = applySavedSearch(flags, await loadSavedSearch(projectId, flags.savedSearch))
+    } catch (e) {
+      warning(e instanceof Error ? e.message : String(e))
+      return
+    }
   }
 
   if (options.status && !ERROR_STATUSES.includes(options.status)) {

@@ -64,6 +64,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         .merge(super::group_workflow_handler::routes())
         .merge(super::assignee_handler::routes())
         .merge(super::activity_handler::routes())
+        .merge(super::saved_search_handler::routes())
         .merge(super::inbound_filter_handler::routes())
         .merge(super::release_handler::routes())
         .merge(super::client_outcome_handler::routes())
@@ -452,6 +453,39 @@ impl From<ErrorTrackingError> for temps_core::problemdetails::Problem {
                 .value("project_id", project_id)
                 .value("filter_id", filter_id)
                 .build(),
+            ErrorTrackingError::NotSavedSearchOwner {
+                project_id,
+                saved_search_id,
+                ..
+            } => temps_core::error_builder::ErrorBuilder::new(StatusCode::FORBIDDEN)
+                .type_("https://temps.sh/probs/not-saved-search-owner")
+                .title("Not The Saved Search's Owner")
+                .detail(err.to_string())
+                .value("project_id", project_id)
+                .value("saved_search_id", saved_search_id)
+                .build(),
+            ErrorTrackingError::SavedSearchExists {
+                project_id,
+                ref name,
+            } => temps_core::error_builder::ErrorBuilder::new(StatusCode::CONFLICT)
+                .type_("https://temps.sh/probs/error-saved-search-exists")
+                .title("Saved Search Already Exists")
+                .detail(err.to_string())
+                .value("project_id", project_id)
+                .value("name", name.clone())
+                .build(),
+            ErrorTrackingError::SavedSearchLimit {
+                project_id,
+                user_id,
+                limit,
+            } => temps_core::error_builder::ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                .type_("https://temps.sh/probs/error-saved-search-limit")
+                .title("Saved Search Limit Reached")
+                .detail(err.to_string())
+                .value("project_id", project_id)
+                .value("user_id", user_id)
+                .value("limit", limit)
+                .build(),
             ErrorTrackingError::InboundFilterExists {
                 project_id,
                 ref kind,
@@ -525,7 +559,8 @@ impl axum::response::IntoResponse for ErrorTrackingError {
             ErrorTrackingError::GroupNotFound => {
                 (StatusCode::NOT_FOUND, "Error group not found".to_string())
             }
-            ErrorTrackingError::NotCommentAuthor { .. } => {
+            ErrorTrackingError::NotCommentAuthor { .. }
+            | ErrorTrackingError::NotSavedSearchOwner { .. } => {
                 (StatusCode::FORBIDDEN, self.to_string())
             }
             ErrorTrackingError::GroupsNotFound { .. }
@@ -539,10 +574,12 @@ impl axum::response::IntoResponse for ErrorTrackingError {
             ErrorTrackingError::GroupAlreadyMerged { .. }
             | ErrorTrackingError::GroupIsMergeTarget { .. }
             | ErrorTrackingError::GroupNotMerged { .. }
-            | ErrorTrackingError::InboundFilterExists { .. } => {
+            | ErrorTrackingError::InboundFilterExists { .. }
+            | ErrorTrackingError::SavedSearchExists { .. } => {
                 (StatusCode::CONFLICT, self.to_string())
             }
-            ErrorTrackingError::InboundFilterLimit { .. } => {
+            ErrorTrackingError::InboundFilterLimit { .. }
+            | ErrorTrackingError::SavedSearchLimit { .. } => {
                 (StatusCode::BAD_REQUEST, self.to_string())
             }
             ErrorTrackingError::EventNotFound => {

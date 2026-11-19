@@ -20,6 +20,7 @@ pub mod count_event;
 pub mod ignore;
 pub mod merge;
 pub mod next_release;
+pub mod saved_search;
 
 #[cfg(test)]
 mod activity_tests;
@@ -31,6 +32,8 @@ mod ignore_tests;
 mod merge_tests;
 #[cfg(test)]
 mod next_release_tests;
+#[cfg(test)]
+mod saved_search_tests;
 #[cfg(test)]
 mod tests;
 
@@ -45,6 +48,10 @@ pub use merge::{
     MAX_SPLIT_FINGERPRINTS,
 };
 pub use next_release::{CurrentRelease, ReleaseRegistry, MAX_RELEASE_CHARS};
+pub use saved_search::{
+    SavedSearch, SavedSearchChange, SavedSearchFilters, SavedSearchPage,
+    MAX_SAVED_SEARCHES_PER_USER, MAX_SAVED_SEARCH_NAME_CHARS,
+};
 
 /// Most groups one bulk request may touch. Larger selections report the rest
 /// in `remaining`, so the caller pages through them.

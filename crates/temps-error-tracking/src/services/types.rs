@@ -101,6 +101,34 @@ pub enum ErrorTrackingError {
         fingerprints: Vec<String>,
     },
 
+    /// A saved search someone other than its owner tried to change.
+    /// Maps to HTTP 403 Forbidden.
+    #[error(
+        "Saved search {saved_search_id} in project {project_id} can only be {action} by its owner{admins}"
+    )]
+    NotSavedSearchOwner {
+        project_id: i32,
+        saved_search_id: i32,
+        action: &'static str,
+        admins: &'static str,
+    },
+
+    /// The owner already has a saved search with this name in the project.
+    /// Maps to HTTP 409 Conflict.
+    #[error("You already have a saved search named '{name}' in project {project_id}")]
+    SavedSearchExists { project_id: i32, name: String },
+
+    /// The owner holds as many saved searches in the project as they may.
+    /// Maps to HTTP 400 Bad Request.
+    #[error(
+        "User {user_id} already has the maximum of {limit} saved searches in project {project_id}; delete one first"
+    )]
+    SavedSearchLimit {
+        project_id: i32,
+        user_id: i32,
+        limit: u64,
+    },
+
     /// An inbound filter id that is not a rule of the project.
     /// Maps to HTTP 404 Not Found.
     #[error("Inbound filter {filter_id} not found in project {project_id}")]

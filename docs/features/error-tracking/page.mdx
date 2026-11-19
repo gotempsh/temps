@@ -774,6 +774,33 @@ const activity = await fetch(
 
 Activity is recorded from this version on; changes made before the upgrade are not in the log. An event that reopens a group is logged once, when it reopens it; ordinary events are never logged here.
 
+### Saved Searches {{ anchor: true, id: 'saved-searches' }}
+
+Set the list's filters (status, assignee, environment, text and sort) and choose **Saved searches → Save the current filters** to keep them under a name. A saved search is yours unless you share it with everyone who can open the project. **Assigned to me** in a shared search means each person's own groups. The time range is not saved, so a search always looks at the range you have open. You can hold 50 saved searches per project. Only the owner can rename or change one; the owner or an administrator can delete a shared one.
+
+<CodeGroup title="Saved Searches">
+```bash {{ title: 'CLI' }}
+# Save a search, list them, and run one (flags you add override it)
+temps errors searches save --project-id 42 --name "Open and mine" --status unresolved --assignee me
+temps errors searches save --project-id 42 --name "Checkout timeouts" --search timeout --shared
+temps errors searches list --project-id 42
+temps errors list --project-id 42 --saved-search 5
+temps errors searches delete --project-id 42 --id 5
+```
+
+```typescript {{ title: 'API' }}
+await fetch('https://your-temps-instance.com/api/projects/42/error-saved-searches', {
+  method: 'POST',
+  headers: { 'Authorization': `Bearer ${API_KEY}`, 'Content-Type': 'application/json' },
+  body: JSON.stringify({
+    name: 'Open and mine',
+    shared: false,
+    filters: { status: 'unresolved', assignee: 'me', sort_by: 'last_seen', sort_order: 'desc' }
+  })
+});
+```
+</CodeGroup>
+
 ### Triage Many Groups at Once
 
 One request resolves, reopens or ignores up to 1,000 groups. Select them by ID, or by the same filters the list uses — status, environment, event window and a text search over the title, error type and message. A request carries either IDs or filters, never both.

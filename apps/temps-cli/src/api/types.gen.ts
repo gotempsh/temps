@@ -8442,6 +8442,18 @@ export type CreateEnvironmentVolumeRequest = {
     size_mb?: number | null;
 };
 
+export type CreateErrorSavedSearchRequest = {
+    filters?: SavedSearchFilters;
+    /**
+     * At most 100 characters, unique among your saved searches in the project.
+     */
+    name: string;
+    /**
+     * Share with everyone who can open the project.
+     */
+    shared?: boolean;
+};
+
 export type CreateExternalServiceRequest = {
     /**
      * Cluster member specifications for topology "cluster". Optional: when
@@ -14461,6 +14473,38 @@ export type ErrorRow = {
     stacktrace_truncated: boolean;
     trace_id?: string | null;
     ts: string;
+};
+
+export type ErrorSavedSearchPageResponse = {
+    /**
+     * Yours and the shared ones, newest first.
+     */
+    data: Array<ErrorSavedSearchResponse>;
+    page: number;
+    page_size: number;
+    total_count: number;
+};
+
+/**
+ * A saved search: a name and the list filters it applies.
+ */
+export type ErrorSavedSearchResponse = {
+    created_at: string;
+    filters: SavedSearchFilters;
+    id: number;
+    /**
+     * Whether the caller owns it, and so may change it.
+     */
+    is_owner: boolean;
+    name: string;
+    owner_name?: string | null;
+    owner_user_id: number;
+    project_id: number;
+    /**
+     * Visible to everyone who can open the project, not only its owner.
+     */
+    shared: boolean;
+    updated_at: string;
 };
 
 export type ErrorTimeSeriesDataResponse = {
@@ -30732,6 +30776,37 @@ export type SaveHttpCheck = {
     spec?: HttpCheckSpec | null;
 };
 
+/**
+ * The list filters a saved search applies. Every field is optional; an
+ * empty set is "all groups, newest first".
+ */
+export type SavedSearchFilters = {
+    /**
+     * `me`, `none`, `user:<id>` or `team:<id>`.
+     */
+    assignee?: string | null;
+    /**
+     * An environment of the project.
+     */
+    environment_id?: number | null;
+    /**
+     * Text in the title, error type or message.
+     */
+    search?: string | null;
+    /**
+     * `last_seen` (default), `first_seen`, `total_count` or `events_in_range`.
+     */
+    sort_by?: string | null;
+    /**
+     * `asc` or `desc` (default).
+     */
+    sort_order?: string | null;
+    /**
+     * `unresolved`, `resolved` or `ignored`; omitted for every status.
+     */
+    status?: string | null;
+};
+
 export type ScalewayCredentialsRequest = {
     api_key: SecretString;
     project_id: string;
@@ -37460,6 +37535,12 @@ export type UpdateErrorGroupRequest = {
      */
     in_next_release?: boolean;
     status: string;
+};
+
+export type UpdateErrorSavedSearchRequest = {
+    filters?: SavedSearchFilters | null;
+    name?: string | null;
+    shared?: boolean | null;
 };
 
 export type UpdateExternalServiceRequest = {
@@ -85208,6 +85289,235 @@ export type UpdateErrorInboundFilterResponses = {
 };
 
 export type UpdateErrorInboundFilterResponse = UpdateErrorInboundFilterResponses[keyof UpdateErrorInboundFilterResponses];
+
+export type ListErrorSavedSearchesData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: {
+        /**
+         * Page number, from 1.
+         */
+        page?: number;
+        /**
+         * Searches per page, 1 to 100.
+         */
+        page_size?: number;
+    };
+    url: '/projects/{project_id}/error-saved-searches';
+};
+
+export type ListErrorSavedSearchesErrors = {
+    /**
+     * Not authenticated
+     */
+    401: unknown;
+    /**
+     * Missing error_tracking:read or project access
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListErrorSavedSearchesResponses = {
+    /**
+     * A page of saved searches
+     */
+    200: ErrorSavedSearchPageResponse;
+};
+
+export type ListErrorSavedSearchesResponse = ListErrorSavedSearchesResponses[keyof ListErrorSavedSearchesResponses];
+
+export type CreateErrorSavedSearchData = {
+    body: CreateErrorSavedSearchRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/error-saved-searches';
+};
+
+export type CreateErrorSavedSearchErrors = {
+    /**
+     * An invalid name or filter, or 50 saved searches already
+     */
+    400: unknown;
+    /**
+     * Not authenticated
+     */
+    401: unknown;
+    /**
+     * Missing error_tracking:write or project access
+     */
+    403: unknown;
+    /**
+     * You already have a saved search with that name
+     */
+    409: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type CreateErrorSavedSearchResponses = {
+    /**
+     * Search saved
+     */
+    201: ErrorSavedSearchResponse;
+};
+
+export type CreateErrorSavedSearchResponse = CreateErrorSavedSearchResponses[keyof CreateErrorSavedSearchResponses];
+
+export type DeleteErrorSavedSearchData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Saved search ID
+         */
+        saved_search_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/error-saved-searches/{saved_search_id}';
+};
+
+export type DeleteErrorSavedSearchErrors = {
+    /**
+     * Not authenticated
+     */
+    401: unknown;
+    /**
+     * Neither its owner nor an administrator
+     */
+    403: unknown;
+    /**
+     * No such saved search you can see in the project
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type DeleteErrorSavedSearchResponses = {
+    /**
+     * Saved search deleted
+     */
+    204: void;
+};
+
+export type DeleteErrorSavedSearchResponse = DeleteErrorSavedSearchResponses[keyof DeleteErrorSavedSearchResponses];
+
+export type GetErrorSavedSearchData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Saved search ID
+         */
+        saved_search_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/error-saved-searches/{saved_search_id}';
+};
+
+export type GetErrorSavedSearchErrors = {
+    /**
+     * Not authenticated
+     */
+    401: unknown;
+    /**
+     * Missing error_tracking:read or project access
+     */
+    403: unknown;
+    /**
+     * No such saved search you can see in the project
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetErrorSavedSearchResponses = {
+    /**
+     * The saved search
+     */
+    200: ErrorSavedSearchResponse;
+};
+
+export type GetErrorSavedSearchResponse = GetErrorSavedSearchResponses[keyof GetErrorSavedSearchResponses];
+
+export type UpdateErrorSavedSearchData = {
+    body: UpdateErrorSavedSearchRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Saved search ID
+         */
+        saved_search_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/error-saved-searches/{saved_search_id}';
+};
+
+export type UpdateErrorSavedSearchErrors = {
+    /**
+     * An invalid name or filter
+     */
+    400: unknown;
+    /**
+     * Not authenticated
+     */
+    401: unknown;
+    /**
+     * Not its owner, or missing error_tracking:write
+     */
+    403: unknown;
+    /**
+     * No such saved search you can see in the project
+     */
+    404: unknown;
+    /**
+     * You already have a saved search with that name
+     */
+    409: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UpdateErrorSavedSearchResponses = {
+    /**
+     * Saved search changed
+     */
+    200: ErrorSavedSearchResponse;
+};
+
+export type UpdateErrorSavedSearchResponse = UpdateErrorSavedSearchResponses[keyof UpdateErrorSavedSearchResponses];
 
 export type GetErrorStatsData = {
     body?: never;
