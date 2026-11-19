@@ -549,8 +549,10 @@ class SignatureVerificationTests(unittest.TestCase):
         self.assertEqual(auth[:2], ["auth", "status"])
         self.assertEqual(verify[:2], ["attestation", "verify"])
         self.assertEqual(verify[verify.index("--repo") + 1], "gotempsh/temps")
-        self.assertEqual(verify[verify.index("--signer-workflow") + 1],
-                         "gotempsh/temps/.github/workflows/release.yml")
+        # Exact identity, never --signer-workflow (a prefix match in some gh
+        # releases, which `release.yml-x.yml` would also satisfy).
+        self.assertNotIn("--signer-workflow", verify)
+        self.assertEqual(verify[verify.index("--cert-identity") + 1], RELEASE_IDENTITY)
         self.assertEqual(verify[verify.index("--source-ref") + 1], "refs/tags/v0.1.0")
 
     def test_gh_failure_aborts_the_install(self):

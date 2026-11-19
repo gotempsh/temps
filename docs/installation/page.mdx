@@ -36,7 +36,7 @@ cosign verify-blob --bundle "$archive.sigstore.json" \
   --certificate-identity "$identity" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com "$archive"
 gh attestation verify "$archive" --repo gotempsh/temps \
-  --signer-workflow gotempsh/temps/.github/workflows/release.yml
+  --cert-identity "$identity"
 ```
 
 The exact certificate identity binds the signature to the release workflow and
@@ -93,7 +93,7 @@ cosign verify "$image" \
   --certificate-identity "$identity" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 gh attestation verify "oci://$image" --repo gotempsh/temps \
-  --signer-workflow gotempsh/temps/.github/workflows/release.yml
+  --cert-identity "$identity"
 docker buildx imagetools inspect "$image" --format '{{json .SBOM}}'
 docker buildx imagetools inspect "$image" --format '{{json .Provenance}}'
 ```

@@ -7,6 +7,7 @@ import {
   consoleApiUrl,
   cosignVerifyArgs,
   ghAttestationArgs,
+  manualVerifyCommands,
   databaseUrl,
   generateAdminPassword,
   isLocalServerCommand,
@@ -82,7 +83,7 @@ describe('release signature commands', () => {
     expect(ghAttestationArgs('/s/a.tar.gz', 'v1.2.3')).toEqual([
       'attestation', 'verify', '/s/a.tar.gz',
       '--repo', 'gotempsh/temps',
-      '--signer-workflow', 'gotempsh/temps/.github/workflows/release.yml',
+      '--cert-identity', 'https://github.com/gotempsh/temps/.github/workflows/release.yml@refs/tags/v1.2.3',
       '--source-ref', 'refs/tags/v1.2.3',
       '--cert-oidc-issuer', 'https://token.actions.githubusercontent.com',
     ])
@@ -322,5 +323,23 @@ describe('volumeOwnership', () => {
     expect(volumeOwnership(volume({}, Number.NaN), [service], INSTALLED).owned).toBe(false)
     expect(volumeOwnership(volume(), [service], null).owned).toBe(false)
     expect(volumeOwnership(volume(), [], INSTALLED).owned).toBe(false)
+  })
+})
+
+describe('manualVerifyCommands', () => {
+  test('download the release assets and verify them with the identity pinned to the tag', () => {
+    const [download, verify, digest] = manualVerifyCommands('v1.2.3', 'temps-linux-amd64')
+    expect(download).toBe(
+      'gh release download v1.2.3 --repo gotempsh/temps --pattern temps-linux-amd64.tar.gz --pattern temps-linux-amd64.tar.gz.sigstore.json',
+    )
+    expect(verify).toContain(
+      '--certificate-identity https://github.com/gotempsh/temps/.github/workflows/release.yml@refs/tags/v1.2.3',
+    )
+    expect(verify).toContain('--certificate-oidc-issuer https://token.actions.githubusercontent.com temps-linux-amd64.tar.gz')
+    expect(digest).toBe('sha256sum temps-linux-amd64.tar.gz')
+  })
+
+  test('use the digest tool macOS ships with on darwin', () => {
+    expect(manualVerifyCommands('v1.2.3', 'temps-darwin-arm64')[2]).toBe('shasum -a 256 temps-darwin-arm64.tar.gz')
   })
 })

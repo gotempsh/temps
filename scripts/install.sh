@@ -188,18 +188,18 @@ $output
     if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
         info "Verifying build provenance with the GitHub CLI..."
         if ! output=$(gh attestation verify "$file" --repo gotempsh/temps \
-                --signer-workflow "$release_workflow" \
+                --cert-identity "$identity" \
                 --source-ref "refs/tags/$tag" \
                 --cert-oidc-issuer "$oidc_issuer" 2>&1); then
             rm -f "$file"
             error "Build provenance verification FAILED: $asset has no attestation from the Temps
 release workflow at $tag. The download may have been tampered with. Aborting installation.
-  expected workflow: $release_workflow
-  expected ref:      refs/tags/$tag
+  expected signer: $identity
+  expected issuer: $oidc_issuer
 gh said:
 $output"
         fi
-        success "Build provenance verified (gh): built by $release_workflow at refs/tags/$tag"
+        success "Build provenance verified (gh): built by $identity"
         return 0
     fi
 

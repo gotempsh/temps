@@ -228,6 +228,21 @@ export function releaseIdentity(version: string): string {
   return `https://github.com/${RELEASE_WORKFLOW}@refs/tags/${version}`
 }
 
+/**
+ * Shell commands that download `target`'s archive and bundle for `version`
+ * and verify the signature with the identity pinned, for a user who had no
+ * verifier when `temps start` ran.
+ */
+export function manualVerifyCommands(version: string, target: string): string[] {
+  const archive = `${target}.tar.gz`
+  return [
+    `gh release download ${version} --repo ${RELEASE_REPO} --pattern ${archive} --pattern ${archive}.sigstore.json`,
+    `cosign verify-blob --bundle ${archive}.sigstore.json --certificate-identity ${releaseIdentity(version)} ` +
+      `--certificate-oidc-issuer ${GITHUB_ACTIONS_ISSUER} ${archive}`,
+    target.startsWith('temps-darwin') ? `shasum -a 256 ${archive}` : `sha256sum ${archive}`,
+  ]
+}
+
 /** `cosign verify-blob` against a release's Sigstore bundle, identity pinned. */
 export function cosignVerifyArgs(archive: string, bundle: string, version: string): string[] {
   return [
@@ -239,12 +254,17 @@ export function cosignVerifyArgs(archive: string, bundle: string, version: strin
   ]
 }
 
-/** `gh attestation verify` pinned to the release workflow at `version`. */
+/**
+ * `gh attestation verify` pinned to the release workflow at `version`. The
+ * certificate identity is matched exactly: `--signer-workflow` is a prefix
+ * match in some gh releases, which a workflow such as `release.yml-x.yml`
+ * would also satisfy.
+ */
 export function ghAttestationArgs(archive: string, version: string): string[] {
   return [
     'attestation', 'verify', archive,
     '--repo', RELEASE_REPO,
-    '--signer-workflow', RELEASE_WORKFLOW,
+    '--cert-identity', releaseIdentity(version),
     '--source-ref', `refs/tags/${version}`,
     '--cert-oidc-issuer', GITHUB_ACTIONS_ISSUER,
   ]
