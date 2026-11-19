@@ -10,6 +10,11 @@ import { PageHeader } from '@/components/layout/PageContainer'
 
 import { AnalyticsTrafficChart } from '@/components/analytics/overview/AnalyticsTrafficChart'
 import { AnalyticsBreakdowns } from '@/components/analytics/overview/AnalyticsBreakdowns'
+import {
+  FileDownloadsCard,
+  NotFoundCard,
+  OutboundLinksCard,
+} from '@/components/analytics/overview/AutoEventsCards'
 
 import { DateTimeRange } from '@/components/ui/date-time-range'
 
@@ -1453,6 +1458,24 @@ export function ProjectAnalyticsOverview({
             events={
               <div className="grid min-w-0 grid-cols-1 gap-4 md:grid-cols-2">
                 <EventsChart
+                  project={project}
+                  startDate={startDate}
+                  endDate={endDate}
+                  environment={selectedEnvironment}
+                />
+                <NotFoundCard
+                  project={project}
+                  startDate={startDate}
+                  endDate={endDate}
+                  environment={selectedEnvironment}
+                />
+                <OutboundLinksCard
+                  project={project}
+                  startDate={startDate}
+                  endDate={endDate}
+                  environment={selectedEnvironment}
+                />
+                <FileDownloadsCard
                   project={project}
                   startDate={startDate}
                   endDate={endDate}

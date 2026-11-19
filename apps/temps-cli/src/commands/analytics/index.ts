@@ -20,6 +20,7 @@ import {
 import { performanceInsights } from './performance.js'
 import { enrichVisitorAction } from './enrich.js'
 import { registerAnalyticsKeysCommands } from './keys.js'
+import { fileDownloads, notFound, outboundLinks } from './auto-events.js'
 
 function collect(value: string, previous: string[]): string[] {
   return [...previous, value]
@@ -60,6 +61,45 @@ export function registerAnalyticsCommands(program: Command): void {
     .option('--limit <n>', 'Number of results (default: 20, max: 100)')
     .option('--json', 'Output in JSON format')
     .action(breakdown)
+
+  analytics
+    .command('outbound')
+    .description('Show the outbound links visitors clicked (outbound_click events)')
+    .option('-p, --project <project>', 'Project slug or ID')
+    .option(
+      '--period <period>',
+      'Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m)',
+      '7d',
+    )
+    .option('--limit <n>', 'Number of results (default: 20, max: 100)')
+    .option('--json', 'Output in JSON format')
+    .action(outboundLinks)
+
+  analytics
+    .command('downloads')
+    .description('Show the files visitors downloaded (file_download events)')
+    .option('-p, --project <project>', 'Project slug or ID')
+    .option(
+      '--period <period>',
+      'Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m)',
+      '7d',
+    )
+    .option('--limit <n>', 'Number of results (default: 20, max: 100)')
+    .option('--json', 'Output in JSON format')
+    .action(fileDownloads)
+
+  analytics
+    .command('not-found')
+    .description('Show pages visitors could not find: 404s Temps answered and not_found events')
+    .option('-p, --project <project>', 'Project slug or ID')
+    .option(
+      '--period <period>',
+      'Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m)',
+      '7d',
+    )
+    .option('--limit <n>', 'Number of results (default: 20, max: 100)')
+    .option('--json', 'Output in JSON format')
+    .action(notFound)
 
   analytics
     .command('funnels')
