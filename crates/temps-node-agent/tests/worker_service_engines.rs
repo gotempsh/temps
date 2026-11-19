@@ -4036,6 +4036,192 @@ async fn a_control_plane_redis_is_backed_up_and_restored_by_the_same_node_half()
     drop(s3);
 }
 
+const DRAGONFLY_IMAGE: &str = "docker.dragonflydb.io/dragonflydb/dragonfly:v2.1.0";
+
+/// Start a Dragonfly container `name` on `network` with its data on volume
+/// `volume`, as a replica of `primary` when given.
+async fn start_dragonfly(
+    docker: &Docker,
+    name: &str,
+    volume: &str,
+    network: &str,
+    password: &str,
+    primary: Option<&str>,
+) {
+    let mut cmd = vec![
+        "dragonfly".to_string(),
+        "--logtostderr".to_string(),
+        "--proactor_threads=1".to_string(),
+        "--maxmemory=256mb".to_string(),
+        "--requirepass".to_string(),
+        password.to_string(),
+    ];
+    if let Some(primary) = primary {
+        cmd.extend([
+            "--masterauth".to_string(),
+            password.to_string(),
+            "--replicaof".to_string(),
+            format!("{primary}:6379"),
+        ]);
+    }
+    docker
+        .create_container(
+            Some(
+                bollard::query_parameters::CreateContainerOptionsBuilder::default()
+                    .name(name)
+                    .build(),
+            ),
+            bollard::models::ContainerCreateBody {
+                image: Some(DRAGONFLY_IMAGE.to_string()),
+                cmd: Some(cmd),
+                host_config: Some(bollard::models::HostConfig {
+                    network_mode: Some(network.to_string()),
+                    mounts: Some(vec![bollard::models::Mount {
+                        target: Some("/data".to_string()),
+                        source: Some(volume.to_string()),
+                        typ: Some(bollard::models::MountType::VOLUME),
+                        ..Default::default()
+                    }]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_or_else(|e| panic!("create Dragonfly {name}: {e}"));
+    docker
+        .start_container(
+            name,
+            None::<bollard::query_parameters::StartContainerOptions>,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("start Dragonfly {name}: {e}"));
+}
+
+/// Issue #1953: Dragonfly does not serve `redis-cli --rdb`'s replication
+/// handshake ("Replicating a replica is unsupported" on a replica), which
+/// failed every RDB backup of a Dragonfly service. The RDB backup has it
+/// save its own snapshot instead, in either role, and the object it
+/// uploads is that snapshot, holding the replica's data, with nothing left
+/// behind on the service's volume.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dragonfly_replica_and_primary_are_backed_up_by_the_rdb_engine() {
+    use std::io::Read as _;
+    use temps_providers::externalsvc::redis_node::{
+        redis_rdb_backup, RedisRdbBackup, RDB_HELPER_IMAGE,
+    };
+
+    let docker = match Docker::connect_with_defaults() {
+        Ok(docker) if docker.ping().await.is_ok() => docker,
+        _ => {
+            println!("Docker not available (set DOCKER_HOST), skipping the Dragonfly proof");
+            return;
+        }
+    };
+    for image in [DRAGONFLY_IMAGE, RUSTFS_IMAGE, RDB_HELPER_IMAGE] {
+        if docker.inspect_image(image).await.is_err() {
+            println!("image {image} is not present locally, skipping the Dragonfly proof");
+            return;
+        }
+    }
+    let network = temps_core::NETWORK_NAME.as_str();
+    temps_docker_util::ensure_bridge_network(&docker, network)
+        .await
+        .expect("the service network");
+    let suffix = std::process::id();
+    let primary = format!("redis-dfprimary{suffix}");
+    let replica = format!("redis-dfreplica{suffix}");
+    let s3_name = format!("dfredis3{suffix}");
+    let password = "local-dragonfly-proof";
+    let _cleanup = Cleanup {
+        docker: docker.clone(),
+        containers: vec![replica.clone(), primary.clone(), s3_name.clone()],
+        volumes: vec![format!("{primary}-data"), format!("{replica}-data")],
+    };
+    start_dragonfly(
+        &docker,
+        &primary,
+        &format!("{primary}-data"),
+        network,
+        password,
+        None,
+    )
+    .await;
+    wait_redis(&docker, &primary, password).await;
+    start_dragonfly(
+        &docker,
+        &replica,
+        &format!("{replica}-data"),
+        network,
+        password,
+        Some(&primary),
+    )
+    .await;
+    wait_redis(&docker, &replica, password).await;
+    redis_cli(&docker, &primary, password, &["SET", "proof", "replicated"]).await;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while redis_cli(&docker, &replica, password, &["GET", "proof"]).await != "replicated" {
+        assert!(Instant::now() < deadline, "the replica never synced");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(
+        redis_cli(&docker, &replica, password, &["INFO", "replication"])
+            .await
+            .contains("role:slave"),
+        "the backed-up container is a replica"
+    );
+    let (s3, s3_port) = redis_bucket(&docker, &s3_name, network).await;
+
+    for (container, service) in [(&replica, "dfreplica"), (&primary, "dfprimary")] {
+        let key = format!(
+            "{WALG_BUCKET_PATH}/external_services/redis/{service}/2026/11/19/local-{suffix}/dump.rdb.gz"
+        );
+        let size = redis_rdb_backup(
+            Arc::new(docker.clone()),
+            RedisRdbBackup {
+                service_id: 1,
+                service: service.to_string(),
+                container_name: container.clone(),
+                password: password.to_string(),
+                destination: redis_destination(format!("http://127.0.0.1:{s3_port}")),
+                key: key.clone(),
+            },
+        )
+        .await
+        .unwrap_or_else(|e| panic!("the RDB backup of Dragonfly {container}: {e}"));
+        assert!(size > 0, "{container}");
+
+        let object = s3
+            .get_object()
+            .bucket(REDIS_WALG_BUCKET)
+            .key(&key)
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("download {key}: {e:?}"))
+            .body
+            .collect()
+            .await
+            .expect("the object's body")
+            .into_bytes();
+        let mut rdb = Vec::new();
+        flate2::read::GzDecoder::new(object.as_ref())
+            .read_to_end(&mut rdb)
+            .expect("a gzipped snapshot");
+        assert!(rdb.starts_with(b"REDIS"), "{container}: an RDB snapshot");
+        assert!(
+            rdb.windows(b"replicated".len()).any(|w| w == b"replicated"),
+            "{container}: the snapshot holds the data"
+        );
+        let (_, left) = exec(
+            &docker,
+            container,
+            &["sh", "-c", "ls -a /data | grep '^temps-backup' || true"],
+        )
+        .await;
+        assert_eq!(left, "", "{container}: the snapshot file is removed");
+    }
+}
+
 // ── MariaDB (ADR-099): the control plane's engines, run by the agent ────────
 
 /// `mariadb` as root in `container`, batch output without a header.

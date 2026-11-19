@@ -130,17 +130,52 @@ pub fn walg_backup_env(
     env
 }
 
-/// The RDB helper's script: the snapshot goes to a file in the helper (the
-/// stream form carries a marker Redis rejects on restore), then gzipped to
-/// stdout. The container is reached by name on the service network.
-pub fn rdb_dump_script(container: &str) -> String {
+/// The RDB helper's script, gzipping one snapshot to stdout. The
+/// container is reached by name on the service network.
+///
+/// - Redis (and Valkey, KeyDB) serve `redis-cli --rdb`, which takes the
+///   snapshot over a replication handshake into a file in the helper (the
+///   stream form carries a marker Redis rejects on restore). A replica
+///   serves it like a primary.
+/// - Dragonfly refuses that handshake: a replica with "Replicating a replica
+///   is unsupported", a primary with an unknown `SYNC`. It is asked to
+///   `SAVE RDB <snapshot>` into its own `dir` instead, which works in either
+///   role; the helper reads the file through the container's volumes
+///   (`workdir` is the container's, where a relative `dir` points) and
+///   removes it afterwards.
+pub fn rdb_dump_script(container: &str, workdir: &str, snapshot: &str) -> String {
     format!(
-        "set -e\n\
-         f=\"${{TMPDIR:-/tmp}}/temps-backup.rdb\"\n\
-         redis-cli -h {host} -p 6379 --rdb \"$f\" >&2\n\
-         gzip -c \"$f\"\n\
-         rm -f \"$f\"",
-        host = shell_escape(container)
+        r#"set -e
+host={host}
+if redis-cli -h "$host" -p 6379 INFO server | grep -q '^dragonfly_version:'; then
+  dir=$(redis-cli -h "$host" -p 6379 --raw CONFIG GET dir | sed -n 2p | tr -d '\r')
+  case "$dir" in
+    /*) ;;
+    '') dir={workdir} ;;
+    *) dir={workdir}/"$dir" ;;
+  esac
+  f="$dir"/{snapshot}.rdb
+  trap 'rm -f "$f"' EXIT
+  echo "$host runs Dragonfly, which does not serve redis-cli --rdb: saving a snapshot to $f instead" >&2
+  reply=$(redis-cli -h "$host" -p 6379 SAVE RDB {snapshot} 2>&1)
+  if [ "$reply" != OK ]; then
+    echo "SAVE RDB on Dragonfly $host failed: $reply" >&2
+    exit 1
+  fi
+  if [ ! -f "$f" ]; then
+    echo "Dragonfly $host saved its snapshot to $f, which is not on a volume of its container; point its dir at a volume to back it up" >&2
+    exit 1
+  fi
+  gzip -c "$f"
+else
+  f="${{TMPDIR:-/tmp}}/temps-backup.rdb"
+  redis-cli -h "$host" -p 6379 --rdb "$f" >&2
+  gzip -c "$f"
+  rm -f "$f"
+fi"#,
+        host = shell_escape(container),
+        workdir = shell_escape(workdir),
+        snapshot = shell_escape(snapshot),
     )
 }
 
@@ -368,16 +403,24 @@ pub async fn redis_rdb_backup(
             ),
         });
     }
-    let running = docker
+    let inspect = docker
         .inspect_container(&container_name, None::<InspectContainerOptions>)
         .await
         .map_err(|error| RedisNodeError::Inspect {
             container: container_name.clone(),
             reason: error.to_string(),
-        })?
+        })?;
+    let running = inspect
         .state
         .and_then(|state| state.running)
         .unwrap_or(false);
+    // Where a relative snapshot `dir` of Dragonfly points; Docker
+    // starts a process in `/` when the image sets no working directory.
+    let workdir = inspect
+        .config
+        .and_then(|config| config.working_dir)
+        .filter(|dir| !dir.is_empty())
+        .unwrap_or_else(|| "/".to_string());
     if !running {
         return Err(RedisNodeError::Refused {
             service_id,
@@ -423,8 +466,14 @@ pub async fn redis_rdb_backup(
             container: container_name.clone(),
             tool: "redis-cli --rdb",
             image: RDB_HELPER_IMAGE.to_string(),
-            script: rdb_dump_script(&container_name),
+            script: rdb_dump_script(
+                &container_name,
+                &workdir,
+                &format!("temps-backup-{:08x}", rand::random::<u32>()),
+            ),
             env,
+            // Dragonfly's snapshot is a file in its volume.
+            volumes_from: Some(container_name.clone()),
             sensitive,
         },
         &destination,
@@ -791,10 +840,32 @@ mod tests {
 
     #[test]
     fn the_rdb_helper_keeps_the_password_out_of_its_script() {
-        let script = rdb_dump_script("redis-cache");
-        assert!(script.contains("redis-cli -h 'redis-cache' -p 6379 --rdb \"$f\""));
+        let script = rdb_dump_script("redis-cache", "/data", "temps-backup-0000abcd");
+        assert!(script.contains("host='redis-cache'\n"));
+        assert!(script.contains("redis-cli -h \"$host\" -p 6379 --rdb \"$f\""));
         assert!(script.contains("gzip -c \"$f\""));
         assert!(!script.contains("REDISCLI_AUTH"));
+    }
+
+    /// Dragonfly refuses `--rdb` ("Replicating a replica is unsupported" on
+    /// a replica), so it saves its own snapshot, which is read from its
+    /// volume and removed on every path.
+    #[test]
+    fn dragonfly_saves_a_snapshot_instead_of_replicating() {
+        let script = rdb_dump_script("redis-cache", "/srv data", "temps-backup-0000abcd");
+        assert!(script.contains("grep -q '^dragonfly_version:'"));
+        assert!(script.contains("SAVE RDB 'temps-backup-0000abcd'"));
+        assert!(script.contains("f=\"$dir\"/'temps-backup-0000abcd'.rdb"));
+        assert!(script.contains("'') dir='/srv data' ;;"));
+        assert!(script.contains("trap 'rm -f \"$f\"' EXIT"));
+        // redis-cli exits 0 on an error reply, so the reply itself is checked.
+        assert!(script.contains("[ \"$reply\" != OK ]"));
+        let snapshot = script.find("SAVE RDB").expect("the Dragonfly branch");
+        let stream = script.find("--rdb \"$f\"").expect("the replication branch");
+        assert!(
+            snapshot < stream,
+            "Dragonfly is recognised before --rdb runs"
+        );
     }
 
     #[test]
