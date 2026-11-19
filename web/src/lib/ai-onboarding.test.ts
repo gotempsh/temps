@@ -8,9 +8,13 @@ import {
   AI_HARNESS_POLL_INTERVAL_MS,
   buildAiHarnessCommands,
   buildAiHarnessKeyRequest,
+  canRemovePendingKey,
   describeHarnessConnection,
   harnessPollInterval,
   harnessStatusOf,
+  ONBOARDING_POLL_INTERVAL_MS,
+  onboardingPollInterval,
+  resolveOnboardingStatus,
   shouldShowHarnessPendingBanner,
 } from './ai-onboarding'
 
@@ -23,7 +27,9 @@ const STUB_BUNX = 'bunx() { printf "BUNX %s\\n" "$*"; }'
  */
 function runConnect(shell: string, typedKey: string) {
   const { connectCli } = buildAiHarnessCommands('https://temps.example.com')
-  const stdin = `${STUB_BUNX}\n${connectCli}\n${typedKey}\n`
+  // The trailing line runs in the user's shell after the block: the key must
+  // not be left behind there.
+  const stdin = `${STUB_BUNX}\n${connectCli}\n${typedKey}\necho "AFTER[\${TEMPS_API_KEY-unset}]"\n`
   const result = Bun.spawnSync([shell], {
     stdin: new TextEncoder().encode(stdin),
     env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: '/tmp' },
@@ -32,6 +38,50 @@ function runConnect(shell: string, typedKey: string) {
     stdout: result.stdout.toString(),
     stderr: result.stderr.toString(),
   }
+}
+
+/**
+ * Logs every `stty` call to stdout instead of touching a terminal (the
+ * command sends `stty`'s stderr to /dev/null); `-g` "saves" a state.
+ */
+const STUB_STTY =
+  'stty() { if [ "$1" = -g ]; then echo saved-state; else echo "STTY $*"; fi; }'
+
+/**
+ * Start the connect command, wait until it sits at the hidden key prompt
+ * (echo turned off), then interrupt it the way Ctrl-C does.
+ */
+async function interruptAtPrompt(shell: string) {
+  const { connectCli } = buildAiHarnessCommands('https://temps.example.com')
+  // `:` after the block keeps the shell from exec-ing the subshell in place,
+  // so the subshell is a child process that can be signalled.
+  const script = `${STUB_BUNX}\n${STUB_STTY}\n${connectCli}\n:\n`
+  const child = Bun.spawn([shell, '-c', script], {
+    stdin: 'pipe',
+    stdout: 'pipe',
+    stderr: 'pipe',
+    env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: '/tmp' },
+  })
+  const decoder = new TextDecoder()
+  let stdout = ''
+  const reader = child.stdout.getReader()
+  const deadline = Date.now() + 4_000
+  while (!stdout.includes('STTY -echo') && Date.now() < deadline) {
+    const { value, done } = await reader.read()
+    if (done) break
+    stdout += decoder.decode(value)
+  }
+  // Ctrl-C reaches the foreground job; the subshell is the outer shell's child.
+  Bun.spawnSync(['pkill', '-INT', '-P', String(child.pid)])
+  const killer = setTimeout(() => child.kill('SIGKILL'), 4_000)
+  for (;;) {
+    const { value, done } = await reader.read()
+    if (done) break
+    stdout += decoder.decode(value)
+  }
+  await child.exited
+  clearTimeout(killer)
+  return { stdout }
 }
 
 const shells = ['bash', 'zsh'].map((name) => ({
@@ -54,7 +104,9 @@ describe('AI harness onboarding commands', () => {
     )
     expect(commands.connectCli).toContain('--api-key "$TEMPS_API_KEY"')
     expect(commands.connectCli).toContain('--context temps-example-com')
-    expect(commands.connectCli).toContain('unset TEMPS_API_KEY')
+    // A subshell: the key and the cleanup traps end with the block.
+    expect(commands.connectCli.startsWith('(')).toBe(true)
+    expect(commands.connectCli.trimEnd().endsWith(')')).toBe(true)
   })
 
   test('never uses read -p, which zsh treats as a coprocess read', () => {
@@ -70,6 +122,24 @@ describe('AI harness onboarding commands', () => {
         expect(stdout).toContain(
           'BUNX @temps-sdk/cli@0.1.38 login https://temps.example.com --api-key tk_typed_example --context temps-example-com'
         )
+      }
+    )
+
+    test.skipIf(!shell.available)(
+      `${shell.name}: the key is not left in the user's shell`,
+      () => {
+        const { stdout } = runConnect(shell.name, 'tk_typed_example')
+        expect(stdout).toContain('AFTER[unset]')
+      }
+    )
+
+    test.skipIf(!shell.available)(
+      `${shell.name}: Ctrl-C at the key prompt restores the terminal and logs nothing in`,
+      async () => {
+        const { stdout } = await interruptAtPrompt(shell.name)
+        expect(stdout).toContain('STTY -echo')
+        expect(stdout).toContain('STTY saved-state')
+        expect(stdout).not.toContain('BUNX')
       }
     )
 
@@ -185,5 +255,70 @@ describe('AI harness status', () => {
   test('says nothing when no credential connected', () => {
     expect(describeHarnessConnection(null)).toBeNull()
     expect(describeHarnessConnection(undefined)).toBeNull()
+  })
+
+  describe('on /setup/ai', () => {
+    const missing = { status: 'missing' as const, key_id: null }
+    const waiting = { status: 'waiting' as const, key_id: 12 }
+
+    test('a failed or pending status read is unknown, not missing', () => {
+      expect(
+        resolveOnboardingStatus(undefined, { keyJustCreated: false })
+      ).toBe('unknown')
+    })
+
+    test('a successful missing answer offers creation', () => {
+      expect(resolveOnboardingStatus(missing, { keyJustCreated: false })).toBe(
+        'missing'
+      )
+    })
+
+    test('a key created in this visit waits even if the refetch failed', () => {
+      expect(resolveOnboardingStatus(undefined, { keyJustCreated: true })).toBe(
+        'waiting'
+      )
+      expect(resolveOnboardingStatus(missing, { keyJustCreated: true })).toBe(
+        'waiting'
+      )
+    })
+
+    test('the server answer wins once it reports the key', () => {
+      const connected = { status: 'connected' as const, key_id: 12 }
+      expect(resolveOnboardingStatus(connected, { keyJustCreated: true })).toBe(
+        'connected'
+      )
+      const deactivated = { status: 'missing' as const, key_id: 12 }
+      expect(
+        resolveOnboardingStatus(deactivated, { keyJustCreated: true })
+      ).toBe('missing')
+    })
+
+    test('keeps polling while the page shows waiting', () => {
+      expect(onboardingPollInterval(undefined, { keyJustCreated: true })).toBe(
+        ONBOARDING_POLL_INTERVAL_MS
+      )
+      expect(onboardingPollInterval(waiting, { keyJustCreated: false })).toBe(
+        ONBOARDING_POLL_INTERVAL_MS
+      )
+      expect(
+        onboardingPollInterval(
+          { status: 'connected', key_id: 12 },
+          { keyJustCreated: true }
+        )
+      ).toBe(false)
+      expect(onboardingPollInterval(undefined, { keyJustCreated: false })).toBe(
+        false
+      )
+    })
+
+    test('removal goes ahead only while the confirmed key still waits', () => {
+      expect(canRemovePendingKey(waiting, 12)).toBe(true)
+      expect(canRemovePendingKey(waiting, null)).toBe(false)
+      expect(canRemovePendingKey(waiting, 13)).toBe(false)
+      expect(canRemovePendingKey({ status: 'connected', key_id: 12 }, 12)).toBe(
+        false
+      )
+      expect(canRemovePendingKey(undefined, 12)).toBe(false)
+    })
   })
 })

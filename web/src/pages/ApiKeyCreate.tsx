@@ -38,7 +38,8 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { getEnvironmentsOptions } from '@/api/client/@tanstack/react-query.gen'
-import { useMutation, useQuery } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { invalidateApiKeyQueries } from '@/lib/api-key-queries'
 import {
   AlertCircle,
   ArrowLeft,
@@ -124,6 +125,7 @@ export default function ApiKeyCreate() {
       ? ''
       : requestedRole
 
+  const queryClient = useQueryClient()
   const createMutation = useMutation({
     ...createApiKeyMutation(),
     meta: {
@@ -131,6 +133,7 @@ export default function ApiKeyCreate() {
     },
     onSuccess: (response) => {
       setCreatedKey(response)
+      void invalidateApiKeyQueries(queryClient)
       setStep(4) // Show success step
       toast.success('API key created successfully')
     },

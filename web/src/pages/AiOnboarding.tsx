@@ -25,8 +25,6 @@ import {
   createApiKeyMutation,
   deleteApiKeyMutation,
   getAiHarnessStatusOptions,
-  getAiHarnessStatusQueryKey,
-  listApiKeysQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
@@ -43,9 +41,13 @@ import {
   AI_HARNESS_KEY_NAME,
   buildAiHarnessCommands,
   buildAiHarnessKeyRequest,
+  canRemovePendingKey,
   describeHarnessConnection,
-  harnessStatusOf,
+  onboardingPollInterval,
+  resolveOnboardingStatus,
 } from '@/lib/ai-onboarding'
+import { invalidateApiKeyQueries } from '@/lib/api-key-queries'
+import { problemDetail } from '@/lib/api-problem'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import { sensitiveActionErrorMessage } from '@/lib/sensitiveActionProblem'
 import { cn } from '@/lib/utils'
@@ -79,28 +81,28 @@ export function AiOnboarding() {
   const commands = buildAiHarnessCommands(origin)
 
   const queryClient = useQueryClient()
-  const [confirmRemoveOpen, setConfirmRemoveOpen] = useState(false)
+  // The key the user asked to remove; the dialog stays open only while the
+  // server still reports that same key as waiting.
+  const [removalKeyId, setRemovalKeyId] = useState<number | null>(null)
   const { markCompleted: markHarnessCompleted } = useManualHarnessCompletion()
+  const keyJustCreated = createdKeySecret !== null
 
   const {
     data: harness,
     isLoading: harnessLoading,
+    isError: harnessReadFailed,
+    error: harnessReadError,
+    isFetching: harnessFetching,
     refetch: refetchHarness,
   } = useQuery({
     ...getAiHarnessStatusOptions(),
     retry: false,
     // Faster than the app-wide banner: this page is where the user waits.
+    // Polls on what the page shows, so a failed refetch right after creating
+    // the key does not leave it showing waiting with polling stopped.
     refetchInterval: (query) =>
-      harnessStatusOf(query.state.data) === 'waiting' ? 5_000 : false,
+      onboardingPollInterval(query.state.data, { keyJustCreated }),
   })
-
-  const invalidateHarnessQueries = () =>
-    Promise.all([
-      queryClient.invalidateQueries({
-        queryKey: getAiHarnessStatusQueryKey(),
-      }),
-      queryClient.invalidateQueries({ queryKey: listApiKeysQueryKey() }),
-    ])
   const { handleSensitiveActionError, verificationDialog } =
     useSensitiveActionVerification()
 
@@ -141,7 +143,7 @@ export function AiOnboarding() {
     },
     onSuccess: async () => {
       setCreatedKeySecret(null)
-      setConfirmRemoveOpen(false)
+      setRemovalKeyId(null)
       try {
         markHarnessCompleted()
       } catch (error) {
@@ -151,7 +153,7 @@ export function AiOnboarding() {
             : 'Could not mark the harness step as done'
         )
       }
-      await invalidateHarnessQueries()
+      await invalidateApiKeyQueries(queryClient)
       toast.success('Pending harness key removed')
     },
     onError: (error) => {
@@ -174,11 +176,21 @@ export function AiOnboarding() {
   }, [setBreadcrumbs])
 
   const harnessKeyId = harness?.key_id ?? null
-  const harnessStatus = harnessStatusOf(harness) ?? 'missing'
-  const effectiveHarnessStatus =
-    createdKeySecret && harnessStatus === 'missing' && harnessKeyId === null
-      ? 'waiting'
-      : harnessStatus
+  // `unknown` (not `missing`) while the status cannot be read: creation is
+  // offered only after the server says no key exists.
+  const effectiveHarnessStatus = resolveOnboardingStatus(harness, {
+    keyJustCreated,
+  })
+  const statusUnknown = effectiveHarnessStatus === 'unknown'
+  // Removal targets a key the server reports as waiting, whether or not this
+  // visit created it.
+  const pendingKeyId = harness?.status === 'waiting' ? harnessKeyId : null
+  const removalAllowed = canRemovePendingKey(harness, removalKeyId)
+  if (removalKeyId !== null && !removalAllowed && !removePendingKey.isPending) {
+    // The key connected (or changed) while the confirmation was open: drop
+    // the request instead of revoking the credential that just connected.
+    setRemovalKeyId(null)
+  }
   // A dedicated key exists but cannot connect (deactivated, or expired
   // unused). Creating another would conflict on its name, so link to it.
   const harnessKeyUnusable =
@@ -258,6 +270,18 @@ export function AiOnboarding() {
                   <ArrowRight className="ml-1.5 size-4" />
                 </Link>
               </Button>
+            ) : statusUnknown ? (
+              <Button
+                size="lg"
+                variant="outline"
+                onClick={() => void refetchHarness()}
+                disabled={harnessFetching}
+              >
+                {harnessFetching ? (
+                  <Loader2 className="mr-1.5 size-4 animate-spin" />
+                ) : null}
+                Retry status check
+              </Button>
             ) : effectiveHarnessStatus === 'waiting' ? (
               <div className="inline-flex items-center gap-2 rounded-lg border border-amber-500/30 bg-amber-500/5 px-4 py-2.5 text-sm font-medium text-amber-700 dark:text-amber-300">
                 <Circle className="size-3 fill-current" />
@@ -295,23 +319,35 @@ export function AiOnboarding() {
               This page detects the first authenticated request automatically,
               including a CLI login you approve in the browser.
             </p>
-            {harnessKeyId !== null && (
-              <div className="mt-3 flex flex-col gap-2 sm:flex-row sm:items-center">
-                <span className="text-sm">
-                  Connected with a different credential?
-                </span>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => setConfirmRemoveOpen(true)}
-                  disabled={removePendingKey.isPending}
-                >
-                  {removePendingKey.isPending ? (
-                    <Loader2 className="mr-1.5 size-3.5 animate-spin" />
-                  ) : null}
-                  Remove pending key
-                </Button>
-              </div>
+          </AlertDescription>
+        </Alert>
+      )}
+
+      {pendingKeyId !== null && (
+        <div className="flex flex-col gap-2 rounded-lg border bg-muted/30 px-4 py-3 text-sm sm:flex-row sm:items-center">
+          <span>Connected with a different credential?</span>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => setRemovalKeyId(pendingKeyId)}
+            disabled={removePendingKey.isPending}
+          >
+            {removePendingKey.isPending ? (
+              <Loader2 className="mr-1.5 size-3.5 animate-spin" />
+            ) : null}
+            Remove pending key
+          </Button>
+        </div>
+      )}
+
+      {statusUnknown && harnessReadFailed && (
+        <Alert variant="destructive">
+          <ShieldAlert className="size-4" />
+          <AlertTitle>Couldn&apos;t check the harness connection</AlertTitle>
+          <AlertDescription>
+            {problemDetail(
+              harnessReadError,
+              'The status request failed. Retry, or check the key in Settings → API keys.'
             )}
           </AlertDescription>
         </Alert>
@@ -336,11 +372,13 @@ export function AiOnboarding() {
           }
           loading={harnessLoading}
           status={
-            harnessKeyUnusable
-              ? 'Needs attention'
-              : harnessKeyId !== null || createdKeySecret
-                ? 'Key ready'
-                : 'Required'
+            statusUnknown
+              ? 'Unknown'
+              : harnessKeyUnusable
+                ? 'Needs attention'
+                : harnessKeyId !== null || createdKeySecret
+                  ? 'Key ready'
+                  : 'Required'
           }
         >
           <div className="space-y-3">
@@ -355,6 +393,14 @@ export function AiOnboarding() {
             </Alert>
             {createdKeySecret ? (
               <OneTimeKeySecret value={createdKeySecret} />
+            ) : statusUnknown ? (
+              <Button
+                variant="outline"
+                onClick={() => void refetchHarness()}
+                disabled={harnessFetching}
+              >
+                Retry status check
+              </Button>
             ) : harnessKeyId !== null ? (
               <Button asChild variant="outline">
                 <Link to={`/settings/keys/${harnessKeyId}`}>
@@ -532,16 +578,22 @@ export function AiOnboarding() {
       </div>
       {verificationDialog}
       <ConfirmDeleteDialog
-        open={confirmRemoveOpen}
-        onOpenChange={setConfirmRemoveOpen}
+        open={removalAllowed}
+        onOpenChange={(open) => {
+          if (!open) setRemovalKeyId(null)
+        }}
         resourceType="API key"
         resourceName={AI_HARNESS_KEY_NAME}
         verb="Remove"
         consequences="The unused admin key stops working and this setup step is marked done. A harness already connected with another credential keeps working. The removal is recorded in the audit log."
         isPending={removePendingKey.isPending}
         onConfirm={() => {
-          if (harnessKeyId !== null) {
-            removePendingKey.mutate({ path: { id: harnessKeyId } })
+          // Re-check at the moment of confirmation, not when the dialog opened.
+          if (
+            removalKeyId !== null &&
+            canRemovePendingKey(harness, removalKeyId)
+          ) {
+            removePendingKey.mutate({ path: { id: removalKeyId } })
           }
         }}
       />
