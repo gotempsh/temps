@@ -321,7 +321,7 @@ async fn fetch_missing_pty_agent(
     if !guest_agent_needs_fetch(explicit, beside.as_deref(), dest) {
         return None;
     }
-    println!("  fetching temps-pty-agent from the release that matches this binary (checksum-verified)...");
+    println!("  fetching temps-pty-agent from the release that matches this binary (checksum and signature verified)...");
     match fetch_guest_agents_from_release(&[PTY_AGENT_BINARY_NAME]).await {
         Ok(agents) if agents.path(PTY_AGENT_BINARY_NAME).is_some() => Some(agents),
         Ok(agents) => {

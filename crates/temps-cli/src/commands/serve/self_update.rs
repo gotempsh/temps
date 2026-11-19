@@ -5,10 +5,10 @@
 //!
 //! This is the implementation behind `temps_core::SelfUpdater`; the HTTP surface
 //! lives in temps-config (`GET/POST /settings/update`). It reuses the download,
-//! checksum and atomic-swap machinery of `temps upgrade` — the only genuinely
-//! new problems here are (a) deciding honestly whether the process will come
-//! back after it exits, and (b) reporting the outcome of an operation that by
-//! definition kills the process that started it.
+//! checksum, Sigstore signature and atomic-swap machinery of `temps upgrade` —
+//! the only genuinely new problems here are (a) deciding honestly whether the
+//! process will come back after it exits, and (b) reporting the outcome of an
+//! operation that by definition kills the process that started it.
 //!
 //! **How the restart works.** Nothing in temps restarts temps. Where a
 //! supervisor is detected (systemd `Restart=always`, launchd `KeepAlive`) the
@@ -41,10 +41,12 @@ use tracing::{error, info, warn};
 
 use crate::commands::upgrade::{
     check_write_permission, create_upgrade_temp_file, current_version_tag, download_asset_to_file,
-    extract_binary_from_tarball_file, fetch_expected_checksum, fetch_latest_release_in_channel,
-    fetch_specific_release, finalize_staged_binary, is_newer_version, is_older_version,
-    platform_target, seal_staged_binary, stage_vm_agent_from_tarball, verify_computed_checksum,
-    GitHubRelease, UpgradeChannel,
+    ensure_signature_published, extract_binary_from_tarball_file, fetch_expected_checksum,
+    fetch_latest_release_in_channel, fetch_specific_release, finalize_staged_binary,
+    host_unsigned_remedy, is_newer_version, is_older_version, platform_target,
+    preflight_staged_binary, seal_staged_binary, stage_vm_agent_from_tarball,
+    verify_computed_checksum, verify_release_asset, GitHubRelease, ReleaseTrustSource,
+    UpgradeChannel,
 };
 
 /// Grace period between accepting the update and exiting the process. Long
@@ -955,6 +957,10 @@ impl UpdateJob {
                 )
             })?;
 
+        // An unsigned release is refused before the download, not after.
+        ensure_signature_published(&release, &tarball_name, false)
+            .map_err(|e| e.with_unsigned_remedy(&host_unsigned_remedy(&release.tag_name)))?;
+
         info!(
             to = %to_version,
             size_mb = format!("{:.1}", asset.size as f64 / 1_048_576.0),
@@ -987,6 +993,19 @@ impl UpdateJob {
         // install.sh: never install bytes that could not be verified.
         let expected = fetch_expected_checksum(&release, &tarball_name).await?;
         verify_computed_checksum(&computed, &expected)?;
+        // And on its Sigstore signature, pinned to the release workflow at
+        // this tag. There is no opt-out from the console: an unsigned (old)
+        // release can only be installed deliberately, from a shell, with
+        // `temps upgrade --allow-unsigned`.
+        verify_release_asset(
+            &ReleaseTrustSource::PublicGood,
+            &release,
+            &tarball_name,
+            &computed,
+            false,
+        )
+        .await
+        .map_err(|e| e.with_unsigned_remedy(&host_unsigned_remedy(&release.tag_name)))?;
 
         let mut staged_file = create_upgrade_temp_file(&parent, ".temps-selfupdate-bin.")?;
         let staged_path = staged_file.path().to_path_buf();
@@ -1345,41 +1364,6 @@ fn running_under_systemd_service() -> bool {
         }),
         Err(_) => true,
     }
-}
-
-/// Run the staged binary's `--version` before trusting it.
-///
-/// Catches the failures a checksum cannot: a build for the wrong libc, a
-/// missing shared library, a corrupted extraction. Cheap insurance — without
-/// it, a binary that cannot exec turns a one-click update into an outage that
-/// only a console on the host can fix.
-///
-/// Runs directly against the already-staged extraction file (the same one
-/// `finalize_staged_binary` will persist) instead of writing a second full
-/// copy just to exec it — that second copy is exactly the kind of extra
-/// in-memory/on-disk buffering the streaming rewrite of this flow removed
-/// everywhere else.
-fn preflight_staged_binary(staged_path: &Path) -> anyhow::Result<()> {
-    let output = std::process::Command::new(staged_path)
-        .arg("--version")
-        .output();
-
-    let output = output.map_err(|e| {
-        anyhow::anyhow!(
-            "The downloaded binary could not be executed on this host: {}. \
-             The running version was left untouched.",
-            e
-        )
-    })?;
-    if !output.status.success() {
-        return Err(anyhow::anyhow!(
-            "The downloaded binary exited with {} when asked for its version: {}. \
-             The running version was left untouched.",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    Ok(())
 }
 
 /// Arguments for the `temps migrate` child of an update. With

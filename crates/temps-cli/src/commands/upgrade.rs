@@ -11,6 +11,11 @@ use std::sync::Arc;
 use tempfile::{NamedTempFile, TempPath};
 use tracing::{debug, info};
 
+mod release_signature;
+pub(crate) use release_signature::{
+    ensure_signature_published, host_unsigned_remedy, verify_release_asset, ReleaseTrustSource,
+};
+
 const GITHUB_RELEASES_API: &str = "https://api.github.com/repos/gotempsh/temps/releases";
 
 /// Default base URL of the Temps Cloud license + EE binary proxy. The EE
@@ -226,6 +231,13 @@ pub struct UpgradeCommand {
     /// Skip confirmation prompt
     #[arg(long, short = 'y')]
     pub yes: bool,
+
+    /// Install a release that publishes no Sigstore signature
+    /// (`<tarball>.sigstore.json`), trusting its SHA-256 checksum alone.
+    /// Only releases published before signing was introduced lack one. A
+    /// signature that is present but does not verify is refused regardless.
+    #[arg(long)]
+    pub allow_unsigned: bool,
 
     /// Only check for updates, don't install
     #[arg(long)]
@@ -518,6 +530,10 @@ impl UpgradeCommand {
         println!("    Binary:   {}", binary_path.display());
         println!("    Size:     {:.1} MB", size_mb);
         println!("    Release:  {}", release.html_url);
+        println!(
+            "    Signature: {}",
+            release_signature::describe_release_signature(&release, &tarball_name)
+        );
         println!();
         print_lock_capacity_warning(self.database_url.as_deref()).await;
 
@@ -544,8 +560,13 @@ impl UpgradeCommand {
             }
         }
 
-        // Check write permissions before downloading
+        // Check write permissions, and that the release is signed, before
+        // downloading
         check_write_permission(&binary_path)?;
+        release_signature::ensure_signature_published(&release, &tarball_name, self.allow_unsigned)
+            .map_err(|e| {
+                e.with_unsigned_remedy(&release_signature::host_unsigned_remedy(&release.tag_name))
+            })?;
 
         let parent = binary_path
             .parent()
@@ -581,6 +602,23 @@ impl UpgradeCommand {
         verify_computed_checksum(&computed, &checksum_text)?;
         println!("  Checksum verified.");
 
+        // The checksum ships in the same release as the tarball, so it proves
+        // integrity, not origin. The Sigstore signature binds the bytes to the
+        // release workflow at this exact tag.
+        println!("  Verifying signature...");
+        let signature = verify_release_asset(
+            &ReleaseTrustSource::PublicGood,
+            &release,
+            &tarball_name,
+            &computed,
+            self.allow_unsigned,
+        )
+        .await
+        .map_err(|e| {
+            e.with_unsigned_remedy(&release_signature::host_unsigned_remedy(&release.tag_name))
+        })?;
+        println!("  {}", signature.summary());
+
         // Extract the binary from the tarball, straight into the staging file
         // that the atomic rename below consumes.
         println!("  Extracting binary...");
@@ -607,9 +645,11 @@ impl UpgradeCommand {
         let staged_pty_agent =
             stage_pty_agent_reporting(download_file.as_file_mut(), &download_path, &binary_path);
 
-        // Replace the binary atomically
+        // Replace the binary atomically, but only once it has run here. The
+        // signature proves the bytes come from this release, not that they
+        // are this platform's build.
         println!("  Replacing binary at {}...", binary_path.display());
-        finalize_staged_binary(&binary_path, staged_path)?;
+        install_staged_binary(&binary_path, staged_path)?;
         install_vm_agent_reporting(staged_agent);
         install_pty_agent_reporting(staged_pty_agent);
         print_launcher_refresh_reminder();
@@ -2059,7 +2099,7 @@ impl ReleaseGuestAgents {
 /// fresh install does not depend on the operator unpacking an archive by hand.
 /// It goes through the same pipeline as `temps upgrade`: the tarball streams
 /// to disk, and nothing is unpacked unless the release publishes a checksum
-/// that matches. The version is the running binary's own, because the VM
+/// that matches and a Sigstore signature from its release workflow. The version is the running binary's own, because the VM
 /// agent has to agree with the host on the wire protocol.
 ///
 /// An agent the release does not ship is simply absent from the result
@@ -2074,18 +2114,21 @@ pub(crate) async fn fetch_guest_agents_from_release(
         &current_version_tag(),
         &target,
         std::time::Duration::from_secs(300),
+        &ReleaseTrustSource::PublicGood,
     )
     .await
 }
 
-/// One deadline covers release metadata, the streamed archive and checksum bodies.
-/// The endpoint/deadline are injectable so tests never depend on public releases.
+/// One deadline covers release metadata, the streamed archive and checksum;
+/// the signature check follows on its own bounds. The endpoint, deadline and Sigstore trust root are
+/// injectable so tests never depend on public releases.
 async fn fetch_guest_agents_from_release_from(
     names: &[&str],
     releases_api: &str,
     tag: &str,
     target: &str,
     deadline: std::time::Duration,
+    trust: &ReleaseTrustSource,
 ) -> anyhow::Result<ReleaseGuestAgents> {
     if names
         .iter()
@@ -2095,69 +2138,88 @@ async fn fetch_guest_agents_from_release_from(
             "Unknown guest agent requested from release {tag}"
         ));
     }
-    tokio::time::timeout(deadline, async {
-        let release = fetch_specific_release_from(tag, releases_api).await?;
-        let tarball_name = format!("temps-{}.tar.gz", target);
-        let asset = release
-            .assets
-            .iter()
-            .find(|a| a.name == tarball_name)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "release {} has no {} asset to take the guest agents from",
-                    release.tag_name,
-                    tarball_name
-                )
+    // The deadline covers the transfers (metadata, archive, checksum). The
+    // signature check runs after it on its own bounds (bundle retries, a 30 s
+    // TUF refresh that falls back to the embedded root), so a slow archive
+    // cannot cancel it before that fallback gets its turn.
+    let (release, tarball_name, dir, mut tarball, tarball_path, computed) =
+        tokio::time::timeout(deadline, async {
+            let release = fetch_specific_release_from(tag, releases_api).await?;
+            let tarball_name = format!("temps-{}.tar.gz", target);
+            let asset = release
+                .assets
+                .iter()
+                .find(|a| a.name == tarball_name)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "release {} has no {} asset to take the guest agents from",
+                        release.tag_name,
+                        tarball_name
+                    )
+                })?;
+            // An unsigned release is refused before the ~110 MB download.
+            ensure_signature_published(&release, &tarball_name, false).map_err(|e| {
+                e.with_unsigned_remedy(release_signature::GUEST_AGENT_UNSIGNED_REMEDY)
             })?;
 
-        let dir = tempfile::tempdir()
-            .map_err(|e| anyhow::anyhow!("Failed to create a scratch directory: {}", e))?;
-        let tarball_path = dir.path().join(&tarball_name);
-        let mut tarball = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&tarball_path)
-            .map_err(|e| anyhow::anyhow!("Failed to create {}: {}", tarball_path.display(), e))?;
+            let dir = tempfile::tempdir()
+                .map_err(|e| anyhow::anyhow!("Failed to create a scratch directory: {}", e))?;
+            let tarball_path = dir.path().join(&tarball_name);
+            let mut tarball = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&tarball_path)
+                .map_err(|e| {
+                    anyhow::anyhow!("Failed to create {}: {}", tarball_path.display(), e)
+                })?;
 
-        let computed =
-            download_asset_to_file(&asset.browser_download_url, &mut tarball, &tarball_path)
-                .await?;
-        let checksum_text = fetch_expected_checksum(&release, &tarball_name).await?;
-        verify_computed_checksum(&computed, &checksum_text)?;
-
-        for name in names {
-            let out_path = dir.path().join(name);
-            let mut out = fs::File::create(&out_path)
-                .map_err(|e| anyhow::anyhow!("Failed to create {}: {}", out_path.display(), e))?;
-            let extracted = extract_entry_from_tarball_file(
-                &mut tarball,
-                &tarball_path,
-                &mut out,
-                &out_path,
-                name,
-            )?;
-            drop(out);
-            if extracted.is_none() {
-                let _ = fs::remove_file(&out_path);
-            }
-        }
-        // The ~110 MB archive is not needed once the entries are out.
-        drop(tarball);
-        let _ = fs::remove_file(&tarball_path);
-
-        Ok(ReleaseGuestAgents {
-            dir,
-            tag: release.tag_name,
+            let computed =
+                download_asset_to_file(&asset.browser_download_url, &mut tarball, &tarball_path)
+                    .await?;
+            let checksum_text = fetch_expected_checksum(&release, &tarball_name).await?;
+            verify_computed_checksum(&computed, &checksum_text)?;
+            anyhow::Ok((release, tarball_name, dir, tarball, tarball_path, computed))
         })
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "Fetching guest agents from release {tag} timed out after {} seconds",
+                deadline.as_secs_f64(),
+            )
+        })??;
+
+    // The agents run as root inside every VM, so they get the same origin
+    // check as the host binary, and no unsigned opt-out: an explicit
+    // `--vm-agent-bin`/`--pty-agent-bin` path is the way around it.
+    verify_release_asset(trust, &release, &tarball_name, &computed, false)
+        .await
+        .map_err(|e| e.with_unsigned_remedy(release_signature::GUEST_AGENT_UNSIGNED_REMEDY))?;
+
+    for name in names {
+        let out_path = dir.path().join(name);
+        let mut out = fs::File::create(&out_path)
+            .map_err(|e| anyhow::anyhow!("Failed to create {}: {}", out_path.display(), e))?;
+        let extracted = extract_entry_from_tarball_file(
+            &mut tarball,
+            &tarball_path,
+            &mut out,
+            &out_path,
+            name,
+        )?;
+        drop(out);
+        if extracted.is_none() {
+            let _ = fs::remove_file(&out_path);
+        }
+    }
+    // The ~110 MB archive is not needed once the entries are out.
+    drop(tarball);
+    let _ = fs::remove_file(&tarball_path);
+
+    Ok(ReleaseGuestAgents {
+        dir,
+        tag: release.tag_name,
     })
-    .await
-    .map_err(|_| {
-        anyhow::anyhow!(
-            "Fetching guest agents from release {tag} timed out after {} seconds",
-            deadline.as_secs_f64(),
-        )
-    })?
 }
 
 /// Explicit paths take precedence even when invalid: setup reports that error
@@ -2365,6 +2427,129 @@ pub(crate) fn create_upgrade_temp_file(
                 e
             )
         })
+}
+
+/// Run the staged binary's `--version` before trusting it.
+///
+/// Catches the failures a checksum cannot: a build for the wrong libc, a
+/// missing shared library, a corrupted extraction. Cheap insurance — without
+/// it, a binary that cannot exec turns a one-click update into an outage that
+/// only a console on the host can fix. It also catches a genuine release
+/// archive for another platform: the Sigstore signature binds the bytes to the
+/// release workflow and tag, not to the asset name, so a signed
+/// `temps-linux-arm64.tar.gz` offered as `temps-linux-amd64.tar.gz` verifies,
+/// and only running it shows it cannot work here.
+///
+/// Runs directly against the already-staged extraction file (the same one
+/// `finalize_staged_binary` will persist) instead of writing a second full
+/// copy just to exec it — that second copy is exactly the kind of extra
+/// in-memory/on-disk buffering the streaming rewrite of this flow removed
+/// everywhere else.
+pub(crate) fn preflight_staged_binary(staged_path: &Path) -> anyhow::Result<()> {
+    preflight_staged_binary_within(staged_path, PREFLIGHT_TIMEOUT)
+}
+
+/// How long the staged binary gets to print its version.
+const PREFLIGHT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// At most this much of the staged binary's stderr is kept for the error.
+const PREFLIGHT_STDERR_LIMIT: u64 = 64 * 1024;
+
+/// How long to wait for the stderr of a binary that already exited.
+const PREFLIGHT_STDERR_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Replace `binary_path` with the staged binary only once it has run on this
+/// host (see [`preflight_staged_binary`]); a binary that cannot run leaves the
+/// installed one untouched.
+pub(crate) fn install_staged_binary(
+    binary_path: &Path,
+    staged_path: TempPath,
+) -> anyhow::Result<()> {
+    preflight_staged_binary(staged_path.as_ref())?;
+    finalize_staged_binary(binary_path, staged_path)
+}
+
+fn preflight_staged_binary_within(
+    staged_path: &Path,
+    timeout: std::time::Duration,
+) -> anyhow::Result<()> {
+    use std::io::Read;
+    use std::process::Stdio;
+
+    let mut child = std::process::Command::new(staged_path)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "The downloaded binary could not be executed on this host: {}. \
+                 The running version was left untouched.",
+                e
+            )
+        })?;
+    // Drain stderr on a thread so a chatty binary cannot block on a full pipe
+    // while this thread waits for it; only the first 64 KiB is kept. The
+    // result comes back over a channel, never a join: a descendant that
+    // inherited stderr can hold the pipe open long after the binary exits.
+    let stderr = child.stderr.take();
+    let (stderr_tx, stderr_rx) = std::sync::mpsc::sync_channel::<String>(1);
+    std::thread::spawn(move || {
+        let mut kept = Vec::new();
+        if let Some(mut stderr) = stderr {
+            let _ = (&mut stderr)
+                .take(PREFLIGHT_STDERR_LIMIT)
+                .read_to_end(&mut kept);
+            let _ = stderr_tx.send(String::from_utf8_lossy(&kept).trim().to_string());
+            let _ = std::io::copy(&mut stderr, &mut std::io::sink());
+        }
+    });
+
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(anyhow::anyhow!(
+                    "The downloaded binary did not answer `{} --version` within {} seconds and \
+                     was stopped. The running version was left untouched.",
+                    staged_path.display(),
+                    timeout.as_secs_f64()
+                ));
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(anyhow::anyhow!(
+                    "Could not wait for the downloaded binary {}: {}. \
+                     The running version was left untouched.",
+                    staged_path.display(),
+                    e
+                ));
+            }
+        }
+    };
+    if status.success() {
+        return Ok(());
+    }
+    // The binary has exited; give its stderr a moment, bounded by the
+    // deadline, then report without it rather than wait on a descendant.
+    let grace = deadline
+        .saturating_duration_since(std::time::Instant::now())
+        .min(PREFLIGHT_STDERR_GRACE);
+    let stderr = stderr_rx
+        .recv_timeout(grace)
+        .unwrap_or_else(|_| "(no error output within the deadline)".to_string());
+    Err(anyhow::anyhow!(
+        "The downloaded binary exited with {} when asked for its version: {}. \
+         The running version was left untouched.",
+        status,
+        stderr
+    ))
 }
 
 /// Finish writing a staged executable, make it durable, and close its writable
@@ -3632,12 +3817,16 @@ mod tests {
         assert!(upgrade_scratch_paths(dir.path()).is_empty());
     }
 
-    /// Serve release metadata, archive and checksum from localhost for fetch tests.
+    /// Serve release metadata, archive, checksum and (when `signed_by` names
+    /// an identity) a Sigstore bundle from localhost for fetch tests. The
+    /// returned trust source accepts only the throwaway Sigstore instance that
+    /// signed it.
     async fn guest_release_server(
         archive: Vec<u8>,
         bad_checksum: bool,
         stall: Option<&'static str>,
-    ) -> (String, tokio::task::JoinHandle<()>) {
+        signed_by: Option<&str>,
+    ) -> (String, tokio::task::JoinHandle<()>, ReleaseTrustSource) {
         use axum::{
             body::Body,
             extract::{OriginalUri, State},
@@ -3651,6 +3840,7 @@ mod tests {
             base: String,
             archive: Vec<u8>,
             checksum: String,
+            bundle: Option<String>,
             stall: Option<&'static str>,
         }
         async fn serve(State(f): State<Fixture>, OriginalUri(uri): OriginalUri) -> Response<Body> {
@@ -3667,15 +3857,22 @@ mod tests {
                 f.archive
             } else if path.ends_with("checksum") {
                 f.checksum.into_bytes()
+            } else if path.ends_with("bundle") {
+                f.bundle.unwrap_or_default().into_bytes()
             } else {
+                let mut assets = vec![
+                    serde_json::json!({"name":"temps-test.tar.gz", "browser_download_url":format!("{}/archive", f.base), "size":f.archive.len()}),
+                    serde_json::json!({"name":"temps-test.tar.gz.sha256", "browser_download_url":format!("{}/checksum", f.base), "size":64}),
+                ];
+                if f.bundle.is_some() {
+                    assets.push(serde_json::json!({"name":"temps-test.tar.gz.sigstore.json", "browser_download_url":format!("{}/bundle", f.base), "size":1}));
+                }
                 serde_json::to_vec(&serde_json::json!({
                     "tag_name": "v1.2.3", "prerelease": false, "draft": false,
                     "html_url": "https://example.test/releases/v1.2.3",
-                    "assets": [
-                        {"name":"temps-test.tar.gz", "browser_download_url":format!("{}/archive", f.base), "size":f.archive.len()},
-                        {"name":"temps-test.tar.gz.sha256", "browser_download_url":format!("{}/checksum", f.base), "size":64}
-                    ]
-                })).unwrap()
+                    "assets": assets
+                }))
+                .unwrap()
             };
             Response::new(Body::from(body))
         }
@@ -3686,22 +3883,36 @@ mod tests {
         } else {
             hex::encode(Sha256::digest(&archive))
         };
+        let sigstore = release_signature::test_sigstore::TestSigstore::new();
+        let bundle = signed_by.map(|identity| {
+            sigstore.sign(
+                &archive,
+                identity,
+                "https://token.actions.githubusercontent.com",
+            )
+        });
         let fixture = Fixture {
             base: base.clone(),
             archive,
             checksum: hash,
+            bundle,
             stall,
         };
         let app = Router::new()
             .route("/tags/{tag}", get(serve))
             .route("/archive", get(serve))
             .route("/checksum", get(serve))
+            .route("/bundle", get(serve))
             .with_state(fixture);
         let server = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        (base, server)
+        (base, server, sigstore.trust())
     }
+
+    /// The identity a genuine signature on the fixture release carries.
+    const FIXTURE_SIGNER: &str =
+        "https://github.com/gotempsh/temps/.github/workflows/release.yml@refs/tags/v1.2.3";
 
     #[tokio::test]
     async fn guest_release_fetch_extracts_both_agents_and_cleans_scratch() {
@@ -3709,13 +3920,15 @@ mod tests {
             (VM_AGENT_BINARY_NAME, b"vm"),
             (PTY_AGENT_BINARY_NAME, b"pty"),
         ]);
-        let (api, server) = guest_release_server(archive, false, None).await;
+        let (api, server, trust) =
+            guest_release_server(archive, false, None, Some(FIXTURE_SIGNER)).await;
         let result = fetch_guest_agents_from_release_from(
             &[VM_AGENT_BINARY_NAME, PTY_AGENT_BINARY_NAME],
             &api,
             "v1.2.3",
             "test",
             std::time::Duration::from_secs(5),
+            &trust,
         )
         .await;
         server.abort();
@@ -3738,13 +3951,15 @@ mod tests {
     #[tokio::test]
     async fn guest_release_fetch_rejects_checksum_and_reports_absent_agents() {
         let archive = tarball_with_entries(&[(VM_AGENT_BINARY_NAME, b"vm")]);
-        let (api, server) = guest_release_server(archive.clone(), true, None).await;
+        let (api, server, trust) =
+            guest_release_server(archive.clone(), true, None, Some(FIXTURE_SIGNER)).await;
         let result = fetch_guest_agents_from_release_from(
             &[VM_AGENT_BINARY_NAME],
             &api,
             "v1.2.3",
             "test",
             std::time::Duration::from_secs(5),
+            &trust,
         )
         .await;
         server.abort();
@@ -3752,13 +3967,15 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("Checksum mismatch"));
-        let (api, server) = guest_release_server(archive, false, None).await;
+        let (api, server, trust) =
+            guest_release_server(archive, false, None, Some(FIXTURE_SIGNER)).await;
         let result = fetch_guest_agents_from_release_from(
             &[VM_AGENT_BINARY_NAME, PTY_AGENT_BINARY_NAME],
             &api,
             "v1.2.3",
             "test",
             std::time::Duration::from_secs(5),
+            &trust,
         )
         .await;
         server.abort();
@@ -3767,13 +3984,103 @@ mod tests {
         assert!(agents.path(PTY_AGENT_BINARY_NAME).is_none());
     }
 
+    /// A staged executable script: sealed, so it can be run.
+    #[cfg(unix)]
+    fn staged_script(dir: &Path, body: &str) -> TempPath {
+        let mut staged = create_upgrade_temp_file(dir, ".temps-upgrade-bin.").unwrap();
+        staged.as_file_mut().write_all(body.as_bytes()).unwrap();
+        seal_staged_binary(staged).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preflight_stops_a_binary_that_never_answers() {
+        let dir = tempfile::tempdir().unwrap();
+        let staged = staged_script(dir.path(), "#!/bin/sh\nexec sleep 30\n");
+        let started = std::time::Instant::now();
+        let err =
+            preflight_staged_binary_within(staged.as_ref(), std::time::Duration::from_millis(300))
+                .unwrap_err()
+                .to_string();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "{err}"
+        );
+        assert!(err.contains("did not answer"), "{err}");
+        assert!(err.contains("left untouched"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preflight_does_not_wait_on_a_descendant_holding_stderr() {
+        let dir = tempfile::tempdir().unwrap();
+        // Exits at once with a failure, leaving a child that keeps stderr open.
+        let staged = staged_script(dir.path(), "#!/bin/sh\nsleep 30 &\nexit 4\n");
+        let started = std::time::Instant::now();
+        let err =
+            preflight_staged_binary_within(staged.as_ref(), std::time::Duration::from_secs(20))
+                .unwrap_err()
+                .to_string();
+        assert!(
+            started.elapsed() < PREFLIGHT_STDERR_GRACE + std::time::Duration::from_secs(5),
+            "took {:?}: {err}",
+            started.elapsed()
+        );
+        assert!(err.contains("exited with"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_binary_that_cannot_run_never_replaces_the_installed_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let installed = dir.path().join("temps");
+        std::fs::write(&installed, b"the working binary").unwrap();
+        let staged = staged_script(dir.path(), "#!/bin/sh\nexit 126\n");
+        let staged_file = staged.to_path_buf();
+        let err = install_staged_binary(&installed, staged)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("left untouched"), "{err}");
+        assert_eq!(std::fs::read(&installed).unwrap(), b"the working binary");
+        assert!(!staged_file.exists(), "the staged binary is discarded");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_binary_that_runs_replaces_the_installed_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let installed = dir.path().join("temps");
+        std::fs::write(&installed, b"the old binary").unwrap();
+        let script = "#!/bin/sh\nexit 0\n";
+        let staged = staged_script(dir.path(), script);
+        install_staged_binary(&installed, staged).unwrap();
+        assert_eq!(std::fs::read(&installed).unwrap(), script.as_bytes());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preflight_reports_why_the_binary_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let staged = staged_script(
+            dir.path(),
+            "#!/bin/sh\necho 'cannot run on this host' >&2\nexit 3\n",
+        );
+        let err =
+            preflight_staged_binary_within(staged.as_ref(), std::time::Duration::from_secs(10))
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("cannot run on this host"), "{err}");
+        assert!(err.contains("left untouched"), "{err}");
+    }
+
     #[tokio::test]
     async fn guest_release_fetch_bounds_every_response_body() {
         for stage in ["headers", "v1.2.3", "archive", "checksum"] {
-            let (api, server) = guest_release_server(
+            let (api, server, trust) = guest_release_server(
                 tarball_with_entries(&[(VM_AGENT_BINARY_NAME, b"vm")]),
                 false,
                 Some(stage),
+                Some(FIXTURE_SIGNER),
             )
             .await;
             let result = fetch_guest_agents_from_release_from(
@@ -3782,6 +4089,7 @@ mod tests {
                 "v1.2.3",
                 "test",
                 std::time::Duration::from_millis(250),
+                &trust,
             )
             .await;
             server.abort();
@@ -3790,6 +4098,85 @@ mod tests {
                 "stage {stage}"
             );
         }
+    }
+
+    /// The signature check runs after the transfer deadline, on its own
+    /// bounds, so a stalled bundle fails as a bundle download, retried and
+    /// timed out, never as a hang.
+    #[tokio::test]
+    async fn guest_release_fetch_bounds_a_stalled_bundle_on_its_own() {
+        let (api, server, trust) = guest_release_server(
+            tarball_with_entries(&[(VM_AGENT_BINARY_NAME, b"vm")]),
+            false,
+            Some("bundle"),
+            Some(FIXTURE_SIGNER),
+        )
+        .await;
+        let result = fetch_guest_agents_from_release_from(
+            &[VM_AGENT_BINARY_NAME],
+            &api,
+            "v1.2.3",
+            "test",
+            std::time::Duration::from_millis(250),
+            &trust,
+        )
+        .await;
+        server.abort();
+        let err = result.unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<release_signature::ReleaseSignatureError>(),
+                Some(release_signature::ReleaseSignatureError::BundleDownload { .. })
+            ),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn guest_release_fetch_refuses_an_unsigned_release() {
+        let archive = tarball_with_entries(&[(VM_AGENT_BINARY_NAME, b"vm")]);
+        // The archive stalls: only a refusal before downloading it can
+        // return the signature error rather than a timeout.
+        let (api, server, trust) =
+            guest_release_server(archive, false, Some("archive"), None).await;
+        let result = fetch_guest_agents_from_release_from(
+            &[VM_AGENT_BINARY_NAME],
+            &api,
+            "v1.2.3",
+            "test",
+            std::time::Duration::from_secs(2),
+            &trust,
+        )
+        .await;
+        server.abort();
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("publishes no Sigstore signature"), "{err}");
+        assert!(err.contains("temps-test.tar.gz.sigstore.json"), "{err}");
+        // The remedy is the agent path flag, not `temps upgrade --allow-unsigned`,
+        // which cannot fetch an agent.
+        assert!(err.contains("--vm-agent-bin"), "{err}");
+        assert!(!err.contains("--allow-unsigned"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn guest_release_fetch_refuses_a_signature_from_another_identity() {
+        let archive = tarball_with_entries(&[(VM_AGENT_BINARY_NAME, b"vm")]);
+        let impostor =
+            "https://github.com/someone-else/temps/.github/workflows/release.yml@refs/tags/v1.2.3";
+        let (api, server, trust) = guest_release_server(archive, false, None, Some(impostor)).await;
+        let result = fetch_guest_agents_from_release_from(
+            &[VM_AGENT_BINARY_NAME],
+            &api,
+            "v1.2.3",
+            "test",
+            std::time::Duration::from_secs(5),
+            &trust,
+        )
+        .await;
+        server.abort();
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains(impostor), "{err}");
+        assert!(err.contains(FIXTURE_SIGNER), "{err}");
     }
 
     #[test]
@@ -4877,6 +5264,7 @@ mod tests {
             version: None,
             path: None,
             yes: false,
+            allow_unsigned: false,
             check: false,
             split: false,
             stable: false,
@@ -4905,6 +5293,7 @@ mod tests {
             version: None,
             path: None,
             yes: false,
+            allow_unsigned: false,
             check: false,
             split: false,
             stable: true,
@@ -4930,6 +5319,7 @@ mod tests {
             version: None,
             path: None,
             yes: false,
+            allow_unsigned: false,
             check: false,
             split: false,
             stable: true,
@@ -4950,6 +5340,7 @@ mod tests {
             version: None,
             path: None,
             yes: false,
+            allow_unsigned: false,
             check: false,
             split: false,
             stable: false,
@@ -4990,6 +5381,7 @@ mod tests {
             version: None,
             path: None,
             yes: false,
+            allow_unsigned: false,
             check: false,
             split: false,
             stable: false,

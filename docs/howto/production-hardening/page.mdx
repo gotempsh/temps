@@ -233,10 +233,14 @@ Temps does not expose a Prometheus `/metrics` endpoint for the control plane its
 
 ## Verify release artifacts {{ anchor: true, id: 'release-verification' }}
 
-Releases produced by the current publishing workflow attach GitHub build-provenance and SPDX SBOM attestations to binary tarballs. Verify a downloaded tarball before installing it:
+`temps upgrade`, the console's **Update now** and the install script verify each release tarball's Sigstore signature before installing it. The signature is pinned to the release workflow of `gotempsh/temps` at the exact tag. A release without a signature is refused unless you pass `--allow-unsigned`. Only releases from before signing was introduced lack one. The install script can only check the signature when `cosign` or an authenticated `gh` is installed; on a bare server it warns that the origin was not verified. Install `cosign` on hosts where you run the installer, and never pass `--allow-unsigned` to install a current release. See [Verify release downloads](/docs/installation#release-signature-verification) for exactly what is checked.
+
+Releases produced by the current publishing workflow also attach GitHub build-provenance and SPDX SBOM attestations to binary tarballs. Verify a tarball you downloaded by hand before installing it:
 
 ```bash
-gh attestation verify temps-linux-amd64.tar.gz --repo gotempsh/temps
+tag=v0.1.0   # the release you downloaded
+gh attestation verify temps-linux-amd64.tar.gz --repo gotempsh/temps \
+  --cert-identity "https://github.com/gotempsh/temps/.github/workflows/release.yml@refs/tags/$tag"
 ```
 
 The main `ghcr.io/gotempsh/temps` image includes BuildKit SBOM and provenance attestations for each platform. Its published multi-platform manifest is signed using GitHub Actions' OIDC identity. Resolve the digest and verify that the signing identity belongs to the release workflow:
