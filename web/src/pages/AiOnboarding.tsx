@@ -42,8 +42,10 @@ import {
   buildAiHarnessCommands,
   buildAiHarnessKeyRequest,
   canRemovePendingKey,
+  type CreatedHarnessKey,
   describeHarnessConnection,
   onboardingPollInterval,
+  reconcileCreatedKey,
   resolveOnboardingStatus,
 } from '@/lib/ai-onboarding'
 import { invalidateApiKeyQueries } from '@/lib/api-key-queries'
@@ -76,7 +78,8 @@ const STARTER_PROMPTS = [
 
 export function AiOnboarding() {
   const { setBreadcrumbs } = useBreadcrumbs()
-  const [createdKeySecret, setCreatedKeySecret] = useState<string | null>(null)
+  const [createdKey, setCreatedKey] = useState<CreatedHarnessKey | null>(null)
+  const createdKeySecret = createdKey?.secret ?? null
   const origin = typeof window === 'undefined' ? '' : window.location.origin
   const commands = buildAiHarnessCommands(origin)
 
@@ -85,7 +88,8 @@ export function AiOnboarding() {
   // server still reports that same key as waiting.
   const [removalKeyId, setRemovalKeyId] = useState<number | null>(null)
   const { markCompleted: markHarnessCompleted } = useManualHarnessCompletion()
-  const keyJustCreated = createdKeySecret !== null
+  // The creation fallback applies only until the server reports the key.
+  const keyJustCreated = createdKey !== null && !createdKey.acknowledged
 
   const {
     data: harness,
@@ -112,7 +116,11 @@ export function AiOnboarding() {
       errorTitle: 'Failed to create AI harness key',
     },
     onSuccess: async (response) => {
-      setCreatedKeySecret(response.api_key)
+      setCreatedKey({
+        secret: response.api_key,
+        id: response.id,
+        acknowledged: false,
+      })
       await refetchHarness()
       toast.success('AI harness key created')
     },
@@ -142,7 +150,7 @@ export function AiOnboarding() {
       errorTitle: 'Failed to remove the pending AI harness key',
     },
     onSuccess: async () => {
-      setCreatedKeySecret(null)
+      setCreatedKey(null)
       setRemovalKeyId(null)
       try {
         markHarnessCompleted()
@@ -174,6 +182,9 @@ export function AiOnboarding() {
       { label: 'Connect AI harness' },
     ])
   }, [setBreadcrumbs])
+
+  const reconciledKey = reconcileCreatedKey(createdKey, harness)
+  if (reconciledKey !== createdKey) setCreatedKey(reconciledKey)
 
   const harnessKeyId = harness?.key_id ?? null
   // `unknown` (not `missing`) while the status cannot be read: creation is

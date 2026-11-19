@@ -14,6 +14,7 @@ import {
   harnessStatusOf,
   ONBOARDING_POLL_INTERVAL_MS,
   onboardingPollInterval,
+  reconcileCreatedKey,
   resolveOnboardingStatus,
   shouldShowHarnessPendingBanner,
 } from './ai-onboarding'
@@ -319,6 +320,39 @@ describe('AI harness status', () => {
         false
       )
       expect(canRemovePendingKey(undefined, 12)).toBe(false)
+    })
+
+    describe('a key created in this visit', () => {
+      const created = { secret: 'tk_secret', id: 12, acknowledged: false }
+
+      test('stays unacknowledged until the server reports it', () => {
+        expect(reconcileCreatedKey(created, undefined)).toBe(created)
+        expect(reconcileCreatedKey(created, missing)).toBe(created)
+      })
+
+      test('is acknowledged once the server reports its id', () => {
+        expect(reconcileCreatedKey(created, waiting)).toEqual({
+          ...created,
+          acknowledged: true,
+        })
+      })
+
+      test('is forgotten when an acknowledged key is removed elsewhere', () => {
+        const acknowledged = { ...created, acknowledged: true }
+        expect(reconcileCreatedKey(acknowledged, waiting)).toBe(acknowledged)
+        expect(reconcileCreatedKey(acknowledged, undefined)).toBe(acknowledged)
+        expect(reconcileCreatedKey(acknowledged, missing)).toBeNull()
+      })
+
+      test('after removal elsewhere the page offers creation again', () => {
+        const acknowledged = { ...created, acknowledged: true }
+        const next = reconcileCreatedKey(acknowledged, missing)
+        expect(
+          resolveOnboardingStatus(missing, {
+            keyJustCreated: next !== null && !next.acknowledged,
+          })
+        ).toBe('missing')
+      })
     })
   })
 })

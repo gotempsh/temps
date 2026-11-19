@@ -80,6 +80,34 @@ export function resolveOnboardingStatus(
   return status ?? 'unknown'
 }
 
+/** A key this visit created, and whether the server has reported it yet. */
+export interface CreatedHarnessKey {
+  secret: string
+  id: number
+  acknowledged: boolean
+}
+
+/**
+ * Track the key this visit created against the server's answer. Until the
+ * server reports that key, the page keeps treating it as waiting (even
+ * through failed refetches). Once acknowledged, a later successful `missing`
+ * with no key means it was removed elsewhere: forget it, so the page stops
+ * showing a revoked secret and offers creation again. Returns the same
+ * object when nothing changes.
+ */
+export function reconcileCreatedKey(
+  created: CreatedHarnessKey | null,
+  data: Pick<AiHarnessStatusResponse, 'status' | 'key_id'> | undefined
+): CreatedHarnessKey | null {
+  if (!created || !data) return created
+  if (!created.acknowledged) {
+    return data.key_id === created.id
+      ? { ...created, acknowledged: true }
+      : created
+  }
+  return data.status === 'missing' && data.key_id == null ? null : created
+}
+
 /** Poll /setup/ai for as long as it shows waiting, whatever the cache holds. */
 export function onboardingPollInterval(
   data: Pick<AiHarnessStatusResponse, 'status' | 'key_id'> | undefined,
