@@ -121,11 +121,17 @@ export function scrollTopToAlign(
  * Returns whether anything moved. When the element is not inside a scroll
  * container the document scrolls, unless the app shell has locked it
  * (`overflow: hidden` on the body), in which case nothing is moved.
+ *
+ * An element that is not rendered (`hidden`, `display: none`, or inside
+ * either) has no box to scroll to, so nothing moves, as with the native
+ * call: measured, its empty box reads as the top of the view and would
+ * scroll a reader who had moved down back up without showing anything.
  */
 export function scrollElementIntoView(
   element: Element,
   { block = 'start', behavior }: ScrollToElementOptions = {}
 ): boolean {
+  if (element.getClientRects().length === 0) return false
   const container = scrollContainerOf(element)
   const doc = element.ownerDocument
   const scroller = container ?? doc.scrollingElement

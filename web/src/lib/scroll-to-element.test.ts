@@ -207,6 +207,28 @@ test('a smooth scroll jumps instead when the system asks for reduced motion', ()
   ])
 })
 
+test('a hidden element moves nothing, even when the reader has scrolled down', () => {
+  const { page, flags } = mountShell()
+  page.scrollTop = 400
+  for (const hide of [
+    () => flags.setAttribute('hidden', ''),
+    () => {
+      flags.removeAttribute('hidden')
+      page.setAttribute('hidden', '')
+    },
+    () => {
+      page.removeAttribute('hidden')
+      flags.style.display = 'none'
+    },
+  ]) {
+    hide()
+    for (const block of ['start', 'center', 'nearest'] as const)
+      expect(scrollElementIntoView(flags, { block })).toBe(false)
+  }
+  expect(layout.scrolls).toEqual([])
+  expect(layout.scrollTopOf(page)).toBe(400)
+})
+
 test('scrolling to an id moves nothing until the element exists', () => {
   const { page } = mountShell()
   expect(scrollToElementId('missing')).toBe(false)

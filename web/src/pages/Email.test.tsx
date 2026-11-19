@@ -154,6 +154,26 @@ test('an old ?tab= link scrolls the page to its section and leaves the shell in 
   expectOnlyConsoleScrolled(layout, CONSOLE_MAX_SCROLL)
 })
 
+test('an old ?tab= link to a section setup still hides leaves the page where the reader put it', async () => {
+  // No email sent yet: Sent emails stays hidden behind the checklist.
+  layout.place('#email-sent', NEAR_THE_END)
+  const { view } = renderEmail('/email?tab=emails', {
+    providers: [PROVIDER],
+    domains: [DOMAIN],
+  })
+  // The reader scrolls while the page loads.
+  const page = document.getElementById('console') as HTMLElement
+  page.scrollTop = 300
+  await view.findByRole('region', { name: 'Set up sending' })
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  expect(
+    document.getElementById('email-sent')?.closest('[hidden]')
+  ).not.toBeNull()
+  expect(layout.scrolls).toEqual([])
+  expect(layout.intoView).toEqual([])
+  expect(layout.scrollTopOf(page)).toBe(300)
+})
+
 test('during setup, a connected provider shows but the empty domains do not', async () => {
   const { view } = renderEmail('/email', { providers: [PROVIDER] })
   expect(await view.findByRole('heading', { name: 'Providers' })).toBeTruthy()

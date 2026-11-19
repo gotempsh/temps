@@ -11,6 +11,8 @@ import { afterEach, beforeEach } from 'bun:test'
  *   closest `[data-scroller]` ancestor (or of the viewport when there is none).
  *   A scroller is positioned the same way within its own scroller.
  * - `data-height="N"`: the element's own height, in px (default 0).
+ * - An element that is `hidden`, or inside a `hidden` one, or `display:
+ *   none`, has no client rects, as in a browser.
  * - `data-scroller` plus `data-client-height` / `data-scroll-height`: a box
  *   with that visible height and content height. Its `scrollTop` is clamped
  *   to what it can scroll, like a browser's.
@@ -101,6 +103,15 @@ export function installFakeScrollLayout() {
           width: 0,
           height,
         }
+      },
+    })
+    // No boxes for an element that is not rendered, as in a browser.
+    overrideElement('getClientRects', {
+      value(this: Element) {
+        const hidden =
+          this.closest('[hidden]') !== null ||
+          getComputedStyle(this).display === 'none'
+        return hidden ? [] : [this.getBoundingClientRect()]
       },
     })
     overrideElement('scrollHeight', {
