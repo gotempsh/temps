@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 pub mod alert_rules_handler;
+pub mod assignee_handler;
 pub mod audit;
 pub mod group_workflow_handler;
 pub mod handler;

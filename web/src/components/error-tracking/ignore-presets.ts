@@ -81,7 +81,9 @@ export function describeIgnoreState(
   }
   if (state.until_event_count != null) {
     const left = Math.max(state.until_event_count - totalCount, 0)
-    parts.push(`for ${left.toLocaleString()} more occurrence${left === 1 ? '' : 's'}`)
+    parts.push(
+      `for ${left.toLocaleString()} more occurrence${left === 1 ? '' : 's'}`
+    )
   }
   if (state.until_user_count != null) {
     parts.push(

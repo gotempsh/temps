@@ -14251,6 +14251,27 @@ export type ErrorEventResponse = {
     timestamp: string;
 };
 
+export type ErrorGroupAssigneeOptionsResponse = {
+    /**
+     * Teams, at most 20.
+     */
+    teams: Array<GroupAssignee>;
+    /**
+     * Users who can access the project, at most 20.
+     */
+    users: Array<GroupAssignee>;
+};
+
+export type ErrorGroupAssigneeResponse = {
+    assignee?: GroupAssignee | null;
+    /**
+     * Whether the assignee changed. Assigning the current assignee again
+     * changes nothing and notifies nobody.
+     */
+    changed: boolean;
+    group_id: number;
+};
+
 export type ErrorGroupDeploymentResponse = {
     branch?: string | null;
     commit_hash?: string | null;
@@ -14288,7 +14309,12 @@ export type ErrorGroupResponse = {
      * Present only when `start_date` and `end_date` were supplied on the list request.
      */
     affected_users?: number | null;
+    /**
+     * Deprecated: a free-text assignee from before assignees were users or
+     * teams, kept read-only when it matched no user. Use `assignee`.
+     */
     assigned_to?: string | null;
+    assignee?: GroupAssignee | null;
     created_at: string;
     deployment?: ErrorGroupDeploymentResponse | null;
     deployment_id?: number | null;
@@ -17274,6 +17300,25 @@ export type GoalResponse = {
  * Observed worker enforcement, independent of the requested authorization.
  */
 export type GrantEnforcement = 'not_requested' | 'pending' | 'active' | 'stopping' | 'stopped';
+
+/**
+ * An assignee with what a reader needs to show it.
+ */
+export type GroupAssignee = {
+    /**
+     * The user's email; `None` for a team.
+     */
+    email?: string | null;
+    id: number;
+    /**
+     * The user's or team's name.
+     */
+    name: string;
+    /**
+     * `user` or `team`.
+     */
+    type: string;
+};
 
 /**
  * A group variable as returned by the API. `value` is `"***"` in lists,
@@ -20273,10 +20318,19 @@ export type ListErrorEventsQuery = {
 };
 
 export type ListErrorGroupsQuery = {
+    /**
+     * Only groups with this assignee: `me` (you, or a team you are in),
+     * `none`, `user:<id>` or `team:<id>`.
+     */
+    assignee?: string | null;
     end_date?: string | null;
     environment_id?: number | null;
     page?: number;
     page_size?: number;
+    /**
+     * Case-insensitive text in the title, error type or message.
+     */
+    search?: string | null;
     sort_by?: string | null;
     sort_order?: string;
     start_date?: string | null;
@@ -32886,6 +32940,15 @@ export type SetEnvironmentHostsRequest = {
     enabled: boolean;
 };
 
+/**
+ * Who to assign the group to. Set one of the two ids, or neither to
+ * unassign.
+ */
+export type SetErrorGroupAssigneeRequest = {
+    team_id?: number | null;
+    user_id?: number | null;
+};
+
 export type SetFlagEnvironmentRequest = {
     /**
      * The kill switch. `false` makes the flag serve its default regardless of
@@ -37666,10 +37729,14 @@ export type UpdateEnvironmentVariableRequest = {
 
 export type UpdateErrorGroupRequest = {
     /**
-     * Assignee (email by convention).
-     * - `Some("user@example.com")` — sets the assignee.
-     * - `Some("")` (empty string) — clears the current assignment (sets to null).
-     * - `null` / field omitted — leaves the existing value unchanged.
+     * Deprecated: assign by email. Prefer
+     * `PUT /projects/{project_id}/error-groups/{group_id}/assignee`.
+     * - `Some("user@example.com")`: assigns the user with that email; an
+     * email that is no user's is refused.
+     * - `Some("")` (empty string): unassigns the group.
+     * - `null` / field omitted: leaves the assignee unchanged.
+     *
+     * The status `assigned` is accepted and stored as `unresolved`.
      */
     assigned_to?: string | null;
     ignore?: IgnoreConditionsRequest | null;
@@ -84481,6 +84548,52 @@ export type GetErrorDashboardStatsResponses = {
 
 export type GetErrorDashboardStatsResponse = GetErrorDashboardStatsResponses[keyof GetErrorDashboardStatsResponses];
 
+export type SearchErrorGroupAssigneesData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: {
+        /**
+         * Text in the user's name or email, or the team's name. Empty lists the
+         * first candidates alphabetically.
+         */
+        q?: string;
+    };
+    url: '/projects/{project_id}/error-group-assignees';
+};
+
+export type SearchErrorGroupAssigneesErrors = {
+    /**
+     * Search text too long
+     */
+    400: unknown;
+    /**
+     * Not authenticated
+     */
+    401: unknown;
+    /**
+     * Missing error_tracking:write or project access
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type SearchErrorGroupAssigneesResponses = {
+    /**
+     * Assignee candidates
+     */
+    200: ErrorGroupAssigneeOptionsResponse;
+};
+
+export type SearchErrorGroupAssigneesResponse = SearchErrorGroupAssigneesResponses[keyof SearchErrorGroupAssigneesResponses];
+
 export type ListErrorGroupsData = {
     body?: never;
     path: {
@@ -84498,6 +84611,15 @@ export type ListErrorGroupsData = {
         end_date?: string | null;
         sort_by?: string | null;
         sort_order?: string;
+        /**
+         * Only groups with this assignee: `me` (you, or a team you are in),
+         * `none`, `user:<id>` or `team:<id>`.
+         */
+        assignee?: string | null;
+        /**
+         * Case-insensitive text in the title, error type or message.
+         */
+        search?: string | null;
     };
     url: '/projects/{project_id}/error-groups';
 };
@@ -84631,6 +84753,54 @@ export type UpdateErrorGroupResponses = {
      */
     200: unknown;
 };
+
+export type SetErrorGroupAssigneeData = {
+    body: SetErrorGroupAssigneeRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Error group ID
+         */
+        group_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/error-groups/{group_id}/assignee';
+};
+
+export type SetErrorGroupAssigneeErrors = {
+    /**
+     * Both ids set, an unknown user or team, or a user without access to the project
+     */
+    400: unknown;
+    /**
+     * Not authenticated
+     */
+    401: unknown;
+    /**
+     * Missing error_tracking:write or project access
+     */
+    403: unknown;
+    /**
+     * Error group not found in the project
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type SetErrorGroupAssigneeResponses = {
+    /**
+     * Assignee set
+     */
+    200: ErrorGroupAssigneeResponse;
+};
+
+export type SetErrorGroupAssigneeResponse = SetErrorGroupAssigneeResponses[keyof SetErrorGroupAssigneeResponses];
 
 export type ListErrorEventsData = {
     body?: never;

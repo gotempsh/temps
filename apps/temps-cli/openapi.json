@@ -30230,6 +30230,57 @@
         ],
         "type": "object"
       },
+      "ErrorGroupAssigneeOptionsResponse": {
+        "properties": {
+          "teams": {
+            "description": "Teams, at most 20.",
+            "items": {
+              "$ref": "#/components/schemas/GroupAssignee"
+            },
+            "type": "array"
+          },
+          "users": {
+            "description": "Users who can access the project, at most 20.",
+            "items": {
+              "$ref": "#/components/schemas/GroupAssignee"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "users",
+          "teams"
+        ],
+        "type": "object"
+      },
+      "ErrorGroupAssigneeResponse": {
+        "properties": {
+          "assignee": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/GroupAssignee",
+                "description": "The new assignee; `None` when the group was unassigned."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "changed": {
+            "description": "Whether the assignee changed. Assigning the current assignee again\nchanges nothing and notifies nobody.",
+            "type": "boolean"
+          },
+          "group_id": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "group_id",
+          "changed"
+        ],
+        "type": "object"
+      },
       "ErrorGroupDeploymentResponse": {
         "properties": {
           "branch": {
@@ -30320,9 +30371,21 @@
             ]
           },
           "assigned_to": {
+            "description": "Deprecated: a free-text assignee from before assignees were users or\nteams, kept read-only when it matched no user. Use `assignee`.",
             "type": [
               "string",
               "null"
+            ]
+          },
+          "assignee": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/GroupAssignee",
+                "description": "The user or team the group is assigned to."
+              },
+              {
+                "type": "null"
+              }
             ]
           },
           "created_at": {
@@ -37103,6 +37166,36 @@
         ],
         "type": "string"
       },
+      "GroupAssignee": {
+        "description": "An assignee with what a reader needs to show it.",
+        "properties": {
+          "email": {
+            "description": "The user's email; `None` for a team.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "name": {
+            "description": "The user's or team's name.",
+            "type": "string"
+          },
+          "type": {
+            "description": "`user` or `team`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "id",
+          "name"
+        ],
+        "type": "object"
+      },
       "GroupEnvVarResponse": {
         "description": "A group variable as returned by the API. `value` is `\"***\"` in lists,\nplaintext only in the create/update response of a non-secret variable,\nand always `null` for secrets.",
         "properties": {
@@ -43530,6 +43623,13 @@
       },
       "ListErrorGroupsQuery": {
         "properties": {
+          "assignee": {
+            "description": "Only groups with this assignee: `me` (you, or a team you are in),\n`none`, `user:<id>` or `team:<id>`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "end_date": {
             "format": "date-time",
             "type": [
@@ -43553,6 +43653,13 @@
             "format": "int64",
             "minimum": 0,
             "type": "integer"
+          },
+          "search": {
+            "description": "Case-insensitive text in the title, error type or message.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "sort_by": {
             "type": [
@@ -70298,6 +70405,26 @@
         ],
         "type": "object"
       },
+      "SetErrorGroupAssigneeRequest": {
+        "description": "Who to assign the group to. Set one of the two ids, or neither to\nunassign.",
+        "properties": {
+          "team_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "user_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "SetFlagEnvironmentRequest": {
         "properties": {
           "enabled": {
@@ -80156,7 +80283,7 @@
       "UpdateErrorGroupRequest": {
         "properties": {
           "assigned_to": {
-            "description": "Assignee (email by convention).\n- `Some(\"user@example.com\")` — sets the assignee.\n- `Some(\"\")` (empty string) — clears the current assignment (sets to null).\n- `null` / field omitted — leaves the existing value unchanged.",
+            "description": "Deprecated: assign by email. Prefer\n`PUT /projects/{project_id}/error-groups/{group_id}/assignee`.\n- `Some(\"user@example.com\")`: assigns the user with that email; an\n  email that is no user's is refused.\n- `Some(\"\")` (empty string): unassigns the group.\n- `null` / field omitted: leaves the assignee unchanged.\n\nThe status `assigned` is accepted and stored as `unresolved`.",
             "type": [
               "string",
               "null"
@@ -159883,6 +160010,67 @@
         "x-maturity": "beta"
       }
     },
+    "/projects/{project_id}/error-group-assignees": {
+      "get": {
+        "description": "Returns at most 20 users who can access the project and 20 teams whose\nname (or a user's email) contains `q`.",
+        "operationId": "search_error_group_assignees",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Text in the user's name or email, or the team's name. Empty lists the\nfirst candidates alphabetically.",
+            "in": "query",
+            "name": "q",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorGroupAssigneeOptionsResponse"
+                }
+              }
+            },
+            "description": "Assignee candidates"
+          },
+          "400": {
+            "description": "Search text too long"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Missing error_tracking:write or project access"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Search users and teams to assign an error group to",
+        "tags": [
+          "error-tracking"
+        ],
+        "x-maturity": "beta"
+      }
+    },
     "/projects/{project_id}/error-groups": {
       "get": {
         "operationId": "list_error_groups",
@@ -159981,6 +160169,30 @@
             "required": false,
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "description": "Only groups with this assignee: `me` (you, or a team you are in),\n`none`, `user:<id>` or `team:<id>`.",
+            "in": "query",
+            "name": "assignee",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Case-insensitive text in the title, error type or message.",
+            "in": "query",
+            "name": "search",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
             }
           }
         ],
@@ -160165,6 +160377,81 @@
           }
         },
         "summary": "Update error group status",
+        "tags": [
+          "error-tracking"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/projects/{project_id}/error-groups/{group_id}/assignee": {
+      "put": {
+        "description": "The assignee is independent of the status: an assigned group can be\nresolved or ignored and keeps its assignee. A new assignee is emailed\nwhen an email provider is configured, and `status_change` alert rules\nthat list `assigned` fire.",
+        "operationId": "set_error_group_assignee",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Error group ID",
+            "in": "path",
+            "name": "group_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetErrorGroupAssigneeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorGroupAssigneeResponse"
+                }
+              }
+            },
+            "description": "Assignee set"
+          },
+          "400": {
+            "description": "Both ids set, an unknown user or team, or a user without access to the project"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Missing error_tracking:write or project access"
+          },
+          "404": {
+            "description": "Error group not found in the project"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Assign an error group to a user or a team, or unassign it",
         "tags": [
           "error-tracking"
         ],
@@ -185948,6 +186235,10 @@
     },
     {
       "description": "Error tracking inbound filters",
+      "name": "error-tracking"
+    },
+    {
+      "description": "Error group assignment",
       "name": "error-tracking"
     },
     {

@@ -4,19 +4,13 @@ import { PageTitle } from '@temps-sdk/ds'
 import { HighlightedCode } from '@/components/ui/code-block'
 import { FixErrorWithAgentButton } from '@/components/ai/FixErrorWithAgentButton'
 
-import {
-  ErrorEventResponse,
-  ProjectResponse,
-  RouteUserWithRoles,
-  UserResponse,
-} from '@/api/client'
+import { ErrorEventResponse, ProjectResponse } from '@/api/client'
 import {
   getEnvironmentsOptions,
   getErrorGroupOptions,
   getErrorGroupQueryKey,
   listErrorEventsOptions,
   listErrorEventsQueryKey,
-  listUsersOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { AutofixIncidentCard } from '@/components/autofix/AutofixIncidentCard'
 import { SentryEventDetail } from '@/components/error-tracking/SentryEventDetail'
@@ -25,6 +19,7 @@ import { updateErrorGroupMutation } from '@/api/client/@tanstack/react-query.gen
 import { GroupMergeActions } from '@/components/error-tracking/GroupMergeActions'
 import { IgnoreMenu } from '@/components/error-tracking/IgnoreMenu'
 import { ResolveMenu } from '@/components/error-tracking/ResolveMenu'
+import { AssigneeMenu } from '@/components/error-tracking/AssigneeMenu'
 import {
   IGNORE_PRESETS,
   describeIgnoreState,
@@ -32,7 +27,6 @@ import {
   type IgnoreConditions,
 } from '@/components/error-tracking/ignore-presets'
 import { Alert, AlertDescription } from '@/components/ui/alert'
-import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import { Badge } from '@/components/ui/badge'
 import { RefreshButton } from '@/components/ui/refresh-button'
 import { queryKeyPrefix } from '@/lib/refresh'
@@ -48,8 +42,6 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
-  DropdownMenuLabel,
-  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { ScrollArea } from '@/components/ui/scroll-area'
@@ -74,11 +66,9 @@ import {
   List,
   MoreVertical,
   RotateCcw,
-  UserRound,
 } from 'lucide-react'
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useNavigate, useParams } from 'react-router'
-import { useIsInstanceAdmin } from '@/hooks/useIsInstanceAdmin'
 
 export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
   const { projectSlug, errorGroupId } = useParams<{
@@ -143,45 +133,6 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
   const { data: environments } = useQuery({
     ...getEnvironmentsOptions({ path: { project_id: project.id } }),
   })
-
-  // No per-project members endpoint exists yet — same instance-wide user
-  // source TeamDetail's AddMemberDialog uses to resolve `assigned_to` (an
-  // email/username string) to a display name + avatar.
-  // Listing users needs `users:write` (instance administrators only); other
-  // roles fall back to showing the raw assignee string.
-  const isInstanceAdmin = useIsInstanceAdmin()
-  const { data: usersData } = useQuery({
-    ...listUsersOptions({ query: { include_deleted: false } }),
-    enabled: isInstanceAdmin,
-  })
-  const userByIdentity = useMemo(() => {
-    const map = new Map<string, NonNullable<typeof usersData>[number]>()
-    for (const u of usersData ?? []) {
-      if (u.user.email) map.set(u.user.email.toLowerCase(), u)
-      if (u.user.username) map.set(u.user.username.toLowerCase(), u)
-    }
-    return map
-  }, [usersData])
-
-  const assigneeMutation = useMutation({
-    ...updateErrorGroupMutation(),
-    meta: { errorTitle: 'Failed to update assignee' },
-    onSuccess: () => {
-      queryClient.invalidateQueries({
-        queryKey: getErrorGroupOptions({
-          path: { group_id: parseInt(errorGroupId!), project_id: project.id },
-        }).queryKey,
-      })
-    },
-  })
-  const assign = (assignedTo: string) =>
-    assigneeMutation.mutate({
-      path: { group_id: parseInt(errorGroupId!), project_id: project.id },
-      body: {
-        status: (errorGroup as { status?: string })?.status ?? 'unresolved',
-        assigned_to: assignedTo,
-      },
-    })
 
   usePageTitle(errorGroup ? `Error: ${errorGroup.title}` : 'Error Details')
 
@@ -350,7 +301,10 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
 
         {errorGroup.ignore && (
           <p className="text-sm text-muted-foreground">
-            {describeIgnoreState(errorGroup.ignore, errorGroup.total_count ?? 0)}
+            {describeIgnoreState(
+              errorGroup.ignore,
+              errorGroup.total_count ?? 0
+            )}
           </p>
         )}
 
@@ -408,13 +362,12 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
                 }}
               />
             )}
-            <AssigneeControl
-              assignedTo={errorGroup.assigned_to}
-              userByIdentity={userByIdentity}
-              currentUser={currentUser}
-              users={usersData}
-              onAssign={assign}
-              isPending={assigneeMutation.isPending}
+            <AssigneeMenu
+              projectId={project.id}
+              groupId={errorGroup.id}
+              assignee={errorGroup.assignee}
+              legacyAssignedTo={errorGroup.assigned_to}
+              currentUserId={currentUser?.id}
             />
 
             {/* Desktop: full action buttons */}
@@ -469,9 +422,7 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
                   )}
                   {(errorGroup as any).status !== 'resolved' && (
                     <DropdownMenuItem
-                      onClick={() =>
-                        updateStatus('resolved', undefined, true)
-                      }
+                      onClick={() => updateStatus('resolved', undefined, true)}
                     >
                       <Check className="mr-2 h-4 w-4" />
                       Resolve in next release
@@ -630,93 +581,5 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
         </TabsContent>
       </Tabs>
     </div>
-  )
-}
-
-function AssigneeControl({
-  assignedTo,
-  userByIdentity,
-  currentUser,
-  users,
-  onAssign,
-  isPending,
-}: {
-  assignedTo?: string | null
-  userByIdentity: Map<string, RouteUserWithRoles>
-  currentUser: UserResponse | null
-  users?: RouteUserWithRoles[]
-  onAssign: (assignedTo: string) => void
-  isPending: boolean
-}) {
-  const assignedUser = assignedTo
-    ? userByIdentity.get(assignedTo.toLowerCase())
-    : undefined
-  const label = assignedTo
-    ? (assignedUser?.user.name ?? assignedTo)
-    : 'Unassigned'
-  const initials = (
-    assignedUser?.user.username ||
-    assignedUser?.user.name ||
-    assignedTo ||
-    '?'
-  )
-    .slice(0, 2)
-    .toUpperCase()
-  const isAssignedToMe =
-    !!assignedTo &&
-    !!currentUser?.email &&
-    assignedTo.toLowerCase() === currentUser.email.toLowerCase()
-
-  return (
-    <DropdownMenu>
-      <DropdownMenuTrigger asChild>
-        <Button
-          variant="outline"
-          size="sm"
-          disabled={isPending}
-          className="gap-2"
-        >
-          {assignedTo ? (
-            <Avatar className="h-5 w-5">
-              <AvatarImage src={assignedUser?.user.image} />
-              <AvatarFallback className="text-[9px]">{initials}</AvatarFallback>
-            </Avatar>
-          ) : (
-            <UserRound className="h-4 w-4 text-muted-foreground" />
-          )}
-          {label}
-        </Button>
-      </DropdownMenuTrigger>
-      <DropdownMenuContent align="end" className="max-h-72 overflow-y-auto">
-        {!isAssignedToMe && currentUser && (
-          <DropdownMenuItem
-            onClick={() => onAssign(currentUser.email || currentUser.username)}
-          >
-            Assign to me
-          </DropdownMenuItem>
-        )}
-        {assignedTo && (
-          <DropdownMenuItem onClick={() => onAssign('')}>
-            Unassign
-          </DropdownMenuItem>
-        )}
-        {users && users.length > 0 && (
-          <>
-            <DropdownMenuSeparator />
-            <DropdownMenuLabel className="text-xs font-normal text-muted-foreground">
-              Assign to someone else
-            </DropdownMenuLabel>
-            {users.map((u) => (
-              <DropdownMenuItem
-                key={u.user.id}
-                onClick={() => onAssign(u.user.email || u.user.username)}
-              >
-                {u.user.name}
-              </DropdownMenuItem>
-            ))}
-          </>
-        )}
-      </DropdownMenuContent>
-    </DropdownMenu>
   )
 }

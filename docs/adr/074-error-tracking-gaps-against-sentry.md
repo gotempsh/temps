@@ -4,8 +4,8 @@
 
 Proposed — 2026-11-19. Being implemented in the order of the Decision
 section. D1.1 (bulk actions), D1.2 (merge and split), D1.3 (ignore
-until), D1.4 (inbound filters) and D1.5 (resolve in the next release) have
-shipped; the questions they settled
+until), D1.4 (inbound filters), D1.5 (resolve in the next release) and
+D1.6 (assignment) have shipped; the questions they settled
 are recorded under "Settled while implementing".
 
 Related: ADR 016 (ClickHouse traces backend), ADR 027 (cross-project trace
@@ -32,7 +32,7 @@ The signal-by-signal contract is in `docs/features/error-tracking/page.mdx`
 | DSN ingest from official SDKs: errors, transactions and spans, logs, metrics, web replay, check-ins, feedback, CSP and NEL reports, client reports | `crates/temps-error-tracking/src/sentry/` | Yes |
 | Grouping by fingerprint, explicit SDK fingerprints | `error_groups`, `sentry/mapper.rs` | Yes |
 | Source maps by Debug ID, late symbolication | `services/source_map_service/` | Yes |
-| Group status and assignee | `error_groups.status`, `error_groups.assigned_to` | `unresolved`, `resolved`, `ignored`, `assigned`; assignee is free text |
+| Group status and assignee | `error_groups.status`, `error_groups.assigned_to` | `unresolved`, `resolved`, `ignored`, `assigned`; assignee is free text (before D1.6) |
 | Regression detection and alert rules | `services/error_alert_service.rs`, `error_alert_rules` | Yes |
 | Releases: counts per signal and example links | `/projects/{project_id}/telemetry-releases` | Correlation only |
 | Traces: list, detail, cross-project | `crates/temps-otel` | Yes |
@@ -307,4 +307,37 @@ deploys, which is web services. It comes last and may never be worth building.
 - "Newest" is project-wide, not per environment: a release first deployed
   to staging counts as current for production too, which can only keep a
   group resolved longer, never reopen it early.
+
+### D1.6 Assignment
+
+- The assignee is `assignee_user_id` or `assignee_team_id` on the group, at
+  most one of them (a check constraint), and no longer a status. The new
+  route is `PUT /projects/{project_id}/error-groups/{group_id}/assignee`;
+  `GET /projects/{project_id}/error-group-assignees?q=` returns at most 20
+  users and 20 teams to pick from.
+- **Upgrade.** Each stored free-text `assigned_to` is matched to the
+  active user with that email, case-insensitively, and then cleared. A value
+  that matches no user is kept in `assigned_to`, read-only, so nothing typed
+  by hand is lost. Groups in the `assigned` status move to `unresolved`: an
+  assigned group was an open issue someone was working on, and
+  `unresolved` is the open state; the assignee stays on the row. `down`
+  writes matched users back as their email but cannot restore the status.
+- **Compatibility.** The update request's `assigned_to` still works: an
+  email assigns that user (an unknown email is refused), an empty string
+  unassigns. A write of status `assigned` is stored as `unresolved`. A list
+  filtered by `status=assigned` returns nothing; use `assignee=` instead.
+- A user assignee must be able to open the project (the same team-access
+  check the API applies to requests). Any team can be assigned; whether a
+  team has access to the project is not checked, because a team without
+  project access can still be the owner of a problem.
+- **Notification.** A change to a new assignee is mailed through the
+  transactional email path (email providers only, the recipients only),
+  in the background, when an email provider is configured; a team's
+  members are mailed, at most 50. A failed or missing mail never fails the
+  assignment. `status_change` alert rules that list `assigned` still fire on
+  a new assignee, so existing rules keep their meaning. There is no in-app
+  notification yet.
+- "Assigned to me" is `assignee=me` on the list: groups assigned to the
+  caller or to a team the caller is a member of. Bulk assignment is not
+  offered.
 

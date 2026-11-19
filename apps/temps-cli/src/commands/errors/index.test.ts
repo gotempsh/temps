@@ -4,7 +4,9 @@
 import { test, expect, describe } from 'bun:test'
 import {
   BULK_ERROR_GROUP_LIMIT,
+  buildAssigneeBody,
   buildIgnoreConditions,
+  checkAssigneeFilter,
   checkInNextRelease,
   formatBytes,
   matchesSourceFileFilter,
@@ -150,5 +152,29 @@ describe('checkInNextRelease', () => {
     expect(() => checkInNextRelease(true, true)).not.toThrow()
     expect(() => checkInNextRelease(undefined, false)).not.toThrow()
     expect(() => checkInNextRelease(true, false)).toThrow('--in-next-release')
+  })
+})
+
+describe('buildAssigneeBody', () => {
+  test('takes exactly one target', () => {
+    expect(buildAssigneeBody({ userId: '7' }, undefined)).toEqual({ user_id: 7 })
+    expect(buildAssigneeBody({ teamId: '3' }, undefined)).toEqual({ team_id: 3 })
+    expect(buildAssigneeBody({ me: true }, 12)).toEqual({ user_id: 12 })
+    expect(buildAssigneeBody({ none: true }, undefined)).toEqual({})
+    expect(() => buildAssigneeBody({}, undefined)).toThrow('exactly one')
+    expect(() => buildAssigneeBody({ userId: '7', teamId: '3' }, undefined)).toThrow('exactly one')
+    expect(() => buildAssigneeBody({ userId: 'x' }, undefined)).toThrow('positive numeric id')
+    expect(() => buildAssigneeBody({ me: true }, undefined)).toThrow('--me')
+  })
+})
+
+describe('checkAssigneeFilter', () => {
+  test('accepts the four forms only', () => {
+    for (const ok of ['me', 'none', 'user:4', ' team:9 ']) {
+      expect(() => checkAssigneeFilter(ok)).not.toThrow()
+    }
+    for (const bad of ['', 'you', 'user:', 'team:x']) {
+      expect(() => checkAssigneeFilter(bad)).toThrow('--assignee')
+    }
   })
 })

@@ -62,6 +62,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
     Router::new()
         .merge(super::feedback_handler::routes())
         .merge(super::group_workflow_handler::routes())
+        .merge(super::assignee_handler::routes())
         .merge(super::inbound_filter_handler::routes())
         .merge(super::release_handler::routes())
         .merge(super::client_outcome_handler::routes())
@@ -112,6 +113,11 @@ pub struct ListErrorGroupsQuery {
     pub sort_by: Option<String>,
     #[serde(default = "default_sort_order")]
     pub sort_order: String,
+    /// Only groups with this assignee: `me` (you, or a team you are in),
+    /// `none`, `user:<id>` or `team:<id>`.
+    pub assignee: Option<String>,
+    /// Case-insensitive text in the title, error type or message.
+    pub search: Option<String>,
 }
 
 #[derive(Debug, Deserialize, ToSchema, IntoParams)]
@@ -130,10 +136,14 @@ pub struct ListErrorEventsQuery {
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct UpdateErrorGroupRequest {
     pub status: String,
-    /// Assignee (email by convention).
-    /// - `Some("user@example.com")` — sets the assignee.
-    /// - `Some("")` (empty string) — clears the current assignment (sets to null).
-    /// - `null` / field omitted — leaves the existing value unchanged.
+    /// Deprecated: assign by email. Prefer
+    /// `PUT /projects/{project_id}/error-groups/{group_id}/assignee`.
+    /// - `Some("user@example.com")`: assigns the user with that email; an
+    ///   email that is no user's is refused.
+    /// - `Some("")` (empty string): unassigns the group.
+    /// - `null` / field omitted: leaves the assignee unchanged.
+    ///
+    /// The status `assigned` is accepted and stored as `unresolved`.
     pub assigned_to: Option<String>,
     /// With `status: ignored`: when the group comes back. Omitted, the next
     /// event reopens it.
@@ -205,7 +215,11 @@ pub struct ErrorGroupResponse {
     pub last_seen: String,
     pub total_count: i32,
     pub status: String,
+    /// Deprecated: a free-text assignee from before assignees were users or
+    /// teams, kept read-only when it matched no user. Use `assignee`.
     pub assigned_to: Option<String>,
+    /// The user or team the group is assigned to.
+    pub assignee: Option<crate::services::group_workflow::GroupAssignee>,
     /// Set when this group was merged into another one. Its events and count
     /// stay with it so the merge can be undone, it is left out of lists, and
     /// its future events land in the group named here.
@@ -304,6 +318,7 @@ impl From<ErrorGroupDomain> for ErrorGroupResponse {
             total_count: group.total_count,
             status: group.status,
             assigned_to: group.assigned_to,
+            assignee: group.assignee,
             merged_into_group_id: group.merged_into_group_id,
             ignore: group.ignore,
             resolution: group.resolution,
@@ -364,6 +379,36 @@ impl From<ErrorTrackingError> for temps_core::problemdetails::Problem {
                 .detail(err.to_string())
                 .value("project_id", project_id)
                 .value("group_ids", group_ids.clone())
+                .build(),
+            ErrorTrackingError::GroupNotInProject {
+                project_id,
+                group_id,
+            } => temps_core::error_builder::ErrorBuilder::new(StatusCode::NOT_FOUND)
+                .type_("https://temps.sh/probs/error-group-not-found")
+                .title("Error Group Not Found")
+                .detail(err.to_string())
+                .value("project_id", project_id)
+                .value("group_id", group_id)
+                .build(),
+            ErrorTrackingError::CommentNotFound {
+                group_id,
+                comment_id,
+            } => temps_core::error_builder::ErrorBuilder::new(StatusCode::NOT_FOUND)
+                .type_("https://temps.sh/probs/error-group-comment-not-found")
+                .title("Comment Not Found")
+                .detail(err.to_string())
+                .value("group_id", group_id)
+                .value("comment_id", comment_id)
+                .build(),
+            ErrorTrackingError::SavedSearchNotFound {
+                project_id,
+                saved_search_id,
+            } => temps_core::error_builder::ErrorBuilder::new(StatusCode::NOT_FOUND)
+                .type_("https://temps.sh/probs/error-saved-search-not-found")
+                .title("Saved Search Not Found")
+                .detail(err.to_string())
+                .value("project_id", project_id)
+                .value("saved_search_id", saved_search_id)
                 .build(),
             ErrorTrackingError::FingerprintsNotInGroup {
                 group_id,
@@ -469,6 +514,9 @@ impl axum::response::IntoResponse for ErrorTrackingError {
                 (StatusCode::NOT_FOUND, "Error group not found".to_string())
             }
             ErrorTrackingError::GroupsNotFound { .. }
+            | ErrorTrackingError::GroupNotInProject { .. }
+            | ErrorTrackingError::CommentNotFound { .. }
+            | ErrorTrackingError::SavedSearchNotFound { .. }
             | ErrorTrackingError::InboundFilterNotFound { .. }
             | ErrorTrackingError::FingerprintsNotInGroup { .. } => {
                 (StatusCode::NOT_FOUND, self.to_string())
@@ -553,6 +601,15 @@ pub async fn list_error_groups(
     project_access_guard!(auth, project_id, state.project_access_checker);
     let page = query.page;
     let page_size = query.page_size.clamp(1, 100);
+    let refine = crate::services::types::GroupListRefinement {
+        assignee: query
+            .assignee
+            .as_deref()
+            .filter(|a| !a.trim().is_empty())
+            .map(|a| crate::services::group_workflow::AssigneeFilter::parse(a, auth.user_id()))
+            .transpose()?,
+        search: query.search,
+    };
 
     let (groups, total_count) = state
         .error_tracking_service
@@ -566,6 +623,7 @@ pub async fn list_error_groups(
             Some(query.sort_order),
             query.start_date.map(|d| d.into()),
             query.end_date.map(|d| d.into()),
+            &refine,
         )
         .await?;
 
@@ -643,13 +701,31 @@ pub async fn update_error_group(
     permission_guard!(auth, ErrorTrackingWrite);
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
+    // Legacy assignee by email (ADR 074, D1.6): resolved to a user and set
+    // through the assignee route, so it is checked and audited the same way.
+    if let Some(assigned_to) = request.assigned_to.as_deref() {
+        let assignee = if assigned_to.trim().is_empty() {
+            None
+        } else {
+            Some(
+                state
+                    .error_tracking_service
+                    .workflow
+                    .user_by_email(assigned_to)
+                    .await?,
+            )
+        };
+        super::assignee_handler::assign_and_audit(
+            &state, &auth, &metadata, project_id, group_id, assignee,
+        )
+        .await?;
+    }
     state
         .error_tracking_service
         .update_error_group_status(
             group_id,
             project_id,
             request.status.clone(),
-            request.assigned_to.clone(),
             request.ignore.clone().map(Into::into),
             request.in_next_release,
         )
@@ -1216,7 +1292,7 @@ mod tests {
                 ignore: None,
                 in_next_release: false,
                 status: "resolved".to_string(),
-                assigned_to: Some("owner@example.com".to_string()),
+                assigned_to: Some(String::new()),
             }),
         )
         .await
@@ -1232,16 +1308,40 @@ mod tests {
 
         {
             let entries = recorder.entries.lock().expect("lock");
-            assert_eq!(entries.len(), 1, "exactly one audit event per update");
-            let (op, user_id, payload) = &entries[0];
+            // The legacy assignee field is applied through the assignee
+            // route, which audits it on its own.
+            assert_eq!(entries.len(), 2, "the assignment, then the update");
+            assert_eq!(entries[0].0, "ERROR_GROUP_ASSIGNED");
+            let (op, user_id, payload) = &entries[1];
             assert_eq!(op, "ERROR_GROUP_UPDATED");
             assert_eq!(*user_id, Some(5));
             assert_eq!(payload["project_id"], project_id);
             assert_eq!(payload["group_id"], group_id);
             assert_eq!(payload["status"], "resolved");
-            assert_eq!(payload["assigned_to"], "owner@example.com");
+            assert_eq!(payload["assigned_to"], "");
             assert_eq!(payload["context"]["ip_address"], "203.0.113.9");
         }
+
+        // An email that is no user's is refused before anything is written.
+        let unknown = update_error_group(
+            State(state.clone()),
+            RequireAuth(auth.clone()),
+            Path((project_id, group_id)),
+            Extension(metadata()),
+            Json(UpdateErrorGroupRequest {
+                ignore: None,
+                in_next_release: false,
+                status: "unresolved".to_string(),
+                assigned_to: Some("nobody@example.com".to_string()),
+            }),
+        )
+        .await
+        .expect_err("an unknown email is refused");
+        assert_eq!(
+            axum::response::IntoResponse::into_response(unknown).status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(recorder.entries.lock().expect("lock").len(), 2);
 
         // A group from another project is not found: no write, no audit event.
         let missing = update_error_group(
@@ -1260,7 +1360,7 @@ mod tests {
         assert!(missing.is_err(), "cross-project update must fail");
         assert_eq!(
             recorder.entries.lock().expect("lock").len(),
-            1,
+            2,
             "a failed update must not emit an audit event"
         );
     }

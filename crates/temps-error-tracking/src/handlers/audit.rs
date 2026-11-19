@@ -199,6 +199,37 @@ impl AuditOperation for ErrorGroupSplitAudit {
     }
 }
 
+/// Audit event for assigning an error group (ADR 074, D1.6).
+#[derive(Debug, Clone, Serialize)]
+pub struct ErrorGroupAssignedAudit {
+    pub context: AuditContext,
+    pub project_id: i32,
+    pub group_id: i32,
+    /// The assignee before the request; `None` when unassigned.
+    pub previous: Option<crate::services::group_workflow::Assignee>,
+    /// The assignee the request set; `None` unassigns.
+    pub assignee: Option<crate::services::group_workflow::Assignee>,
+    pub changed: bool,
+}
+
+impl AuditOperation for ErrorGroupAssignedAudit {
+    fn operation_type(&self) -> String {
+        "ERROR_GROUP_ASSIGNED".to_string()
+    }
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
+    }
+}
+
 /// Audit event for a triage update on an error group (status and/or assignee).
 #[derive(Debug, Clone, Serialize)]
 pub struct ErrorGroupUpdatedAudit {

@@ -42,6 +42,21 @@ pub enum ErrorTrackingError {
         group_ids: Vec<i32>,
     },
 
+    /// A group id that is not a group of the project. Maps to HTTP 404.
+    #[error("Error group {group_id} not found in project {project_id}")]
+    GroupNotInProject { project_id: i32, group_id: i32 },
+
+    /// A comment id that is not a comment on the group. Maps to HTTP 404.
+    #[error("Comment {comment_id} not found on error group {group_id}")]
+    CommentNotFound { group_id: i32, comment_id: i64 },
+
+    /// A saved search id that is not one of the project's. Maps to HTTP 404.
+    #[error("Saved search {saved_search_id} not found in project {project_id}")]
+    SavedSearchNotFound {
+        project_id: i32,
+        saved_search_id: i32,
+    },
+
     /// A merge or split names a group that is already merged into another.
     /// Maps to HTTP 409 Conflict.
     #[error(
@@ -353,6 +368,8 @@ pub struct ErrorGroupDomain {
     /// (ADR 074, D1.3). `None` for any other group.
     pub ignore: Option<GroupIgnoreState>,
     pub resolution: Option<GroupResolutionState>,
+    /// The user or team the group is assigned to (ADR 074, D1.6).
+    pub assignee: Option<super::group_workflow::GroupAssignee>,
     pub project_id: i32,
     pub environment_id: Option<i32>,
     pub deployment_id: Option<i32>,
@@ -582,6 +599,16 @@ mod without_nul_tests {
         );
         assert_eq!(event.screen_width, Some(1920));
     }
+}
+
+/// Refinements of the error group list beyond its original filters
+/// (ADR 074, D1.6 and D1.8).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GroupListRefinement {
+    /// Only groups with this assignee.
+    pub assignee: Option<super::group_workflow::AssigneeFilter>,
+    /// Case-insensitive substring of the title, error type or message.
+    pub search: Option<String>,
 }
 
 /// A group resolved in the next release (ADR 074, D1.5).

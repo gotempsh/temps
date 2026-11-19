@@ -141,7 +141,18 @@ async fn a_merged_group_is_hidden_from_the_list_and_the_status_counts() {
     let analytics =
         crate::services::error_analytics_service::ErrorAnalyticsService::new(db.clone());
     let (before, total_before) = crud
-        .list_error_groups(project, None, None, None, None, None, None, None, None)
+        .list_error_groups(
+            project,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &Default::default(),
+        )
         .await
         .expect("list before merge");
     assert_eq!(before.len(), 2);
@@ -153,7 +164,18 @@ async fn a_merged_group_is_hidden_from_the_list_and_the_status_counts() {
         .expect("merge succeeds");
 
     let (after, total_after) = crud
-        .list_error_groups(project, None, None, None, None, None, None, None, None)
+        .list_error_groups(
+            project,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &Default::default(),
+        )
         .await
         .expect("list after merge");
     assert_eq!(total_after, 1);

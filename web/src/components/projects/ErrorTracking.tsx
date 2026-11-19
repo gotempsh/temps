@@ -16,10 +16,8 @@ import {
   listErrorGroupsOptions,
   listErrorGroupsQueryKey,
   listDsnsOptions,
-  listUsersOptions,
   bulkUpdateErrorGroupsMutation,
   mergeErrorGroupsMutation,
-  updateErrorGroupMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import { ErrorTimeSeriesChart } from '@/components/error-tracking/ErrorTimeSeriesChart'
 import { AnalyticsFilters } from '@/components/project/ProjectAnalytics'
@@ -32,9 +30,8 @@ import {
   type AnalyticsDateFilter,
   type QuickFilter,
 } from '@/hooks/useAnalyticsDateRange'
-import { useIsInstanceAdmin } from '@/hooks/useIsInstanceAdmin'
+import { AssigneeMenu } from '@/components/error-tracking/AssigneeMenu'
 import { Alert, AlertDescription } from '@/components/ui/alert'
-import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import { Badge } from '@/components/ui/badge'
 import { FixErrorWithAgentButton } from '@/components/ai/FixErrorWithAgentButton'
 import { offersFixInList } from '@/components/ai/fix-error-with-agent'
@@ -50,14 +47,6 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuLabel,
-  DropdownMenuSeparator,
-  DropdownMenuTrigger,
-} from '@/components/ui/dropdown-menu'
 import { EmptyState } from '@/components/ui/empty-state'
 import { Label } from '@/components/ui/label'
 import {
@@ -81,7 +70,6 @@ import {
   Settings,
   TrendingDown,
   TrendingUp,
-  UserRound,
   Users,
 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
@@ -157,6 +145,10 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
   const [statusFilter, setStatusFilter] = useState<
     'unresolved' | 'resolved' | 'all'
   >('unresolved')
+  // "Assigned to me" covers the user's teams too (ADR 074, D1.6).
+  const [assigneeFilter, setAssigneeFilter] = useState<'any' | 'me' | 'none'>(
+    'any'
+  )
   const [groupSort, setGroupSort] = useState('last_seen:desc')
   const [page, setPage] = useState(1)
   const pageSize = 25
@@ -201,26 +193,6 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
     }),
   })
 
-  // Instance users, used to resolve `assigned_to` (an email/username string)
-  // to a display name + avatar for the assignee control. No per-project
-  // members endpoint exists yet, so this mirrors the same source
-  // TeamDetail's AddMemberDialog uses for its user picker.
-  // Listing users needs `users:write` (instance administrators only); other
-  // roles fall back to showing the raw assignee string.
-  const isInstanceAdmin = useIsInstanceAdmin()
-  const { data: usersData } = useQuery({
-    ...listUsersOptions({ query: { include_deleted: false } }),
-    enabled: isInstanceAdmin,
-  })
-  const userByIdentity = useMemo(() => {
-    const map = new Map<string, NonNullable<typeof usersData>[number]>()
-    for (const u of usersData ?? []) {
-      if (u.user.email) map.set(u.user.email.toLowerCase(), u)
-      if (u.user.username) map.set(u.user.username.toLowerCase(), u)
-    }
-    return map
-  }, [usersData])
-
   // Derive selected environment from environments data
   const selectedEnvironmentId = useMemo(() => {
     if (!environments || environments.length === 0) return undefined
@@ -243,7 +215,7 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
   // Bulk triage selection, by group id. Cleared whenever the visible page
   // changes, so a resolve can never land on a group the user cannot see.
   const [selectedGroupIds, setSelectedGroupIds] = useState<number[]>([])
-  const pageScope = `${statusFilter}\u0000${groupSort}\u0000${environmentFilter}\u0000${dateFilter.quickFilter}\u0000${dateFilter.dateRange?.from?.getTime() ?? ''}\u0000${dateFilter.dateRange?.to?.getTime() ?? ''}`
+  const pageScope = `${statusFilter}\u0000${assigneeFilter}\u0000${groupSort}\u0000${environmentFilter}\u0000${dateFilter.quickFilter}\u0000${dateFilter.dateRange?.from?.getTime() ?? ''}\u0000${dateFilter.dateRange?.to?.getTime() ?? ''}`
   const [previousPageScope, setPreviousPageScope] = useState(pageScope)
   if (pageScope !== previousPageScope) {
     setPreviousPageScope(pageScope)
@@ -268,6 +240,7 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
         page,
         page_size: pageSize,
         status: statusFilter === 'all' ? null : statusFilter,
+        assignee: assigneeFilter === 'any' ? null : assigneeFilter,
         start_date: timeRange.startTime,
         end_date: timeRange.endTime,
         environment_id: environmentFilter,
@@ -302,20 +275,6 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
       }),
       enabled: hasErrors,
     })
-
-  // Shared mutation for the assignee quick-actions on each row ("Assign to
-  // me" / "Unassign"). `assigned_to: ''` is the backend's clear-assignment
-  // sentinel — see UpdateErrorGroupRequest's doc comment.
-  const assigneeMutation = useMutation({
-    ...updateErrorGroupMutation(),
-    meta: { errorTitle: 'Failed to update assignee' },
-    onSuccess: () => {
-      queryClient.invalidateQueries({
-        queryKey: listErrorGroupsOptions({ path: { project_id: project.id } })
-          .queryKey,
-      })
-    },
-  })
 
   // One request for the whole selection; the console never loops over the
   // single-group endpoint.
@@ -540,31 +499,6 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
       group.events_in_range != null &&
       group.events_in_range !== group.total_count
 
-    const assignedUser = group.assigned_to
-      ? userByIdentity.get(group.assigned_to.toLowerCase())
-      : undefined
-    const assigneeLabel = group.assigned_to
-      ? (assignedUser?.user.name ?? group.assigned_to)
-      : 'Unassigned'
-    const assigneeInitials = (
-      assignedUser?.user.username ||
-      assignedUser?.user.name ||
-      group.assigned_to ||
-      '?'
-    )
-      .slice(0, 2)
-      .toUpperCase()
-    const isAssignedToMe =
-      !!group.assigned_to &&
-      !!currentUser?.email &&
-      group.assigned_to.toLowerCase() === currentUser.email.toLowerCase()
-
-    const assign = (assignedTo: string) =>
-      assigneeMutation.mutate({
-        path: { project_id: project.id, group_id: group.id },
-        body: { status: group.status ?? 'unresolved', assigned_to: assignedTo },
-      })
-
     return (
       <div
         key={group.id}
@@ -705,50 +639,14 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
           />
         )}
 
-        <DropdownMenu>
-          <DropdownMenuTrigger asChild>
-            <button
-              type="button"
-              onClick={(e) => e.stopPropagation()}
-              className="shrink-0 rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring hover:ring-2 hover:ring-border transition-shadow"
-              aria-label={`Assignee: ${assigneeLabel}`}
-              title={assigneeLabel}
-            >
-              {group.assigned_to ? (
-                <Avatar className="h-6 w-6">
-                  <AvatarImage src={assignedUser?.user.image} />
-                  <AvatarFallback className="text-[10px]">
-                    {assigneeInitials}
-                  </AvatarFallback>
-                </Avatar>
-              ) : (
-                <span className="flex h-6 w-6 items-center justify-center rounded-full border border-dashed border-muted-foreground/40 text-muted-foreground">
-                  <UserRound className="h-3.5 w-3.5" />
-                </span>
-              )}
-            </button>
-          </DropdownMenuTrigger>
-          <DropdownMenuContent align="end" onClick={(e) => e.stopPropagation()}>
-            <DropdownMenuLabel className="text-xs font-normal text-muted-foreground">
-              {assigneeLabel}
-            </DropdownMenuLabel>
-            <DropdownMenuSeparator />
-            {!isAssignedToMe && currentUser && (
-              <DropdownMenuItem
-                onClick={() =>
-                  assign(currentUser.email || currentUser.username)
-                }
-              >
-                Assign to me
-              </DropdownMenuItem>
-            )}
-            {group.assigned_to && (
-              <DropdownMenuItem onClick={() => assign('')}>
-                Unassign
-              </DropdownMenuItem>
-            )}
-          </DropdownMenuContent>
-        </DropdownMenu>
+        <AssigneeMenu
+          variant="avatar"
+          projectId={project.id}
+          groupId={group.id}
+          assignee={group.assignee}
+          legacyAssignedTo={group.assigned_to}
+          currentUserId={currentUser?.id}
+        />
 
         <ChevronRight className="h-4 w-4 text-muted-foreground/60 group-hover:text-muted-foreground shrink-0" />
       </div>
@@ -849,6 +747,24 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
                   <SelectItem value="all">All</SelectItem>
                 </SelectContent>
               </Select>
+              <Select
+                value={assigneeFilter}
+                onValueChange={(v) =>
+                  setAssigneeFilter(v as 'any' | 'me' | 'none')
+                }
+              >
+                <SelectTrigger
+                  className="w-[160px]"
+                  aria-label="Filter error groups by assignee"
+                >
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="any">Anyone</SelectItem>
+                  <SelectItem value="me">Assigned to me</SelectItem>
+                  <SelectItem value="none">Unassigned</SelectItem>
+                </SelectContent>
+              </Select>
               <Select value={groupSort} onValueChange={setGroupSort}>
                 <SelectTrigger
                   className="w-[170px]"
@@ -909,9 +825,7 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
                 selectedGroupIds={selectedGroupIds}
                 onSelectionChange={setSelectedGroupIds}
                 onAction={applyBulkAction}
-                onMerge={() =>
-                  setMergeTarget(Math.min(...selectedGroupIds))
-                }
+                onMerge={() => setMergeTarget(Math.min(...selectedGroupIds))}
                 isPending={bulkMutation.isPending || mergeMutation.isPending}
               />
               <ConfirmDialog

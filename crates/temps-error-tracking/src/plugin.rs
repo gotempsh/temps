@@ -151,6 +151,7 @@ impl TempsPlugin for ErrorTrackingPlugin {
                 context.get_service::<temps_notifications::services::NotificationService>()
             {
                 tracing::info!("Error tracking: notification callback wired successfully");
+                error_tracking_service.set_assignment_mailer(notification_service.clone());
                 let ns = notification_service.clone();
                 let notif_db = db.clone();
                 let alarm_slot = alarm_service_slot.clone();
@@ -530,6 +531,8 @@ impl TempsPlugin for ErrorTrackingPlugin {
             <crate::handlers::inbound_filter_handler::InboundFilterApiDoc as OpenApiTrait>::openapi(
             ),
         );
+        schema
+            .merge(<crate::handlers::assignee_handler::AssigneeApiDoc as OpenApiTrait>::openapi());
         schema.merge(
             <crate::handlers::client_outcome_handler::ClientOutcomeApiDoc as OpenApiTrait>::openapi(
             ),

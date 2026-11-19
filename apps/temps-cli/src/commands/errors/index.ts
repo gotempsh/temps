@@ -6,6 +6,7 @@ import { requireAuth, config, credentials } from '../../config/store.js'
 import { setupClient, client, getErrorMessage, normalizeApiUrl } from '../../lib/api-client.js'
 import {
   bulkUpdateErrorGroups,
+  setErrorGroupAssignee,
   listErrorGroupFingerprints,
   mergeErrorGroups,
   splitErrorGroup,
@@ -18,6 +19,7 @@ import {
   getErrorStats,
   getErrorTimeSeries,
   getErrorDashboardStats,
+  getCurrentUser,
 } from '../../api/sdk.gen.js'
 import type { ErrorGroupResponse, ErrorEventResponse, ErrorTimeSeriesDataResponse } from '../../api/types.gen.js'
 import { withSpinner, startSpinner, succeedSpinner, failSpinner } from '../../ui/spinner.js'
@@ -38,7 +40,54 @@ interface ListOptions {
   endDate?: string
   sortBy?: string
   sortOrder?: string
+  assignee?: string
+  search?: string
   json?: boolean
+}
+
+interface AssignOptions {
+  projectId: string
+  groupId: string
+  userId?: string
+  teamId?: string
+  me?: boolean
+  none?: boolean
+  json?: boolean
+}
+
+/** Body of `PUT .../assignee` from the `errors assign` flags. */
+export function buildAssigneeBody(
+  options: Pick<AssignOptions, 'userId' | 'teamId' | 'me' | 'none'>,
+  currentUserId: number | undefined
+): { user_id?: number; team_id?: number } {
+  const chosen = [options.userId, options.teamId, options.me, options.none].filter(
+    (v) => v !== undefined && v !== false
+  )
+  if (chosen.length !== 1) {
+    throw new Error('Choose exactly one of --user-id, --team-id, --me or --none')
+  }
+  if (options.none) return {}
+  if (options.me) {
+    if (currentUserId === undefined) {
+      throw new Error('--me needs a signed-in user; use --user-id instead')
+    }
+    return { user_id: currentUserId }
+  }
+  const raw = (options.userId ?? options.teamId) as string
+  const id = Number(raw)
+  if (!Number.isInteger(id) || id <= 0) {
+    throw new Error(`Expected a positive numeric id, got "${raw}"`)
+  }
+  return options.userId !== undefined ? { user_id: id } : { team_id: id }
+}
+
+/** Check the `--assignee` list filter before sending it. */
+export function checkAssigneeFilter(value: string): string {
+  const trimmed = value.trim()
+  if (!/^(me|none|user:[0-9]+|team:[0-9]+)$/.test(trimmed)) {
+    throw new Error(`--assignee takes me, none, user:<id> or team:<id>; got "${value}"`)
+  }
+  return trimmed
 }
 
 interface ShowOptions {
@@ -394,8 +443,22 @@ export function registerErrorsCommands(program: Command): void {
     .option('--end-date <date>', 'Filter by end date (ISO 8601)')
     .option('--sort-by <field>', 'Sort by field (e.g., total_count, last_seen, first_seen)')
     .option('--sort-order <order>', 'Sort order: asc or desc')
+    .option('--assignee <who>', 'Only groups assigned to: me (you or your teams), none, user:<id> or team:<id>')
+    .option('--search <text>', 'Only groups whose title, type or message contains this text')
     .option('--json', 'Output in JSON format')
     .action(listErrorGroupsAction)
+
+  errors
+    .command('assign')
+    .description('Assign an error group to a user or team, or unassign it')
+    .requiredOption('--project-id <id>', 'Project ID')
+    .requiredOption('--group-id <id>', 'Error group ID')
+    .option('--user-id <id>', 'Assign to this user')
+    .option('--team-id <id>', 'Assign to this team')
+    .option('--me', 'Assign to yourself')
+    .option('--none', 'Unassign the group')
+    .option('--json', 'Output in JSON format')
+    .action(assignErrorGroupAction)
 
   errors
     .command('show')
@@ -412,7 +475,7 @@ export function registerErrorsCommands(program: Command): void {
       .requiredOption('--project-id <id>', 'Project ID')
       .requiredOption('--group-id <id>', 'Error group ID')
       .requiredOption('--status <status>', 'New status (unresolved, resolved, ignored)')
-      .option('--assigned-to <user>', 'Assign to user')
+      .option('--assigned-to <email>', 'Assign to the user with this email ("" unassigns); see also errors assign')
   ).action(updateErrorGroupAction)
 
   const bulk = errors
@@ -616,6 +679,13 @@ async function listErrorGroupsAction(options: ListOptions): Promise<void> {
   }
 
   const environmentId = options.environmentId ? parseInt(options.environmentId, 10) : undefined
+  let assignee: string | undefined
+  try {
+    assignee = options.assignee ? checkAssigneeFilter(options.assignee) : undefined
+  } catch (e) {
+    warning(e instanceof Error ? e.message : String(e))
+    return
+  }
 
   const result = await withSpinner('Fetching error groups...', async () => {
     const { data, error } = await listErrorGroups({
@@ -630,6 +700,8 @@ async function listErrorGroupsAction(options: ListOptions): Promise<void> {
         ...(options.endDate && { end_date: options.endDate }),
         ...(options.sortBy && { sort_by: options.sortBy }),
         ...(options.sortOrder && { sort_order: options.sortOrder }),
+        ...(assignee && { assignee }),
+        ...(options.search && { search: options.search }),
       },
     })
     if (error) {
@@ -661,6 +733,7 @@ async function listErrorGroupsAction(options: ListOptions): Promise<void> {
     { header: 'Type', key: 'error_type' },
     { header: 'Count', accessor: (g) => g.total_count.toString(), color: (v) => parseInt(v, 10) > 100 ? colors.error(v) : v },
     { header: 'Status', key: 'status', color: (v) => statusBadge(v === 'resolved' ? 'success' : v === 'ignored' ? 'inactive' : 'error') },
+    { header: 'Assignee', accessor: (g) => g.assignee?.name ?? g.assigned_to ?? '-' },
     { header: 'Last Seen', accessor: (g) => formatRelativeTime(g.last_seen) },
   ]
 
@@ -670,6 +743,57 @@ async function listErrorGroupsAction(options: ListOptions): Promise<void> {
     info(`Page ${pagination.page} of ${pagination.total_pages} (${pagination.total_count} total)`)
   }
   newline()
+}
+
+async function assignErrorGroupAction(options: AssignOptions): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const projectId = parseInt(options.projectId, 10)
+  const groupId = parseInt(options.groupId, 10)
+  if (isNaN(projectId) || isNaN(groupId)) {
+    warning('Invalid project or group ID')
+    return
+  }
+  let body: { user_id?: number; team_id?: number }
+  try {
+    const me = options.me ? await currentUserId() : undefined
+    body = buildAssigneeBody(options, me)
+  } catch (e) {
+    warning(e instanceof Error ? e.message : String(e))
+    return
+  }
+
+  const result = await withSpinner('Assigning error group...', async () => {
+    const { data, error } = await setErrorGroupAssignee({
+      client,
+      path: { project_id: projectId, group_id: groupId },
+      body,
+    })
+    if (error || !data) {
+      throw new Error(getErrorMessage(error))
+    }
+    return data
+  })
+
+  if (options.json) {
+    json(result)
+    return
+  }
+  if (!result.assignee) {
+    success(`Error group #${groupId} is unassigned`)
+  } else {
+    success(`Error group #${groupId} assigned to ${result.assignee.name} (${result.assignee.type} ${result.assignee.id})`)
+  }
+  if (!result.changed) {
+    info('Nothing changed: it already had that assignee')
+  }
+}
+
+/** The signed-in user's id, for `--me`. */
+async function currentUserId(): Promise<number | undefined> {
+  const { data } = await getCurrentUser({ client })
+  return typeof data?.id === 'number' ? data.id : undefined
 }
 
 async function showErrorGroup(options: ShowOptions): Promise<void> {
@@ -710,7 +834,9 @@ async function showErrorGroup(options: ShowOptions): Promise<void> {
   if (group.message_template) {
     keyValue('Message', group.message_template)
   }
-  if (group.assigned_to) {
+  if (group.assignee) {
+    keyValue('Assigned To', `${group.assignee.name} (${group.assignee.type} ${group.assignee.id})`)
+  } else if (group.assigned_to) {
     keyValue('Assigned To', group.assigned_to)
   }
   if (group.environment_id !== null && group.environment_id !== undefined) {

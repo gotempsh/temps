@@ -34,8 +34,16 @@ pub struct Model {
     pub total_count: i32,
 
     // Status management
-    pub status: String,              // 'unresolved', 'resolved', 'ignored'
-    pub assigned_to: Option<String>, // User ID or email
+    pub status: String, // 'unresolved', 'resolved', 'ignored'
+    /// Legacy free-text assignee, read-only since ADR 074 D1.6: a value the
+    /// migration could not match to a user. New assignments use
+    /// `assignee_user_id` or `assignee_team_id`.
+    pub assigned_to: Option<String>,
+    /// The user the group is assigned to (ADR 074, D1.6). At most one of
+    /// this and `assignee_team_id` is set.
+    pub assignee_user_id: Option<i32>,
+    /// The team the group is assigned to.
+    pub assignee_team_id: Option<i32>,
 
     /// Set when this group was merged into another one (ADR 074, D1.2): its
     /// fingerprints now route to that group and new events land there. The

@@ -25,7 +25,9 @@ describe('ignorePresetConditions', () => {
   })
 
   test('count, user and forever presets', () => {
-    expect(ignorePresetConditions('hundred_more', now)).toEqual({ event_count: 100 })
+    expect(ignorePresetConditions('hundred_more', now)).toEqual({
+      event_count: 100,
+    })
     expect(ignorePresetConditions('ten_users', now)).toEqual({ user_count: 10 })
     expect(ignorePresetConditions('forever', now)).toEqual({ forever: true })
   })
@@ -39,7 +41,9 @@ describe('describeIgnoreState', () => {
   const date = () => 'Jan 17'
 
   test('forever', () => {
-    expect(describeIgnoreState({ user_count: 0, forever: true }, 5)).toContain('forever')
+    expect(describeIgnoreState({ user_count: 0, forever: true }, 5)).toContain(
+      'forever'
+    )
   })
 
   test('combines the conditions and shows progress', () => {

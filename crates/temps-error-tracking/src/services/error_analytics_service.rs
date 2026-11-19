@@ -500,6 +500,7 @@ impl ErrorAnalyticsService {
             .map(|group| ErrorGroupDomain {
                 ignore: super::types::GroupIgnoreState::from_group(&group),
                 resolution: super::types::GroupResolutionState::from_group(&group),
+                assignee: None,
                 id: group.id,
                 title: group.title,
                 error_type: group.error_type,

@@ -249,6 +249,7 @@ impl ErrorCRUDService {
         sort_order: Option<String>,
         start_date: Option<DateTime<Utc>>,
         end_date: Option<DateTime<Utc>>,
+        refine: &super::types::GroupListRefinement,
     ) -> Result<(Vec<ErrorGroupDomain>, u64), ErrorTrackingError> {
         let page = page.unwrap_or(1).max(1);
         let page_size = page_size.unwrap_or(20).clamp(1, 100);
@@ -267,6 +268,27 @@ impl ErrorCRUDService {
 
         if let Some(env_id) = environment_id {
             query = query.filter(error_groups::Column::EnvironmentId.eq(env_id));
+        }
+
+        if let Some(assignee) = refine.assignee {
+            query = query.filter(assignee.condition());
+        }
+        if let Some(search) = refine.search.as_deref().filter(|s| !s.trim().is_empty()) {
+            use sea_orm::sea_query::extension::postgres::PgExpr;
+            use sea_orm::sea_query::Expr;
+            if search.chars().count() > super::group_workflow::BULK_SEARCH_MAX_CHARS {
+                return Err(ErrorTrackingError::Validation(format!(
+                    "search is longer than {} characters",
+                    super::group_workflow::BULK_SEARCH_MAX_CHARS
+                )));
+            }
+            let pattern = super::group_workflow::like_pattern(search);
+            query = query.filter(
+                sea_orm::Condition::any()
+                    .add(Expr::col(error_groups::Column::Title).ilike(pattern.clone()))
+                    .add(Expr::col(error_groups::Column::ErrorType).ilike(pattern.clone()))
+                    .add(Expr::col(error_groups::Column::MessageTemplate).ilike(pattern)),
+            );
         }
 
         // Apply time-range filter: restrict to groups that have at least one event in the window.
@@ -344,11 +366,16 @@ impl ErrorCRUDService {
                 .await?
         };
 
+        let assignees: Vec<(i32, super::group_workflow::Assignee)> = groups
+            .iter()
+            .filter_map(|g| super::group_workflow::Assignee::of_group(g).map(|a| (g.id, a)))
+            .collect();
         let mut domain_groups: Vec<ErrorGroupDomain> = groups
             .into_iter()
             .map(|group| ErrorGroupDomain {
                 ignore: super::types::GroupIgnoreState::from_group(&group),
                 resolution: super::types::GroupResolutionState::from_group(&group),
+                assignee: None,
                 id: group.id,
                 title: group.title,
                 error_type: group.error_type,
@@ -370,6 +397,19 @@ impl ErrorCRUDService {
                 deployment: None,
             })
             .collect();
+
+        // Assignee names for the page, in at most two queries.
+        if !assignees.is_empty() {
+            let keys: Vec<super::group_workflow::Assignee> =
+                assignees.iter().map(|(_, a)| *a).collect();
+            let names =
+                super::group_workflow::assignee::load_assignees(self.db.as_ref(), &keys).await?;
+            let by_group: HashMap<i32, super::group_workflow::Assignee> =
+                assignees.into_iter().collect();
+            for group in &mut domain_groups {
+                group.assignee = by_group.get(&group.id).and_then(|a| names.get(a)).cloned();
+            }
+        }
 
         // Compute per-group windowed aggregates for the current page only.
         // Only runs when a date range was requested, never unbounded against error_events.
@@ -658,9 +698,17 @@ impl ErrorCRUDService {
             }
         }
 
+        let assignee = match super::group_workflow::Assignee::of_group(&group) {
+            Some(key) => super::group_workflow::assignee::load_assignees(self.db.as_ref(), &[key])
+                .await?
+                .remove(&key),
+            None => None,
+        };
+
         Ok(ErrorGroupDomain {
             ignore: super::types::GroupIgnoreState::from_group(&group),
             resolution,
+            assignee,
             id: group.id,
             title: group.title,
             error_type: group.error_type,
@@ -693,7 +741,6 @@ impl ErrorCRUDService {
         group_id: i32,
         project_id: i32,
         status: String,
-        assigned_to: Option<String>,
         ignore: Option<IgnoreConditions>,
         in_next_release: bool,
     ) -> Result<(), ErrorTrackingError> {
@@ -710,17 +757,7 @@ impl ErrorCRUDService {
         let write = StatusWrite::new(status, ignore.unwrap_or_default())
             .with_release(after_release.map(|r| r.id));
         let mut values: Vec<sea_orm::Value> = vec![group_id.into(), project_id.into()];
-        let mut set = write.set_clause(&mut values);
-        match assigned_to {
-            // Empty string is the sentinel for "clear the assignment"
-            Some(ref s) if s.is_empty() => set.push_str(", assigned_to = NULL"),
-            Some(assignee) => {
-                values.push(assignee.into());
-                set.push_str(&format!(", assigned_to = ${}", values.len()));
-            }
-            // Field omitted — leave the existing value untouched
-            None => {}
-        }
+        let set = write.set_clause(&mut values);
         let updated = tx
             .execute(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
@@ -840,14 +877,19 @@ impl ErrorCRUDService {
 
 /// The statuses a group can hold. Anything else would drop the group out of every
 /// status filter and stats bucket.
-const ERROR_GROUP_STATUSES: [&str; 4] = ["unresolved", "resolved", "ignored", "assigned"];
+const ERROR_GROUP_STATUSES: [&str; 3] = ["unresolved", "resolved", "ignored"];
 
 pub(crate) fn validate_group_status(status: &str) -> Result<(), ErrorTrackingError> {
     canonical_group_status(status).map(|_| ())
 }
 
-/// The known status equal to `status`, as a static string.
+/// The known status equal to `status`, as a static string. `assigned` was a
+/// status until ADR 074 D1.6 made the assignee a separate field; a write that
+/// still sends it means "open", and lands as `unresolved`.
 pub(crate) fn canonical_group_status(status: &str) -> Result<&'static str, ErrorTrackingError> {
+    if status == "assigned" {
+        return Ok("unresolved");
+    }
     ERROR_GROUP_STATUSES
         .into_iter()
         .find(|known| *known == status)
@@ -884,14 +926,7 @@ mod group_status_tests {
         // An empty mock fails on any query, so a pass proves nothing was read.
         let db = sea_orm::MockDatabase::new(DatabaseBackend::Postgres).into_connection();
         let result = ErrorCRUDService::new(Arc::new(db))
-            .update_error_group_status(
-                1,
-                1,
-                "definitely-not-a-status".to_string(),
-                None,
-                None,
-                false,
-            )
+            .update_error_group_status(1, 1, "definitely-not-a-status".to_string(), None, false)
             .await;
         assert!(matches!(result, Err(ErrorTrackingError::Validation(_))));
     }
@@ -1042,39 +1077,9 @@ mod tests {
     }
 
     #[test]
-    fn test_status_validation() {
-        // Valid statuses
-        let valid_statuses = vec!["unresolved", "resolved", "ignored", "assigned"];
-        for status in valid_statuses {
-            assert!(
-                status == "unresolved"
-                    || status == "resolved"
-                    || status == "ignored"
-                    || status == "assigned",
-                "Status {} should be valid",
-                status
-            );
-        }
-    }
-
-    #[test]
-    fn test_error_group_status_transitions() {
-        // Document valid status transitions
-        let transitions = vec![
-            ("unresolved", "resolved"), // Fix deployed
-            ("unresolved", "ignored"),  // Known/acceptable error
-            ("unresolved", "assigned"), // Assigned to developer
-            ("assigned", "resolved"),   // Developer fixed it
-            ("assigned", "unresolved"), // Unassign
-            ("ignored", "unresolved"),  // No longer acceptable
-            ("resolved", "unresolved"), // Regression (reopen)
-        ];
-
-        for (from, to) in transitions {
-            // Verify both states are valid
-            assert!(["unresolved", "resolved", "ignored", "assigned"].contains(&from));
-            assert!(["unresolved", "resolved", "ignored", "assigned"].contains(&to));
-        }
+    fn assigned_is_no_longer_a_status_and_lands_as_unresolved() {
+        assert_eq!(ERROR_GROUP_STATUSES, ["unresolved", "resolved", "ignored"]);
+        assert_eq!(canonical_group_status("assigned").ok(), Some("unresolved"));
     }
 
     #[tokio::test]
@@ -1089,14 +1094,7 @@ mod tests {
 
         // Update status to resolved
         let result = service
-            .update_error_group_status(
-                group_id,
-                project_id,
-                "resolved".to_string(),
-                None,
-                None,
-                false,
-            )
+            .update_error_group_status(group_id, project_id, "resolved".to_string(), None, false)
             .await;
 
         assert!(result.is_ok());
@@ -1113,37 +1111,25 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn test_update_error_group_with_assignment() {
+    async fn a_legacy_assigned_status_write_keeps_the_group_open() {
         let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorCRUDService::new(db.clone());
 
         let project_id = create_test_project(&db).await;
-        let group_id = create_test_error_group(&db, project_id, "unresolved").await;
+        let group_id = create_test_error_group(&db, project_id, "resolved").await;
 
-        // Assign to developer
-        let result = service
-            .update_error_group_status(
-                group_id,
-                project_id,
-                "assigned".to_string(),
-                Some("dev@example.com".to_string()),
-                None,
-                false,
-            )
-            .await;
+        service
+            .update_error_group_status(group_id, project_id, "assigned".to_string(), None, false)
+            .await
+            .expect("an old client's 'assigned' is accepted");
 
-        assert!(result.is_ok());
-
-        // Verify assignment
         let group = error_groups::Entity::find_by_id(group_id)
             .one(db.as_ref())
             .await
             .expect("Failed to fetch group")
             .expect("Group not found");
-
-        assert_eq!(group.status, "assigned");
-        assert_eq!(group.assigned_to, Some("dev@example.com".to_string()));
+        assert_eq!(group.status, "unresolved");
     }
 
     #[tokio::test]
@@ -1158,14 +1144,7 @@ mod tests {
 
         // Ignore error
         let result = service
-            .update_error_group_status(
-                group_id,
-                project_id,
-                "ignored".to_string(),
-                None,
-                None,
-                false,
-            )
+            .update_error_group_status(group_id, project_id, "ignored".to_string(), None, false)
             .await;
 
         assert!(result.is_ok());
@@ -1189,7 +1168,7 @@ mod tests {
 
         // Try to update non-existent group
         let result = service
-            .update_error_group_status(99999, 1, "resolved".to_string(), None, None, false)
+            .update_error_group_status(99999, 1, "resolved".to_string(), None, false)
             .await;
 
         assert!(result.is_err());
@@ -1211,7 +1190,7 @@ mod tests {
 
         // Try to update from wrong project
         let result = service
-            .update_error_group_status(group_id, 99999, "resolved".to_string(), None, None, false)
+            .update_error_group_status(group_id, 99999, "resolved".to_string(), None, false)
             .await;
 
         assert!(result.is_err());
@@ -1247,6 +1226,7 @@ mod tests {
                 None,
                 None,
                 None,
+                &Default::default(),
             )
             .await
             .expect("Failed to list groups");
@@ -1281,6 +1261,7 @@ mod tests {
                 None,
                 None,
                 None,
+                &Default::default(),
             )
             .await
             .expect("Failed to list groups");
@@ -1352,6 +1333,7 @@ mod tests {
                         Some(direction.to_string()),
                         Some(start),
                         Some(end),
+                        &Default::default(),
                     )
                     .await
                     .expect("range-sorted group page");

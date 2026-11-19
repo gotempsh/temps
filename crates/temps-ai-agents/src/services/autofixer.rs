@@ -2419,6 +2419,8 @@ mod tests {
             ignore_forever: false,
             resolved_in_next_release: false,
             resolved_in_release_after_id: None,
+            assignee_user_id: None,
+            assignee_team_id: None,
             project_id,
             environment_id: None,
             deployment_id: None,

@@ -118,7 +118,7 @@ These checks use synthetic applications, real HTTP endpoints, native storage que
 | Errors, messages and stacks | Adapted: native error events, groups and stack details | Symbolication depends on available native source artifacts; native crash decoding is separate. |
 | Breadcrumbs, users, tags and contexts | Adapted: error detail payload and native metadata | User/request/browser/runtime fields populate native details; exact user/tag filtering is available on native event queries. Other typed contexts stay in JSON metadata and the original source event. Not every field has a separate index. |
 | Fingerprints and grouping | Adapted: native fingerprints and grouping; concurrent insertion and counts reconciled; native extension: reversible group merge and fingerprint split | Explicit SDK fingerprints and `{{ default }}` are supported. Default grouping uses Temps stack/message normalization, not Sentry server algorithm versions. Grouping configuration APIs are not provided. A merge or split redirects future events and never rewrites stored ones. |
-| Issue APIs and triage | Existing native error list, detail and resolution APIs/UI; native extension: bulk resolve/reopen/ignore by ID or filter (`POST /projects/{project_id}/error-groups/bulk`, `temps errors bulk`); [resolve in the next release](#resolve-next-release); ignore until a time, count or user count; server-side [inbound filters](#inbound-filters) that drop matching events before storage | Sentry issue APIs are not implemented. Bulk requests are capped at 1,000 groups and 50 status-change notifications each. |
+| Issue APIs and triage | Existing native error list, detail and resolution APIs/UI; native extension: bulk resolve/reopen/ignore by ID or filter (`POST /projects/{project_id}/error-groups/bulk`, `temps errors bulk`); [resolve in the next release](#resolve-next-release); [assignment to a user or team](#assign) with an assigned-to-me filter; ignore until a time, count or user count; server-side [inbound filters](#inbound-filters) that drop matching events before storage | Sentry issue APIs are not implemented. Bulk requests are capped at 1,000 groups and 50 status-change notifications each. |
 | Alert APIs and alerts | Existing Temps alert rules and alarms; cron health feeds native alarms | Sentry alert APIs are not implemented. Delivery requires a configured provider; external delivery was not verified in the synthetic run. |
 | Debug ID source maps and artifact bundles | Adapted: CLI artifact bundles imported into native source maps; exact Debug ID lookup without a release, including maps uploaded after an error | Full-access project build credential required; public DSNs cannot access artifacts. SYSB v2, stored/deflated ZIP entries, 50 MiB compressed/expanded bundle, 256 files, 128 maps. Symbolication loads at most 32 maps/50 MiB per event; staged chunks expire after one hour (64 MiB/project, 256 MiB globally). Indexed/Hermes/native debug artifacts are outside this contract. |
 | Releases | Native extension: correlate retained errors, logs, spans, metric points, feedback and check-ins by SDK release version | Errors → Releases shows exact counts and native example links in a bounded 1–31 day window. Deployment/finalization, commits and release health are separate workflows. |
@@ -712,6 +712,35 @@ await fetch('https://your-temps-instance.com/api/projects/42/error-groups/123', 
 </CodeGroup>
 
 The group's `resolution` field shows the release it was resolved after, and the console offers **Resolve in next release** next to **Resolve**. The check runs in the statement that already counts the event, against a per-project release list that ingest adds to once per release. Any other status change, or resolving it again, replaces the condition.
+
+### Assign Groups {{ anchor: true, id: 'assign' }}
+
+A group is assigned to a **user** or a **team**, separately from its status: an assigned group can be resolved or ignored and keeps its assignee. Only users who can open the project can be assigned. A new assignee gets an email when an email provider is configured (a team's members are mailed, up to 50), and `status_change` alert rules that list `assigned` fire, as they did when assignment was a status. Assigning the current assignee again changes nothing and tells nobody.
+
+The error list filters by assignee: **Assigned to me** shows the groups assigned to you or to a team you are in, and **Unassigned** shows the rest. In the API the filter is `assignee=me`, `none`, `user:<id>` or `team:<id>` on `GET /projects/{project_id}/error-groups`.
+
+<CodeGroup title="Assign Groups">
+```bash {{ title: 'CLI' }}
+# Assign to yourself, to a user, to a team, or to nobody
+temps errors assign --project-id 42 --group-id 123 --me
+temps errors assign --project-id 42 --group-id 123 --user-id 7
+temps errors assign --project-id 42 --group-id 123 --team-id 3
+temps errors assign --project-id 42 --group-id 123 --none
+
+# What is on my plate
+temps errors list --project-id 42 --status unresolved --assignee me
+```
+
+```typescript {{ title: 'API' }}
+await fetch('https://your-temps-instance.com/api/projects/42/error-groups/123/assignee', {
+  method: 'PUT',
+  headers: { 'Authorization': `Bearer ${API_KEY}`, 'Content-Type': 'application/json' },
+  body: JSON.stringify({ team_id: 3 })   // or { user_id: 7 }, or {} to unassign
+});
+```
+</CodeGroup>
+
+Earlier versions stored the assignee as free text and used an `assigned` status. Upgrading matches each stored assignee to the user with that email and moves `assigned` groups to `unresolved`, with their assignee. A value that matches no user stays in the read-only `assigned_to` field. The `assigned_to` field of the update request still works, by email, and the status `assigned` is accepted and stored as `unresolved`.
 
 ### Triage Many Groups at Once
 

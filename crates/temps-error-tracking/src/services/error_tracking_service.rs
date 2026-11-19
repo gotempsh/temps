@@ -48,6 +48,9 @@ pub struct ErrorTrackingService {
     notification_callback: OnceCell<NotificationCallback>,
     autopilot_callback: OnceCell<NotificationCallback>,
     job_queue: OnceCell<Arc<dyn temps_core::JobQueue>>,
+    /// Sends the email that tells a user a group was assigned to them
+    /// (ADR 074, D1.6). Unset, assignments are not mailed.
+    assignment_mailer: OnceCell<Arc<dyn temps_core::notifications::NotificationService>>,
 }
 
 impl ErrorTrackingService {
@@ -73,6 +76,7 @@ impl ErrorTrackingService {
             notification_callback: OnceCell::new(),
             autopilot_callback: OnceCell::new(),
             job_queue: OnceCell::new(),
+            assignment_mailer: OnceCell::new(),
         }
     }
 
@@ -94,6 +98,83 @@ impl ErrorTrackingService {
     /// Only notifications with trigger_type "new_issue" or "regression" are forwarded.
     pub fn set_autopilot_callback(&self, callback: NotificationCallback) {
         let _ = self.autopilot_callback.set(callback);
+    }
+
+    /// Mail assignees through this service (ADR 074, D1.6).
+    pub fn set_assignment_mailer(
+        &self,
+        mailer: Arc<dyn temps_core::notifications::NotificationService>,
+    ) {
+        let _ = self.assignment_mailer.set(mailer);
+    }
+
+    /// Assign a group to a user or team, or unassign it (ADR 074, D1.6).
+    ///
+    /// The status is untouched. A new assignee triggers the `status_change`
+    /// alert rules that list `assigned` (the status assignment used to be),
+    /// and is mailed in the background when an email provider is set up; a
+    /// failed or missing mail never fails the assignment. `base_url` is the
+    /// console origin, used to link the group's page in the email.
+    pub async fn assign_error_group(
+        &self,
+        project_id: i32,
+        group_id: i32,
+        assignee: Option<super::group_workflow::Assignee>,
+        assigned_by: Option<String>,
+        base_url: Option<String>,
+    ) -> Result<super::group_workflow::AssignmentOutcome, ErrorTrackingError> {
+        let outcome = self
+            .workflow
+            .set_assignee(project_id, group_id, assignee)
+            .await?;
+        let changed = outcome.previous != assignee;
+        if changed && assignee.is_some() {
+            if let Some(group) = self.load_group(group_id).await {
+                let notifications = self.alerts.evaluate_status_change(&group, "assigned").await;
+                let enriched = self.enrich_notifications(notifications, project_id).await;
+                self.send_alert_notifications(enriched).await;
+            }
+        }
+        if let (Some(mailer), false) = (self.assignment_mailer.get(), outcome.recipients.is_empty())
+        {
+            let mailer = mailer.clone();
+            let slug = temps_entities::projects::Entity::find_by_id(project_id)
+                .one(self.db.as_ref())
+                .await?
+                .map(|project| project.slug);
+            let console_url = match (base_url, slug) {
+                (Some(base), Some(slug)) => Some(format!(
+                    "{}/projects/{slug}/errors/{group_id}",
+                    base.trim_end_matches('/')
+                )),
+                _ => None,
+            };
+            let message = assignment_email(&outcome, group_id, assigned_by, console_url);
+            tokio::spawn(async move {
+                match mailer.is_email_provider_configured().await {
+                    Ok(true) => {
+                        if let Err(error) = mailer.send_transactional_email(message).await {
+                            tracing::warn!(
+                                project_id,
+                                group_id,
+                                "failed to mail the assignee of error group {group_id}: {error}"
+                            );
+                        }
+                    }
+                    Ok(false) => tracing::debug!(
+                        project_id,
+                        group_id,
+                        "no email provider; assignment of error group {group_id} not mailed"
+                    ),
+                    Err(error) => tracing::warn!(
+                        project_id,
+                        group_id,
+                        "could not check the email provider for error group {group_id}: {error}"
+                    ),
+                }
+            });
+        }
+        Ok(outcome)
     }
 
     /// Announce new and regressed groups on the job queue (ADR-054), so
@@ -357,6 +438,7 @@ impl ErrorTrackingService {
         sort_order: Option<String>,
         start_date: Option<DateTime<Utc>>,
         end_date: Option<DateTime<Utc>>,
+        refine: &super::types::GroupListRefinement,
     ) -> Result<(Vec<ErrorGroupDomain>, u64), ErrorTrackingError> {
         self.crud
             .list_error_groups(
@@ -369,6 +451,7 @@ impl ErrorTrackingService {
                 sort_order,
                 start_date,
                 end_date,
+                refine,
             )
             .await
     }
@@ -408,7 +491,6 @@ impl ErrorTrackingService {
         group_id: i32,
         project_id: i32,
         status: String,
-        assigned_to: Option<String>,
         ignore: Option<IgnoreConditions>,
         in_next_release: bool,
     ) -> Result<(), ErrorTrackingError> {
@@ -417,7 +499,6 @@ impl ErrorTrackingService {
                 group_id,
                 project_id,
                 status.clone(),
-                assigned_to,
                 ignore,
                 in_next_release,
             )
@@ -659,5 +740,45 @@ impl ErrorTrackingService {
             .ok()
             .flatten()
             .map(|e| e.name)
+    }
+}
+
+/// The email telling an assignee about a group. Plain text plus a link.
+fn assignment_email(
+    outcome: &super::group_workflow::AssignmentOutcome,
+    group_id: i32,
+    assigned_by: Option<String>,
+    console_url: Option<String>,
+) -> temps_core::notifications::EmailMessage {
+    let to_whom = outcome
+        .current
+        .as_ref()
+        .map(|a| {
+            if a.kind == "team" {
+                format!("your team {}", a.name)
+            } else {
+                "you".to_string()
+            }
+        })
+        .unwrap_or_else(|| "you".to_string());
+    let by = assigned_by
+        .map(|who| format!(" by {who}"))
+        .unwrap_or_default();
+    let link = console_url
+        .map(|url| format!("\n\nOpen it: {url}"))
+        .unwrap_or_default();
+    temps_core::notifications::EmailMessage {
+        to: outcome.recipients.clone(),
+        subject: format!(
+            "Error #{group_id} assigned to {to_whom}: {}",
+            outcome.group_title
+        ),
+        body: format!(
+            "Error group #{group_id} \"{}\" was assigned to {to_whom}{by}.{link}",
+            outcome.group_title
+        ),
+        html_body: None,
+        from: None,
+        reply_to: None,
     }
 }
