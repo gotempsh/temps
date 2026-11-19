@@ -5,6 +5,8 @@ import { describe, expect, test } from 'bun:test'
 import {
   StartError,
   consoleApiUrl,
+  cosignVerifyArgs,
+  ghAttestationArgs,
   databaseUrl,
   generateAdminPassword,
   isLocalServerCommand,
@@ -19,6 +21,7 @@ import {
   pickRelease,
   proxyPortCandidates,
   releaseAssetUrl,
+  releaseIdentity,
   releaseTarget,
   resolveSkillsScope,
   volumeOwnership,
@@ -61,6 +64,28 @@ describe('pickRelease', () => {
 
   test('stable skips prereleases and drafts', () => {
     expect(pickRelease(releases, 'stable', 'temps-darwin-arm64')).toBe('v0.0.8')
+  })
+})
+
+describe('release signature commands', () => {
+  test('pin the release workflow at the exact tag', () => {
+    expect(releaseIdentity('v0.1.0-beta.62')).toBe(
+      'https://github.com/gotempsh/temps/.github/workflows/release.yml@refs/tags/v0.1.0-beta.62',
+    )
+    expect(cosignVerifyArgs('/s/a.tar.gz', '/s/a.tar.gz.sigstore.json', 'v1.2.3')).toEqual([
+      'verify-blob',
+      '--bundle', '/s/a.tar.gz.sigstore.json',
+      '--certificate-identity', 'https://github.com/gotempsh/temps/.github/workflows/release.yml@refs/tags/v1.2.3',
+      '--certificate-oidc-issuer', 'https://token.actions.githubusercontent.com',
+      '/s/a.tar.gz',
+    ])
+    expect(ghAttestationArgs('/s/a.tar.gz', 'v1.2.3')).toEqual([
+      'attestation', 'verify', '/s/a.tar.gz',
+      '--repo', 'gotempsh/temps',
+      '--signer-workflow', 'gotempsh/temps/.github/workflows/release.yml',
+      '--source-ref', 'refs/tags/v1.2.3',
+      '--cert-oidc-issuer', 'https://token.actions.githubusercontent.com',
+    ])
   })
 })
 

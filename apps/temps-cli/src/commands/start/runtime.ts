@@ -213,6 +213,43 @@ export function releaseAssetUrl(version: string, target: string, suffix = '.tar.
   return `https://github.com/${RELEASE_REPO}/releases/download/${encodeURIComponent(version)}/${target}${suffix}`
 }
 
+/** The workflow that signs every release archive, as `gh` names it. */
+export const RELEASE_WORKFLOW = `${RELEASE_REPO}/.github/workflows/release.yml`
+
+/** The OIDC issuer of GitHub Actions workload identities. */
+export const GITHUB_ACTIONS_ISSUER = 'https://token.actions.githubusercontent.com'
+
+/**
+ * The certificate identity a genuine signature on `version` carries: the
+ * release workflow of this repository at that exact tag, for stable, beta and
+ * nightly releases alike. Matched exactly, never as a pattern.
+ */
+export function releaseIdentity(version: string): string {
+  return `https://github.com/${RELEASE_WORKFLOW}@refs/tags/${version}`
+}
+
+/** `cosign verify-blob` against a release's Sigstore bundle, identity pinned. */
+export function cosignVerifyArgs(archive: string, bundle: string, version: string): string[] {
+  return [
+    'verify-blob',
+    '--bundle', bundle,
+    '--certificate-identity', releaseIdentity(version),
+    '--certificate-oidc-issuer', GITHUB_ACTIONS_ISSUER,
+    archive,
+  ]
+}
+
+/** `gh attestation verify` pinned to the release workflow at `version`. */
+export function ghAttestationArgs(archive: string, version: string): string[] {
+  return [
+    'attestation', 'verify', archive,
+    '--repo', RELEASE_REPO,
+    '--signer-workflow', RELEASE_WORKFLOW,
+    '--source-ref', `refs/tags/${version}`,
+    '--cert-oidc-issuer', GITHUB_ACTIONS_ISSUER,
+  ]
+}
+
 export interface ReleaseSummary {
   tag_name: string
   draft?: boolean

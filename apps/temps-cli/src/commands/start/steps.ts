@@ -28,7 +28,9 @@ import {
   RELEASE_REPO,
   StartError,
   binaryPath,
+  cosignVerifyArgs,
   databaseUrl,
+  ghAttestationArgs,
   isLocalServerCommand,
   isLocalState,
   localUrls,
@@ -37,6 +39,7 @@ import {
   parseLocalServerPids,
   pickRelease,
   releaseAssetUrl,
+  releaseIdentity,
   skillTargets,
   type Channel,
   type LocalPaths,
@@ -374,6 +377,117 @@ async function sha256File(path: string): Promise<string> {
 }
 
 /**
+ * How the origin of a downloaded archive was established. A checksum from
+ * the same release proves integrity only: whoever can replace the archive
+ * can replace its checksum too.
+ */
+export type OriginCheck =
+  /** The Sigstore bundle verified with cosign, or the build attestation with gh. */
+  | { kind: 'cosign' | 'gh'; identity: string }
+  /** Signed, but neither cosign nor an authenticated gh is installed to check it. */
+  | { kind: 'unverified'; identity: string }
+  /** No signature published, accepted because of --allow-unsigned. */
+  | { kind: 'unsigned' }
+
+export interface OriginDeps {
+  /** The bundle body, or null when the release does not publish one (404). */
+  fetchBundle(url: string): Promise<string | null>
+  /** Run a tool; resolves null when it is not installed. */
+  runTool(command: string, args: readonly string[]): Promise<RunResult | null>
+}
+
+const originDeps: OriginDeps = {
+  async fetchBundle(url) {
+    let response: Response
+    try {
+      response = await fetch(url, {
+        headers: { 'User-Agent': 'temps-cli' },
+        signal: AbortSignal.timeout(30_000),
+        redirect: 'follow',
+      })
+    } catch (error) {
+      throw new StartError('download', 'network', `Could not reach ${url}: ${(error as Error).message}`)
+    }
+    if (response.status === 404) return null
+    if (!response.ok) {
+      throw new StartError('download', 'http_error', `GET ${url} returned HTTP ${response.status}.`)
+    }
+    return response.text()
+  },
+  async runTool(command, args) {
+    try {
+      return await run(command, args, { timeoutMs: 120_000 })
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
+      throw error
+    }
+  },
+}
+
+/**
+ * Check who published `archive`, the same way install.sh does. The release
+ * must publish a Sigstore bundle unless `allowUnsigned` (only releases from
+ * before signing lack one). cosign verifies it with the identity pinned to
+ * the release workflow at `version`; without cosign an authenticated `gh`
+ * verifies the build attestation; with neither, the result says the origin
+ * was not verified. Any check that runs and fails throws, `allowUnsigned`
+ * or not.
+ */
+export async function verifyArchiveOrigin(
+  archive: string,
+  version: string,
+  target: string,
+  allowUnsigned: boolean,
+  deps: OriginDeps = originDeps,
+): Promise<OriginCheck> {
+  const asset = `${target}.tar.gz`
+  const identity = releaseIdentity(version)
+  const bundleText = await deps.fetchBundle(releaseAssetUrl(version, target, '.tar.gz.sigstore.json'))
+  if (bundleText === null) {
+    if (allowUnsigned) return { kind: 'unsigned' }
+    throw new StartError(
+      'download',
+      'unsigned_release',
+      `Release ${version} publishes no Sigstore signature for ${asset} (no ${asset}.sigstore.json asset), ` +
+        'so its origin cannot be verified. Nothing was installed. Releases published before signing was ' +
+        `introduced have none; to run one anyway on its checksum alone: temps start --runtime-version ${version} --allow-unsigned`,
+    )
+  }
+  const bundle = `${archive}.sigstore.json`
+  await writeFile(bundle, bundleText, { mode: 0o600 })
+  try {
+    const cosign = await deps.runTool('cosign', cosignVerifyArgs(archive, bundle, version))
+    if (cosign) {
+      if (cosign.code !== 0) {
+        throw new StartError(
+          'download',
+          'signature_failed',
+          `The ${asset} archive for ${version} is not signed by ${identity}; it may have been tampered with. ` +
+            `Nothing was installed. cosign said: ${lastLines(cosign.stderr || cosign.stdout, 4)}`,
+        )
+      }
+      return { kind: 'cosign', identity }
+    }
+  } finally {
+    await rm(bundle, { force: true })
+  }
+  const auth = await deps.runTool('gh', ['auth', 'status'])
+  if (auth && auth.code === 0) {
+    const gh = await deps.runTool('gh', ghAttestationArgs(archive, version))
+    if (!gh || gh.code !== 0) {
+      throw new StartError(
+        'download',
+        'signature_failed',
+        `The ${asset} archive for ${version} has no build attestation from ${identity}; it may have been ` +
+          `tampered with. Nothing was installed. gh said: ${lastLines(gh?.stderr || gh?.stdout || '', 4)}`,
+      )
+    }
+    return { kind: 'gh', identity }
+  }
+  return { kind: 'unverified', identity }
+}
+
+/**
  * Download, verify and unpack the server binary for `version`. A version
  * already on disk is reused, so later starts need no network.
  */
@@ -381,7 +495,8 @@ export async function ensureBinary(
   paths: LocalPaths,
   version: string,
   target: string,
-): Promise<{ path: string; downloaded: boolean; bytes: number }> {
+  allowUnsigned = false,
+): Promise<{ path: string; downloaded: boolean; bytes: number; origin?: OriginCheck }> {
   const bin = binaryPath(paths, version)
   if (existsSync(bin)) return { path: bin, downloaded: false, bytes: 0 }
 
@@ -407,6 +522,7 @@ export async function ensureBinary(
         `The ${target} archive for ${version} failed its checksum (expected ${expected}, got ${actual}). Nothing was installed.`,
       )
     }
+    const origin = await verifyArchiveOrigin(archive, version, target, allowUnsigned)
     const untar = await run('tar', ['-xzf', archive, '-C', staging], { timeoutMs: 120_000 })
     if (untar.code !== 0) {
       throw new StartError('download', 'extract_failed', `Could not unpack ${archive}: ${lastLines(untar.stderr, 3)}`)
@@ -418,7 +534,7 @@ export async function ensureBinary(
     await chmod(join(staging, 'temps'), 0o755)
     await rm(dir, { recursive: true, force: true })
     await rename(staging, dir)
-    return { path: bin, downloaded: true, bytes: statSync(bin).size }
+    return { path: bin, downloaded: true, bytes: statSync(bin).size, origin }
   } catch (error) {
     await rm(staging, { recursive: true, force: true })
     throw error
