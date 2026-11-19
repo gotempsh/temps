@@ -3,7 +3,16 @@
 
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
 import { createHash } from 'node:crypto'
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -117,5 +126,35 @@ describe('approve-packages.sh entry point', () => {
     const result = Bun.spawnSync([bash, SCRIPT])
     expect(result.exitCode).toBe(2)
     expect(result.stderr.toString()).toContain('usage:')
+  })
+})
+
+describe('approve-packages.sh package list', () => {
+  test('pins the versions the workspace manifests would pack', () => {
+    // `npm pack` names each tarball after its manifest version, and the script
+    // looks for exactly that file: a stale pin refuses the whole package.
+    const repo = join(import.meta.dir, '..', '..')
+    const manifests = [
+      join(import.meta.dir, 'package.json'),
+      ...readdirSync(join(repo, 'sdks/node/packages')).map((dir) =>
+        join(repo, 'sdks/node/packages', dir, 'package.json')
+      ),
+    ]
+    const versions = new Map<string, string>()
+    for (const manifest of manifests) {
+      let parsed: { name?: string; version?: string }
+      try {
+        parsed = JSON.parse(readFileSync(manifest, 'utf8'))
+      } catch {
+        continue
+      }
+      if (parsed.name && parsed.version) versions.set(parsed.name, parsed.version)
+    }
+
+    const pins = [...readFileSync(SCRIPT, 'utf8').matchAll(/^\s+"(@temps-sdk\/[^@"]+)@([^"]+)"$/gm)]
+    expect(pins.length).toBeGreaterThan(0)
+    for (const [, name = '', pinned] of pins) {
+      expect({ name, version: pinned }).toEqual({ name, version: versions.get(name) })
+    }
   })
 })

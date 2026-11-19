@@ -24,10 +24,10 @@ set -u
 # Order matters: analytics-core first, the packages depending on it after.
 PACKAGES=(
   "@temps-sdk/analytics-core@0.0.6"
-  "@temps-sdk/react-analytics@0.0.8"
-  "@temps-sdk/analytics-browser@0.0.7"
-  "@temps-sdk/svelte-analytics@0.0.5"
-  "@temps-sdk/vue-analytics@0.0.5"
+  "@temps-sdk/react-analytics@0.0.9"
+  "@temps-sdk/analytics-browser@0.0.8"
+  "@temps-sdk/svelte-analytics@0.0.6"
+  "@temps-sdk/vue-analytics@0.0.6"
   "@temps-sdk/plugin@0.1.0-beta.2"
   "@temps-sdk/cli@0.1.38"
 )
