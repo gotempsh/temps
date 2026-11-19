@@ -12,6 +12,12 @@ import {
 import { EngagementTracker } from "./EngagementTracker";
 import { SpeedTracker } from "./SpeedTracker";
 import { SessionRecorder } from "./SessionRecorder";
+import {
+  NOT_FOUND_EVENT,
+  NotFoundMarkerWatcher,
+  notFoundEventData,
+  setupLinkTracking,
+} from "./AutoTracking";
 
 interface InternalCleanup {
   (): void;
@@ -38,6 +44,10 @@ export function createAnalytics(options: AnalyticsOptions = {}): AnalyticsApi {
     engagementThreshold = 10000,
     enableSessionRecording = false,
     sessionRecordingConfig = {},
+    autoTrackOutboundLinks = true,
+    autoTrackFileDownloads = true,
+    fileDownloadExtensions,
+    autoTrackNotFound = true,
   } = options;
 
   const cleanups: InternalCleanup[] = [];
@@ -65,6 +75,16 @@ export function createAnalytics(options: AnalyticsOptions = {}): AnalyticsApi {
     );
   };
 
+  const trackNotFound: AnalyticsApi["trackNotFound"] = (data = {}) =>
+    trackEvent(NOT_FOUND_EVENT, notFoundEventData(data));
+
+  // Created before the first page view so that page view is checked too.
+  const notFoundWatcher =
+    enabled && autoTrackNotFound
+      ? new NotFoundMarkerWatcher(() => void trackNotFound())
+      : null;
+  if (notFoundWatcher) cleanups.push(() => notFoundWatcher.cancel());
+
   const trackPageview: AnalyticsApi["trackPageview"] = () => {
     if (!enabled) return;
     void sendAnalytics(
@@ -85,6 +105,7 @@ export function createAnalytics(options: AnalyticsOptions = {}): AnalyticsApi {
       basePath,
       ingestKey
     );
+    notFoundWatcher?.afterPageview();
   };
 
   const identify: AnalyticsApi["identify"] = async () => {
@@ -116,6 +137,26 @@ export function createAnalytics(options: AnalyticsOptions = {}): AnalyticsApi {
     }
 
     cleanups.push(setupClickDelegation(trackEvent));
+    cleanups.push(
+      setupLinkTracking(
+        { autoTrackOutboundLinks, autoTrackFileDownloads, fileDownloadExtensions },
+        (eventName, data) => {
+          sendAnalyticsReliable(
+            "event",
+            {
+              event_name: eventName,
+              request_query: window.location.search,
+              request_path: window.location.pathname,
+              domain: resolveDomain(),
+              language: navigator.language,
+              event_data: data,
+            },
+            basePath,
+            ingestKey
+          );
+        }
+      )
+    );
   }
 
   const recorder =
@@ -140,6 +181,7 @@ export function createAnalytics(options: AnalyticsOptions = {}): AnalyticsApi {
     ingestKey,
     trackEvent,
     trackPageview,
+    trackNotFound,
     identify,
     enableSessionRecording(): void {
       if (!enabled) return;

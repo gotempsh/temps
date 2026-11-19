@@ -45,6 +45,16 @@ function readDataset(): AnalyticsOptions {
   if (ds.heartbeatInterval) opts.heartbeatInterval = Number(ds.heartbeatInterval);
   if (ds.inactivityTimeout) opts.inactivityTimeout = Number(ds.inactivityTimeout);
   if (ds.engagementThreshold) opts.engagementThreshold = Number(ds.engagementThreshold);
+  // Outbound links, file downloads and 404 markers (ADR 071 D1), on by default.
+  if (ds.autoTrackOutboundLinks) opts.autoTrackOutboundLinks = ds.autoTrackOutboundLinks === "true";
+  if (ds.autoTrackFileDownloads) opts.autoTrackFileDownloads = ds.autoTrackFileDownloads === "true";
+  if (ds.fileDownloadExtensions) {
+    opts.fileDownloadExtensions = ds.fileDownloadExtensions
+      .split(",")
+      .map((s) => s.trim().replace(/^\./, ""))
+      .filter((s) => s.length > 0);
+  }
+  if (ds.autoTrackNotFound) opts.autoTrackNotFound = ds.autoTrackNotFound === "true";
   if (ds.sessionRecording) opts.enableSessionRecording = ds.sessionRecording === "true";
   if (ds.sessionSampleRate) recording.sessionSampleRate = Number(ds.sessionSampleRate);
   if (ds.maskAllInputs) recording.maskAllInputs = ds.maskAllInputs === "true";

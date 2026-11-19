@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import type { AutoTrackOptions } from "./AutoTracking";
+
 export type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
 
@@ -115,7 +117,7 @@ export interface AnalyticsClientOptions {
   ingestKey?: string;
 }
 
-export interface AnalyticsOptions extends AnalyticsClientOptions {
+export interface AnalyticsOptions extends AnalyticsClientOptions, AutoTrackOptions {
   /** Auto track pageviews on route changes. Defaults to true. */
   autoTrackPageviews?: boolean;
   /** Auto track page leave events. Defaults to true. */
@@ -153,6 +155,13 @@ export interface AnalyticsApi {
   trackEvent(eventName: string, data?: Record<string, JsonValue>): Promise<void>;
   /** Manually trigger a pageview. */
   trackPageview(): void;
+  /**
+   * Report the current page as missing: emits a `not_found` event whose
+   * `path` property is the current path. For apps that answer `200` for an
+   * unknown route, call it from the "not found" view, or put the
+   * `data-temps-404` attribute on that view and let the tracker do it.
+   */
+  trackNotFound(data?: Record<string, JsonValue>): Promise<void>;
   /** Identify a user. No-op placeholder for now. */
   identify(userId: string, traits?: Record<string, JsonValue>): Promise<void> | void;
   /** Enable session recording at runtime. */

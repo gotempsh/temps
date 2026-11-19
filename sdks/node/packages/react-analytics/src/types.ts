@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import type React from "react";
-import type { JsonValue, AnalyticsClientOptions } from "@temps-sdk/analytics-core";
+import type { JsonValue, AnalyticsClientOptions, AutoTrackOptions } from "@temps-sdk/analytics-core";
 import type { SessionRecorderConfig } from "./SessionRecorder";
 
 export type {
@@ -21,11 +21,17 @@ export interface AnalyticsContextValue {
   identify: (userId: string, traits?: Record<string, JsonValue>) => Promise<void> | void;
   /** Manually trigger a pageview. */
   trackPageview: () => void;
+  /**
+   * Report the current page as missing: sends a `not_found` event whose
+   * `path` property is the current path. Call it from your "not found" view,
+   * or mark that view with `data-temps-404` and let the provider do it.
+   */
+  trackNotFound: (data?: Record<string, JsonValue>) => Promise<void>;
   /** Whether analytics are currently enabled. */
   enabled: boolean;
 }
 
-export interface TempsAnalyticsProviderProps extends AnalyticsClientOptions {
+export interface TempsAnalyticsProviderProps extends AnalyticsClientOptions, AutoTrackOptions {
   /** Auto track pageviews on route changes. Defaults to true. */
   autoTrackPageviews?: boolean;
   /** Auto track page leave events. Defaults to true. */
