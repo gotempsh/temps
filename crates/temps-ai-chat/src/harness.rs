@@ -407,6 +407,26 @@ mod tests {
         }
     }
 
+    /// ADR-107: a single-server install runs its tunnel on the control
+    /// plane. The playbook used to send the user off to add a worker first.
+    #[test]
+    fn the_credential_playbook_places_a_single_servers_tunnel_on_the_control_plane() {
+        let playbook = all()
+            .iter()
+            .find(|playbook| playbook.name == "add-a-provider-credential")
+            .expect("add-a-provider-credential playbook");
+        assert!(
+            playbook.body.contains("`--node_ids 0`"),
+            "{}",
+            playbook.body
+        );
+        assert!(playbook.body.contains("no worker is needed"));
+        assert!(!playbook.body.contains("only runs on a worker"));
+        assert!(!playbook
+            .body
+            .contains("Do not propose `create_ingress_connector`"));
+    }
+
     #[test]
     fn playbook_names_are_unique() {
         let mut names: Vec<&str> = all()
