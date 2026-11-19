@@ -4036,7 +4036,7 @@ async fn a_control_plane_redis_is_backed_up_and_restored_by_the_same_node_half()
     drop(s3);
 }
 
-const DRAGONFLY_IMAGE: &str = "docker.dragonflydb.io/dragonflydb/dragonfly:v2.1.0";
+const DRAGONFLY_IMAGE: &str = "docker.dragonflydb.io/dragonflydb/dragonfly:v2.1.0@sha256:94891bb22ce2fb0f7a5a3ff1bb3b2fbbc5830e2523293e47723d87fa3e5b1184";
 
 /// Start a Dragonfly container `name` on `network` with its data on volume
 /// `volume`, as a replica of `primary` when given.
@@ -4052,7 +4052,7 @@ async fn start_dragonfly(
         "dragonfly".to_string(),
         "--logtostderr".to_string(),
         "--proactor_threads=1".to_string(),
-        "--maxmemory=256mb".to_string(),
+        "--maxmemory=512mb".to_string(),
         "--requirepass".to_string(),
         password.to_string(),
     ];
@@ -4098,17 +4098,32 @@ async fn start_dragonfly(
         .unwrap_or_else(|e| panic!("start Dragonfly {name}: {e}"));
 }
 
+/// The `temps-backup-*` files on `container`'s `/data`, one per line.
+async fn backup_snapshots(docker: &Docker, container: &str) -> String {
+    exec(
+        docker,
+        container,
+        &["sh", "-c", "ls -a /data | grep '^temps-backup' || true"],
+    )
+    .await
+    .1
+}
+
 /// Issue #1953: Dragonfly does not serve `redis-cli --rdb`'s replication
 /// handshake ("Replicating a replica is unsupported" on a replica), which
 /// failed every RDB backup of a Dragonfly service. The RDB backup has it
 /// save its own snapshot instead, in either role, and the object it
 /// uploads is that snapshot, holding the replica's data, with nothing left
 /// behind on the service's volume.
+///
+/// A helper killed midway leaves its `SAVE` running in Dragonfly, which
+/// writes the file after the helper is gone; removing the snapshot waits
+/// for that save and leaves nothing behind either.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_dragonfly_replica_and_primary_are_backed_up_by_the_rdb_engine() {
     use std::io::Read as _;
     use temps_providers::externalsvc::redis_node::{
-        redis_rdb_backup, RedisRdbBackup, RDB_HELPER_IMAGE,
+        redis_rdb_backup, remove_rdb_snapshot, RdbSnapshot, RedisRdbBackup, RDB_HELPER_IMAGE,
     };
 
     let docker = match Docker::connect_with_defaults() {
@@ -4118,9 +4133,16 @@ async fn a_dragonfly_replica_and_primary_are_backed_up_by_the_rdb_engine() {
             return;
         }
     };
+    // Pulled when missing, so a clean CI runner runs the proof rather than
+    // skipping it.
     for image in [DRAGONFLY_IMAGE, RUSTFS_IMAGE, RDB_HELPER_IMAGE] {
-        if docker.inspect_image(image).await.is_err() {
-            println!("image {image} is not present locally, skipping the Dragonfly proof");
+        if docker.inspect_image(image).await.is_ok() {
+            continue;
+        }
+        if let Err(error) =
+            temps_docker_util::pull_image(&docker, temps_docker_util::PullSpec::new(image)).await
+        {
+            println!("pulling {image} failed ({error}), skipping the Dragonfly proof");
             return;
         }
     }
@@ -4212,14 +4234,100 @@ async fn a_dragonfly_replica_and_primary_are_backed_up_by_the_rdb_engine() {
             rdb.windows(b"replicated".len()).any(|w| w == b"replicated"),
             "{container}: the snapshot holds the data"
         );
-        let (_, left) = exec(
-            &docker,
-            container,
-            &["sh", "-c", "ls -a /data | grep '^temps-backup' || true"],
-        )
-        .await;
-        assert_eq!(left, "", "{container}: the snapshot file is removed");
+        assert_eq!(
+            backup_snapshots(&docker, container).await,
+            "",
+            "{container}: the snapshot file is removed"
+        );
     }
+
+    // A helper killed while its SAVE runs: enough data that the save is
+    // still writing its `.tmp` when the client is gone.
+    redis_cli(
+        &docker,
+        &primary,
+        password,
+        &["DEBUG", "POPULATE", "1000000", "bulk", "100"],
+    )
+    .await;
+    let abandoned = "temps-backup-abandoned";
+    let saver = format!("dfsaver{suffix}");
+    let _saver_cleanup = Cleanup {
+        docker: docker.clone(),
+        containers: vec![saver.clone()],
+        volumes: Vec::new(),
+    };
+    docker
+        .create_container(
+            Some(
+                bollard::query_parameters::CreateContainerOptionsBuilder::default()
+                    .name(&saver)
+                    .build(),
+            ),
+            bollard::models::ContainerCreateBody {
+                image: Some(RDB_HELPER_IMAGE.to_string()),
+                cmd: Some(vec![
+                    "redis-cli".to_string(),
+                    "-h".to_string(),
+                    primary.clone(),
+                    "SAVE".to_string(),
+                    "RDB".to_string(),
+                    abandoned.to_string(),
+                ]),
+                env: Some(vec![format!("REDISCLI_AUTH={password}")]),
+                host_config: Some(bollard::models::HostConfig {
+                    network_mode: Some(network.to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the saving client");
+    docker
+        .start_container(
+            &saver,
+            None::<bollard::query_parameters::StartContainerOptions>,
+        )
+        .await
+        .expect("start the saving client");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while backup_snapshots(&docker, &primary).await.is_empty() {
+        assert!(Instant::now() < deadline, "the SAVE never started");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    docker
+        .remove_container(
+            &saver,
+            Some(bollard::query_parameters::RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("kill the saving client");
+    remove_rdb_snapshot(
+        &docker,
+        &RdbSnapshot {
+            container_name: primary.clone(),
+            workdir: "/data".to_string(),
+            name: abandoned.to_string(),
+            password: password.to_string(),
+        },
+    )
+    .await
+    .expect("the abandoned snapshot is removed");
+    assert!(
+        redis_cli(&docker, &primary, password, &["INFO", "persistence"])
+            .await
+            .contains("saving:0"),
+        "the removal waited for the save to end"
+    );
+    assert_eq!(
+        backup_snapshots(&docker, &primary).await,
+        "",
+        "the abandoned snapshot is removed"
+    );
 }
 
 // ── MariaDB (ADR-099): the control plane's engines, run by the agent ────────

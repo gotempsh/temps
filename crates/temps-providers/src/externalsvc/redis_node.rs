@@ -22,15 +22,20 @@
 
 use std::sync::Arc;
 
-use bollard::query_parameters::InspectContainerOptions;
+use bollard::models::ContainerCreateBody;
+use bollard::query_parameters::{
+    CreateContainerOptionsBuilder, InspectContainerOptions, RemoveContainerOptionsBuilder,
+    StartContainerOptions, WaitContainerOptionsBuilder,
+};
 use bollard::Docker;
+use futures::StreamExt;
 use temps_service_protocol::{
     RedisRdbBackupRequest, RedisRdbBackupResult, RedisRestoreRequest, RedisRestoreResult,
     RedisWalgBackupRequest, RedisWalgBackupResult, WorkerS3Destination,
 };
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{info, warn};
 
 use super::naming::{redis_container_name, shell_escape};
 use super::postgres_walg_backup::{
@@ -39,7 +44,8 @@ use super::postgres_walg_backup::{
 use super::redis::restore_swap::keep_target_bookkeeping;
 use super::redis::{classify_redis_backup_location, RedisBackupLocationKind};
 use super::worker_data::{
-    s3_credentials, s3_source_row, stream_helper_to_s3, StreamedHelper, WorkerDataError,
+    helper_host_config, s3_credentials, s3_source_row, stream_helper_to_s3, StreamedHelper,
+    WorkerDataError,
 };
 use super::{
     managed_instance_name, EngineError, RedisService, S3Credentials, SensitiveValues,
@@ -68,6 +74,15 @@ pub const RDB_DUMP_FILE: &str = "dump.rdb.gz";
 
 /// How much of `wal-g`'s stderr an error keeps.
 const STDERR_TAIL_BYTES: usize = 2_000;
+
+/// How long removing an abandoned Dragonfly snapshot waits for the `SAVE`
+/// writing it: Dragonfly finishes a `SAVE` whose client was killed, and
+/// renames its `.tmp` file into place when it ends.
+const SNAPSHOT_SAVE_WAIT_SECS: u64 = 3_600;
+/// How often that wait asks Dragonfly whether it is still saving.
+const SNAPSHOT_POLL_SECS: u64 = 2;
+/// The cleanup helper's exit code when it gave up waiting.
+const SNAPSHOT_STILL_SAVING_EXIT: i64 = 3;
 
 /// `<bucket_path>/external_services/redis/<service>`: where a Redis
 /// service's backups live inside its S3 source.
@@ -148,14 +163,8 @@ pub fn rdb_dump_script(container: &str, workdir: &str, snapshot: &str) -> String
         r#"set -e
 host={host}
 if redis-cli -h "$host" -p 6379 INFO server | grep -q '^dragonfly_version:'; then
-  dir=$(redis-cli -h "$host" -p 6379 --raw CONFIG GET dir | sed -n 2p | tr -d '\r')
-  case "$dir" in
-    /*) ;;
-    '') dir={workdir} ;;
-    *) dir={workdir}/"$dir" ;;
-  esac
-  f="$dir"/{snapshot}.rdb
-  trap 'rm -f "$f"' EXIT
+{path}
+  trap 'rm -f "$f" "$f.tmp"' EXIT
   echo "$host runs Dragonfly, which does not serve redis-cli --rdb: saving a snapshot to $f instead" >&2
   reply=$(redis-cli -h "$host" -p 6379 SAVE RDB {snapshot} 2>&1)
   if [ "$reply" != OK ]; then
@@ -174,8 +183,55 @@ else
   rm -f "$f"
 fi"#,
         host = shell_escape(container),
+        path = snapshot_path_lines(workdir, snapshot),
+        snapshot = shell_escape(snapshot),
+    )
+}
+
+/// Shell lines setting `f` to where Dragonfly at `$host` writes snapshot
+/// `snapshot`: its `dir`, relative to the container's `workdir` unless
+/// absolute, or `workdir` when it reports none.
+fn snapshot_path_lines(workdir: &str, snapshot: &str) -> String {
+    format!(
+        r#"  dir=$(redis-cli -h "$host" -p 6379 --raw CONFIG GET dir | sed -n 2p | tr -d '\r')
+  case "$dir" in
+    /*) ;;
+    '') dir={workdir} ;;
+    *) dir={workdir}/"$dir" ;;
+  esac
+  f="$dir"/{snapshot}.rdb"#,
         workdir = shell_escape(workdir),
         snapshot = shell_escape(snapshot),
+    )
+}
+
+/// The script removing snapshot `snapshot` after its backup's helper was
+/// killed (an upload failure, a cancellation) before its own trap could.
+/// Dragonfly finishes the `SAVE` anyway, writing `<snapshot>.rdb.tmp` and
+/// renaming it when done, so the script first waits, bounded, while that
+/// file exists or Dragonfly reports `saving:1`. On a server that is not
+/// Dragonfly no such file exists and nothing waits.
+pub fn rdb_snapshot_cleanup_script(container: &str, workdir: &str, snapshot: &str) -> String {
+    let polls = SNAPSHOT_SAVE_WAIT_SECS / SNAPSHOT_POLL_SECS;
+    format!(
+        r#"host={host}
+{path}
+i=0
+while [ -e "$f.tmp" ] || redis-cli -h "$host" -p 6379 INFO persistence 2>/dev/null | grep -q '^saving:1'; do
+  i=$((i + 1))
+  if [ "$i" -gt {polls} ]; then
+    rm -f "$f" "$f.tmp"
+    echo "Dragonfly $host was still saving after {wait}s; $f is left behind if that save completes" >&2
+    exit {still_saving}
+  fi
+  sleep {poll}
+done
+rm -f "$f" "$f.tmp""#,
+        host = shell_escape(container),
+        path = snapshot_path_lines(workdir, snapshot),
+        wait = SNAPSHOT_SAVE_WAIT_SECS,
+        poll = SNAPSHOT_POLL_SECS,
+        still_saving = SNAPSHOT_STILL_SAVING_EXIT,
     )
 }
 
@@ -220,6 +276,15 @@ pub enum RedisNodeError {
     Inspect { container: String, reason: String },
     #[error("Pulling the Redis backup helper image {image} failed: {reason}")]
     HelperImage { image: String, reason: String },
+    #[error(
+        "Removing Dragonfly snapshot '{snapshot}' from the volume of Redis container \
+         '{container}' failed: {reason}"
+    )]
+    SnapshotCleanup {
+        container: String,
+        snapshot: String,
+        reason: String,
+    },
     #[error("Restore of Redis service {service_id} ('{service}') failed: {source}")]
     Restore {
         service_id: i32,
@@ -369,6 +434,185 @@ impl std::fmt::Debug for RedisRdbBackup {
     }
 }
 
+/// The snapshot file one RDB backup asks Dragonfly to save into its
+/// container's volume. `Debug` redacts the password.
+#[derive(Clone)]
+pub struct RdbSnapshot {
+    pub container_name: String,
+    /// The container's working directory, where a relative `dir` points.
+    pub workdir: String,
+    /// The file's name without `.rdb`, unique to the backup.
+    pub name: String,
+    pub password: String,
+}
+
+impl std::fmt::Debug for RdbSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RdbSnapshot")
+            .field("container_name", &self.container_name)
+            .field("workdir", &self.workdir)
+            .field("name", &self.name)
+            .field("password", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// Remove `snapshot` from its container's volume with a one-shot helper,
+/// once Dragonfly has finished any `SAVE` still writing it. A no-op when
+/// there is no such file.
+pub async fn remove_rdb_snapshot(
+    docker: &Docker,
+    snapshot: &RdbSnapshot,
+) -> Result<(), RedisNodeError> {
+    let failed = |reason: String| RedisNodeError::SnapshotCleanup {
+        container: snapshot.container_name.clone(),
+        snapshot: snapshot.name.clone(),
+        reason,
+    };
+    let helper_name = format!(
+        "temps-backup-cleanup-{}-{:08x}",
+        snapshot.container_name.trim_start_matches('/'),
+        rand::random::<u32>()
+    );
+    let env = if snapshot.password.is_empty() {
+        vec![]
+    } else {
+        vec![format!("REDISCLI_AUTH={}", snapshot.password)]
+    };
+    let created = docker
+        .create_container(
+            Some(
+                CreateContainerOptionsBuilder::new()
+                    .name(&helper_name)
+                    .build(),
+            ),
+            ContainerCreateBody {
+                image: Some(RDB_HELPER_IMAGE.to_string()),
+                entrypoint: Some(vec!["sh".to_string(), "-c".to_string()]),
+                cmd: Some(vec![rdb_snapshot_cleanup_script(
+                    &snapshot.container_name,
+                    &snapshot.workdir,
+                    &snapshot.name,
+                )]),
+                env: Some(env),
+                labels: Some(
+                    [
+                        ("sh.temps.kind".to_string(), "backup".to_string()),
+                        (
+                            "sh.temps.backup_of".to_string(),
+                            snapshot.container_name.clone(),
+                        ),
+                    ]
+                    .into_iter()
+                    .collect(),
+                ),
+                host_config: Some(helper_host_config(Some(&snapshot.container_name))),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|error| failed(format!("creating helper '{helper_name}': {error}")))?;
+    let outcome = async {
+        docker
+            .start_container(&created.id, None::<StartContainerOptions>)
+            .await
+            .map_err(|error| failed(format!("starting helper '{helper_name}': {error}")))?;
+        let deadline = std::time::Duration::from_secs(SNAPSHOT_SAVE_WAIT_SECS + 300);
+        let waited = tokio::time::timeout(
+            deadline,
+            docker
+                .wait_container(
+                    &created.id,
+                    Some(WaitContainerOptionsBuilder::new().build()),
+                )
+                .next(),
+        )
+        .await
+        .map_err(|_| {
+            failed(format!(
+                "helper '{helper_name}' did not finish within {}s",
+                deadline.as_secs()
+            ))
+        })?;
+        let exit_code = match waited {
+            Some(Ok(response)) => response.status_code,
+            Some(Err(bollard::errors::Error::DockerContainerWaitError { code, .. })) => code,
+            Some(Err(error)) => {
+                return Err(failed(format!(
+                    "waiting for helper '{helper_name}': {error}"
+                )))
+            }
+            None => -1,
+        };
+        match exit_code {
+            0 => Ok(()),
+            SNAPSHOT_STILL_SAVING_EXIT => Err(failed(format!(
+                "Dragonfly was still saving after {SNAPSHOT_SAVE_WAIT_SECS}s; the file is left \
+                 behind if that save completes"
+            ))),
+            code => Err(failed(format!(
+                "helper '{helper_name}' exited with code {code}"
+            ))),
+        }
+    }
+    .await;
+    if let Err(error) = docker
+        .remove_container(
+            &created.id,
+            Some(RemoveContainerOptionsBuilder::new().force(true).build()),
+        )
+        .await
+    {
+        warn!(helper = %helper_name, %error, "removing the snapshot cleanup helper failed");
+    }
+    outcome
+}
+
+/// Removes an RDB backup's Dragonfly snapshot when the backup ends any way
+/// but success. The helper's own trap removes it when its script ends, but
+/// a helper killed midway (a failed upload, a cancelled backup) never runs
+/// it, and the `SAVE` it started carries on in Dragonfly: without this, each
+/// such attempt would leave a dataset-sized file on the live data volume.
+struct SnapshotGuard {
+    docker: Arc<Docker>,
+    snapshot: Option<RdbSnapshot>,
+}
+
+impl SnapshotGuard {
+    /// The backup succeeded, so the helper's trap already removed the file.
+    fn disarm(mut self) {
+        self.snapshot = None;
+    }
+}
+
+impl Drop for SnapshotGuard {
+    fn drop(&mut self) {
+        let Some(snapshot) = self.snapshot.take() else {
+            return;
+        };
+        let docker = Arc::clone(&self.docker);
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(async move {
+                    if let Err(error) = remove_rdb_snapshot(&docker, &snapshot).await {
+                        warn!(
+                            container = %snapshot.container_name,
+                            snapshot = %snapshot.name,
+                            %error,
+                            "an abandoned Redis backup snapshot could not be removed"
+                        );
+                    }
+                });
+            }
+            Err(_) => warn!(
+                container = %snapshot.container_name,
+                snapshot = %snapshot.name,
+                "an abandoned Redis backup snapshot is left behind: no runtime to remove it"
+            ),
+        }
+    }
+}
+
 /// Whether `key` is an RDB backup of `service` (`…/external_services/redis/
 /// <service>/…/dump.rdb.gz`), the only object the RDB backup writes.
 fn is_rdb_key_of(key: &str, service: &str) -> bool {
@@ -459,18 +703,25 @@ pub async fn redis_rdb_backup(
             &destination.secret_access_key,
             destination.session_token.as_deref(),
         );
-    stream_helper_to_s3(
+    let snapshot = RdbSnapshot {
+        container_name: container_name.clone(),
+        workdir,
+        name: format!("temps-backup-{:08x}", rand::random::<u32>()),
+        password: password.clone(),
+    };
+    let script = rdb_dump_script(&container_name, &snapshot.workdir, &snapshot.name);
+    let guard = SnapshotGuard {
+        docker: docker.clone(),
+        snapshot: Some(snapshot),
+    };
+    let result = stream_helper_to_s3(
         docker.clone(),
         StreamedHelper {
             service: service.clone(),
             container: container_name.clone(),
             tool: "redis-cli --rdb",
             image: RDB_HELPER_IMAGE.to_string(),
-            script: rdb_dump_script(
-                &container_name,
-                &workdir,
-                &format!("temps-backup-{:08x}", rand::random::<u32>()),
-            ),
+            script,
             env,
             // Dragonfly's snapshot is a file in its volume.
             volumes_from: Some(container_name.clone()),
@@ -479,8 +730,11 @@ pub async fn redis_rdb_backup(
         &destination,
         &key,
     )
-    .await
-    .map_err(|source| RedisNodeError::Rdb {
+    .await;
+    if result.is_ok() {
+        guard.disarm();
+    }
+    result.map_err(|source| RedisNodeError::Rdb {
         service_id,
         service,
         source: Box::new(source),
@@ -764,7 +1018,17 @@ mod tests {
             },
             key: "fleet/external_services/redis/cache/u-1/dump.rdb.gz".to_string(),
         };
-        for printed in [format!("{walg:?}"), format!("{rdb:?}")] {
+        let snapshot = RdbSnapshot {
+            container_name: "redis-cache".to_string(),
+            workdir: "/data".to_string(),
+            name: "temps-backup-0000abcd".to_string(),
+            password: "redis-secret".to_string(),
+        };
+        for printed in [
+            format!("{walg:?}"),
+            format!("{rdb:?}"),
+            format!("{snapshot:?}"),
+        ] {
             for secret in ["redis-secret", "SECRET", "token-secret"] {
                 assert!(!printed.contains(secret), "{printed}");
             }
@@ -857,7 +1121,7 @@ mod tests {
         assert!(script.contains("SAVE RDB 'temps-backup-0000abcd'"));
         assert!(script.contains("f=\"$dir\"/'temps-backup-0000abcd'.rdb"));
         assert!(script.contains("'') dir='/srv data' ;;"));
-        assert!(script.contains("trap 'rm -f \"$f\"' EXIT"));
+        assert!(script.contains("trap 'rm -f \"$f\" \"$f.tmp\"' EXIT"));
         // redis-cli exits 0 on an error reply, so the reply itself is checked.
         assert!(script.contains("[ \"$reply\" != OK ]"));
         let snapshot = script.find("SAVE RDB").expect("the Dragonfly branch");
@@ -866,6 +1130,30 @@ mod tests {
             snapshot < stream,
             "Dragonfly is recognised before --rdb runs"
         );
+    }
+
+    /// A killed helper's `SAVE` finishes in Dragonfly afterwards, so the
+    /// cleanup waits for it, bounded, before removing both of its files.
+    #[test]
+    fn an_abandoned_snapshot_is_removed_once_dragonfly_stops_saving() {
+        let script =
+            rdb_snapshot_cleanup_script("redis-cache", "/srv data", "temps-backup-0000abcd");
+        assert!(script.contains("f=\"$dir\"/'temps-backup-0000abcd'.rdb"));
+        assert!(script.contains("'') dir='/srv data' ;;"));
+        let wait = script
+            .find("while [ -e \"$f.tmp\" ] || redis-cli -h \"$host\" -p 6379 INFO persistence")
+            .expect("the wait for the save");
+        assert!(script.contains("grep -q '^saving:1'"));
+        assert!(script.contains(&format!(
+            "if [ \"$i\" -gt {} ]",
+            SNAPSHOT_SAVE_WAIT_SECS / SNAPSHOT_POLL_SECS
+        )));
+        assert!(script.contains(&format!("exit {SNAPSHOT_STILL_SAVING_EXIT}")));
+        let remove = script
+            .rfind("rm -f \"$f\" \"$f.tmp\"")
+            .expect("the removal");
+        assert!(wait < remove, "the file is removed after the save ends");
+        assert!(!script.contains("REDISCLI_AUTH"));
     }
 
     #[test]

@@ -78,7 +78,7 @@ const HELPER_PIDS_LIMIT: i64 = 64;
 /// memory and processes, without new privileges. `volumes_from` mounts the
 /// volumes of that container, for a helper that reads a file its service
 /// wrote rather than a stream.
-fn helper_host_config(volumes_from: Option<&str>) -> HostConfig {
+pub(crate) fn helper_host_config(volumes_from: Option<&str>) -> HostConfig {
     HostConfig {
         network_mode: Some(temps_core::NETWORK_NAME.to_string()),
         volumes_from: volumes_from.map(|container| vec![container.to_string()]),
