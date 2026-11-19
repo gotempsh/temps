@@ -1323,6 +1323,49 @@ export type AiConfigSettings = {
     config_repo_branch?: string;
 };
 
+/**
+ * The credential that authenticated the harness. Never carries the secret,
+ * only the identifiers the API-key list already shows.
+ */
+export type AiHarnessCredential = {
+    id: number;
+    key_prefix: string;
+    kind: AiHarnessCredentialKind;
+    last_used_at: string;
+    name: string;
+};
+
+/**
+ * Which credential proved the harness connected.
+ */
+export type AiHarnessCredentialKind = 'dedicated_key' | 'cli_login';
+
+/**
+ * Where the harness onboarding stands for the calling user.
+ */
+export type AiHarnessState = 'missing' | 'waiting' | 'connected';
+
+/**
+ * `GET /api-keys/ai-harness/status`: the caller's AI harness connection.
+ */
+export type AiHarnessStatusResponse = {
+    connected_via?: AiHarnessCredential | null;
+    key_created_at?: string | null;
+    /**
+     * The dedicated harness key, when one exists (active or not).
+     */
+    key_id?: number | null;
+    /**
+     * Why the status is not `connected`, in words the console can show.
+     */
+    reason?: string | null;
+    /**
+     * Console route that resolves `reason`.
+     */
+    setup_path?: string | null;
+    status: AiHarnessState;
+};
+
 export type AiModelOptionDto = {
     default_thinking_option_id?: string | null;
     id: string;
@@ -48385,6 +48428,37 @@ export type CreateApiKeyResponses = {
 };
 
 export type CreateApiKeyResponse2 = CreateApiKeyResponses[keyof CreateApiKeyResponses];
+
+export type GetAiHarnessStatusData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/api-keys/ai-harness/status';
+};
+
+export type GetAiHarnessStatusErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetAiHarnessStatusResponses = {
+    /**
+     * AI harness connection status for the caller
+     */
+    200: AiHarnessStatusResponse;
+};
+
+export type GetAiHarnessStatusResponse = GetAiHarnessStatusResponses[keyof GetAiHarnessStatusResponses];
 
 export type GetApiKeyPermissionsData = {
     body?: never;

@@ -323,6 +323,10 @@ pub const AI_READ_ALLOWLIST: &[&str] = &[
     // ── Auth / API keys / OIDC (masked keys/secrets only) ──
     "list_api_keys",
     "get_api_key",
+    // Whether the caller's external AI harness has connected: status, the
+    // connecting key's id, name, prefix and timestamps. No secret or hash,
+    // the same masking class as `get_api_key`.
+    "get_ai_harness_status",
     "list_public_providers",
     "list_oidc_providers",
     "list_oidc_provider_users",
