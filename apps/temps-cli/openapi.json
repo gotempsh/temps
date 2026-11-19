@@ -74713,9 +74713,19 @@
             "type": "string"
           },
           "chat_id": {
-            "description": "Chat to post to: a numeric user, group or channel ID (`-100…` for\nsupergroups and channels) or a public `@channelusername`. A JSON\ninteger is accepted too.",
-            "example": "-1001234567890",
-            "type": "string"
+            "description": "Chat to post to: a numeric user, group or channel ID (`-100…` for supergroups and channels) or a public `@channelusername`. A JSON integer is accepted too.",
+            "examples": [
+              "-1001234567890"
+            ],
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "format": "int64",
+                "type": "integer"
+              }
+            ]
           },
           "message_thread_id": {
             "description": "Optional forum topic (`message_thread_id`) for forum-style groups.",

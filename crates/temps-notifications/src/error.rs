@@ -23,6 +23,16 @@ pub enum NotificationError {
     #[error("Notification provider with ID {provider_id} not found")]
     ProviderNotFound { provider_id: i32 },
 
+    /// A type-specific endpoint (e.g. `PUT /notification-providers/telegram/{id}`)
+    /// was given the ID of a provider of another type. Refused before any write:
+    /// storing a Telegram config on a Slack row would break its delivery.
+    #[error("Notification provider {provider_id} is a '{actual}' provider, not '{expected}'")]
+    ProviderTypeMismatch {
+        provider_id: i32,
+        expected: &'static str,
+        actual: String,
+    },
+
     #[error("Notification provider {provider_id} has unsupported type '{provider_type}'")]
     UnsupportedProviderType {
         provider_id: i32,

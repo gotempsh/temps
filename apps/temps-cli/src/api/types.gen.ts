@@ -34631,11 +34631,9 @@ export type TelegramConfig = {
      */
     bot_token: string;
     /**
-     * Chat to post to: a numeric user, group or channel ID (`-100…` for
-     * supergroups and channels) or a public `@channelusername`. A JSON
-     * integer is accepted too.
+     * Chat to post to: a numeric user, group or channel ID (`-100…` for supergroups and channels) or a public `@channelusername`. A JSON integer is accepted too.
      */
-    chat_id: string;
+    chat_id: string | number;
     /**
      * Optional forum topic (`message_thread_id`) for forum-style groups.
      */

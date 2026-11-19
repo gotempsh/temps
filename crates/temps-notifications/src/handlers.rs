@@ -514,12 +514,36 @@ pub struct TelegramConfig {
     /// supergroups and channels) or a public `@channelusername`. A JSON
     /// integer is accepted too.
     #[serde(deserialize_with = "crate::telegram::deserialize_chat_id")]
-    #[schema(value_type = String, example = "-1001234567890")]
+    #[schema(schema_with = telegram_chat_id_schema)]
     pub chat_id: String,
     /// Optional forum topic (`message_thread_id`) for forum-style groups.
     #[serde(default)]
     #[schema(example = 42)]
     pub message_thread_id: Option<i64>,
+}
+
+/// OpenAPI schema for [`TelegramConfig::chat_id`]: a string, or the JSON
+/// integer form Telegram itself uses for chat IDs. Both are stored as a string.
+fn telegram_chat_id_schema() -> utoipa::openapi::schema::Schema {
+    use utoipa::openapi::schema::{ObjectBuilder, OneOfBuilder, Schema, Type};
+    use utoipa::openapi::{KnownFormat, SchemaFormat};
+
+    Schema::OneOf(
+        OneOfBuilder::new()
+            .item(ObjectBuilder::new().schema_type(Type::String))
+            .item(
+                ObjectBuilder::new()
+                    .schema_type(Type::Integer)
+                    .format(Some(SchemaFormat::KnownFormat(KnownFormat::Int64))),
+            )
+            .description(Some(
+                "Chat to post to: a numeric user, group or channel ID (`-100…` for \
+                 supergroups and channels) or a public `@channelusername`. A JSON \
+                 integer is accepted too.",
+            ))
+            .examples([serde_json::json!("-1001234567890")])
+            .build(),
+    )
 }
 
 impl TelegramConfig {
@@ -844,6 +868,14 @@ fn notification_provider_write_problem(error: &NotificationError, title: &'stati
         return ErrorBuilder::new(StatusCode::BAD_REQUEST)
             .title("Invalid masked provider configuration")
             .detail(validation_error.to_string())
+            .build();
+    }
+    if let NotificationError::ProviderTypeMismatch { .. } = error {
+        // From the type-specific endpoint's point of view there is no such
+        // provider; the detail names the type the ID actually belongs to.
+        return ErrorBuilder::new(StatusCode::NOT_FOUND)
+            .title("Provider not found")
+            .detail(error.to_string())
             .build();
     }
     if let NotificationError::InvalidProviderConfig(config_error) = error {
@@ -1839,7 +1871,7 @@ async fn update_telegram_provider(
     };
     let provider = app_state
         .notification_service
-        .update_provider(id, update_request.into())
+        .update_provider_of_type(id, TELEGRAM_PROVIDER_TYPE, update_request.into())
         .await
         .map_err(|e| {
             error!(
@@ -3025,6 +3057,34 @@ mod tests {
                 .expect("recording audit mutex should not be poisoned")
                 .is_empty(),
             "a refused create must not be audited as a creation"
+        );
+    }
+
+    #[test]
+    fn telegram_chat_id_schema_declares_string_and_integer_forms() {
+        let spec = serde_json::to_value(NotificationProvidersApiDoc::openapi())
+            .expect("the OpenAPI document serializes");
+        let chat_id = &spec["components"]["schemas"]["TelegramConfig"]["properties"]["chat_id"];
+        let types: Vec<&str> = chat_id["oneOf"]
+            .as_array()
+            .unwrap_or_else(|| panic!("chat_id should be a oneOf, got {chat_id}"))
+            .iter()
+            .filter_map(|item| item["type"].as_str())
+            .collect();
+        assert_eq!(types, ["string", "integer"], "{chat_id}");
+        assert!(
+            chat_id["description"]
+                .as_str()
+                .is_some_and(|d| d.contains("@channelusername")),
+            "{chat_id}"
+        );
+        let required = spec["components"]["schemas"]["TelegramConfig"]["required"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            required.contains(&serde_json::json!("chat_id")),
+            "{required:?}"
         );
     }
 

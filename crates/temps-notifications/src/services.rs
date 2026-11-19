@@ -2973,6 +2973,30 @@ impl NotificationService {
         provider_id: i32,
         update: UpdateProviderRequest,
     ) -> Result<Option<notification_providers::Model>> {
+        self.update_provider_checked(provider_id, None, update)
+            .await
+    }
+
+    /// [`Self::update_provider`] for a type-specific endpoint: refuses, before
+    /// writing anything, a provider whose stored type is not `expected_type`.
+    /// The provider type never changes after creation, so the check made on
+    /// the row loaded here holds for the write that follows.
+    pub async fn update_provider_of_type(
+        &self,
+        provider_id: i32,
+        expected_type: &'static str,
+        update: UpdateProviderRequest,
+    ) -> Result<Option<notification_providers::Model>> {
+        self.update_provider_checked(provider_id, Some(expected_type), update)
+            .await
+    }
+
+    async fn update_provider_checked(
+        &self,
+        provider_id: i32,
+        expected_type: Option<&'static str>,
+        update: UpdateProviderRequest,
+    ) -> Result<Option<notification_providers::Model>> {
         // First check if the provider exists
         let provider = notification_providers::Entity::find_by_id(provider_id)
             .one(self.db.as_ref())
@@ -2983,6 +3007,15 @@ impl NotificationService {
             ))?;
 
         if let Some(provider) = provider {
+            if let Some(expected) = expected_type {
+                if provider.provider_type != expected {
+                    return Err(NotificationError::ProviderTypeMismatch {
+                        provider_id,
+                        expected,
+                        actual: provider.provider_type,
+                    });
+                }
+            }
             let existing_config = provider.config.clone();
             let provider_type = provider.provider_type.clone();
             let renamed_to = update
@@ -6656,6 +6689,84 @@ mod tests {
 
         // Types without a schema keep accepting arbitrary config.
         assert!(validate_provider_config("custom", &serde_json::json!({"x": 1})).is_ok());
+    }
+
+    #[tokio::test]
+    async fn telegram_update_refuses_a_provider_of_another_type() {
+        let test_db = test_database_or_skip!();
+        let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password(
+            "notification-telegram-type-guard-test",
+        ));
+        let service = NotificationService::new(test_db.connection_arc(), encryption_service);
+
+        let slack = service
+            .add_provider(
+                "Team Slack".to_string(),
+                "slack".to_string(),
+                serde_json::json!({
+                    "webhook_url": "https://hooks.slack.example/services/T0/B0/x",
+                    "channel": null,
+                }),
+                true,
+            )
+            .await
+            .expect("a Slack provider should be created");
+
+        let error = service
+            .update_provider_of_type(
+                slack.id,
+                TELEGRAM_PROVIDER_TYPE,
+                UpdateProviderRequest {
+                    name: Some("Hijacked".to_string()),
+                    config: Some(serde_json::json!({
+                        "bot_token": "123456789:AAExampleSecretToken",
+                        "chat_id": "-1001234567890",
+                    })),
+                    enabled: None,
+                },
+            )
+            .await
+            .expect_err("a Telegram update must not land on a Slack provider");
+        match &error {
+            NotificationError::ProviderTypeMismatch {
+                provider_id,
+                expected,
+                actual,
+            } => {
+                assert_eq!(*provider_id, slack.id);
+                assert_eq!(*expected, "telegram");
+                assert_eq!(actual, "slack");
+            }
+            other => panic!("expected a type mismatch, got {other}"),
+        }
+
+        // Nothing was written: name, type and Slack config are untouched.
+        let unchanged = service.get_provider(slack.id).await.unwrap().unwrap();
+        assert_eq!(unchanged.name, "Team Slack");
+        assert_eq!(unchanged.provider_type, "slack");
+        let stored = service
+            .decrypt_provider_config_raw(Some(unchanged.id), &unchanged.config)
+            .unwrap();
+        assert_eq!(
+            stored["webhook_url"],
+            "https://hooks.slack.example/services/T0/B0/x"
+        );
+        assert!(stored.get("bot_token").is_none());
+
+        // An unknown ID is still "no such provider" (404), not a type error.
+        let unknown = service
+            .update_provider_of_type(
+                i32::MAX,
+                TELEGRAM_PROVIDER_TYPE,
+                UpdateProviderRequest {
+                    name: Some("Nobody".to_string()),
+                    config: None,
+                    enabled: None,
+                },
+            )
+            .await
+            .expect("a missing provider is not an error");
+        assert!(unknown.is_none());
     }
 
     #[tokio::test]
