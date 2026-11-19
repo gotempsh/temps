@@ -103,13 +103,19 @@ listeners after it starts, so it is bound whether or not a connector exists.
 
 A worker agent on the same machine (a control plane also enrolled as a
 worker) already holds `7480` for its own tunnel origin, so a taken port is
-not the end: the proxy takes the first free port up to `7489` and logs which.
+not the end: the proxy takes the first free port up to `7489` and logs which,
+skipping the ports its own listeners (HTTP, TLS, the console's) are
+configured on, which are not bound yet when it chooses.
 The port is part of the provider's tunnel configuration
 (`http://127.0.0.1:{edge_port}`), so a tunnel placed **only** on the control
 plane follows it: a new one is created on that port, and the connector loop
 moves an existing one, telling the provider first and keeping the new port
 only once the provider accepted it (a failure leaves the old port and the
-error on the tunnel, and is not retried every pass). A tunnel also placed on
+error on the tunnel, and is not retried every pass). Configuring a tunnel at
+the provider and saving the result run as one step per connector across
+every service instance (a transaction-scoped advisory lock taken before the
+row is read), so a sync overlapping a move configures and saves the moved
+port, never an older one after it. A tunnel also placed on
 workers keeps its port, since every worker binds it itself; its control-plane
 replica reports why it does not run. With every port taken, the listener is
 skipped and a connector placed on node `0` reports why it cannot start.

@@ -904,9 +904,10 @@ pub fn setup_proxy_server(
     // listener once it runs, so it is bound now whether or not a tunnel runs
     // here yet.
     if let Some(origin) = proxy_config.tunnel_origin.as_deref() {
-        if let Some(address) =
-            first_bindable_tunnel_origin(temps_core::tunnel_origin::tunnel_origin_candidates())
-        {
+        if let Some(address) = first_bindable_tunnel_origin(tunnel_origin_candidates_for(
+            &proxy_config,
+            temps_core::tunnel_origin::tunnel_origin_candidates(),
+        )) {
             proxy_service.add_tcp(&address.to_string());
             origin.mark_bound(address.port());
             info!(%address, "Tunnel origin listener configured for the control plane's tunnels");
@@ -996,6 +997,31 @@ fn preflight_check_listen_addresses(proxy_config: &ProxyConfig) -> Result<()> {
         let _tls_listener = bind_or_report(tls_address, "TEMPS_TLS_ADDRESS")?;
     }
     Ok(())
+}
+
+/// `candidates` without the ports this process's own listeners use (HTTP,
+/// TLS, the console's): they are not bound yet when the tunnel origin is
+/// chosen, so probing would find them free. Compared by port alone, so a
+/// wildcard listener (`0.0.0.0:7481`) excludes its loopback form too.
+fn tunnel_origin_candidates_for(
+    proxy_config: &ProxyConfig,
+    candidates: impl IntoIterator<Item = std::net::SocketAddr>,
+) -> Vec<std::net::SocketAddr> {
+    let own: Vec<u16> = [
+        Some(proxy_config.address.as_str()),
+        proxy_config.tls_address.as_deref(),
+        Some(proxy_config.console_address.as_str()),
+        proxy_config.console_ingress_address.as_deref(),
+        proxy_config.internal_dns_sync_address.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|address| address.rsplit_once(':')?.1.parse().ok())
+    .collect();
+    candidates
+        .into_iter()
+        .filter(|candidate| !own.contains(&candidate.port()))
+        .collect()
 }
 
 /// The first of `candidates` the control plane's tunnel origin can listen
@@ -1608,6 +1634,50 @@ mod preflight_bind_tests {
         assert_eq!(first_bindable_tunnel_origin([taken]), None);
         drop(held);
         assert_eq!(first_bindable_tunnel_origin([taken, free]), Some(taken));
+    }
+
+    /// ADR-107 D3: the fallback never takes a port the proxy's own HTTP or
+    /// TLS listener (or the console's) is configured on, wildcard included:
+    /// they are bound after the choice, so the probe would find them free.
+    #[test]
+    fn the_tunnel_origin_never_takes_the_proxys_own_listener_ports() {
+        let candidates: Vec<std::net::SocketAddr> = (7480..=7485)
+            .map(|port| std::net::SocketAddr::from(([127, 0, 0, 1], port)))
+            .collect();
+        let proxy_config = ProxyConfig {
+            address: "0.0.0.0:7481".to_string(),
+            tls_address: Some("127.0.0.1:7482".to_string()),
+            console_address: "[::]:7483".to_string(),
+            ..Default::default()
+        };
+        let ports: Vec<u16> = tunnel_origin_candidates_for(&proxy_config, candidates)
+            .iter()
+            .map(|address| address.port())
+            .collect();
+        assert_eq!(ports, vec![7480, 7484, 7485]);
+
+        // The case reported: a worker agent holds the first port and the TLS
+        // listener is configured on the next, still unbound. The origin skips
+        // both.
+        let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let taken = held.local_addr().unwrap();
+        let (tls, next) = {
+            let first = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let second = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            (first.local_addr().unwrap(), second.local_addr().unwrap())
+        };
+        let proxy_config = ProxyConfig {
+            tls_address: Some(tls.to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            first_bindable_tunnel_origin(tunnel_origin_candidates_for(
+                &proxy_config,
+                [taken, tls, next]
+            )),
+            Some(next)
+        );
+        drop(held);
     }
 
     #[test]
