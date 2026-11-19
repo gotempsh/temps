@@ -636,10 +636,6 @@ impl UpgradeCommand {
         // preflight: Unix rejects an executable that is still open for write.
         let staged_path = seal_staged_binary(staged_file)?;
 
-        // Run it before it replaces anything. The signature proves the bytes
-        // come from this release, not that they are this platform's build.
-        preflight_staged_binary(staged_path.as_ref())?;
-
         // The Linux tarball also carries the Firecracker guest agent, which
         // must stay in step with the host's wire protocol. Stage it now, while
         // a failure can still be reported before anything on disk changes, and
@@ -649,9 +645,11 @@ impl UpgradeCommand {
         let staged_pty_agent =
             stage_pty_agent_reporting(download_file.as_file_mut(), &download_path, &binary_path);
 
-        // Replace the binary atomically
+        // Replace the binary atomically, but only once it has run here. The
+        // signature proves the bytes come from this release, not that they
+        // are this platform's build.
         println!("  Replacing binary at {}...", binary_path.display());
-        finalize_staged_binary(&binary_path, staged_path)?;
+        install_staged_binary(&binary_path, staged_path)?;
         install_vm_agent_reporting(staged_agent);
         install_pty_agent_reporting(staged_pty_agent);
         print_launcher_refresh_reminder();
@@ -2159,6 +2157,10 @@ async fn fetch_guest_agents_from_release_from(
                         tarball_name
                     )
                 })?;
+            // An unsigned release is refused before the ~110 MB download.
+            ensure_signature_published(&release, &tarball_name, false).map_err(|e| {
+                e.with_unsigned_remedy(release_signature::GUEST_AGENT_UNSIGNED_REMEDY)
+            })?;
 
             let dir = tempfile::tempdir()
                 .map_err(|e| anyhow::anyhow!("Failed to create a scratch directory: {}", e))?;
@@ -2453,6 +2455,20 @@ const PREFLIGHT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30
 /// At most this much of the staged binary's stderr is kept for the error.
 const PREFLIGHT_STDERR_LIMIT: u64 = 64 * 1024;
 
+/// How long to wait for the stderr of a binary that already exited.
+const PREFLIGHT_STDERR_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Replace `binary_path` with the staged binary only once it has run on this
+/// host (see [`preflight_staged_binary`]); a binary that cannot run leaves the
+/// installed one untouched.
+pub(crate) fn install_staged_binary(
+    binary_path: &Path,
+    staged_path: TempPath,
+) -> anyhow::Result<()> {
+    preflight_staged_binary(staged_path.as_ref())?;
+    finalize_staged_binary(binary_path, staged_path)
+}
+
 fn preflight_staged_binary_within(
     staged_path: &Path,
     timeout: std::time::Duration,
@@ -2474,17 +2490,20 @@ fn preflight_staged_binary_within(
             )
         })?;
     // Drain stderr on a thread so a chatty binary cannot block on a full pipe
-    // while this thread waits for it; only the first 64 KiB is kept.
+    // while this thread waits for it; only the first 64 KiB is kept. The
+    // result comes back over a channel, never a join: a descendant that
+    // inherited stderr can hold the pipe open long after the binary exits.
     let stderr = child.stderr.take();
-    let reader = std::thread::spawn(move || {
+    let (stderr_tx, stderr_rx) = std::sync::mpsc::sync_channel::<String>(1);
+    std::thread::spawn(move || {
         let mut kept = Vec::new();
         if let Some(mut stderr) = stderr {
             let _ = (&mut stderr)
                 .take(PREFLIGHT_STDERR_LIMIT)
                 .read_to_end(&mut kept);
+            let _ = stderr_tx.send(String::from_utf8_lossy(&kept).trim().to_string());
             let _ = std::io::copy(&mut stderr, &mut std::io::sink());
         }
-        String::from_utf8_lossy(&kept).trim().to_string()
     });
 
     let deadline = std::time::Instant::now() + timeout;
@@ -2514,16 +2533,23 @@ fn preflight_staged_binary_within(
             }
         }
     };
-    let stderr = reader.join().unwrap_or_default();
-    if !status.success() {
-        return Err(anyhow::anyhow!(
-            "The downloaded binary exited with {} when asked for its version: {}. \
-             The running version was left untouched.",
-            status,
-            stderr
-        ));
+    if status.success() {
+        return Ok(());
     }
-    Ok(())
+    // The binary has exited; give its stderr a moment, bounded by the
+    // deadline, then report without it rather than wait on a descendant.
+    let grace = deadline
+        .saturating_duration_since(std::time::Instant::now())
+        .min(PREFLIGHT_STDERR_GRACE);
+    let stderr = stderr_rx
+        .recv_timeout(grace)
+        .unwrap_or_else(|_| "(no error output within the deadline)".to_string());
+    Err(anyhow::anyhow!(
+        "The downloaded binary exited with {} when asked for its version: {}. \
+         The running version was left untouched.",
+        status,
+        stderr
+    ))
 }
 
 /// Finish writing a staged executable, make it durable, and close its writable
@@ -3986,6 +4012,53 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn preflight_does_not_wait_on_a_descendant_holding_stderr() {
+        let dir = tempfile::tempdir().unwrap();
+        // Exits at once with a failure, leaving a child that keeps stderr open.
+        let staged = staged_script(dir.path(), "#!/bin/sh\nsleep 30 &\nexit 4\n");
+        let started = std::time::Instant::now();
+        let err =
+            preflight_staged_binary_within(staged.as_ref(), std::time::Duration::from_secs(20))
+                .unwrap_err()
+                .to_string();
+        assert!(
+            started.elapsed() < PREFLIGHT_STDERR_GRACE + std::time::Duration::from_secs(5),
+            "took {:?}: {err}",
+            started.elapsed()
+        );
+        assert!(err.contains("exited with"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_binary_that_cannot_run_never_replaces_the_installed_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let installed = dir.path().join("temps");
+        std::fs::write(&installed, b"the working binary").unwrap();
+        let staged = staged_script(dir.path(), "#!/bin/sh\nexit 126\n");
+        let staged_file = staged.to_path_buf();
+        let err = install_staged_binary(&installed, staged)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("left untouched"), "{err}");
+        assert_eq!(std::fs::read(&installed).unwrap(), b"the working binary");
+        assert!(!staged_file.exists(), "the staged binary is discarded");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_binary_that_runs_replaces_the_installed_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let installed = dir.path().join("temps");
+        std::fs::write(&installed, b"the old binary").unwrap();
+        let script = "#!/bin/sh\nexit 0\n";
+        let staged = staged_script(dir.path(), script);
+        install_staged_binary(&installed, staged).unwrap();
+        assert_eq!(std::fs::read(&installed).unwrap(), script.as_bytes());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn preflight_reports_why_the_binary_failed() {
         let dir = tempfile::tempdir().unwrap();
         let staged = staged_script(
@@ -4062,13 +4135,16 @@ mod tests {
     #[tokio::test]
     async fn guest_release_fetch_refuses_an_unsigned_release() {
         let archive = tarball_with_entries(&[(VM_AGENT_BINARY_NAME, b"vm")]);
-        let (api, server, trust) = guest_release_server(archive, false, None, None).await;
+        // The archive stalls: only a refusal before downloading it can
+        // return the signature error rather than a timeout.
+        let (api, server, trust) =
+            guest_release_server(archive, false, Some("archive"), None).await;
         let result = fetch_guest_agents_from_release_from(
             &[VM_AGENT_BINARY_NAME],
             &api,
             "v1.2.3",
             "test",
-            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(2),
             &trust,
         )
         .await;
