@@ -938,8 +938,21 @@ impl AgentExecutor {
             .and_then(|y| yaml_serde::from_str::<temps_core::WorkflowYamlConfig>(y).ok())
             .map(|y| (y.cpu_limit, y.memory_limit_mb))
             .unwrap_or((None, None));
-        let cpu_limit = yaml_cpu.unwrap_or(global_sandbox.cpu_limit);
-        let memory_limit_mb = yaml_mem.unwrap_or(global_sandbox.memory_limit_mb);
+        let (cpu_limit, memory_limit_mb) = match self
+            .sandbox_registry
+            .provider()
+            .host_capacity(None, None)
+            .await?
+        {
+            Some(host) => (
+                host.cpu_limit(run_id, yaml_cpu, global_sandbox.cpu_limit)?,
+                host.memory_limit(run_id, yaml_mem, global_sandbox.memory_limit_mb)?,
+            ),
+            None => (
+                yaml_cpu.unwrap_or(global_sandbox.cpu_limit),
+                yaml_mem.unwrap_or(global_sandbox.memory_limit_mb),
+            ),
+        };
 
         // Per-run named volume for `/workspace`. Retained so follow-up phases
         // (autofixer fix → PR) or workspace sandboxes can re-mount it.

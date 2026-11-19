@@ -174,6 +174,70 @@ impl std::fmt::Display for SandboxBackend {
     }
 }
 
+/// Resources advertised by the Docker daemon running the sandbox.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct SandboxHostCapacity {
+    pub cpu_cores: f64,
+    pub memory_mb: u64,
+}
+
+impl SandboxHostCapacity {
+    pub fn cpu_limit(
+        self,
+        run_id: i32,
+        explicit: Option<f64>,
+        default: f64,
+    ) -> Result<f64, AgentError> {
+        if let Some(requested) = explicit {
+            if !(0.01..=self.cpu_cores).contains(&requested) {
+                return Err(AgentError::SandboxCpuLimit {
+                    run_id,
+                    requested,
+                    host: self.cpu_cores,
+                });
+            }
+            return Ok(requested);
+        }
+        if default > self.cpu_cores {
+            tracing::info!(
+                run_id,
+                requested = default,
+                host_cpu_count = self.cpu_cores,
+                "Clamped sandbox CPU default"
+            );
+        }
+        Ok(default.min(self.cpu_cores))
+    }
+
+    pub fn memory_limit(
+        self,
+        run_id: i32,
+        explicit: Option<u64>,
+        default: u64,
+    ) -> Result<u64, AgentError> {
+        if let Some(requested) = explicit {
+            if requested > self.memory_mb {
+                return Err(AgentError::Validation {
+                    message: format!(
+                        "Sandbox run {run_id} requested {requested} MB but its host has {} MB",
+                        self.memory_mb
+                    ),
+                });
+            }
+            return Ok(requested);
+        }
+        if default > self.memory_mb {
+            tracing::info!(
+                run_id,
+                requested = default,
+                host_memory_mb = self.memory_mb,
+                "Clamped sandbox memory default"
+            );
+        }
+        Ok(default.min(self.memory_mb))
+    }
+}
+
 /// Resource limits a provider applies when a create request leaves them out.
 /// `None` means the provider does not say, so a caller that needs to bound
 /// the effective value cannot assume one.
@@ -1526,6 +1590,15 @@ done
     fn supports_backend(&self, backend: SandboxBackend) -> bool {
         let _ = backend;
         true
+    }
+
+    /// Capacity of the daemon that serves this placement, when reported.
+    async fn host_capacity(
+        &self,
+        _node_id: Option<i32>,
+        _backend: Option<SandboxBackend>,
+    ) -> Result<Option<crate::SandboxHostCapacity>, AgentError> {
+        Ok(None)
     }
 
     /// The limits `create` applies to a request that omits them, for the
