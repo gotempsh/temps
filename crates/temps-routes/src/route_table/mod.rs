@@ -4704,11 +4704,14 @@ mod tests {
                         .append_query_results([containers.clone()])
                         .append_query_results([vec![project.clone()]])
                         .append_query_results([Vec::<custom_routes::Model>::new()])
+                        .append_query_results([vec![environment.clone()]])
+                        .append_query_results([containers.clone()])
+                        .append_query_results([vec![environment.clone()]])
+                        .append_query_results([containers.clone()])
                         .append_query_results([vec![custom_domain]])
-                        .append_query_results([containers.clone()])
-                        .append_query_results([vec![environment.clone()]])
-                        .append_query_results([containers.clone()])
-                        .append_query_results([vec![environment.clone()]])
+                        .append_query_results([Vec::<
+                            std::collections::BTreeMap<String, sea_orm::Value>,
+                        >::new()])
                         .append_query_results([containers])
                         .append_query_results([Vec::<
                             std::collections::BTreeMap<String, sea_orm::Value>,

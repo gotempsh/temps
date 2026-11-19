@@ -2969,15 +2969,22 @@ impl AppSettings {
         !preview.is_empty() && preview == host
     }
 
-    /// True when `host` belongs to the platform: a reserved hostname (see
-    /// [`Self::is_reserved_hostname`]) or any name at or below the preview
-    /// domain, where every generated environment and deployment address lives.
-    ///
-    /// Generated names are only composed when the proxy loads its routes, so
-    /// they cannot be looked up in a table. A project domain or an operator
-    /// route that took one would be served in place of the real address, and
-    /// a name that nobody has generated yet can be claimed before it exists.
-    /// A leading `*.` is ignored, so a wildcard below the preview domain counts.
+    /// Project domains may use exact names below the preview domain. Wildcards
+    /// there could also match generated addresses, including nested names.
+    /// Callers separately check the platform's generated addresses.
+    pub fn is_reserved_project_domain(&self, host: &str) -> bool {
+        let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+        let preview = temps_core::public_hostname::base_domain(&self.preview_domain);
+        self.is_reserved_hostname(&host)
+            || host == preview
+            || host.strip_prefix("*.").is_some_and(|base| {
+                self.is_reserved_hostname(base)
+                    || temps_core::route_policy::is_at_or_below(base, &preview)
+            })
+    }
+
+    /// Operator custom routes, including TLS passthrough, reserve the entire
+    /// preview namespace before the proxy selects an application by hostname.
     pub fn is_platform_hostname(&self, host: &str) -> bool {
         if self.is_reserved_hostname(host.trim_start_matches("*.")) {
             return true;
@@ -3004,6 +3011,20 @@ impl AppSettings {
 mod platform_hostname_tests {
     use super::AppSettings;
 
+    #[test]
+    fn project_domains_can_use_exact_names_below_preview() {
+        let settings = settings("*.Apps.Example.com.", Some("https://console.example.com"));
+        assert!(!settings.is_reserved_project_domain("Api.Apps.Example.com."));
+        for host in [
+            "apps.example.com",
+            "console.example.com",
+            "*.apps.example.com",
+            "*.sub.apps.example.com",
+        ] {
+            assert!(settings.is_reserved_project_domain(host), "{host}");
+        }
+    }
+
     fn settings(preview: &str, external_url: Option<&str>) -> AppSettings {
         AppSettings {
             preview_domain: preview.to_string(),
@@ -3013,7 +3034,7 @@ mod platform_hostname_tests {
     }
 
     #[test]
-    fn names_at_or_below_the_preview_domain_belong_to_the_platform() {
+    fn operator_routes_reserve_the_whole_preview_domain() {
         let settings = settings("apps.example.com", None);
         for host in [
             "apps.example.com",

@@ -175,6 +175,9 @@ export function DomainsSettings({ project }: DomainsSettingsProps) {
             >
               <div className="min-w-0">
                 <p className="break-all font-medium">{domain.domain}</p>
+                {domain.status === 'hostname_conflict' && (
+                  <p className="text-sm text-destructive">{domain.message}</p>
+                )}
                 {domain.environment && (
                   <p className="text-sm text-muted-foreground">
                     Environment: {domain.environment.slug}

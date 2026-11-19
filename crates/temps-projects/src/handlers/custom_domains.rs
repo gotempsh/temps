@@ -223,16 +223,14 @@ pub async fn list_custom_domains_for_project(
 
     let total = custom_domains.len();
 
-    let mut domain_responses = Vec::new();
-    for domain in custom_domains {
-        let domain_with_info = state
-            .custom_domain_service
-            .get_domain_with_info(domain)
-            .await?;
-        domain_responses.push(CustomDomainResponse::from(CustomDomainWithInfo::from(
-            domain_with_info,
-        )));
-    }
+    let domain_responses = state
+        .custom_domain_service
+        .domains_with_info(custom_domains)
+        .await?
+        .into_iter()
+        .map(CustomDomainWithInfo::from)
+        .map(CustomDomainResponse::from)
+        .collect();
 
     Ok((
         StatusCode::OK,
