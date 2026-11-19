@@ -4,6 +4,7 @@
 import { describe, expect, test } from 'bun:test'
 import { readdirSync, readFileSync, statSync } from 'node:fs'
 import { join, relative } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { QueryClient } from '@tanstack/react-query'
 import {
   getAiHarnessStatusQueryKey,
@@ -50,7 +51,9 @@ describe('API key mutations', () => {
   // Every console module that changes an API key must refresh the AI
   // harness status too, or the setup checklist and banner keep a stale state.
   test('every module that changes an API key refreshes the harness status', () => {
-    const src = new URL('../', import.meta.url).pathname
+    // fileURLToPath, not `.pathname`: a checkout path with a space or other
+    // escaped character would stay percent-encoded and readdirSync would fail.
+    const src = fileURLToPath(new URL('../', import.meta.url))
     const missing = sourceFiles(src).filter((file) => {
       const source = readFileSync(file, 'utf8')
       const changesKeys = [...source.matchAll(CLIENT_IMPORT)].some((match) =>
