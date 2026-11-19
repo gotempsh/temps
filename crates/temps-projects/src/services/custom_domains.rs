@@ -5,12 +5,15 @@ use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection,
     EntityTrait, QueryFilter, QuerySelect, Set, TransactionError, TransactionTrait,
 };
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use temps_config::AppSettings;
+use temps_config::{
+    domain_ownership::{generated_address_conflicts, GeneratedAddress},
+    AppSettings,
+};
 use temps_core::url_validation;
 use temps_entities::{
-    domain_delivery_bindings, domains, environment_domains, environments, project_custom_domains,
-    settings,
+    domain_delivery_bindings, domains, environments, project_custom_domains, settings,
 };
 use thiserror::Error;
 use tracing::{debug, info};
@@ -164,44 +167,51 @@ impl CustomDomainService {
         Ok(())
     }
 
-    /// Rejects a hostname that is already an environment's address, in any
-    /// project. The route table serves a custom domain in place of the
-    /// environment address with the same name, so without this a user of
-    /// one project could take over another project's environment host --
-    /// including a tunnel environment host (ADR 068 D3), whose names are
-    /// predictable and published before anyone asks for them.
-    ///
-    /// An address is stored either as a full hostname or as the bare label
-    /// that sits under the preview domain, so a hostname directly under
-    /// `preview_domain` is compared by both.
+    /// Check the currently stored addresses under the same lock used to publish
+    /// tunnel hosts. Route assembly independently enforces generated precedence.
     async fn ensure_not_environment_address<C: ConnectionTrait>(
         conn: &C,
         domain: &str,
         preview_domain: &str,
     ) -> Result<(), CustomDomainError> {
-        let candidates = environment_address_candidates(domain, preview_domain);
-        let Some(row) = environment_domains::Entity::find()
-            .filter(
-                sea_orm::sea_query::Expr::expr(sea_orm::sea_query::Func::lower(
-                    sea_orm::sea_query::Expr::col(environment_domains::Column::Domain),
+        let host = domain.trim_end_matches('.').to_ascii_lowercase();
+        let conflicts =
+            generated_address_conflicts(conn, &HashSet::from([host.clone()]), preview_domain)
+                .await?;
+        if let Some(owner) = conflicts.get(&host) {
+            let reason = match owner {
+                GeneratedAddress::Environment => {
+                    "already an environment's address; remove it there first"
+                }
+                GeneratedAddress::Tunnel => "published by a tunnel as an environment's address",
+                GeneratedAddress::Deployment => "already a deployment's address",
+            };
+            return Err(CustomDomainError::DuplicateDomain(format!(
+                "'{domain}' is {reason}"
+            )));
+        }
+        // A stored deployment can be promoted again. Reserve its slug on
+        // assignment, even when its fallback is absent from the current table.
+        let base = temps_core::public_hostname::base_domain(preview_domain);
+        if let Some(slug) = host.strip_suffix(&format!(".{base}")) {
+            if temps_entities::deployments::Entity::find()
+                .select_only()
+                .column(temps_entities::deployments::Column::Id)
+                .filter(sea_orm::sea_query::Expr::cust_with_values(
+                    "LOWER(slug) = $1",
+                    [slug],
                 ))
-                .is_in(candidates),
-            )
-            .one(conn)
-            .await?
-        else {
-            return Ok(());
-        };
-        Err(CustomDomainError::DuplicateDomain(
-            if row.generated_by_connector_id.is_some() {
-                format!(
-                    "'{domain}' is published by a tunnel as an environment's address; choose \
-                     another name"
-                )
-            } else {
-                format!("'{domain}' is already an environment's address; remove it there first")
-            },
-        ))
+                .into_tuple::<i32>()
+                .one(conn)
+                .await?
+                .is_some()
+            {
+                return Err(CustomDomainError::DuplicateDomain(format!(
+                    "'{domain}' is a stored deployment's address"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Rejects an `environment_id` that does not belong to `project_id`.
@@ -241,10 +251,8 @@ impl CustomDomainService {
     /// the only way back in is the server's public IP — so the assignment is
     /// refused up front instead of being made and then undone.
     ///
-    /// The preview domain and every name below it belong to the platform too:
-    /// environment and deployment addresses are generated there, and a name
-    /// nobody has generated yet could otherwise be claimed before it exists.
-    /// Returns the preview domain, for the environment-address check.
+    /// Exact names inside the preview zone can be assigned. Wildcards there
+    /// would cover generated addresses. Return the zone for the ownership check.
     async fn ensure_domain_not_reserved(&self, domain: &str) -> Result<String, CustomDomainError> {
         let settings = settings::Entity::find()
             .one(self.db.as_ref())
@@ -252,9 +260,9 @@ impl CustomDomainService {
             .map(|s| AppSettings::from_json(s.data))
             .unwrap_or_default();
 
-        if settings.is_platform_hostname(domain) {
+        if settings.is_reserved_project_domain(domain) {
             return Err(CustomDomainError::InvalidDomain(format!(
-                "'{}' is reserved by Temps itself (console, preview domain or a name below it) and cannot be assigned to a project",
+                "'{}' is reserved by Temps itself (control-plane hostname, preview apex or preview wildcard) and cannot be assigned to a project",
                 domain
             )));
         }
@@ -498,6 +506,10 @@ impl CustomDomainService {
         }
 
         // Must be a hostname at all before anything else looks at it.
+        let domain = domain
+            .strip_suffix('.')
+            .unwrap_or(&domain)
+            .to_ascii_lowercase();
         Self::ensure_domain_is_wellformed(&domain)?;
 
         // The caller is authorized against `project_id`; `environment_id` comes
@@ -505,8 +517,7 @@ impl CustomDomainService {
         self.ensure_environment_in_project(environment_id, project_id)
             .await?;
 
-        // Refuse hostnames the platform serves itself (console, preview domain
-        // and everything below it)
+        // Protect control-plane hostnames and preview wildcards.
         let preview_domain = self.ensure_domain_not_reserved(&domain).await?;
 
         // Check if domain already exists
@@ -652,37 +663,93 @@ impl CustomDomainService {
         &self,
         custom_domain: project_custom_domains::Model,
     ) -> Result<CustomDomainEnrichment, CustomDomainError> {
-        let certificate = if let Some(certificate_id) = custom_domain.certificate_id {
-            domains::Entity::find_by_id(certificate_id)
-                .one(self.db.as_ref())
-                .await
-                .map_err(|source| CustomDomainError::EnrichmentDatabase {
-                    operation: "load certificate metadata",
-                    domain_id: custom_domain.id,
-                    certificate_id: custom_domain.certificate_id,
-                    environment_id: custom_domain.environment_id,
-                    source,
-                })?
-        } else {
-            None
-        };
+        let id = custom_domain.id;
+        let mut result = self.domains_with_info(vec![custom_domain]).await?;
+        result.pop().ok_or_else(|| {
+            CustomDomainError::NotFound(format!(
+                "Custom domain {} disappeared during enrichment",
+                id
+            ))
+        })
+    }
 
-        let environment = environments::Entity::find_by_id(custom_domain.environment_id)
+    /// Batch ownership, certificate and environment lookups for a response page.
+    pub async fn domains_with_info(
+        &self,
+        rows: Vec<project_custom_domains::Model>,
+    ) -> Result<Vec<CustomDomainEnrichment>, CustomDomainError> {
+        let Some(first) = rows.first() else {
+            return Ok(Vec::new());
+        };
+        let metadata_error = |operation, source| CustomDomainError::EnrichmentDatabase {
+            operation,
+            domain_id: first.id,
+            environment_id: first.environment_id,
+            certificate_id: first.certificate_id,
+            source,
+        };
+        let settings = settings::Entity::find()
             .one(self.db.as_ref())
             .await
-            .map_err(|source| CustomDomainError::EnrichmentDatabase {
-                operation: "load environment metadata",
-                domain_id: custom_domain.id,
-                certificate_id: custom_domain.certificate_id,
-                environment_id: custom_domain.environment_id,
-                source,
-            })?;
-
-        Ok(CustomDomainEnrichment {
-            custom_domain,
-            certificate,
-            environment,
-        })
+            .map_err(|e| metadata_error("load hostname settings", e))?
+            .map(|s| AppSettings::from_json(s.data))
+            .unwrap_or_default();
+        let hosts = rows
+            .iter()
+            .map(|row| row.domain.trim_end_matches('.').to_ascii_lowercase())
+            .collect();
+        let conflicts =
+            generated_address_conflicts(self.db.as_ref(), &hosts, &settings.preview_domain)
+                .await
+                .map_err(|e| metadata_error("check generated addresses", e))?;
+        let certificates: HashMap<_, _> = domains::Entity::find()
+            .filter(domains::Column::Id.is_in(rows.iter().filter_map(|r| r.certificate_id)))
+            .all(self.db.as_ref())
+            .await
+            .map_err(|e| metadata_error("load certificate metadata", e))?
+            .into_iter()
+            .map(|c| (c.id, c))
+            .collect();
+        let environments: HashMap<_, _> = environments::Entity::find()
+            .filter(environments::Column::Id.is_in(rows.iter().map(|r| r.environment_id)))
+            .all(self.db.as_ref())
+            .await
+            .map_err(|e| metadata_error("load environment metadata", e))?
+            .into_iter()
+            .map(|e| (e.id, e))
+            .collect();
+        let mut enriched = Vec::with_capacity(rows.len());
+        for mut custom_domain in rows {
+            let host = custom_domain
+                .domain
+                .trim_end_matches('.')
+                .to_ascii_lowercase();
+            let reason = if settings.is_reserved_project_domain(&host) {
+                Some("Temps reserves this hostname.")
+            } else {
+                conflicts.get(&host).map(|owner| match owner {
+                    GeneratedAddress::Environment => "An environment owns this hostname.",
+                    GeneratedAddress::Tunnel => {
+                        "A tunnel publishes an environment on this hostname."
+                    }
+                    GeneratedAddress::Deployment => "A deployment owns this hostname.",
+                })
+            };
+            if let Some(reason) = reason {
+                custom_domain.status = "hostname_conflict".into();
+                custom_domain.message = Some(format!(
+                    "Domain not served. {reason} Rename or delete this domain."
+                ));
+            }
+            enriched.push(CustomDomainEnrichment {
+                certificate: custom_domain
+                    .certificate_id
+                    .and_then(|id| certificates.get(&id).cloned()),
+                environment: environments.get(&custom_domain.environment_id).cloned(),
+                custom_domain,
+            });
+        }
+        Ok(enriched)
     }
 
     /// Confirm that both sides of a requested reassignment are in the caller's
@@ -901,13 +968,14 @@ impl CustomDomainService {
         // check inside the transaction below.
         let mut preview_domain = String::new();
 
+        let domain =
+            domain.map(|host| host.strip_suffix('.').unwrap_or(&host).to_ascii_lowercase());
         // Determine the final domain name for validation
         let final_domain = if let Some(ref new_domain) = domain {
             // Must be a hostname at all before anything else looks at it.
             Self::ensure_domain_is_wellformed(new_domain)?;
 
-            // Refuse hostnames the platform serves itself (console, preview
-            // domain and everything below it)
+            // Apply the same ownership policy as create.
             preview_domain = self.ensure_domain_not_reserved(new_domain).await?;
 
             // Check if new domain already exists (for a different record)
@@ -1223,34 +1291,14 @@ fn validate_redirect_status_code(code: i32) -> Result<(), CustomDomainError> {
 }
 
 /// Refuses a hostname another row holds. Call it under the hostname lock.
-/// The names an environment address for `domain` may be stored under: the
-/// full hostname, and, for a hostname directly under `preview_domain`, its
-/// bare label.
-fn environment_address_candidates(domain: &str, preview_domain: &str) -> Vec<String> {
-    let host = domain.trim().trim_end_matches('.').to_ascii_lowercase();
-    let preview = preview_domain
-        .trim()
-        .trim_start_matches("*.")
-        .trim_end_matches('.')
-        .to_ascii_lowercase();
-    let mut candidates = vec![host.clone()];
-    if !preview.is_empty() {
-        if let Some(label) = host.strip_suffix(&format!(".{preview}")) {
-            if !label.is_empty() && !label.contains('.') {
-                candidates.push(label.to_string());
-            }
-        }
-    }
-    candidates
-}
-
 async fn ensure_hostname_unclaimed<C: ConnectionTrait>(
     conn: &C,
     domain: &str,
     own_id: Option<i32>,
 ) -> Result<(), CustomDomainError> {
-    let mut holder = project_custom_domains::Entity::find()
-        .filter(project_custom_domains::Column::Domain.eq(domain));
+    let mut holder = project_custom_domains::Entity::find().filter(
+        sea_orm::sea_query::Expr::cust_with_values("LOWER(RTRIM(domain, '.')) = $1", [domain]),
+    );
     if let Some(own_id) = own_id {
         holder = holder.filter(project_custom_domains::Column::Id.ne(own_id));
     }
@@ -1508,68 +1556,6 @@ mod tests {
         );
     }
 
-    fn environment_domain_row(generated: Option<i32>) -> environment_domains::Model {
-        environment_domains::Model {
-            id: 7,
-            environment_id: 3,
-            domain: "shop-staging.tunnel.example.com".to_string(),
-            created_at: chrono::Utc::now(),
-            audience: "public".to_string(),
-            private_range: None,
-            private_node_id: None,
-            private_listener: None,
-            generated_by_connector_id: generated,
-            private_via: None,
-            private_service: None,
-            gate: None,
-            gate_allow: None,
-            gate_not_before: None,
-            gate_access_provider_id: None,
-            gate_access_app_id: None,
-            gate_access_aud: None,
-        }
-    }
-
-    /// ADR 068 D3: a custom domain served in place of an environment's
-    /// address would hand that address to another project. A tunnel
-    /// environment host is refused and named as one.
-    #[tokio::test]
-    async fn an_environment_address_cannot_become_a_custom_domain() {
-        use sea_orm::{DatabaseBackend, MockDatabase};
-        for (generated, says) in [
-            (Some(2), "published by a tunnel"),
-            (None, "remove it there"),
-        ] {
-            let db = MockDatabase::new(DatabaseBackend::Postgres)
-                .append_query_results([vec![environment_domain_row(generated)]])
-                .into_connection();
-            let result = CustomDomainService::ensure_not_environment_address(
-                &db,
-                "Shop-Staging.tunnel.example.com",
-                "",
-            )
-            .await;
-            match result {
-                Err(CustomDomainError::DuplicateDomain(message)) => {
-                    assert!(message.contains(says), "{message}")
-                }
-                other => panic!("expected a duplicate, got {other:?}"),
-            }
-            // Compared case-insensitively.
-            let log = format!("{:?}", db.into_transaction_log());
-            assert!(log.contains("LOWER"), "{log}");
-            assert!(log.contains("shop-staging.tunnel.example.com"), "{log}");
-        }
-        let db = MockDatabase::new(DatabaseBackend::Postgres)
-            .append_query_results([Vec::<environment_domains::Model>::new()])
-            .into_connection();
-        assert!(
-            CustomDomainService::ensure_not_environment_address(&db, "free.example.com", "")
-                .await
-                .is_ok()
-        );
-    }
-
     /// The same, end to end across two projects, on create and on rename.
     #[tokio::test]
     async fn another_projects_environment_address_is_refused_as_a_custom_domain() {
@@ -1580,7 +1566,7 @@ mod tests {
         let (_, victim_env) = insert_project_environment(&test_db.db, "Victim Shop").await;
         let (attacker, attacker_env) =
             insert_project_environment(&test_db.db, "Attacker Shop").await;
-        environment_domains::ActiveModel {
+        temps_entities::environment_domains::ActiveModel {
             environment_id: Set(victim_env.id),
             domain: Set("shop-staging.tunnel.example.com".to_string()),
             created_at: Set(chrono::Utc::now()),
@@ -1781,38 +1767,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn an_environment_address_is_looked_up_by_hostname_and_by_bare_label() {
-        // Directly under the preview domain: the stored form may be either.
-        assert_eq!(
-            environment_address_candidates("Shop-Production.Apps.Example.com.", "apps.example.com"),
-            vec!["shop-production.apps.example.com", "shop-production"]
-        );
-        // The preview domain may be configured as a wildcard.
-        assert_eq!(
-            environment_address_candidates("shop.apps.example.com", "*.apps.example.com"),
-            vec!["shop.apps.example.com", "shop"]
-        );
-        // Deeper names and other domains are compared as full hostnames only.
-        assert_eq!(
-            environment_address_candidates("a.b.apps.example.com", "apps.example.com"),
-            vec!["a.b.apps.example.com"]
-        );
-        assert_eq!(
-            environment_address_candidates("shop.other.com", "apps.example.com"),
-            vec!["shop.other.com"]
-        );
-        assert_eq!(
-            environment_address_candidates("shop.apps.example.com", ""),
-            vec!["shop.apps.example.com"]
-        );
-    }
-
-    /// Names at or below the preview domain are the platform's to generate:
-    /// refused on create and on rename, including names no environment has
-    /// taken yet.
     #[tokio::test]
-    async fn a_name_below_the_preview_domain_cannot_be_a_custom_domain() {
+    async fn friendly_preview_names_route_until_a_generated_address_claims_them() {
         let Some(test_db) = test_database().await else {
             return;
         };
@@ -1838,9 +1794,8 @@ mod tests {
         .unwrap();
 
         for below in [
-            "shop-production.apps.example.com",
-            "Shop-Production.APPS.example.com",
-            "a.b.apps.example.com",
+            "apps.example.com",
+            "*.sub.apps.example.com",
             "*.apps.example.com",
         ] {
             let result = service
@@ -1860,13 +1815,70 @@ mod tests {
             );
         }
 
-        // A lookalike outside the preview domain is an ordinary name, and it
-        // cannot be renamed into the preview domain either.
+        let db = test_db.db.as_ref();
+        let connector = temps_entities::ingress_connectors::ActiveModel {
+            name: Set("test-tunnel".into()),
+            provider: Set("cloudflare_tunnel".into()),
+            domain: Set("example.org".into()),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .unwrap();
+        for (stored, connector) in [
+            ("Stored", None),
+            ("Full.Apps.Example.com.", None),
+            ("Environment.Tunnel.Example.org.", Some(connector.id)),
+        ] {
+            temps_entities::environment_domains::ActiveModel {
+                domain: Set(stored.into()),
+                environment_id: Set(env_id),
+                generated_by_connector_id: Set(connector),
+                ..Default::default()
+            }
+            .insert(db)
+            .await
+            .unwrap();
+        }
+        let dep = temps_entities::deployments::ActiveModel {
+            project_id: Set(project_id),
+            environment_id: Set(env_id),
+            slug: Set("current-build".into()),
+            state: Set("completed".into()),
+            metadata: Set(Some(Default::default())),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .unwrap();
+        environments::ActiveModel {
+            id: Set(env_id),
+            current_deployment_id: Set(Some(dep.id)),
+            ..Default::default()
+        }
+        .update(db)
+        .await
+        .unwrap();
+        for host in [
+            "stored.apps.example.com",
+            "FULL.apps.example.com.",
+            "environment.tunnel.example.org",
+            "current-build.apps.example.com",
+        ] {
+            let result = service
+                .create_custom_domain(project_id, env_id, host.into(), None, None, None, None)
+                .await;
+            assert!(
+                matches!(result, Err(CustomDomainError::DuplicateDomain(_))),
+                "{host}: {result:?}"
+            );
+        }
+        // A later generated address takes priority without deleting the row.
         let created = service
             .create_custom_domain(
                 project_id,
                 env_id,
-                "shop-production.apps.example.org".to_string(),
+                "Api.Apps.Example.com.".to_string(),
                 None,
                 None,
                 None,
@@ -1874,10 +1886,26 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(created.domain, "api.apps.example.com");
+        temps_entities::environment_domains::ActiveModel {
+            domain: Set("API".into()),
+            environment_id: Set(env_id),
+            ..Default::default()
+        }
+        .insert(test_db.db.as_ref())
+        .await
+        .unwrap();
+        let info = service.get_domain_with_info(created.clone()).await.unwrap();
+        assert_eq!(info.custom_domain.status, "hostname_conflict");
+        assert!(info
+            .custom_domain
+            .message
+            .as_deref()
+            .is_some_and(|m| m.contains("Rename or delete")));
         let result = service
             .update_custom_domain(
                 created.id,
-                Some("shop-production.apps.example.com".to_string()),
+                Some("test-project.apps.example.com".to_string()),
                 None,
                 None,
                 None,
@@ -1889,8 +1917,8 @@ mod tests {
             )
             .await;
         assert!(
-            matches!(result, Err(CustomDomainError::InvalidDomain(_))),
-            "renaming onto a preview-domain name must be refused: {result:?}"
+            matches!(result, Err(CustomDomainError::DuplicateDomain(_))),
+            "renaming onto a generated name must be refused: {result:?}"
         );
     }
 
