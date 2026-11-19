@@ -116,6 +116,18 @@ impl SentryIngestionService {
                         deployment_id,
                     )?;
 
+                    // Inbound filters (ADR 074, D1.4) drop it before storage.
+                    if self
+                        .error_tracking_service
+                        .inbound_filter_drop(&error_data)
+                        .is_some()
+                    {
+                        if let Some(id) = event.value().and_then(|ev| ev.id.value()) {
+                            event_ids.push(id.to_string());
+                        }
+                        continue;
+                    }
+
                     // Store in database
                     let _group_id = self
                         .error_tracking_service
@@ -185,7 +197,17 @@ impl SentryIngestionService {
             deployment_id,
         )?;
 
-        // 5. Store in database
+        // 5. Inbound filters (ADR 074, D1.4) drop it before storage; the
+        //    event is acknowledged as Sentry acknowledges a filtered one.
+        if self
+            .error_tracking_service
+            .inbound_filter_drop(&error_data)
+            .is_some()
+        {
+            return Ok(event_id);
+        }
+
+        // 6. Store in database
         self.error_tracking_service
             .process_error_event(error_data)
             .await

@@ -17966,6 +17966,31 @@
         ],
         "type": "object"
       },
+      "CreateInboundFilterRequest": {
+        "properties": {
+          "enabled": {
+            "description": "Defaults to true.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "kind": {
+            "$ref": "#/components/schemas/InboundFilterKind"
+          },
+          "pattern": {
+            "description": "Required for `error_message` and `release`, refused for the others.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "type": "object"
+      },
       "CreateIncidentRequest": {
         "properties": {
           "description": {
@@ -40258,6 +40283,101 @@
           "host",
           "success",
           "sans"
+        ],
+        "type": "object"
+      },
+      "InboundFilterKind": {
+        "description": "What a rule drops.",
+        "enum": [
+          "browser_extensions",
+          "web_crawlers",
+          "localhost",
+          "error_message",
+          "release"
+        ],
+        "type": "string"
+      },
+      "InboundFilterResponse": {
+        "description": "One inbound filter rule.",
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "dropped_count": {
+            "description": "Events this rule dropped since it was created.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/InboundFilterKind"
+          },
+          "last_dropped_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "pattern": {
+            "description": "Glob for `error_message` (matched against `Type: message`) and\n`release`; `*` matches any run of characters, `?` one. Case-insensitive.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "project_id",
+          "kind",
+          "enabled",
+          "dropped_count",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
+      },
+      "InboundFiltersResponse": {
+        "description": "Every inbound filter of a project. Bounded by `limit`, so not paginated.",
+        "properties": {
+          "filters": {
+            "items": {
+              "$ref": "#/components/schemas/InboundFilterResponse"
+            },
+            "type": "array"
+          },
+          "limit": {
+            "description": "Most rules a project may hold.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "max_pattern_chars": {
+            "description": "Longest pattern a rule may hold, in characters.",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "filters",
+          "limit",
+          "max_pattern_chars"
         ],
         "type": "object"
       },
@@ -80165,6 +80285,23 @@
         "required": [
           "keep_prepared"
         ],
+        "type": "object"
+      },
+      "UpdateInboundFilterRequest": {
+        "properties": {
+          "enabled": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "pattern": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
         "type": "object"
       },
       "UpdateIncidentRequest": {
@@ -160435,6 +160572,242 @@
         "x-maturity": "beta"
       }
     },
+    "/projects/{project_id}/error-inbound-filters": {
+      "get": {
+        "operationId": "listErrorInboundFilters",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InboundFiltersResponse"
+                }
+              }
+            },
+            "description": "The project's inbound filters"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "List a project's inbound filters and how many events each dropped.",
+        "tags": [
+          "error-tracking"
+        ],
+        "x-maturity": "beta"
+      },
+      "post": {
+        "operationId": "createErrorInboundFilter",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateInboundFilterRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InboundFilterResponse"
+                }
+              }
+            },
+            "description": "Filter created"
+          },
+          "400": {
+            "description": "Invalid kind or pattern, or the project's limit is reached"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "409": {
+            "description": "The project already has this built-in filter"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Add an inbound filter. It applies to the next event.",
+        "tags": [
+          "error-tracking"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/projects/{project_id}/error-inbound-filters/{filter_id}": {
+      "delete": {
+        "operationId": "deleteErrorInboundFilter",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Inbound filter ID",
+            "in": "path",
+            "name": "filter_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Filter deleted"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "No such filter in this project"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Delete an inbound filter. Matching events are stored again from the next\none.",
+        "tags": [
+          "error-tracking"
+        ],
+        "x-maturity": "beta"
+      },
+      "patch": {
+        "operationId": "updateErrorInboundFilter",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Inbound filter ID",
+            "in": "path",
+            "name": "filter_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateInboundFilterRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InboundFilterResponse"
+                }
+              }
+            },
+            "description": "Filter updated"
+          },
+          "400": {
+            "description": "Invalid pattern"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "No such filter in this project"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Change an inbound filter's pattern or switch it on or off.",
+        "tags": [
+          "error-tracking"
+        ],
+        "x-maturity": "beta"
+      }
+    },
     "/projects/{project_id}/error-stats": {
       "get": {
         "operationId": "get_error_stats",
@@ -185524,6 +185897,10 @@
     },
     {
       "description": "Error tracking issue workflow endpoints",
+      "name": "error-tracking"
+    },
+    {
+      "description": "Error tracking inbound filters",
       "name": "error-tracking"
     },
     {

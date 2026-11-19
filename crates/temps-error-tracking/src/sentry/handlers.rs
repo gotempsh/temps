@@ -220,6 +220,20 @@ async fn ingest_sentry_event(
         }
     };
 
+    // Inbound filters (ADR 074, D1.4) drop the event before anything is
+    // stored. It is acknowledged like a stored one, as Sentry does, so the
+    // SDK neither retries nor reports an error; the rule counts the drop.
+    if state
+        .error_tracking_service
+        .inbound_filter_drop(&parsed_event.error_data)
+        .is_some()
+    {
+        let response = SentryEventResponse {
+            id: parsed_event.event_id,
+        };
+        return (StatusCode::OK, Json(response)).into_response();
+    }
+
     // Fix #2: resolve the real client IP using proxy-trust logic.
     // XFF is honored only when the direct TCP peer is loopback (our trusted Pingora proxy).
     // An attacker connecting directly and setting X-Forwarded-For is ignored.
@@ -1353,6 +1367,16 @@ async fn process_parsed_envelope(
     let mut errors_stored = 0;
     // Store each event using the error tracking service
     for mut event in batch.events {
+        // Inbound filters (ADR 074, D1.4): dropped before storage, counted
+        // per rule, and acknowledged so the SDK does not retry.
+        if state
+            .error_tracking_service
+            .inbound_filter_drop(&event.error_data)
+            .is_some()
+        {
+            domains.errors_filtered += 1;
+            continue;
+        }
         // Enrich with IP geolocation and visitor correlation
         enrich_error_event(
             &mut event.error_data,
@@ -1542,6 +1566,7 @@ struct DomainReceipts {
     feedback: u64,
     feedback_duplicates: u64,
     errors_duplicates: u64,
+    errors_filtered: u64,
     spans: u64,
     metrics: u64,
     replay_segments: u64,
@@ -1564,6 +1589,7 @@ impl DomainReceipts {
                 self.feedback_duplicates,
             ),
             ("x-temps-sentry-errors-duplicates", self.errors_duplicates),
+            ("x-temps-sentry-errors-filtered", self.errors_filtered),
             ("x-temps-sentry-spans-stored", self.spans),
             ("x-temps-sentry-metrics-stored", self.metrics),
             (
@@ -3931,6 +3957,78 @@ mod tests {
 
         // Should successfully ingest the event
         assert_eq!(response.status_code(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn an_inbound_filter_drops_a_matching_envelope_event_before_storage() {
+        use crate::services::inbound_filters::InboundFilterKind;
+        let ctx = create_test_context().await;
+        let tracking = ctx.app_state.error_tracking_service.clone();
+        let rule = tracking
+            .inbound_filters
+            .create(
+                ctx.project_id,
+                InboundFilterKind::ErrorMessage,
+                Some("Error: *noisy widget*".into()),
+                true,
+            )
+            .await
+            .unwrap();
+        let app = configure_routes().with_state(ctx.app_state.clone());
+        let server = TestServer::new(app);
+        let auth_header = format!("Sentry sentry_key={},sentry_version=7", ctx.dsn_key);
+        let send = |event_id: &'static str, message: &'static str| {
+            let body = format!(
+                "{{\"event_id\":\"{event_id}\"}}\n{{\"type\":\"event\"}}\n{{\"platform\":\"javascript\",\"level\":\"error\",\"exception\":{{\"values\":[{{\"type\":\"Error\",\"value\":\"{message}\"}}]}}}}\n"
+            );
+            server
+                .post(&format!("/{}/envelope/", ctx.project_id))
+                .content_type("application/octet-stream")
+                .add_header(
+                    HeaderName::from_static("x-sentry-auth"),
+                    HeaderValue::from_str(&auth_header).unwrap(),
+                )
+                .bytes(Bytes::from(body))
+        };
+
+        let filtered = send(
+            "6f1d2c3b4a5e6f708192a3b4c5d6e7f8",
+            "the noisy widget failed",
+        )
+        .await;
+        assert_eq!(
+            filtered.status_code(),
+            StatusCode::OK,
+            "acknowledged, not rejected"
+        );
+        assert_eq!(filtered.header("x-temps-sentry-errors-filtered"), "1");
+        let kept = send("1a2b3c4d5e6f708192a3b4c5d6e7f809", "checkout failed").await;
+        assert_eq!(kept.status_code(), StatusCode::OK);
+        assert_eq!(kept.header("x-temps-sentry-errors-filtered"), "0");
+
+        let (groups, total) = tracking
+            .list_error_groups(
+                ctx.project_id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(total, 1, "only the unfiltered event was stored");
+        assert!(groups[0].title.contains("checkout failed"));
+        let listed = tracking.inbound_filters.list(ctx.project_id).await.unwrap();
+        assert_eq!(listed[0].id, rule.id);
+        assert_eq!(
+            listed[0].dropped_count, 1,
+            "the drop is counted against the rule"
+        );
     }
 
     #[tokio::test]

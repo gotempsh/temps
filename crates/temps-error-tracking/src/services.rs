@@ -7,6 +7,7 @@ pub mod error_crud_service;
 pub mod error_ingestion_service;
 pub mod error_tracking_service;
 pub mod group_workflow;
+pub mod inbound_filters;
 pub mod source_map_service;
 pub mod types;
 

@@ -26,6 +26,7 @@ import { newline, header, icons, json, colors, success, info, warning, keyValue,
 import { readFile, readdir } from 'node:fs/promises'
 import { existsSync, statSync } from 'node:fs'
 import { resolve, basename, join } from 'node:path'
+import { registerInboundFilterCommands } from './filters.js'
 
 interface ListOptions {
   projectId: string
@@ -450,6 +451,8 @@ export function registerErrorsCommands(program: Command): void {
     .requiredOption('--group-id <id>', 'Error group ID')
     .option('--json', 'Output in JSON format')
     .action(listErrorGroupFingerprintsAction)
+
+  registerInboundFilterCommands(errors)
 
   errors
     .command('events')

@@ -62,6 +62,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
     Router::new()
         .merge(super::feedback_handler::routes())
         .merge(super::group_workflow_handler::routes())
+        .merge(super::inbound_filter_handler::routes())
         .merge(super::release_handler::routes())
         .merge(super::client_outcome_handler::routes())
         .route("/error-groups", get(list_global_error_groups))
@@ -374,6 +375,35 @@ impl From<ErrorTrackingError> for temps_core::problemdetails::Problem {
                 .value("group_id", group_id)
                 .value("merged_into_group_id", merged_into_group_id)
                 .build(),
+            ErrorTrackingError::InboundFilterNotFound {
+                project_id,
+                filter_id,
+            } => temps_core::error_builder::ErrorBuilder::new(StatusCode::NOT_FOUND)
+                .type_("https://temps.sh/probs/error-inbound-filter-not-found")
+                .title("Inbound Filter Not Found")
+                .detail(err.to_string())
+                .value("project_id", project_id)
+                .value("filter_id", filter_id)
+                .build(),
+            ErrorTrackingError::InboundFilterExists {
+                project_id,
+                ref kind,
+            } => temps_core::error_builder::ErrorBuilder::new(StatusCode::CONFLICT)
+                .type_("https://temps.sh/probs/error-inbound-filter-exists")
+                .title("Inbound Filter Already Exists")
+                .detail(err.to_string())
+                .value("project_id", project_id)
+                .value("kind", kind.clone())
+                .build(),
+            ErrorTrackingError::InboundFilterLimit { project_id, limit } => {
+                temps_core::error_builder::ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                    .type_("https://temps.sh/probs/error-inbound-filter-limit")
+                    .title("Inbound Filter Limit Reached")
+                    .detail(err.to_string())
+                    .value("project_id", project_id)
+                    .value("limit", limit)
+                    .build()
+            }
             ErrorTrackingError::GroupIsMergeTarget { group_id } => {
                 temps_core::error_builder::ErrorBuilder::new(StatusCode::CONFLICT)
                     .type_("https://temps.sh/probs/error-group-is-merge-target")
@@ -429,12 +459,19 @@ impl axum::response::IntoResponse for ErrorTrackingError {
                 (StatusCode::NOT_FOUND, "Error group not found".to_string())
             }
             ErrorTrackingError::GroupsNotFound { .. }
+            | ErrorTrackingError::InboundFilterNotFound { .. }
             | ErrorTrackingError::FingerprintsNotInGroup { .. } => {
                 (StatusCode::NOT_FOUND, self.to_string())
             }
             ErrorTrackingError::GroupAlreadyMerged { .. }
             | ErrorTrackingError::GroupIsMergeTarget { .. }
-            | ErrorTrackingError::GroupNotMerged { .. } => (StatusCode::CONFLICT, self.to_string()),
+            | ErrorTrackingError::GroupNotMerged { .. }
+            | ErrorTrackingError::InboundFilterExists { .. } => {
+                (StatusCode::CONFLICT, self.to_string())
+            }
+            ErrorTrackingError::InboundFilterLimit { .. } => {
+                (StatusCode::BAD_REQUEST, self.to_string())
+            }
             ErrorTrackingError::EventNotFound => {
                 (StatusCode::NOT_FOUND, "Error event not found".to_string())
             }

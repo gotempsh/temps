@@ -87,6 +87,7 @@ impl ErrorTrackingPlugin {
                     "Client outcome retention cleanup failed"
                 );
             }
+            tracking.refresh_inbound_filters().await;
             ticks += 1;
             if ticks == 1440 {
                 alert_service.cleanup_old_fires(retention_days).await;
@@ -133,6 +134,10 @@ impl TempsPlugin for ErrorTrackingPlugin {
             // Register core error tracking service (with source map support)
             let error_tracking_service = Arc::new(ErrorTrackingService::new(db.clone()));
             error_tracking_service.set_source_map_service(source_map_service);
+            // Inbound filters apply from the first event after boot. A failed
+            // load is retried by the cleanup loop's refresh every 15 seconds;
+            // until then events are stored, never dropped by mistake.
+            error_tracking_service.refresh_inbound_filters().await;
 
             // AlarmService isn't registered yet at this point (Monitoring
             // registers after Error Tracking) — wired in via
@@ -522,6 +527,10 @@ impl TempsPlugin for ErrorTrackingPlugin {
             ),
         );
         schema.merge(
+            <crate::handlers::inbound_filter_handler::InboundFilterApiDoc as OpenApiTrait>::openapi(
+            ),
+        );
+        schema.merge(
             <crate::handlers::client_outcome_handler::ClientOutcomeApiDoc as OpenApiTrait>::openapi(
             ),
         );
@@ -593,6 +602,23 @@ mod tests {
     async fn test_error_tracking_plugin_default() {
         let plugin = ErrorTrackingPlugin;
         assert_eq!(plugin.name(), "error-tracking");
+    }
+
+    #[test]
+    fn the_published_schema_documents_the_triage_and_filter_routes() {
+        let schema = ErrorTrackingPlugin::new()
+            .openapi_schema()
+            .expect("the plugin publishes a schema");
+        for path in [
+            "/projects/{project_id}/error-groups/bulk",
+            "/projects/{project_id}/error-inbound-filters",
+            "/projects/{project_id}/error-inbound-filters/{filter_id}",
+        ] {
+            assert!(
+                schema.paths.paths.contains_key(path),
+                "{path} is routed but missing from the OpenAPI schema"
+            );
+        }
     }
 
     /// Minimal `JobQueue` backed by a real `tokio::sync::broadcast` channel

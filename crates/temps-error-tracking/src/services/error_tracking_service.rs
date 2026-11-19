@@ -41,6 +41,9 @@ pub struct ErrorTrackingService {
     pub client_outcomes: super::client_outcome_service::ClientOutcomeService,
     pub releases: super::release_service::ReleaseService,
     pub workflow: GroupWorkflowService,
+    /// Inbound filter rules (ADR 074, D1.4).
+    pub inbound_filters: super::inbound_filters::InboundFilterService,
+    inbound_filter_registry: Arc<super::inbound_filters::InboundFilterRegistry>,
     source_map_service: OnceCell<Arc<SourceMapService>>,
     notification_callback: OnceCell<NotificationCallback>,
     autopilot_callback: OnceCell<NotificationCallback>,
@@ -49,6 +52,8 @@ pub struct ErrorTrackingService {
 
 impl ErrorTrackingService {
     pub fn new(db: Arc<DatabaseConnection>) -> Self {
+        let inbound_filter_registry =
+            Arc::new(super::inbound_filters::InboundFilterRegistry::new());
         Self {
             db: db.clone(),
             ingestion: ErrorIngestionService::new(db.clone()),
@@ -58,6 +63,11 @@ impl ErrorTrackingService {
             client_outcomes: super::client_outcome_service::ClientOutcomeService::new(db.clone()),
             releases: super::release_service::ReleaseService::new(db.clone()),
             workflow: GroupWorkflowService::new(db.clone()),
+            inbound_filters: super::inbound_filters::InboundFilterService::new(
+                db.clone(),
+                inbound_filter_registry.clone(),
+            ),
+            inbound_filter_registry,
             alerts: ErrorAlertService::new(db),
             source_map_service: OnceCell::new(),
             notification_callback: OnceCell::new(),
@@ -160,6 +170,36 @@ impl ErrorTrackingService {
             .await
             .ok()
             .flatten()
+    }
+
+    /// The inbound filter rule that drops this Sentry error event, if any
+    /// (ADR 074, D1.4). Called at ingest before anything is stored: an
+    /// in-memory lookup with no lock and no database call. The drop is
+    /// counted against the rule.
+    pub fn inbound_filter_drop(&self, error_data: &CreateErrorEventData) -> Option<i32> {
+        self.inbound_filter_registry.evaluate(error_data)
+    }
+
+    /// Flush the inbound filters' drop counters and reload the rules if any
+    /// changed. Run by the plugin's cleanup loop; failures are logged and
+    /// retried on the next tick, and the rules in memory stay in force.
+    pub async fn refresh_inbound_filters(&self) {
+        if let Err(error) = self.inbound_filter_registry.flush(self.db.as_ref()).await {
+            tracing::warn!(
+                error = %error,
+                "Failed to flush inbound filter drop counts; they are kept for the next attempt"
+            );
+        }
+        if let Err(error) = self
+            .inbound_filter_registry
+            .refresh_if_changed(self.db.as_ref())
+            .await
+        {
+            tracing::warn!(
+                error = %error,
+                "Failed to refresh inbound filters; the rules in memory stay in force"
+            );
+        }
     }
 
     // Convenience methods that delegate to specialized services

@@ -74,6 +74,21 @@ pub enum ErrorTrackingError {
         fingerprints: Vec<String>,
     },
 
+    /// An inbound filter id that is not a rule of the project.
+    /// Maps to HTTP 404 Not Found.
+    #[error("Inbound filter {filter_id} not found in project {project_id}")]
+    InboundFilterNotFound { project_id: i32, filter_id: i32 },
+
+    /// A built-in inbound filter kind the project already has.
+    /// Maps to HTTP 409 Conflict.
+    #[error("Project {project_id} already has a '{kind}' inbound filter")]
+    InboundFilterExists { project_id: i32, kind: String },
+
+    /// The project holds as many inbound filters as it may.
+    /// Maps to HTTP 400 Bad Request.
+    #[error("Project {project_id} already has the maximum of {limit} inbound filters")]
+    InboundFilterLimit { project_id: i32, limit: u64 },
+
     #[error("Error event not found")]
     EventNotFound,
 

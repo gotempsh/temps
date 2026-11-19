@@ -3,9 +3,9 @@
 ## Status
 
 Proposed — 2026-11-19. Being implemented in the order of the Decision
-section. D1.1 (bulk actions), D1.2 (merge and split) and D1.3 (ignore
-until) have shipped; the questions they settled are recorded under
-"Settled while implementing".
+section. D1.1 (bulk actions), D1.2 (merge and split), D1.3 (ignore
+until) and D1.4 (inbound filters) have shipped; the questions they settled
+are recorded under "Settled while implementing".
 
 Related: ADR 016 (ClickHouse traces backend), ADR 027 (cross-project trace
 linking), ADR 033 (release identity for symbolication), ADR 054 (autofix
@@ -249,3 +249,27 @@ deploys, which is web services. It comes last and may never be worth building.
   other status clears them), and ignoring an ignored group with conditions
   replaces them. A group that stays ignored fires no alerts; when it comes
   back it is a regression like any other.
+
+### D1.4 Inbound filters
+
+- Five rule kinds, per project, in `error_inbound_filters`: browser
+  extensions, web crawlers and localhost (built in, at most one of each),
+  and error message and release (a case-insensitive glob, `*` and `?`
+  only, at most 200 characters). No regular expressions: a glob cannot be
+  written to take super-linear time, and its matching is bounded by
+  cutting the text to 1,024 characters. At most 50 rules per project.
+- Ingest reads an immutable snapshot of every enabled rule behind an
+  `ArcSwap`, keyed by project: no lock and no database call per event. A
+  write through the API swaps the snapshot before it returns; other
+  processes pick a change up within 15 seconds from a `COUNT(*)` and
+  `MAX(updated_at)` check, and reload only when it differs.
+- Drops are counted per rule in an atomic counter that survives a reload,
+  and added to `dropped_count` and `last_dropped_at` every 15 seconds in
+  one statement; a failed flush keeps the counts for the next one. A crash
+  loses at most those 15 seconds of counts. Reads add the unflushed counts.
+- Filters apply to error events only (store endpoint and envelope `event`
+  items), after the project is resolved and before symbolication or
+  storage. A dropped event is answered as accepted, so the SDK neither
+  retries it nor records it as lost; the envelope response counts it in
+  `x-temps-sentry-errors-filtered`. Sentry instead reports a filtered event
+  as a client outcome; Temps has no server-side outcomes to report it to.

@@ -118,7 +118,7 @@ These checks use synthetic applications, real HTTP endpoints, native storage que
 | Errors, messages and stacks | Adapted: native error events, groups and stack details | Symbolication depends on available native source artifacts; native crash decoding is separate. |
 | Breadcrumbs, users, tags and contexts | Adapted: error detail payload and native metadata | User/request/browser/runtime fields populate native details; exact user/tag filtering is available on native event queries. Other typed contexts stay in JSON metadata and the original source event. Not every field has a separate index. |
 | Fingerprints and grouping | Adapted: native fingerprints and grouping; concurrent insertion and counts reconciled; native extension: reversible group merge and fingerprint split | Explicit SDK fingerprints and `{{ default }}` are supported. Default grouping uses Temps stack/message normalization, not Sentry server algorithm versions. Grouping configuration APIs are not provided. A merge or split redirects future events and never rewrites stored ones. |
-| Issue APIs and triage | Existing native error list, detail and resolution APIs/UI; native extension: bulk resolve/reopen/ignore by ID or filter (`POST /projects/{project_id}/error-groups/bulk`, `temps errors bulk`) | Sentry issue APIs are not implemented. Bulk requests are capped at 1,000 groups and 50 status-change notifications each. |
+| Issue APIs and triage | Existing native error list, detail and resolution APIs/UI; native extension: bulk resolve/reopen/ignore by ID or filter (`POST /projects/{project_id}/error-groups/bulk`, `temps errors bulk`); ignore until a time, count or user count; server-side [inbound filters](#inbound-filters) that drop matching events before storage | Sentry issue APIs are not implemented. Bulk requests are capped at 1,000 groups and 50 status-change notifications each. |
 | Alert APIs and alerts | Existing Temps alert rules and alarms; cron health feeds native alarms | Sentry alert APIs are not implemented. Delivery requires a configured provider; external delivery was not verified in the synthetic run. |
 | Debug ID source maps and artifact bundles | Adapted: CLI artifact bundles imported into native source maps; exact Debug ID lookup without a release, including maps uploaded after an error | Full-access project build credential required; public DSNs cannot access artifacts. SYSB v2, stored/deflated ZIP entries, 50 MiB compressed/expanded bundle, 256 files, 128 maps. Symbolication loads at most 32 maps/50 MiB per event; staged chunks expire after one hour (64 MiB/project, 256 MiB globally). Indexed/Hermes/native debug artifacts are outside this contract. |
 | Releases | Native extension: correlate retained errors, logs, spans, metric points, feedback and check-ins by SDK release version | Errors → Releases shows exact counts and native example links in a bounded 1–31 day window. Deployment/finalization, commits and release health are separate workflows. |
@@ -816,7 +816,47 @@ await fetch('https://your-temps-instance.com/api/projects/42/error-groups/123', 
 
 The conditions are checked in the statement that already counts the event in its group, so they cost nothing per event. Users are counted under the first of the event's user ID, email, username, IP address and visitor, exactly and only while a user condition is active; the count and the users behind it are forgotten when the group comes back or its status changes. While a group stays ignored it fires no alerts. When a condition is met the group reopens as `unresolved`, which is a regression like any other: regression alert rules fire once. Any status change clears the conditions, and ignoring an ignored group again replaces them. The group's `ignore` field shows the conditions and progress; the console shows them on the group page and offers the presets from the Ignore menu.
 
-Ignoring by message pattern is done in the SDK with `ignoreErrors`, as shown above; the server has no pattern rules.
+### Inbound Filters {{ anchor: true, id: 'inbound-filters' }}
+
+Ignoring a group still stores every event. To stop storing noise at all, add an inbound filter: a per-project rule that drops a matching error event when it arrives, before it is grouped, counted or alerted on. Filters apply to every SDK and release at once, with no redeploy, which is what `ignoreErrors` in the SDK cannot do for clients already in the field.
+
+| Kind | Drops an error event when | Pattern |
+|---|---|---|
+| Browser extensions | a stack frame's file is a `chrome-extension://`, `moz-extension://`, `safari-extension://`, `safari-web-extension://`, `ms-browser-extension://` or `edge-extension://` URL | none |
+| Web crawlers | the request's user agent names a known crawler, link previewer or uptime bot (Googlebot, Bingbot, facebookexternalhit, GPTBot, Pingdom, ...) | none |
+| Localhost | the page URL's host is `localhost`, `*.localhost`, `0.0.0.0` or a loopback IP, or the user's IP is a loopback address | none |
+| Error message | an exception's `Type: message` (or the type or message alone, when only one is set) matches | glob, such as `*ResizeObserver loop*` |
+| Release | the event's release matches | glob, such as `0.9.*` |
+
+Globs match the whole text, case-insensitively: `*` matches any run of characters and `?` exactly one; anything else is literal. Patterns are at most 200 characters and are matched against the first 1,024 characters of the text. A project holds at most 50 filters, and each built-in kind once.
+
+Open **Errors → Inbound filters** in a project to add, switch off and delete filters. Each filter shows how many events it dropped and when it last dropped one, so a filter that eats real errors is visible.
+
+<CodeGroup title="Inbound Filters">
+```bash {{ title: 'CLI' }}
+# Drop errors raised inside browser extensions
+temps errors filters add --project-id 42 --kind browser-extensions
+
+# Drop a known-noisy message from every client
+temps errors filters add --project-id 42 --kind error-message --pattern "*ResizeObserver loop*"
+
+# See what each filter dropped; switch one off
+temps errors filters list --project-id 42
+temps errors filters update --project-id 42 --filter-id 7 --disable
+```
+
+```typescript {{ title: 'API' }}
+await fetch('https://your-temps-instance.com/api/projects/42/error-inbound-filters', {
+  method: 'POST',
+  headers: { 'Authorization': `Bearer ${API_KEY}`, 'Content-Type': 'application/json' },
+  body: JSON.stringify({ kind: 'release', pattern: '0.9.*' })
+});
+```
+</CodeGroup>
+
+A dropped event is acknowledged to the SDK as accepted, so the SDK neither retries it nor reports it as lost, and it is not stored anywhere: it cannot be recovered by deleting the filter. Filters apply to error events only; transactions, logs, replays and feedback are not filtered. A change made in the console or API takes effect for the next event on the server that handled it, and on other servers sharing the database within about 15 seconds. Reading and writing filters needs the error-tracking read and write permissions; every change is audit-logged.
+
+Filters are evaluated in memory with no database call and no lock per event; drop counts are kept in memory and written to the database every 15 seconds, so a crash can lose up to 15 seconds of counts but never an event that should have been kept.
 
 ---
 

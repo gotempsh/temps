@@ -8588,6 +8588,18 @@ export type CreateGroupRouteRequest = {
     target_project_id: number;
 };
 
+export type CreateInboundFilterRequest = {
+    /**
+     * Defaults to true.
+     */
+    enabled?: boolean | null;
+    kind: InboundFilterKind;
+    /**
+     * Required for `error_message` and `release`, refused for the others.
+     */
+    pattern?: string | null;
+};
+
 export type CreateIncidentRequest = {
     description?: string | null;
     environment_id?: number | null;
@@ -18883,6 +18895,48 @@ export type ImportedHostVerdict = {
      * Whether the cert was written (or would be written on `dry_run: false`).
      */
     success: boolean;
+};
+
+/**
+ * What a rule drops.
+ */
+export type InboundFilterKind = 'browser_extensions' | 'web_crawlers' | 'localhost' | 'error_message' | 'release';
+
+/**
+ * One inbound filter rule.
+ */
+export type InboundFilterResponse = {
+    created_at: string;
+    /**
+     * Events this rule dropped since it was created.
+     */
+    dropped_count: number;
+    enabled: boolean;
+    id: number;
+    kind: InboundFilterKind;
+    last_dropped_at?: string | null;
+    /**
+     * Glob for `error_message` (matched against `Type: message`) and
+     * `release`; `*` matches any run of characters, `?` one. Case-insensitive.
+     */
+    pattern?: string | null;
+    project_id: number;
+    updated_at: string;
+};
+
+/**
+ * Every inbound filter of a project. Bounded by `limit`, so not paginated.
+ */
+export type InboundFiltersResponse = {
+    filters: Array<InboundFilterResponse>;
+    /**
+     * Most rules a project may hold.
+     */
+    limit: number;
+    /**
+     * Longest pattern a rule may hold, in characters.
+     */
+    max_pattern_chars: number;
 };
 
 export type IncidentBucket = {
@@ -37275,6 +37329,11 @@ export type UpdateHostImagePreparationBody = {
      * upgrade changes the default. `false` stops that; it removes nothing.
      */
     keep_prepared: boolean;
+};
+
+export type UpdateInboundFilterRequest = {
+    enabled?: boolean | null;
+    pattern?: string | null;
 };
 
 /**
@@ -84480,6 +84539,178 @@ export type UnmergeErrorGroupResponses = {
 };
 
 export type UnmergeErrorGroupResponse2 = UnmergeErrorGroupResponses[keyof UnmergeErrorGroupResponses];
+
+export type ListErrorInboundFiltersData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/error-inbound-filters';
+};
+
+export type ListErrorInboundFiltersErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListErrorInboundFiltersResponses = {
+    /**
+     * The project's inbound filters
+     */
+    200: InboundFiltersResponse;
+};
+
+export type ListErrorInboundFiltersResponse = ListErrorInboundFiltersResponses[keyof ListErrorInboundFiltersResponses];
+
+export type CreateErrorInboundFilterData = {
+    body: CreateInboundFilterRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/error-inbound-filters';
+};
+
+export type CreateErrorInboundFilterErrors = {
+    /**
+     * Invalid kind or pattern, or the project's limit is reached
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * The project already has this built-in filter
+     */
+    409: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type CreateErrorInboundFilterResponses = {
+    /**
+     * Filter created
+     */
+    201: InboundFilterResponse;
+};
+
+export type CreateErrorInboundFilterResponse = CreateErrorInboundFilterResponses[keyof CreateErrorInboundFilterResponses];
+
+export type DeleteErrorInboundFilterData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Inbound filter ID
+         */
+        filter_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/error-inbound-filters/{filter_id}';
+};
+
+export type DeleteErrorInboundFilterErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * No such filter in this project
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type DeleteErrorInboundFilterResponses = {
+    /**
+     * Filter deleted
+     */
+    204: void;
+};
+
+export type DeleteErrorInboundFilterResponse = DeleteErrorInboundFilterResponses[keyof DeleteErrorInboundFilterResponses];
+
+export type UpdateErrorInboundFilterData = {
+    body: UpdateInboundFilterRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Inbound filter ID
+         */
+        filter_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/error-inbound-filters/{filter_id}';
+};
+
+export type UpdateErrorInboundFilterErrors = {
+    /**
+     * Invalid pattern
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * No such filter in this project
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UpdateErrorInboundFilterResponses = {
+    /**
+     * Filter updated
+     */
+    200: InboundFilterResponse;
+};
+
+export type UpdateErrorInboundFilterResponse = UpdateErrorInboundFilterResponses[keyof UpdateErrorInboundFilterResponses];
 
 export type GetErrorStatsData = {
     body?: never;

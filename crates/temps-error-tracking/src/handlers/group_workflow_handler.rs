@@ -615,7 +615,7 @@ fn audit_context(auth: &temps_authz::AuthContext, metadata: &RequestMetadata) ->
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::services::error_alert_service::ErrorAlertService;
     use crate::services::error_tracking_service::ErrorTrackingService;
@@ -628,8 +628,8 @@ mod tests {
     use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
 
     #[derive(Default)]
-    struct RecordingAuditLogger {
-        entries: Mutex<Vec<(String, serde_json::Value)>>,
+    pub(crate) struct RecordingAuditLogger {
+        pub(crate) entries: Mutex<Vec<(String, serde_json::Value)>>,
     }
 
     #[async_trait]
@@ -653,7 +653,7 @@ mod tests {
         }
     }
 
-    fn test_user(id: i32, role: Role) -> AuthContext {
+    pub(crate) fn test_user(id: i32, role: Role) -> AuthContext {
         let now = chrono::Utc::now();
         AuthContext::new_session(
             users::Model {
@@ -680,7 +680,7 @@ mod tests {
         )
     }
 
-    fn metadata() -> RequestMetadata {
+    pub(crate) fn metadata() -> RequestMetadata {
         RequestMetadata {
             ip_address: "203.0.113.9".to_string(),
             user_agent: "bulk-test".to_string(),
@@ -694,7 +694,7 @@ mod tests {
         }
     }
 
-    async fn seed(db: &sea_orm::DatabaseConnection) -> (i32, i32, i32) {
+    pub(crate) async fn seed(db: &sea_orm::DatabaseConnection) -> (i32, i32, i32) {
         let now = chrono::Utc::now();
         let project = projects::ActiveModel {
             name: Set("Bulk Project".to_string()),
@@ -741,7 +741,7 @@ mod tests {
         (project.id, ids[0], ids[1])
     }
 
-    fn app_state(
+    pub(crate) fn app_state(
         db: &Arc<sea_orm::DatabaseConnection>,
         audit: Arc<RecordingAuditLogger>,
     ) -> Arc<AppState> {
