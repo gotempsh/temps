@@ -538,6 +538,9 @@ pub struct LoadBalancer {
     /// The header a trusted loopback proxy sends the visitor's JA4 in
     /// (ADR 066, D4). Refreshed from the platform settings; read lock-free.
     loopback_ja4_header: Arc<arc_swap::ArcSwapOption<axum::http::HeaderName>>,
+    /// The loopback listener the control plane's own tunnel connectors
+    /// forward to (ADR-107 D3). `None` outside `temps serve`.
+    tunnel_origin: Option<Arc<temps_core::tunnel_origin::ControlPlaneTunnelOrigin>>,
     on_demand_manager: Option<Arc<OnDemandManager>>,
     /// On-demand HTTP-01 TLS cert manager (ADR-018). When set, the port-80
     /// `request_filter` reads its in-process state cache (NO DB hit) to serve a
@@ -827,6 +830,7 @@ impl LoadBalancer {
             trust_loopback_forwarded_ip: Arc::new(AtomicBool::new(false)),
             expose_platform_identity: Arc::new(AtomicBool::new(false)),
             loopback_ja4_header: Arc::new(arc_swap::ArcSwapOption::empty()),
+            tunnel_origin: None,
             on_demand_manager: None,
             on_demand_cert_manager: None,
             route_table: None,
@@ -1006,6 +1010,16 @@ impl LoadBalancer {
     /// Enable forwarded client IPs only for an explicitly configured local proxy.
     pub fn with_trust_loopback_forwarded_ip(mut self, enabled: Arc<AtomicBool>) -> Self {
         self.trust_loopback_forwarded_ip = enabled;
+        self
+    }
+
+    /// Treat requests on the control plane's tunnel origin as having come
+    /// through its tunnel (ADR-107 D3).
+    pub fn with_tunnel_origin(
+        mut self,
+        origin: Option<Arc<temps_core::tunnel_origin::ControlPlaneTunnelOrigin>>,
+    ) -> Self {
+        self.tunnel_origin = origin;
         self
     }
 
@@ -1523,7 +1537,24 @@ impl LoadBalancer {
         // Trusting the header let a client on the plain-HTTP listener spoof
         // `https`, influencing Secure-cookie attributes and the proto we forward
         // upstream.
-        self.is_tls_connection(session)
+        //
+        // The one exception is decided by the listener, never by a header:
+        // the control plane's tunnel origin on loopback, which only the
+        // tunnel's connector reaches, after the provider's edge terminated
+        // the visitor's HTTPS (ADR-107 D3, ADR-070).
+        self.is_tls_connection(session) || self.via_tunnel_origin(session)
+    }
+
+    /// Whether this request came in on the control plane's tunnel origin
+    /// (ADR-107 D3). Two atomic loads; no lock.
+    pub(crate) fn via_tunnel_origin(&self, session: &PingoraSession) -> bool {
+        let Some(origin) = self.tunnel_origin.as_deref() else {
+            return false;
+        };
+        session
+            .server_addr()
+            .and_then(|address| address.as_inet())
+            .is_some_and(|local| origin.is_origin(*local))
     }
 
     /// Check if the connection is a TLS connection by checking for SSL digest

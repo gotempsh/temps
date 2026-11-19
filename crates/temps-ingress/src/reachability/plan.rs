@@ -264,6 +264,11 @@ pub struct PlanFacts {
     pub control_plane_refusal: Option<String>,
     /// Active workers that let Temps run a tunnel on them.
     pub tunnel_workers: Vec<NamedId>,
+    /// Whether the control plane can run a tunnel itself (ADR-107 D2): it
+    /// runs connectors in this process and its proxy took the tunnel origin.
+    pub control_plane_tunnels: bool,
+    /// Why it cannot, when [`Self::control_plane_tunnels`] is false.
+    pub control_plane_tunnel_refusal: Option<String>,
     /// Active workers whose owner keeps Temps from exposing them.
     pub workers_refusing: Vec<String>,
     /// Whether workers serve the environment, so a tunnel can carry it.
@@ -522,13 +527,21 @@ pub fn fingerprint(facts: &PlanFacts, address: Option<&str>) -> String {
         .as_ref()
         .map(|c| (c.id, c.refusal.is_some()));
     let seen = &facts.service_seen;
+    // ADR-107 D5: a control plane that can run the tunnel offers what one
+    // that cannot does not. Only appended when it can, so other plans hash
+    // as before.
+    let served = if facts.control_plane_tunnels {
+        format!("{}|cp", facts.served_by_workers)
+    } else {
+        facts.served_by_workers.to_string()
+    };
     let canonical = format!(
         "v5|{:?}|{address:?}|{audiences:?}|{}|{}|{}|{tunnels:?}|{choices:?}|{zones:?}|\
          {accounts:?}|{directs:?}|{modes:?}|{intent:?}|{:?}|{records:?}|{private_workers:?}|\
          {ranges:?}|{tailnet:?}|{entries:?}|{credential:?}|{seen:?}|{:?}{}",
         facts.audience,
         facts.deployed,
-        facts.served_by_workers,
+        served,
         address.is_some_and(|a| facts.taken_elsewhere.contains(a)),
         facts.private_rule,
         facts.environment_host_label,
@@ -562,17 +575,59 @@ pub struct TunnelRoute<'a> {
     pub confirmation: Option<String>,
 }
 
-fn usable(tunnel: &TunnelFact) -> bool {
-    tunnel.ready && tunnel.has_nodes
+/// Whether `tunnel` can carry this environment: ready, running somewhere,
+/// and served by every replica (ADR-107 D4). The control plane serves every
+/// deployed environment, workers only what [`PlanFacts::served_by_workers`]
+/// says, and nothing is deployed yet is served once it is.
+fn usable(facts: &PlanFacts, tunnel: &TunnelFact) -> bool {
+    tunnel.ready
+        && tunnel.has_nodes
+        && (!tunnel.on_workers || !facts.deployed || facts.served_by_workers)
 }
 
-fn unusable_because(tunnel: &TunnelFact) -> &'static str {
-    if tunnel.ready {
-        "runs on no worker"
+fn unusable_because(facts: &PlanFacts, tunnel: &TunnelFact) -> String {
+    if !tunnel.ready {
+        "is not ready".to_string()
+    } else if !tunnel.has_nodes {
+        "runs nowhere: run it on the control plane or on a worker".to_string()
     } else {
-        "is not ready"
+        format!(
+            "runs on a worker, which does not serve {}",
+            facts.environment_name
+        )
     }
 }
+
+/// Whether any tunnel could carry this environment: through a worker that
+/// serves it, or through the control plane, which serves every environment
+/// (ADR-107 D4, D5).
+fn tunnels_can_serve(facts: &PlanFacts) -> bool {
+    !facts.deployed
+        || facts.served_by_workers
+        || facts.control_plane_tunnels
+        || facts
+            .tunnels
+            .iter()
+            .any(|t| t.on_control_plane && !t.on_workers)
+}
+
+/// Where a new tunnel runs: a worker that serves the environment and lets
+/// Temps run a tunnel, else the control plane when it can (ADR-107 D5).
+pub fn new_tunnel_node(facts: &PlanFacts) -> Option<NamedId> {
+    let worker = facts
+        .tunnel_workers
+        .first()
+        .filter(|_| !facts.deployed || facts.served_by_workers);
+    worker.cloned().or_else(|| {
+        facts.control_plane_tunnels.then(|| NamedId {
+            id: temps_core::CONTROL_PLANE_NODE_ID,
+            name: CONTROL_PLANE_NAME.to_string(),
+        })
+    })
+}
+
+/// How plans name the control plane as the place a tunnel runs.
+pub const CONTROL_PLANE_NAME: &str = "the control plane";
 
 /// Which tunnel carries `host`: the one that would publish it, else the
 /// most specific covering one with its choice recorded and confirmed.
@@ -580,7 +635,7 @@ pub fn tunnel_route<'a>(facts: &'a PlanFacts, host: &str) -> Option<TunnelRoute<
     let intent = Some(intent_of(facts, host));
     let find = |id: i32| facts.tunnels.iter().find(|t| t.id == id);
     if let Some(PublicationIntent::Tunnel { connector_id, .. }) = intent {
-        if let Some(tunnel) = find(connector_id).filter(|t| usable(t)) {
+        if let Some(tunnel) = find(connector_id).filter(|t| usable(facts, t)) {
             return Some(TunnelRoute {
                 tunnel,
                 route: false,
@@ -591,7 +646,7 @@ pub fn tunnel_route<'a>(facts: &'a PlanFacts, host: &str) -> Option<TunnelRoute<
     let tunnel = facts
         .tunnels
         .iter()
-        .filter(|t| usable(t))
+        .filter(|t| usable(facts, t))
         .filter(|t| {
             t.zone.as_deref().is_some_and(|zone| {
                 covers(&t.domain, zone, host) && record_label(host, &t.domain, zone).is_ok()
@@ -611,12 +666,12 @@ pub fn tunnel_route<'a>(facts: &'a PlanFacts, host: &str) -> Option<TunnelRoute<
             Some(other) if by_choice => format!(
                 "it is set to tunnel `{}` now, which {}",
                 other.name,
-                unusable_because(other)
+                unusable_because(facts, other)
             ),
             Some(other) => format!(
                 "tunnel `{}` would publish it, but {}",
                 other.name,
-                unusable_because(other)
+                unusable_because(facts, other)
             ),
             None => "the tunnel that would publish it is gone".to_string(),
         },
@@ -774,7 +829,7 @@ pub fn suggest_address(facts: &PlanFacts) -> Option<String> {
     let usable_tunnels = facts
         .tunnels
         .iter()
-        .filter(|t| t.ready && t.has_nodes && t.zone.is_some())
+        .filter(|t| usable(facts, t) && t.zone.is_some())
         .map(|t| t.domain.clone());
     let zones = facts
         .zones
@@ -839,7 +894,7 @@ pub fn environment_hosts_tunnel<'a>(facts: &'a PlanFacts, host: &str) -> Option<
         return None;
     }
     facts.tunnels.iter().find(|t| {
-        usable(t)
+        usable(facts, t)
             && t.zone.is_some()
             && host
                 == super::environment_hosts::natural_host(
@@ -1041,17 +1096,49 @@ fn capitalize(text: &str) -> String {
     }
 }
 
-/// Why no tunnel can carry the environment: it is deployed and its workers
-/// serve none of it, so it runs on the control plane.
+/// Why no tunnel can carry the environment: it runs on the control plane,
+/// workers serve none of it, and the control plane cannot run a tunnel
+/// itself (ADR-107 D5).
 fn tunnel_unserved(facts: &PlanFacts) -> Option<PlanBlocked> {
-    (facts.deployed && !facts.served_by_workers).then(|| PlanBlocked {
+    (!tunnels_can_serve(facts)).then(|| PlanBlocked {
         reason: format!(
-            "{} runs on the control plane, and a tunnel only carries what workers serve. \
-             Deploy it to a worker to put it behind a tunnel.",
-            facts.environment_name
+            "{} runs on the control plane, and a tunnel on a worker only carries what \
+             workers serve. A tunnel on the control plane would carry it, but {} Deploy it \
+             to a worker to put it behind a tunnel there, or run cloudflared yourself in \
+             front of Temps' proxy and point it at this server.",
+            facts.environment_name,
+            control_plane_tunnel_refusal(facts)
         ),
         action: None,
     })
+}
+
+/// For the Access refusal: why the control plane's own tunnel is not an
+/// option either, when that is the reason (ADR-107 D5).
+fn access_refusal_suffix(facts: &PlanFacts) -> String {
+    if facts.control_plane_tunnels {
+        return String::new();
+    }
+    format!(
+        " A tunnel on the control plane is not an option: {}",
+        control_plane_tunnel_refusal(facts)
+    )
+}
+
+/// Why the control plane cannot run a tunnel, as a sentence.
+fn control_plane_tunnel_refusal(facts: &PlanFacts) -> String {
+    match facts.control_plane_tunnel_refusal.as_deref() {
+        Some(why) => {
+            let why = why.trim_end_matches('.');
+            let mut chars = why.chars();
+            let first = chars
+                .next()
+                .map(|c| c.to_lowercase().to_string())
+                .unwrap_or_default();
+            format!("{first}{}.", chars.as_str())
+        }
+        None => "this server cannot run one.".to_string(),
+    }
 }
 
 /// Why nothing can serve the environment: it runs on the control plane, a
@@ -1075,11 +1162,21 @@ fn control_plane_unaddressed(facts: &PlanFacts) -> Option<PlanBlocked> {
                 .join("; ")
         )
     };
+    let tunnel = if facts.control_plane_tunnels {
+        "Put it behind a Cloudflare Tunnel on the control plane, which needs no public \
+         address, or set the edge target to the control plane's public address."
+            .to_string()
+    } else {
+        format!(
+            "A tunnel on a worker only carries what workers serve, so set the edge target to \
+             the control plane's public address, or deploy {} to a worker.",
+            facts.environment_name
+        )
+    };
     Some(PlanBlocked {
         reason: format!(
             "{env} runs on the control plane, which has no public address to point DNS at: \
-             {found}. A tunnel only carries what workers serve, so set the edge target to \
-             the control plane's public address, or deploy {env} to a worker.",
+             {found}. {tunnel}",
             env = facts.environment_name
         ),
         action: Some(
@@ -1132,8 +1229,7 @@ fn tunnel_into_private_rule(
     shown: &str,
 ) -> Option<String> {
     let rule = facts.private_rule.as_ref()?;
-    let tunnels_served = !facts.deployed || facts.served_by_workers;
-    if !tunnels_served {
+    if !tunnels_can_serve(facts) {
         return None;
     }
     let through = address
@@ -1304,10 +1400,9 @@ pub fn plan(facts: &PlanFacts) -> ReachabilityPlan {
         .filter(|_| facts.audience == Audience::Public)
         .and_then(|host| becomes_public(facts, host));
 
-    // A tunnel only carries what workers serve, and never into an allow
-    // list its visitors cannot match (D9).
-    let tunnels_served = !facts.deployed || facts.served_by_workers;
-    let tunnels_possible = tunnels_served && facts.private_rule.is_none();
+    // A tunnel only carries what all its replicas serve (ADR-107 D4), and
+    // never into an allow list its visitors cannot match (D9).
+    let tunnels_possible = tunnels_can_serve(facts) && facts.private_rule.is_none();
     let d9_note = tunnel_into_private_rule(facts, address.as_deref(), &shown);
     if let Some(reason) = &d9_note {
         blocked_reasons.push(PlanBlocked {
@@ -1319,11 +1414,18 @@ pub fn plan(facts: &PlanFacts) -> ReachabilityPlan {
         blocked_reasons.push(unserved);
     }
     let not_deployed_warning = (!facts.deployed).then(|| {
-        format!(
-            "Nothing is deployed to {} yet: it is published once a deployment runs on a \
-             worker.",
-            facts.environment_name
-        )
+        if facts.tunnel_workers.is_empty() && facts.control_plane_tunnels {
+            format!(
+                "Nothing is deployed to {} yet: it is published once a deployment runs.",
+                facts.environment_name
+            )
+        } else {
+            format!(
+                "Nothing is deployed to {} yet: it is published once a deployment runs on a \
+                 worker.",
+                facts.environment_name
+            )
+        }
     });
     let mut drafts: Vec<OptionDraft> = Vec::new();
 
@@ -1400,15 +1502,22 @@ pub fn plan(facts: &PlanFacts) -> ReachabilityPlan {
         });
     } else if let (Some(tunnel), true, None) = (covering, tunnels_possible, &route) {
         blocked_reasons.push(PlanBlocked {
-            reason: if tunnel.ready {
+            reason: if !tunnel.ready {
                 format!(
-                    "Tunnel {} covers {shown} but runs on no worker. Run it on one first.",
+                    "Tunnel {} covers {shown} but is not ready yet.",
+                    tunnel.name
+                )
+            } else if !tunnel.has_nodes {
+                format!(
+                    "Tunnel {} covers {shown} but runs nowhere. Run it on the control plane or \
+                     on a worker first.",
                     tunnel.name
                 )
             } else {
                 format!(
-                    "Tunnel {} covers {shown} but is not ready yet.",
-                    tunnel.name
+                    "Tunnel {} covers {shown} but runs on a worker, which does not serve {}. \
+                     Run it on the control plane only to carry {}.",
+                    tunnel.name, facts.environment_name, facts.environment_name
                 )
             },
             action: Some(
@@ -1529,17 +1638,23 @@ pub fn plan(facts: &PlanFacts) -> ReachabilityPlan {
         });
     }
 
-    // 3 and 4. A new tunnel, on a worker that allows it.
-    let tunnel_worker = facts.tunnel_workers.first();
+    // 3 and 4. A new tunnel, on a worker that allows it or on the control
+    // plane (ADR-107 D5).
+    let tunnel_worker = new_tunnel_node(facts);
     if tunnels_possible && covering.is_none() {
-        match tunnel_worker {
+        match tunnel_worker.as_ref() {
             None => {
                 let reason = match facts.workers_refusing.first() {
                     Some(name) => format!(
                         "No worker lets Temps run a tunnel on it: {name} keeps its public \
-                         ingress to itself."
+                         ingress to itself, and the control plane cannot run one: {}",
+                        control_plane_tunnel_refusal(facts)
                     ),
-                    None => "No active worker can run a tunnel.".to_string(),
+                    None => format!(
+                        "No active worker can run a tunnel, and the control plane cannot run \
+                         one: {}",
+                        control_plane_tunnel_refusal(facts)
+                    ),
                 };
                 blocked_reasons.push(PlanBlocked {
                     reason,
@@ -1999,8 +2114,9 @@ fn access_drafts(
         return Err(PlanBlocked {
             reason: format!(
                 "Cloudflare Access only sees traffic that comes through a Cloudflare tunnel, \
-                 and no tunnel can carry {shown} here. Add a worker that allows a tunnel, or \
-                 use the Temps sign-in instead."
+                 and no tunnel can carry {shown} here.{} Add a worker that allows a tunnel, \
+                 or use the Temps sign-in instead.",
+                access_refusal_suffix(facts)
             ),
             action: Some(
                 ReachAction::new(ActionKind::OpenIngress, "Set up ingress")
@@ -3393,6 +3509,8 @@ mod tests {
             zone: Some(zone.into()),
             ready: true,
             has_nodes: true,
+            on_control_plane: false,
+            on_workers: true,
             auto_publish: true,
             environment_hosts: false,
             host_suffix: None,
@@ -5173,6 +5291,31 @@ mod tests {
             .contains("only sees traffic that comes through a Cloudflare tunnel"));
     }
 
+    /// ADR-107 D5: when the control plane's own tunnel is ruled out, the
+    /// Access refusal says why rather than only "add a worker".
+    #[test]
+    fn an_access_plan_says_why_the_control_plane_cannot_carry_it() {
+        let facts = PlanFacts {
+            tunnels: vec![],
+            zones: vec![],
+            tunnel_workers: vec![],
+            served_by_workers: false,
+            control_plane_tunnels: false,
+            control_plane_tunnel_refusal: Some(
+                "This server does not run the proxy in the same process as the console.".into(),
+            ),
+            ..access_facts(vec![provider(4, Ok(vec![]))])
+        };
+        let reason = plan(&facts).blocked.expect("blocked").reason;
+        assert!(
+            reason.contains(
+                "A tunnel on the control plane is not an option: this server does not run \
+                 the proxy in the same process as the console."
+            ),
+            "{reason}"
+        );
+    }
+
     #[test]
     fn a_new_covering_access_app_changes_the_fingerprint_and_others_hash_as_before() {
         let before = access_facts(vec![provider(4, Ok(vec![]))]);
@@ -5757,6 +5900,151 @@ mod tests {
             "{:?}",
             choice.not_offered
         );
+    }
+
+    // ----- ADR-107 D5: a tunnel on the control plane -------------------
+
+    /// A single server: the environment runs on the control plane, no
+    /// worker exists, and this control plane runs connectors.
+    fn single_server() -> PlanFacts {
+        PlanFacts {
+            served_by_workers: false,
+            control_plane_tunnels: true,
+            zones: vec![zone("example.com", "cloudflare")],
+            cloudflare_accounts: vec![NamedId {
+                id: 3,
+                name: "cf".into(),
+            }],
+            ..base()
+        }
+    }
+
+    fn on_control_plane(mut tunnel: TunnelFact) -> TunnelFact {
+        tunnel.on_control_plane = true;
+        tunnel.on_workers = false;
+        tunnel
+    }
+
+    #[test]
+    fn a_control_plane_environment_is_offered_a_new_tunnel_on_the_control_plane() {
+        let facts = single_server();
+        let plan = plan(&facts);
+        assert_eq!(kinds(&plan), vec![PlanOptionKind::NewTunnel]);
+        let option = &plan.options[0];
+        assert_eq!(option.title, "Create a tunnel on the control plane");
+        assert!(option
+            .steps
+            .iter()
+            .any(|s| s.label == "Wait for the control plane to connect"));
+        assert_eq!(
+            new_tunnel_node(&facts),
+            Some(NamedId {
+                id: temps_core::CONTROL_PLANE_NODE_ID,
+                name: CONTROL_PLANE_NAME.into(),
+            })
+        );
+
+        let choice = choice(&facts);
+        assert!(choice.available);
+        assert!(choice.ways_in.iter().any(|w| w.way_in == "tunnel:new"));
+        assert!(choice.not_offered.is_empty(), "{:?}", choice.not_offered);
+    }
+
+    /// A worker that does not serve the environment is not where its
+    /// tunnel goes; the control plane is.
+    #[test]
+    fn a_worker_that_does_not_serve_the_environment_is_passed_over() {
+        let facts = PlanFacts {
+            tunnel_workers: vec![worker()],
+            ..single_server()
+        };
+        assert_eq!(
+            new_tunnel_node(&facts).map(|n| n.id),
+            Some(temps_core::CONTROL_PLANE_NODE_ID)
+        );
+        // Served by workers: the worker stays first.
+        let facts = PlanFacts {
+            served_by_workers: true,
+            ..facts
+        };
+        assert_eq!(new_tunnel_node(&facts).map(|n| n.id), Some(worker().id));
+    }
+
+    #[test]
+    fn a_tunnel_on_the_control_plane_carries_a_control_plane_environment() {
+        let facts = PlanFacts {
+            tunnels: vec![on_control_plane(tunnel(
+                "homelab",
+                "example.com",
+                "example.com",
+            ))],
+            requested: Some("shop.example.com".into()),
+            ..single_server()
+        };
+        let plan = plan(&facts);
+        assert!(
+            kinds(&plan).contains(&PlanOptionKind::ExistingTunnel),
+            "{:?}",
+            kinds(&plan)
+        );
+        assert_eq!(
+            suggest_address(&PlanFacts {
+                requested: None,
+                ..facts.clone()
+            })
+            .as_deref(),
+            Some("myapp.example.com")
+        );
+    }
+
+    /// Every replica must serve it: a tunnel that also runs on a worker does
+    /// not carry an environment only the control plane serves, and the plan
+    /// says how to fix that.
+    #[test]
+    fn a_tunnel_with_a_worker_replica_does_not_carry_a_control_plane_environment() {
+        let mut mixed = tunnel("homelab", "example.com", "example.com");
+        mixed.on_control_plane = true;
+        let facts = PlanFacts {
+            tunnels: vec![mixed],
+            requested: Some("shop.example.com".into()),
+            ..single_server()
+        };
+        let plan = plan(&facts);
+        assert!(!kinds(&plan).contains(&PlanOptionKind::ExistingTunnel));
+        // The covering tunnel blocks a new one; the reason names the fix.
+        let reason = plan.blocked.map(|b| b.reason).unwrap_or_default();
+        assert!(
+            reason.contains("runs on a worker, which does not serve production")
+                && reason.contains("Run it on the control plane only"),
+            "{reason}"
+        );
+    }
+
+    /// The control plane cannot run a tunnel (its proxy is another
+    /// process): nothing is offered, and the reason says why and points at
+    /// the self-managed cloudflared.
+    #[test]
+    fn a_control_plane_that_cannot_run_a_tunnel_says_why() {
+        let facts = PlanFacts {
+            control_plane_tunnels: false,
+            control_plane_tunnel_refusal: Some(
+                "This server does not run the proxy in the same process as the console.".into(),
+            ),
+            directs: vec![direct(true)],
+            ..single_server()
+        };
+        let choice = choice(&facts);
+        assert!(choice
+            .ways_in
+            .iter()
+            .all(|w| !w.way_in.starts_with("tunnel:")));
+        assert_eq!(choice.not_offered.len(), 1, "{:?}", choice.not_offered);
+        let reason = &choice.not_offered[0].reason;
+        assert!(
+            reason.contains("but this server does not run the proxy in the same process"),
+            "{reason}"
+        );
+        assert!(reason.contains("run cloudflared yourself"), "{reason}");
     }
 
     /// A private-only allow list keeps tunnels out while direct ingress still

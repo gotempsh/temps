@@ -758,6 +758,7 @@ pub fn setup_proxy_server(
     .with_shield_bypass_tokens(shield_bypass)
     .with_shield_events(shield_events)
     .with_netwatch(spawn_netwatch()?)
+    .with_tunnel_origin(proxy_config.tunnel_origin.clone())
     // Signed-in addresses (ADR 065 D8). The proxy redeems sign-in codes in
     // process, so it needs the database and the gate key's sealing key; in
     // split topology both are available here as they are to the console.
@@ -899,6 +900,17 @@ pub fn setup_proxy_server(
         .build();
 
     proxy_service.add_tcp(&proxy_config.address);
+    // ADR-107 D3: the control plane's tunnel origin. Pingora cannot add a
+    // listener once it runs, so it is bound now whether or not a tunnel runs
+    // here yet.
+    if let Some(origin) = proxy_config.tunnel_origin.as_deref() {
+        let address = temps_core::tunnel_origin::tunnel_origin_address();
+        if tunnel_origin_bindable(address) {
+            proxy_service.add_tcp(&address.to_string());
+            origin.mark_bound(address.port());
+            info!(%address, "Tunnel origin listener configured for the control plane's tunnels");
+        }
+    }
     // Add TLS if configured
     if let Some(ref tls_address) = proxy_config.tls_address {
         debug!("Adding TLS service on {}", tls_address);
@@ -983,6 +995,27 @@ fn preflight_check_listen_addresses(proxy_config: &ProxyConfig) -> Result<()> {
         let _tls_listener = bind_or_report(tls_address, "TEMPS_TLS_ADDRESS")?;
     }
     Ok(())
+}
+
+/// Whether the control plane's tunnel origin can be bound. Unlike the main
+/// listeners a conflict is not fatal: the proxy serves without it, and a
+/// tunnel placed on the control plane reports why it cannot start
+/// (ADR-107 D3).
+fn tunnel_origin_bindable(address: std::net::SocketAddr) -> bool {
+    match std::net::TcpListener::bind(address) {
+        Ok(_) => true,
+        Err(error) => {
+            tracing::warn!(
+                %address,
+                %error,
+                "the control plane's tunnel origin could not listen, so tunnels cannot run on \
+                 the control plane until the port is free and Temps restarts \
+                 (`ss -ltnp 'sport = :{}'` shows what holds it)",
+                address.port()
+            );
+            false
+        }
+    }
 }
 
 /// Test-only convenience wrapper around `bind_or_report` for exercising a
@@ -1539,6 +1572,17 @@ mod preflight_bind_tests {
         );
 
         drop(held);
+    }
+
+    /// ADR-107 D3: a taken tunnel origin port does not stop the proxy; the
+    /// listener is skipped and the origin stays unbound.
+    #[test]
+    fn a_taken_tunnel_origin_port_is_skipped_not_fatal() {
+        let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = held.local_addr().unwrap();
+        assert!(!tunnel_origin_bindable(address));
+        drop(held);
+        assert!(tunnel_origin_bindable(address));
     }
 
     #[test]

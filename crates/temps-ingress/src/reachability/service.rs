@@ -1587,7 +1587,11 @@ impl ReachabilityService {
             } else {
                 (None, None)
             };
+        // ADR-107 D5: whether a new tunnel can run on the control plane.
+        let control_plane_tunnel_refusal = self.deps.connectors.control_plane_tunnels().err();
         let facts = PlanFacts {
+            control_plane_tunnels: control_plane_tunnel_refusal.is_none(),
+            control_plane_tunnel_refusal,
             intents: HashMap::new(),
             choices: tunnel_facts.choices,
             private_rule,
@@ -2087,8 +2091,10 @@ impl ReachabilityService {
                 });
             }
             PlanOptionKind::NewTunnel | PlanOptionKind::NewTunnelWithToken => {
-                let worker = facts.tunnel_workers.first().cloned().ok_or_else(|| {
-                    ReachabilityError::Conflict("No worker can run a tunnel.".into())
+                let worker = super::plan::new_tunnel_node(&facts).ok_or_else(|| {
+                    ReachabilityError::Conflict(
+                        "Neither a worker nor the control plane can run a tunnel.".into(),
+                    )
                 })?;
                 let covering_zone =
                     zone_for(&address, &facts.zones).filter(|z| z.provider_type == "cloudflare");

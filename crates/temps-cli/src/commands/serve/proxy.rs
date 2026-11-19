@@ -488,6 +488,7 @@ pub fn start_proxy_server(
     docker: Option<Arc<bollard::Docker>>,
     local_workloads_enabled: bool,
     console_startup: Arc<temps_core::console_startup::ConsoleStartupState>,
+    tunnel_origin: Option<Arc<temps_core::tunnel_origin::ControlPlaneTunnelOrigin>>,
 ) -> anyhow::Result<()> {
     let console_address = config.console_address.clone();
     let console_ingress_address = config.public_surface_address().map(str::to_string);
@@ -641,6 +642,8 @@ pub fn start_proxy_server(
         console_startup: Some(console_startup),
         // Console and proxy share this process, so it samples the host too.
         host_metrics: true,
+        // ADR-107 D3: the loopback listener connectors on node 0 forward to.
+        tunnel_origin,
     };
 
     info!(

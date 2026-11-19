@@ -1405,6 +1405,11 @@ impl ServeCommand {
         let console_startup_state =
             Arc::new(temps_core::console_startup::ConsoleStartupState::new());
 
+        // ADR-107 D3: only a proxy in this process can carry a tunnel the
+        // control plane runs, so the origin exists for `--role=all` only.
+        let tunnel_origin = (self.role == ServeRole::All)
+            .then(temps_core::tunnel_origin::ControlPlaneTunnelOrigin::new);
+
         // Build the console params once; both roles consume them.
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let params = console::ConsoleApiParams {
@@ -1437,6 +1442,7 @@ impl ServeCommand {
             external_plugin_registry,
             profile: self.profile,
             startup_state: console_startup_state.clone(),
+            tunnel_origin: tunnel_origin.clone(),
         };
 
         if self.role == ServeRole::Console {
@@ -1588,6 +1594,7 @@ impl ServeCommand {
             docker_handle,
             self.profile.local_workloads_enabled(),
             console_startup_state,
+            tunnel_origin,
         )
     }
 }

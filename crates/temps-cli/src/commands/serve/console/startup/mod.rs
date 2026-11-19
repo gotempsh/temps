@@ -13,8 +13,10 @@
 //!    all initialise; `ready_signal` fires.
 //! 5. [`bootstrap::bootstrap_after_init`]: telemetry, initial admin, SSO and
 //!    Cloud enrollment.
-//! 6. [`background::start_background_services`] and
-//!    [`nodes::start_node_control`]: background loops and node routes.
+//! 6. [`background::start_background_services`],
+//!    [`tunnel_connectors::start_control_plane_connectors`] and
+//!    [`nodes::start_node_control`]: background loops, the control plane's
+//!    own tunnel connectors and node routes.
 //! 7. [`router::build_router`]: the routers each listener serves.
 //! 8. [`serve::serve`]: bind the listeners and serve until shutdown.
 
@@ -30,6 +32,7 @@ mod plugins;
 mod router;
 mod serve;
 mod traefik_adapters;
+mod tunnel_connectors;
 mod validate;
 
 use ai_tools::install_ai_api_tools;
@@ -42,6 +45,7 @@ use plugins::{register_plugins, PluginInputs};
 use router::{build_router, ConsoleRouters, RouterInputs};
 use serve::{serve, ServeInputs};
 use traefik_adapters::{AlarmServiceDriftSink, TraefikTlsProvisioner};
+use tunnel_connectors::start_control_plane_connectors;
 use validate::validate_deps;
 
 /// Initialize and start the console API server
@@ -74,6 +78,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         external_plugin_registry,
         profile,
         startup_state,
+        tunnel_origin,
     } = params;
 
     // Count panics for the anonymous `error_summary` telemetry event. Only
@@ -162,6 +167,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         &traefik_discovery,
     )
     .await;
+    start_control_plane_connectors(service_context, tunnel_origin, config.data_dir.clone());
     let node_routes = start_node_control(service_context, &db);
 
     let routers = build_router(

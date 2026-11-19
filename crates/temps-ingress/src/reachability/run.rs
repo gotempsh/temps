@@ -628,7 +628,17 @@ pub struct NewTunnel {
     /// Unused when the run starts; Cloudflare's tunnel is
     /// `temps-<name>-<install>`.
     pub name: String,
+    /// Where it runs: a worker, or the control plane (id 0, ADR-107 D5).
     pub worker: NamedId,
+}
+
+/// `name` with its first letter upper-cased, to open a sentence.
+fn sentence_start(name: &str) -> String {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
 }
 
 /// What a run is asked to do, resolved from the plan when it starts and
@@ -2805,7 +2815,11 @@ impl Runner<'_> {
                 let (Some(id), Some(new)) = (self.ctx.connector_id, &input.new_tunnel) else {
                     return Outcome::Skipped("No new tunnel.".into());
                 };
-                let worker = new.worker.clone();
+                // "The control plane is connected." reads as a sentence too.
+                let worker = NamedId {
+                    id: new.worker.id,
+                    name: sentence_start(&new.worker.name),
+                };
                 let mut waited = Duration::ZERO;
                 loop {
                     match self.ops.tunnel_status(id).await {
