@@ -637,8 +637,9 @@ impl ApiKeyService {
     /// use (`last_used_at` still empty), which is always written: the AI
     /// harness onboarding waits on exactly that timestamp, and a throttle
     /// primed under the same id (by the previous secret of a rotated key)
-    /// must not hide it. A failed write never fails the request; it is
-    /// logged and the throttle entry dropped, so the next request retries.
+    /// must not hide it. The write is conditioned on the validated secret's
+    /// hash. A failed write never fails the request; it is logged and the
+    /// throttle entry dropped, so the next request retries.
     async fn record_last_used(&self, api_key: &temps_entities::api_keys::Model) {
         let first_use = api_key.last_used_at.is_none();
         // Always consult the throttle so a first use also starts the window.
@@ -646,9 +647,20 @@ impl ApiKeyService {
         if !(first_use || throttle_allows) {
             return;
         }
-        let mut api_key_active: ApiKeyActiveModel = api_key.clone().into();
-        api_key_active.last_used_at = Set(Some(Utc::now()));
-        if let Err(error) = api_key_active.update(self.db.as_ref()).await {
+        // Bound to the secret that was validated, not just the row: if the key
+        // was rotated after validation read it, this matches no row, so the
+        // replacement secret is never stamped as used by a request that sent
+        // the old one. Zero rows affected is not an error for the request.
+        let result = ApiKeyEntity::update_many()
+            .col_expr(
+                temps_entities::api_keys::Column::LastUsedAt,
+                sea_orm::sea_query::Expr::value(Utc::now()),
+            )
+            .filter(temps_entities::api_keys::Column::Id.eq(api_key.id))
+            .filter(temps_entities::api_keys::Column::KeyHash.eq(&api_key.key_hash))
+            .exec(self.db.as_ref())
+            .await;
+        if let Err(error) = result {
             self.last_used_throttle.forget(api_key.id);
             warn!(
                 api_key_id = api_key.id,
@@ -1902,6 +1914,37 @@ mod tests {
         assert!(
             after.last_used_at.is_some(),
             "the new secret's first use must be written even though the throttle window is open"
+        );
+    }
+
+    /// Validation read the old secret; the key was rotated before the usage
+    /// write ran. The write must not mark the replacement secret as used.
+    #[tokio::test]
+    async fn usage_write_racing_a_rotation_does_not_stamp_the_new_secret() {
+        let (db, service, user) = setup_test_env().await;
+        let created = service
+            .create_api_key(user.id, admin_key_request("Interleaved rotation key"))
+            .await
+            .unwrap();
+        let validated_row = api_keys::Entity::find_by_id(created.id)
+            .one(db.db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(validated_row.last_used_at, None);
+
+        service.rotate_api_key(user.id, created.id).await.unwrap();
+        service.record_last_used(&validated_row).await;
+
+        let after = api_keys::Entity::find_by_id(created.id)
+            .one(db.db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(after.key_hash, validated_row.key_hash);
+        assert_eq!(
+            after.last_used_at, None,
+            "a request that sent the rotated-out secret must not mark the new one used"
         );
     }
 
