@@ -76,6 +76,8 @@ pub struct ErrorGroupsBulkUpdatedAudit {
     pub filter: Option<crate::handlers::group_workflow_handler::BulkErrorGroupFilter>,
     /// Ignore conditions the request set, when it set any.
     pub ignore: Option<crate::handlers::group_workflow_handler::IgnoreConditionsRequest>,
+    /// Resolved in the next release.
+    pub in_next_release: bool,
     /// Groups whose status actually changed.
     pub updated_group_ids: Vec<i32>,
     /// Selected groups already in the target status.
@@ -210,6 +212,8 @@ pub struct ErrorGroupUpdatedAudit {
     pub assigned_to: Option<String>,
     /// Ignore conditions set with an `ignored` status.
     pub ignore: Option<crate::handlers::group_workflow_handler::IgnoreConditionsRequest>,
+    /// Resolved in the next release.
+    pub in_next_release: bool,
 }
 
 impl AuditOperation for ErrorGroupUpdatedAudit {
@@ -543,6 +547,7 @@ mod tests {
             status: "resolved".to_string(),
             assigned_to: Some(String::new()),
             ignore: None,
+            in_next_release: false,
         };
 
         assert_eq!(audit.operation_type(), "ERROR_GROUP_UPDATED");

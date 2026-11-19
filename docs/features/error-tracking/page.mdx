@@ -118,7 +118,7 @@ These checks use synthetic applications, real HTTP endpoints, native storage que
 | Errors, messages and stacks | Adapted: native error events, groups and stack details | Symbolication depends on available native source artifacts; native crash decoding is separate. |
 | Breadcrumbs, users, tags and contexts | Adapted: error detail payload and native metadata | User/request/browser/runtime fields populate native details; exact user/tag filtering is available on native event queries. Other typed contexts stay in JSON metadata and the original source event. Not every field has a separate index. |
 | Fingerprints and grouping | Adapted: native fingerprints and grouping; concurrent insertion and counts reconciled; native extension: reversible group merge and fingerprint split | Explicit SDK fingerprints and `{{ default }}` are supported. Default grouping uses Temps stack/message normalization, not Sentry server algorithm versions. Grouping configuration APIs are not provided. A merge or split redirects future events and never rewrites stored ones. |
-| Issue APIs and triage | Existing native error list, detail and resolution APIs/UI; native extension: bulk resolve/reopen/ignore by ID or filter (`POST /projects/{project_id}/error-groups/bulk`, `temps errors bulk`); ignore until a time, count or user count; server-side [inbound filters](#inbound-filters) that drop matching events before storage | Sentry issue APIs are not implemented. Bulk requests are capped at 1,000 groups and 50 status-change notifications each. |
+| Issue APIs and triage | Existing native error list, detail and resolution APIs/UI; native extension: bulk resolve/reopen/ignore by ID or filter (`POST /projects/{project_id}/error-groups/bulk`, `temps errors bulk`); [resolve in the next release](#resolve-next-release); ignore until a time, count or user count; server-side [inbound filters](#inbound-filters) that drop matching events before storage | Sentry issue APIs are not implemented. Bulk requests are capped at 1,000 groups and 50 status-change notifications each. |
 | Alert APIs and alerts | Existing Temps alert rules and alarms; cron health feeds native alarms | Sentry alert APIs are not implemented. Delivery requires a configured provider; external delivery was not verified in the synthetic run. |
 | Debug ID source maps and artifact bundles | Adapted: CLI artifact bundles imported into native source maps; exact Debug ID lookup without a release, including maps uploaded after an error | Full-access project build credential required; public DSNs cannot access artifacts. SYSB v2, stored/deflated ZIP entries, 50 MiB compressed/expanded bundle, 256 files, 128 maps. Symbolication loads at most 32 maps/50 MiB per event; staged chunks expire after one hour (64 MiB/project, 256 MiB globally). Indexed/Hermes/native debug artifacts are outside this contract. |
 | Releases | Native extension: correlate retained errors, logs, spans, metric points, feedback and check-ins by SDK release version | Errors → Releases shows exact counts and native example links in a bounded 1–31 day window. Deployment/finalization, commits and release health are separate workflows. |
@@ -687,6 +687,31 @@ await fetch('https://your-temps-instance.com/api/projects/42/error-groups/123', 
 });
 ```
 </CodeGroup>
+
+### Resolve in the Next Release {{ anchor: true, id: 'resolve-next-release' }}
+
+When the fix is merged but not deployed yet, a plain resolve reopens the group on the next event from the release still running. Resolve it **in the next release** instead: the group records the project's newest release at that moment and stays resolved for events from that release, from an older one, and for events with no release. The first event from a newer release reopens it as a regression.
+
+Releases are ordered by the Temps deployment that first carried them. A git deployment's release is its commit SHA (the `SENTRY_RELEASE` Temps injects), so a release that has been deployed but has not sent an event yet still counts as the current one. A release the SDK sets itself, with no matching deployment, is ordered by when Temps first saw it. A project with no release cannot use this option; the request fails and asks for a plain resolve.
+
+<CodeGroup title="Resolve in the Next Release">
+```bash {{ title: 'CLI' }}
+temps errors update --project-id 42 --group-id 123 --status resolved --in-next-release
+
+# Every unresolved match, after a fix is merged
+temps errors bulk --project-id 42 --action resolve --search "cart total" --in-next-release
+```
+
+```typescript {{ title: 'API' }}
+await fetch('https://your-temps-instance.com/api/projects/42/error-groups/123', {
+  method: 'PUT',
+  headers: { 'Authorization': `Bearer ${API_KEY}`, 'Content-Type': 'application/json' },
+  body: JSON.stringify({ status: 'resolved', in_next_release: true })
+});
+```
+</CodeGroup>
+
+The group's `resolution` field shows the release it was resolved after, and the console offers **Resolve in next release** next to **Resolve**. The check runs in the statement that already counts the event, against a per-project release list that ingest adds to once per release. Any other status change, or resolving it again, replaces the condition.
 
 ### Triage Many Groups at Once
 

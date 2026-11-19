@@ -5,6 +5,7 @@ import { test, expect, describe } from 'bun:test'
 import {
   BULK_ERROR_GROUP_LIMIT,
   buildIgnoreConditions,
+  checkInNextRelease,
   formatBytes,
   matchesSourceFileFilter,
   parseGroupIds,
@@ -141,5 +142,13 @@ describe('buildIgnoreConditions', () => {
 
   test('forever stands alone', () => {
     expect(buildIgnoreConditions({ ignoreForever: true }, now)).toEqual({ forever: true })
+  })
+})
+
+describe('checkInNextRelease', () => {
+  test('goes with a resolve only', () => {
+    expect(() => checkInNextRelease(true, true)).not.toThrow()
+    expect(() => checkInNextRelease(undefined, false)).not.toThrow()
+    expect(() => checkInNextRelease(true, false)).toThrow('--in-next-release')
   })
 })

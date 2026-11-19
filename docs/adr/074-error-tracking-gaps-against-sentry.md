@@ -4,7 +4,8 @@
 
 Proposed — 2026-11-19. Being implemented in the order of the Decision
 section. D1.1 (bulk actions), D1.2 (merge and split), D1.3 (ignore
-until) and D1.4 (inbound filters) have shipped; the questions they settled
+until), D1.4 (inbound filters) and D1.5 (resolve in the next release) have
+shipped; the questions they settled
 are recorded under "Settled while implementing".
 
 Related: ADR 016 (ClickHouse traces backend), ADR 027 (cross-project trace
@@ -273,3 +274,37 @@ deploys, which is web services. It comes last and may never be worth building.
   retries it nor records it as lost; the envelope response counts it in
   `x-temps-sentry-errors-filtered`. Sentry instead reports a filtered event
   as a client outcome; Temps has no server-side outcomes to report it to.
+
+### D1.5 Resolve in the next release
+
+- Releases are ordered in a new per-project table, `error_releases`
+  (version, `released_at`, `first_seen_at`, `deployment_id`). `released_at`
+  is the creation time of the first deployment of the project whose commit
+  SHA equals the release, which is the release Temps injects for git
+  deployments (ADR 033); a release with no matching deployment (set in the
+  SDK, or an image tag) is ordered by when it was first seen. It is written
+  once and never moves. The event's own deployment, from its DSN, is kept
+  as a link only, never as the order, because a DSN can outlive the
+  deployment it was issued for. A migration registers the releases of the
+  last 90 days of stored error events.
+- Ingest registers a release once per process: a bounded in-memory set
+  (20,000 entries) remembers what is registered, and the insert runs
+  outside the event's transaction, so a retried or rolled-back event cannot
+  leave the set ahead of the table. Releases longer than 250 characters are
+  not registered.
+- Resolving in the next release records the project's newest release at
+  that moment (`resolved_in_release_after_id`), after registering the
+  commit SHAs of the project's 20 most recent ready deployments, so a
+  release that is deployed but has not reported an event yet counts as the
+  current one. A project with no release at all cannot use it: the request
+  fails and asks for a plain resolve.
+- The group stays resolved for events from that release, from an older
+  one, and for events with no release (as Sentry does); the first event
+  from a newer release reopens it as a regression. The check is one more
+  branch in the statement that already counts the event. Any other status
+  write clears the condition; resolving again re-bases it on the current
+  release.
+- "Newest" is project-wide, not per environment: a release first deployed
+  to staging counts as current for production too, which can only keep a
+  group resolved longer, never reopen it early.
+

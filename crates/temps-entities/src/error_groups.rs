@@ -57,6 +57,14 @@ pub struct Model {
     /// Stay ignored whatever happens.
     pub ignore_forever: bool,
 
+    /// Resolved "in the next release" (ADR 074, D1.5), read only while
+    /// `status` is 'resolved': events from `resolved_in_release_after_id` or
+    /// an older release, and events with no release, keep it resolved; an
+    /// event from a newer release reopens it.
+    pub resolved_in_next_release: bool,
+    /// The newest release of the project when the group was resolved.
+    pub resolved_in_release_after_id: Option<i32>,
+
     // Relations
     pub project_id: i32,
     pub environment_id: Option<i32>,

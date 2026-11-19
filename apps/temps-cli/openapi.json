@@ -9585,6 +9585,10 @@
                 "type": "null"
               }
             ]
+          },
+          "in_next_release": {
+            "description": "With `status: resolved` (or `action: resolve`): resolved in the next\nrelease. Events from the project's newest release at this moment, or\nan older one, or with no release, keep it resolved; an event from a\nnewer release reopens it. Fails when the project has no release yet.",
+            "type": "boolean"
           }
         },
         "required": [
@@ -30399,6 +30403,17 @@
             "format": "int32",
             "type": "integer"
           },
+          "resolution": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/GroupResolutionState",
+                "description": "While the group is resolved in the next release: the release it was\nresolved after."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "status": {
             "type": "string"
           },
@@ -37294,6 +37309,34 @@
             ]
           }
         },
+        "type": "object"
+      },
+      "GroupResolutionState": {
+        "description": "A group resolved in the next release (ADR 074, D1.5).",
+        "properties": {
+          "after_release": {
+            "description": "That release's version, filled in on the single-group read.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "after_release_id": {
+            "description": "Id of the release the group was resolved after; events from a newer\nrelease reopen it.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "in_next_release": {
+            "description": "Always true; the field exists so clients can test one value.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "in_next_release"
+        ],
         "type": "object"
       },
       "GroupRouteEnvironment": {
@@ -80129,6 +80172,10 @@
                 "type": "null"
               }
             ]
+          },
+          "in_next_release": {
+            "description": "With `status: resolved` (or `action: resolve`): resolved in the next\nrelease. Events from the project's newest release at this moment, or\nan older one, or with no release, keep it resolved; an event from a\nnewer release reopens it. Fails when the project has no release yet.",
+            "type": "boolean"
           },
           "status": {
             "type": "string"

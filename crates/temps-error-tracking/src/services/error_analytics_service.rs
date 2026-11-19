@@ -499,6 +499,7 @@ impl ErrorAnalyticsService {
             .into_iter()
             .map(|group| ErrorGroupDomain {
                 ignore: super::types::GroupIgnoreState::from_group(&group),
+                resolution: super::types::GroupResolutionState::from_group(&group),
                 id: group.id,
                 title: group.title,
                 error_type: group.error_type,

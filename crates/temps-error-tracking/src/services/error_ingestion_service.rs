@@ -182,11 +182,15 @@ pub struct ErrorIngestionService {
     tokenizer: HashTokenizer,
     // One lock-free range per service/database, never a per-project/key cache.
     chunk_range: ArcSwapOption<ErrorChunkRange>,
+    /// Releases already registered for "resolve in the next release"
+    /// (ADR 074, D1.5); bounded, so a release costs one statement per process.
+    releases: super::group_workflow::ReleaseRegistry,
 }
 
 impl ErrorIngestionService {
     pub fn new(db: Arc<DatabaseConnection>) -> Self {
         Self {
+            releases: super::group_workflow::ReleaseRegistry::new(db.clone()),
             db,
             tokenizer: HashTokenizer::new(10000),
             chunk_range: ArcSwapOption::empty(),
@@ -226,6 +230,16 @@ impl ErrorIngestionService {
         error_data: CreateErrorEventData,
         fingerprint: String,
     ) -> Result<IngestedError, ErrorTrackingError> {
+        // Registered before the event's transaction so it is committed even if
+        // that transaction is retried, and so the counter statement can order
+        // the event's release against the one a group was resolved after.
+        self.releases
+            .observe(
+                error_data.project_id,
+                error_data.release_version.as_deref(),
+                error_data.deployment_id,
+            )
+            .await?;
         let mut attempt = 0;
         loop {
             let result = self.process_once(&error_data, &fingerprint).await;

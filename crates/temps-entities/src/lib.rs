@@ -226,6 +226,7 @@ pub mod error_alert_rules;
 pub mod error_events;
 pub mod error_groups;
 pub mod error_inbound_filters;
+pub mod error_releases;
 pub mod project_dsns;
 pub mod project_group_env_vars;
 pub mod project_group_members;

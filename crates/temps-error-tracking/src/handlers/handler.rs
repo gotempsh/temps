@@ -138,6 +138,12 @@ pub struct UpdateErrorGroupRequest {
     /// With `status: ignored`: when the group comes back. Omitted, the next
     /// event reopens it.
     pub ignore: Option<super::group_workflow_handler::IgnoreConditionsRequest>,
+    /// With `status: resolved` (or `action: resolve`): resolved in the next
+    /// release. Events from the project's newest release at this moment, or
+    /// an older one, or with no release, keep it resolved; an event from a
+    /// newer release reopens it. Fails when the project has no release yet.
+    #[serde(default)]
+    pub in_next_release: bool,
 }
 
 #[derive(Debug, Deserialize, ToSchema, IntoParams)]
@@ -206,6 +212,9 @@ pub struct ErrorGroupResponse {
     pub merged_into_group_id: Option<i32>,
     /// While the group is ignored with conditions: when it comes back.
     pub ignore: Option<crate::services::types::GroupIgnoreState>,
+    /// While the group is resolved in the next release: the release it was
+    /// resolved after.
+    pub resolution: Option<crate::services::types::GroupResolutionState>,
     pub project_id: i32,
     pub environment_id: Option<i32>,
     pub deployment_id: Option<i32>,
@@ -297,6 +306,7 @@ impl From<ErrorGroupDomain> for ErrorGroupResponse {
             assigned_to: group.assigned_to,
             merged_into_group_id: group.merged_into_group_id,
             ignore: group.ignore,
+            resolution: group.resolution,
             project_id: group.project_id,
             environment_id: group.environment_id,
             deployment_id: group.deployment_id,
@@ -641,6 +651,7 @@ pub async fn update_error_group(
             request.status.clone(),
             request.assigned_to.clone(),
             request.ignore.clone().map(Into::into),
+            request.in_next_release,
         )
         .await?;
 
@@ -655,6 +666,7 @@ pub async fn update_error_group(
         status: request.status,
         assigned_to: request.assigned_to,
         ignore: request.ignore,
+        in_next_release: request.in_next_release,
     };
     if let Err(e) = state.audit_service.create_audit_log(&audit).await {
         tracing::error!(
@@ -1202,6 +1214,7 @@ mod tests {
             Extension(metadata()),
             Json(UpdateErrorGroupRequest {
                 ignore: None,
+                in_next_release: false,
                 status: "resolved".to_string(),
                 assigned_to: Some("owner@example.com".to_string()),
             }),
@@ -1238,6 +1251,7 @@ mod tests {
             Extension(metadata()),
             Json(UpdateErrorGroupRequest {
                 ignore: None,
+                in_next_release: false,
                 status: "ignored".to_string(),
                 assigned_to: None,
             }),

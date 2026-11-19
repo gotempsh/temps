@@ -24,6 +24,7 @@ import { SentryListItem } from '@/components/error-tracking/SentryListItem'
 import { updateErrorGroupMutation } from '@/api/client/@tanstack/react-query.gen'
 import { GroupMergeActions } from '@/components/error-tracking/GroupMergeActions'
 import { IgnoreMenu } from '@/components/error-tracking/IgnoreMenu'
+import { ResolveMenu } from '@/components/error-tracking/ResolveMenu'
 import {
   IGNORE_PRESETS,
   describeIgnoreState,
@@ -126,10 +127,14 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
     },
   })
 
-  const updateStatus = (status: string, ignore?: IgnoreConditions) => {
+  const updateStatus = (
+    status: string,
+    ignore?: IgnoreConditions,
+    inNextRelease = false
+  ) => {
     statusMutation.mutate({
       path: { group_id: parseInt(errorGroupId!), project_id: project.id },
-      body: { status, ignore },
+      body: { status, ignore, in_next_release: inNextRelease },
     })
   }
 
@@ -349,6 +354,14 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
           </p>
         )}
 
+        {errorGroup.resolution?.in_next_release && (
+          <p className="text-sm text-muted-foreground">
+            {errorGroup.resolution.after_release
+              ? `Resolved in the release after ${errorGroup.resolution.after_release}: events from that release or an older one keep it resolved, and the first event from a newer release reopens it.`
+              : 'Resolved in the next release: the first event from a newer release reopens it.'}
+          </p>
+        )}
+
         {/* The actions stay one group: when they do not fit beside the
             details they move below them together. */}
         <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-3">
@@ -407,15 +420,12 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
             {/* Desktop: full action buttons */}
             <div className="hidden items-center gap-2 sm:flex">
               {(errorGroup as any).status !== 'resolved' && (
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => updateStatus('resolved')}
+                <ResolveMenu
+                  onResolve={(inNextRelease) =>
+                    updateStatus('resolved', undefined, inNextRelease)
+                  }
                   disabled={statusMutation.isPending}
-                >
-                  <Check className="h-4 w-4 mr-1.5" />
-                  Resolve
-                </Button>
+                />
               )}
               {(errorGroup as any).status !== 'resolved' && (
                 <IgnoreMenu
@@ -455,6 +465,16 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
                     <DropdownMenuItem onClick={() => updateStatus('resolved')}>
                       <Check className="mr-2 h-4 w-4" />
                       Resolve
+                    </DropdownMenuItem>
+                  )}
+                  {(errorGroup as any).status !== 'resolved' && (
+                    <DropdownMenuItem
+                      onClick={() =>
+                        updateStatus('resolved', undefined, true)
+                      }
+                    >
+                      <Check className="mr-2 h-4 w-4" />
+                      Resolve in next release
                     </DropdownMenuItem>
                   )}
                   {(errorGroup as any).status !== 'resolved' &&

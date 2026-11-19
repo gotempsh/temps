@@ -3,8 +3,9 @@
 
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
-import { CheckCircle2, Loader2, Merge, RotateCcw } from 'lucide-react'
+import { Loader2, Merge, RotateCcw } from 'lucide-react'
 import { IgnoreMenu } from '@/components/error-tracking/IgnoreMenu'
+import { ResolveMenu } from '@/components/error-tracking/ResolveMenu'
 import type { IgnoreConditions } from '@/components/error-tracking/ignore-presets'
 
 export type BulkTriageAction = 'resolve' | 'unresolve' | 'ignore'
@@ -14,8 +15,15 @@ interface BulkTriageBarProps {
   pageGroupIds: number[]
   selectedGroupIds: number[]
   onSelectionChange: (ids: number[]) => void
-  /** `ignore` carries when the groups come back; omitted, a plain ignore. */
-  onAction: (action: BulkTriageAction, ignore?: IgnoreConditions) => void
+  /**
+   * `ignore` carries when the groups come back; omitted, a plain ignore.
+   * `inNextRelease` goes with `resolve` only.
+   */
+  onAction: (
+    action: BulkTriageAction,
+    ignore?: IgnoreConditions,
+    inNextRelease?: boolean
+  ) => void
   /** Merge every selected group into one; needs at least two selected. */
   onMerge: () => void
   isPending: boolean
@@ -59,15 +67,13 @@ export function BulkTriageBar({
         {isPending && (
           <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground" />
         )}
-        <Button
-          size="sm"
-          variant="outline"
+        <ResolveMenu
+          compactLabel
           disabled={count === 0 || isPending}
-          onClick={() => onAction('resolve')}
-        >
-          <CheckCircle2 className="h-3.5 w-3.5" />
-          <span className="max-sm:sr-only">Resolve</span>
-        </Button>
+          onResolve={(inNextRelease) =>
+            onAction('resolve', undefined, inNextRelease)
+          }
+        />
         <IgnoreMenu
           compactLabel
           disabled={count === 0 || isPending}

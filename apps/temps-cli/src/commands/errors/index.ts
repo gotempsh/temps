@@ -49,6 +49,8 @@ interface ShowOptions {
 
 /** `--ignore-*` flags shared by `errors update` and `errors bulk`. */
 export interface IgnoreFlags {
+  /** With resolve: stay resolved until an event from a newer release. */
+  inNextRelease?: boolean
   ignoreFor?: string
   ignoreUntil?: string
   ignoreCount?: string
@@ -257,6 +259,17 @@ function withIgnoreFlags(command: Command): Command {
     .option('--ignore-count <n>', 'With ignore: come back after this many more occurrences')
     .option('--ignore-users <n>', 'With ignore: come back once this many new users are affected')
     .option('--ignore-forever', 'With ignore: never come back on its own')
+    .option(
+      '--in-next-release',
+      'With resolve: stay resolved until an event arrives from a release newer than the current one'
+    )
+}
+
+/** Refuse `--in-next-release` with anything but a resolve. */
+export function checkInNextRelease(inNextRelease: boolean | undefined, resolving: boolean): void {
+  if (inNextRelease && !resolving) {
+    throw new Error('--in-next-release goes with resolving (--status resolved or --action resolve)')
+  }
 }
 
 // Source map interfaces
@@ -740,6 +753,12 @@ async function updateErrorGroupAction(options: UpdateOptions): Promise<void> {
     warning('The --ignore-* flags go with --status ignored')
     return
   }
+  try {
+    checkInNextRelease(options.inNextRelease, options.status === 'resolved')
+  } catch (e) {
+    warning(e instanceof Error ? e.message : String(e))
+    return
+  }
 
   await withSpinner('Updating error group...', async () => {
     const { error } = await updateErrorGroup({
@@ -749,6 +768,7 @@ async function updateErrorGroupAction(options: UpdateOptions): Promise<void> {
         status: options.status,
         assigned_to: options.assignedTo ?? undefined,
         ignore,
+        in_next_release: options.inNextRelease ?? false,
       },
     })
     if (error) {
@@ -806,6 +826,12 @@ async function bulkUpdateErrorGroupsAction(options: BulkOptions): Promise<void> 
     warning('The --ignore-* flags go with --action ignore')
     return
   }
+  try {
+    checkInNextRelease(options.inNextRelease, options.action === 'resolve')
+  } catch (e) {
+    warning(e instanceof Error ? e.message : String(e))
+    return
+  }
 
   let groupIds: number[] | undefined
   if (options.groupIds) {
@@ -826,10 +852,12 @@ async function bulkUpdateErrorGroupsAction(options: BulkOptions): Promise<void> 
             action: options.action as (typeof BULK_ERROR_ACTIONS)[number],
             group_ids: groupIds,
             ignore,
+            in_next_release: options.inNextRelease ?? false,
           }
         : {
             action: options.action as (typeof BULK_ERROR_ACTIONS)[number],
             ignore,
+            in_next_release: options.inNextRelease ?? false,
             filter: {
               status: options.status,
               environment_id: options.environmentId

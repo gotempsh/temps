@@ -4465,6 +4465,13 @@ export type BulkErrorGroupRequest = {
      */
     group_ids?: Array<number> | null;
     ignore?: IgnoreConditionsRequest | null;
+    /**
+     * With `status: resolved` (or `action: resolve`): resolved in the next
+     * release. Events from the project's newest release at this moment, or
+     * an older one, or with no release, keep it resolved; an event from a
+     * newer release reopens it. Fails when the project has no release yet.
+     */
+    in_next_release?: boolean;
 };
 
 /**
@@ -14304,6 +14311,7 @@ export type ErrorGroupResponse = {
     merged_into_group_id?: number | null;
     message_template?: string | null;
     project_id: number;
+    resolution?: GroupResolutionState | null;
     status: string;
     title: string;
     total_count: number;
@@ -17362,6 +17370,25 @@ export type GroupRepository = {
 
 export type GroupRepositoryResponse = {
     repository?: GroupRepository | null;
+};
+
+/**
+ * A group resolved in the next release (ADR 074, D1.5).
+ */
+export type GroupResolutionState = {
+    /**
+     * That release's version, filled in on the single-group read.
+     */
+    after_release?: string | null;
+    /**
+     * Id of the release the group was resolved after; events from a newer
+     * release reopen it.
+     */
+    after_release_id?: number | null;
+    /**
+     * Always true; the field exists so clients can test one value.
+     */
+    in_next_release: boolean;
 };
 
 /**
@@ -37266,6 +37293,13 @@ export type UpdateErrorGroupRequest = {
      */
     assigned_to?: string | null;
     ignore?: IgnoreConditionsRequest | null;
+    /**
+     * With `status: resolved` (or `action: resolve`): resolved in the next
+     * release. Events from the project's newest release at this moment, or
+     * an older one, or with no release, keep it resolved; an event from a
+     * newer release reopens it. Fails when the project has no release yet.
+     */
+    in_next_release?: boolean;
     status: string;
 };
 

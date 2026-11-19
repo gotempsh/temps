@@ -352,6 +352,7 @@ pub struct ErrorGroupDomain {
     /// While the group is ignored with conditions: when it comes back
     /// (ADR 074, D1.3). `None` for any other group.
     pub ignore: Option<GroupIgnoreState>,
+    pub resolution: Option<GroupResolutionState>,
     pub project_id: i32,
     pub environment_id: Option<i32>,
     pub deployment_id: Option<i32>,
@@ -580,6 +581,29 @@ mod without_nul_tests {
             Some("literal \\u0000 text")
         );
         assert_eq!(event.screen_width, Some(1920));
+    }
+}
+
+/// A group resolved in the next release (ADR 074, D1.5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct GroupResolutionState {
+    /// Always true; the field exists so clients can test one value.
+    pub in_next_release: bool,
+    /// Id of the release the group was resolved after; events from a newer
+    /// release reopen it.
+    pub after_release_id: Option<i32>,
+    /// That release's version, filled in on the single-group read.
+    pub after_release: Option<String>,
+}
+
+impl GroupResolutionState {
+    /// The state of a group resolved in the next release; `None` otherwise.
+    pub fn from_group(group: &temps_entities::error_groups::Model) -> Option<Self> {
+        (group.status == "resolved" && group.resolved_in_next_release).then_some(Self {
+            in_next_release: true,
+            after_release_id: group.resolved_in_release_after_id,
+            after_release: None,
+        })
     }
 }
 

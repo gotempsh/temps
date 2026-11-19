@@ -119,6 +119,7 @@ async fn bulk_resolve_by_ids_updates_only_the_named_groups() {
             BulkGroupSelector::Ids(vec![first, second, first]),
             BulkGroupAction::Resolve,
             None,
+            false,
         )
         .await
         .expect("bulk resolve succeeds");
@@ -162,6 +163,7 @@ async fn a_group_already_in_the_target_status_is_skipped_not_updated() {
             BulkGroupSelector::Ids(vec![open, already]),
             BulkGroupAction::Resolve,
             None,
+            false,
         )
         .await
         .expect("bulk resolve succeeds");
@@ -188,6 +190,7 @@ async fn an_id_from_another_project_fails_the_whole_request_before_writing() {
             BulkGroupSelector::Ids(vec![mine, theirs]),
             BulkGroupAction::Resolve,
             None,
+            false,
         )
         .await
         .expect_err("a foreign group id must be refused");
@@ -256,6 +259,7 @@ async fn bulk_by_filter_matches_status_and_search_and_reports_nothing_remaining(
             }),
             BulkGroupAction::Resolve,
             None,
+            false,
         )
         .await
         .expect("bulk resolve by filter succeeds");
@@ -302,6 +306,7 @@ async fn a_filter_search_treats_wildcards_as_literal_text() {
             }),
             BulkGroupAction::Ignore,
             None,
+            false,
         )
         .await
         .expect("bulk ignore by filter succeeds");
@@ -355,6 +360,7 @@ async fn an_event_window_filter_selects_only_groups_with_events_in_it() {
             }),
             BulkGroupAction::Resolve,
             None,
+            false,
         )
         .await
         .expect("bulk resolve in a window succeeds");
@@ -375,6 +381,7 @@ async fn an_empty_or_oversized_id_list_is_a_validation_error() {
             BulkGroupSelector::Ids(vec![]),
             BulkGroupAction::Resolve,
             None,
+            false,
         )
         .await
         .expect_err("an empty id list is refused");
@@ -390,6 +397,7 @@ async fn an_empty_or_oversized_id_list_is_a_validation_error() {
             BulkGroupSelector::Ids(too_many),
             BulkGroupAction::Resolve,
             None,
+            false,
         )
         .await
         .expect_err("more ids than the cap is refused");
@@ -416,6 +424,7 @@ async fn a_half_open_date_range_and_an_unknown_status_are_refused() {
             }),
             BulkGroupAction::Resolve,
             None,
+            false,
         )
         .await
         .expect_err("a start without an end is refused");
@@ -430,6 +439,7 @@ async fn a_half_open_date_range_and_an_unknown_status_are_refused() {
             }),
             BulkGroupAction::Resolve,
             None,
+            false,
         )
         .await
         .expect_err("an unknown status filter is refused");

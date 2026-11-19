@@ -410,9 +410,17 @@ impl ErrorTrackingService {
         status: String,
         assigned_to: Option<String>,
         ignore: Option<IgnoreConditions>,
+        in_next_release: bool,
     ) -> Result<(), ErrorTrackingError> {
         self.crud
-            .update_error_group_status(group_id, project_id, status.clone(), assigned_to, ignore)
+            .update_error_group_status(
+                group_id,
+                project_id,
+                status.clone(),
+                assigned_to,
+                ignore,
+                in_next_release,
+            )
             .await?;
 
         // Evaluate status change alert rules
@@ -437,10 +445,11 @@ impl ErrorTrackingService {
         selector: BulkGroupSelector,
         action: BulkGroupAction,
         ignore: Option<IgnoreConditions>,
+        in_next_release: bool,
     ) -> Result<BulkGroupOutcome, ErrorTrackingError> {
         let outcome = self
             .workflow
-            .bulk_update_status(project_id, selector, action, ignore)
+            .bulk_update_status(project_id, selector, action, ignore, in_next_release)
             .await?;
         if outcome.updated_ids.is_empty() {
             return Ok(outcome);

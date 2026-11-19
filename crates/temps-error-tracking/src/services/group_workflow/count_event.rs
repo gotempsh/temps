@@ -39,14 +39,16 @@ pub(crate) fn user_key(event: &CreateErrorEventData) -> Option<String> {
 
 /// Count the event in `group_id` and return the group's status afterwards.
 ///
-/// - `resolved` reopens to `unresolved`, as before.
+/// - `resolved` reopens to `unresolved`, as before, unless it was resolved in
+///   the next release (D1.5): then only an event from a release newer than
+///   the one it was resolved after reopens it.
 /// - `ignored` with no condition reopens to `unresolved`, as before.
 /// - `ignored` with conditions stays `ignored` until any one is met: the time
 ///   has passed, `total_count` reached the target, or enough new distinct
 ///   users were affected. `ignore_forever` never reopens.
 ///
-/// When the group reopens, its ignore conditions and the users counted for
-/// them are cleared, so a later plain ignore starts from nothing.
+/// When the group reopens, its ignore and resolution conditions and the users
+/// counted for them are cleared, so a later plain ignore starts from nothing.
 pub(crate) async fn count_event_in_group<C: ConnectionTrait>(
     tx: &C,
     group_id: i32,
@@ -83,6 +85,12 @@ pub(crate) async fn count_event_in_group<C: ConnectionTrait>(
                updated_at = NOW(), \
                ignore_user_count = ignore_user_count + $3, \
                status = CASE \
+                 WHEN status = 'resolved' AND resolved_in_next_release AND NOT EXISTS ( \
+                   SELECT 1 FROM error_releases r \
+                   LEFT JOIN error_releases b ON b.id = error_groups.resolved_in_release_after_id \
+                   WHERE r.project_id = error_groups.project_id AND r.version = $4 \
+                     AND (b.id IS NULL OR (r.released_at, r.id) > (b.released_at, b.id))) \
+                   THEN 'resolved' \
                  WHEN status = 'resolved' THEN 'unresolved' \
                  WHEN status = 'ignored' AND ( \
                    ignore_forever OR ( \
@@ -97,7 +105,12 @@ pub(crate) async fn count_event_in_group<C: ConnectionTrait>(
                  WHEN status = 'ignored' THEN 'unresolved' \
                  ELSE status END \
              WHERE id = $1 RETURNING status",
-            [group_id.into(), event_time.into(), new_user.into()],
+            [
+                group_id.into(),
+                event_time.into(),
+                new_user.into(),
+                event.release_version.as_deref().map(str::trim).into(),
+            ],
         ))
         .await?
         .ok_or(ErrorTrackingError::GroupNotFound)?
@@ -109,7 +122,8 @@ pub(crate) async fn count_event_in_group<C: ConnectionTrait>(
     Ok(status)
 }
 
-/// Forget a group's ignore conditions and the users counted for them.
+/// Forget a group's ignore and resolution conditions and the users counted
+/// for them.
 pub(crate) async fn clear_ignore_conditions<C: ConnectionTrait>(
     tx: &C,
     group_id: i32,
@@ -128,7 +142,8 @@ pub(crate) async fn clear_ignore_conditions_many<C: ConnectionTrait>(
     tx.execute(Statement::from_sql_and_values(
         DatabaseBackend::Postgres,
         "UPDATE error_groups SET ignore_until = NULL, ignore_until_event_count = NULL, \
-         ignore_until_user_count = NULL, ignore_user_count = 0, ignore_forever = FALSE \
+         ignore_until_user_count = NULL, ignore_user_count = 0, ignore_forever = FALSE, \
+         resolved_in_next_release = FALSE, resolved_in_release_after_id = NULL \
          WHERE id = ANY($1)",
         [group_ids.to_vec().into()],
     ))

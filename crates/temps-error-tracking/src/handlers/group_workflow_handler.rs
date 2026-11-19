@@ -146,6 +146,12 @@ pub struct BulkErrorGroupRequest {
     /// With `action: ignore`: when the groups come back. Omitted, the next
     /// event reopens them.
     pub ignore: Option<IgnoreConditionsRequest>,
+    /// With `status: resolved` (or `action: resolve`): resolved in the next
+    /// release. Events from the project's newest release at this moment, or
+    /// an older one, or with no release, keep it resolved; an event from a
+    /// newer release reopens it. Fails when the project has no release yet.
+    #[serde(default)]
+    pub in_next_release: bool,
 }
 
 /// When an ignored error group comes back. With no field set the next event
@@ -255,6 +261,7 @@ pub async fn bulk_update_error_groups(
             selector,
             request.action.into(),
             request.ignore.clone().map(Into::into),
+            request.in_next_release,
         )
         .await?;
     let response = BulkErrorGroupResponse::new(request.action, outcome);
@@ -275,6 +282,7 @@ pub async fn bulk_update_error_groups(
         requested_group_ids: request.group_ids,
         filter: request.filter,
         ignore: request.ignore,
+        in_next_release: request.in_next_release,
         updated_group_ids: response.updated_ids.clone(),
         skipped: response.skipped,
         remaining: response.remaining,
@@ -775,6 +783,7 @@ pub(crate) mod tests {
             Extension(metadata()),
             Json(BulkErrorGroupRequest {
                 ignore: None,
+                in_next_release: false,
                 action: BulkErrorGroupAction::Resolve,
                 group_ids: Some(vec![first, second]),
                 filter: None,
@@ -822,6 +831,7 @@ pub(crate) mod tests {
             Extension(metadata()),
             Json(BulkErrorGroupRequest {
                 ignore: None,
+                in_next_release: false,
                 action: BulkErrorGroupAction::Resolve,
                 group_ids: Some(vec![1]),
                 filter: None,
@@ -853,6 +863,7 @@ pub(crate) mod tests {
                 Extension(metadata()),
                 Json(BulkErrorGroupRequest {
                     ignore: None,
+                    in_next_release: false,
                     action: BulkErrorGroupAction::Ignore,
                     group_ids: ids,
                     filter,

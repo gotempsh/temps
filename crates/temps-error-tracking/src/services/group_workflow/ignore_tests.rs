@@ -63,6 +63,7 @@ async fn ignored_group(
             BulkGroupSelector::Ids(vec![id]),
             BulkGroupAction::Ignore,
             Some(conditions),
+            false,
         )
         .await
         .expect("ignore the group");
@@ -251,6 +252,7 @@ async fn a_new_ignore_replaces_the_conditions_and_resolving_clears_them() {
                 forever: true,
                 ..Default::default()
             }),
+            false,
         )
         .await
         .expect("re-ignore");
@@ -265,6 +267,7 @@ async fn a_new_ignore_replaces_the_conditions_and_resolving_clears_them() {
             BulkGroupSelector::Ids(vec![id]),
             BulkGroupAction::Resolve,
             None,
+            false,
         )
         .await
         .expect("resolve");
@@ -290,6 +293,7 @@ async fn conditions_on_a_status_other_than_ignored_are_refused() {
                 event_count: Some(3),
                 ..Default::default()
             }),
+            false,
         )
         .await
         .expect_err("conditions only go with ignore");

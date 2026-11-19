@@ -22,7 +22,7 @@ test('the actions stay disabled until something is selected', () => {
     />
   )
 
-  const resolve = screen.getByRole('button', { name: /resolve/i })
+  const resolve = screen.getByRole('button', { name: 'Resolve' })
   expect(resolve.hasAttribute('disabled')).toBe(true)
   fireEvent.click(resolve)
   expect(actions).toEqual([])
@@ -46,7 +46,7 @@ test('a selection enables each action and reports which one was chosen', async (
   )
 
   expect(screen.getByText('2 selected')).toBeTruthy()
-  fireEvent.click(screen.getByRole('button', { name: /resolve/i }))
+  fireEvent.click(screen.getByRole('button', { name: 'Resolve' }))
   // Ignore opens a menu of conditions for coming back.
   await act(async () => {
     fireEvent.pointerDown(screen.getByRole('button', { name: /ignore/i }), {
@@ -148,4 +148,35 @@ test('merge needs at least two groups and reports the request', () => {
   expect(merge().hasAttribute('disabled')).toBe(false)
   fireEvent.click(merge())
   expect(merges).toBe(1)
+})
+
+test('resolve in next release is offered next to resolve', async () => {
+  const calls: Array<[BulkTriageAction, boolean | undefined]> = []
+  render(
+    <BulkTriageBar
+      pageGroupIds={[4]}
+      selectedGroupIds={[4]}
+      onSelectionChange={() => {}}
+      onAction={(action, _ignore, inNextRelease) =>
+        calls.push([action, inNextRelease])
+      }
+      onMerge={() => {}}
+      isPending={false}
+    />
+  )
+
+  fireEvent.click(screen.getByRole('button', { name: 'Resolve' }))
+  await act(async () => {
+    fireEvent.pointerDown(
+      screen.getByRole('button', { name: 'More ways to close the group' }),
+      { button: 0, ctrlKey: false }
+    )
+  })
+  await act(async () => {
+    fireEvent.click(await screen.findByText('Resolve in next release'))
+  })
+  expect(calls).toEqual([
+    ['resolve', false],
+    ['resolve', true],
+  ])
 })

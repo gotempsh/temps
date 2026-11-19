@@ -380,11 +380,17 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
 
   const applyBulkAction = (
     action: 'resolve' | 'unresolve' | 'ignore',
-    ignore?: IgnoreConditions
+    ignore?: IgnoreConditions,
+    inNextRelease?: boolean
   ) =>
     bulkMutation.mutate({
       path: { project_id: project.id },
-      body: { action, group_ids: selectedGroupIds, ignore },
+      body: {
+        action,
+        group_ids: selectedGroupIds,
+        ignore,
+        in_next_release: inNextRelease ?? false,
+      },
     })
 
   // Fetch DSN for the selected environment (always fetch when environment is selected)

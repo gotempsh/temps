@@ -17,11 +17,14 @@ use super::types::ErrorTrackingError;
 pub mod count_event;
 pub mod ignore;
 pub mod merge;
+pub mod next_release;
 
 #[cfg(test)]
 mod ignore_tests;
 #[cfg(test)]
 mod merge_tests;
+#[cfg(test)]
+mod next_release_tests;
 #[cfg(test)]
 mod tests;
 
@@ -30,6 +33,7 @@ pub use merge::{
     GroupFingerprint, MergeOutcome, SplitOutcome, UnmergeOutcome, MAX_MERGE_SOURCES,
     MAX_SPLIT_FINGERPRINTS,
 };
+pub use next_release::{CurrentRelease, ReleaseRegistry, MAX_RELEASE_CHARS};
 
 /// Most groups one bulk request may touch. Larger selections report the rest
 /// in `remaining`, so the caller pages through them.
@@ -126,11 +130,19 @@ impl GroupWorkflowService {
         selector: BulkGroupSelector,
         action: BulkGroupAction,
         ignore: Option<IgnoreConditions>,
+        in_next_release: bool,
     ) -> Result<BulkGroupOutcome, ErrorTrackingError> {
         let target = action.target_status();
         IgnoreConditions::check_for_status(ignore.as_ref(), target, Utc::now())?;
-        let write = StatusWrite::new(target, ignore.unwrap_or_default());
+        check_next_release_for_status(in_next_release, target)?;
         let tx = self.db.begin().await?;
+        let after_release = if in_next_release {
+            Some(next_release::current_release(&tx, project_id).await?)
+        } else {
+            None
+        };
+        let write = StatusWrite::new(target, ignore.unwrap_or_default())
+            .with_release(after_release.as_ref().map(|r| r.id));
         let outcome = match selector {
             BulkGroupSelector::Ids(ids) => {
                 self.bulk_update_by_ids(&tx, project_id, ids, &write)
@@ -274,17 +286,31 @@ impl GroupWorkflowService {
 pub(crate) struct StatusWrite {
     status: &'static str,
     ignore: IgnoreConditions,
+    /// With `resolved`: resolved in the release after this one (D1.5).
+    after_release_id: Option<i32>,
 }
 
 impl StatusWrite {
     pub(crate) fn new(status: &'static str, ignore: IgnoreConditions) -> Self {
-        Self { status, ignore }
+        Self {
+            status,
+            ignore,
+            after_release_id: None,
+        }
+    }
+
+    /// Resolve in the release after `release_id`; `None` for a plain write.
+    pub(crate) fn with_release(mut self, release_id: Option<i32>) -> Self {
+        self.after_release_id = release_id;
+        self
     }
 
     /// Whether a group already in the target status is written anyway: an
-    /// ignore with conditions replaces the conditions of an ignored group.
+    /// ignore with conditions replaces the conditions of an ignored group,
+    /// and resolving in the next release re-bases a resolved one.
     fn reapplies(&self) -> bool {
-        self.status == "ignored" && !self.ignore.is_empty()
+        (self.status == "ignored" && !self.ignore.is_empty())
+            || (self.status == "resolved" && self.after_release_id.is_some())
     }
 
     /// `SET` assignments, binding their values after those already in
@@ -301,12 +327,17 @@ impl StatusWrite {
         let users = values.len();
         values.push(self.ignore.forever.into());
         let forever = values.len();
+        values.push(self.after_release_id.is_some().into());
+        let next_release = values.len();
+        values.push(self.after_release_id.into());
+        let after_release = values.len();
         format!(
             "status = ${status}, updated_at = NOW(), ignore_until = ${until}, \
              ignore_until_event_count = CASE WHEN ${events}::int IS NULL THEN NULL \
                ELSE LEAST(total_count::bigint + ${events}::int, 2147483647)::int END, \
              ignore_until_user_count = ${users}, ignore_user_count = 0, \
-             ignore_forever = ${forever}"
+             ignore_forever = ${forever}, resolved_in_next_release = ${next_release}, \
+             resolved_in_release_after_id = ${after_release}"
         )
     }
 
@@ -318,6 +349,19 @@ impl StatusWrite {
         values.push(self.status.to_owned().into());
         format!("{alias}.status <> ${}", values.len())
     }
+}
+
+/// "Resolve in the next release" only goes with the `resolved` status.
+pub(crate) fn check_next_release_for_status(
+    in_next_release: bool,
+    status: &str,
+) -> Result<(), ErrorTrackingError> {
+    if in_next_release && status != "resolved" {
+        return Err(ErrorTrackingError::Validation(format!(
+            "in_next_release applies only to status 'resolved', not '{status}'"
+        )));
+    }
+    Ok(())
 }
 
 /// Escape `%`, `_` and `\` so a user's text is matched literally by ILIKE.

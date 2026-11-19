@@ -584,6 +584,7 @@ async fn a_retried_event_after_a_merge_neither_counts_nor_reopens() {
             BulkGroupSelector::Ids(vec![target]),
             BulkGroupAction::Resolve,
             None,
+            false,
         )
         .await
         .expect("resolve the survivor");

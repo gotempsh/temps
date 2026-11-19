@@ -348,6 +348,7 @@ impl ErrorCRUDService {
             .into_iter()
             .map(|group| ErrorGroupDomain {
                 ignore: super::types::GroupIgnoreState::from_group(&group),
+                resolution: super::types::GroupResolutionState::from_group(&group),
                 id: group.id,
                 title: group.title,
                 error_type: group.error_type,
@@ -645,8 +646,21 @@ impl ErrorCRUDService {
             None
         };
 
+        let mut resolution = super::types::GroupResolutionState::from_group(&group);
+        if let Some(state) = resolution.as_mut() {
+            if let Some(release_id) = state.after_release_id {
+                state.after_release = super::group_workflow::next_release::release_versions(
+                    self.db.as_ref(),
+                    &[release_id],
+                )
+                .await?
+                .remove(&release_id);
+            }
+        }
+
         Ok(ErrorGroupDomain {
             ignore: super::types::GroupIgnoreState::from_group(&group),
+            resolution,
             id: group.id,
             title: group.title,
             error_type: group.error_type,
@@ -681,12 +695,20 @@ impl ErrorCRUDService {
         status: String,
         assigned_to: Option<String>,
         ignore: Option<IgnoreConditions>,
+        in_next_release: bool,
     ) -> Result<(), ErrorTrackingError> {
         let status = canonical_group_status(&status)?;
         IgnoreConditions::check_for_status(ignore.as_ref(), status, Utc::now())?;
-        let write = StatusWrite::new(status, ignore.unwrap_or_default());
+        super::group_workflow::check_next_release_for_status(in_next_release, status)?;
 
         let tx = self.db.begin().await?;
+        let after_release = if in_next_release {
+            Some(super::group_workflow::next_release::current_release(&tx, project_id).await?)
+        } else {
+            None
+        };
+        let write = StatusWrite::new(status, ignore.unwrap_or_default())
+            .with_release(after_release.map(|r| r.id));
         let mut values: Vec<sea_orm::Value> = vec![group_id.into(), project_id.into()];
         let mut set = write.set_clause(&mut values);
         match assigned_to {
@@ -862,7 +884,14 @@ mod group_status_tests {
         // An empty mock fails on any query, so a pass proves nothing was read.
         let db = sea_orm::MockDatabase::new(DatabaseBackend::Postgres).into_connection();
         let result = ErrorCRUDService::new(Arc::new(db))
-            .update_error_group_status(1, 1, "definitely-not-a-status".to_string(), None, None)
+            .update_error_group_status(
+                1,
+                1,
+                "definitely-not-a-status".to_string(),
+                None,
+                None,
+                false,
+            )
             .await;
         assert!(matches!(result, Err(ErrorTrackingError::Validation(_))));
     }
@@ -1060,7 +1089,14 @@ mod tests {
 
         // Update status to resolved
         let result = service
-            .update_error_group_status(group_id, project_id, "resolved".to_string(), None, None)
+            .update_error_group_status(
+                group_id,
+                project_id,
+                "resolved".to_string(),
+                None,
+                None,
+                false,
+            )
             .await;
 
         assert!(result.is_ok());
@@ -1093,6 +1129,7 @@ mod tests {
                 "assigned".to_string(),
                 Some("dev@example.com".to_string()),
                 None,
+                false,
             )
             .await;
 
@@ -1121,7 +1158,14 @@ mod tests {
 
         // Ignore error
         let result = service
-            .update_error_group_status(group_id, project_id, "ignored".to_string(), None, None)
+            .update_error_group_status(
+                group_id,
+                project_id,
+                "ignored".to_string(),
+                None,
+                None,
+                false,
+            )
             .await;
 
         assert!(result.is_ok());
@@ -1145,7 +1189,7 @@ mod tests {
 
         // Try to update non-existent group
         let result = service
-            .update_error_group_status(99999, 1, "resolved".to_string(), None, None)
+            .update_error_group_status(99999, 1, "resolved".to_string(), None, None, false)
             .await;
 
         assert!(result.is_err());
@@ -1167,7 +1211,7 @@ mod tests {
 
         // Try to update from wrong project
         let result = service
-            .update_error_group_status(group_id, 99999, "resolved".to_string(), None, None)
+            .update_error_group_status(group_id, 99999, "resolved".to_string(), None, None, false)
             .await;
 
         assert!(result.is_err());
