@@ -46,6 +46,12 @@ pub struct Model {
     /// proxy's `certificate_callback` refuses to re-enqueue a job for the same
     /// hostname until this timestamp elapses. `None` means "no active backoff".
     pub on_demand_backoff_until: Option<DBDateTime>,
+    /// Why the last certificate attempt failed, as a typed cause
+    /// (`unreachable`, `dns_lookup`, `upstream_answered`, `rate_limited`, ...;
+    /// `temps_domains::CertFailureCause`). Cleared when a certificate is
+    /// issued or a new order starts. `None` for rows that have not failed
+    /// since the column was added.
+    pub failure_cause: Option<String>,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
 }
@@ -117,6 +123,7 @@ mod tests {
             is_wildcard: false,
             verification_method: "http-01".to_string(),
             on_demand_backoff_until: None,
+            failure_cause: None,
             created_at: now,
             updated_at: now,
         };

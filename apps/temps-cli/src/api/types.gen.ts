@@ -4446,6 +4446,11 @@ export type CatalogReference = {
 };
 
 /**
+ * Why the last certificate attempt for a domain failed.
+ */
+export type CertFailureCause = 'dns_lookup' | 'unreachable' | 'upstream_answered' | 'caa_forbids' | 'rate_limited' | 'ca_transient' | 'config' | 'unknown';
+
+/**
  * Current on-demand cert status for a single hostname (ADR-018 §5). Backs
  * `GET /domains/by-host/{hostname}/cert-status`.
  */
@@ -12608,6 +12613,7 @@ export type DomainResponse = {
     dns_challenge_value?: string | null;
     domain: string;
     expiration_time?: number | null;
+    failure_cause?: CertFailureCause | null;
     id: number;
     is_wildcard: boolean;
     last_error?: string | null;

@@ -700,6 +700,11 @@ impl DomainService {
                 let mut domain_active: domains::ActiveModel = domain.clone().into();
                 domain_active.last_error = Set(Some(e.to_string()));
                 domain_active.last_error_type = Set(Some("challenge_request".to_string()));
+                domain_active.failure_cause = Set(Some(
+                    crate::failure_cause::classify(&e.to_string())
+                        .as_str()
+                        .to_string(),
+                ));
                 if let Err(update_err) = domain_active.update(self.db.as_ref()).await {
                     error!(
                         "Failed to persist challenge-request failure for domain {}: {}",
@@ -808,6 +813,7 @@ impl DomainService {
                 // fresh challenge instructions.
                 domain_active.last_error = Set(None);
                 domain_active.last_error_type = Set(None);
+                domain_active.failure_cause = Set(None);
 
                 match challenge_data.challenge_type {
                     ChallengeType::Http01 => {
@@ -900,6 +906,7 @@ impl DomainService {
                 domain_active.expiration_time = Set(Some(cert_data.expiration_time));
                 domain_active.last_error = Set(None);
                 domain_active.last_error_type = Set(None);
+                domain_active.failure_cause = Set(None);
                 // As in `complete_challenge`: the certificate came from an ACME
                 // order for this challenge type, so the renewal job can renew
                 // it the same way.
@@ -1159,6 +1166,7 @@ impl DomainService {
                 domain_active.last_renewed = Set(Some(Utc::now()));
                 domain_active.last_error = Set(None);
                 domain_active.last_error_type = Set(None);
+                domain_active.failure_cause = Set(None);
                 // Record the challenge that was actually validated. A row
                 // created as `manual` (e.g. by `temps setup`) and issued here
                 // would otherwise stay `manual`, which the renewal job never
@@ -1303,6 +1311,11 @@ impl DomainService {
                 domain_active.status = Set(fallback_status.to_string());
                 domain_active.last_error = Set(Some(e.to_string()));
                 domain_active.last_error_type = Set(Some(error_type.to_string()));
+                domain_active.failure_cause = Set(Some(
+                    crate::failure_cause::classify(&e.to_string())
+                        .as_str()
+                        .to_string(),
+                ));
 
                 if let Err(update_err) = domain_active.update(self.db.as_ref()).await {
                     error!(
@@ -1534,9 +1547,11 @@ impl DomainService {
             // leave a stale "error" surfaced to operators for a healthy domain.
             domain_active.last_error = Set(None);
             domain_active.last_error_type = Set(None);
+            domain_active.failure_cause = Set(None);
         } else {
             domain_active.last_error = Set(Some("Order cancelled by user".to_string()));
             domain_active.last_error_type = Set(Some("cancelled".to_string()));
+            domain_active.failure_cause = Set(None);
         }
 
         let updated_domain = domain_active.update(self.db.as_ref()).await?;
@@ -1946,6 +1961,7 @@ impl DomainService {
                 active.on_demand_backoff_until = Set(None);
                 active.last_error = Set(None);
                 active.last_error_type = Set(None);
+                active.failure_cause = Set(None);
                 let updated = active.update(self.db.as_ref()).await?;
                 Ok(updated)
             }
@@ -2060,6 +2076,11 @@ impl DomainService {
         active.status = Set("on_demand_failed".to_string());
         active.last_error = Set(Some(error_chain.to_string()));
         active.last_error_type = Set(Some(category.to_string()));
+        active.failure_cause = Set(Some(
+            crate::failure_cause::classify(error_chain)
+                .as_str()
+                .to_string(),
+        ));
         active.on_demand_backoff_until = Set(Some(backoff_until));
         active.update(self.db.as_ref()).await?;
         Ok(backoff_until)
@@ -2138,7 +2159,15 @@ impl DomainService {
             return ("rate_limited".to_string(), Some(deadline));
         }
 
-        let chain = error_chain_string(err).to_lowercase();
+        let chain = error_chain_string(err);
+        // The CA's problem type, when the error carries one, is exact. The
+        // keyword fallback below misread HTTP-01 failures: their text always
+        // contains `/.well-known/acme-challenge/`, and a hostname may contain
+        // "dns".
+        if let Some(cause) = crate::failure_cause::classify_problem(&chain) {
+            return (cause.legacy_category().to_string(), None);
+        }
+        let chain = chain.to_lowercase();
         let category = if chain.contains("ratelimited") || chain.contains("rate limit") {
             "rate_limited"
         } else if chain.contains("dns") {
@@ -3258,6 +3287,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_provision_on_demand_failure_records_the_typed_cause() {
+        // A closed port 80, in the shape the provider reports the CA's
+        // problem. The hostname contains "dns": that must not decide.
+        let Some((service, db, _guard)) = on_demand_service(OnDemandMockMode::Fail(
+            "Order validation failed after 2 attempt(s): [mydns.1-2-3-4.sslip.io Http01] \
+             urn:ietf:params:acme:error:connection: 203.0.113.10: Fetching \
+             http://mydns.1-2-3-4.sslip.io/.well-known/acme-challenge/abc: Connection refused"
+                .to_string(),
+        ))
+        .await
+        else {
+            return;
+        };
+        let hostname = "mydns.1-2-3-4.sslip.io";
+        let _ = service
+            .provision_on_demand(hostname, "ops@example.com")
+            .await;
+
+        let row = domains::Entity::find()
+            .filter(domains::Column::Domain.eq(hostname))
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("domains row exists");
+        assert_eq!(row.failure_cause.as_deref(), Some("unreachable"));
+        assert_eq!(row.last_error_type.as_deref(), Some("challenge_mismatch"));
+        let attempt = service
+            .latest_on_demand_attempt(hostname)
+            .await
+            .unwrap()
+            .expect("the failure is audited");
+        assert_eq!(
+            attempt.error_category.as_deref(),
+            Some("challenge_mismatch")
+        );
+    }
+
+    #[tokio::test]
     async fn test_provision_on_demand_rate_limited_mapping() {
         // LE rateLimited problem, flattened to a string at the provider boundary,
         // with an explicit Retry-After window in the detail.
@@ -4284,6 +4351,20 @@ mod tests {
                 "challenge_mismatch",
             ),
             ("connection reset by peer", "internal"),
+            // With the CA's problem type the type decides, not words in the
+            // hostname or the token path.
+            (
+                "[mydns.example.com Http01] urn:ietf:params:acme:error:connection: Fetching http://mydns.example.com/.well-known/acme-challenge/x: Connection refused",
+                "challenge_mismatch",
+            ),
+            (
+                "[app.example.com Http01] urn:ietf:params:acme:error:connection: Timeout during connect (likely firewall problem)",
+                "challenge_mismatch",
+            ),
+            (
+                "[app.example.com Http01] urn:ietf:params:acme:error:dns: DNS problem: NXDOMAIN looking up A for app.example.com",
+                "dns_failure",
+            ),
         ];
         for (msg, expected) in cases {
             let err =
@@ -4385,6 +4466,7 @@ mod tests {
             is_wildcard: false,
             verification_method: "http-01".to_string(),
             on_demand_backoff_until: None,
+            failure_cause: None,
             created_at: now,
             updated_at: now,
         }

@@ -169,6 +169,7 @@ mod tests {
             is_wildcard: false,
             verification_method: "http".to_string(),
             on_demand_backoff_until: None,
+            failure_cause: None,
             created_at: now,
             updated_at: now,
         }
