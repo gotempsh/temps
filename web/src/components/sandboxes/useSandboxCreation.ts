@@ -3,19 +3,23 @@
 
 import { useQuery } from '@tanstack/react-query'
 import { getSandboxCreationOptions } from '@/api/client/@tanstack/react-query.gen'
-import { CREATION_POLL_MS, keepPolling } from './sandbox-creation'
+import {
+  CREATION_POLL_MS,
+  failedAfterRequestEnded,
+  keepPolling,
+} from './sandbox-creation'
 
 /**
- * Polls the steps of the create sent with `creationId` while it runs. A 404
- * before the server has started tracking it is retried while the create
- * request is still in flight (`requestSettled` false): the request and the
- * first poll race. A 404 otherwise means the server does not track the
- * create and stops polling; a network or server error keeps polling (see
- * `keepPolling`).
+ * Polls the steps of the create sent with `creationId` while it runs.
+ * `requestEndedAt` is when the create request ended (ms since the epoch),
+ * or null while it runs. A 404 that came before that is retried: the first
+ * read races the server registering the id. A 404 after it means the server
+ * does not track the create and stops polling; a network or server error
+ * keeps polling (see `keepPolling`).
  */
 export function useSandboxCreation(
   creationId: string | null,
-  requestSettled: boolean
+  requestEndedAt: number | null
 ) {
   return useQuery({
     ...getSandboxCreationOptions({ path: { creation_id: creationId ?? '' } }),
@@ -28,7 +32,7 @@ export function useSandboxCreation(
       keepPolling(
         query.state.data,
         query.state.status === 'error' ? query.state.error : null,
-        requestSettled
+        failedAfterRequestEnded(query.state.errorUpdatedAt, requestEndedAt)
       )
         ? CREATION_POLL_MS
         : false,

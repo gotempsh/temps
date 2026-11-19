@@ -121,14 +121,16 @@ export function creationUntracked(error: unknown): boolean {
 }
 
 /**
- * Whether to poll a create's steps again (`error` is the last read's
- * failure, or null).
+ * Whether to poll a create's steps again. `error` is the last read's
+ * failure, or null; `failedAfterRequestEnded` says whether that failure
+ * came after the create request (`POST /v1/sandboxes`) had ended.
  *
  * - No failure: while the create runs, or until the first answer.
  * - A 404 stops polling, even over steps read earlier: the server no longer
  *   tracks the create, so it will never finish there. The one exception is
- *   a 404 before anything was read while the create request is still in
- *   flight: the first read can race the server registering the id.
+ *   a 404 before anything was read that came while the create request was
+ *   still in flight: that read can race the server registering the id, so
+ *   one more read after the request ends decides.
  * - Any other failure is transient: keep polling while the create is
  *   running or not read yet, so its steps (or its failure) come back once
  *   the server answers.
@@ -136,11 +138,24 @@ export function creationUntracked(error: unknown): boolean {
 export function keepPolling(
   creation: SandboxCreation | undefined,
   error: unknown,
-  requestSettled: boolean
+  failedAfterRequestEnded: boolean
 ): boolean {
   if (!error) return creationRunning(creation)
-  if (creationUntracked(error)) return creation === undefined && !requestSettled
+  if (creationUntracked(error)) {
+    return creation === undefined && !failedAfterRequestEnded
+  }
   return creationRunning(creation)
+}
+
+/**
+ * Whether a read that failed at `errorAt` (ms since the epoch) failed after
+ * the create request ended at `requestEndedAt` (null while it runs).
+ */
+export function failedAfterRequestEnded(
+  errorAt: number,
+  requestEndedAt: number | null
+): boolean {
+  return requestEndedAt !== null && errorAt >= requestEndedAt
 }
 
 /**

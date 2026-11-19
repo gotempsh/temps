@@ -140,7 +140,10 @@ export function CreateSandboxSheet({
   // The id the current attempt's steps are tracked under. Set on submit,
   // kept after a failure so the failed step stays on screen.
   const [creationId, setCreationId] = useState<string | null>(null)
-  const creation = useSandboxCreation(creationId, !create.isPending)
+  // When this attempt's create request ended: a 404 read before then may
+  // predate the server registering the id, so it is read again after.
+  const [requestEndedAt, setRequestEndedAt] = useState<number | null>(null)
+  const creation = useSandboxCreation(creationId, requestEndedAt)
 
   // Start from a clean form, and without the previous attempt's error, each
   // time the sheet is opened (it stays mounted while closed).
@@ -149,6 +152,7 @@ export function CreateSandboxSheet({
     form.reset(createSandboxFormDefaults)
     resetCreate()
     setCreationId(null)
+    setRequestEndedAt(null)
   }, [open, form, resetCreate])
 
   const placement = useQuery({
@@ -166,7 +170,11 @@ export function CreateSandboxSheet({
   const submit = (values: CreateSandboxFormValues) => {
     const id = newCreationId()
     setCreationId(id)
-    create.mutate({ body: { ...toCreateSandboxBody(values), creation_id: id } })
+    setRequestEndedAt(null)
+    create.mutate(
+      { body: { ...toCreateSandboxBody(values), creation_id: id } },
+      { onSettled: () => setRequestEndedAt(Date.now()) }
+    )
   }
   // A refused create the server never tracked has no steps: its error
   // alone says what happened. Steps the server stopped tracking (a 404

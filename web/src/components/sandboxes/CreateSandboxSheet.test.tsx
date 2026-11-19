@@ -347,6 +347,59 @@ test(
 )
 
 test(
+  'a 404 read before the server registered the create is read again once the request ends',
+  async () => {
+    allowIntervalPolling()
+    const restoreId = fixCreationId()
+    let reads = 0
+    let refuse: (response: Response) => void = () => {}
+    const api = mockApi({
+      'GET /v1/sandboxes/placement': () => jsonResponse(PLACEMENT),
+      // Fails only after the first read has already come back 404.
+      'POST /v1/sandboxes': () =>
+        new Promise<Response>((resolve) => {
+          refuse = resolve
+        }),
+      // The first read beats the registration; later reads see the failure.
+      [`GET /v1/sandboxes/creations/${CREATION_ID}`]: () => {
+        reads += 1
+        if (reads === 1) return jsonResponse({ title: 'Not Found' }, 404)
+        return jsonResponse({
+          creation_id: CREATION_ID,
+          sandbox_id: null,
+          status: 'failed',
+          started_at: '2026-01-01T00:00:00Z',
+          finished_at: '2026-01-01T00:00:02Z',
+          error: 'pulling image failed',
+          steps: [
+            creationStep('pull_image', 'Pull the sandbox image', 'failed', {
+              error: "pulling image 'img:1' failed: no space left on device",
+            }),
+          ],
+        })
+      },
+    })
+    const view = renderSheet()
+
+    fireEvent.click(await view.findByRole('button', { name: 'Create sandbox' }))
+    await waitFor(() => expect(reads).toBe(1), { timeout: 5_000 })
+    refuse(
+      jsonResponse(
+        { title: 'Sandbox Creation Failed', detail: 'pulling image failed' },
+        500
+      )
+    )
+
+    await view.findByText(/no space left on device/, undefined, {
+      timeout: 15_000,
+    })
+    api.restore()
+    restoreId()
+  },
+  POLLING_TEST_TIMEOUT_MS
+)
+
+test(
   'steps the server stopped tracking are dropped, not left running',
   async () => {
     allowIntervalPolling()

@@ -13,6 +13,7 @@ import {
   anyHostPulling,
   creationRunning,
   creationUntracked,
+  failedAfterRequestEnded,
   downloadLabel,
   downloadPercent,
   failedStep,
@@ -127,11 +128,12 @@ describe('creation state', () => {
 
   test('stops polling a create the server never tracked once its request ended', () => {
     const notFound = { status: 404, title: 'Not Found' }
-    // Before any answer: keep trying while the request is in flight, even
-    // over a 404 (the first read races the server registering the id).
+    // Before any answer: keep trying over a 404 that came while the request
+    // was in flight (the read races the server registering the id), even
+    // once the request has ended: one more read decides.
     expect(keepPolling(undefined, null, false)).toBe(true)
     expect(keepPolling(undefined, notFound, false)).toBe(true)
-    // The request ended and the server does not track it: stop.
+    // A 404 read after the request ended: the server does not track it.
     expect(keepPolling(undefined, notFound, true)).toBe(false)
     // A tracked create is followed until it finishes.
     expect(keepPolling(base, null, true)).toBe(true)
@@ -153,6 +155,13 @@ describe('creation state', () => {
     expect(
       keepPolling({ ...base, status: 'succeeded' }, unavailable, true)
     ).toBe(false)
+  })
+
+  test('a failure counts as after the request only once the request has ended', () => {
+    expect(failedAfterRequestEnded(1_000, null)).toBe(false)
+    expect(failedAfterRequestEnded(1_000, 2_000)).toBe(false)
+    expect(failedAfterRequestEnded(2_000, 2_000)).toBe(true)
+    expect(failedAfterRequestEnded(3_000, 2_000)).toBe(true)
   })
 
   test('only a 404 means the server does not track the create', () => {
