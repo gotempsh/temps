@@ -79,7 +79,11 @@ function setup({
     worker(2, 'worker-b'),
     worker(3, 'worker-c', 'offline'),
   ],
-}: { nodes?: () => ReturnType<typeof worker>[] | Response } = {}) {
+  entry = '/settings/nodes/ingress',
+}: {
+  nodes?: () => ReturnType<typeof worker>[] | Response
+  entry?: string
+} = {}) {
   const posted: { path: string; body: unknown }[] = []
   // The tunnel comes back with the suffix it was created with.
   let hostSuffix: string | null = null
@@ -155,7 +159,7 @@ function setup({
   })
   render(
     <QueryClientProvider client={client}>
-      <MemoryRouter initialEntries={['/settings/nodes/ingress']}>
+      <MemoryRouter initialEntries={[entry]}>
         <BreadcrumbProvider>
           <IngressSetupPage />
         </BreadcrumbProvider>
@@ -473,4 +477,39 @@ test('a picked worker that goes offline holds Create until the operator decides'
   expect(posted.find((p) => p.path === 'connectors')?.body).toMatchObject({
     node_ids: [1],
   })
+})
+
+test('with no worker the tunnel runs on the control plane', async () => {
+  const { posted } = setup({ nodes: () => [] })
+  await screen.findByText('example.com')
+  expect(screen.queryByText('No worker node yet')).toBeNull()
+  const controlPlane = screen.getByRole('checkbox', { name: 'Control plane' })
+  await waitFor(() =>
+    expect(controlPlane.getAttribute('data-state')).toBe('checked')
+  )
+  fireEvent.click(screen.getByRole('radio', { name: /example\.com/ }))
+  const create = screen.getByRole('button', { name: 'Create tunnel' })
+  await waitFor(() => expect(create.hasAttribute('disabled')).toBe(false))
+  fireEvent.click(create)
+  await waitFor(() =>
+    expect(posted.find((p) => p.path === 'connectors')?.body).toMatchObject({
+      node_ids: [0],
+    })
+  )
+})
+
+test('with a worker picked the control plane is offered but not picked', async () => {
+  setup()
+  await screen.findByText('example.com')
+  const controlPlane = screen.getByRole('checkbox', { name: 'Control plane' })
+  const a = screen.getByRole('checkbox', { name: 'worker-a' })
+  await waitFor(() => expect(a.getAttribute('data-state')).toBe('checked'))
+  expect(controlPlane.getAttribute('data-state')).toBe('unchecked')
+  expect(controlPlane.hasAttribute('disabled')).toBe(false)
+})
+
+test('open ports still need a worker', async () => {
+  setup({ nodes: () => [], entry: '/settings/nodes/ingress?via=ports' })
+  await screen.findByText('No worker node yet')
+  expect(screen.queryByRole('checkbox', { name: 'Control plane' })).toBeNull()
 })

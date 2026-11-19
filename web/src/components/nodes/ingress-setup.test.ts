@@ -23,6 +23,9 @@ import {
   uniqueTunnelName,
   unavailableWorker,
   workerEligibility,
+  availabilityLabel,
+  CONTROL_PLANE_NODE_ID,
+  controlPlaneEligibility,
 } from './ingress-setup'
 
 function managed(
@@ -480,5 +483,148 @@ describe('unavailableWorker', () => {
     expect(draining).toContain("Worker 'worker-d' is draining")
     expect(draining).toContain('Bring it back from its page')
     expect(draining).not.toContain('systemctl')
+  })
+})
+
+describe('the control plane (ADR-107)', () => {
+  const cloudflare = (nodeIds: number[]) => ({
+    provider: 'cloudflare_tunnel',
+    nodes: nodeIds.map((node_id) => ({ node_id })),
+  })
+
+  test('is picked by default only when no worker is', () => {
+    expect(controlPlaneEligibility([], 0)).toEqual({
+      selectable: true,
+      hasIngress: false,
+      defaultOn: true,
+    })
+    expect(controlPlaneEligibility([], 1).defaultOn).toBe(false)
+  })
+
+  test('already running a tunnel, it is offered but not picked', () => {
+    const state = controlPlaneEligibility([cloudflare([0])], 0)
+    expect(state.selectable).toBe(true)
+    expect(state.hasIngress).toBe(true)
+    expect(state.defaultOn).toBe(false)
+    expect(controlPlaneEligibility([cloudflare([1])], 0).hasIngress).toBe(false)
+  })
+
+  test('is not looked up in the node list before creating', () => {
+    expect(
+      unavailableWorker(
+        [{ id: CONTROL_PLANE_NODE_ID, name: 'Control plane' }],
+        []
+      )
+    ).toBeUndefined()
+    expect(
+      unavailableWorker(
+        [
+          { id: CONTROL_PLANE_NODE_ID, name: 'Control plane' },
+          { id: 9, name: 'gone' },
+        ],
+        []
+      )
+    ).toContain("Worker 'gone' is no longer in this cluster")
+  })
+
+  test('names the first step after what it checks', () => {
+    expect(availabilityLabel([{ id: 1, name: 'worker-a' }])).toBe(
+      'Workers worker-a online'
+    )
+    expect(availabilityLabel([{ id: 0, name: 'Control plane' }])).toBe(
+      'Control plane ready'
+    )
+    expect(
+      availabilityLabel([
+        { id: 0, name: 'Control plane' },
+        { id: 1, name: 'worker-a' },
+      ])
+    ).toBe('Control plane ready, workers worker-a online')
+  })
+
+  test('a tunnel on the control plane is created on node 0 and waits for it', async () => {
+    let polls = 0
+    const { api, calls } = fakeApi({
+      listNodes: async () => {
+        calls.push('nodes')
+        return []
+      },
+      createConnector: async (request) => {
+        calls.push(`create ${request.name} ${request.node_ids.join(',')}`)
+        return connector([])
+      },
+      getConnector: async () =>
+        polls++ === 0
+          ? connector([])
+          : connector([
+              {
+                node_id: 0,
+                node_name: 'Control plane',
+                state: 'ready',
+                ready_connections: 4,
+              },
+            ]),
+    })
+    const reports: SetupStep[][] = []
+    const outcome = await runTunnelSetup(
+      {
+        ...plan,
+        managed: managed(),
+        nodes: [{ id: 0, name: 'Control plane' }],
+      },
+      api,
+      (s) => reports.push(s)
+    )
+    expect(outcome.kind).toBe('done')
+    expect(calls).toContain('create example-com 0')
+    const waiting = reports.find((r) =>
+      r.some(
+        (s) =>
+          s.key === 'node-0' &&
+          s.status === 'running' &&
+          s.detail?.includes('control plane')
+      )
+    )
+    expect(waiting?.find((s) => s.key === 'node-0')?.detail).toBe(
+      'Waiting for the control plane to start it'
+    )
+    const last = reports[reports.length - 1]
+    expect(last.find((s) => s.key === 'workers')?.label).toBe(
+      'Control plane ready'
+    )
+    expect(last.find((s) => s.key === 'node-0')).toMatchObject({
+      label: 'Connected on Control plane',
+      status: 'done',
+    })
+  })
+
+  test('a control plane that cannot run it fails as a node, not a worker', async () => {
+    const { api } = fakeApi({
+      listNodes: async () => [],
+      createConnector: async () => connector([]),
+      getConnector: async () =>
+        connector([
+          {
+            node_id: 0,
+            node_name: 'Control plane',
+            state: 'refused',
+            last_error: 'The control plane cannot run a connector: no proxy',
+          },
+        ]),
+    })
+    const outcome = await runTunnelSetup(
+      {
+        ...plan,
+        managed: managed(),
+        nodes: [{ id: 0, name: 'Control plane' }],
+      },
+      api,
+      () => {}
+    )
+    expect(outcome.kind).toBe('failed')
+    if (outcome.kind !== 'failed') return
+    expect(outcome.error).toBe(
+      'No node could run the tunnel: The control plane cannot run a connector: no proxy'
+    )
   })
 })
