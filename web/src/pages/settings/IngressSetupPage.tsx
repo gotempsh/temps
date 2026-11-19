@@ -226,8 +226,11 @@ export function IngressSetupPage() {
       ) : null}
       {showWizard && workers.length === 0 && hadWorkers && (
         <p className="text-xs text-amber-700 dark:text-amber-300">
-          This cluster has no worker nodes any more, so nothing new can be set
-          up here. What this page reported is kept below.
+          This cluster has no worker nodes any more.{' '}
+          {via === 'tunnel'
+            ? 'A new tunnel can still run on the control plane.'
+            : 'Open ports need a worker, so nothing new can be set up here.'}{' '}
+          What this page reported is kept below.
         </p>
       )}
       {/* A failed poll keeps the last list: replacing the wizard here would
@@ -1381,10 +1384,7 @@ function ConflictNote({ tunnel }: { tunnel: ConnectorView }) {
           <>
             {' '}
             (it runs on{' '}
-            <Link className="underline" to={workerUrl(first.node_id)}>
-              {first.node_name}
-            </Link>
-            )
+            <NodeLink nodeId={first.node_id} name={first.node_name} />)
           </>
         )}
         .
@@ -1726,14 +1726,25 @@ function OutcomePanel({
   )
 }
 
+/**
+ * A worker's name links to its tunnel controls. The control plane has no
+ * such page section (its tunnels are managed here), so it is named only.
+ */
+function NodeLink({ nodeId, name }: { nodeId: number; name: string }) {
+  if (nodeId === CONTROL_PLANE_NODE_ID) return <span>{name}</span>
+  return (
+    <Link className="underline" to={workerUrl(nodeId)}>
+      {name}
+    </Link>
+  )
+}
+
 function WorkerLinks({ nodes }: { nodes: ConnectorView['nodes'] }) {
   return (
     <p className="flex flex-wrap gap-x-3 gap-y-1">
-      <span>Workers:</span>
+      <span>Runs on:</span>
       {nodes.map((n) => (
-        <Link key={n.node_id} className="underline" to={workerUrl(n.node_id)}>
-          {n.node_name}
-        </Link>
+        <NodeLink key={n.node_id} nodeId={n.node_id} name={n.node_name} />
       ))}
     </p>
   )
