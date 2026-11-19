@@ -2427,12 +2427,6 @@ pub(crate) fn create_upgrade_temp_file(
         })
 }
 
-/// Finish writing a staged executable, make it durable, and close its writable
-/// handle.
-///
-/// Closing the handle is part of the correctness contract: the in-process
-/// updater executes this path for its preflight, and Unix can reject (or kill)
-/// an executable while any process still has it open for writing.
 /// Run the staged binary's `--version` before trusting it.
 ///
 /// Catches the failures a checksum cannot: a build for the wrong libc, a
@@ -2450,28 +2444,94 @@ pub(crate) fn create_upgrade_temp_file(
 /// in-memory/on-disk buffering the streaming rewrite of this flow removed
 /// everywhere else.
 pub(crate) fn preflight_staged_binary(staged_path: &Path) -> anyhow::Result<()> {
-    let output = std::process::Command::new(staged_path)
-        .arg("--version")
-        .output();
+    preflight_staged_binary_within(staged_path, PREFLIGHT_TIMEOUT)
+}
 
-    let output = output.map_err(|e| {
-        anyhow::anyhow!(
-            "The downloaded binary could not be executed on this host: {}. \
-             The running version was left untouched.",
-            e
-        )
-    })?;
-    if !output.status.success() {
+/// How long the staged binary gets to print its version.
+const PREFLIGHT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// At most this much of the staged binary's stderr is kept for the error.
+const PREFLIGHT_STDERR_LIMIT: u64 = 64 * 1024;
+
+fn preflight_staged_binary_within(
+    staged_path: &Path,
+    timeout: std::time::Duration,
+) -> anyhow::Result<()> {
+    use std::io::Read;
+    use std::process::Stdio;
+
+    let mut child = std::process::Command::new(staged_path)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "The downloaded binary could not be executed on this host: {}. \
+                 The running version was left untouched.",
+                e
+            )
+        })?;
+    // Drain stderr on a thread so a chatty binary cannot block on a full pipe
+    // while this thread waits for it; only the first 64 KiB is kept.
+    let stderr = child.stderr.take();
+    let reader = std::thread::spawn(move || {
+        let mut kept = Vec::new();
+        if let Some(mut stderr) = stderr {
+            let _ = (&mut stderr)
+                .take(PREFLIGHT_STDERR_LIMIT)
+                .read_to_end(&mut kept);
+            let _ = std::io::copy(&mut stderr, &mut std::io::sink());
+        }
+        String::from_utf8_lossy(&kept).trim().to_string()
+    });
+
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(anyhow::anyhow!(
+                    "The downloaded binary did not answer `{} --version` within {} seconds and \
+                     was stopped. The running version was left untouched.",
+                    staged_path.display(),
+                    timeout.as_secs_f64()
+                ));
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(anyhow::anyhow!(
+                    "Could not wait for the downloaded binary {}: {}. \
+                     The running version was left untouched.",
+                    staged_path.display(),
+                    e
+                ));
+            }
+        }
+    };
+    let stderr = reader.join().unwrap_or_default();
+    if !status.success() {
         return Err(anyhow::anyhow!(
             "The downloaded binary exited with {} when asked for its version: {}. \
              The running version was left untouched.",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
+            status,
+            stderr
         ));
     }
     Ok(())
 }
 
+/// Finish writing a staged executable, make it durable, and close its writable
+/// handle.
+///
+/// Closing the handle is part of the correctness contract: the in-process
+/// updater executes this path for its preflight, and Unix can reject (or kill)
+/// an executable while any process still has it open for writing.
 pub(crate) fn seal_staged_binary(staged_file: NamedTempFile) -> anyhow::Result<TempPath> {
     let staged_path = staged_file.path().to_path_buf();
 
@@ -3896,6 +3956,48 @@ mod tests {
         let agents = result.unwrap();
         assert!(agents.path(VM_AGENT_BINARY_NAME).is_some());
         assert!(agents.path(PTY_AGENT_BINARY_NAME).is_none());
+    }
+
+    /// A staged executable script: sealed, so it can be run.
+    #[cfg(unix)]
+    fn staged_script(dir: &Path, body: &str) -> TempPath {
+        let mut staged = create_upgrade_temp_file(dir, ".temps-upgrade-bin.").unwrap();
+        staged.as_file_mut().write_all(body.as_bytes()).unwrap();
+        seal_staged_binary(staged).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preflight_stops_a_binary_that_never_answers() {
+        let dir = tempfile::tempdir().unwrap();
+        let staged = staged_script(dir.path(), "#!/bin/sh\nexec sleep 30\n");
+        let started = std::time::Instant::now();
+        let err =
+            preflight_staged_binary_within(staged.as_ref(), std::time::Duration::from_millis(300))
+                .unwrap_err()
+                .to_string();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "{err}"
+        );
+        assert!(err.contains("did not answer"), "{err}");
+        assert!(err.contains("left untouched"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preflight_reports_why_the_binary_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let staged = staged_script(
+            dir.path(),
+            "#!/bin/sh\necho 'cannot run on this host' >&2\nexit 3\n",
+        );
+        let err =
+            preflight_staged_binary_within(staged.as_ref(), std::time::Duration::from_secs(10))
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("cannot run on this host"), "{err}");
+        assert!(err.contains("left untouched"), "{err}");
     }
 
     #[tokio::test]

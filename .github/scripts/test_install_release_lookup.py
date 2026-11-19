@@ -402,8 +402,16 @@ class InstallResult:
         return [call[1:] for call in self.tool_calls if call[0] == tool]
 
 
+# A `timeout` stand-in: records its arguments, then runs the command.
+FAKE_TIMEOUT = """#!/bin/sh
+printf '%s\\n' "$*" >> "$FAKE_TIMEOUT_CALLS"
+shift
+exec "$@"
+"""
+
+
 def run_install(arguments=("v0.1.0",), tools=(), bundle="{}", environment_extra=None,
-                temps_already_on_path=False):
+                temps_already_on_path=False, fake_timeout=False):
     """Run the installer to the end against a local archive.
 
     `tools` names fake verifiers to put on PATH (`cosign`, `gh`); `bundle` is
@@ -422,6 +430,9 @@ def run_install(arguments=("v0.1.0",), tools=(), bundle="{}", environment_extra=
         for tool in tools:
             (bin_dir / tool).write_text(FAKE_VERIFIER)
             names.append(tool)
+        if fake_timeout:
+            (bin_dir / "timeout").write_text(FAKE_TIMEOUT)
+            names.append("timeout")
         for name in names:
             (bin_dir / name).chmod(0o755)
 
@@ -517,6 +528,18 @@ class SignatureVerificationTests(unittest.TestCase):
         self.assertEqual(arguments[arguments.index("--connect-timeout") + 1], "15")
         self.assertEqual(arguments[arguments.index("--max-time") + 1], "60")
         self.assertEqual(arguments[arguments.index("--retry") + 1], "3")
+
+    def test_verifiers_run_under_a_deadline_where_timeout_exists(self):
+        with tempfile.TemporaryDirectory(prefix="temps-install-timeout-") as temporary:
+            recorded = Path(temporary) / "timeout-calls"
+            recorded.touch()
+            result = run_install(tools=("gh",), fake_timeout=True,
+                                 environment_extra={"FAKE_TIMEOUT_CALLS": str(recorded)})
+            calls = recorded.read_text().splitlines()
+        self.assert_installed(result)
+        self.assertEqual([call.split()[:4] for call in calls],
+                         [["300", "gh", "auth", "status"],
+                          ["300", "gh", "attestation", "verify"]])
 
     def test_cosign_verifies_with_the_pinned_identity_and_issuer(self):
         result = run_install(tools=("cosign", "gh"))

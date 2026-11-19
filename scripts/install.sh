@@ -135,6 +135,16 @@ Aborting installation."
 release_workflow=gotempsh/temps/.github/workflows/release.yml
 oidc_issuer=https://token.actions.githubusercontent.com
 
+# Run a verifier with a deadline where coreutils `timeout` exists (every
+# mainstream Linux); a verifier that is stopped counts as a failure.
+with_deadline() {
+    if command -v timeout >/dev/null 2>&1; then
+        timeout 300 "$@"
+    else
+        "$@"
+    fi
+}
+
 verify_signature() {
     local file="$1" url="$2" tag="$3" asset="$4"
     local bundle="$file.sigstore.json" identity status output
@@ -167,7 +177,7 @@ Refusing to install $tag without checking it. Retry in a moment."
 
     if command -v cosign >/dev/null 2>&1; then
         info "Verifying signature with cosign..."
-        if ! output=$(cosign verify-blob --bundle "$bundle" \
+        if ! output=$(with_deadline cosign verify-blob --bundle "$bundle" \
                 --certificate-identity "$identity" \
                 --certificate-oidc-issuer "$oidc_issuer" "$file" 2>&1); then
             rm -f "$bundle" "$file"
@@ -185,9 +195,9 @@ $output
     fi
     rm -f "$bundle"
 
-    if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+    if command -v gh >/dev/null 2>&1 && with_deadline gh auth status >/dev/null 2>&1; then
         info "Verifying build provenance with the GitHub CLI..."
-        if ! output=$(gh attestation verify "$file" --repo gotempsh/temps \
+        if ! output=$(with_deadline gh attestation verify "$file" --repo gotempsh/temps \
                 --cert-identity "$identity" \
                 --source-ref "refs/tags/$tag" \
                 --cert-oidc-issuer "$oidc_issuer" 2>&1); then
