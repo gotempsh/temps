@@ -35,7 +35,7 @@ pub use migration::m20261112_000001_seed_postgres_wal_archiving_alert_rules::Mig
 pub use migration::m20261113_000009_legacy_standalone_vault_coverage::Migration as LegacyStandaloneVaultCoverageMigration;
 pub use migration::m20261113_000010_legacy_vault_revocation_fence::Migration as LegacyVaultRevocationFenceMigration;
 pub use migration::m20261113_000011_vault_membership_fence::Migration as VaultMembershipFenceMigration;
-pub use migration::m20261119_000007_error_group_assignees::Migration as ErrorGroupAssigneesMigration;
+pub use migration::m20261120_000005_error_group_assignees::Migration as ErrorGroupAssigneesMigration;
 pub use migration::Migrator;
 
 pub use migration::m20261022_000001_dns_name_claims::{

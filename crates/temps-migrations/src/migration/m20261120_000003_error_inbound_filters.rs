@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Server-side inbound filters for error events (ADR 074, D1.4).
+//! Server-side inbound filters for error events (ADR 111, D1.4).
 //!
 //! One row per rule. Ingest never reads this table per event: rules are held
 //! in memory and reloaded when they change. `dropped_count` is incremented by

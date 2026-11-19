@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Ordered releases per project, and "resolve in the next release" on an
-//! error group (ADR 074, D1.5).
+//! error group (ADR 111, D1.5).
 //!
 //! `error_releases` holds one row per (project, release version) Temps has
 //! seen. Its order is `released_at`: the creation time of the first Temps

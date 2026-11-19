@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Saved searches over error groups (ADR 074, D1.8).
+//! Saved searches over error groups (ADR 111, D1.8).
 //!
 //! A saved search is a named set of list filters owned by one user in one
 //! project, private unless shared with everyone who can open the project.

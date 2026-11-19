@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! An error group's assignee is a user or a team, and no longer a status
-//! (ADR 074, D1.6).
+//! (ADR 111, D1.6).
 //!
 //! `assignee_user_id` and `assignee_team_id` reference the assignee; at most
 //! one is set. Existing free-text `assigned_to` values are matched to a user

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Comments and an activity log on error groups (ADR 074, D1.7).
+//! Comments and an activity log on error groups (ADR 111, D1.7).
 //!
 //! One row per thing that happened to a group: a comment, a status change by
 //! a person, a regression reopened by an event, an assignment, a merge, an

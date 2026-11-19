@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Conditions on an ignored error group (ADR 074, D1.3).
+//! Conditions on an ignored error group (ADR 111, D1.3).
 //!
 //! An `ignored` group with none of these set keeps today's behaviour: the next
 //! event reopens it. With conditions, ingest keeps it ignored until any one of

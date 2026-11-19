@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Merging and splitting error groups (ADR 074, D1.2).
+//! Merging and splitting error groups (ADR 111, D1.2).
 //!
 //! Ingest already resolves an event's fingerprint to a group through
 //! `error_group_fingerprints`, so a merge is a repointing of those rows: every
