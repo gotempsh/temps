@@ -200,6 +200,7 @@ export default function ApiKeyDetail() {
       errorTitle: 'Failed to delete API key',
     },
     onSuccess: () => {
+      invalidateApiKeyQueries(queryClient)
       toast.success('API key deleted successfully')
       navigate('/settings/keys')
     },
