@@ -11,6 +11,11 @@ use std::sync::Arc;
 use tempfile::{NamedTempFile, TempPath};
 use tracing::{debug, info};
 
+mod release_signature;
+pub(crate) use release_signature::{
+    ensure_signature_published, verify_release_asset, ReleaseTrustSource,
+};
+
 const GITHUB_RELEASES_API: &str = "https://api.github.com/repos/gotempsh/temps/releases";
 
 /// Default base URL of the Temps Cloud license + EE binary proxy. The EE
@@ -226,6 +231,13 @@ pub struct UpgradeCommand {
     /// Skip confirmation prompt
     #[arg(long, short = 'y')]
     pub yes: bool,
+
+    /// Install a release that publishes no Sigstore signature
+    /// (`<tarball>.sigstore.json`), trusting its SHA-256 checksum alone.
+    /// Only releases published before signing was introduced lack one. A
+    /// signature that is present but does not verify is refused regardless.
+    #[arg(long)]
+    pub allow_unsigned: bool,
 
     /// Only check for updates, don't install
     #[arg(long)]
@@ -518,6 +530,10 @@ impl UpgradeCommand {
         println!("    Binary:   {}", binary_path.display());
         println!("    Size:     {:.1} MB", size_mb);
         println!("    Release:  {}", release.html_url);
+        println!(
+            "    Signature: {}",
+            release_signature::describe_release_signature(&release, &tarball_name)
+        );
         println!();
         print_lock_capacity_warning(self.database_url.as_deref()).await;
 
@@ -544,8 +560,14 @@ impl UpgradeCommand {
             }
         }
 
-        // Check write permissions before downloading
+        // Check write permissions, and that the release is signed, before
+        // downloading
         check_write_permission(&binary_path)?;
+        release_signature::ensure_signature_published(
+            &release,
+            &tarball_name,
+            self.allow_unsigned,
+        )?;
 
         let parent = binary_path
             .parent()
@@ -580,6 +602,20 @@ impl UpgradeCommand {
         let checksum_text = fetch_expected_checksum(&release, &tarball_name).await?;
         verify_computed_checksum(&computed, &checksum_text)?;
         println!("  Checksum verified.");
+
+        // The checksum ships in the same release as the tarball, so it proves
+        // integrity, not origin. The Sigstore signature binds the bytes to the
+        // release workflow at this exact tag.
+        println!("  Verifying signature...");
+        let signature = verify_release_asset(
+            &ReleaseTrustSource::PublicGood,
+            &release,
+            &tarball_name,
+            &computed,
+            self.allow_unsigned,
+        )
+        .await?;
+        println!("  {}", signature.summary());
 
         // Extract the binary from the tarball, straight into the staging file
         // that the atomic rename below consumes.
@@ -2059,7 +2095,7 @@ impl ReleaseGuestAgents {
 /// fresh install does not depend on the operator unpacking an archive by hand.
 /// It goes through the same pipeline as `temps upgrade`: the tarball streams
 /// to disk, and nothing is unpacked unless the release publishes a checksum
-/// that matches. The version is the running binary's own, because the VM
+/// that matches and a Sigstore signature from its release workflow. The version is the running binary's own, because the VM
 /// agent has to agree with the host on the wire protocol.
 ///
 /// An agent the release does not ship is simply absent from the result
@@ -2074,18 +2110,21 @@ pub(crate) async fn fetch_guest_agents_from_release(
         &current_version_tag(),
         &target,
         std::time::Duration::from_secs(300),
+        &ReleaseTrustSource::PublicGood,
     )
     .await
 }
 
-/// One deadline covers release metadata, the streamed archive and checksum bodies.
-/// The endpoint/deadline are injectable so tests never depend on public releases.
+/// One deadline covers release metadata, the streamed archive, checksum and
+/// signature bodies. The endpoint, deadline and Sigstore trust root are
+/// injectable so tests never depend on public releases.
 async fn fetch_guest_agents_from_release_from(
     names: &[&str],
     releases_api: &str,
     tag: &str,
     target: &str,
     deadline: std::time::Duration,
+    trust: &ReleaseTrustSource,
 ) -> anyhow::Result<ReleaseGuestAgents> {
     if names
         .iter()
@@ -2125,6 +2164,10 @@ async fn fetch_guest_agents_from_release_from(
                 .await?;
         let checksum_text = fetch_expected_checksum(&release, &tarball_name).await?;
         verify_computed_checksum(&computed, &checksum_text)?;
+        // The agents run as root inside every VM, so they get the same origin
+        // check as the host binary, and no unsigned opt-out: an explicit
+        // `--vm-agent-bin`/`--pty-agent-bin` path is the way around it.
+        verify_release_asset(trust, &release, &tarball_name, &computed, false).await?;
 
         for name in names {
             let out_path = dir.path().join(name);
@@ -3632,12 +3675,16 @@ mod tests {
         assert!(upgrade_scratch_paths(dir.path()).is_empty());
     }
 
-    /// Serve release metadata, archive and checksum from localhost for fetch tests.
+    /// Serve release metadata, archive, checksum and (when `signed_by` names
+    /// an identity) a Sigstore bundle from localhost for fetch tests. The
+    /// returned trust source accepts only the throwaway Sigstore instance that
+    /// signed it.
     async fn guest_release_server(
         archive: Vec<u8>,
         bad_checksum: bool,
         stall: Option<&'static str>,
-    ) -> (String, tokio::task::JoinHandle<()>) {
+        signed_by: Option<&str>,
+    ) -> (String, tokio::task::JoinHandle<()>, ReleaseTrustSource) {
         use axum::{
             body::Body,
             extract::{OriginalUri, State},
@@ -3651,6 +3698,7 @@ mod tests {
             base: String,
             archive: Vec<u8>,
             checksum: String,
+            bundle: Option<String>,
             stall: Option<&'static str>,
         }
         async fn serve(State(f): State<Fixture>, OriginalUri(uri): OriginalUri) -> Response<Body> {
@@ -3667,15 +3715,22 @@ mod tests {
                 f.archive
             } else if path.ends_with("checksum") {
                 f.checksum.into_bytes()
+            } else if path.ends_with("bundle") {
+                f.bundle.unwrap_or_default().into_bytes()
             } else {
+                let mut assets = vec![
+                    serde_json::json!({"name":"temps-test.tar.gz", "browser_download_url":format!("{}/archive", f.base), "size":f.archive.len()}),
+                    serde_json::json!({"name":"temps-test.tar.gz.sha256", "browser_download_url":format!("{}/checksum", f.base), "size":64}),
+                ];
+                if f.bundle.is_some() {
+                    assets.push(serde_json::json!({"name":"temps-test.tar.gz.sigstore.json", "browser_download_url":format!("{}/bundle", f.base), "size":1}));
+                }
                 serde_json::to_vec(&serde_json::json!({
                     "tag_name": "v1.2.3", "prerelease": false, "draft": false,
                     "html_url": "https://example.test/releases/v1.2.3",
-                    "assets": [
-                        {"name":"temps-test.tar.gz", "browser_download_url":format!("{}/archive", f.base), "size":f.archive.len()},
-                        {"name":"temps-test.tar.gz.sha256", "browser_download_url":format!("{}/checksum", f.base), "size":64}
-                    ]
-                })).unwrap()
+                    "assets": assets
+                }))
+                .unwrap()
             };
             Response::new(Body::from(body))
         }
@@ -3686,22 +3741,36 @@ mod tests {
         } else {
             hex::encode(Sha256::digest(&archive))
         };
+        let sigstore = release_signature::test_sigstore::TestSigstore::new();
+        let bundle = signed_by.map(|identity| {
+            sigstore.sign(
+                &archive,
+                identity,
+                "https://token.actions.githubusercontent.com",
+            )
+        });
         let fixture = Fixture {
             base: base.clone(),
             archive,
             checksum: hash,
+            bundle,
             stall,
         };
         let app = Router::new()
             .route("/tags/{tag}", get(serve))
             .route("/archive", get(serve))
             .route("/checksum", get(serve))
+            .route("/bundle", get(serve))
             .with_state(fixture);
         let server = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        (base, server)
+        (base, server, sigstore.trust())
     }
+
+    /// The identity a genuine signature on the fixture release carries.
+    const FIXTURE_SIGNER: &str =
+        "https://github.com/gotempsh/temps/.github/workflows/release.yml@refs/tags/v1.2.3";
 
     #[tokio::test]
     async fn guest_release_fetch_extracts_both_agents_and_cleans_scratch() {
@@ -3709,13 +3778,15 @@ mod tests {
             (VM_AGENT_BINARY_NAME, b"vm"),
             (PTY_AGENT_BINARY_NAME, b"pty"),
         ]);
-        let (api, server) = guest_release_server(archive, false, None).await;
+        let (api, server, trust) =
+            guest_release_server(archive, false, None, Some(FIXTURE_SIGNER)).await;
         let result = fetch_guest_agents_from_release_from(
             &[VM_AGENT_BINARY_NAME, PTY_AGENT_BINARY_NAME],
             &api,
             "v1.2.3",
             "test",
             std::time::Duration::from_secs(5),
+            &trust,
         )
         .await;
         server.abort();
@@ -3738,13 +3809,15 @@ mod tests {
     #[tokio::test]
     async fn guest_release_fetch_rejects_checksum_and_reports_absent_agents() {
         let archive = tarball_with_entries(&[(VM_AGENT_BINARY_NAME, b"vm")]);
-        let (api, server) = guest_release_server(archive.clone(), true, None).await;
+        let (api, server, trust) =
+            guest_release_server(archive.clone(), true, None, Some(FIXTURE_SIGNER)).await;
         let result = fetch_guest_agents_from_release_from(
             &[VM_AGENT_BINARY_NAME],
             &api,
             "v1.2.3",
             "test",
             std::time::Duration::from_secs(5),
+            &trust,
         )
         .await;
         server.abort();
@@ -3752,13 +3825,15 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("Checksum mismatch"));
-        let (api, server) = guest_release_server(archive, false, None).await;
+        let (api, server, trust) =
+            guest_release_server(archive, false, None, Some(FIXTURE_SIGNER)).await;
         let result = fetch_guest_agents_from_release_from(
             &[VM_AGENT_BINARY_NAME, PTY_AGENT_BINARY_NAME],
             &api,
             "v1.2.3",
             "test",
             std::time::Duration::from_secs(5),
+            &trust,
         )
         .await;
         server.abort();
@@ -3769,11 +3844,12 @@ mod tests {
 
     #[tokio::test]
     async fn guest_release_fetch_bounds_every_response_body() {
-        for stage in ["headers", "v1.2.3", "archive", "checksum"] {
-            let (api, server) = guest_release_server(
+        for stage in ["headers", "v1.2.3", "archive", "checksum", "bundle"] {
+            let (api, server, trust) = guest_release_server(
                 tarball_with_entries(&[(VM_AGENT_BINARY_NAME, b"vm")]),
                 false,
                 Some(stage),
+                Some(FIXTURE_SIGNER),
             )
             .await;
             let result = fetch_guest_agents_from_release_from(
@@ -3782,6 +3858,7 @@ mod tests {
                 "v1.2.3",
                 "test",
                 std::time::Duration::from_millis(250),
+                &trust,
             )
             .await;
             server.abort();
@@ -3790,6 +3867,46 @@ mod tests {
                 "stage {stage}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn guest_release_fetch_refuses_an_unsigned_release() {
+        let archive = tarball_with_entries(&[(VM_AGENT_BINARY_NAME, b"vm")]);
+        let (api, server, trust) = guest_release_server(archive, false, None, None).await;
+        let result = fetch_guest_agents_from_release_from(
+            &[VM_AGENT_BINARY_NAME],
+            &api,
+            "v1.2.3",
+            "test",
+            std::time::Duration::from_secs(5),
+            &trust,
+        )
+        .await;
+        server.abort();
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("publishes no Sigstore signature"), "{err}");
+        assert!(err.contains("temps-test.tar.gz.sigstore.json"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn guest_release_fetch_refuses_a_signature_from_another_identity() {
+        let archive = tarball_with_entries(&[(VM_AGENT_BINARY_NAME, b"vm")]);
+        let impostor =
+            "https://github.com/someone-else/temps/.github/workflows/release.yml@refs/tags/v1.2.3";
+        let (api, server, trust) = guest_release_server(archive, false, None, Some(impostor)).await;
+        let result = fetch_guest_agents_from_release_from(
+            &[VM_AGENT_BINARY_NAME],
+            &api,
+            "v1.2.3",
+            "test",
+            std::time::Duration::from_secs(5),
+            &trust,
+        )
+        .await;
+        server.abort();
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains(impostor), "{err}");
+        assert!(err.contains(FIXTURE_SIGNER), "{err}");
     }
 
     #[test]
@@ -4877,6 +4994,7 @@ mod tests {
             version: None,
             path: None,
             yes: false,
+            allow_unsigned: false,
             check: false,
             split: false,
             stable: false,
@@ -4905,6 +5023,7 @@ mod tests {
             version: None,
             path: None,
             yes: false,
+            allow_unsigned: false,
             check: false,
             split: false,
             stable: true,
@@ -4930,6 +5049,7 @@ mod tests {
             version: None,
             path: None,
             yes: false,
+            allow_unsigned: false,
             check: false,
             split: false,
             stable: true,
@@ -4950,6 +5070,7 @@ mod tests {
             version: None,
             path: None,
             yes: false,
+            allow_unsigned: false,
             check: false,
             split: false,
             stable: false,
@@ -4990,6 +5111,7 @@ mod tests {
             version: None,
             path: None,
             yes: false,
+            allow_unsigned: false,
             check: false,
             split: false,
             stable: false,

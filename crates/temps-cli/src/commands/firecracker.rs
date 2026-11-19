@@ -866,7 +866,7 @@ impl FirecrackerSetupCommand {
             return None;
         }
         println!(
-            "  Fetching {} from the release that matches this binary (checksum-verified)...",
+            "  Fetching {} from the release that matches this binary (checksum and signature verified)...",
             missing.join(" and ")
         );
         match fetch_guest_agents_from_release(&missing).await {
