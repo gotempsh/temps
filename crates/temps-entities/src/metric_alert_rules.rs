@@ -104,7 +104,7 @@ pub struct Model {
     pub last_evaluated_at: Option<DBDateTime>,
     /// What the rule watches: `metric` (an OTel metric, the default) or
     /// `logs` (the number of log lines matching `saved_search_id` per
-    /// window; ADR 073 D1). Kept as a column, not in the blob, so the
+    /// window; ADR 108 D1). Kept as a column, not in the blob, so the
     /// evaluator dispatches without decoding anything.
     pub source: String,
     /// FK to `log_saved_searches(id)`, set when `source = 'logs'`. The FK is

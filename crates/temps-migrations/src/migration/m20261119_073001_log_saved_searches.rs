@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Saved log searches (ADR 073 D1).
+//! Saved log searches (ADR 108 D1).
 //!
 //! A saved search is a named, per-project log query: the same filter set the
 //! global log search accepts (source, levels, environments, services,

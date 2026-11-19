@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Keys for the HTTP log ingest endpoint (ADR 073 D1).
+//! Keys for the HTTP log ingest endpoint (ADR 108 D1).
 //!
 //! The plaintext key is shown once at creation and never stored: `key_hash`
 //! is its SHA-256 and `key_prefix` the leading characters for display.

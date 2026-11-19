@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! HTTP log ingest and its keys (ADR 073 D1).
+//! HTTP log ingest and its keys (ADR 108 D1).
 //!
 //! `POST /logs/ingest` is authenticated by a log ingest key, not by a user
 //! session: it is called by collectors. The key admin routes are ordinary

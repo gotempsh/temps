@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Saved log searches (ADR 073 D1).
+//! Saved log searches (ADR 108 D1).
 //!
 //! A saved search names a log query so an investigation does not start from
 //! an empty box, and so something else can reference it: a log alert counts

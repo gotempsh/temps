@@ -1648,7 +1648,7 @@ impl TempsPlugin for OtelPlugin {
                 // ADR-022: optional general AI foundation, registered by the AI
                 // gateway plugin when present. Absent -> deterministic Tier-1 text.
                 let ai = context.get_service::<dyn temps_ai::AiService>();
-                // ADR 073 D1: the counter behind log alerts, registered by
+                // ADR 108 D1: the counter behind log alerts, registered by
                 // the log aggregator plugin. Resolved again at
                 // initialization, where every plugin has registered, so the
                 // order of the two plugins cannot decide whether log alerts
@@ -2302,7 +2302,7 @@ impl TempsPlugin for OtelPlugin {
             // Spawn the metric alert evaluator run loop (evaluator already created above).
             {
                 let evaluator = metric_alert_evaluator;
-                // Log alerts (ADR 073 D1) count lines through the log
+                // Log alerts (ADR 108 D1) count lines through the log
                 // aggregator's series source. Setting it here — after every
                 // plugin has registered — is what makes the feature
                 // independent of plugin registration order; it is a no-op

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Log alerts as metric alert rules (ADR 073 D1).
+//! Log alerts as metric alert rules (ADR 108 D1).
 //!
 //! A log alert reuses the whole metric alert rule machinery (detectors,
 //! evaluator state machine, alarm log, notification routes); only the

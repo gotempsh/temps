@@ -93,7 +93,7 @@ impl From<LogAggregatorError> for Problem {
             LogAggregatorError::Validation { .. } => problemdetails::new(StatusCode::BAD_REQUEST)
                 .with_title("Validation Error")
                 .with_detail(error.to_string()),
-            // ── Saved searches and log ingest (ADR 073 D1) ──────────────
+            // ── Saved searches and log ingest (ADR 108 D1) ──────────────
             LogAggregatorError::SavedSearchNotFound { .. } => {
                 problemdetails::new(StatusCode::NOT_FOUND)
                     .with_title("Saved Log Search Not Found")
@@ -1243,7 +1243,7 @@ mod tests {
 
     // ── Tests ───────────────────────────────────────────────────────────
 
-    // ── HTTP log ingest (ADR 073 D1) ────────────────────────────────────
+    // ── HTTP log ingest (ADR 108 D1) ────────────────────────────────────
 
     async fn seed_project(db: &sea_orm::DatabaseConnection) -> i32 {
         use sea_orm::{ActiveModelTrait, Set};

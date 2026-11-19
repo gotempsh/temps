@@ -61,7 +61,7 @@ pub struct CreateMetricAlertRequest {
     /// `count` for a log alert, which counts matching lines.
     pub aggregation: String,
     /// What the rule watches: the metric above (the default), or the number
-    /// of log lines matching a saved search per window (ADR 073 D1):
+    /// of log lines matching a saved search per window (ADR 108 D1):
     /// `{"kind":"logs","saved_search_id":3}`.
     #[serde(default)]
     pub source: AlertSeriesSource,
@@ -154,7 +154,7 @@ pub struct OtelMetricAlertRuleResponse {
     /// Coarse detector discriminator: `static|anomaly|forecast|outlier|auto_watch`.
     pub detection_kind: String,
     /// What the rule watches: the named metric, or a saved log search
-    /// (ADR 073 D1).
+    /// (ADR 108 D1).
     pub source: AlertSeriesSource,
     /// The typed detector definition (discriminated union keyed by `kind`).
     pub detection_config: DetectionConfig,

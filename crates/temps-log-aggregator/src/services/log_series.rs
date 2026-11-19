@@ -1,13 +1,13 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Counting the lines a saved search matches (ADR 073 D1).
+//! Counting the lines a saved search matches (ADR 108 D1).
 //!
 //! This is the series a log alert is evaluated on, and the series a
 //! log-count dashboard panel charts. It is a *pull*: the alert evaluator
 //! asks for one bounded window per rule per tick. Nothing here is on the
 //! ingest path, and no rule is ever matched against a line as it arrives —
-//! that is the whole reason log alerts are built this way (ADR 073 D1).
+//! that is the whole reason log alerts are built this way (ADR 108 D1).
 //!
 //! Two ways to count, picked per query:
 //!

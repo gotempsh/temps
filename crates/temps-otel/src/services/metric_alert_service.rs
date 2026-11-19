@@ -65,7 +65,7 @@ pub const ALLOWED_SEVERITIES: &[&str] = &["info", "warning", "critical"];
 const MAX_NAME_LEN: usize = 200;
 pub const MAX_METRIC_NAME_LEN: usize = 256;
 
-/// The series name a log alert reports (ADR 073 D1). A log rule is not
+/// The series name a log alert reports (ADR 108 D1). A log rule is not
 /// defined on an OTel metric, but every notification, alarm payload and
 /// chart axis expects a series name, so it gets one that says what it is.
 /// Set by this service, never by the caller.
@@ -75,7 +75,7 @@ pub const LOG_ALERT_METRIC_NAME: &str = "logs.matched_lines";
 /// counted, never averaged.
 pub const LOG_ALERT_AGGREGATION: &str = "count";
 
-/// What series a rule is evaluated on (ADR 073 D1).
+/// What series a rule is evaluated on (ADR 108 D1).
 ///
 /// A log rule carries its saved search in the same value, so "a log alert
 /// with nothing to count" cannot be constructed.
@@ -92,7 +92,7 @@ pub const LOG_ALERT_AGGREGATION: &str = "count";
 )]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AlertSeriesSource {
-    /// The OTel metric the rule names. Every rule before ADR 073.
+    /// The OTel metric the rule names. Every rule before ADR 108.
     #[default]
     Metric,
     /// The number of log lines matching a saved search per window.
@@ -186,7 +186,7 @@ pub fn validate_group_by(group_by: &[String]) -> Result<(), OtelError> {
 }
 
 /// Validate the parts of a log alert that differ from a metric alert
-/// (ADR 073 D1).
+/// (ADR 108 D1).
 ///
 /// Deliberately narrow in this phase. A log alert counts lines in one
 /// bounded window and compares the count against a threshold:
@@ -1663,7 +1663,7 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    // ── Log alerts (ADR 073 D1) ─────────────────────────────────────────
+    // ── Log alerts (ADR 108 D1) ─────────────────────────────────────────
 
     /// A log rule's validator input: the fields a caller controls.
     fn validate_log(

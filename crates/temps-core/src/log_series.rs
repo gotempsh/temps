@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Log-derived series for alert rules (ADR 073 D1).
+//! Log-derived series for alert rules (ADR 108 D1).
 //!
 //! A log alert is a metric alert rule whose series is the number of log
 //! lines matching a saved search per evaluation window. The rule evaluator

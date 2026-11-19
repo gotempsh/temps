@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Log ingest keys (ADR 073 D1): the credential a collector outside Temps
+//! Log ingest keys (ADR 108 D1): the credential a collector outside Temps
 //! presents to `POST /logs/ingest`.
 //!
 //! A key belongs to one project and optionally pins one environment. Unlike

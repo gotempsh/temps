@@ -274,7 +274,7 @@ fn extract_message_from_json(map: &serde_json::Map<String, Value>) -> Option<Str
 ///
 /// `raw` is the message when the object has no message key. Shared by the
 /// container collector (through [`parse_log_line`]) and the HTTP ingest
-/// endpoint (ADR 073 D1), which parses each NDJSON line once and strips its
+/// endpoint (ADR 108 D1), which parses each NDJSON line once and strips its
 /// own envelope keys (timestamp, service) before calling this.
 pub fn parse_json_log_object(
     mut map: serde_json::Map<String, Value>,

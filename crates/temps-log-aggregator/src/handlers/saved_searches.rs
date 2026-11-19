@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Saved log search endpoints (ADR 073 D1).
+//! Saved log search endpoints (ADR 108 D1).
 //!
 //! Project-scoped CRUD. Reads need `logs:read`, writes `logs:write`, and
 //! every call is additionally confined to the project the caller was

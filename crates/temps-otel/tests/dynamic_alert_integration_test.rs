@@ -803,7 +803,7 @@ async fn test_delete_alert_rejects_cross_project_rule_id_before_touching_evaluat
     );
 }
 
-// ── Log alerts (ADR 073 D1) ─────────────────────────────────────────────
+// ── Log alerts (ADR 108 D1) ─────────────────────────────────────────────
 
 /// A log-line counter that returns whatever count the test sets, so the
 /// evaluator's log path runs against the real `alarms` table without a log

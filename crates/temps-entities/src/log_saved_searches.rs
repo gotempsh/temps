@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Saved log searches (ADR 073 D1): a named, per-project log query that
+//! Saved log searches (ADR 108 D1): a named, per-project log query that
 //! the console, log alerts and dashboard tiles reference by id.
 
 use async_trait::async_trait;

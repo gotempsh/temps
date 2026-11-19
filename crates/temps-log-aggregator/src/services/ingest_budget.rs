@@ -759,7 +759,7 @@ impl IngestLimiter {
     }
 
     /// Decide a whole batch at once, at `now`: every line is admitted or none
-    /// is (ADR 073 D1, the HTTP log ingest endpoint).
+    /// is (ADR 108 D1, the HTTP log ingest endpoint).
     ///
     /// A collector that gets a `429` retries the batch, so storing part of
     /// one and refusing the rest would duplicate the stored part on retry.
@@ -1098,7 +1098,7 @@ mod tests {
         admitted
     }
 
-    // ── Whole-batch admission (ADR 073 D1, HTTP log ingest) ────────────
+    // ── Whole-batch admission (ADR 108 D1, HTTP log ingest) ────────────
 
     #[test]
     fn a_batch_within_the_budget_is_admitted_whole_and_consumes_it() {

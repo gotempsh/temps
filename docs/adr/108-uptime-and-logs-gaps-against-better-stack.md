@@ -1,4 +1,4 @@
-# ADR 073: What logs, uptime and status pages are missing to match Better Stack
+# ADR 108: What logs, uptime and status pages are missing to match Better Stack
 
 ## Status
 
@@ -9,8 +9,9 @@ ADR 025 (unified alarm log), ADR 026 (metric alert label filters), ADR 045 to
 047 (global logs stores), ADR 052 and 053 (pluggable health probes,
 distributed runtime health).
 
-One of four gap ADRs (071 Plausible, 072 PostHog, 073 Better Stack,
-074 Sentry). The target is 90% of what a typical user relies on.
+One of four gap ADRs, against Plausible, PostHog, Better Stack (this one)
+and Sentry. The target is 90% of what a typical user relies on. Drafted as
+ADR 073; renumbered because 071 to 074 were already taken on `main`.
 
 ## Context
 

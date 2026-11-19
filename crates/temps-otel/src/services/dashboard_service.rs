@@ -71,7 +71,7 @@ pub struct DashboardTile {
     #[serde(default)]
     pub group_by: Vec<String>,
     /// What the tile charts: the metric above (the default), or a saved log
-    /// search over time (ADR 073 D1). A log tile ignores `metric_name`,
+    /// search over time (ADR 108 D1). A log tile ignores `metric_name`,
     /// `aggregation`, `label_filters` and `group_by`.
     #[serde(default)]
     pub source: DashboardTileSource,
@@ -688,7 +688,7 @@ mod tests {
         assert!(tile.group_by.is_empty());
     }
 
-    // ── Log tiles (ADR 073 D1) ──────────────────────────────────────────
+    // ── Log tiles (ADR 108 D1) ──────────────────────────────────────────
 
     fn log_layout(saved_search_id: i32, metric: &str) -> DashboardLayout {
         let mut layout = sample_layout();

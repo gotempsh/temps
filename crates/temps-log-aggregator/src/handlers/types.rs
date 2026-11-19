@@ -44,12 +44,12 @@ pub struct LogAggregatorAppState {
     /// Per-container ingestion budget, for the throttled containers the
     /// capabilities endpoint reports.
     pub ingest_budget: Arc<IngestBudget>,
-    /// Saved log searches (ADR 073 D1): the named queries the console
+    /// Saved log searches (ADR 108 D1): the named queries the console
     /// offers and log alerts count.
     pub saved_search_service: Arc<LogSavedSearchService>,
-    /// Series of a saved search, for dashboard panels (ADR 073 D1).
+    /// Series of a saved search, for dashboard panels (ADR 108 D1).
     pub log_series_service: Arc<crate::services::LogSeriesService>,
-    /// HTTP log ingest (ADR 073 D1): key authentication, budget, writing.
+    /// HTTP log ingest (ADR 108 D1): key authentication, budget, writing.
     pub ingest_service: Arc<crate::ingest::LogIngestService>,
     /// Log ingest key CRUD.
     pub ingest_key_service: Arc<crate::ingest::LogIngestKeyService>,

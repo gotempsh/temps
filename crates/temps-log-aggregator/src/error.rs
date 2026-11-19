@@ -123,7 +123,7 @@ pub enum LogAggregatorError {
     #[error("Validation error: {message}")]
     Validation { message: String },
 
-    // ── Saved searches and log ingest (ADR 073 D1) ──────────────────────
+    // ── Saved searches and log ingest (ADR 108 D1) ──────────────────────
     #[error("Saved log search {saved_search_id} not found in project {project_id}")]
     SavedSearchNotFound {
         project_id: i32,

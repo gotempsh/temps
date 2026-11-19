@@ -846,7 +846,7 @@ impl FireDetails {
         }
     }
 
-    /// A log alert's breach (ADR 073 D1). The payload names the saved
+    /// A log alert's breach (ADR 108 D1). The payload names the saved
     /// search by id, never the query text: an alarm is read by people who
     /// can open the search, and a message needle can contain anything.
     fn log_breach(rule: &AlertRule, sample: &LogSeriesSample, p: &StaticParams) -> Self {
@@ -1023,7 +1023,7 @@ pub struct MetricAlertEvaluator {
     /// called inside a timeout on each fire and may replace the lead sentence,
     /// never block or fail the alert.
     ai: Option<Arc<dyn temps_ai::AiService>>,
-    /// ADR 073 D1: counts the lines a saved log search matches, for rules
+    /// ADR 108 D1: counts the lines a saved log search matches, for rules
     /// whose source is `logs`. Provided by the log aggregator plugin.
     ///
     /// A `OnceLock` because the two plugins register independently: the
@@ -1064,7 +1064,7 @@ impl MetricAlertEvaluator {
         }
     }
 
-    /// Supply the log-line counter after construction (ADR 073 D1), for the
+    /// Supply the log-line counter after construction (ADR 108 D1), for the
     /// composition root that can only resolve it once every plugin has
     /// registered. Ignored, with a warning, if one is already set: the
     /// evaluator must not swap the series it counts mid-flight.
@@ -1225,7 +1225,7 @@ impl MetricAlertEvaluator {
     /// `dynamic_alerts`, per-series). ADR-026 Phase 3.
     async fn evaluate_rule(&self, rule: AlertRule) -> Result<(), crate::error::OtelError> {
         // A log rule counts lines instead of reducing a metric bucket, so it
-        // never reaches the metric query paths below (ADR 073 D1).
+        // never reaches the metric query paths below (ADR 108 D1).
         match AlertSeriesSource::from_columns(&rule.source, rule.saved_search_id) {
             Some(AlertSeriesSource::Logs { saved_search_id }) => {
                 return self.evaluate_log_rule(rule, saved_search_id).await;
@@ -1268,7 +1268,7 @@ impl MetricAlertEvaluator {
         }
     }
 
-    /// Evaluate a log alert (ADR 073 D1): count the lines the rule's saved
+    /// Evaluate a log alert (ADR 108 D1): count the lines the rule's saved
     /// search matches in this window, then run the same static-threshold
     /// decision the metric path runs.
     ///
@@ -1459,7 +1459,7 @@ impl MetricAlertEvaluator {
 
     /// The aggregate state machine: breach duration, transition, fire or
     /// resolve, persist. Shared by the metric path and the log-count path
-    /// (ADR 073 D1) so both get identical `for_duration`, alarm and
+    /// (ADR 108 D1) so both get identical `for_duration`, alarm and
     /// persistence behaviour — a log alert is the same alert with a
     /// different series.
     async fn apply_decision(
@@ -3232,7 +3232,7 @@ mod tests {
         assert_eq!(selected[0].1, 42);
     }
 
-    // ── Log alerts (ADR 073 D1) ─────────────────────────────────────────
+    // ── Log alerts (ADR 108 D1) ─────────────────────────────────────────
 
     fn log_rule(window_secs: i32, threshold: f64) -> AlertRule {
         let mut rule = make_rule_with_scope(serde_json::json!([]), serde_json::json!([]));

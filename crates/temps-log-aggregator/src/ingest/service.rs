@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! The HTTP log ingest path (ADR 073 D1): authenticate the key, parse the
+//! The HTTP log ingest path (ADR 108 D1): authenticate the key, parse the
 //! batch, charge the project's ingestion budget, write the lines.
 //!
 //! Lines go through the same [`ChunkWriterService::write_line`] a container's

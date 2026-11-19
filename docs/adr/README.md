@@ -126,6 +126,7 @@ the number of the ADR they belong to; they do not take a number of their own.
 | [105](./105-sandbox-internal-access.md) | A sandbox can call a project's internal address when that project allows it | Proposed | amends [101](./101-internal-access-grants.md) |
 | [106](./106-durable-workflows.md) | Durable workflows orchestrated by Temps | Proposed |  |
 | [107](./107-control-plane-tunnel-connectors.md) | The control plane runs tunnel connectors for the apps it serves | Proposed | amends [058](./058-ingress-modes-and-a-shared-app-domain.md) |
+| [108](./108-uptime-and-logs-gaps-against-better-stack.md) | What logs, uptime and status pages are missing to match Better Stack | Proposed |  |
 
 ## Supporting documents
 

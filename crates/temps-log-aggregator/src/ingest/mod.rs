@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! HTTP log ingest for sources outside Temps (ADR 073 D1).
+//! HTTP log ingest for sources outside Temps (ADR 108 D1).
 //!
 //! `POST /logs/ingest` takes newline-delimited JSON authenticated by a
 //! project's log ingest key. A host, a database, a CDN or an app that Temps

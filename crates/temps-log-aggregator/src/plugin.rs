@@ -42,7 +42,7 @@ use temps_clickhouse::ClickHouseConfig;
 /// this is how often a change is picked up without a restart.
 const BUDGET_SYNC_INTERVAL: Duration = Duration::from_secs(60);
 
-/// How often log ingest key usage counters are written (ADR 073 D1).
+/// How often log ingest key usage counters are written (ADR 108 D1).
 const INGEST_KEY_USAGE_FLUSH_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Interval for the periodic flush ticker (10 seconds)
@@ -347,7 +347,7 @@ impl TempsPlugin for LogAggregatorPlugin {
             // Audit service
             let audit_service = context.require_service::<dyn temps_core::AuditLogger>();
 
-            // ── ADR 073 D1: saved searches and the log-alert series ─────
+            // ── ADR 108 D1: saved searches and the log-alert series ─────
             // The saved-search list is plain project configuration; the
             // series source is what the metric alert evaluator pulls on its
             // interval to count the lines a saved search matches. Both are
@@ -367,7 +367,7 @@ impl TempsPlugin for LogAggregatorPlugin {
                 log_series_service.clone() as Arc<dyn temps_core::log_series::LogSeriesSource>
             );
 
-            // ── ADR 073 D1: HTTP log ingest ─────────────────────────────
+            // ── ADR 108 D1: HTTP log ingest ─────────────────────────────
             // Keys are project configuration; the ingest service writes
             // through the same chunk writer and per-project budget a
             // container's lines go through.
@@ -585,7 +585,7 @@ impl TempsPlugin for LogAggregatorPlugin {
                 });
             }
 
-            // ── Log ingest key usage (ADR 073 D1) ───────────────────────
+            // ── Log ingest key usage (ADR 108 D1) ───────────────────────
             // Line counts and last-used times are summed in memory per
             // request and written here, one statement per key used since
             // the last tick, so ingest costs no database write per request.
