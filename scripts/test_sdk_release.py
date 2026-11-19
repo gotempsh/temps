@@ -5,12 +5,16 @@ import base64
 import hashlib
 import json
 import io
+import re
+import shutil
+import subprocess
 import tarfile
 from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
 import urllib.error
+import sdk_prepare
 import sdk_release as release
 
 
@@ -418,6 +422,519 @@ class ReleaseTests(unittest.TestCase):
         self.assertNotIn('matrix:', publish)
         self.assertIn('persist-credentials: false', publish)
         self.assertIn('python3 scripts/sdk_release.py publish-tags', publish)
+
+
+class FakeHistory:
+    """In-memory git history: commits oldest first, each touching paths (with contents when known)."""
+
+    def __init__(self):
+        self.log = []
+        self.refs = {}
+
+    def commit(self, subject, files, body=''):
+        sha = hashlib.sha1(f'{len(self.log)}:{subject}'.encode()).hexdigest()
+        self.log.append({'sha': sha, 'subject': subject, 'body': body,
+                         'files': files if isinstance(files, dict) else dict.fromkeys(files)})
+        return sha
+
+    def tag(self, name):
+        self.refs[name] = self.log[-1]['sha']
+
+    def tags(self, prefix):
+        return sorted(tag for tag in self.refs if tag.startswith(prefix))
+
+    def tag_exists(self, tag):
+        return tag in self.refs
+
+    def position(self, revision):
+        sha = self.refs.get(revision.removeprefix('refs/tags/'), revision)
+        return next(index for index, commit in enumerate(self.log) if commit['sha'] == sha)
+
+    def commits(self, base, paths, excludes):
+        def within(file, roots):
+            return any(file == root or file.startswith(root + '/') for root in roots)
+        return [{k: commit[k] for k in ('sha', 'subject', 'body')}
+                for commit in reversed(self.log[self.position(base) + 1:])
+                if any(within(file, paths) and not within(file, excludes) for file in commit['files'])]
+
+    def revisions(self, path):
+        return [commit['sha'] for commit in reversed(self.log) if path in commit['files']]
+
+    def show(self, revision, path):
+        for commit in reversed(self.log[:self.position(revision) + 1]):
+            if isinstance(commit['files'].get(path), str):
+                return commit['files'][path]
+        return None
+
+
+class PrepareTests(unittest.TestCase):
+    """`prepare` against an in-memory history and registry; nothing touches git or the network."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.history = FakeHistory()
+        self.registry = {}
+        self.catalog = {}
+        self.crates = []
+        self.write('.github/releases/prepared.json', '{}\n')
+
+    def write(self, path, text):
+        target = self.root / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text)
+        return text
+
+    def read(self, path):
+        return (self.root / path).read_text()
+
+    def add(self, key, kind, version, *, name=None, path=None, deps=(), published=(), **extra):
+        """Add a catalog package whose manifest an initial commit records at `version`."""
+        name = name or {'crate': key, 'go': 'github.com/gotempsh/temps/sdks/go/' + key}.get(kind, '@temps-sdk/' + key)
+        path = path or {'npm': f'sdks/node/packages/{key}', 'crate': f'crates/{key}',
+                        'pypi': f'sdks/{key}', 'go': f'sdks/go/{key}'}[kind]
+        self.catalog[key] = dict(kind=kind, path=path, name=name, **extra)
+        self.write('.github/releases/packages.json', json.dumps(self.catalog, indent=2))
+        files = {}
+        if kind == 'npm':
+            data = {'name': name, 'version': version}
+            if deps:
+                data['dependencies'] = {self.catalog[dep]['name']: 'workspace:*' for dep in deps}
+            files[f'{path}/package.json'] = self.write(f'{path}/package.json', json.dumps(data, indent=2) + '\n')
+            self.write_bun_lock()
+        elif kind == 'crate':
+            lines = ['[package]', f'name = "{name}"', f'version = "{version}"', 'edition.workspace = true', '',
+                     '[dependencies]', 'serde = { workspace = true }']
+            for dep in deps:
+                sibling = self.catalog[dep]
+                lines.append(f'{sibling["name"]} = {{ path = "../{dep}", version = "={self.version(dep)}" }}')
+            files[f'{path}/Cargo.toml'] = self.write(f'{path}/Cargo.toml', '\n'.join(lines) + '\n')
+            self.crates.append((name, version, [self.catalog[dep]['name'] for dep in deps]))
+            self.write_cargo_lock()
+        elif kind == 'pypi':
+            files[f'{path}/pyproject.toml'] = self.write(
+                f'{path}/pyproject.toml', f'[project]\nname = "{name}"\nversion = "{version}"\ndependencies = []\n')
+            self.write(f'{path}/uv.lock', f'version = 1\n\n[[package]]\nname = "{sdk_prepare.canonical(name)}"\n'
+                                          f'version = "{version}"\n'
+                                          'source = { editable = "." }\n')
+        else:
+            self.write(f'{path}/go.mod', f'module {name}\n\ngo 1.23\n')
+            files[f'{path}/VERSION'] = self.write(f'{path}/VERSION', version + '\n')
+        self.history.commit(f'chore(release): add {key}', files)
+        self.registry[name] = set(published)
+
+    def version(self, key):
+        return release.manifest(self.catalog[key], self.root)['version']
+
+    def write_bun_lock(self):
+        entries = ''.join(
+            f'    "{p["path"].removeprefix("sdks/node/")}": {{\n      "name": "{p["name"]}",\n'
+            f'      "version": "{self.version(key)}",\n    }},\n'
+            for key, p in sorted(self.catalog.items()) if p['kind'] == 'npm')
+        self.write('sdks/node/bun.lock', '{\n  "lockfileVersion": 1,\n  "workspaces": {\n' + entries + '  },\n}\n')
+
+    def write_cargo_lock(self):
+        blocks = ['version = 4\n']
+        for name, version, deps in self.crates:
+            block = f'[[package]]\nname = "{name}"\nversion = "{version}"\n'
+            if deps:
+                block += 'dependencies = [\n' + ''.join(f' "{dep}",\n' for dep in deps) + ']\n'
+            blocks.append(block)
+        blocks.append('[[package]]\nname = "serde"\nversion = "1.0.0"\n'
+                      'source = "registry+https://github.com/rust-lang/crates.io-index"\n')
+        self.write('Cargo.lock', '\n'.join(blocks))
+
+    def release_tag(self, key, version):
+        self.history.tag(release.package_tag(key, self.catalog[key], version))
+
+    def change(self, key, subject, body=''):
+        return self.history.commit(subject, [f"{self.catalog[key]['path']}/src/index.ts"], body)
+
+    def prepare(self, tag='v9.0.0', write=True):
+        return sdk_prepare.prepare(tag, self.root, history=self.history,
+                                   published=lambda package: self.registry.get(package['name'], set()), write=write)
+
+    def selection(self, tag='v9.0.0'):
+        report, _ = self.prepare(tag)
+        return {entry['key']: entry['version'] for entry in report}
+
+    def test_conventional_commit_levels(self):
+        for subject, body, level in [
+                ('fix(cli): handle empty input', '', 'patch'), ('perf: cache lookups', '', 'patch'),
+                ('feat(kv): add scan', '', 'minor'), ('feat(kv)!: drop the v1 client', '', 'major'),
+                ('fix!: rename the option', '', 'major'),
+                ('refactor(kv): split modules', 'BREAKING CHANGE: the client is now async', 'major'),
+                ('fix: tidy', 'BREAKING-CHANGE: renamed', 'major'),
+                ('chore(deps): bump serde', '', None), ('docs: explain', '', None), ('test: cover', '', None),
+                ('Merge pull request #1 from someone/branch', '', None), ('feat:missing space', '', None),
+                ('Fix: capitalised type', '', None), ('fix: mentions BREAKING CHANGE in passing', '', 'patch')]:
+            with self.subTest(subject=subject):
+                self.assertEqual(sdk_prepare.commit_level(subject, body), level)
+
+    def test_each_bump_kind_from_a_tagged_release(self):
+        for subject, expected in [('fix: patch', '1.2.4'), ('perf: faster', '1.2.4'), ('feat: feature', '1.3.0'),
+                                  ('feat!: breaking', '2.0.0'), ('chore: nothing', None)]:
+            with self.subTest(subject=subject):
+                self.setUp()
+                self.add('kv', 'npm', '1.2.3', published={'1.2.3'})
+                self.release_tag('kv', '1.2.3')
+                self.change('kv', subject)
+                self.change('kv', 'fix: second fix')
+                if expected is None:
+                    self.history.log.pop()
+                self.assertEqual(self.selection().get('kv'), expected)
+
+    def test_pre_1_0_shifts_bumps_down_one_level(self):
+        for subjects, expected in [(['feat!: breaking'], '0.5.0'), (['feat: feature'], '0.4.3'),
+                                   (['fix: patch'], '0.4.3'), (['fix: one', 'feat: two'], '0.4.3')]:
+            with self.subTest(subjects=subjects):
+                self.setUp()
+                self.add('kv', 'npm', '0.4.2', published={'0.4.2'})
+                self.release_tag('kv', '0.4.2')
+                for subject in subjects:
+                    self.change('kv', subject)
+                self.assertEqual(self.selection().get('kv'), expected)
+                self.assertEqual(json.loads(self.read('sdks/node/packages/kv/package.json'))['version'], expected)
+
+    def test_next_core_follows_semver_increments_of_prereleases(self):
+        version = sdk_prepare.Version
+        for base, level, expected in [('1.2.3', 'patch', '1.2.4'), ('1.2.3', 'minor', '1.3.0'),
+                                      ('1.2.3', 'major', '2.0.0'), ('1.3.0-beta.2', 'minor', '1.3.0'),
+                                      ('1.2.3-beta.2', 'minor', '1.3.0'), ('2.0.0-beta.1', 'major', '2.0.0'),
+                                      ('1.2.0-beta.1', 'major', '2.0.0'), ('1.2.3-beta.4', 'patch', '1.2.3'),
+                                      ('0.1.0-beta.62', 'major', '0.1.0'), ('0.0.1-beta.1', 'major', '0.1.0'),
+                                      ('1.2.3-beta.4', None, '1.2.3')]:
+            with self.subTest(base=base, level=level):
+                self.assertEqual(sdk_prepare.next_core(version.parse(base, 'npm'), level).format('npm'), expected)
+
+    def test_beta_numbering_continues_from_registry_and_tags(self):
+        self.add('kv', 'npm', '1.2.3', published={'1.2.3', '1.3.0-beta.1', '1.3.0-beta.2'})
+        self.add('py', 'pypi', '1.2.3', name='temps-sample', published={'1.2.3', '1.3.0b1'})
+        self.release_tag('kv', '1.2.3')
+        self.release_tag('py', '1.2.3')
+        self.change('kv', 'feat: scan')
+        self.change('py', 'feat: scan')
+        self.history.commit('chore: tag a beta whose upload never happened', ['README.md'])
+        self.release_tag('kv', '1.3.0-beta.4')
+        self.change('kv', 'fix: scan bound')
+        self.assertEqual(self.selection('v9.0.0-beta.1'), {'kv': '1.3.0-beta.5', 'py': '1.3.0b2'})
+        self.assertEqual(release.channel(self.version('py'), 'pypi'), 'beta')
+
+    def test_beta_after_a_beta_tag_keeps_its_core_and_stable_graduates_it(self):
+        self.add('kv', 'npm', '1.3.0-beta.1', published={'1.2.3', '1.3.0-beta.1'})
+        self.release_tag('kv', '1.3.0-beta.1')
+        self.change('kv', 'fix: follow-up')
+        self.assertEqual(self.selection('v9.0.0-beta.2'), {'kv': '1.3.0-beta.2'})
+        self.setUp()
+        self.add('kv', 'npm', '1.3.0-beta.1', published={'1.2.3', '1.3.0-beta.1'})
+        self.release_tag('kv', '1.3.0-beta.1')
+        # No commit since the beta: a stable server tag still releases it as stable.
+        self.assertEqual(self.selection('v9.0.0'), {'kv': '1.3.0'})
+
+    def test_untagged_unpublished_package_is_a_first_release(self):
+        self.add('sandbox', 'npm', '0.0.1')
+        self.add('protocol', 'crate', '0.1.0-beta.62', name='temps-plugin-protocol')
+        self.add('py', 'pypi', '0.1.0', name='temps-sample')
+        self.add('workflows', 'go', '0.1.0')
+        beta = self.selection('v9.0.0-beta.1')
+        self.assertEqual(beta, {'protocol': '0.1.0-beta.62', 'py': '0.1.0b1',
+                                'sandbox': '0.0.1-beta.1', 'workflows': '0.1.0-beta.1'})
+        self.assertEqual(self.read('sdks/go/workflows/VERSION'), '0.1.0-beta.1\n')
+        self.assertIn('version = "0.1.0b1"', self.read('sdks/py/uv.lock'))
+        report, _ = self.prepare('v9.0.0-beta.1', write=False)
+        self.assertTrue(all(entry['previous'] is None and 'first release' in entry['reason'] for entry in report))
+
+    def test_untagged_unpublished_package_goes_stable_as_its_manifest_core(self):
+        self.add('sandbox', 'npm', '0.0.1')
+        self.add('protocol', 'crate', '0.1.0-beta.62', name='temps-plugin-protocol')
+        self.assertEqual(self.selection('v9.0.0'), {'protocol': '0.1.0', 'sandbox': '0.0.1'})
+
+    def test_already_published_version_without_changes_is_skipped(self):
+        self.add('kv', 'npm', '0.0.4', published={'0.0.3', '0.0.4'})
+        self.change('kv', 'docs: readme')
+        report, files = self.prepare()
+        self.assertEqual(report, [])
+        self.assertEqual(files, [])
+        self.assertEqual(json.loads(self.read('.github/releases/prepared.json')), {})
+
+    def test_untagged_published_package_anchors_on_the_commit_that_set_its_version(self):
+        self.history.commit('feat: shipped in 0.0.4', ['sdks/node/packages/kv/src/a.ts'])
+        self.add('kv', 'npm', '0.0.4', published={'0.0.4'})
+        self.change('kv', 'fix: after the release')
+        report, _ = self.prepare()
+        self.assertEqual([(e['key'], e['previous'], e['version']) for e in report], [('kv', '0.0.4', '0.0.5')])
+        self.assertEqual([c['subject'] for c in report[0]['commits']], ['fix: after the release'])
+
+    def test_a_computed_version_that_is_already_published_is_never_selected(self):
+        self.add('kv', 'npm', '1.2.3', published={'1.2.3', '1.2.4'})
+        self.release_tag('kv', '1.2.3')
+        self.change('kv', 'fix: patch')
+        with self.assertRaisesRegex(ValueError, r'@temps-sdk/kv 1\.2\.4 is already published'):
+            self.prepare()
+        self.assertEqual(self.version('kv'), '1.2.3')
+
+    def test_registry_ahead_of_history_fails_closed(self):
+        self.add('kv', 'npm', '0.0.5', published={'0.0.9'})
+        with self.assertRaisesRegex(ValueError, 'registry already has 0.0.9'):
+            self.prepare()
+
+    def test_dependency_cascade_rebuilds_dependents_in_publish_order(self):
+        self.add('analytics-core', 'npm', '0.0.6', published={'0.0.6'})
+        self.add('react-analytics', 'npm', '0.0.9', deps=['analytics-core'], published={'0.0.9'})
+        self.add('temps-plugin-protocol', 'crate', '1.0.0', published={'1.0.0'})
+        self.add('temps-plugin-sdk', 'crate', '1.0.0', deps=['temps-plugin-protocol'], published={'1.0.0'})
+        self.add('unrelated', 'npm', '1.0.0', published={'1.0.0'})
+        for key, version in [('analytics-core', '0.0.6'), ('react-analytics', '0.0.9'),
+                             ('temps-plugin-protocol', '1.0.0'), ('temps-plugin-sdk', '1.0.0'), ('unrelated', '1.0.0')]:
+            self.release_tag(key, version)
+        self.change('analytics-core', 'feat: new event')
+        self.history.commit('fix(protocol): header', ['crates/temps-plugin-protocol/src/lib.rs'])
+        report, _ = self.prepare()
+        self.assertEqual([(e['key'], e['version']) for e in report],
+                         [('analytics-core', '0.0.7'), ('temps-plugin-protocol', '1.0.1'),
+                          ('react-analytics', '0.0.10'), ('temps-plugin-sdk', '1.0.1')])
+        self.assertEqual(report[2]['reason'], 'dependency @temps-sdk/analytics-core')
+        self.assertEqual(list(json.loads(self.read('.github/releases/prepared.json'))['v9.0.0']),
+                         ['analytics-core', 'temps-plugin-protocol', 'react-analytics', 'temps-plugin-sdk'])
+        self.assertEqual([p['key'] for p in release.plan('v9.0.0', self.root)],
+                         ['analytics-core', 'temps-plugin-protocol', 'react-analytics', 'temps-plugin-sdk'])
+        self.assertIn('temps-plugin-protocol = { path = "../temps-plugin-protocol", version = "=1.0.1" }',
+                      self.read('crates/temps-plugin-sdk/Cargo.toml'))
+        lock = self.read('Cargo.lock')
+        self.assertIn('name = "temps-plugin-protocol"\nversion = "1.0.1"\n', lock)
+        self.assertIn('name = "temps-plugin-sdk"\nversion = "1.0.1"\n', lock)
+        self.assertIn('name = "serde"\nversion = "1.0.0"\n', lock)
+        bun = self.read('sdks/node/bun.lock')
+        self.assertIn('"name": "@temps-sdk/analytics-core",\n      "version": "0.0.7"', bun)
+        self.assertIn('"name": "@temps-sdk/react-analytics",\n      "version": "0.0.10"', bun)
+        self.assertIn('"name": "@temps-sdk/unrelated",\n      "version": "1.0.0"', bun)
+
+    def test_cascade_is_transitive(self):
+        self.add('base', 'npm', '1.0.0', published={'1.0.0'})
+        self.add('middle', 'npm', '1.0.0', deps=['base'], published={'1.0.0'})
+        self.add('top', 'npm', '1.0.0', deps=['middle'], published={'1.0.0'})
+        for key in ('base', 'middle', 'top'):
+            self.release_tag(key, '1.0.0')
+        self.change('base', 'fix: bug')
+        self.assertEqual(self.selection(), {'base': '1.0.1', 'middle': '1.0.1', 'top': '1.0.1'})
+
+    def test_stable_package_cannot_depend_on_a_prerelease_sibling(self):
+        self.add('core', 'npm', '1.0.0', published={'1.0.0'})
+        self.add('app', 'npm', '1.0.0', deps=['core'], published={'1.0.0'})
+        self.release_tag('core', '1.0.0')
+        self.release_tag('app', '1.0.0')
+        # A hand edit left the core on an unpublished prerelease with nothing releasable since its tag.
+        path = 'sdks/node/packages/core/package.json'
+        self.history.commit('chore: try a beta', {path: self.write(
+            path, json.dumps({'name': '@temps-sdk/core', 'version': '1.1.0-beta.1'}) + '\n')})
+        self.change('app', 'fix: app bug')
+        with self.assertRaisesRegex(ValueError, 'app: stable package depends on prerelease sibling @temps-sdk/core'):
+            self.prepare('v9.0.0')
+        self.assertEqual(self.read('.github/releases/prepared.json'), '{}\n')
+        # A beta server tag may ship it: both become betas.
+        self.assertEqual(self.selection('v9.0.0-beta.1'), {'app': '1.0.1-beta.1'})
+
+    def test_prepare_is_idempotent(self):
+        self.add('analytics-core', 'npm', '0.0.6', published={'0.0.6'})
+        self.add('react-analytics', 'npm', '0.0.9', deps=['analytics-core'], published={'0.0.9'})
+        self.add('sandbox', 'npm', '0.0.1')
+        self.add('temps-plugin-protocol', 'crate', '1.0.0', published={'1.0.0'})
+        self.add('temps-plugin-sdk', 'crate', '1.0.0', deps=['temps-plugin-protocol'], published={'1.0.0'})
+        self.add('py', 'pypi', '0.1.0', name='temps-sample')
+        self.release_tag('temps-plugin-protocol', '1.0.0')
+        self.release_tag('temps-plugin-sdk', '1.0.0')
+        self.change('analytics-core', 'feat: event')
+        self.history.commit('feat(protocol)!: v2 frames', ['crates/temps-plugin-protocol/src/lib.rs'])
+        for tag in ('v9.0.0-beta.1', 'v9.0.0'):
+            with self.subTest(tag=tag):
+                _, first = self.prepare(tag)
+                self.assertTrue(first)
+                snapshot = {path: self.read(path) for path in first}
+                again, second = self.prepare(tag, write=False)
+                self.assertEqual(second, [])
+                self.prepare(tag)
+                self.assertEqual({path: self.read(path) for path in first}, snapshot)
+                self.assertEqual(release.plan(tag, self.root)[0]['key'], 'analytics-core')
+                self.assertEqual(len(again), 6)
+
+    def test_python_and_go_workspace_dependencies_cascade_and_are_repinned(self):
+        self.add('py-core', 'pypi', '1.0.0', name='temps_core', published={'1.0.0'})
+        self.add('py-app', 'pypi', '1.0.0', name='temps-app', published={'1.0.0'})
+        self.write('sdks/py-app/pyproject.toml', '[project]\nname = "temps-app"\nversion = "1.0.0"\n'
+                   'dependencies = ["temps-core==1.0.0", "aiohttp>=3"]\n\n'
+                   '[tool.uv.sources]\ntemps-core = { path = "../py-core" }\n')
+        self.add('go-core', 'go', '1.0.0', published={'1.0.0'})
+        self.add('go-app', 'go', '1.0.0', published={'1.0.0'})
+        core = self.catalog['go-core']['name']
+        self.write('sdks/go/go-app/go.mod', f'module {self.catalog["go-app"]["name"]}\n\ngo 1.23\n\n'
+                   f'require {core} v1.0.0\n\nreplace {core} => ../go-core\n')
+        for key in ('py-core', 'py-app', 'go-core', 'go-app'):
+            self.release_tag(key, '1.0.0')
+        self.change('py-core', 'fix: core')
+        self.change('go-core', 'feat: core')
+        self.assertEqual(self.selection(), {'go-app': '1.0.1', 'go-core': '1.1.0', 'py-app': '1.0.1', 'py-core': '1.0.1'})
+        self.assertIn('"temps-core==1.0.1"', self.read('sdks/py-app/pyproject.toml'))
+        self.assertIn(f'require {core} v1.1.0\n\nreplace {core} => ../go-core\n', self.read('sdks/go/go-app/go.mod'))
+
+    def test_commit_touching_no_package_selects_nothing(self):
+        self.add('kv', 'npm', '1.0.0', published={'1.0.0'})
+        self.add('py', 'pypi', '1.0.0', name='temps-sample', published={'1.0.0'})
+        self.release_tag('kv', '1.0.0')
+        self.release_tag('py', '1.0.0')
+        self.history.commit('feat(web): new console page', ['web/src/page.tsx', 'crates/temps-core/src/lib.rs'])
+        self.history.commit('fix(kv)!: only the subject names kv', ['docs/kv.md'])
+        self.assertEqual(self.prepare(), ([], []))
+
+    def test_nested_catalog_paths_belong_to_the_inner_package_only(self):
+        self.add('python-plugin', 'pypi', '1.0.0', name='temps-plugin-sdk', path='sdks/python', published={'1.0.0'})
+        self.add('python-workflows', 'pypi', '1.0.0', name='temps-workflows', path='sdks/python/workflows',
+                 published={'1.0.0'})
+        self.release_tag('python-plugin', '1.0.0')
+        self.release_tag('python-workflows', '1.0.0')
+        self.history.commit('feat(workflows): retries', ['sdks/python/workflows/temps_workflows/run.py'])
+        self.assertEqual(self.selection(), {'python-workflows': '1.1.0'})
+
+    def test_declared_sources_count_as_package_changes(self):
+        self.add('api', 'npm', '1.0.0', published={'1.0.0'}, sources=['apps/temps-cli/openapi.json'])
+        self.release_tag('api', '1.0.0')
+        self.history.commit('feat(flags): new endpoint', ['apps/temps-cli/openapi.json'])
+        self.assertEqual(self.selection(), {'api': '1.1.0'})
+
+    def test_manual_unpublished_bump_ahead_of_the_commits_is_kept(self):
+        self.add('kv', 'npm', '1.2.3', published={'1.2.3'})
+        self.release_tag('kv', '1.2.3')
+        path = 'sdks/node/packages/kv/package.json'
+        self.history.commit('chore(kv): prepare 2.0', {path: self.write(
+            path, json.dumps({'name': '@temps-sdk/kv', 'version': '2.0.0'}) + '\n')})
+        self.write_bun_lock()
+        self.change('kv', 'fix: patch')
+        self.assertEqual(self.selection(), {'kv': '2.0.0'})
+
+    def test_go_major_two_requires_a_new_module_path(self):
+        self.add('workflows', 'go', '1.4.0', published={'1.4.0'})
+        self.release_tag('workflows', '1.4.0')
+        self.change('workflows', 'feat!: new API')
+        with self.assertRaisesRegex(ValueError, 'Go v2\\+ requires a new /v2 module path'):
+            self.prepare()
+
+    def test_target_tag_rules(self):
+        self.add('kv', 'npm', '1.0.0')
+        for tag, message in [('v9.0.0-nightly.20261119.abcdef', 'Nightly'), ('sdk/kv/v1.0.0', 'Not a server'),
+                             ('v9.0', 'Not a server'), ('v9.0.0;rm', 'Not a server')]:
+            with self.subTest(tag=tag), self.assertRaisesRegex(ValueError, message):
+                self.prepare(tag)
+        self.history.refs['v9.0.0'] = self.history.log[-1]['sha']
+        with self.assertRaisesRegex(ValueError, 'already tagged'):
+            self.prepare('v9.0.0')
+
+    def test_registry_lookups_cover_every_ever_used_version(self):
+        def fetch(url, **kwargs):
+            pages = {
+                'https://registry.npmjs.org/%40temps-sdk%2Fkv': {
+                    'versions': {'1.0.0': {}}, 'time': {'created': '', 'modified': '', '1.0.0': '', '1.0.1': ''}},
+                'https://pypi.org/pypi/temps-sample/json': {'releases': {'1.0.0b1': []}},
+                'https://crates.io/api/v1/crates/temps-sample/versions?per_page=100': {
+                    'versions': [{'num': '1.0.0', 'yanked': True}], 'meta': {'next_page': '?per_page=100&seek=x'}},
+                'https://crates.io/api/v1/crates/temps-sample/versions?per_page=100&seek=x': {
+                    'versions': [{'num': '0.9.0', 'yanked': False}], 'meta': {'next_page': None}},
+            }
+            if 'proxy.golang.org' in url:
+                self.assertEqual(url, 'https://proxy.golang.org/github.com/!example/mod/@v/list')
+                self.assertEqual(kwargs['missing'], (404, 410))
+                return kwargs['parse'](io.BytesIO(b'v1.0.0\nv1.1.0-beta.1\n'))
+            return pages.get(url)
+        versions = sdk_prepare.published_versions
+        self.assertEqual(versions({'kind': 'npm', 'name': '@temps-sdk/kv'}, fetch), {'1.0.0', '1.0.1'})
+        self.assertEqual(versions({'kind': 'npm', 'name': '@temps-sdk/new'}, fetch), set())
+        self.assertEqual(versions({'kind': 'pypi', 'name': 'temps-sample'}, fetch), {'1.0.0b1'})
+        self.assertEqual(versions({'kind': 'crate', 'name': 'temps-sample'}, fetch), {'1.0.0', '0.9.0'})
+        self.assertEqual(versions({'kind': 'go', 'name': 'github.com/Example/mod'}, fetch), {'1.0.0', '1.1.0-beta.1'})
+
+    def test_summary_lists_each_package_without_mentions(self):
+        self.add('kv', 'npm', '1.0.0', published={'1.0.0'})
+        self.release_tag('kv', '1.0.0')
+        self.change('kv', 'fix(kv): thanks @someone for `scan`')
+        report, _ = self.prepare('v9.0.0-beta.1')
+        text = sdk_prepare.summary('v9.0.0-beta.1', report)
+        self.assertIn('| `@temps-sdk/kv` | npm | `1.0.0` | `1.0.1-beta.1` | 1 commit (patch) |', text)
+        self.assertIn("`fix(kv): thanks @someone for 'scan'`", text)
+        self.assertIn('nothing to prepare', sdk_prepare.summary('v9.0.0', []))
+
+
+class GitHistoryTests(unittest.TestCase):
+    """The real git adapter, against a throwaway repository."""
+
+    def git(self, *args):
+        return subprocess.run(('git', '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid',
+                               '-c', 'commit.gpgsign=false', '-c', 'tag.gpgsign=false', *args),
+                              cwd=self.root, check=True, text=True, capture_output=True).stdout
+
+    def commit(self, path, content, message):
+        target = self.root / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content)
+        self.git('add', path)
+        self.git('commit', '-q', '-m', message)
+        return self.git('rev-parse', 'HEAD').strip()
+
+    def test_tags_commits_and_manifest_revisions(self):
+        if shutil.which('git') is None:
+            self.skipTest('git is not installed')
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        self.git('init', '-q', '-b', 'main')
+        first = self.commit('sdks/python/pyproject.toml', '[project]\nversion = "1.0.0"\n', 'chore: add')
+        self.git('tag', '-a', 'sdk/python/v1.0.0', '-m', 'release')
+        self.commit('sdks/python/workflows/run.py', 'x', 'feat(workflows): nested')
+        self.commit('sdks/python/plugin.py', 'x', 'fix(plugin): outer\n\nBREAKING CHANGE: renamed')
+        history = sdk_prepare.GitHistory(self.root)
+        history.ensure_full_history()
+        self.assertEqual(history.tags('sdk/python/v'), ['sdk/python/v1.0.0'])
+        self.assertTrue(history.tag_exists('sdk/python/v1.0.0'))
+        self.assertFalse(history.tag_exists('v1.0.0'))
+        commits = history.commits('refs/tags/sdk/python/v1.0.0', ['sdks/python'], ['sdks/python/workflows'])
+        self.assertEqual([c['subject'] for c in commits], ['fix(plugin): outer'])
+        self.assertIn('BREAKING CHANGE: renamed', commits[0]['body'])
+        self.assertEqual(history.revisions('sdks/python/pyproject.toml'), [first])
+        self.assertIn('1.0.0', history.show(first, 'sdks/python/pyproject.toml'))
+        self.assertIsNone(history.show(first, 'missing.toml'))
+
+
+class SdkReleasePrepWorkflowTests(unittest.TestCase):
+    workflow = (release.ROOT / '.github/workflows/sdk-release-prep.yml').read_text()
+
+    def test_prep_holds_no_registry_credentials(self):
+        self.assertNotIn('id-token', self.workflow)
+        self.assertNotIn('environment:', self.workflow)
+        self.assertEqual(re.findall(r'secrets\.\w+', self.workflow), [])
+        for forbidden in ('NPM_TOKEN', 'NODE_AUTH_TOKEN', 'CARGO_REGISTRY', 'PYPI', 'publish --'):
+            self.assertNotIn(forbidden, self.workflow)
+        self.assertIn('permissions: {}', self.workflow)
+        write_jobs = re.findall(r'permissions:\n((?:\s{6}\S.*\n)+)', self.workflow)
+        self.assertIn('      contents: write\n      pull-requests: write\n', write_jobs)
+        self.assertIn('      contents: read\n', write_jobs)
+
+    def test_actions_are_pinned_by_sha(self):
+        uses = re.findall(r'uses:\s*(\S+)', self.workflow)
+        self.assertTrue(uses)
+        for action in uses:
+            self.assertRegex(action, r'^[\w.-]+/[\w./-]+@[0-9a-f]{40}$')
+
+    def test_prepares_validates_and_dry_builds_before_opening_the_pr(self):
+        steps = [self.workflow.index(text) for text in (
+            'sdk_release.py prepare --tag', 'sdk_release.py validate', 'sdk_release.py build --tag',
+            'gh pr create')]
+        self.assertEqual(steps, sorted(steps))
+        self.assertIn('chore(release): prepare SDKs for ${TARGET}', self.workflow)
+        self.assertIn('git commit -q -s -F -', self.workflow)
+        self.assertIn('release/v*', self.workflow)
+
+    def test_release_script_refuses_unprepared_sdks(self):
+        script = (release.ROOT / 'scripts/release.sh').read_text()
+        self.assertIn('python3 scripts/sdk_release.py prepare --tag "v${VERSION}" --check', script)
+        self.assertLess(script.index('prepare --tag "v${VERSION}" --check'), script.index('git tag -a'))
 
 
 if __name__ == '__main__':

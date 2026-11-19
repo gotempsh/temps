@@ -50,6 +50,20 @@ fi
 # Verify explicitly prepared SDK versions before preparing the server release.
 python3 scripts/sdk_release.py plan --tag "v${VERSION}" || exit 1
 
+# SDKs that changed since their last release publish with this tag only once
+# the SDK Release Prep workflow's PR (pushing release/v${VERSION} starts it)
+# is merged. --check changes nothing; it fails while files would change.
+if ! python3 scripts/sdk_release.py prepare --tag "v${VERSION}" --check > /dev/null; then
+    echo -e "${YELLOW}SDK releases for v${VERSION} are not prepared (see above).${NC}"
+    echo -e "${YELLOW}Run the SDK Release Prep workflow for v${VERSION} and merge its PR first, or continue without publishing those SDK changes.${NC}"
+    echo -e "${YELLOW}Continue without them? (y/N)${NC}"
+    read -r CONTINUE
+    if [ "$CONTINUE" != "y" ] && [ "$CONTINUE" != "Y" ]; then
+        echo "Aborted"
+        exit 1
+    fi
+fi
+
 # Run tests
 echo -e "${GREEN}Running tests...${NC}"
 if ! cargo test --workspace --lib; then

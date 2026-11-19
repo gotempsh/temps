@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import tarfile
 import time
 import tempfile
@@ -52,6 +53,14 @@ def manifest(package, root=ROOT):
     return tomllib.loads((path / file).read_text())[field]
 
 
+# Protocol before the Rust SDK, analytics core before its consumers.
+PUBLISH_FIRST = ('analytics-core', 'temps-plugin-protocol')
+
+
+def publish_order(key):
+    return (key not in PUBLISH_FIRST, key)
+
+
 def package_tag(key, package, version):
     return f"{package['path']}/v{version}" if package['kind'] == 'go' else f'sdk/{key}/v{version}'
 
@@ -67,7 +76,7 @@ def catalog_packages(root=ROOT):
         packages.append(dict(package, key=key, version=version,
                              channel=channel(version, package['kind']),
                              tag=package_tag(key, package, version)))
-    return sorted(packages, key=lambda p: (p['key'] not in ('analytics-core', 'temps-plugin-protocol'), p['key']))
+    return sorted(packages, key=lambda p: publish_order(p['key']))
 
 
 def validate(root=ROOT):
@@ -116,9 +125,7 @@ def plan(tag, root=ROOT):
             raise ValueError('Go v2+ requires a new /v2 module path and catalog entry')
         result.append(dict(package, key=key, version=version, channel=expected_channel,
                            tag=package_tag(key, package, version)))
-    # Protocol before the Rust SDK, analytics core before its consumers.
-    priority = {'temps-plugin-protocol': 0, 'analytics-core': 0}
-    return sorted(result, key=lambda p: (priority.get(p['key'], 1), p['key']))
+    return sorted(result, key=lambda p: publish_order(p['key']))
 
 
 def notes(packages):
@@ -232,15 +239,16 @@ def build(packages, output):
     (output / 'sha256.json').write_text(json.dumps(inventory, sort_keys=True) + '\n')
 
 
-def registry_json(url):
+def registry_json(url, parse=json.load, missing=(404,)):
+    """Fetch registry metadata; only the listed statuses mean "does not exist"."""
     request = urllib.request.Request(url, headers={'User-Agent': 'temps-sdk-release (https://github.com/gotempsh/temps)'})
     for attempt in range(3):
         try:
             with urllib.request.urlopen(request, timeout=30) as response:
-                return json.load(response)
+                return parse(response)
         except urllib.error.HTTPError as error:
             error.close()
-            if error.code == 404:
+            if error.code in missing:
                 return None
             if error.code not in (429, 500, 502, 503, 504) or attempt == 2:
                 raise
@@ -435,16 +443,47 @@ def verify_artifact_plan(output, packages, revision):
         raise ValueError('Artifact inventory/checksums differ from tested packages')
 
 
+def prepare_command(args, parser):
+    import sdk_prepare
+    if not args.tag:
+        parser.error('--tag is required for prepare')
+    try:
+        report, files = sdk_prepare.prepare(args.tag, write=not args.check)
+    except ValueError as error:
+        parser.exit(2, f'error: {error}\n')
+    text = sdk_prepare.summary(args.tag, report)
+    print(text, flush=True)
+    if args.summary:
+        args.summary.write_text(text)
+    if args.changed_files:
+        args.changed_files.write_text(''.join(path + '\n' for path in files))
+    if file := os.environ.get('GITHUB_OUTPUT'):
+        with open(file, 'a') as stream:
+            stream.write(f'selected={str(bool(report)).lower()}\n')
+            stream.write(f"kinds={json.dumps(sorted({entry['kind'] for entry in report}))}\n")
+            stream.write(f'changed={str(bool(files)).lower()}\n')
+    if args.check and files:
+        print(f'SDK releases for {args.tag} are not prepared; these files would change: ' + ', '.join(files),
+              file=sys.stderr)
+        sys.exit(1)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=['plan', 'notes', 'build', 'check', 'publish', 'publish-tags', 'check-tags', 'validate', 'verify'])
+    parser.add_argument('command', choices=['plan', 'notes', 'build', 'check', 'publish', 'publish-tags', 'check-tags', 'validate', 'verify', 'prepare'])
     parser.add_argument('--tag')
     parser.add_argument('--all', action='store_true', help='Build all current SDKs for validation only')
     parser.add_argument('--output', type=Path, default=Path('sdk-artifacts'))
     parser.add_argument('--kind', choices=['npm', 'pypi', 'crate', 'go'])
+    parser.add_argument('--check', action='store_true', help='prepare: change nothing; exit 1 when files would change')
+    parser.add_argument('--summary', type=Path, help='prepare: write the per-package changelog table here')
+    parser.add_argument('--changed-files', type=Path, help='prepare: write the changed paths here, one per line')
     args = parser.parse_args()
     if args.command == 'validate':
         validate()
+        return
+    if args.command == 'prepare':
+        prepare_command(args, parser)
         return
     if args.all and args.command != 'build':
         parser.error('--all is only allowed for build')
