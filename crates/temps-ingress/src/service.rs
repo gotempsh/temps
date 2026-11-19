@@ -11,8 +11,8 @@ use std::time::Duration;
 use chrono::Utc;
 use sea_orm::sea_query::Expr;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait,
-    PaginatorTrait, QueryFilter, QueryOrder, Set, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, DatabaseTransaction,
+    EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use temps_core::secret_string::SecretString;
@@ -888,6 +888,24 @@ impl IngressConnectorService {
     }
 
     /// The tunnel `id`. A credential row is not one.
+    /// Read connector `id` for a read-modify-write of its row, locked
+    /// (`FOR UPDATE`) until `txn` ends. The in-process `settings_lock` only
+    /// orders writers of one service instance; `temps serve` runs a second
+    /// one for the control plane's connectors (ADR-107 D2), so the row lock
+    /// is what keeps their token-holder and status updates from overwriting
+    /// each other.
+    async fn find_for_update(
+        txn: &DatabaseTransaction,
+        id: i32,
+    ) -> Result<ingress_connectors::Model, IngressError> {
+        ingress_connectors::Entity::find_by_id(id)
+            .lock_exclusive()
+            .one(txn)
+            .await?
+            .filter(|m| !crate::registry::is_credential_kind(&m.provider))
+            .ok_or(IngressError::NotFound(id))
+    }
+
     async fn find(&self, id: i32) -> Result<ingress_connectors::Model, IngressError> {
         ingress_connectors::Entity::find_by_id(id)
             .one(self.db.as_ref())
@@ -1458,7 +1476,8 @@ impl IngressConnectorService {
         // Under the lock `ensure` and the secret rotation write the row
         // with, so neither can put back a status read before this.
         let _guard = self.settings_lock.lock().await;
-        let connector = self.find(id).await?;
+        let txn = self.db.begin().await?;
+        let connector = Self::find_for_update(&txn, id).await?;
         if connector.name != name {
             return Err(IngressError::Validation(format!(
                 "Connector {id} is `{}` now, not `{name}`; nothing was removed.",
@@ -1476,8 +1495,9 @@ impl IngressConnectorService {
                     Expr::value(Utc::now()),
                 )
                 .filter(ingress_connectors::Column::Id.eq(id))
-                .exec(self.db.as_ref())
+                .exec(&txn)
                 .await?;
+            txn.commit().await?;
             info!(connector_id = id, "ingress connector marked deleting");
             // A connector being removed is no longer in node 0's specs:
             // stop it there now rather than at the next poll.
@@ -1708,11 +1728,12 @@ impl IngressConnectorService {
         // Settings the service owns may have changed while the provider was
         // called (token holders); keep the stored ones.
         let _guard = self.settings_lock.lock().await;
-        let current = self
-            .find(connector.id)
+        let txn = self.db.begin().await?;
+        let current = Self::find_for_update(&txn, connector.id)
             .await
             .unwrap_or_else(|_| connector.clone());
         if is_deleting(&current) {
+            drop(txn);
             // Removed meanwhile: nothing it made is kept.
             if let Ok(handle) = &outcome {
                 if let Ok(provider) = self.provider_for(&connector).await {
@@ -1735,7 +1756,6 @@ impl IngressConnectorService {
                 row.secret_encrypted = Set(Some(secret));
                 row.status = Set("ready".into());
                 row.last_error = Set(None);
-                let txn = self.db.begin().await?;
                 row.update(&txn).await?;
                 if replaced {
                     // Every record points at the tunnel that is gone. Marked
@@ -1766,7 +1786,8 @@ impl IngressConnectorService {
             Err(error) => {
                 row.status = Set("error".into());
                 row.last_error = Set(Some(error.to_string()));
-                row.update(self.db.as_ref()).await?;
+                row.update(&txn).await?;
+                txn.commit().await?;
                 Err(error)
             }
         }
@@ -1805,7 +1826,8 @@ impl IngressConnectorService {
         secret: Option<String>,
     ) -> Result<(), IngressError> {
         let _guard = self.settings_lock.lock().await;
-        let connector = self.find(connector_id).await?;
+        let txn = self.db.begin().await?;
+        let connector = Self::find_for_update(&txn, connector_id).await?;
         let stored = token_holders(&connector.settings);
         let holders = change(stored.clone());
         if secret.is_none() && stored.as_ref() == Some(&holders) {
@@ -1832,7 +1854,8 @@ impl IngressConnectorService {
             row.status = Set("ready".into());
             row.last_error = Set(None);
         }
-        row.update(self.db.as_ref()).await?;
+        row.update(&txn).await?;
+        txn.commit().await?;
         Ok(())
     }
 
@@ -4121,6 +4144,54 @@ mod tests {
                 .last_error
                 .as_deref()
                 .is_some_and(|e| e.contains("port 8443")));
+            drop(test_db);
+        }
+
+        /// The console's service and the one `temps serve` runs node 0's
+        /// connectors with record token holders on the same row: neither
+        /// may overwrite the other's (a lost holder is never revoked).
+        #[tokio::test]
+        async fn two_service_instances_never_lose_each_others_token_holders() {
+            let Some((test_db, first, _calls, id)) = setup_with(None).await else {
+                return;
+            };
+            let db = test_db.connection_arc();
+            let encryption =
+                Arc::new(EncryptionService::new("0123456789abcdef0123456789abcdef").expect("key"));
+            let providers = Arc::new(DnsProviderService::new(db.clone(), encryption.clone()));
+            let second = Arc::new(IngressConnectorService::new(
+                db.clone(),
+                encryption.clone(),
+                providers.clone(),
+                Arc::new(ManagedDnsRecordService::new(
+                    db.clone(),
+                    providers,
+                    encryption,
+                )),
+                Arc::new(CachedPeerTable::new(db.clone())),
+            ));
+            let mut writes = tokio::task::JoinSet::new();
+            for node in 1..=24 {
+                let service = if node % 2 == 0 {
+                    first.clone()
+                } else {
+                    second.clone()
+                };
+                writes.spawn(async move {
+                    service
+                        .add_token_holders(id, &BTreeSet::from([node]))
+                        .await
+                        .expect("holder recorded");
+                });
+            }
+            while let Some(done) = writes.join_next().await {
+                done.expect("writer");
+            }
+            let row = first.find(id).await.expect("connector");
+            assert_eq!(
+                token_holders(&row.settings),
+                Some((1..=24).collect::<BTreeSet<i32>>())
+            );
             drop(test_db);
         }
 
