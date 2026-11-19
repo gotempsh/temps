@@ -364,6 +364,12 @@ impl From<DomainServiceError> for Problem {
                     .detail(msg)
                     .build()
             }
+            error @ DomainServiceError::OnDemandBackoffActive { .. } => {
+                ErrorBuilder::new(StatusCode::TOO_MANY_REQUESTS)
+                    .title("On-demand TLS Backing Off")
+                    .detail(error.to_string())
+                    .build()
+            }
             DomainServiceError::OnDemandRateLimited {
                 hostname, detail, ..
             } => ErrorBuilder::new(StatusCode::TOO_MANY_REQUESTS)

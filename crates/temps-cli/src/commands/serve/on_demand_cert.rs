@@ -147,6 +147,11 @@ fn map_provision_error(err: temps_domains::DomainServiceError) -> CertProvisionF
             category: "rate_limited".to_string(),
             backoff_until_epoch: retry_after.map(|d| d.timestamp().max(0) as u64),
         },
+        E::OnDemandBackoffActive { backoff_until, .. } => CertProvisionFailure {
+            error_chain,
+            category: "backoff_active".to_string(),
+            backoff_until_epoch: Some(backoff_until.timestamp().max(0) as u64),
+        },
         E::OnDemandIssuanceFailed {
             category,
             backoff_until,
@@ -797,5 +802,19 @@ mod tests {
         let failure = map_provision_error(err);
         assert_eq!(failure.category, "internal");
         assert_eq!(failure.backoff_until_epoch, None);
+    }
+
+    #[test]
+    fn map_backoff_active_error_holds_the_host_until_the_stored_deadline() {
+        // A refusal because another process's backoff still runs must hand
+        // the proxy that deadline, not let it fall back to the first rung.
+        let until = chrono::DateTime::from_timestamp(4_102_444_800, 0).unwrap();
+        let err = temps_domains::DomainServiceError::OnDemandBackoffActive {
+            hostname: "app.1.2.3.4.sslip.io".to_string(),
+            backoff_until: until,
+        };
+        let failure = map_provision_error(err);
+        assert_eq!(failure.category, "backoff_active");
+        assert_eq!(failure.backoff_until_epoch, Some(4_102_444_800));
     }
 }
