@@ -46,10 +46,17 @@ pub struct Model {
     /// proxy's `certificate_callback` refuses to re-enqueue a job for the same
     /// hostname until this timestamp elapses. `None` means "no active backoff".
     pub on_demand_backoff_until: Option<DBDateTime>,
+    /// On-demand issuance failures in a row, which picks the next rung of the
+    /// backoff ladder. Written in the same update as `on_demand_backoff_until`
+    /// and reset to 0 when a certificate is issued or imported.
+    pub on_demand_failure_streak: i32,
+    /// When the last on-demand failure in the streak happened; a streak older
+    /// than the quiet gap starts over. `None` when there is no streak.
+    pub on_demand_last_failure_at: Option<DBDateTime>,
     /// Why the last certificate attempt failed, as a typed cause
     /// (`unreachable`, `dns_lookup`, `upstream_answered`, `rate_limited`, ...;
     /// `temps_domains::CertFailureCause`). Cleared when a certificate is
-    /// issued or a new order starts. `None` for rows that have not failed
+    /// issued or imported, or a new order starts. `None` for rows that have not failed
     /// since the column was added.
     pub failure_cause: Option<String>,
     pub created_at: DBDateTime,
@@ -73,6 +80,23 @@ impl Related<super::custom_routes::Entity> for Entity {
 impl Related<super::project_custom_domains::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::ProjectCustomDomains.def()
+    }
+}
+
+impl ActiveModel {
+    /// Forget why earlier certificate attempts failed, for a domain that now
+    /// holds a certificate (issued by the CA or imported): the error and its
+    /// typed cause, and the on-demand backoff and failure streak, so a later failure starts the
+    /// ladder from the bottom. Every path that installs a certificate calls
+    /// this, so a new failure field cannot be cleared on one and missed on
+    /// another.
+    pub fn clear_certificate_failure(&mut self) {
+        self.last_error = Set(None);
+        self.last_error_type = Set(None);
+        self.on_demand_backoff_until = Set(None);
+        self.on_demand_failure_streak = Set(0);
+        self.on_demand_last_failure_at = Set(None);
+        self.failure_cause = Set(None);
     }
 }
 
@@ -123,6 +147,8 @@ mod tests {
             is_wildcard: false,
             verification_method: "http-01".to_string(),
             on_demand_backoff_until: None,
+            on_demand_failure_streak: 0,
+            on_demand_last_failure_at: None,
             failure_cause: None,
             created_at: now,
             updated_at: now,
@@ -132,5 +158,48 @@ mod tests {
 
         assert!(!json.contains("stored-private-key"), "{json}");
         assert!(json.contains("app.example.com"), "{json}");
+    }
+
+    #[test]
+    fn clearing_certificate_failure_resets_the_error_its_cause_and_the_on_demand_streak() {
+        let now = chrono::Utc::now();
+        let failed = Model {
+            id: 7,
+            domain: "failed.example.com".to_string(),
+            certificate: None,
+            private_key: None,
+            expiration_time: None,
+            last_renewed: None,
+            status: "on_demand_failed".to_string(),
+            dns_challenge_token: None,
+            dns_challenge_value: None,
+            http_challenge_token: None,
+            http_challenge_key_authorization: None,
+            last_error: Some("connection refused".to_string()),
+            last_error_type: Some("challenge_mismatch".to_string()),
+            is_wildcard: false,
+            verification_method: "http-01".to_string(),
+            on_demand_backoff_until: Some(now + chrono::Duration::hours(4)),
+            on_demand_failure_streak: 4,
+            on_demand_last_failure_at: Some(now),
+            failure_cause: Some("unreachable".to_string()),
+            created_at: now,
+            updated_at: now,
+        };
+
+        let mut active: ActiveModel = failed.into();
+        active.clear_certificate_failure();
+
+        assert_eq!(active.last_error, Set(None));
+        assert_eq!(active.last_error_type, Set(None));
+        assert_eq!(active.on_demand_backoff_until, Set(None));
+        assert_eq!(active.on_demand_failure_streak, Set(0));
+        assert_eq!(active.on_demand_last_failure_at, Set(None));
+        assert_eq!(active.failure_cause, Set(None));
+        // Only failure state: the status and the rest are the caller's.
+        assert_eq!(
+            active.status,
+            sea_orm::ActiveValue::Unchanged("on_demand_failed".to_string())
+        );
     }
 }

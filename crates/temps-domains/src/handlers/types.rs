@@ -611,6 +611,8 @@ mod failure_cause_response_tests {
             is_wildcard: false,
             verification_method: "http-01".to_string(),
             on_demand_backoff_until: None,
+            on_demand_failure_streak: 0,
+            on_demand_last_failure_at: None,
             failure_cause: failure_cause.map(str::to_string),
             created_at: now,
             updated_at: now,
