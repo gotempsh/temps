@@ -20,6 +20,7 @@ import {
 import { performanceInsights } from './performance.js'
 import { enrichVisitorAction } from './enrich.js'
 import { registerAnalyticsKeysCommands } from './keys.js'
+import { registerAnalyticsConversionsCommands } from './conversions.js'
 import { fileDownloads, notFound, outboundLinks } from './auto-events.js'
 
 function collect(value: string, previous: string[]): string[] {
@@ -33,6 +34,7 @@ export function registerAnalyticsCommands(program: Command): void {
     .description('View project analytics')
 
   registerAnalyticsKeysCommands(analytics)
+  registerAnalyticsConversionsCommands(analytics)
 
   analytics
     .command('overview')
@@ -436,6 +438,12 @@ Examples:
   $ temps analytics enrich enc_AbC123 --data '{"user_id":"user_123","email":"ada@example.com"}'
   $ temps analytics enrich 4821 --set plan=pro --set segment=enterprise
   $ temps analytics enrich enc_AbC123 --unset trial_ends_at --json
+
+  Conversions (events or pages that count as success):
+  $ temps analytics conversions list -p my-site --period 30d
+  $ temps analytics conversions create -p my-site --name Signup --event signup
+  $ temps analytics conversions create -p my-site --name Purchase --event purchase --revenue-property amount --currency EUR
+  $ temps analytics conversions breakdown -p my-site --goal-id 3 --by channel
 
   Ingest keys (for apps Temps does not deploy):
   $ temps analytics keys list   --project-id 7

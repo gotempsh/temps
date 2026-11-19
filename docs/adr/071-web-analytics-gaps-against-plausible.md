@@ -2,8 +2,9 @@
 
 ## Status
 
-Proposed — 2026-11-19. D1 is implemented; what it settled is recorded
-under "Settled while implementing D1". D2 to D9 are not started.
+Proposed — 2026-11-19. D1 and D2 are implemented; what they settled is
+recorded under "Settled while implementing D1" and "... D2". D3 to D9 are
+not started.
 
 Related: ADR 012 (ClickHouse analytics backend), ADR 040 (analytics ingest
 keys), ADR 072 (product analytics gaps against PostHog; D2 here is the goal
@@ -26,7 +27,7 @@ Temps today keeps most of the dashboard.
 |---|---|---|
 | Visitors, sessions, page views, bounce rate, live visitors | `crates/temps-analytics` | Yes |
 | Breakdowns: pages, referrers, channels, UTM, country/region/city, browser, OS, device, language | `web/src/components/analytics/overview/` | Yes |
-| Dashboard filters by dimension, period comparison | `filter_*` fields in `crates/temps-analytics/src/types/requests.rs` | Yes |
+| Drill-downs by dimension, period comparison | `filter_*` fields in `crates/temps-analytics/src/types/requests.rs` (visitors list), the channel card's drill-down | Partly. There is no filter that applies to the whole overview; the `filter_*` fields segment the visitors list |
 | Custom events | `/projects/{project_id}/events/*` in `crates/temps-analytics-events`, `/analytics/event-*` in `crates/temps-analytics` | Yes. Breakdowns were over fixed columns only (`PropertyColumn`); a breakdown by a custom property came with D1 (`GET /analytics/event-properties`) |
 | Funnels | `crates/temps-analytics-funnels` | Yes |
 | Engagement time (heartbeat, page leave) | `sdks/node/packages/analytics-core/src/EngagementTracker.ts` | Yes |
@@ -315,6 +316,53 @@ they come last.
 - **Where it shows.** Three cards in the overview's Events tab, each with an
   explanation and a link to the tracker setup while empty; CLI
   `temps analytics outbound | downloads | not-found`.
+
+## Settled while implementing D2
+
+- **Where the code lives.** `crates/temps-analytics-funnels/src/goals/`,
+  next to the funnels whose filter type (`SmartFilter`) a goal reuses. The
+  table is `analytics_goals`; the API types are `AnalyticsGoal*` and the
+  routes `/projects/{project_id}/analytics/goals`, because the AI chat
+  already owns `list_goals` and the generated `listGoals`.
+- **The shape other features read.** `AnalyticsGoal` is flat: `id`,
+  `project_id`, `name`, `kind` (`event` or `page`), `event_name`,
+  `event_filter` (array of `SmartFilter`), `page_path`, `revenue_property`,
+  `revenue_currency`. `AnalyticsGoalService::stats(project_id, start, end,
+  environment_id)` returns per goal `unique_conversions`,
+  `total_conversions`, `conversion_rate` and an optional revenue total and
+  average. ADR 072 experiments can store a goal id and call that.
+- **Matching.** Read time, never on the ingest path, so a new goal covers
+  history and costs nothing per event. An event goal matches
+  `COALESCE(event_name, event_type)`, as funnel steps do. A page goal
+  matches page views by `pathname`, exactly, or with `*` as the only
+  wildcard. All goals of a project are counted in one scan of `events`
+  (each row joins the goals it matches through a lateral `UNION ALL`);
+  at most 50 goals per project bound that query. Crawlers never convert.
+- **Conversion rate.** Converting visitors over distinct visitors with a
+  page view in the period, the overview's visitor count. It is capped at
+  100%, since a visitor can convert in the period without a page view in it.
+- **Revenue.** A numeric event property and an ISO 4217 code per goal,
+  event goals only. A value that is missing or not a plain decimal adds
+  nothing but still counts as a conversion, so one malformed event cannot
+  fail the report. Totals are returned as floating point, which is enough
+  for a report and not meant for accounting.
+- **"A goal is a dashboard filter like any dimension."** The overview has
+  no filter that applies to every card (the context table above was wrong
+  about that), so there was nothing to plug a goal into. The question the
+  filter answers, "sources of the visitors who converted", is a breakdown of
+  one goal instead: channel, referrer, UTM source, medium and campaign,
+  page, country, device, browser, operating system, each with visitors,
+  conversions, rate and revenue. Source dimensions are the visitor's first
+  touch, as the visitors list's segment filters are. A filter across the
+  whole overview, for goals and for every other dimension, is left for when
+  the overview gets one.
+- **Where it shows.** A Conversions card on the overview under the visitor
+  chart, with a definition dialog (event or page, an optional property
+  filter, optional revenue), edit and delete, and the breakdown. Without
+  goals the card stays, explains what a conversion is, and offers to define
+  one. CLI `temps analytics conversions list | create | update | delete |
+  breakdown`. Writes are audit-logged (`ANALYTICS_GOAL_CREATED`,
+  `_UPDATED`, `_DELETED`).
 
 ## Not doing
 

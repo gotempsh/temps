@@ -572,6 +572,74 @@ Set performance budgets and get alerts when exceeded:
 
 ---
 
+## Conversions {{ anchor: true, id: 'conversions' }}
+
+A conversion is something a visitor does that counts as success: an event such as `signup` or `purchase`, or a visit to a page such as `/thank-you`. Define it once and the overview shows how many visitors reach it, the conversion rate, the revenue it carried, and where those visitors came from.
+
+Conversions are read from the events you already record. Defining one needs no change to your site, and it covers your whole history straight away; deleting one deletes no events.
+
+<Properties>
+  <Property name="Event conversion">
+    Matches an event by name, built-in or custom: `signup`, `purchase`, `file_download`, `outbound_click`. It can be narrowed to events whose property has a given value, for example `plan` equal to `pro`.
+  </Property>
+  <Property name="Page conversion">
+    Matches page views by path. `*` matches any run of characters: `/thank-you` matches that page only, `/docs/*` every page under `/docs/`.
+  </Property>
+  <Property name="Revenue">
+    An event conversion can name a numeric property and a currency, for example `track('purchase', { amount: 49 })` with property `amount` and currency `EUR`. Each conversion then contributes its amount; events whose property is missing or not a plain number still count as conversions but add no revenue.
+  </Property>
+</Properties>
+
+### What the report shows
+
+In the project's **Analytics** overview, the **Conversions** card lists every conversion for the selected period and environment:
+
+- **Visitors**: distinct visitors who converted at least once.
+- **Total**: matching events; a visitor who buys twice counts twice.
+- **Rate**: converting visitors as a share of all visitors with a page view in the period, the visitor count of the overview.
+- **Revenue**: the sum of the revenue property, when the conversion has one.
+
+Select a conversion to see who converted, grouped by channel, referrer, UTM source, medium or campaign, the page it happened on, country, device, browser or operating system. Each row shows the visitors with that value, how many converted, the rate and the revenue. Channel, referrer and UTM values are the visitor's **first touch**: how they first arrived, as in the visitors list. Crawlers are never counted.
+
+A project can define up to 50 conversions. Names are unique within a project, ignoring case.
+
+### From the CLI
+
+```bash {{ title: 'CLI' }}
+bunx @temps-sdk/cli analytics conversions create --name Signup --event signup
+bunx @temps-sdk/cli analytics conversions create --name "Thank you" --page /thank-you
+bunx @temps-sdk/cli analytics conversions create --name Purchase --event purchase \
+  --revenue-property amount --currency EUR
+bunx @temps-sdk/cli analytics conversions list --period 30d
+bunx @temps-sdk/cli analytics conversions breakdown --goal-id 3 --by utm-source
+```
+
+### From the API
+
+```bash {{ title: 'Define a conversion' }}
+curl -X POST "$TEMPS_API_URL/projects/1/analytics/goals" \
+  -H "Authorization: Bearer $TEMPS_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Pro signup",
+    "kind": "event",
+    "event_name": "signup",
+    "event_filter": [{ "type": "custom_data", "value": { "path": "plan", "value": "pro" } }]
+  }'
+```
+
+| Method | Path | What it does |
+|---|---|---|
+| `GET` | `/projects/{project_id}/analytics/goals` | List conversions, newest first (`page`, `page_size`) |
+| `POST` | `/projects/{project_id}/analytics/goals` | Define one |
+| `GET`, `PUT`, `DELETE` | `/projects/{project_id}/analytics/goals/{goal_id}` | Read, replace or delete one |
+| `GET` | `/projects/{project_id}/analytics/goals/stats` | Visitors, conversions, rate and revenue of every conversion (`start_date`, `end_date`, `environment_id`) |
+| `GET` | `/projects/{project_id}/analytics/goals/{goal_id}/breakdown` | One conversion by `dimension`: `channel`, `referrer`, `utm_source`, `utm_medium`, `utm_campaign`, `page`, `country`, `device_type`, `browser`, `operating_system` |
+
+Reading needs `analytics:read`; defining, changing and deleting need `analytics:write` and are recorded in the audit log. `event_filter` uses the same filters as funnel steps. The API calls these *goals*; the console calls them conversions so they are not confused with the goals of the AI activity report.
+
+---
+
 ## Funnel Analysis {{ anchor: true, id: 'funnel-analysis' }}
 
 Track multi-step conversion funnels to optimize user flows.

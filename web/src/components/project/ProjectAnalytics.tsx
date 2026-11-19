@@ -15,6 +15,7 @@ import {
   NotFoundCard,
   OutboundLinksCard,
 } from '@/components/analytics/overview/AutoEventsCards'
+import { ConversionsCard } from '@/components/analytics/overview/ConversionsCard'
 
 import { DateTimeRange } from '@/components/ui/date-time-range'
 
@@ -1382,6 +1383,12 @@ export function ProjectAnalyticsOverview({
               />
             )}
           </div>
+          <ConversionsCard
+            project={project}
+            startDate={startDate}
+            endDate={endDate}
+            environment={selectedEnvironment}
+          />
           <AnalyticsBreakdowns
             traffic={
               <div className="grid min-w-0 grid-cols-1 gap-4 md:grid-cols-2">
