@@ -756,6 +756,13 @@ pub const AI_READ_ALLOWLIST: &[&str] = &[
     "list_sandboxes",
     // Sandbox event list — lifecycle events (created, started, stopped).
     "list_events",
+    // A sandbox create's ordered steps (status, timings, image download
+    // bytes, the failed step's reason) and each host's sandbox image state:
+    // what the assistant needs to answer "why is my sandbox slow to start".
+    // Image references, host names and error reasons; no credential.
+    "get_sandbox_creation",
+    "get_sandbox_creation_by_sandbox",
+    "get_sandbox_image_preparation",
     // ── Coverage audit: reads added after a DTO review (masked or no secrets) ──
     // Projects and deployments
     "get_cloudflare_project_capability",

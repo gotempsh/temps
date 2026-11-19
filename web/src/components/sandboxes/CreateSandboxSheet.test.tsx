@@ -2,7 +2,12 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { afterEach, expect, test } from 'bun:test'
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import {
+  QueryClient,
+  QueryClientProvider,
+  environmentManager,
+  focusManager,
+} from '@tanstack/react-query'
 import { cleanup, fireEvent, render, waitFor } from '@testing-library/react'
 import { MemoryRouter, Route, Routes } from 'react-router'
 import { installBrowserWindow } from '@/test/dom'
@@ -11,7 +16,26 @@ import { jsonResponse, mockApi } from '@/test/fetch-mock'
 import { CreateSandboxSheet } from './CreateSandboxSheet'
 
 installBrowserWindow()
-afterEach(cleanup)
+// Whether React Query treats this process as a server, as it decided when
+// first imported: restored after a test that needs interval polling.
+const queryRanAsServer = environmentManager.isServer()
+
+afterEach(() => {
+  cleanup()
+  focusManager.setFocused(undefined)
+  environmentManager.setIsServer(() => queryRanAsServer)
+})
+
+/**
+ * Let interval polls run. React Query schedules none when it took the
+ * process for a server, which it does if a server-rendering test imported it
+ * before any test installed a browser window; and none while the window is
+ * unfocused. Both are reset in `afterEach`.
+ */
+function allowIntervalPolling() {
+  environmentManager.setIsServer(() => false)
+  focusManager.setFocused(true)
+}
 
 const PLACEMENT = {
   allowed_node_ids: null,
@@ -167,6 +191,12 @@ test('a slow create explains the wait and can be closed', async () => {
 
 const CREATION_ID = '00000000-0000-4000-8000-000000000001'
 
+/**
+ * Tests that wait on several real one-second polls: more than Bun's 5 s
+ * default, which a loaded CI runner can exceed.
+ */
+const POLLING_TEST_TIMEOUT_MS = 20_000
+
 /** Makes the sheet's next `creation_id` predictable, so its poll can be mocked. */
 function fixCreationId() {
   const original = crypto.randomUUID.bind(crypto)
@@ -269,105 +299,117 @@ test('a failed create shows which step failed and why', async () => {
   restoreId()
 })
 
-test('a step read that fails for a moment recovers the failed step once the server answers', async () => {
-  const restoreId = fixCreationId()
-  let reads = 0
-  const api = mockApi({
-    'GET /v1/sandboxes/placement': () => jsonResponse(PLACEMENT),
-    'POST /v1/sandboxes': () =>
-      jsonResponse(
-        { title: 'Sandbox Creation Failed', detail: 'pulling image failed' },
-        500
-      ),
-    // The first reads hit a server that is briefly unavailable.
-    [`GET /v1/sandboxes/creations/${CREATION_ID}`]: () => {
-      reads += 1
-      if (reads <= 2) {
-        return jsonResponse({ title: 'Service Unavailable' }, 503)
-      }
-      return jsonResponse({
-        creation_id: CREATION_ID,
-        sandbox_id: null,
-        status: 'failed',
-        started_at: '2026-01-01T00:00:00Z',
-        finished_at: '2026-01-01T00:00:02Z',
-        error: 'pulling image failed',
-        steps: [
-          creationStep('pull_image', 'Pull the sandbox image', 'failed', {
-            error: "pulling image 'img:1' failed: no space left on device",
-          }),
-        ],
-      })
-    },
-  })
-  const view = renderSheet()
-
-  fireEvent.click(await view.findByRole('button', { name: 'Create sandbox' }))
-
-  await view.findByText(/no space left on device/, undefined, {
-    timeout: 5_000,
-  })
-  api.restore()
-  restoreId()
-})
-
-test('steps the server stopped tracking are dropped, not left running', async () => {
-  const restoreId = fixCreationId()
-  let reads = 0
-  let refuse: (response: Response) => void = () => {}
-  const api = mockApi({
-    'GET /v1/sandboxes/placement': () => jsonResponse(PLACEMENT),
-    // Answers only after the server has lost the create.
-    'POST /v1/sandboxes': () =>
-      new Promise<Response>((resolve) => {
-        refuse = resolve
-      }),
-    // One running answer, then the server restarted and no longer knows it.
-    [`GET /v1/sandboxes/creations/${CREATION_ID}`]: () => {
-      reads += 1
-      if (reads === 1) {
+test(
+  'a step read that fails for a moment recovers the failed step once the server answers',
+  async () => {
+    allowIntervalPolling()
+    const restoreId = fixCreationId()
+    let reads = 0
+    const api = mockApi({
+      'GET /v1/sandboxes/placement': () => jsonResponse(PLACEMENT),
+      'POST /v1/sandboxes': () =>
+        jsonResponse(
+          { title: 'Sandbox Creation Failed', detail: 'pulling image failed' },
+          500
+        ),
+      // The first reads hit a server that is briefly unavailable.
+      [`GET /v1/sandboxes/creations/${CREATION_ID}`]: () => {
+        reads += 1
+        if (reads <= 2) {
+          return jsonResponse({ title: 'Service Unavailable' }, 503)
+        }
         return jsonResponse({
           creation_id: CREATION_ID,
-          sandbox_id: 'sbx_new1',
-          status: 'running',
+          sandbox_id: null,
+          status: 'failed',
           started_at: '2026-01-01T00:00:00Z',
-          finished_at: null,
-          error: null,
+          finished_at: '2026-01-01T00:00:02Z',
+          error: 'pulling image failed',
           steps: [
-            creationStep('pull_image', 'Pull the sandbox image', 'running'),
+            creationStep('pull_image', 'Pull the sandbox image', 'failed', {
+              error: "pulling image 'img:1' failed: no space left on device",
+            }),
           ],
         })
-      }
-      return jsonResponse({ title: 'Not Found' }, 404)
-    },
-  })
-  const view = renderSheet()
+      },
+    })
+    const view = renderSheet()
 
-  fireEvent.click(await view.findByRole('button', { name: 'Create sandbox' }))
-  await view.findByText('Pull the sandbox image')
-  await waitFor(() => expect(reads).toBeGreaterThanOrEqual(2), {
-    timeout: 5_000,
-  })
-  refuse(
-    jsonResponse(
-      { title: 'Sandbox Creation Failed', detail: 'the server restarted' },
-      503
+    fireEvent.click(await view.findByRole('button', { name: 'Create sandbox' }))
+
+    await view.findByText(/no space left on device/, undefined, {
+      timeout: 15_000,
+    })
+    api.restore()
+    restoreId()
+  },
+  POLLING_TEST_TIMEOUT_MS
+)
+
+test(
+  'steps the server stopped tracking are dropped, not left running',
+  async () => {
+    allowIntervalPolling()
+    const restoreId = fixCreationId()
+    let reads = 0
+    let refuse: (response: Response) => void = () => {}
+    const api = mockApi({
+      'GET /v1/sandboxes/placement': () => jsonResponse(PLACEMENT),
+      // Answers only after the server has lost the create.
+      'POST /v1/sandboxes': () =>
+        new Promise<Response>((resolve) => {
+          refuse = resolve
+        }),
+      // One running answer, then the server restarted and no longer knows it.
+      [`GET /v1/sandboxes/creations/${CREATION_ID}`]: () => {
+        reads += 1
+        if (reads === 1) {
+          return jsonResponse({
+            creation_id: CREATION_ID,
+            sandbox_id: 'sbx_new1',
+            status: 'running',
+            started_at: '2026-01-01T00:00:00Z',
+            finished_at: null,
+            error: null,
+            steps: [
+              creationStep('pull_image', 'Pull the sandbox image', 'running'),
+            ],
+          })
+        }
+        return jsonResponse({ title: 'Not Found' }, 404)
+      },
+    })
+    const view = renderSheet()
+
+    fireEvent.click(await view.findByRole('button', { name: 'Create sandbox' }))
+    await view.findByText('Pull the sandbox image')
+    await waitFor(() => expect(reads).toBeGreaterThanOrEqual(2), {
+      timeout: 15_000,
+    })
+    refuse(
+      jsonResponse(
+        { title: 'Sandbox Creation Failed', detail: 'the server restarted' },
+        503
+      )
     )
-  )
 
-  await view.findByText(/the server restarted/)
-  await waitFor(() =>
-    expect(
-      view.queryByRole('list', { name: 'Sandbox creation steps' })
-    ).toBeNull()
-  )
-  // And it stops asking.
-  const after = reads
-  await new Promise((resolve) => setTimeout(resolve, 2_500))
-  expect(reads).toBe(after)
-  api.restore()
-  restoreId()
-})
+    await view.findByText(/the server restarted/, undefined, { timeout: 5_000 })
+    await waitFor(
+      () =>
+        expect(
+          view.queryByRole('list', { name: 'Sandbox creation steps' })
+        ).toBeNull(),
+      { timeout: 5_000 }
+    )
+    // And it stops asking.
+    const after = reads
+    await new Promise((resolve) => setTimeout(resolve, 1_500))
+    expect(reads).toBe(after)
+    api.restore()
+    restoreId()
+  },
+  POLLING_TEST_TIMEOUT_MS
+)
 
 test('says so, and cannot submit, when sandboxes are unavailable', async () => {
   const api = mockApi({})

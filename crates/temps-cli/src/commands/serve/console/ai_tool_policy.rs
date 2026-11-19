@@ -641,6 +641,10 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        "pulling the multi-gigabyte sandbox image onto hosts, and whether each host keeps it pulled, are administrator decisions about disk and bandwidth made in the console",
+        &["prepare_sandbox_images", "update_host_image_preparation"],
+    ),
+    (
         "the node platform's own platform lifecycle and trust root; operator only",
         &[
             "check_for_update",
