@@ -21,16 +21,17 @@ pub use temps_service_protocol::{
     MariadbDumpBackupRequest, MariadbDumpBackupResult, MariadbPhysicalBackupRequest,
     MariadbPhysicalBackupResult, MariadbRestoreRequest, MariadbRestoreResult, MongodbBackupMode,
     MongodbBackupRequest, MongodbBackupResult, MongodbRestoreRequest, MongodbRestoreResult,
-    PostgresWalgArchiveRequest, PostgresWalgArchiveResult, PostgresWalgBackupOutcomeRequest,
-    PostgresWalgBackupProgress, PostgresWalgBackupRequest, PostgresWalgBackupResult,
-    PostgresWalgCredentialsRequest, PostgresWalgCredentialsResult, PostgresWalgRestoreRequest,
-    PostgresWalgRestoreResult, RecoveryTarget, RedisRdbBackupRequest, RedisRdbBackupResult,
-    RedisRestoreRequest, RedisRestoreResult, RedisWalgBackupRequest, RedisWalgBackupResult,
-    RemoteHealthProbeRequest, RemoteHealthProbeResponse, RemoteRuntimeEnvRequest,
-    RemoteRuntimeEnvResponse, RemoteServiceBackupRequest, RemoteServiceBackupResponse,
-    RemoteServiceRestoreRequest, RemoteServiceRestoreResponse, RemoteWalHealthRequest,
-    RemoteWalHealthResponse, ServiceContainerRuntime, ServiceContainerStats, WorkerRestoreEngine,
-    WorkerRestoreOutcomeRequest, WorkerRestoreProgress, WorkerRestoreResult, WorkerS3Destination,
+    PostgresClusterWalgBackupRequest, PostgresWalgArchiveRequest, PostgresWalgArchiveResult,
+    PostgresWalgBackupOutcomeRequest, PostgresWalgBackupProgress, PostgresWalgBackupRequest,
+    PostgresWalgBackupResult, PostgresWalgCredentialsRequest, PostgresWalgCredentialsResult,
+    PostgresWalgRestoreRequest, PostgresWalgRestoreResult, RecoveryTarget, RedisRdbBackupRequest,
+    RedisRdbBackupResult, RedisRestoreRequest, RedisRestoreResult, RedisWalgBackupRequest,
+    RedisWalgBackupResult, RemoteHealthProbeRequest, RemoteHealthProbeResponse,
+    RemoteRuntimeEnvRequest, RemoteRuntimeEnvResponse, RemoteServiceBackupRequest,
+    RemoteServiceBackupResponse, RemoteServiceRestoreRequest, RemoteServiceRestoreResponse,
+    RemoteWalHealthRequest, RemoteWalHealthResponse, ServiceContainerRuntime,
+    ServiceContainerStats, WorkerRestoreEngine, WorkerRestoreOutcomeRequest, WorkerRestoreProgress,
+    WorkerRestoreResult, WorkerS3Destination,
 };
 
 /// Whether a node's agent has a route this release added. An agent that
@@ -511,6 +512,31 @@ impl RemoteServiceClient {
         );
         self.agent_post_with_timeout(
             "/agent/services/postgres/walg-backup",
+            request,
+            DATA_OPERATION_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Take a WAL-G base backup of a PostgreSQL HA cluster from its primary,
+    /// a data member the remote node runs, with the control plane's own
+    /// cluster engine. The destination's credentials and the login travel
+    /// only in the sealed body; an agent without the route is told to
+    /// update. Its outcome is read with [`Self::postgres_walg_backup_outcome`].
+    pub async fn postgres_cluster_walg_backup(
+        &self,
+        request: &PostgresClusterWalgBackupRequest,
+    ) -> Result<PostgresWalgBackupResult, ExternalServiceError> {
+        info!(
+            service = %request.service,
+            service_id = request.service_id,
+            ordinal = request.ordinal,
+            node = %self.node_name,
+            bucket = %request.destination.bucket,
+            "Taking a WAL-G base backup of a PostgreSQL cluster on its primary's node"
+        );
+        self.agent_post_with_timeout(
+            "/agent/services/postgres/cluster-walg-backup",
             request,
             DATA_OPERATION_TIMEOUT,
         )
@@ -2277,6 +2303,105 @@ mod tests {
         let message = error.to_string();
         assert!(
             message.contains("/agent/services/postgres/walg-backup"),
+            "{message}"
+        );
+        assert!(message.contains("Update the node's agent"), "{message}");
+    }
+
+    /// A cluster's WAL-G base backup reaches its primary's node sealed, with
+    /// the member named by ordinal and the login and destination's
+    /// credentials unreadable on the wire, and the engine's outcome comes
+    /// back as it is. An agent without the route is told to update.
+    #[tokio::test]
+    async fn a_cluster_walg_backup_is_sealed_to_the_primarys_node() {
+        async fn walg(headers: HeaderMap, sealed: axum::body::Bytes) -> Json<serde_json::Value> {
+            for secret in ["db-password", "destination-session"] {
+                assert!(
+                    !String::from_utf8_lossy(&sealed).contains(secret),
+                    "{secret} readable on the wire"
+                );
+            }
+            let request: PostgresClusterWalgBackupRequest = open_for_test(
+                &headers,
+                "/agent/services/postgres/cluster-walg-backup",
+                &sealed,
+            );
+            assert_eq!(request.service_id, 9);
+            assert_eq!(request.service, "orders-ha");
+            assert_eq!(request.ordinal, 3);
+            assert_eq!(request.pg_port, 6013);
+            assert_eq!(request.password, "db-password");
+            Json(serde_json::json!({
+                "success": true,
+                "data": {
+                    "status": "completed",
+                    "restarted": false,
+                    "stdout": "",
+                    "stderr": "INFO: Wrote backup with name base_000000010000000000000005",
+                    "lsn": "0/5000060"
+                },
+                "error": null
+            }))
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/agent/services/postgres/cluster-walg-backup", post(walg)),
+            )
+            .await
+            .unwrap();
+        });
+        let client = |address: std::net::SocketAddr| {
+            RemoteServiceClient::new(
+                format!("http://{address}"),
+                "node-token".to_string(),
+                "worker-3".to_string(),
+            )
+            .unwrap()
+            .with_sealing(test_sealing())
+        };
+        let request = PostgresClusterWalgBackupRequest {
+            service_id: 9,
+            service: "orders-ha".to_string(),
+            ordinal: 3,
+            pg_port: 6013,
+            username: "app".to_string(),
+            password: "db-password".to_string(),
+            database: "appdb".to_string(),
+            destination: worker_destination(),
+            bucket_path: "base".to_string(),
+            backup_uuid: "u-5".to_string(),
+        };
+        let outcome = client(address)
+            .postgres_cluster_walg_backup(&request)
+            .await
+            .unwrap();
+        server.abort();
+        assert_eq!(
+            outcome,
+            PostgresWalgBackupResult::Completed {
+                restarted: false,
+                stdout: String::new(),
+                stderr: "INFO: Wrote backup with name base_000000010000000000000005".to_string(),
+                lsn: Some("0/5000060".to_string()),
+            }
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let older = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, Router::new()).await.unwrap();
+        });
+        let error = client(older)
+            .postgres_cluster_walg_backup(&request)
+            .await
+            .expect_err("an older agent cannot take a cluster WAL-G backup");
+        server.abort();
+        let message = error.to_string();
+        assert!(
+            message.contains("/agent/services/postgres/cluster-walg-backup"),
             "{message}"
         );
         assert!(message.contains("Update the node's agent"), "{message}");
