@@ -9,8 +9,9 @@
 use std::sync::Arc;
 
 use axum::{
+    body::Bytes,
     extract::{Path, State},
-    http::StatusCode,
+    http::{header, HeaderMap, StatusCode},
     response::IntoResponse,
     Extension, Json,
 };
@@ -171,6 +172,50 @@ pub async fn get_sandbox_image_preparation(
     Ok(Json(state.image_preparation.status().await?))
 }
 
+/// The host a prepare request names, or `None` for every eligible host.
+///
+/// An empty body means every host. A body that is not empty must be JSON and
+/// say so in `Content-Type`: axum's `Option<Json<_>>` reads a body without
+/// that header as no body at all, which turned `{"node_id": 4}` sent without
+/// it into "pull on every host".
+fn requested_node(headers: &HeaderMap, body: &Bytes) -> Result<Option<i32>, Problem> {
+    if body.iter().all(u8::is_ascii_whitespace) {
+        return Ok(None);
+    }
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    let essence = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if essence != "application/json" && !essence.ends_with("+json") {
+        return Err(temps_core::error_builder::ErrorBuilder::new(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        )
+        .title("JSON Body Required")
+        .detail(format!(
+            "a sandbox image preparation request with a body must send it as \
+                     application/json (got Content-Type '{content_type}'); send no body \
+                     to prepare every eligible host"
+        ))
+        .value("content_type", content_type)
+        .build());
+    }
+    let parsed: PrepareSandboxImagesBody = serde_json::from_slice(body).map_err(|error| {
+        temps_core::error_builder::ErrorBuilder::new(StatusCode::UNPROCESSABLE_ENTITY)
+            .title("Invalid Preparation Request")
+            .detail(format!(
+                "the sandbox image preparation request body is not valid: {error}"
+            ))
+            .build()
+    })?;
+    Ok(parsed.node_id)
+}
+
 /// Pull the default sandbox image on every eligible host (or one), so the
 /// first sandbox there starts without a multi-gigabyte download, and keep
 /// those hosts prepared across upgrades. Saves the policy of every host at
@@ -186,7 +231,8 @@ pub async fn get_sandbox_image_preparation(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Administrator role required"),
         (status = 404, description = "No such host"),
-        (status = 422, description = "The host (or every host) cannot take sandboxes"),
+        (status = 415, description = "A body was sent without a JSON Content-Type"),
+        (status = 422, description = "The body is not valid, or the host (or every host) cannot take sandboxes"),
         (status = 500, description = "The preparation could not be recorded")
     ),
     security(("bearer_auth" = []))
@@ -195,10 +241,11 @@ pub async fn prepare_sandbox_images(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<SandboxAppState>>,
     Extension(metadata): Extension<RequestMetadata>,
-    body: Option<Json<PrepareSandboxImagesBody>>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Result<impl IntoResponse, Problem> {
     require_sandbox_admin(&auth)?;
-    let requested = body.and_then(|Json(b)| b.node_id);
+    let requested = requested_node(&headers, &body)?;
     let prepared = state.image_preparation.prepare(requested).await?;
     let user_id = auth.user_id();
     tracing::info!(user_id, requested_node_id = ?requested, prepared_node_ids = ?prepared, "sandbox image preparation requested");
@@ -375,6 +422,79 @@ mod tests {
             .body(axum::body::Body::from(body.to_string()))
             .expect("request");
         app.oneshot(request).await.expect("response").status()
+    }
+
+    fn headers(content_type: Option<&str>) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        if let Some(value) = content_type {
+            headers.insert(header::CONTENT_TYPE, value.parse().expect("header"));
+        }
+        headers
+    }
+
+    fn requested(content_type: Option<&str>, body: &str) -> Result<Option<i32>, StatusCode> {
+        requested_node(&headers(content_type), &Bytes::from(body.to_string()))
+            .map_err(|problem| problem.status_code)
+    }
+
+    #[test]
+    fn no_body_prepares_every_host() {
+        assert_eq!(requested(None, ""), Ok(None));
+        assert_eq!(requested(None, " \n"), Ok(None));
+        assert_eq!(requested(Some("application/json"), ""), Ok(None));
+        assert_eq!(requested(Some("application/json"), "{}"), Ok(None));
+    }
+
+    #[test]
+    fn a_json_body_names_its_host() {
+        assert_eq!(
+            requested(Some("application/json"), r#"{"node_id": 4}"#),
+            Ok(Some(4))
+        );
+        assert_eq!(
+            requested(Some("Application/JSON; charset=utf-8"), r#"{"node_id": 4}"#),
+            Ok(Some(4))
+        );
+    }
+
+    #[test]
+    fn a_body_without_a_json_content_type_is_refused_not_read_as_every_host() {
+        assert_eq!(
+            requested(None, r#"{"node_id": 4}"#),
+            Err(StatusCode::UNSUPPORTED_MEDIA_TYPE)
+        );
+        assert_eq!(
+            requested(Some("text/plain"), r#"{"node_id": 4}"#),
+            Err(StatusCode::UNSUPPORTED_MEDIA_TYPE)
+        );
+    }
+
+    #[test]
+    fn an_invalid_json_body_is_refused() {
+        assert_eq!(
+            requested(Some("application/json"), "{not json"),
+            Err(StatusCode::UNPROCESSABLE_ENTITY)
+        );
+        assert_eq!(
+            requested(Some("application/json"), r#"{"node": 4}"#),
+            Err(StatusCode::UNPROCESSABLE_ENTITY),
+            "unknown fields are refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_route_refuses_a_body_without_a_json_content_type() {
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/sandboxes/image-preparation")
+            .body(axum::body::Body::from(r#"{"node_id": 4}"#))
+            .expect("request");
+        let status = app(Some(Role::Admin))
+            .oneshot(request)
+            .await
+            .expect("response")
+            .status();
+        assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
     }
 
     #[test]

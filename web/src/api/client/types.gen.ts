@@ -97396,7 +97396,11 @@ export type PrepareSandboxImagesErrors = {
      */
     404: unknown;
     /**
-     * The host (or every host) cannot take sandboxes
+     * A body was sent without a JSON Content-Type
+     */
+    415: unknown;
+    /**
+     * The body is not valid, or the host (or every host) cannot take sandboxes
      */
     422: unknown;
     /**

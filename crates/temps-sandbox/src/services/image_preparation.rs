@@ -226,6 +226,22 @@ pub(crate) fn outgoing_images(
     }
 }
 
+/// Take `removed` out of row `id`'s `stale_images` as it is stored now,
+/// keeping the rest in order. A removal pass reads the row, then waits on
+/// the host for each image; a pull finishing meanwhile can add images to
+/// the list. Writing back the list read before the wait would drop those,
+/// and an image no list records is never cleaned up.
+pub(crate) fn subtract_removed_statement(id: i32, removed: Vec<String>) -> Statement {
+    Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "UPDATE sandbox_image_preparations SET stale_images = ARRAY( \
+             SELECT entry.image FROM unnest(stale_images) WITH ORDINALITY AS entry(image, position) \
+             WHERE NOT (entry.image = ANY($2)) ORDER BY entry.position \
+         ), updated_at = now() WHERE id = $1",
+        [id.into(), removed.into()],
+    )
+}
+
 /// Upsert a host's row with `keep_prepared = keep`.
 async fn upsert_keep<C: ConnectionTrait>(
     conn: &C,
@@ -720,9 +736,11 @@ impl ImagePreparationService {
     }
 
     /// Try again to remove every image awaiting removal; keep the ones a
-    /// container still uses.
+    /// container still uses. Only the images removed here leave the stored
+    /// list (see [`subtract_removed_statement`]), so images another writer
+    /// added while this pass waited on the host stay recorded.
     async fn retry_removal(&self, host: &str, row: &sandbox_image_preparations::Model) {
-        let mut still_used = Vec::new();
+        let mut removed = Vec::new();
         for image in &row.stale_images {
             if row.prepared_image.as_deref() == Some(image.as_str()) {
                 continue;
@@ -732,22 +750,26 @@ impl ImagePreparationService {
                 .remove_prepared_image_on(row.node_id, image)
                 .await
             {
-                Ok(ImageRemoval::InUse) => still_used.push(image.clone()),
+                Ok(ImageRemoval::InUse) => {}
                 Err(error) => {
                     tracing::debug!(host = %host, image = %image, %error, "could not remove a previous sandbox image; retried later");
-                    still_used.push(image.clone());
                 }
                 Ok(
                     ImageRemoval::Removed | ImageRemoval::NotPresent | ImageRemoval::Unsupported,
-                ) => tracing::info!(host = %host, image = %image, "previous sandbox image removed"),
+                ) => {
+                    tracing::info!(host = %host, image = %image, "previous sandbox image removed");
+                    removed.push(image.clone());
+                }
             }
         }
-        if still_used == row.stale_images {
+        if removed.is_empty() {
             return;
         }
-        let mut active = row.clone().into_active_model();
-        active.stale_images = Set(still_used);
-        if let Err(error) = active.update(self.db.as_ref()).await {
+        if let Err(error) = self
+            .db
+            .execute(subtract_removed_statement(row.id, removed))
+            .await
+        {
             tracing::warn!(host = %host, %error, "could not record removed sandbox images");
         }
     }
@@ -994,6 +1016,8 @@ mod tests {
     struct UnresponsiveHost {
         asked: std::sync::atomic::AtomicUsize,
         removed: std::sync::Mutex<Vec<String>>,
+        /// Images a container still uses: their removal answers `InUse`.
+        in_use: Vec<String>,
     }
 
     #[async_trait::async_trait]
@@ -1096,8 +1120,79 @@ mod tests {
             image: &str,
         ) -> Result<ImageRemoval, temps_agent_core::error::AgentError> {
             self.removed.lock().unwrap().push(image.to_string());
+            if self.in_use.iter().any(|used| used == image) {
+                return Ok(ImageRemoval::InUse);
+            }
             Ok(ImageRemoval::Removed)
         }
+    }
+
+    /// Run a removal pass over `row` against a mock database and return the
+    /// statements it wrote.
+    async fn removal_pass_writes(
+        row: sandbox_image_preparations::Model,
+        host: Arc<UnresponsiveHost>,
+    ) -> Vec<sea_orm::Transaction> {
+        use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult};
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_exec_results([MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let sandbox_service = Arc::new(
+            crate::services::sandbox_service::tests::preview_test_service_with_db(db.clone()),
+        );
+        let service = ImagePreparationService::new(db.clone(), host, sandbox_service);
+        service.retry_removal("control plane", &row).await;
+        drop(service);
+        Arc::try_unwrap(db)
+            .unwrap_or_else(|_| panic!("the service still holds the database"))
+            .into_transaction_log()
+    }
+
+    #[tokio::test]
+    async fn a_removal_pass_takes_out_only_what_it_removed_from_the_stored_list() {
+        // img:1 is still used, img:0 goes. The pass must not write back the
+        // list it read (which would drop anything a finishing pull added
+        // while it waited on the host): it subtracts img:0 from the list as
+        // stored at write time.
+        let host = Arc::new(UnresponsiveHost {
+            in_use: vec!["img:1".into()],
+            ..Default::default()
+        });
+        let mut before = row(true, Some("img:2"));
+        before.stale_images = vec!["img:1".into(), "img:0".into()];
+
+        let writes = removal_pass_writes(before, host.clone()).await;
+
+        assert_eq!(*host.removed.lock().unwrap(), vec!["img:1", "img:0"]);
+        assert_eq!(
+            writes,
+            vec![sea_orm::Transaction::one(subtract_removed_statement(
+                1,
+                vec!["img:0".into()]
+            ))]
+        );
+        let sql = writes[0].statements()[0].sql.clone();
+        assert!(
+            sql.contains("unnest(stale_images)") && sql.contains("ANY($2)"),
+            "{sql}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_removal_pass_that_removed_nothing_writes_nothing() {
+        let host = Arc::new(UnresponsiveHost {
+            in_use: vec!["img:0".into()],
+            ..Default::default()
+        });
+        let mut before = row(true, Some("img:2"));
+        before.stale_images = vec!["img:0".into()];
+
+        assert!(removal_pass_writes(before, host).await.is_empty());
     }
 
     /// The service over a mock database that answers `results` in order.

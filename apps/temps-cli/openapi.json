@@ -180534,8 +180534,11 @@
           "404": {
             "description": "No such host"
           },
+          "415": {
+            "description": "A body was sent without a JSON Content-Type"
+          },
           "422": {
-            "description": "The host (or every host) cannot take sandboxes"
+            "description": "The body is not valid, or the host (or every host) cannot take sandboxes"
           },
           "500": {
             "description": "The preparation could not be recorded"
