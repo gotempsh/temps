@@ -132,11 +132,12 @@ impl OnDemandCertProvisioner for DomainServiceProvisioner {
 
 /// Map a `DomainServiceError` from the on-demand flow into the proxy-side
 /// [`CertProvisionFailure`]. `temps-domains` already persisted the authoritative
-/// `on_demand_backoff_until` on the `domains` row; here we only mirror the coarse
-/// category and the rate-limit `Retry-After` deadline (the one deadline the
-/// orchestration layer surfaces to us). When no precise deadline is available we
-/// return `None`, and the manager's negative cache falls back to its short first
-/// rung — the authoritative DB ladder reasserts itself on the next request.
+/// `on_demand_backoff_until` on the `domains` row and returns that deadline with
+/// every failure (the rate-limit `Retry-After`, or the ladder rung); the
+/// manager's negative cache must wait exactly that long, because it is what
+/// holds the host back. Only when no deadline was stored (the failure state
+/// could not be written) do we return `None`, and the manager falls back to its
+/// short first rung.
 fn map_provision_error(err: temps_domains::DomainServiceError) -> CertProvisionFailure {
     use temps_domains::DomainServiceError as E;
     let error_chain = err.to_string();
@@ -146,10 +147,14 @@ fn map_provision_error(err: temps_domains::DomainServiceError) -> CertProvisionF
             category: "rate_limited".to_string(),
             backoff_until_epoch: retry_after.map(|d| d.timestamp().max(0) as u64),
         },
-        E::OnDemandIssuanceFailed { category, .. } => CertProvisionFailure {
+        E::OnDemandIssuanceFailed {
+            category,
+            backoff_until,
+            ..
+        } => CertProvisionFailure {
             error_chain,
             category: category.clone(),
-            backoff_until_epoch: None,
+            backoff_until_epoch: backoff_until.map(|d| d.timestamp().max(0) as u64),
         },
         _ => CertProvisionFailure {
             error_chain,
@@ -763,14 +768,34 @@ mod tests {
     }
 
     #[test]
-    fn map_issuance_failed_error_preserves_category_no_deadline() {
+    fn map_issuance_failed_error_carries_the_persisted_ladder_deadline() {
+        // The ladder deadline must reach the proxy's negative cache: without
+        // it the cache retried every 5 minutes whatever the ladder said.
+        let deadline = Utc::now() + ChronoDuration::hours(4);
         let err = temps_domains::DomainServiceError::OnDemandIssuanceFailed {
             hostname: "app.1.2.3.4.sslip.io".to_string(),
             category: "challenge_mismatch".to_string(),
             error_chain: "challenge token not served".to_string(),
+            backoff_until: Some(deadline),
         };
         let failure = map_provision_error(err);
         assert_eq!(failure.category, "challenge_mismatch");
+        assert_eq!(
+            failure.backoff_until_epoch,
+            Some(deadline.timestamp().max(0) as u64)
+        );
+    }
+
+    #[test]
+    fn map_issuance_failed_error_without_a_stored_deadline_has_none() {
+        let err = temps_domains::DomainServiceError::OnDemandIssuanceFailed {
+            hostname: "app.1.2.3.4.sslip.io".to_string(),
+            category: "internal".to_string(),
+            error_chain: "no ACME contact email configured".to_string(),
+            backoff_until: None,
+        };
+        let failure = map_provision_error(err);
+        assert_eq!(failure.category, "internal");
         assert_eq!(failure.backoff_until_epoch, None);
     }
 }

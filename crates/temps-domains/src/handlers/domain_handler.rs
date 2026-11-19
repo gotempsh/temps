@@ -376,6 +376,7 @@ impl From<DomainServiceError> for Problem {
                 hostname,
                 category,
                 error_chain,
+                ..
             } => ErrorBuilder::new(StatusCode::BAD_GATEWAY)
                 .title("On-demand TLS Issuance Failed")
                 .detail(format!(
