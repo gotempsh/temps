@@ -31,7 +31,7 @@ import {
 } from '@/components/project/setup/SetupWizardShell'
 import { Input } from '@/components/ui/input'
 import { useDebounce } from '@/hooks/useDebounce'
-import { preferredScrollBehavior } from '@/lib/scroll-behavior'
+import { scrollToElementId } from '@/lib/scroll-to-element'
 import { useAttributeFilter } from '@/hooks/useAttributeFilter'
 import { attributesQueryValue } from '@/lib/attribute-facets'
 import {
@@ -794,10 +794,7 @@ export default function TracesList({ project }: TracesListProps) {
   useEffect(() => {
     if (!showSetup || !scrollToSetup) return
     const frame = requestAnimationFrame(() => {
-      document.getElementById('traces-setup')?.scrollIntoView({
-        behavior: preferredScrollBehavior(),
-        block: 'start',
-      })
+      scrollToElementId('traces-setup', { behavior: 'smooth' })
       setScrollToSetup(false)
     })
     return () => cancelAnimationFrame(frame)
@@ -1075,10 +1072,7 @@ export default function TracesList({ project }: TracesListProps) {
               onClick={() => {
                 setShowSetup((v) => !v)
                 requestAnimationFrame(() => {
-                  document.getElementById('traces-setup')?.scrollIntoView({
-                    behavior: preferredScrollBehavior(),
-                    block: 'start',
-                  })
+                  scrollToElementId('traces-setup', { behavior: 'smooth' })
                 })
               }}
             >
@@ -1236,10 +1230,7 @@ export default function TracesList({ project }: TracesListProps) {
                     size="sm"
                     className="gap-2"
                     onClick={() => {
-                      document.getElementById('traces-setup')?.scrollIntoView({
-                        behavior: preferredScrollBehavior(),
-                        block: 'start',
-                      })
+                      scrollToElementId('traces-setup', { behavior: 'smooth' })
                     }}
                   >
                     <Settings2 className="h-3.5 w-3.5" />

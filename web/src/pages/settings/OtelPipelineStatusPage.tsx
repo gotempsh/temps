@@ -70,6 +70,7 @@ import {
 } from 'lucide-react'
 import { type MouseEvent, useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router'
+import { scrollElementToTop } from '@/lib/scroll-to-element'
 
 // ---------------------------------------------------------------------------
 // Trend chart
@@ -545,7 +546,7 @@ function scrollToActivation(event: MouseEvent<HTMLAnchorElement>) {
   const target = document.getElementById(ACTIVATION_SECTION_ANCHOR)
   if (!target) return
   event.preventDefault()
-  target.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  scrollElementToTop(target, { behavior: 'smooth' })
 }
 
 /**
@@ -556,7 +557,7 @@ function scrollToActivation(event: MouseEvent<HTMLAnchorElement>) {
  * not have to scroll past four charts to discover that an activation is moving
  * them to Cloud right now.
  */
-function ActivationJumpLink({
+export function ActivationJumpLink({
   job,
 }: {
   job: BulkActivationJobResponse | null | undefined

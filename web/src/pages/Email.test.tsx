@@ -6,11 +6,19 @@ import { cleanup, render, waitFor, within } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter } from 'react-router'
 import { BreadcrumbProvider } from '@/contexts/BreadcrumbContext'
+import {
+  CONSOLE_MAX_SCROLL,
+  ConsoleShell,
+  NEAR_THE_END,
+  expectOnlyConsoleScrolled,
+} from '@/test/console-shell'
 import { installBrowserWindow } from '@/test/dom'
+import { installFakeScrollLayout } from '@/test/fake-scroll-layout'
 import { jsonResponse, mockApi } from '@/test/fetch-mock'
 import { Email } from './Email'
 
 installBrowserWindow()
+const layout = installFakeScrollLayout()
 afterEach(cleanup)
 
 const PROVIDER = {
@@ -60,7 +68,9 @@ function renderEmail(
     >
       <MemoryRouter initialEntries={[entry]}>
         <BreadcrumbProvider>
-          <Email />
+          <ConsoleShell>
+            <Email />
+          </ConsoleShell>
         </BreadcrumbProvider>
       </MemoryRouter>
     </QueryClientProvider>
@@ -135,19 +145,13 @@ test('a hidden section stays mounted, so an open dialog survives it hiding', asy
   }
 })
 
-test('an old ?tab= link scrolls to its section once the page knows it shows', async () => {
-  const scrolled: string[] = []
-  const original = Element.prototype.scrollIntoView
-  // A hidden section has no box to scroll to, as in a browser.
-  Element.prototype.scrollIntoView = function (this: Element) {
-    if (!this.closest('[hidden]')) scrolled.push(this.id)
-  }
-  try {
-    renderEmail('/email?tab=providers', SET_UP)
-    await waitFor(() => expect(scrolled).toContain('email-providers'))
-  } finally {
-    Element.prototype.scrollIntoView = original
-  }
+test('an old ?tab= link scrolls the page to its section and leaves the shell in place', async () => {
+  // Sent emails sit at the end of the page and cannot reach its top.
+  layout.place('#email-sent', NEAR_THE_END)
+  const { view } = renderEmail('/email?tab=emails', SET_UP)
+  await view.findByRole('heading', { name: 'Sent emails' })
+  await waitFor(() => expect(layout.scrolls.length).toBeGreaterThan(0))
+  expectOnlyConsoleScrolled(layout, CONSOLE_MAX_SCROLL)
 })
 
 test('during setup, a connected provider shows but the empty domains do not', async () => {
@@ -195,7 +199,9 @@ test('a failed lookup never claims a setup step is still to do', async () => {
     >
       <MemoryRouter initialEntries={['/email']}>
         <BreadcrumbProvider>
-          <Email />
+          <ConsoleShell>
+            <Email />
+          </ConsoleShell>
         </BreadcrumbProvider>
       </MemoryRouter>
     </QueryClientProvider>

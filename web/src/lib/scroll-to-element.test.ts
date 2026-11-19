@@ -2,16 +2,22 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { afterEach, expect, test } from 'bun:test'
+import { readdirSync, readFileSync } from 'node:fs'
+import { join, relative } from 'node:path'
 import { installFakeScrollLayout } from '@/test/fake-scroll-layout'
 import {
   scrollContainerOf,
+  scrollElementIntoView,
   scrollElementToTop,
+  scrollToElementId,
   scrollTopToAlign,
 } from './scroll-to-element'
 
 const layout = installFakeScrollLayout()
 
+const originalMatchMedia = window.matchMedia
 afterEach(() => {
+  window.matchMedia = originalMatchMedia
   document.body.innerHTML = ''
   document.body.style.overflow = ''
   document.documentElement.removeAttribute('data-client-height')
@@ -113,4 +119,144 @@ test('outside the app shell the document scrolls', () => {
   const loose = document.getElementById('loose') as HTMLElement
   scrollElementToTop(loose)
   expect(layout.scrolls).toEqual([{ target: 'window', top: 700 }])
+})
+
+/** The system's reduced-motion preference, as `matchMedia` reports it. */
+function prefersReducedMotion(reduce: boolean) {
+  window.matchMedia = ((query: string) => ({
+    matches: reduce && query === '(prefers-reduced-motion: reduce)',
+  })) as unknown as typeof window.matchMedia
+}
+
+test('centring a row near the end scrolls its container as far as it goes and leaves the shell alone', () => {
+  const { frame, page, flags } = mountShell()
+  flags.setAttribute('data-height', '100')
+  expect(scrollElementIntoView(flags, { block: 'center' })).toBe(true)
+  expect(layout.scrollTopOf(page)).toBe(900)
+  expect(layout.scrollTopOf(frame)).toBe(0)
+  expect(layout.scrolls.map((scroll) => scroll.target)).toEqual(['page'])
+})
+
+test('centring puts the middle of the element in the middle of its container', () => {
+  const { page, previews } = mountShell()
+  previews.setAttribute('data-height', '100')
+  // 500 + 100 / 2 - 600 / 2
+  expect(scrollTopToAlign(previews, page, 'center')).toBe(250)
+  scrollElementIntoView(previews, { block: 'center' })
+  expect(layout.scrolls).toEqual([{ target: 'page', top: 250 }])
+})
+
+test('nearest leaves a visible element where it is', () => {
+  const { page, previews } = mountShell()
+  previews.setAttribute('data-height', '100')
+  page.scrollTop = 200
+  expect(scrollElementIntoView(previews, { block: 'nearest' })).toBe(false)
+  expect(layout.scrolls).toEqual([])
+})
+
+test('nearest brings an element below the view up to the bottom edge', () => {
+  const { frame, flags } = mountShell()
+  flags.setAttribute('data-height', '100')
+  // 1300 + 100 - 600
+  expect(scrollElementIntoView(flags, { block: 'nearest' })).toBe(true)
+  expect(layout.scrolls).toEqual([{ target: 'page', top: 800 }])
+  expect(layout.scrollTopOf(frame)).toBe(0)
+})
+
+test('nearest brings an element above the view down to the top edge', () => {
+  const { page, previews } = mountShell()
+  previews.setAttribute('data-height', '100')
+  page.scrollTop = 800
+  scrollElementIntoView(previews, { block: 'nearest' })
+  expect(layout.scrolls).toEqual([{ target: 'page', top: 500 }])
+})
+
+test('nearest shows the top of an element taller than the view that starts below it', () => {
+  const { frame, page, previews } = mountShell()
+  previews.setAttribute('data-height', '900')
+  page.scrollTop = 0
+  scrollElementIntoView(previews, { block: 'nearest' })
+  expect(layout.scrolls).toEqual([{ target: 'page', top: 500 }])
+  expect(layout.scrollTopOf(frame)).toBe(0)
+})
+
+test('nearest leaves an element that covers the whole view alone', () => {
+  const { page, previews } = mountShell()
+  previews.setAttribute('data-height', '900')
+  page.scrollTop = 600
+  expect(scrollElementIntoView(previews, { block: 'nearest' })).toBe(false)
+  expect(layout.scrolls).toEqual([])
+})
+
+test('a smooth scroll animates the container only', () => {
+  prefersReducedMotion(false)
+  const { page, previews } = mountShell()
+  scrollElementToTop(previews, { behavior: 'smooth' })
+  expect(layout.scrolls).toEqual([
+    { target: 'page', top: 500, behavior: 'smooth' },
+  ])
+  expect(layout.scrollTopOf(page)).toBe(500)
+})
+
+test('a smooth scroll jumps instead when the system asks for reduced motion', () => {
+  prefersReducedMotion(true)
+  const { previews } = mountShell()
+  scrollElementIntoView(previews, { behavior: 'smooth' })
+  expect(layout.scrolls).toEqual([
+    { target: 'page', top: 500, behavior: 'auto' },
+  ])
+})
+
+test('scrolling to an id moves nothing until the element exists', () => {
+  const { page } = mountShell()
+  expect(scrollToElementId('missing')).toBe(false)
+  expect(scrollToElementId('previews')).toBe(true)
+  expect(layout.scrollTopOf(page)).toBe(500)
+})
+
+test('the native scrollIntoView, which moves the shell, is never used', () => {
+  const { previews, flags } = mountShell()
+  scrollElementToTop(previews)
+  scrollElementIntoView(flags, { block: 'center' })
+  scrollElementIntoView(flags, { block: 'nearest' })
+  expect(layout.intoView).toEqual([])
+})
+
+/**
+ * Call sites still allowed to use the native `scrollIntoView`, each because
+ * it cannot move the app shell. Anything else under the shell goes through
+ * `scrollElementIntoView`.
+ */
+const NATIVE_SCROLL_INTO_VIEW_ALLOWED: Record<string, string> = {
+  // `block: 'nearest'` on one ~32px option inside the suggestion list's own
+  // `max-h-60` scroller: the browser stops as soon as the option is visible,
+  // and the page's scroll container lies inside the shell's box, so the shell
+  // never has to move.
+  'components/observability/LogQueryInput.tsx':
+    'nearest, on a small option in its own listbox',
+}
+
+/** Every production source file under `web/src`. */
+function sourceFiles(dir: string): string[] {
+  return readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+    const path = join(dir, entry.name)
+    if (entry.isDirectory())
+      return entry.name === 'node_modules' || entry.name === 'client'
+        ? []
+        : sourceFiles(path)
+    return /\.tsx?$/.test(entry.name) && !/\.test\.tsx?$/.test(entry.name)
+      ? [path]
+      : []
+  })
+}
+
+test('no console code calls the native scrollIntoView, which drags the shell along', () => {
+  const root = join(import.meta.dir, '..')
+  const calls = sourceFiles(root)
+    .filter((path) =>
+      /\.scrollIntoView\s*(\?\.)?\s*\(/.test(readFileSync(path, 'utf8'))
+    )
+    .map((path) => relative(root, path))
+    .sort()
+  expect(calls).toEqual(Object.keys(NATIVE_SCROLL_INTO_VIEW_ALLOWED).sort())
 })
