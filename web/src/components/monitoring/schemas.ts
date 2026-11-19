@@ -123,7 +123,9 @@ const buildProviderSchema = (allowMaskedValues: boolean) =>
         // Telegram config
         bot_token: z.string().optional(),
         chat_id: z.string().optional(),
-        message_thread_id: optionalNumber(z.number().int().positive()),
+        // Checked in the Telegram-only superRefine below, so a topic left in
+        // the wizard after switching provider cannot block another type.
+        message_thread_id: optionalNumber(z.number()),
 
         // Email config
         smtp_host: z.string().optional(),
@@ -289,6 +291,17 @@ const buildProviderSchema = (allowMaskedValues: boolean) =>
           message:
             'Use a numeric chat ID (e.g. -1001234567890) or a public @channelusername.',
           path: ['config', 'chat_id'],
+        })
+      }
+      const topicId = data.config.message_thread_id
+      if (
+        topicId !== undefined &&
+        !(Number.isSafeInteger(topicId) && topicId > 0)
+      ) {
+        ctx.addIssue({
+          code: 'custom',
+          message: 'Topic ID must be a positive whole number, e.g. 42.',
+          path: ['config', 'message_thread_id'],
         })
       }
     })

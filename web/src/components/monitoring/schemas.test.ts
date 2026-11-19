@@ -169,6 +169,26 @@ describe('telegram provider form', () => {
     ).toEqual({ bot_token: '', chat_id: '', message_thread_id: undefined })
   })
 
+  test('rejects a topic that is not a positive whole number, on the topic field', () => {
+    for (const topic of [0, -3, 4.5]) {
+      expect(
+        issuePaths({
+          ...telegram,
+          config: { ...telegram.config, message_thread_id: topic },
+        })
+      ).toEqual(['config.message_thread_id'])
+    }
+  })
+
+  test('a topic left over from the Telegram step does not block another provider', () => {
+    // Wizard: enter topic 0 for Telegram, go back, pick Slack.
+    const result = providerSchema.safeParse({
+      ...slackProvider,
+      config: { ...slackProvider.config, message_thread_id: 0 },
+    })
+    expect(result.success).toBe(true)
+  })
+
   test('an emptied topic (NaN) is treated as unset', () => {
     const result = providerSchema.safeParse({
       ...telegram,
