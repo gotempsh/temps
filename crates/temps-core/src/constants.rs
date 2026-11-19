@@ -5,6 +5,10 @@ use once_cell::sync::Lazy;
 
 pub const DOCKER_LABEL_PREFIX: &str = "temps.";
 
+/// The control plane's node id. It has no `nodes` row; every node-keyed
+/// table and API uses `0` for it (ADR-107 D1).
+pub const CONTROL_PLANE_NODE_ID: i32 = 0;
+
 /// Docker network name - configurable via TEMPS_NETWORK_NAME environment variable
 /// Defaults to "temps-app-network" if not set
 #[allow(

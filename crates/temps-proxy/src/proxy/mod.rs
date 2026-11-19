@@ -538,6 +538,9 @@ pub struct LoadBalancer {
     /// The header a trusted loopback proxy sends the visitor's JA4 in
     /// (ADR 066, D4). Refreshed from the platform settings; read lock-free.
     loopback_ja4_header: Arc<arc_swap::ArcSwapOption<axum::http::HeaderName>>,
+    /// The loopback listener the control plane's own tunnel connectors
+    /// forward to (ADR-107 D3). `None` outside `temps serve`.
+    tunnel_origin: Option<Arc<temps_core::tunnel_origin::ControlPlaneTunnelOrigin>>,
     on_demand_manager: Option<Arc<OnDemandManager>>,
     /// On-demand HTTP-01 TLS cert manager (ADR-018). When set, the port-80
     /// `request_filter` reads its in-process state cache (NO DB hit) to serve a
@@ -827,6 +830,7 @@ impl LoadBalancer {
             trust_loopback_forwarded_ip: Arc::new(AtomicBool::new(false)),
             expose_platform_identity: Arc::new(AtomicBool::new(false)),
             loopback_ja4_header: Arc::new(arc_swap::ArcSwapOption::empty()),
+            tunnel_origin: None,
             on_demand_manager: None,
             on_demand_cert_manager: None,
             route_table: None,
@@ -1006,6 +1010,16 @@ impl LoadBalancer {
     /// Enable forwarded client IPs only for an explicitly configured local proxy.
     pub fn with_trust_loopback_forwarded_ip(mut self, enabled: Arc<AtomicBool>) -> Self {
         self.trust_loopback_forwarded_ip = enabled;
+        self
+    }
+
+    /// Treat requests on the control plane's tunnel origin as having come
+    /// through its tunnel (ADR-107 D3).
+    pub fn with_tunnel_origin(
+        mut self,
+        origin: Option<Arc<temps_core::tunnel_origin::ControlPlaneTunnelOrigin>>,
+    ) -> Self {
+        self.tunnel_origin = origin;
         self
     }
 
@@ -1523,7 +1537,39 @@ impl LoadBalancer {
         // Trusting the header let a client on the plain-HTTP listener spoof
         // `https`, influencing Secure-cookie attributes and the proto we forward
         // upstream.
-        self.is_tls_connection(session)
+        //
+        // The one exception is decided by the listener, never by a header:
+        // the control plane's tunnel origin on loopback, which only the
+        // tunnel's connector reaches, after the provider's edge terminated
+        // the visitor's HTTPS (ADR-107 D3, ADR-070).
+        self.is_tls_connection(session) || self.tunnel_visitor_on_https(session)
+    }
+
+    /// Whether a request on the control plane's tunnel origin came from a
+    /// visitor who reached the provider's edge over HTTPS (ADR-107 D3).
+    ///
+    /// The listener decides that the request is a tunnel's; the provider's
+    /// `X-Forwarded-Proto` can only *downgrade* it: a hostname whose edge
+    /// policy lets plain HTTP through (`AllowHttp`, `AllowAll`) forwards
+    /// `http`, and that visitor must still get the app's HTTPS redirect and
+    /// no `Secure` cookies. A missing or other value keeps HTTPS, so a
+    /// connector that does not send it never loops on our own redirect, and a
+    /// forged value can only cause a redirect, never skip one. Off the tunnel
+    /// origin the header is never read (SEC-12).
+    pub(crate) fn tunnel_visitor_on_https(&self, session: &PingoraSession) -> bool {
+        self.via_tunnel_origin(session) && !edge_forwarded_plain_http(session.req_header())
+    }
+
+    /// Whether this request came in on the control plane's tunnel origin
+    /// (ADR-107 D3). Two atomic loads; no lock.
+    pub(crate) fn via_tunnel_origin(&self, session: &PingoraSession) -> bool {
+        let Some(origin) = self.tunnel_origin.as_deref() else {
+            return false;
+        };
+        session
+            .server_addr()
+            .and_then(|address| address.as_inet())
+            .is_some_and(|local| origin.is_origin(*local))
     }
 
     /// Check if the connection is a TLS connection by checking for SSL digest
@@ -1588,7 +1634,11 @@ impl LoadBalancer {
         // must name the same hostname: a connection made for one status page
         // cannot be steered to another with a forged Host header. The console
         // re-checks the hostname-to-page binding (`STATUS_HOST_HEADER`) too.
+        // A tunnel's visitor reached the provider's edge over HTTPS and the
+        // connector forwards in plain HTTP on loopback (ADR-107 D3): no SNI
+        // to compare, and nothing to upgrade.
         let is_tls = self.is_tls_connection(session);
+        let is_https = is_tls || self.tunnel_visitor_on_https(session);
         if is_tls {
             let sni = Self::tls_sni(session);
             if sni
@@ -1607,7 +1657,7 @@ impl LoadBalancer {
                 );
                 return self.write_misdirected(session, ctx).await;
             }
-        } else if !self.disable_https_redirect {
+        } else if !is_https && !self.disable_https_redirect {
             // A verified hostname always has its certificate: upgrade.
             let location = format!("https://{host}{}", ctx.path);
             let mut resp = https_redirect_response(
@@ -1648,7 +1698,7 @@ impl LoadBalancer {
         } else {
             header.remove_header("x-forwarded-for");
         }
-        header.insert_header("X-Forwarded-Proto", if is_tls { "https" } else { "http" })?;
+        header.insert_header("X-Forwarded-Proto", if is_https { "https" } else { "http" })?;
         header.insert_header("Host", host.as_str())?;
         header.insert_header(STATUS_HOST_HEADER, host.as_str())?;
 
@@ -1883,9 +1933,9 @@ impl LoadBalancer {
             return Ok(false);
         }
         let now = temps_shield::unix_now();
-        // The clearance cookie is `__Host-` and `Secure`: only a TLS
-        // connection can receive one.
-        let tls = ctx.tls_fingerprint.is_some() || self.is_tls_connection(session);
+        // The clearance cookie is `__Host-` and `Secure`: only an HTTPS
+        // visitor can receive one, which a tunnel's visitor is (ADR-107 D3).
+        let tls = ctx.tls_fingerprint.is_some() || self.is_https_request(session);
         let (decision, netwatch_line) = {
             let header = session.req_header();
             let text = |name: &str| header.headers.get(name).and_then(|v| v.to_str().ok());
@@ -2497,7 +2547,7 @@ impl LoadBalancer {
                 .await;
         }
         if ctx.path == PREVIEW_LOGOUT_PATH && ctx.method == "POST" {
-            let secure = self.is_tls_connection(session);
+            let secure = self.is_https_request(session);
             let set_cookie =
                 build_logout_cookie_sandbox(&preview_host.hex, &settings.preview_domain, secure);
             let mut response = ResponseHeader::build(303, None)?;
@@ -3109,7 +3159,7 @@ impl LoadBalancer {
                 hex,
                 &cookie_value,
                 &settings.preview_domain,
-                self.is_tls_connection(session),
+                self.is_https_request(session),
             ))
         };
 
@@ -3128,7 +3178,7 @@ impl LoadBalancer {
         // an unpartitioned host-only cookie and a parent-domain cookie
         // alongside the fresh CHIPS cookie, sometimes emitting them in
         // separate Cookie header fields.
-        if should_refresh_cookie && self.is_tls_connection(session) {
+        if should_refresh_cookie && self.is_https_request(session) {
             let unpartitioned_cookie = build_logout_cookie_sandbox_unpartitioned(hex);
             response.append_header("Set-Cookie", &unpartitioned_cookie)?;
             let legacy_cookie = build_logout_cookie_sandbox(hex, &settings.preview_domain, false);
@@ -3189,7 +3239,7 @@ impl LoadBalancer {
             return write_preview_redirect(session, ctx, &next, "preview_login_not_required").await;
         }
 
-        let secure = self.is_tls_connection(session);
+        let secure = self.is_https_request(session);
         let snapshot = self
             .route_table
             .as_ref()
@@ -3325,6 +3375,19 @@ fn parse_public_authority(raw_authority: &str) -> Option<PublicAuthority> {
         forwarded_host,
         port,
     })
+}
+
+/// Whether the tunnel provider's edge says the visitor used plain HTTP: the
+/// first `X-Forwarded-Proto` value is `http` (any case). Read only for a
+/// request on the control plane's tunnel origin (see
+/// `LoadBalancer::tunnel_visitor_on_https`).
+fn edge_forwarded_plain_http(request: &RequestHeader) -> bool {
+    request
+        .headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .is_some_and(|scheme| scheme.trim().eq_ignore_ascii_case("http"))
 }
 
 /// Strip every client-controlled IP/forwarding header from the request that

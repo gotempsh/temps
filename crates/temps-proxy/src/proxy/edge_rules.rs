@@ -152,7 +152,7 @@ impl LoadBalancer {
             Decision::Challenge { rule_id } => {
                 // The engine only decides `challenge` for a visitor without
                 // a valid clearance; serve Shield's challenge for it.
-                let tls = ctx.tls_fingerprint.is_some() || self.is_tls_connection(session);
+                let tls = ctx.tls_fingerprint.is_some() || self.is_https_request(session);
                 let outcome = if !navigation {
                     temps_shield::Outcome::TooManyRequests
                 } else if !tls {

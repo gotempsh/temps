@@ -265,6 +265,23 @@ fn tunnel_service_hostnames(hosts: Option<&Vec<String>>, route_label: &str) -> V
         .collect()
 }
 
+/// Every public Compose service beside each tunnel host of an environment
+/// (ADR 068 D3): the same names the awake path routes, so a sleeping
+/// environment still wakes on them and a control-plane tunnel keeps
+/// publishing them (ADR-107 D4).
+fn compose_tunnel_service_hostnames(
+    preset_config: Option<&temps_entities::preset::PresetConfig>,
+    tunnel_hosts: Option<&Vec<String>>,
+) -> Vec<String> {
+    let Some(temps_entities::preset::PresetConfig::DockerCompose(config)) = preset_config else {
+        return Vec::new();
+    };
+    temps_entities::preset::compose_public_route_labels(&config.public_ports)
+        .iter()
+        .flat_map(|label| tunnel_service_hostnames(tunnel_hosts, label))
+        .collect()
+}
+
 fn compose_public_service_hostnames(
     preset_config: Option<&temps_entities::preset::PresetConfig>,
     preview_domain: &str,
@@ -1501,6 +1518,11 @@ pub struct CachedPeerTable {
     /// Optional callback invoked after each route reload with sleeping environment entries.
     on_sleeping_callback: parking_lot::Mutex<Option<OnSleepingCallback>>,
 
+    /// Public hostnames of sleeping on-demand environments as of the last
+    /// reload. They have no route (the proxy wakes them on a visit), so a
+    /// tunnel on the control plane keeps publishing them (ADR-107 D4).
+    sleeping_hosts: ArcSwap<Vec<String>>,
+
     /// Optional async callback invoked after each successful reload.
     /// Used to publish per-deployment internal DNS records (ADR-012-lite)
     /// in lockstep with the route table.
@@ -1676,6 +1698,7 @@ impl CachedPeerTable {
             db,
             runtime_context,
             on_sleeping_callback: parking_lot::Mutex::new(None),
+            sleeping_hosts: ArcSwap::from_pointee(Vec::new()),
             on_reload_callback: parking_lot::Mutex::new(None),
             on_cert_eligible_callback: parking_lot::Mutex::new(None),
             generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -2482,6 +2505,41 @@ impl CachedPeerTable {
             .keys()
             .filter(|host| !host.ends_with(".temps.local"))
             .count()
+    }
+
+    /// Public hostnames of sleeping on-demand environments: routed nowhere
+    /// until a visit wakes them, but the control-plane proxy answers them.
+    pub fn public_sleeping_hostnames(&self) -> Vec<String> {
+        self.sleeping_hosts.load().as_ref().clone()
+    }
+
+    /// Record what [`Self::public_sleeping_hostnames`] returns: only real
+    /// public hostnames (a bare subdomain, a wildcard, an internal or a
+    /// private address is none), normalized and deduplicated.
+    pub(crate) fn record_sleeping_hosts(&self, sleeping: &[SleepingEnvironmentEntry]) {
+        let mut hosts: Vec<String> = sleeping
+            .iter()
+            .map(|entry| normalize_route_hostname(&entry.domain).into_owned())
+            .filter(|host| {
+                host.contains('.')
+                    && !host.starts_with("*.")
+                    && !host.ends_with(".temps.local")
+                    && !self.is_private_hostname(host)
+            })
+            .collect();
+        hosts.sort_unstable();
+        hosts.dedup();
+        self.sleeping_hosts.store(Arc::new(hosts));
+    }
+
+    /// Marks `host` as a sleeping environment's, for callers in other
+    /// crates that need one without a database. `load_routes` owns this on
+    /// the production path.
+    #[doc(hidden)]
+    pub fn insert_sleeping_host_for_test(&self, host: &str) {
+        let mut hosts = self.sleeping_hosts.load().as_ref().clone();
+        hosts.push(normalize_route_hostname(host).into_owned());
+        self.sleeping_hosts.store(Arc::new(hosts));
     }
 
     /// Every public hostname in the route table, whoever serves it.
@@ -4791,6 +4849,33 @@ mod tests {
         assert!(tunnel_service_hostnames(None, "api").is_empty());
     }
 
+    /// A sleeping Compose environment wakes on (and a control-plane tunnel
+    /// keeps publishing) every tunnel-form service host, as when awake.
+    #[test]
+    fn a_sleeping_compose_environment_keeps_its_tunnel_service_hostnames() {
+        use temps_entities::preset::{DockerComposeConfig, PresetConfig};
+        let route = |service: &str, port: u16| ComposePublicPort {
+            service: service.to_string(),
+            port,
+            ..Default::default()
+        };
+        let config = PresetConfig::DockerCompose(DockerComposeConfig {
+            public_ports: vec![route("web", 3000), route("web", 9222), route("api", 8080)],
+            ..Default::default()
+        });
+        let tunnel_hosts = vec!["shop-staging.tunnel.example.com".to_string()];
+        assert_eq!(
+            compose_tunnel_service_hostnames(Some(&config), Some(&tunnel_hosts)),
+            vec![
+                "shop-staging--web.tunnel.example.com".to_string(),
+                "shop-staging--web-9222.tunnel.example.com".to_string(),
+                "shop-staging--api.tunnel.example.com".to_string(),
+            ]
+        );
+        assert!(compose_tunnel_service_hostnames(Some(&config), None).is_empty());
+        assert!(compose_tunnel_service_hostnames(None, Some(&tunnel_hosts)).is_empty());
+    }
+
     #[test]
     fn sleeping_environment_wakes_on_every_public_compose_service_hostname() {
         use temps_entities::preset::{DockerComposeConfig, PresetConfig};
@@ -5397,6 +5482,14 @@ mod unavailable_route_tests {
                 .iter()
                 .any(|entry| entry.domain == host && entry.environment_id == environment.id),
             "the sleeping environment must still be handed to the wake path: {sleeping:?}"
+        );
+        // ADR-107 D4: a control-plane tunnel keeps publishing it, so a
+        // visit can reach the proxy that wakes it.
+        let published = route_table.public_sleeping_hostnames();
+        assert!(published.contains(&host.to_string()), "{published:?}");
+        assert!(
+            published.iter().all(|h| h.contains('.')),
+            "a bare subdomain is no hostname: {published:?}"
         );
 
         Ok(())

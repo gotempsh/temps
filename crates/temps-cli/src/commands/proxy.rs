@@ -546,6 +546,9 @@ impl ProxyCommand {
             console_startup: None,
             // The console process samples the host (`temps serve --role=console`).
             host_metrics: false,
+            // The console is another process and runs no connector here
+            // (ADR-107 D2), so nothing is bound for a tunnel.
+            tunnel_origin: None,
         };
         let listener = Arc::new(temps_routes::RouteTableListener::new(
             route_table.clone(),

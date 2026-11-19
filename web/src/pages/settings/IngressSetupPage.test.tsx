@@ -79,10 +79,23 @@ function setup({
     worker(2, 'worker-b'),
     worker(3, 'worker-c', 'offline'),
   ],
-}: { nodes?: () => ReturnType<typeof worker>[] | Response } = {}) {
+  entry = '/settings/nodes/ingress',
+}: {
+  nodes?: () => ReturnType<typeof worker>[] | Response
+  entry?: string
+} = {}) {
   const posted: { path: string; body: unknown }[] = []
-  // The tunnel comes back with the suffix it was created with.
+  // The tunnel comes back with the suffix and placement it was created with.
   let hostSuffix: string | null = null
+  let placed: number[] = [1]
+  const nodesOf = (state: string) =>
+    placed.map((node_id) => ({
+      node_id,
+      node_name:
+        node_id === 0 ? 'Control plane' : `worker-${'abc'[node_id - 1]}`,
+      state,
+      ready_connections: 4,
+    }))
   // A pasted token adds account 2 next to the existing account 1.
   const accounts = [cloudflareAccount(1, 'Cloudflare')]
   const perAccount = (id: number) => ({
@@ -139,23 +152,35 @@ function setup({
       return new Response(null, { status: 204 })
     },
     'POST /ingress/connectors': async (request) => {
-      const body = (await request.json()) as { host_suffix?: string }
+      const body = (await request.json()) as {
+        host_suffix?: string
+        node_ids?: number[]
+      }
       posted.push({ path: 'connectors', body })
       hostSuffix = body.host_suffix ?? null
+      placed = body.node_ids ?? placed
       return jsonResponse(
-        { ...tunnel('pending'), host_suffix: hostSuffix },
+        {
+          ...tunnel('pending'),
+          nodes: nodesOf('pending'),
+          host_suffix: hostSuffix,
+        },
         201
       )
     },
     'GET /ingress/connectors/9': () =>
-      jsonResponse({ ...tunnel('ready'), host_suffix: hostSuffix }),
+      jsonResponse({
+        ...tunnel('ready'),
+        nodes: nodesOf('ready'),
+        host_suffix: hostSuffix,
+      }),
   })
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   })
   render(
     <QueryClientProvider client={client}>
-      <MemoryRouter initialEntries={['/settings/nodes/ingress']}>
+      <MemoryRouter initialEntries={[entry]}>
         <BreadcrumbProvider>
           <IngressSetupPage />
         </BreadcrumbProvider>
@@ -424,6 +449,10 @@ test('a run\u2019s result stays when a later poll finds no workers', async () =>
   await client.refetchQueries({ queryKey: adminListNodesQueryKey() })
 
   await screen.findByText(/This cluster has no worker nodes any more/)
+  // The tunnel wizard still works without one: it says so.
+  expect(
+    screen.getByText(/A new tunnel can still run on the control plane/)
+  ).toBeTruthy()
   // The result, not the empty-cluster onboarding that would replace it.
   expect(
     screen.getByText('Visitors can reach apps under example.com')
@@ -473,4 +502,45 @@ test('a picked worker that goes offline holds Create until the operator decides'
   expect(posted.find((p) => p.path === 'connectors')?.body).toMatchObject({
     node_ids: [1],
   })
+})
+
+test('with no worker the tunnel runs on the control plane', async () => {
+  const { posted } = setup({ nodes: () => [] })
+  await screen.findByText('example.com')
+  expect(screen.queryByText('No worker node yet')).toBeNull()
+  const controlPlane = screen.getByRole('checkbox', { name: 'Control plane' })
+  await waitFor(() =>
+    expect(controlPlane.getAttribute('data-state')).toBe('checked')
+  )
+  fireEvent.click(screen.getByRole('radio', { name: /example\.com/ }))
+  const create = screen.getByRole('button', { name: 'Create tunnel' })
+  await waitFor(() => expect(create.hasAttribute('disabled')).toBe(false))
+  fireEvent.click(create)
+  await waitFor(() =>
+    expect(posted.find((p) => p.path === 'connectors')?.body).toMatchObject({
+      node_ids: [0],
+    })
+  )
+  // The run follows the control plane's connector to the end.
+  await screen.findByText('Visitors can reach apps under example.com')
+  expect(screen.getByText('Connected on Control plane')).toBeTruthy()
+  // The control plane has no worker page to link to.
+  expect(screen.getAllByText('Control plane').length).toBeGreaterThan(0)
+  expect(screen.queryByRole('link', { name: 'Control plane' })).toBeNull()
+})
+
+test('with a worker picked the control plane is offered but not picked', async () => {
+  setup()
+  await screen.findByText('example.com')
+  const controlPlane = screen.getByRole('checkbox', { name: 'Control plane' })
+  const a = screen.getByRole('checkbox', { name: 'worker-a' })
+  await waitFor(() => expect(a.getAttribute('data-state')).toBe('checked'))
+  expect(controlPlane.getAttribute('data-state')).toBe('unchecked')
+  expect(controlPlane.hasAttribute('disabled')).toBe(false)
+})
+
+test('open ports still need a worker', async () => {
+  setup({ nodes: () => [], entry: '/settings/nodes/ingress?via=ports' })
+  await screen.findByText('No worker node yet')
+  expect(screen.queryByRole('checkbox', { name: 'Control plane' })).toBeNull()
 })

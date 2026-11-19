@@ -58,7 +58,7 @@ use temps_entities::node_resource_settings::{NodeResourcePolicy, SystemReserved}
 use temps_workload::{Isolation, PlacementSpec, Resources, WorkloadKind};
 
 /// The control plane, which has no `nodes` row.
-pub const CONTROL_PLANE_NODE_ID: i32 = 0;
+pub const CONTROL_PLANE_NODE_ID: i32 = temps_core::CONTROL_PLANE_NODE_ID;
 /// Nodes at or above this load score are passed over, unless every node is.
 pub const DEFAULT_MAX_LOAD_THRESHOLD: f64 = 0.90;
 /// The node label that carries a scheduling role.

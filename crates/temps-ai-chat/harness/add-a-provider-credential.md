@@ -85,9 +85,14 @@ provider, OIDC sign-in providers (`/settings`), AI model provider keys,
 platform settings and the CI builder, and service credentials (Temps generates
 database passwords; leave them out of `create_service`).
 
-A tunnel only runs on a worker node that allows public ingress. On an install
-whose only node is the control plane, say so plainly and offer the two ways
-on: turn on public ingress for the control plane and point DNS at its public
-address, or add a worker (it can be the same machine) and delegate ingress on
-it with `temps agent ingress delegated`. Do not propose `create_ingress_connector`
-until one exists.
+A tunnel runs on the control plane, on worker nodes that allow public
+ingress, or on both. On an install whose only node is the control plane, place
+it there: `create_ingress_connector` with `--node_ids 0` (node `0` is the
+control plane); no worker is needed. Prefer `get_reachability_choices` first:
+its `new_tunnel` choice already names the node to use. When creating it on
+node `0` is refused because the control plane runs its proxy as a separate
+process (`temps serve --role console`), say so plainly and offer the other ways
+on: place the tunnel on a worker, or turn on public ingress for the control
+plane and point DNS at its public address. Placing a tunnel on both the
+control plane and a worker publishes only the apps the workers serve; for apps
+the control plane runs, use node `0` alone.

@@ -73,6 +73,10 @@ import {
   uniqueTunnelName,
   workerEligibility,
   type WorkerEligibility,
+  CONTROL_PLANE_NAME,
+  CONTROL_PLANE_NODE_ID,
+  controlPlaneEligibility,
+  pickedNodeName,
 } from '@/components/nodes/ingress-setup'
 import { WorkerIngressBadge } from '@/components/nodes/WorkerIngressBadge'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
@@ -146,10 +150,12 @@ export function IngressSetupPage() {
   // result and the undo it offers.
   const [hadWorkers, setHadWorkers] = useState(false)
   if (workers.length > 0 && !hadWorkers) setHadWorkers(true)
+  const loaded =
+    !nodesQuery.isLoading && !(nodesQuery.isError && !nodesQuery.data)
+  // A tunnel can run on the control plane itself (ADR-107), so it needs no
+  // worker; open ports are set up on a worker.
   const showWizard =
-    !nodesQuery.isLoading &&
-    !(nodesQuery.isError && !nodesQuery.data) &&
-    (workers.length > 0 || hadWorkers)
+    loaded && (via === 'tunnel' || workers.length > 0 || hadWorkers)
   const anyPublic = workers.some((w) => addressScope(w.address) === 'public')
 
   const choose = (next: IngressWay) => {
@@ -180,9 +186,9 @@ export function IngressSetupPage() {
             title="Cloudflare Tunnel"
             badge={!anyPublic ? 'Recommended' : undefined}
           >
-            The worker connects out to Cloudflare, and visitors come in through
-            Cloudflare&apos;s network. No public IP, open port or router change;
-            Cloudflare serves HTTPS. Best when the worker has no public IP.
+            This server or a worker connects out to Cloudflare, and visitors
+            come in through Cloudflare&apos;s network. No public IP, open port
+            or router change; Cloudflare serves HTTPS. Best behind NAT.
           </WayCard>
           <WayCard
             value="ports"
@@ -215,13 +221,16 @@ export function IngressSetupPage() {
             </Button>
           </AlertDescription>
         </Alert>
-      ) : workers.length === 0 && !hadWorkers ? (
+      ) : via === 'ports' && workers.length === 0 && !hadWorkers ? (
         <NoWorkers />
       ) : null}
-      {showWizard && workers.length === 0 && (
+      {showWizard && workers.length === 0 && hadWorkers && (
         <p className="text-xs text-amber-700 dark:text-amber-300">
-          This cluster has no worker nodes any more, so nothing new can be set
-          up here. What this page reported is kept below.
+          This cluster has no worker nodes any more.{' '}
+          {via === 'tunnel'
+            ? 'A new tunnel can still run on the control plane.'
+            : 'Open ports need a worker, so nothing new can be set up here.'}{' '}
+          What this page reported is kept below.
         </p>
       )}
       {/* A failed poll keeps the last list: replacing the wizard here would
@@ -403,14 +412,26 @@ function TunnelSetup({
       workerEligibility(node, settingsQueries[index]?.data?.mode, tunnels),
     ])
   )
+  const workerDefaults = workers
+    .filter((n) => eligibility.get(n.id)?.defaultOn)
+    .map((n) => n.id)
+  const controlPlane = controlPlaneEligibility(tunnels, workerDefaults.length)
+  eligibility.set(CONTROL_PLANE_NODE_ID, controlPlane)
   const defaults =
     preferredWorker != null && eligibility.get(preferredWorker)?.selectable
       ? [preferredWorker]
-      : workers.filter((n) => eligibility.get(n.id)?.defaultOn).map((n) => n.id)
+      : controlPlane.defaultOn
+        ? [CONTROL_PLANE_NODE_ID]
+        : workerDefaults
   const nodeIds = (picked ?? defaults).filter(
     (id) => eligibility.get(id)?.selectable
   )
-  const chosenNodes = workers.filter((n) => nodeIds.includes(n.id))
+  const chosenNodes = [
+    ...(nodeIds.includes(CONTROL_PLANE_NODE_ID)
+      ? [{ id: CONTROL_PLANE_NODE_ID, name: CONTROL_PLANE_NAME }]
+      : []),
+    ...workers.filter((n) => nodeIds.includes(n.id)),
+  ]
   // Workers the operator picked that a later poll made unavailable (offline,
   // removed): the run would quietly use fewer, so it waits for a decision.
   const droppedPicks = (picked ?? [])
@@ -635,14 +656,15 @@ function TunnelSetup({
 
         <Card className="shadow-none">
           <CardHeader>
-            <CardTitle className="text-base">4. Workers</CardTitle>
+            <CardTitle className="text-base">4. Where it runs</CardTitle>
             <CardDescription>
-              Every worker picked runs the tunnel. With more than one, apps stay
-              reachable when a worker goes down.
+              Every node picked runs the tunnel. With more than one, apps stay
+              reachable when one goes down.
             </CardDescription>
           </CardHeader>
           <CardContent>
             <WorkerPicker
+              controlPlane={controlPlane}
               workers={workers}
               eligibility={eligibility}
               selected={nodeIds}
@@ -668,8 +690,8 @@ function TunnelSetup({
           <CardTitle className="text-base">5. Create</CardTitle>
           <CardDescription>
             {ready
-              ? `Creates tunnel ${tunnelName} in Cloudflare for ${tunnelDomain}, running on ${chosenNodes.map((n) => n.name).join(', ')}.${managed ? '' : ` Adds ${zone} to Temps first.`}`
-              : 'Pick an account, a domain and at least one worker.'}
+              ? `Creates tunnel ${tunnelName} in Cloudflare for ${tunnelDomain}, running on ${chosenNodes.map(pickedNodeName).join(', ')}.${managed ? '' : ` Adds ${zone} to Temps first.`}`
+              : 'Pick an account, a domain and where it runs.'}
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
@@ -1362,10 +1384,7 @@ function ConflictNote({ tunnel }: { tunnel: ConnectorView }) {
           <>
             {' '}
             (it runs on{' '}
-            <Link className="underline" to={workerUrl(first.node_id)}>
-              {first.node_name}
-            </Link>
-            )
+            <NodeLink nodeId={first.node_id} name={first.node_name} />)
           </>
         )}
         .
@@ -1375,31 +1394,60 @@ function ConflictNote({ tunnel }: { tunnel: ConnectorView }) {
 }
 
 function WorkerPicker({
+  controlPlane,
   workers,
   eligibility,
   selected,
   onChange,
 }: {
+  controlPlane: WorkerEligibility
   workers: NodeInfoResponse[]
   eligibility: Map<number, WorkerEligibility>
   selected: number[]
   onChange: (ids: number[]) => void
 }) {
-  const allServed = workers.every(
-    (n) =>
-      !eligibility.get(n.id)?.selectable || eligibility.get(n.id)?.hasIngress
-  )
+  const allServed =
+    controlPlane.hasIngress &&
+    workers.every(
+      (n) =>
+        !eligibility.get(n.id)?.selectable || eligibility.get(n.id)?.hasIngress
+    )
   const toggle = (id: number, on: boolean) =>
     onChange(on ? [...selected, id] : selected.filter((n) => n !== id))
   return (
     <div className="space-y-3">
       {allServed && selected.length === 0 && (
         <p className="text-sm text-muted-foreground">
-          Every worker that can take a tunnel already has a way in. Pick the
-          ones that should also run this one.
+          Every node that can take a tunnel already has a way in. Pick the ones
+          that should also run this one.
         </p>
       )}
       <ul className="divide-y rounded-md border">
+        <li className="space-y-2 p-3">
+          <div className="flex flex-wrap items-center gap-2">
+            <Checkbox
+              id="worker-control-plane"
+              checked={selected.includes(CONTROL_PLANE_NODE_ID)}
+              onCheckedChange={(on) =>
+                toggle(CONTROL_PLANE_NODE_ID, on === true)
+              }
+            />
+            <Label htmlFor="worker-control-plane" className="font-medium">
+              {CONTROL_PLANE_NAME}
+            </Label>
+            <span className="text-xs text-muted-foreground">This server</span>
+            {controlPlane.hasIngress && (
+              <Badge variant="secondary">Runs a tunnel</Badge>
+            )}
+          </div>
+          {selected.includes(CONTROL_PLANE_NODE_ID) &&
+            selected.some((id) => id !== CONTROL_PLANE_NODE_ID) && (
+              <p className="pl-6 text-xs text-muted-foreground">
+                With a worker too, the tunnel publishes only the apps the
+                workers serve.
+              </p>
+            )}
+        </li>
         {workers.map((node) => {
           const state = eligibility.get(node.id)
           const id = `worker-${node.id}`
@@ -1678,14 +1726,25 @@ function OutcomePanel({
   )
 }
 
+/**
+ * A worker's name links to its tunnel controls. The control plane has no
+ * such page section (its tunnels are managed here), so it is named only.
+ */
+function NodeLink({ nodeId, name }: { nodeId: number; name: string }) {
+  if (nodeId === CONTROL_PLANE_NODE_ID) return <span>{name}</span>
+  return (
+    <Link className="underline" to={workerUrl(nodeId)}>
+      {name}
+    </Link>
+  )
+}
+
 function WorkerLinks({ nodes }: { nodes: ConnectorView['nodes'] }) {
   return (
     <p className="flex flex-wrap gap-x-3 gap-y-1">
-      <span>Workers:</span>
+      <span>Runs on:</span>
       {nodes.map((n) => (
-        <Link key={n.node_id} className="underline" to={workerUrl(n.node_id)}>
-          {n.node_name}
-        </Link>
+        <NodeLink key={n.node_id} nodeId={n.node_id} name={n.node_name} />
       ))}
     </p>
   )
