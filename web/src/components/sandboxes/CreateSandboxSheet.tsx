@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useEffect, type ReactNode } from 'react'
+import { useEffect, useState, type ReactNode } from 'react'
 import { useNavigate } from 'react-router'
 import { useForm } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
@@ -57,6 +57,8 @@ import {
   type CreateSandboxFormValues,
 } from './sandbox-create'
 import { SandboxBackendLogo } from './SandboxBackendLogo'
+import { SandboxCreationSteps, useSandboxCreation } from './SandboxCreationSteps'
+import { newCreationId } from './sandbox-creation'
 
 const LIFECYCLES = [
   {
@@ -130,12 +132,18 @@ export function CreateSandboxSheet({
   })
   const { reset: resetCreate } = create
 
+  // The id the current attempt's steps are tracked under. Set on submit,
+  // kept after a failure so the failed step stays on screen.
+  const [creationId, setCreationId] = useState<string | null>(null)
+  const creation = useSandboxCreation(creationId)
+
   // Start from a clean form, and without the previous attempt's error, each
   // time the sheet is opened (it stays mounted while closed).
   useEffect(() => {
     if (!open) return
     form.reset(createSandboxFormDefaults)
     resetCreate()
+    setCreationId(null)
   }, [open, form, resetCreate])
 
   const placement = useQuery({
@@ -150,8 +158,12 @@ export function CreateSandboxSheet({
   const backends = backendChoices(allNodes, selectedNode)
   const target = targetNode(allNodes, selectedNode)
 
-  const submit = (values: CreateSandboxFormValues) =>
-    create.mutate({ body: toCreateSandboxBody(values) })
+  const submit = (values: CreateSandboxFormValues) => {
+    const id = newCreationId()
+    setCreationId(id)
+    create.mutate({ body: { ...toCreateSandboxBody(values), creation_id: id } })
+  }
+  const showSteps = creationId !== null && (create.isPending || create.isError)
 
   return (
     <Sheet
@@ -480,15 +492,16 @@ export function CreateSandboxSheet({
               )}
             />
 
-            {create.isPending && (
-              <Alert>
-                <AlertDescription>
-                  Starting the sandbox. The first one on a node builds its
-                  image, which can take several minutes. You can close this
-                  panel: it keeps starting and appears in the sandbox list
-                  when it is ready.
-                </AlertDescription>
-              </Alert>
+            {showSteps && (
+              <div className="space-y-2 rounded-lg border p-3">
+                <SandboxCreationSteps creation={creation.data} />
+                {create.isPending && (
+                  <p className="text-xs text-muted-foreground">
+                    You can close this panel: the sandbox keeps starting and
+                    appears in the sandbox list when it is ready.
+                  </p>
+                )}
+              </div>
             )}
 
             {create.isError && (

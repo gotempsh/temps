@@ -9294,6 +9294,13 @@ export type CreateSandboxBody = {
      */
     cpu_limit?: number | null;
     /**
+     * Id the client gives this create, so it can read the create's steps
+     * from `GET /v1/sandboxes/creations/{creation_id}` while it waits for
+     * this request: 8 to 64 letters, digits, `-` or `_`, new for every
+     * create (a UUID works). Optional.
+     */
+    creation_id?: string | null;
+    /**
      * Root disk size in MB, `[1, 65536]` (Firecracker only; Docker ignores
      * it). Omit for the platform default (1 GiB).
      */
@@ -9595,6 +9602,41 @@ export type CreatedShieldTokenResponse = ShieldTokenResponse & {
      */
     secret: string;
 };
+
+export type CreationStatus = 'running' | 'succeeded' | 'failed';
+
+/**
+ * One step and where it stands.
+ */
+export type CreationStep = {
+    /**
+     * Image download progress (`pull_image` only), when the registry
+     * reports sizes.
+     */
+    bytes_done?: number | null;
+    bytes_total?: number | null;
+    /**
+     * What the step did or is doing (`already present`, `on node
+     * worker-1`, `downloading`), or why it was skipped.
+     */
+    detail?: string | null;
+    /**
+     * Why the step failed, with the node, image or sandbox involved.
+     */
+    error?: string | null;
+    finished_at?: string | null;
+    kind: CreationStepKind;
+    started_at?: string | null;
+    status: CreationStepStatus;
+    title: string;
+};
+
+/**
+ * One step of a sandbox create, in the order the create runs them.
+ */
+export type CreationStepKind = 'check_request' | 'select_node' | 'record_sandbox' | 'pull_image' | 'create_container' | 'start_container' | 'wait_ready' | 'seed_source' | 'ready';
+
+export type CreationStepStatus = 'pending' | 'running' | 'done' | 'failed' | 'skipped';
 
 /**
  * How a stored credential is presented to the destination, plus any fixed
@@ -17826,6 +17868,49 @@ export type HistogramSummary = {
 };
 
 /**
+ * One host's sandbox image preparation, as the API reports it.
+ */
+export type HostImagePreparation = {
+    /**
+     * The host can take new sandboxes, so it is worth preparing.
+     */
+    eligible: boolean;
+    /**
+     * Why the host is not eligible, when it is not.
+     */
+    ineligible_reason?: string | null;
+    is_control_plane: boolean;
+    /**
+     * Temps keeps this host's default sandbox image pulled, re-pulling it
+     * when the default changes. Turned on by "prepare".
+     */
+    keep_prepared: boolean;
+    /**
+     * Why the last preparation failed.
+     */
+    last_error?: string | null;
+    last_error_at?: string | null;
+    /**
+     * Node id; `0` for the control plane.
+     */
+    node_id: number;
+    node_name: string;
+    /**
+     * The image Temps last prepared on this host.
+     */
+    prepared_image?: string | null;
+    /**
+     * A previously prepared image still to remove (a container used it).
+     */
+    stale_image?: string | null;
+    status?: ImagePrepareStatus | null;
+    /**
+     * Why the status could not be read.
+     */
+    status_error?: string | null;
+};
+
+/**
  * Whether Temps runs a project's app.
  *
  * `External` projects run elsewhere (Vercel, Netlify, a VPS) and only send
@@ -18075,6 +18160,55 @@ export type ImageInfo = {
      * Working directory (WORKDIR from Dockerfile)
      */
     working_dir?: string | null;
+};
+
+/**
+ * Where one host stands with one sandbox image.
+ */
+export type ImagePrepareState = 'not_pulled' | 'pulling' | 'ready' | 'failed' | 'unsupported';
+
+/**
+ * One host's status for one sandbox image.
+ */
+export type ImagePrepareStatus = {
+    /**
+     * The image was already on the host when the attempt started: nothing
+     * was downloaded.
+     */
+    already_present?: boolean;
+    /**
+     * Bytes downloaded so far, summed over the layers the registry
+     * reported. `None` before the registry reports any size.
+     */
+    bytes_done?: number | null;
+    /**
+     * Total bytes to download, summed over the layers reported so far (it
+     * grows while the registry announces layers).
+     */
+    bytes_total?: number | null;
+    /**
+     * What a running pull is doing right now (`downloading`, `extracting`,
+     * `building locally`).
+     */
+    detail?: string | null;
+    /**
+     * Why the last attempt failed, or why the host cannot prepare images.
+     */
+    error?: string | null;
+    /**
+     * When the last attempt finished.
+     */
+    finished_at?: string | null;
+    /**
+     * The exact reference a create on this host would use (tag or
+     * `@sha256:` digest), so the pre-pull and the create cannot disagree.
+     */
+    image: string;
+    /**
+     * When the running or last attempt started.
+     */
+    started_at?: string | null;
+    state: ImagePrepareState;
 };
 
 /**
@@ -25196,6 +25330,17 @@ export type PostgresWalHealth = {
 };
 
 /**
+ * Start preparing sandbox hosts.
+ */
+export type PrepareSandboxImagesBody = {
+    /**
+     * The host to prepare: a node id, or `0` for the control plane.
+     * Omitted or `null`: every host eligible for sandbox placement.
+     */
+    node_id?: number | null;
+};
+
+/**
  * Union type for preset configurations
  * Use the appropriate configuration type based on your preset
  */
@@ -29981,6 +30126,31 @@ export type SandboxConnections = {
 };
 
 /**
+ * A sandbox create and its steps.
+ */
+export type SandboxCreation = {
+    /**
+     * The id the client gave the create (or one the server generated).
+     */
+    creation_id: string;
+    /**
+     * Why the create failed.
+     */
+    error?: string | null;
+    finished_at?: string | null;
+    /**
+     * The sandbox's public id, once its row exists.
+     */
+    sandbox_id?: string | null;
+    started_at: string;
+    status: CreationStatus;
+    /**
+     * Every step, in order.
+     */
+    steps: Array<CreationStep>;
+};
+
+/**
  * One directory of the chat's sandbox: folders first, then files, by name.
  */
 export type SandboxDirectory = {
@@ -30111,6 +30281,21 @@ export type SandboxFileView = {
      */
     size: number;
     truncated: boolean;
+};
+
+/**
+ * Every host that can run sandboxes and its image preparation.
+ */
+export type SandboxImagePreparationResponse = {
+    /**
+     * Every eligible host has its default image: the next create on any of
+     * them starts without a download.
+     */
+    all_ready: boolean;
+    /**
+     * Control plane first, then workers by name.
+     */
+    hosts: Array<HostImagePreparation>;
 };
 
 /**
@@ -37216,6 +37401,17 @@ export type UpdateGroupEnvVarRequest = {
     include_in_preview?: boolean | null;
     is_secret?: boolean | null;
     value?: string | null;
+};
+
+/**
+ * Turn keeping one host prepared on or off.
+ */
+export type UpdateHostImagePreparationBody = {
+    /**
+     * Keep this host's default sandbox image pulled, re-pulling it when an
+     * upgrade changes the default. `false` stops that; it removes nothing.
+     */
+    keep_prepared: boolean;
 };
 
 /**
@@ -97097,6 +97293,152 @@ export type CreateSandboxResponses = {
 
 export type CreateSandboxResponse = CreateSandboxResponses[keyof CreateSandboxResponses];
 
+export type GetSandboxCreationData = {
+    body?: never;
+    path: {
+        /**
+         * The `creation_id` sent with the create
+         */
+        creation_id: string;
+    };
+    query?: never;
+    url: '/v1/sandboxes/creations/{creation_id}';
+};
+
+export type GetSandboxCreationErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * No create with this id is tracked for the caller (unknown, or finished more than 15 minutes ago)
+     */
+    404: unknown;
+};
+
+export type GetSandboxCreationResponses = {
+    /**
+     * The create and its ordered steps
+     */
+    200: SandboxCreation;
+};
+
+export type GetSandboxCreationResponse = GetSandboxCreationResponses[keyof GetSandboxCreationResponses];
+
+export type GetSandboxImagePreparationData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/v1/sandboxes/image-preparation';
+};
+
+export type GetSandboxImagePreparationErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * The hosts could not be listed
+     */
+    500: unknown;
+};
+
+export type GetSandboxImagePreparationResponses = {
+    /**
+     * Image preparation of every sandbox host
+     */
+    200: SandboxImagePreparationResponse;
+};
+
+export type GetSandboxImagePreparationResponse = GetSandboxImagePreparationResponses[keyof GetSandboxImagePreparationResponses];
+
+export type PrepareSandboxImagesData = {
+    body: PrepareSandboxImagesBody;
+    path?: never;
+    query?: never;
+    url: '/v1/sandboxes/image-preparation';
+};
+
+export type PrepareSandboxImagesErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Administrator role required
+     */
+    403: unknown;
+    /**
+     * No such host
+     */
+    404: unknown;
+    /**
+     * The host (or every host) cannot take sandboxes
+     */
+    422: unknown;
+    /**
+     * The preparation could not be recorded
+     */
+    500: unknown;
+};
+
+export type PrepareSandboxImagesResponses = {
+    /**
+     * Preparation started; current status of every host
+     */
+    202: SandboxImagePreparationResponse;
+};
+
+export type PrepareSandboxImagesResponse = PrepareSandboxImagesResponses[keyof PrepareSandboxImagesResponses];
+
+export type UpdateHostImagePreparationData = {
+    body: UpdateHostImagePreparationBody;
+    path: {
+        /**
+         * Node id, or `0` for the control plane
+         */
+        node_id: number;
+    };
+    query?: never;
+    url: '/v1/sandboxes/image-preparation/nodes/{node_id}';
+};
+
+export type UpdateHostImagePreparationErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Administrator role required
+     */
+    403: unknown;
+    /**
+     * No such host
+     */
+    404: unknown;
+    /**
+     * The change could not be saved
+     */
+    500: unknown;
+};
+
+export type UpdateHostImagePreparationResponses = {
+    /**
+     * Updated image preparation of every host
+     */
+    200: SandboxImagePreparationResponse;
+};
+
+export type UpdateHostImagePreparationResponse = UpdateHostImagePreparationResponses[keyof UpdateHostImagePreparationResponses];
+
 export type GetSandboxPlacementData = {
     body?: never;
     path?: never;
@@ -97381,6 +97723,42 @@ export type CmdLogsResponses = {
      */
     200: unknown;
 };
+
+export type GetSandboxCreationBySandboxData = {
+    body?: never;
+    path: {
+        /**
+         * Sandbox id
+         */
+        id: string;
+    };
+    query?: never;
+    url: '/v1/sandboxes/{id}/creation';
+};
+
+export type GetSandboxCreationBySandboxErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * No such sandbox for the caller, or its create is no longer tracked
+     */
+    404: unknown;
+};
+
+export type GetSandboxCreationBySandboxResponses = {
+    /**
+     * The create and its ordered steps
+     */
+    200: SandboxCreation;
+};
+
+export type GetSandboxCreationBySandboxResponse = GetSandboxCreationBySandboxResponses[keyof GetSandboxCreationBySandboxResponses];
 
 export type DestroySandboxData = {
     body?: never;

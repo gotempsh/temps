@@ -2,6 +2,11 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { SandboxDetailTabs } from '@/components/sandboxes/SandboxDetailTabs'
+import { SandboxCreationSteps } from '@/components/sandboxes/SandboxCreationSteps'
+import {
+  CREATION_POLL_MS,
+  creationRunning,
+} from '@/components/sandboxes/sandbox-creation'
 import { SandboxVaultAccess } from '@/components/service-access/SandboxVaultAccess'
 import { SandboxInternalAddressesCard } from '@/components/sandboxes/SandboxInternalAddressesCard'
 import { useEffect, useMemo, useRef, useState } from 'react'
@@ -70,6 +75,7 @@ import {
   execMutation,
   extendTimeoutMutation,
   getSandboxOptions,
+  getSandboxCreationBySandboxOptions,
   getSandboxQueryKey,
   listEventsOptions,
   listEventsQueryKey,
@@ -277,9 +283,22 @@ export default function SandboxDetail() {
   } = useQuery({
     ...sandboxQuery,
     enabled: sandboxId.length > 0,
-    refetchInterval: 10_000,
+    // Faster while the create runs, so the page flips to running promptly.
+    refetchInterval: (query) =>
+      query.state.data?.sandbox.status === 'starting' ? 2_000 : 10_000,
   })
   const sandbox = sandboxResp ? toSandboxView(sandboxResp.sandbox) : undefined
+
+  // The create's steps, while it runs. A 404 means this server no longer
+  // tracks it (restarted, or finished long ago): the page just says Starting.
+  const starting = sandbox?.status === 'starting'
+  const creationQuery = useQuery({
+    ...getSandboxCreationBySandboxOptions({ path: { id: sandboxId } }),
+    enabled: starting,
+    retry: false,
+    refetchInterval: (query) =>
+      starting && creationRunning(query.state.data) ? CREATION_POLL_MS : false,
+  })
 
   const now = useNow(!!sandbox && sandbox.status !== 'destroyed')
 
@@ -791,6 +810,18 @@ export default function SandboxDetail() {
                 onRetry={() => refetch()}
                 retrying={isFetching}
               />
+            )}
+            {starting && !creationQuery.isError && (
+              <Card>
+                <CardHeader className="pb-3">
+                  <CardTitle className="text-sm font-medium">
+                    Creating the sandbox
+                  </CardTitle>
+                </CardHeader>
+                <CardContent>
+                  <SandboxCreationSteps creation={creationQuery.data} />
+                </CardContent>
+              </Card>
             )}
             {!destroyed && (
               <div
