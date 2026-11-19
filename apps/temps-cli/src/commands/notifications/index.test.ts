@@ -11,6 +11,10 @@ import {
   buildEmailConfigUpdate,
   buildWebhookConfigUpdate,
   parseProviderIds,
+  hasTelegramConfigChanges,
+  parseTopicId,
+  buildTelegramConfigUpdate,
+  KEEP_STORED_SECRET,
 } from './index.js'
 
 describe('parseEnabledFlag', () => {
@@ -162,5 +166,50 @@ describe('parseProviderIds', () => {
 
   test('a single ID parses to a one-element array', () => {
     expect(parseProviderIds('42')).toEqual([42])
+  })
+})
+
+describe('telegram helpers', () => {
+  test('hasTelegramConfigChanges: true only when a telegram flag is present', () => {
+    expect(hasTelegramConfigChanges({})).toBe(false)
+    expect(hasTelegramConfigChanges({ botToken: '123:abc' })).toBe(true)
+    expect(hasTelegramConfigChanges({ chatId: '-1001' })).toBe(true)
+    // An empty --topic-id is a deliberate "clear the topic", not an absent flag.
+    expect(hasTelegramConfigChanges({ topicId: '' })).toBe(true)
+  })
+
+  test('parseTopicId: integers parse, empty clears, anything else is invalid', () => {
+    expect(parseTopicId(undefined)).toBeUndefined()
+    expect(parseTopicId('42')).toBe(42)
+    expect(parseTopicId(' 7 ')).toBe(7)
+    expect(parseTopicId('')).toBeNull()
+    expect(parseTopicId('0')).toBe('invalid')
+    expect(parseTopicId('-3')).toBe('invalid')
+    expect(parseTopicId('4.5')).toBe('invalid')
+    expect(parseTopicId('general')).toBe('invalid')
+    expect(parseTopicId('99999999999999999999')).toBe('invalid')
+  })
+
+  test('buildTelegramConfigUpdate keeps the stored token when --bot-token is omitted', () => {
+    const current = { bot_token: '***', chat_id: '-1001234567890', message_thread_id: 12 }
+    expect(buildTelegramConfigUpdate({ chatId: '@alerts' }, undefined, current)).toEqual({
+      bot_token: KEEP_STORED_SECRET,
+      chat_id: '@alerts',
+      message_thread_id: 12,
+    })
+  })
+
+  test('buildTelegramConfigUpdate never echoes back a revealed token from the current config', () => {
+    const current = { bot_token: '123:revealed-secret', chat_id: '-1001' }
+    expect(buildTelegramConfigUpdate({}, undefined, current).bot_token).toBe(KEEP_STORED_SECRET)
+  })
+
+  test('buildTelegramConfigUpdate applies a new token, clears the topic, and stringifies a numeric chat id', () => {
+    const current = { bot_token: '***', chat_id: -1001234567890, message_thread_id: 12 }
+    expect(buildTelegramConfigUpdate({ botToken: '123:new' }, null, current)).toEqual({
+      bot_token: '123:new',
+      chat_id: '-1001234567890',
+      message_thread_id: null,
+    })
   })
 })
