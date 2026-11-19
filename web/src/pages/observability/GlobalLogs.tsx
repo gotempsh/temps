@@ -33,10 +33,37 @@ import {
   useGlobalLogSearch,
   type GlobalLogFilters,
 } from '@/hooks/useGlobalLogs'
+import { LogIngestKeys } from '@/components/observability/LogIngestKeys'
+import {
+  SavedLogSearches,
+  SavedSearchNotShown,
+} from '@/components/observability/SavedLogSearches'
+import {
+  savedQueryFromParams,
+  savedRangeFromWindow,
+  viewFromSavedSearch,
+} from '@/lib/saved-log-search'
 import { RefreshCw, Loader2 } from 'lucide-react'
 import { Callout, HelpPopover } from '@temps-sdk/ds'
 
 const LEVELS: LogLevel[] = ['TRACE', 'DEBUG', 'INFO', 'WARN', 'ERROR']
+
+/** The filter params alone, so a moving time window does not count as a change. */
+function filterKey(params: URLSearchParams): string {
+  const kept = new URLSearchParams()
+  for (const key of [
+    'project_id',
+    'source',
+    'level',
+    'env',
+    'node_id',
+    'deploy_id',
+    'q',
+  ])
+    if (params.get(key)) kept.set(key, params.get(key) ?? '')
+  for (const predicate of params.getAll('attr')) kept.append('attr', predicate)
+  return kept.toString()
+}
 
 export default function GlobalLogs() {
   const view = useGlobalView()
@@ -44,6 +71,13 @@ export default function GlobalLogs() {
   const { setBreadcrumbs } = useBreadcrumbs()
   useEffect(() => setBreadcrumbs([{ label: 'Logs' }]), [setBreadcrumbs])
   const [follow, setFollow] = useState(false)
+  // The saved search last opened, and the filters it holds that this page
+  // has no control for. Cleared as soon as the filters change by hand.
+  const [openedSearch, setOpenedSearch] = useState<{
+    name: string
+    notShown: string[]
+    key: string
+  } | null>(null)
   const source: LogSourceKind =
     view.params.get('source') === 'application'
       ? 'application'
@@ -138,6 +172,37 @@ export default function GlobalLogs() {
     setFollow(false)
     view.patch(patch)
   }
+  const openSavedSearch = (
+    saved: Parameters<typeof viewFromSavedSearch>[0] & { name: string }
+  ) => {
+    setFollow(false)
+    const opened = viewFromSavedSearch(saved)
+    view.advance()
+    const apply = (current: URLSearchParams) => {
+      const next = new URLSearchParams(current)
+      for (const [key, value] of Object.entries({
+        ...opened.patch,
+        range: opened.window.preset,
+        from:
+          opened.window.preset === 'custom' ? opened.window.from : undefined,
+        to: opened.window.preset === 'custom' ? opened.window.to : undefined,
+      })) {
+        if (value) next.set(key, value)
+        else next.delete(key)
+      }
+      next.delete('attr')
+      for (const predicate of opened.attrs) next.append('attr', predicate)
+      return next
+    }
+    // Every filter the key reads comes from the search itself, so the key
+    // of the page it opens is known before the URL changes.
+    setOpenedSearch({
+      name: saved.name,
+      notShown: opened.notShown,
+      key: filterKey(apply(new URLSearchParams())),
+    })
+    view.update(apply)
+  }
   const lines = search.error ? [] : search.lines
 
   // Facets count the whole time range, so they can name projects that have
@@ -224,6 +289,21 @@ export default function GlobalLogs() {
           view.projectId
             ? 'Container logs from the selected service, newest first.'
             : 'Container logs from every service and database, newest first.'
+        }
+        actions={
+          <div className="flex items-center gap-2">
+            <LogIngestKeys projectId={projectId} />
+            <SavedLogSearches
+              projectId={projectId}
+              currentQuery={savedQueryFromParams(view.params)}
+              currentRange={savedRangeFromWindow({
+                from: view.from,
+                to: view.to,
+                preset: view.range,
+              })}
+              onOpen={openSavedSearch}
+            />
+          </div>
         }
       />
       <LogCollectionNotice
@@ -333,6 +413,12 @@ export default function GlobalLogs() {
                 </HelpPopover>
               </div>
             </div>
+            {openedSearch && openedSearch.key === filterKey(view.params) && (
+              <SavedSearchNotShown
+                name={openedSearch.name}
+                notShown={openedSearch.notShown}
+              />
+            )}
             {attrs.length > 0 && (
               <AttrPredicateChips predicates={attrs} onRemove={removeAttr} />
             )}

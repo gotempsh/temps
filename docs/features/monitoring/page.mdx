@@ -337,6 +337,10 @@ Restart and Redeploy ask for confirmation first.
 
 When a metric alert rule fires, the Metrics page lists it above the charts. Click the row to open the chart of the metric that fired, with the rule's filters applied. **View alarm** opens the alarm the rule raised, where you can acknowledge or silence it. Rules that alert per series link to the alarm of the first firing series, and other rules open the project's alarm list. **Edit rule** opens the rule.
 
+### Alerts on log lines
+
+A metric alert rule can also count the log lines a saved search matches, for example error lines that mention a failed payment, and fire when the count crosses a threshold within a window of up to one hour. It raises alarms and notifications like any other rule. See [Alerts on Logs](/docs/logs#alerts-on-logs).
+
 ---
 
 ## Monitoring Best Practices

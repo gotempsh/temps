@@ -2,7 +2,8 @@
 
 ## Status
 
-Proposed — 2026-11-19
+Proposed — 2026-11-19. D1 implemented — 2026-11-19 (see *Settled while
+implementing D1*). D2 to D8 not started.
 
 Related: ADR 021 (multi-node log aggregation, humanized alert notifications),
 ADR 025 (unified alarm log), ADR 026 (metric alert label filters), ADR 045 to
@@ -86,6 +87,58 @@ The gaps, most important first.
   without Temps running a syslog listener. Over-budget batches are rejected
   with `429`, counted, and shown on the pipeline status page.
 - Log-derived series become a panel type in the existing dashboard builder.
+
+### Settled while implementing D1
+
+- **Which store a log alert counts (open question 2).** Both, chosen per
+  search. A saved search without a text needle is counted in the line
+  index plus the unsealed head buffers, exactly. A search with a text
+  needle, or an install without a line index, is counted by one bounded,
+  newest-first scan of the chunk store that stops at 1,000 matching lines.
+  The window is capped at one hour either way, so on a small host a rule
+  can never ask for more than an hour of history per evaluation.
+- **A capped count is a lower bound.** The evaluator reports it as
+  "at least N". It can establish "more than the threshold" but never
+  "fewer than": a below-threshold rule on a capped count is undecided and
+  keeps its state (and any open alarm) rather than firing or resolving. A
+  rule "more than the cap" could never fire and is refused when saved.
+- **Log alerts are static thresholds on a count.** No anomaly or forecast
+  detector (the metric history holds no log counts to learn from), no
+  `group_by`, no per-series alerting, aggregation fixed to `count`. An
+  alert on a numeric log field is not built; the dashboard can chart one.
+- **Saved searches.** Per project, at most 100, `logs:read` to see and the
+  new `logs:write` to change. The time range is one of `15m`, `1h`, `6h`,
+  `24h`, `7d`, `30d`; a custom window from the logs page is saved as the
+  nearest of those, since a saved search is a question to ask again, not a
+  fixed slice of the past. Deleting a search an alert counts is refused
+  with `409`; a dashboard tile charting a deleted search says so.
+  "Shared" means visible to everyone who can read the project's logs;
+  there are no private searches.
+- **Ingest keys are their own table**, modelled on the analytics ingest
+  keys of ADR 040 rather than reusing them: a log key is a different
+  capability (`tlk_` prefix, optionally pinned to an environment, with a
+  default service), and an analytics key must not be able to write logs.
+  Only the SHA-256 of a key is stored; the plaintext is returned once.
+  Lookups are cached for 30 seconds; revoking through the API evicts the
+  cached entry at once.
+- **A batch is all or nothing.** One malformed line refuses the batch with
+  its line number, and the ingest budget is charged and enforced per
+  batch, so a retrying collector never stores half a batch twice. Limits:
+  5 MiB per request, 10,000 lines, 256 KiB per line, 16 service names per
+  key (further names fold into the key's default service). A timestamp
+  more than 7 days old or 5 minutes ahead becomes arrival time and is kept
+  as an attribute.
+- **Dashboard tiles.** A tile's `source` is `metric` (the default, so
+  existing layouts are unchanged) or `logs` with a saved search and
+  `count` or `<fn>:<attribute>`. A count series is at most 240 buckets, a
+  numeric one at most 60 and needs the line index and no text needle. A
+  scanned count stops at 5,000 lines and reports from when it counted, so
+  a chart never draws zero for a period nobody counted.
+- **Console.** Saved searches and ingest keys are reached from the logs
+  page header, scoped to the service the page is filtered to. A log alert
+  is a choice in the existing alert form. There is no CLI for alert rules
+  of any kind yet, so log alerts are created in the console or the API;
+  the CLI gains `temps logs saved` and `temps logs keys`.
 
 ### D2. Status page subscribers and scheduled maintenance
 

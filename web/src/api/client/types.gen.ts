@@ -1616,6 +1616,22 @@ export type AlertRuleResponse = {
 };
 
 /**
+ * What series a rule is evaluated on (ADR 108 D1).
+ *
+ * A log rule carries its saved search in the same value, so "a log alert
+ * with nothing to count" cannot be constructed.
+ */
+export type AlertSeriesSource = {
+    kind: 'metric';
+} | {
+    kind: 'logs';
+    /**
+     * `log_saved_searches.id`, in the rule's own project.
+     */
+    saved_search_id: number;
+};
+
+/**
  * Wire-format allocation. `null` in the JSON when the node hasn't been
  * allocated yet — workers should treat that as "single-host mode, do
  * not bring up the overlay".
@@ -8657,6 +8673,22 @@ export type CreateIpAccessControlRequest = {
     reason?: string | null;
 };
 
+export type CreateLogIngestKeyRequest = {
+    /**
+     * Service label for lines that do not name one. Default `external`.
+     */
+    default_service?: string | null;
+    /**
+     * Pin the key to one environment of the project. Absent: lines are
+     * labelled with the environment `external`.
+     */
+    environment_id?: number | null;
+    /**
+     * A label for the collector or host using the key.
+     */
+    name: string;
+};
+
 export type CreateMcpRequest = {
     config: {
         [key: string]: unknown;
@@ -8668,7 +8700,8 @@ export type CreateMcpRequest = {
 
 export type CreateMetricAlertRequest = {
     /**
-     * One of `avg|sum|min|max|count|rate|p50|p90|p95|p99`.
+     * One of `avg|sum|min|max|count|rate|p50|p90|p95|p99`. Forced to
+     * `count` for a log alert, which counts matching lines.
      */
     aggregation: string;
     /**
@@ -8708,13 +8741,23 @@ export type CreateMetricAlertRequest = {
      * `|value|`). Range 1–100, default 20.
      */
     max_series?: number;
-    metric_name: string;
+    /**
+     * The OTel metric to watch. Required unless `source` is a saved log
+     * search, in which case the series is named by the server.
+     */
+    metric_name?: string | null;
     name: string;
     project_id: number;
     /**
      * One of `info|warning|critical`.
      */
     severity: string;
+    /**
+     * What the rule watches: the metric above (the default), or the number
+     * of log lines matching a saved search per window (ADR 108 D1):
+     * `{"kind":"logs","saved_search_id":3}`.
+     */
+    source?: AlertSeriesSource;
     window_secs: number;
 };
 
@@ -9423,6 +9466,27 @@ export type CreateSandboxPreviewSessionRequest = {
     url: string;
 };
 
+export type CreateSavedSearchRequest = {
+    description?: string | null;
+    /**
+     * Unique within the project.
+     */
+    name: string;
+    /**
+     * Pinned searches sort first. Default false.
+     */
+    pinned?: boolean;
+    /**
+     * The filter set. An empty query is allowed: "everything in this
+     * project" is a legitimate thing to pin.
+     */
+    query?: SavedSearchQuery;
+    /**
+     * One of `15m`, `1h`, `6h`, `24h`, `7d`, `30d`. Default `1h`.
+     */
+    time_range?: string | null;
+};
+
 export type CreateShieldEntryRequest = {
     /**
      * When the entry stops applying; omit for never.
@@ -9564,6 +9628,16 @@ export type CreateWorkflowGrantRequest = {
     action: WorkflowGrantAction;
     resource: string;
     source_environment_id: number;
+};
+
+/**
+ * A key just created: the only response that carries the plaintext.
+ */
+export type CreatedLogIngestKeyResponse = LogIngestKeyResponse & {
+    /**
+     * The full key. Shown once; only its hash is stored.
+     */
+    key: string;
 };
 
 /**
@@ -10039,9 +10113,30 @@ export type DashboardTile = {
      */
     metric_name: string;
     /**
+     * What the tile charts: the metric above (the default), or a saved log
+     * search over time (ADR 108 D1). A log tile ignores `metric_name`,
+     * `aggregation`, `label_filters` and `group_by`.
+     */
+    source?: DashboardTileSource;
+    /**
      * Optional display title; falls back to the metric name in the UI.
      */
     title?: string | null;
+};
+
+/**
+ * The series a tile charts.
+ */
+export type DashboardTileSource = {
+    kind: 'metric';
+} | {
+    kind: 'logs';
+    /**
+     * `count` (lines per bucket), or `avg`, `sum`, `max`, `p50`, `p95`,
+     * `p99` or `count_distinct` followed by `:<attribute>`.
+     */
+    metric?: string;
+    saved_search_id: number;
 };
 
 /**
@@ -20411,6 +20506,41 @@ export type LogIngestBudgetStatus = {
     throttled: Array<ThrottledLogSource>;
 };
 
+export type LogIngestKeyResponse = {
+    created_at: string;
+    created_by_user_id?: number | null;
+    default_service: string;
+    environment_id?: number | null;
+    id: number;
+    is_active: boolean;
+    /**
+     * The first characters of the key, for recognising it.
+     */
+    key_prefix: string;
+    last_used_at?: string | null;
+    /**
+     * Lines ingested with this key. Updated every 30 seconds.
+     */
+    line_count: number;
+    name: string;
+    project_id: number;
+    revoked_at?: string | null;
+};
+
+export type LogIngestKeysResponse = {
+    data: Array<LogIngestKeyResponse>;
+    page: number;
+    page_size: number;
+    total: number;
+};
+
+export type LogIngestResponse = {
+    /**
+     * Lines stored from this request.
+     */
+    accepted: number;
+};
+
 /**
  * Normalized log level
  */
@@ -20480,6 +20610,39 @@ export type LogSearchLine = {
      */
     stream: LogStream;
     timestamp: string;
+};
+
+/**
+ * A bucketed log series.
+ */
+export type LogSeries = {
+    method: LogSeriesMethod;
+    /**
+     * Set when a scan stopped at its cap: buckets ending before this time
+     * have no value.
+     */
+    partial_before?: string | null;
+    points: Array<LogSeriesPoint>;
+};
+
+/**
+ * How a series was computed.
+ */
+export type LogSeriesMethod = 'index' | 'scan';
+
+/**
+ * One bucket of a log series.
+ */
+export type LogSeriesPoint = {
+    /**
+     * Bucket start.
+     */
+    ts: string;
+    /**
+     * `None` when nothing was counted for the bucket (outside a capped
+     * scan) or no line contributed to a numeric aggregate.
+     */
+    value?: number | null;
 };
 
 /**
@@ -23472,6 +23635,11 @@ export type OtelMetricAlertRuleResponse = {
         [key: string]: SeriesStateEntry;
     };
     severity: string;
+    /**
+     * What the rule watches: the named metric, or a saved log search
+     * (ADR 108 D1).
+     */
+    source: AlertSeriesSource;
     updated_at: string;
     window_secs: number;
 };
@@ -30663,6 +30831,80 @@ export type SaveHttpCheck = {
     spec?: HttpCheckSpec | null;
 };
 
+/**
+ * The stored filter set of a saved search.
+ *
+ * Mirrors `GlobalLogSearchRequest` without `start_time`/`end_time`,
+ * `cursor`, `page_size` and the project selector: the window is the
+ * caller's and the project is the row's. External services are held as ids
+ * rather than names so counting a saved search needs no control-plane name
+ * resolution.
+ */
+export type SavedSearchQuery = {
+    /**
+     * Attribute predicates in the wire form the search endpoints take:
+     * `<key><op><value>` with `op` one of `=`, `!=`, `^=`, `>`, `<`, or
+     * `<key>?` for "exists".
+     */
+    attrs?: Array<string>;
+    container_ids?: Array<string>;
+    deploy_id?: number | null;
+    /**
+     * Environment identifiers as the store holds them.
+     */
+    envs?: Array<string>;
+    /**
+     * Narrow to these of the project's external services (databases,
+     * imported services). Empty means every source allowed by `source`.
+     */
+    external_service_ids?: Array<number>;
+    levels?: Array<LogLevel>;
+    node_ids?: Array<number>;
+    /**
+     * Container service labels (`web`, `worker`).
+     */
+    services?: Array<string>;
+    /**
+     * Which family of sources to search: everything the project has
+     * (`collected`), its application containers, or its databases.
+     */
+    source?: LogSourceKind;
+    /**
+     * Case-insensitive substring match over the message.
+     */
+    text?: string | null;
+};
+
+export type SavedSearchResponse = {
+    /**
+     * Log alert rules counting this search. A search with alerts cannot be
+     * deleted until they are detached, so the console can say so before
+     * offering the button.
+     */
+    alert_count: number;
+    created_at: string;
+    created_by?: number | null;
+    description?: string | null;
+    id: number;
+    name: string;
+    pinned: boolean;
+    project_id: number;
+    query: SavedSearchQuery;
+    time_range: string;
+    updated_at: string;
+};
+
+export type SavedSearchesResponse = {
+    data: Array<SavedSearchResponse>;
+    page: number;
+    page_size: number;
+    /**
+     * Allowed `time_range` values, so a client never has to hard-code them.
+     */
+    time_ranges: Array<string>;
+    total: number;
+};
+
 export type ScalewayCredentialsRequest = {
     api_key: SecretString;
     project_id: string;
@@ -37605,6 +37847,7 @@ export type UpdateMetricAlertRequest = {
     metric_name?: string | null;
     name?: string | null;
     severity?: string | null;
+    source?: AlertSeriesSource | null;
     window_secs?: number | null;
 };
 
@@ -37981,6 +38224,20 @@ export type UpdateSandboxPlacementBody = {
      * sandboxes keep running wherever they are.
      */
     allowed_node_ids: Array<number> | null;
+};
+
+export type UpdateSavedSearchRequest = {
+    /**
+     * Absent leaves the description unchanged; an empty string clears it.
+     */
+    description?: string | null;
+    /**
+     * Absent leaves the name unchanged.
+     */
+    name?: string | null;
+    pinned?: boolean | null;
+    query?: SavedSearchQuery | null;
+    time_range?: string | null;
 };
 
 export type UpdateSecretBody = {
@@ -65757,6 +66014,54 @@ export type SearchGlobalLogsResponses = {
 
 export type SearchGlobalLogsResponse = SearchGlobalLogsResponses[keyof SearchGlobalLogsResponses];
 
+export type IngestLogsData = {
+    /**
+     * One JSON object per line
+     */
+    body: string;
+    path?: never;
+    query?: never;
+    url: '/logs/ingest';
+};
+
+export type IngestLogsErrors = {
+    /**
+     * A line is not a JSON object
+     */
+    400: ProblemDetails;
+    /**
+     * Missing or unknown key
+     */
+    401: ProblemDetails;
+    /**
+     * Body too large
+     */
+    413: ProblemDetails;
+    /**
+     * Compressed body
+     */
+    415: ProblemDetails;
+    /**
+     * The project's log ingestion budget is exhausted
+     */
+    429: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type IngestLogsError = IngestLogsErrors[keyof IngestLogsErrors];
+
+export type IngestLogsResponses = {
+    /**
+     * Lines stored
+     */
+    202: LogIngestResponse;
+};
+
+export type IngestLogsResponse = IngestLogsResponses[keyof IngestLogsResponses];
+
 export type LogIngestBudgetData = {
     body?: never;
     path?: never;
@@ -70709,7 +71014,7 @@ export type GetTraceResponses = {
 
 export type GetTraceResponse = GetTraceResponses[keyof GetTraceResponses];
 
-export type IngestLogsData = {
+export type IngestLogs2Data = {
     /**
      * OTLP ExportLogsServiceRequest (protobuf, optionally gzip/zstd compressed)
      */
@@ -70719,7 +71024,7 @@ export type IngestLogsData = {
     url: '/otel/v1/logs';
 };
 
-export type IngestLogsErrors = {
+export type IngestLogs2Errors = {
     /**
      * Invalid payload
      */
@@ -70742,9 +71047,9 @@ export type IngestLogsErrors = {
     500: ProblemDetails;
 };
 
-export type IngestLogsError = IngestLogsErrors[keyof IngestLogsErrors];
+export type IngestLogs2Error = IngestLogs2Errors[keyof IngestLogs2Errors];
 
-export type IngestLogsResponses = {
+export type IngestLogs2Responses = {
     /**
      * Logs accepted (OTLP protobuf response)
      */
@@ -87235,6 +87540,460 @@ export type PurgeProjectLogsResponses = {
      */
     200: unknown;
 };
+
+export type ListLogIngestKeysData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: {
+        /**
+         * 1-based page. Default 1.
+         */
+        page?: number | null;
+        /**
+         * Default 20, maximum 100.
+         */
+        page_size?: number | null;
+    };
+    url: '/projects/{project_id}/logs/ingest-keys';
+};
+
+export type ListLogIngestKeysErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type ListLogIngestKeysError = ListLogIngestKeysErrors[keyof ListLogIngestKeysErrors];
+
+export type ListLogIngestKeysResponses = {
+    /**
+     * Keys
+     */
+    200: LogIngestKeysResponse;
+};
+
+export type ListLogIngestKeysResponse = ListLogIngestKeysResponses[keyof ListLogIngestKeysResponses];
+
+export type CreateLogIngestKeyData = {
+    body: CreateLogIngestKeyRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/logs/ingest-keys';
+};
+
+export type CreateLogIngestKeyErrors = {
+    /**
+     * Validation error
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Project or environment not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type CreateLogIngestKeyError = CreateLogIngestKeyErrors[keyof CreateLogIngestKeyErrors];
+
+export type CreateLogIngestKeyResponses = {
+    /**
+     * Key created; the plaintext is in `key`
+     */
+    201: CreatedLogIngestKeyResponse;
+};
+
+export type CreateLogIngestKeyResponse = CreateLogIngestKeyResponses[keyof CreateLogIngestKeyResponses];
+
+export type RevokeLogIngestKeyData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Log ingest key ID
+         */
+        key_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/logs/ingest-keys/{key_id}/revoke';
+};
+
+export type RevokeLogIngestKeyErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Key not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type RevokeLogIngestKeyError = RevokeLogIngestKeyErrors[keyof RevokeLogIngestKeyErrors];
+
+export type RevokeLogIngestKeyResponses = {
+    /**
+     * Key revoked
+     */
+    200: LogIngestKeyResponse;
+};
+
+export type RevokeLogIngestKeyResponse = RevokeLogIngestKeyResponses[keyof RevokeLogIngestKeyResponses];
+
+export type ListSavedSearchesData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: {
+        /**
+         * 1-based page number. Default 1.
+         */
+        page?: number | null;
+        /**
+         * Rows per page. Default 20, maximum 100.
+         */
+        page_size?: number | null;
+    };
+    url: '/projects/{project_id}/logs/saved-searches';
+};
+
+export type ListSavedSearchesErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type ListSavedSearchesError = ListSavedSearchesErrors[keyof ListSavedSearchesErrors];
+
+export type ListSavedSearchesResponses = {
+    /**
+     * Saved searches
+     */
+    200: SavedSearchesResponse;
+};
+
+export type ListSavedSearchesResponse = ListSavedSearchesResponses[keyof ListSavedSearchesResponses];
+
+export type CreateSavedSearchData = {
+    body: CreateSavedSearchRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/logs/saved-searches';
+};
+
+export type CreateSavedSearchErrors = {
+    /**
+     * Validation error
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Name taken or limit reached
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type CreateSavedSearchError = CreateSavedSearchErrors[keyof CreateSavedSearchErrors];
+
+export type CreateSavedSearchResponses = {
+    /**
+     * Saved search created
+     */
+    201: SavedSearchResponse;
+};
+
+export type CreateSavedSearchResponse = CreateSavedSearchResponses[keyof CreateSavedSearchResponses];
+
+export type DeleteSavedSearchData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Saved search ID
+         */
+        saved_search_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/logs/saved-searches/{saved_search_id}';
+};
+
+export type DeleteSavedSearchErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Saved search not found
+     */
+    404: ProblemDetails;
+    /**
+     * Still used by a log alert
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type DeleteSavedSearchError = DeleteSavedSearchErrors[keyof DeleteSavedSearchErrors];
+
+export type DeleteSavedSearchResponses = {
+    /**
+     * Saved search deleted
+     */
+    204: void;
+};
+
+export type DeleteSavedSearchResponse = DeleteSavedSearchResponses[keyof DeleteSavedSearchResponses];
+
+export type GetSavedSearchData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Saved search ID
+         */
+        saved_search_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/logs/saved-searches/{saved_search_id}';
+};
+
+export type GetSavedSearchErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Saved search not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetSavedSearchError = GetSavedSearchErrors[keyof GetSavedSearchErrors];
+
+export type GetSavedSearchResponses = {
+    /**
+     * Saved search
+     */
+    200: SavedSearchResponse;
+};
+
+export type GetSavedSearchResponse = GetSavedSearchResponses[keyof GetSavedSearchResponses];
+
+export type UpdateSavedSearchData = {
+    body: UpdateSavedSearchRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Saved search ID
+         */
+        saved_search_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/logs/saved-searches/{saved_search_id}';
+};
+
+export type UpdateSavedSearchErrors = {
+    /**
+     * Validation error
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Saved search not found
+     */
+    404: ProblemDetails;
+    /**
+     * Name taken
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type UpdateSavedSearchError = UpdateSavedSearchErrors[keyof UpdateSavedSearchErrors];
+
+export type UpdateSavedSearchResponses = {
+    /**
+     * Saved search updated
+     */
+    200: SavedSearchResponse;
+};
+
+export type UpdateSavedSearchResponse = UpdateSavedSearchResponses[keyof UpdateSavedSearchResponses];
+
+export type SavedSearchSeriesData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Saved search ID
+         */
+        saved_search_id: number;
+    };
+    query: {
+        /**
+         * Window start, RFC 3339.
+         */
+        start_time: string;
+        /**
+         * Window end, RFC 3339.
+         */
+        end_time: string;
+        /**
+         * Bucket width in seconds. Default 60.
+         */
+        bucket_secs?: number | null;
+        /**
+         * `count` (default), or `avg`, `sum`, `max`, `p50`, `p95`, `p99` or
+         * `count_distinct` followed by `:<attribute>`, e.g. `p95:duration_ms`.
+         */
+        metric?: string | null;
+    };
+    url: '/projects/{project_id}/logs/saved-searches/{saved_search_id}/series';
+};
+
+export type SavedSearchSeriesErrors = {
+    /**
+     * Invalid window, bucket or metric
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Saved search not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+    /**
+     * A numeric series needs the line index, which is unavailable
+     */
+    503: ProblemDetails;
+};
+
+export type SavedSearchSeriesError = SavedSearchSeriesErrors[keyof SavedSearchSeriesErrors];
+
+export type SavedSearchSeriesResponses = {
+    /**
+     * The series
+     */
+    200: LogSeries;
+};
+
+export type SavedSearchSeriesResponse = SavedSearchSeriesResponses[keyof SavedSearchSeriesResponses];
 
 export type ListMcpsData = {
     body?: never;

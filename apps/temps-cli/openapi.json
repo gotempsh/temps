@@ -3855,6 +3855,47 @@
         ],
         "type": "object"
       },
+      "AlertSeriesSource": {
+        "description": "What series a rule is evaluated on (ADR 108 D1).\n\nA log rule carries its saved search in the same value, so \"a log alert\nwith nothing to count\" cannot be constructed.",
+        "oneOf": [
+          {
+            "description": "The OTel metric the rule names. Every rule before ADR 108.",
+            "properties": {
+              "kind": {
+                "enum": [
+                  "metric"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The number of log lines matching a saved search per window.",
+            "properties": {
+              "kind": {
+                "enum": [
+                  "logs"
+                ],
+                "type": "string"
+              },
+              "saved_search_id": {
+                "description": "`log_saved_searches.id`, in the rule's own project.",
+                "format": "int32",
+                "type": "integer"
+              }
+            },
+            "required": [
+              "saved_search_id",
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "AllocEntry": {
         "description": "Wire-format allocation. `null` in the JSON when the node hasn't been\nallocated yet — workers should treat that as \"single-host mode, do\nnot bring up the overlay\".",
         "properties": {
@@ -18060,6 +18101,33 @@
         ],
         "type": "object"
       },
+      "CreateLogIngestKeyRequest": {
+        "properties": {
+          "default_service": {
+            "description": "Service label for lines that do not name one. Default `external`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "environment_id": {
+            "description": "Pin the key to one environment of the project. Absent: lines are\nlabelled with the environment `external`.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "name": {
+            "description": "A label for the collector or host using the key.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
       "CreateMcpRequest": {
         "properties": {
           "config": {
@@ -18088,7 +18156,7 @@
       "CreateMetricAlertRequest": {
         "properties": {
           "aggregation": {
-            "description": "One of `avg|sum|min|max|count|rate|p50|p90|p95|p99`.",
+            "description": "One of `avg|sum|min|max|count|rate|p50|p90|p95|p99`. Forced to\n`count` for a log alert, which counts matching lines.",
             "type": "string"
           },
           "detection_config": {
@@ -18140,7 +18208,11 @@
             "type": "integer"
           },
           "metric_name": {
-            "type": "string"
+            "description": "The OTel metric to watch. Required unless `source` is a saved log\nsearch, in which case the series is named by the server.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "name": {
             "type": "string"
@@ -18153,6 +18225,10 @@
             "description": "One of `info|warning|critical`.",
             "type": "string"
           },
+          "source": {
+            "$ref": "#/components/schemas/AlertSeriesSource",
+            "description": "What the rule watches: the metric above (the default), or the number\nof log lines matching a saved search per window (ADR 108 D1):\n`{\"kind\":\"logs\",\"saved_search_id\":3}`."
+          },
           "window_secs": {
             "format": "int32",
             "type": "integer"
@@ -18161,7 +18237,6 @@
         "required": [
           "project_id",
           "name",
-          "metric_name",
           "aggregation",
           "detection_config",
           "window_secs",
@@ -19399,6 +19474,39 @@
         ],
         "type": "object"
       },
+      "CreateSavedSearchRequest": {
+        "properties": {
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "description": "Unique within the project.",
+            "type": "string"
+          },
+          "pinned": {
+            "description": "Pinned searches sort first. Default false.",
+            "type": "boolean"
+          },
+          "query": {
+            "$ref": "#/components/schemas/SavedSearchQuery",
+            "description": "The filter set. An empty query is allowed: \"everything in this\nproject\" is a legitimate thing to pin."
+          },
+          "time_range": {
+            "description": "One of `15m`, `1h`, `6h`, `24h`, `7d`, `30d`. Default `1h`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
       "CreateShieldEntryRequest": {
         "properties": {
           "expires_at": {
@@ -19767,6 +19875,26 @@
           "resource"
         ],
         "type": "object"
+      },
+      "CreatedLogIngestKeyResponse": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/LogIngestKeyResponse"
+          },
+          {
+            "properties": {
+              "key": {
+                "description": "The full key. Shown once; only its hash is stored.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "key"
+            ],
+            "type": "object"
+          }
+        ],
+        "description": "A key just created: the only response that carries the plaintext."
       },
       "CreatedRepositoryResponse": {
         "description": "The repository that was created. Carries no credentials.",
@@ -20918,6 +21046,10 @@
             "description": "The metric name to chart (e.g. `http.server.duration`).",
             "type": "string"
           },
+          "source": {
+            "$ref": "#/components/schemas/DashboardTileSource",
+            "description": "What the tile charts: the metric above (the default), or a saved log\nsearch over time (ADR 108 D1). A log tile ignores `metric_name`,\n`aggregation`, `label_filters` and `group_by`."
+          },
           "title": {
             "description": "Optional display title; falls back to the metric name in the UI.",
             "type": [
@@ -20932,6 +21064,50 @@
           "aggregation"
         ],
         "type": "object"
+      },
+      "DashboardTileSource": {
+        "description": "The series a tile charts.",
+        "oneOf": [
+          {
+            "description": "An OTel metric, named by the tile's `metric_name`.",
+            "properties": {
+              "kind": {
+                "enum": [
+                  "metric"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "A saved log search of the dashboard's project, charted by\n`GET /projects/{project_id}/logs/saved-searches/{id}/series`.",
+            "properties": {
+              "kind": {
+                "enum": [
+                  "logs"
+                ],
+                "type": "string"
+              },
+              "metric": {
+                "description": "`count` (lines per bucket), or `avg`, `sum`, `max`, `p50`, `p95`,\n`p99` or `count_distinct` followed by `:<attribute>`.",
+                "type": "string"
+              },
+              "saved_search_id": {
+                "format": "int32",
+                "type": "integer"
+              }
+            },
+            "required": [
+              "saved_search_id",
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
       },
       "DataEngine": {
         "description": "The engines Temps operates as managed services.",
@@ -44063,6 +44239,124 @@
         ],
         "type": "object"
       },
+      "LogIngestKeyResponse": {
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "created_by_user_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "default_service": {
+            "type": "string"
+          },
+          "environment_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "is_active": {
+            "type": "boolean"
+          },
+          "key_prefix": {
+            "description": "The first characters of the key, for recognising it.",
+            "type": "string"
+          },
+          "last_used_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "line_count": {
+            "description": "Lines ingested with this key. Updated every 30 seconds.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "revoked_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "project_id",
+          "name",
+          "key_prefix",
+          "default_service",
+          "is_active",
+          "line_count",
+          "created_at"
+        ],
+        "type": "object"
+      },
+      "LogIngestKeysResponse": {
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/LogIngestKeyResponse"
+            },
+            "type": "array"
+          },
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "data",
+          "total",
+          "page",
+          "page_size"
+        ],
+        "type": "object"
+      },
+      "LogIngestResponse": {
+        "properties": {
+          "accepted": {
+            "description": "Lines stored from this request.",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "accepted"
+        ],
+        "type": "object"
+      },
       "LogLevel": {
         "description": "Normalized log level",
         "enum": [
@@ -44221,6 +44515,63 @@
           "service",
           "message",
           "line_id"
+        ],
+        "type": "object"
+      },
+      "LogSeries": {
+        "description": "A bucketed log series.",
+        "properties": {
+          "method": {
+            "$ref": "#/components/schemas/LogSeriesMethod"
+          },
+          "partial_before": {
+            "description": "Set when a scan stopped at its cap: buckets ending before this time\nhave no value.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "points": {
+            "items": {
+              "$ref": "#/components/schemas/LogSeriesPoint"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "points",
+          "method"
+        ],
+        "type": "object"
+      },
+      "LogSeriesMethod": {
+        "description": "How a series was computed.",
+        "enum": [
+          "index",
+          "scan"
+        ],
+        "type": "string"
+      },
+      "LogSeriesPoint": {
+        "description": "One bucket of a log series.",
+        "properties": {
+          "ts": {
+            "description": "Bucket start.",
+            "format": "date-time",
+            "type": "string"
+          },
+          "value": {
+            "description": "`None` when nothing was counted for the bucket (outside a capped\nscan) or no line contributed to a numeric aggregate.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "ts"
         ],
         "type": "object"
       },
@@ -50474,6 +50825,10 @@
           "severity": {
             "type": "string"
           },
+          "source": {
+            "$ref": "#/components/schemas/AlertSeriesSource",
+            "description": "What the rule watches: the named metric, or a saved log search\n(ADR 108 D1)."
+          },
           "updated_at": {
             "example": "2025-10-12T12:15:47.609192Z",
             "type": "string"
@@ -50490,6 +50845,7 @@
           "metric_name",
           "aggregation",
           "detection_kind",
+          "source",
           "detection_config",
           "window_secs",
           "for_duration_secs",
@@ -65455,6 +65811,181 @@
         ],
         "type": "object"
       },
+      "SavedSearchQuery": {
+        "description": "The stored filter set of a saved search.\n\nMirrors `GlobalLogSearchRequest` without `start_time`/`end_time`,\n`cursor`, `page_size` and the project selector: the window is the\ncaller's and the project is the row's. External services are held as ids\nrather than names so counting a saved search needs no control-plane name\nresolution.",
+        "properties": {
+          "attrs": {
+            "description": "Attribute predicates in the wire form the search endpoints take:\n`<key><op><value>` with `op` one of `=`, `!=`, `^=`, `>`, `<`, or\n`<key>?` for \"exists\".",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "container_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "deploy_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "envs": {
+            "description": "Environment identifiers as the store holds them.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "external_service_ids": {
+            "description": "Narrow to these of the project's external services (databases,\nimported services). Empty means every source allowed by `source`.",
+            "items": {
+              "format": "int32",
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "levels": {
+            "items": {
+              "$ref": "#/components/schemas/LogLevel"
+            },
+            "type": "array"
+          },
+          "node_ids": {
+            "items": {
+              "format": "int32",
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "services": {
+            "description": "Container service labels (`web`, `worker`).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "source": {
+            "$ref": "#/components/schemas/LogSourceKind",
+            "description": "Which family of sources to search: everything the project has\n(`collected`), its application containers, or its databases."
+          },
+          "text": {
+            "description": "Case-insensitive substring match over the message.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "SavedSearchResponse": {
+        "properties": {
+          "alert_count": {
+            "description": "Log alert rules counting this search. A search with alerts cannot be\ndeleted until they are detached, so the console can say so before\noffering the button.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "created_by": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "pinned": {
+            "type": "boolean"
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "query": {
+            "$ref": "#/components/schemas/SavedSearchQuery"
+          },
+          "time_range": {
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "project_id",
+          "name",
+          "query",
+          "time_range",
+          "pinned",
+          "alert_count",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
+      },
+      "SavedSearchesResponse": {
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/SavedSearchResponse"
+            },
+            "type": "array"
+          },
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "time_ranges": {
+            "description": "Allowed `time_range` values, so a client never has to hard-code them.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "data",
+          "total",
+          "page",
+          "page_size",
+          "time_ranges"
+        ],
+        "type": "object"
+      },
       "ScalewayCredentialsRequest": {
         "properties": {
           "api_key": {
@@ -80071,6 +80602,17 @@
               "null"
             ]
           },
+          "source": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/AlertSeriesSource",
+                "description": "Switches what the rule watches when present (absent = unchanged)."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "window_secs": {
             "format": "int32",
             "type": [
@@ -80976,6 +81518,48 @@
         "required": [
           "allowed_node_ids"
         ],
+        "type": "object"
+      },
+      "UpdateSavedSearchRequest": {
+        "properties": {
+          "description": {
+            "description": "Absent leaves the description unchanged; an empty string clears it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "description": "Absent leaves the name unchanged.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "pinned": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "query": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/SavedSearchQuery",
+                "description": "Replaces the filter set wholesale when present."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "time_range": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
         "type": "object"
       },
       "UpdateSecretBody": {
@@ -128715,6 +129299,104 @@
         ]
       }
     },
+    "/logs/ingest": {
+      "post": {
+        "description": "One JSON object per line; see the logs documentation for the keys read.\nA batch is stored whole or refused whole.",
+        "operationId": "ingest_logs",
+        "requestBody": {
+          "content": {
+            "application/x-ndjson": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          },
+          "description": "One JSON object per line",
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LogIngestResponse"
+                }
+              }
+            },
+            "description": "Lines stored"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "A line is not a JSON object"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Missing or unknown key"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Body too large"
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Compressed body"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The project's log ingestion budget is exhausted"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Ingest newline-delimited JSON log lines with a log ingest key.",
+        "tags": [
+          "Logs"
+        ]
+      }
+    },
     "/logs/ingest-budget": {
       "get": {
         "operationId": "log_ingest_budget",
@@ -164316,6 +164998,925 @@
           }
         ],
         "summary": "Purge all logs for a project before a given timestamp",
+        "tags": [
+          "Logs"
+        ]
+      }
+    },
+    "/projects/{project_id}/logs/ingest-keys": {
+      "get": {
+        "operationId": "list_log_ingest_keys",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "1-based page. Default 1.",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Default 20, maximum 100.",
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LogIngestKeysResponse"
+                }
+              }
+            },
+            "description": "Keys"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "List a project's log ingest keys. Never returns a key's plaintext.",
+        "tags": [
+          "Logs"
+        ]
+      },
+      "post": {
+        "operationId": "create_log_ingest_key",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateLogIngestKeyRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreatedLogIngestKeyResponse"
+                }
+              }
+            },
+            "description": "Key created; the plaintext is in `key`"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Validation error"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Project or environment not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Create a log ingest key. The response is the only time the key is shown.",
+        "tags": [
+          "Logs"
+        ]
+      }
+    },
+    "/projects/{project_id}/logs/ingest-keys/{key_id}/revoke": {
+      "post": {
+        "operationId": "revoke_log_ingest_key",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Log ingest key ID",
+            "in": "path",
+            "name": "key_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LogIngestKeyResponse"
+                }
+              }
+            },
+            "description": "Key revoked"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Key not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Revoke a log ingest key. Lines it already sent stay.",
+        "tags": [
+          "Logs"
+        ]
+      }
+    },
+    "/projects/{project_id}/logs/saved-searches": {
+      "get": {
+        "operationId": "list_saved_searches",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "1-based page number. Default 1.",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Rows per page. Default 20, maximum 100.",
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SavedSearchesResponse"
+                }
+              }
+            },
+            "description": "Saved searches"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "List a project's saved log searches, pinned first.",
+        "tags": [
+          "Logs"
+        ]
+      },
+      "post": {
+        "operationId": "create_saved_search",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateSavedSearchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SavedSearchResponse"
+                }
+              }
+            },
+            "description": "Saved search created"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Validation error"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Name taken or limit reached"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Save a log search for a project.",
+        "tags": [
+          "Logs"
+        ]
+      }
+    },
+    "/projects/{project_id}/logs/saved-searches/{saved_search_id}": {
+      "delete": {
+        "operationId": "delete_saved_search",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Saved search ID",
+            "in": "path",
+            "name": "saved_search_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Saved search deleted"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Saved search not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Still used by a log alert"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Delete a saved log search. Refused while a log alert counts it.",
+        "tags": [
+          "Logs"
+        ]
+      },
+      "get": {
+        "operationId": "get_saved_search",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Saved search ID",
+            "in": "path",
+            "name": "saved_search_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SavedSearchResponse"
+                }
+              }
+            },
+            "description": "Saved search"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Saved search not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Read one saved log search.",
+        "tags": [
+          "Logs"
+        ]
+      },
+      "patch": {
+        "operationId": "update_saved_search",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Saved search ID",
+            "in": "path",
+            "name": "saved_search_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateSavedSearchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SavedSearchResponse"
+                }
+              }
+            },
+            "description": "Saved search updated"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Validation error"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Saved search not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Name taken"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Change a saved log search.",
+        "tags": [
+          "Logs"
+        ]
+      }
+    },
+    "/projects/{project_id}/logs/saved-searches/{saved_search_id}/series": {
+      "get": {
+        "operationId": "saved_search_series",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Saved search ID",
+            "in": "path",
+            "name": "saved_search_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Window start, RFC 3339.",
+            "in": "query",
+            "name": "start_time",
+            "required": true,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Window end, RFC 3339.",
+            "in": "query",
+            "name": "end_time",
+            "required": true,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Bucket width in seconds. Default 60.",
+            "in": "query",
+            "name": "bucket_secs",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "`count` (default), or `avg`, `sum`, `max`, `p50`, `p95`, `p99` or\n`count_distinct` followed by `:<attribute>`, e.g. `p95:duration_ms`.",
+            "in": "query",
+            "name": "metric",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LogSeries"
+                }
+              }
+            },
+            "description": "The series"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid window, bucket or metric"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Saved search not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "A numeric series needs the line index, which is unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Chart a saved log search over time: matching lines per bucket, or a\nnumeric attribute aggregated per bucket.",
         "tags": [
           "Logs"
         ]

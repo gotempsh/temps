@@ -10,8 +10,12 @@ import { ProjectResponse } from '@/api/client'
 // GET /otel/dashboards/{id} endpoint (operationId get_dashboard). Not present
 // in the committed SDK; imported so the page is regen-ready (project rule:
 // always use the generated SDK, never hand-roll fetch).
-import { getDashboardOptions } from '@/api/client/@tanstack/react-query.gen'
+import {
+  getDashboardOptions,
+  listSavedSearchesOptions,
+} from '@/api/client/@tanstack/react-query.gen'
 import { MetricTile } from '@/components/metrics/MetricTile'
+import { LogSearchTile } from '@/components/metrics/LogSearchTile'
 import { rollupStatus, useAlertStatus } from '@/components/metrics/alert-status'
 import {
   dashboardTiles,
@@ -66,6 +70,28 @@ export default function DashboardView({ project }: DashboardViewProps) {
   usePageTitle(dashboard ? `${dashboard.name} · Dashboards` : 'Dashboard')
 
   const sections = dashboard?.layout?.sections ?? []
+  // Names for log tiles without a title of their own: one list call for
+  // the whole dashboard, only when it has a log tile.
+  const hasLogTile = sections.some((section) =>
+    section.tiles?.some((tile) => tile.source?.kind === 'logs')
+  )
+  const savedSearchesQuery = useQuery({
+    ...listSavedSearchesOptions({
+      path: { project_id: project.id },
+      query: { page_size: 100 },
+    }),
+    enabled: hasLogTile,
+  })
+  const searchNames = useMemo(
+    () =>
+      new Map(
+        (savedSearchesQuery.data?.data ?? []).map((search) => [
+          search.id,
+          search.name,
+        ])
+      ),
+    [savedSearchesQuery.data]
+  )
 
   // Datadog-style firing status for this dashboard, derived from the same
   // cached alert-rule fetch the tiles use (no extra round-trip). Rolled up at
@@ -177,20 +203,35 @@ export default function DashboardView({ project }: DashboardViewProps) {
                   </p>
                 ) : (
                   <div className="grid grid-cols-1 gap-3 md:grid-cols-2 lg:grid-cols-3">
-                    {section.tiles.map((tile) => (
-                      <MetricTile
-                        key={tile.id}
-                        project={project}
-                        metricName={tile.metric_name}
-                        aggregation={tile.aggregation}
-                        title={tile.title}
-                        labelFilters={tile.label_filters}
-                        groupBy={tile.group_by}
-                        fromIso={fromIso}
-                        toIso={toIso}
-                        bucketInterval={bucketInterval}
-                      />
-                    ))}
+                    {section.tiles.map((tile) =>
+                      tile.source?.kind === 'logs' ? (
+                        <LogSearchTile
+                          key={tile.id}
+                          projectId={project.id}
+                          savedSearchId={tile.source.saved_search_id}
+                          metric={tile.source.metric ?? 'count'}
+                          title={tile.title}
+                          searchName={searchNames.get(
+                            tile.source.saved_search_id
+                          )}
+                          fromIso={fromIso}
+                          toIso={toIso}
+                        />
+                      ) : (
+                        <MetricTile
+                          key={tile.id}
+                          project={project}
+                          metricName={tile.metric_name}
+                          aggregation={tile.aggregation}
+                          title={tile.title}
+                          labelFilters={tile.label_filters}
+                          groupBy={tile.group_by}
+                          fromIso={fromIso}
+                          toIso={toIso}
+                          bucketInterval={bucketInterval}
+                        />
+                      )
+                    )}
                   </div>
                 )}
               </section>
