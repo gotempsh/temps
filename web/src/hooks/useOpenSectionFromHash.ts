@@ -11,6 +11,10 @@ import { scrollElementToTop } from '@/lib/scroll-to-element'
  * finish loading the content above it.
  */
 const WAIT_FOR_SECTION_MS = 10_000
+/** Padding and borders move what follows too, not only the content box. */
+const BORDER_BOX: ResizeObserverOptions = { box: 'border-box' }
+/** Most siblings above a linked section watched for size changes. */
+const MAX_SIBLINGS_OBSERVED = 200
 /** Input that means the reader has started moving around the page. */
 const READER_INPUT = ['wheel', 'touchstart', 'pointerdown', 'keydown'] as const
 const HIGHLIGHT_MS = 2_000
@@ -42,6 +46,32 @@ function reveal(element: HTMLElement) {
   if (element instanceof HTMLDetailsElement) element.open = true
   scrollElementToTop(element)
   highlight(element)
+}
+
+/**
+ * Watches everything whose size moves `element`: each ancestor, which grows
+ * when content inside it does, and the siblings before `element` and before
+ * each ancestor, since an ancestor of fixed height (the scroll container
+ * itself) does not resize when a child above the section grows. Siblings are
+ * taken nearest first, at most `MAX_SIBLINGS_OBSERVED`, so a long list above
+ * the section bounds the work.
+ */
+function observeLayoutAbove(observer: ResizeObserver, element: HTMLElement) {
+  observer.disconnect()
+  let budget = MAX_SIBLINGS_OBSERVED
+  for (
+    let node: Element = element;
+    node.parentElement && node.parentElement !== document.body;
+    node = node.parentElement
+  ) {
+    observer.observe(node.parentElement, BORDER_BOX)
+    for (
+      let sibling = node.previousElementSibling;
+      sibling && budget > 0;
+      sibling = sibling.previousElementSibling, budget--
+    )
+      observer.observe(sibling, BORDER_BOX)
+  }
 }
 
 /** Highlights in progress, so a repeat restarts the timer instead of racing it. */
@@ -95,7 +125,7 @@ export function useScrollToLinkedSection() {
     let shown: HTMLElement | null = null
     let onPrimary = false
     // Content above the section can grow without a node being added (text
-    // filled in, a style applied); that resizes one of its ancestors.
+    // filled in, a style applied). See `observeLayoutAbove`.
     const resized =
       typeof ResizeObserver === 'undefined'
         ? null
@@ -103,14 +133,7 @@ export function useScrollToLinkedSection() {
     const show = (element: HTMLElement) => {
       shown = element
       reveal(element)
-      if (!resized) return
-      resized.disconnect()
-      for (
-        let node = element.parentElement;
-        node && node !== document.body;
-        node = node.parentElement
-      )
-        resized.observe(node)
+      if (resized) observeLayoutAbove(resized, element)
     }
     const follow = () => {
       if (!onPrimary) {

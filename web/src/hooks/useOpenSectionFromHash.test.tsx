@@ -34,23 +34,30 @@ afterEach(() => {
   Element.prototype.scrollIntoView = originalScrollIntoView
 })
 
-/** Elements under a live `ResizeObserver`, and a way to report them resized. */
+/**
+ * Elements under a live `ResizeObserver`, and a way to report some of them
+ * resized: like a browser, only observers watching one of them are called.
+ */
 const observedForResize = new Set<Element>()
-let resizeCallbacks: (() => void)[] = []
+const observedBox = new Map<Element, string | undefined>()
+let resizeCallbacks: ((resized: Element[]) => void)[] = []
 const originalResizeObserver = globalThis.ResizeObserver
 beforeEach(() => {
   observedForResize.clear()
+  observedBox.clear()
   resizeCallbacks = []
   globalThis.ResizeObserver = class {
     private readonly observed = new Set<Element>()
     constructor(callback: ResizeObserverCallback) {
-      resizeCallbacks.push(() => {
-        if (this.observed.size) callback([], this as unknown as ResizeObserver)
+      resizeCallbacks.push((resized) => {
+        if (resized.some((element) => this.observed.has(element)))
+          callback([], this as unknown as ResizeObserver)
       })
     }
-    observe(element: Element) {
+    observe(element: Element, options?: ResizeObserverOptions) {
       this.observed.add(element)
       observedForResize.add(element)
+      observedBox.set(element, options?.box)
     }
     unobserve(element: Element) {
       this.observed.delete(element)
@@ -65,7 +72,8 @@ beforeEach(() => {
 afterEach(() => {
   globalThis.ResizeObserver = originalResizeObserver
 })
-const reportResize = () => act(() => resizeCallbacks.forEach((fn) => fn()))
+const reportResize = (...resized: Element[]) =>
+  act(() => resizeCallbacks.forEach((report) => report(resized)))
 
 /**
  * Which section each scroll of the page brought to its top, in order, read
@@ -222,14 +230,16 @@ test('keeps the section in view when content above it grows without new nodes', 
     <DeliveryPage grows="size" />
   )
   await waitFor(() => expect(layout.scrolls).toHaveLength(1))
-  expect(
-    observedForResize.has(document.getElementById('page') as Element)
-  ).toBe(true)
-  // Only geometry changes: no node is added, so only a resize reports it.
+  // Only geometry changes: no node is added, so the mutation watch is silent.
   showSetting()
   await settle()
   expect(layout.scrolls).toHaveLength(1)
-  reportResize()
+  // Both sections sit directly in the fixed-height scroll container, which
+  // does not resize; only the section that grew does, as in a browser. Its
+  // border box is watched, so growing padding counts too.
+  const grown = document.getElementById('settings-section-previews') as Element
+  expect(observedBox.get(grown)).toBe('border-box')
+  reportResize(grown)
   expect(layout.scrolls).toEqual([
     { target: 'page', top: 1200 },
     { target: 'page', top: 2100 },
@@ -248,7 +258,7 @@ test('once the reader scrolls, the page is theirs', async () => {
   expect(observedForResize.size).toBe(0)
   showSetting()
   await settle()
-  reportResize()
+  reportResize(document.getElementById('settings-section-previews') as Element)
   expect(layout.scrolls).toEqual([{ target: 'page', top: 1200 }])
 })
 
