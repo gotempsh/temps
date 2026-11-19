@@ -23,8 +23,9 @@ use sea_orm::{
 
 use temps_entities::metric_alert_rules::{ActiveModel, Column, Entity, Model};
 
-use crate::detectors::DetectionConfig;
+use crate::detectors::{Comparator, DetectionConfig};
 use crate::error::OtelError;
+use temps_core::log_series::{LOG_ALERT_COUNT_CAP, LOG_ALERT_MAX_WINDOW_SECS};
 
 /// Metric alert rules one project may create through the API (#1210). Each
 /// rule is a recurring query against the metrics store, so the count is a
@@ -63,6 +64,72 @@ pub const ALLOWED_SEVERITIES: &[&str] = &["info", "warning", "critical"];
 
 const MAX_NAME_LEN: usize = 200;
 pub const MAX_METRIC_NAME_LEN: usize = 256;
+
+/// The series name a log alert reports (ADR 073 D1). A log rule is not
+/// defined on an OTel metric, but every notification, alarm payload and
+/// chart axis expects a series name, so it gets one that says what it is.
+/// Set by this service, never by the caller.
+pub const LOG_ALERT_METRIC_NAME: &str = "logs.matched_lines";
+
+/// The only aggregation a log alert can have: a window's matching lines are
+/// counted, never averaged.
+pub const LOG_ALERT_AGGREGATION: &str = "count";
+
+/// What series a rule is evaluated on (ADR 073 D1).
+///
+/// A log rule carries its saved search in the same value, so "a log alert
+/// with nothing to count" cannot be constructed.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    utoipa::ToSchema,
+)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AlertSeriesSource {
+    /// The OTel metric the rule names. Every rule before ADR 073.
+    #[default]
+    Metric,
+    /// The number of log lines matching a saved search per window.
+    Logs {
+        /// `log_saved_searches.id`, in the rule's own project.
+        saved_search_id: i32,
+    },
+}
+
+impl AlertSeriesSource {
+    /// The stored `metric_alert_rules.source` discriminator.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Metric => "metric",
+            Self::Logs { .. } => "logs",
+        }
+    }
+
+    /// Rebuild the source from a stored row's two columns. An unknown
+    /// discriminator, or `logs` with no saved search, reads as `None` so the
+    /// evaluator can skip the rule loudly instead of evaluating the wrong
+    /// series.
+    pub fn from_columns(source: &str, saved_search_id: Option<i32>) -> Option<Self> {
+        match (source, saved_search_id) {
+            ("metric", _) => Some(Self::Metric),
+            ("logs", Some(saved_search_id)) => Some(Self::Logs { saved_search_id }),
+            _ => None,
+        }
+    }
+
+    pub fn saved_search_id(self) -> Option<i32> {
+        match self {
+            Self::Metric => None,
+            Self::Logs { saved_search_id } => Some(saved_search_id),
+        }
+    }
+}
 
 /// Validate `label_filters` pairs: at most [`MAX_LABEL_FILTERS`] pairs, each
 /// key passing the OTel metric-name character allowlist `[a-zA-Z0-9_.:-]`, each
@@ -118,6 +185,110 @@ pub fn validate_group_by(group_by: &[String]) -> Result<(), OtelError> {
     Ok(())
 }
 
+/// Validate the parts of a log alert that differ from a metric alert
+/// (ADR 073 D1).
+///
+/// Deliberately narrow in this phase. A log alert counts lines in one
+/// bounded window and compares the count against a threshold:
+///
+/// - **Static detectors only.** An anomaly band is built from the metrics
+///   store's history, which holds no log counts, so an anomaly log rule
+///   would score against a baseline that does not exist.
+/// - **No breakdowns.** Splitting a line count into per-label series needs
+///   a grouped count the saved search does not express yet.
+/// - **A bounded window.** Counting walks the log store, so the window is
+///   capped rather than left to reach back arbitrarily on a small host.
+/// - **A reachable threshold.** Counting stops at
+///   [`LOG_ALERT_COUNT_CAP`] and reports a lower bound, so a
+///   "more than the cap" rule could never fire and is refused instead of
+///   silently never alerting.
+fn validate_log_rule(
+    aggregation: &str,
+    window_secs: i32,
+    detection_config: &DetectionConfig,
+    group_by: &[String],
+    dynamic_alerts: bool,
+) -> Result<(), OtelError> {
+    if aggregation.trim().to_ascii_lowercase() != LOG_ALERT_AGGREGATION {
+        return Err(OtelError::Validation {
+            message: format!(
+                "A log alert counts matching lines, so its aggregation must be \
+                 '{LOG_ALERT_AGGREGATION}' (got '{aggregation}')"
+            ),
+        });
+    }
+    if window_secs > LOG_ALERT_MAX_WINDOW_SECS {
+        return Err(OtelError::Validation {
+            message: format!(
+                "A log alert's window must be at most {LOG_ALERT_MAX_WINDOW_SECS} seconds \
+                 (got {window_secs}); counting lines reads the log store, so the window is \
+                 bounded"
+            ),
+        });
+    }
+    if !group_by.is_empty() || dynamic_alerts {
+        return Err(OtelError::Validation {
+            message: "A log alert counts one series, so it takes no group_by keys and no \
+                      per-series alerting"
+                .to_string(),
+        });
+    }
+    match detection_config {
+        DetectionConfig::Static(params) => {
+            if !params.threshold.is_finite() || params.threshold < 0.0 {
+                return Err(OtelError::Validation {
+                    message: format!(
+                        "A log alert's threshold is a number of lines, so it must be finite \
+                         and not negative (got {})",
+                        params.threshold
+                    ),
+                });
+            }
+            let cap = LOG_ALERT_COUNT_CAP as f64;
+            if matches!(params.comparator, Comparator::Gt | Comparator::Gte)
+                && params.threshold >= cap
+            {
+                return Err(OtelError::Validation {
+                    message: format!(
+                        "A log alert counts at most {LOG_ALERT_COUNT_CAP} lines per window, so \
+                         a threshold of {} lines could never be exceeded. Use a shorter window \
+                         or a lower threshold",
+                        params.threshold
+                    ),
+                });
+            }
+            Ok(())
+        }
+        other => Err(OtelError::Validation {
+            message: format!(
+                "A log alert compares a line count against a threshold, so it needs a static \
+                 detector, not '{}'",
+                other.kind_str()
+            ),
+        }),
+    }
+}
+
+/// The series name and aggregation a rule is stored with.
+///
+/// A metric rule keeps what the caller sent. A log rule gets
+/// [`LOG_ALERT_METRIC_NAME`] and [`LOG_ALERT_AGGREGATION`], so a log alert
+/// is never labelled with a metric that does not exist and never claims to
+/// average anything.
+fn normalize_series(
+    series_source: AlertSeriesSource,
+    metric_name: String,
+    aggregation: String,
+) -> (String, String) {
+    match series_source {
+        AlertSeriesSource::Metric => (metric_name, aggregation),
+        AlertSeriesSource::Logs { .. } => (
+            LOG_ALERT_METRIC_NAME.to_string(),
+            LOG_ALERT_AGGREGATION.to_string(),
+        ),
+    }
+}
+
 /// Validate the cross-cutting rule fields against the allowlists and sane bounds,
 /// then delegate detector-specific validation to the typed [`DetectionConfig`].
 ///
@@ -137,6 +308,7 @@ fn validate_rule(
     dynamic_alerts: bool,
     max_series: i32,
     grouped_notification_threshold: i32,
+    series_source: AlertSeriesSource,
 ) -> Result<(), OtelError> {
     let trimmed_name = name.trim();
     if trimmed_name.is_empty() {
@@ -149,31 +321,46 @@ fn validate_rule(
             message: format!("Alert rule name exceeds {MAX_NAME_LEN} characters"),
         });
     }
+    // A log rule has no metric: its series is the count of lines matching a
+    // saved search, and this service names it (`LOG_ALERT_METRIC_NAME`), so
+    // a caller cannot label a log alert with a misleading metric.
+    let is_log_rule = matches!(series_source, AlertSeriesSource::Logs { .. });
     let trimmed_metric = metric_name.trim();
-    if trimmed_metric.is_empty() {
+    if is_log_rule {
+        validate_log_rule(
+            aggregation,
+            window_secs,
+            detection_config,
+            group_by,
+            dynamic_alerts,
+        )?;
+    } else if trimmed_metric.is_empty() {
         return Err(OtelError::Validation {
-            message: "Alert rule metric_name cannot be empty".to_string(),
+            message: "Alert rule metric_name cannot be empty (required unless the rule's source is a saved log search)"
+                .to_string(),
         });
     }
-    if trimmed_metric.len() > MAX_METRIC_NAME_LEN {
-        return Err(OtelError::Validation {
-            message: format!("Alert rule metric_name exceeds {MAX_METRIC_NAME_LEN} characters"),
-        });
-    }
-    // Same allowlist the label-filter and group_by keys already use. Length
-    // alone was not enough: `metric_name` is interpolated into the alert
-    // summary prompt (`purpose: alert.summary`), and when the configured
-    // summary provider is an agent CLI that prompt is handed to a host
-    // process. A metric name is a machine identifier, so restricting it to
-    // `[a-zA-Z0-9_.:-]` costs nothing and removes the injection surface
-    // (newlines, quotes and instruction-shaped prose can no longer appear).
-    if temps_metrics::validate_metric_name(trimmed_metric).is_err() {
-        return Err(OtelError::Validation {
-            message: format!(
-                "Alert rule metric_name '{trimmed_metric}' contains characters outside the \
+    if !is_log_rule {
+        if trimmed_metric.len() > MAX_METRIC_NAME_LEN {
+            return Err(OtelError::Validation {
+                message: format!("Alert rule metric_name exceeds {MAX_METRIC_NAME_LEN} characters"),
+            });
+        }
+        // Same allowlist the label-filter and group_by keys already use. Length
+        // alone was not enough: `metric_name` is interpolated into the alert
+        // summary prompt (`purpose: alert.summary`), and when the configured
+        // summary provider is an agent CLI that prompt is handed to a host
+        // process. A metric name is a machine identifier, so restricting it to
+        // `[a-zA-Z0-9_.:-]` costs nothing and removes the injection surface
+        // (newlines, quotes and instruction-shaped prose can no longer appear).
+        if temps_metrics::validate_metric_name(trimmed_metric).is_err() {
+            return Err(OtelError::Validation {
+                message: format!(
+                    "Alert rule metric_name '{trimmed_metric}' contains characters outside the \
                  allowed set [a-zA-Z0-9_.:-]"
-            ),
-        });
+                ),
+            });
+        }
     }
     let agg = aggregation.trim().to_ascii_lowercase();
     if !ALLOWED_AGGREGATIONS.contains(&agg.as_str()) {
@@ -257,6 +444,35 @@ impl MetricAlertService {
         Self { db }
     }
 
+    /// A log rule may only count a saved search of its own project.
+    ///
+    /// The evaluator's lookup is project-scoped too, so a foreign id could
+    /// never read another project's lines; this refuses it at write time
+    /// instead of storing a rule that silently never evaluates.
+    async fn ensure_saved_search_in_project(
+        &self,
+        project_id: i32,
+        source: AlertSeriesSource,
+    ) -> Result<(), OtelError> {
+        use temps_entities::log_saved_searches;
+        let Some(saved_search_id) = source.saved_search_id() else {
+            return Ok(());
+        };
+        let found = log_saved_searches::Entity::find_by_id(saved_search_id)
+            .filter(log_saved_searches::Column::ProjectId.eq(project_id))
+            .count(self.db.as_ref())
+            .await?;
+        if found == 0 {
+            return Err(OtelError::Validation {
+                message: format!(
+                    "Saved log search {saved_search_id} not found in project {project_id}; a log \
+                     alert can only count a saved search of its own project"
+                ),
+            });
+        }
+        Ok(())
+    }
+
     /// List rules for a project, newest first, paginated.
     ///
     /// Returns `(items, total)` where `total` is the unpaginated count.
@@ -298,7 +514,11 @@ impl MetricAlertService {
         dynamic_alerts: bool,
         max_series: i32,
         grouped_notification_threshold: i32,
+        series_source: AlertSeriesSource,
     ) -> Result<Model, OtelError> {
+        // A log rule's series name and aggregation are ours to set, not the
+        // caller's: there is no metric behind them.
+        let (metric_name, aggregation) = normalize_series(series_source, metric_name, aggregation);
         validate_rule(
             &name,
             &metric_name,
@@ -312,13 +532,18 @@ impl MetricAlertService {
             dynamic_alerts,
             max_series,
             grouped_notification_threshold,
+            series_source,
         )?;
+        self.ensure_saved_search_in_project(project_id, series_source)
+            .await?;
 
         let model = ActiveModel {
             project_id: Set(project_id),
             name: Set(name.trim().to_string()),
             metric_name: Set(metric_name.trim().to_string()),
             aggregation: Set(aggregation.trim().to_ascii_lowercase()),
+            source: Set(series_source.as_str().to_string()),
+            saved_search_id: Set(series_source.saved_search_id()),
             detection_kind: Set(detection_config.kind_str().to_string()),
             detection_config: Set(detection_config.to_value()?),
             window_secs: Set(window_secs),
@@ -396,6 +621,7 @@ impl MetricAlertService {
         dynamic_alerts: Option<bool>,
         max_series: Option<i32>,
         grouped_notification_threshold: Option<i32>,
+        series_source: Option<AlertSeriesSource>,
     ) -> Result<Model, OtelError> {
         // Ensure the row exists AND belongs to the project (typed 404 otherwise).
         let existing = self.get(project_id, id).await?;
@@ -431,6 +657,22 @@ impl MetricAlertService {
         let eff_max_series = max_series.unwrap_or(existing.max_series);
         let eff_grouped_threshold =
             grouped_notification_threshold.unwrap_or(existing.grouped_notification_threshold);
+        // An unreadable stored source (a `logs` row whose saved search id
+        // went missing) is refused rather than silently re-validated as a
+        // metric rule, which would let an update "fix" it into a rule that
+        // watches a metric nobody asked for.
+        let eff_source = match series_source {
+            Some(source) => source,
+            None => AlertSeriesSource::from_columns(&existing.source, existing.saved_search_id)
+                .ok_or_else(|| OtelError::Validation {
+                    message: format!(
+                        "Alert rule {id} has source '{}' with saved_search_id {:?}, which is not \
+                         a series this binary can evaluate; set the source explicitly to repair it",
+                        existing.source, existing.saved_search_id
+                    ),
+                })?,
+        };
+        let (eff_metric, eff_agg) = normalize_series(eff_source, eff_metric, eff_agg);
         validate_rule(
             &eff_name,
             &eff_metric,
@@ -444,18 +686,26 @@ impl MetricAlertService {
             eff_dynamic,
             eff_max_series,
             eff_grouped_threshold,
+            eff_source,
         )?;
+        if series_source.is_some() {
+            self.ensure_saved_search_in_project(project_id, eff_source)
+                .await?;
+        }
 
         let mut active: ActiveModel = existing.into();
+        // The source is set from the merged value either way: a rule that
+        // becomes a log rule must get its saved search, and one that becomes
+        // a metric rule must lose it, or the two columns disagree.
+        active.source = Set(eff_source.as_str().to_string());
+        active.saved_search_id = Set(eff_source.saved_search_id());
+        active.metric_name = Set(eff_metric.trim().to_string());
+        active.aggregation = Set(eff_agg.trim().to_ascii_lowercase());
         if let Some(n) = name {
             active.name = Set(n.trim().to_string());
         }
-        if let Some(m) = metric_name {
-            active.metric_name = Set(m.trim().to_string());
-        }
-        if let Some(a) = aggregation {
-            active.aggregation = Set(a.trim().to_ascii_lowercase());
-        }
+        // `metric_name` and `aggregation` were applied above through the
+        // merged values, which a log rule overrides with its own series.
         if let Some(c) = detection_config {
             active.detection_kind = Set(c.kind_str().to_string());
             active.detection_config = Set(c.to_value()?);
@@ -620,6 +870,8 @@ mod tests {
             series_states: serde_json::json!({}),
             last_dropped_series_count: 0,
             last_evaluated_at: None,
+            source: "metric".to_string(),
+            saved_search_id: None,
             created_at: now,
             updated_at: now,
         }
@@ -657,6 +909,7 @@ mod tests {
                 false,
                 20,
                 5,
+                AlertSeriesSource::Metric,
             )
             .await
     }
@@ -769,6 +1022,7 @@ mod tests {
                 false,
                 20,
                 5,
+                AlertSeriesSource::Metric,
             )
             .await;
         assert!(matches!(result.unwrap_err(), OtelError::Validation { .. }));
@@ -795,6 +1049,7 @@ mod tests {
                 false,
                 20,
                 5,
+                AlertSeriesSource::Metric,
             )
             .await;
         assert!(matches!(result.unwrap_err(), OtelError::Validation { .. }));
@@ -828,6 +1083,7 @@ mod tests {
                 false,
                 20,
                 5,
+                AlertSeriesSource::Metric,
             )
             .await;
         assert!(matches!(result.unwrap_err(), OtelError::Validation { .. }));
@@ -854,6 +1110,7 @@ mod tests {
                 false,
                 20,
                 5,
+                AlertSeriesSource::Metric,
             )
             .await;
         assert!(matches!(result.unwrap_err(), OtelError::Validation { .. }));
@@ -885,6 +1142,7 @@ mod tests {
                 7,
                 999,
                 Some("New Name".to_string()),
+                None,
                 None,
                 None,
                 None,
@@ -1001,6 +1259,7 @@ mod tests {
                 false,
                 20,
                 5,
+                AlertSeriesSource::Metric,
             )
             .await;
         assert!(matches!(result.unwrap_err(), OtelError::Validation { .. }));
@@ -1027,6 +1286,7 @@ mod tests {
                 false,
                 20,
                 5,
+                AlertSeriesSource::Metric,
             )
             .await;
         assert!(matches!(result.unwrap_err(), OtelError::Validation { .. }));
@@ -1054,6 +1314,7 @@ mod tests {
                 false,
                 20,
                 5,
+                AlertSeriesSource::Metric,
             )
             .await;
         assert!(matches!(result.unwrap_err(), OtelError::Validation { .. }));
@@ -1085,6 +1346,7 @@ mod tests {
                 false,
                 20,
                 5,
+                AlertSeriesSource::Metric,
             )
             .await;
         assert_passes_validation(result);
@@ -1111,6 +1373,7 @@ mod tests {
                 false,
                 20,
                 5,
+                AlertSeriesSource::Metric,
             )
             .await;
         assert!(matches!(result.unwrap_err(), OtelError::Validation { .. }));
@@ -1137,6 +1400,7 @@ mod tests {
                 false,
                 20,
                 5,
+                AlertSeriesSource::Metric,
             )
             .await;
         assert!(matches!(result.unwrap_err(), OtelError::Validation { .. }));
@@ -1164,6 +1428,7 @@ mod tests {
                 true,
                 0,
                 5,
+                AlertSeriesSource::Metric,
             )
             .await;
         assert!(matches!(too_low.unwrap_err(), OtelError::Validation { .. }));
@@ -1185,6 +1450,7 @@ mod tests {
                 true,
                 101,
                 5,
+                AlertSeriesSource::Metric,
             )
             .await;
         assert!(matches!(
@@ -1220,6 +1486,7 @@ mod tests {
                 true,
                 20,
                 5,
+                AlertSeriesSource::Metric,
             )
             .await;
         assert_passes_validation(result);
@@ -1252,6 +1519,7 @@ mod tests {
                 true,
                 20,
                 5,
+                AlertSeriesSource::Metric,
             )
             .await;
         assert!(matches!(result.unwrap_err(), OtelError::Validation { .. }));
@@ -1280,6 +1548,7 @@ mod tests {
                 true,
                 50,
                 5,
+                AlertSeriesSource::Metric,
             )
             .await;
         assert_passes_validation(result);
@@ -1309,6 +1578,7 @@ mod tests {
                 true,
                 20,
                 250,
+                AlertSeriesSource::Metric,
             )
             .await;
         assert_passes_validation(result);
@@ -1336,6 +1606,7 @@ mod tests {
                 true,
                 20,
                 0,
+                AlertSeriesSource::Metric,
             )
             .await;
         assert!(matches!(too_low.unwrap_err(), OtelError::Validation { .. }));
@@ -1357,6 +1628,7 @@ mod tests {
                 true,
                 20,
                 1001,
+                AlertSeriesSource::Metric,
             )
             .await;
         assert!(matches!(
@@ -1389,5 +1661,254 @@ mod tests {
             )
             .await;
         assert!(result.is_ok());
+    }
+
+    // ── Log alerts (ADR 073 D1) ─────────────────────────────────────────
+
+    /// A log rule's validator input: the fields a caller controls.
+    fn validate_log(
+        aggregation: &str,
+        window_secs: i32,
+        detection: DetectionConfig,
+        group_by: Vec<String>,
+        dynamic: bool,
+    ) -> Result<(), OtelError> {
+        validate_rule(
+            "Payment failures",
+            "",
+            aggregation,
+            "warning",
+            window_secs,
+            60,
+            &detection,
+            &[],
+            &group_by,
+            dynamic,
+            20,
+            5,
+            AlertSeriesSource::Logs { saved_search_id: 3 },
+        )
+    }
+
+    fn log_threshold(comparator: Comparator, threshold: f64) -> DetectionConfig {
+        DetectionConfig::Static(StaticParams {
+            comparator,
+            threshold,
+        })
+    }
+
+    #[test]
+    fn a_log_rule_needs_no_metric_name() {
+        // The whole point: a log alert watches a saved search, so requiring
+        // a metric would make it unconstructible.
+        assert!(validate_log(
+            LOG_ALERT_AGGREGATION,
+            300,
+            log_threshold(Comparator::Gt, 20.0),
+            vec![],
+            false,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn a_metric_rule_still_requires_a_metric_name() {
+        let error = validate_rule(
+            "High latency",
+            "   ",
+            "p95",
+            "warning",
+            300,
+            60,
+            &static_cfg(),
+            &[],
+            &[],
+            false,
+            20,
+            5,
+            AlertSeriesSource::Metric,
+        )
+        .expect_err("a metric rule with no metric is rejected");
+        assert!(
+            error.to_string().contains("metric_name cannot be empty"),
+            "unexpected: {error}"
+        );
+    }
+
+    #[test]
+    fn a_log_rules_series_name_and_aggregation_are_set_by_the_server() {
+        let (metric, aggregation) = normalize_series(
+            AlertSeriesSource::Logs { saved_search_id: 3 },
+            "something.misleading".to_string(),
+            "p95".to_string(),
+        );
+        assert_eq!(metric, LOG_ALERT_METRIC_NAME);
+        assert_eq!(aggregation, LOG_ALERT_AGGREGATION);
+
+        // A metric rule keeps exactly what the caller sent.
+        let (metric, aggregation) = normalize_series(
+            AlertSeriesSource::Metric,
+            "http.server.duration".to_string(),
+            "p95".to_string(),
+        );
+        assert_eq!(metric, "http.server.duration");
+        assert_eq!(aggregation, "p95");
+    }
+
+    #[test]
+    fn a_log_rule_refuses_a_window_wider_than_the_cap() {
+        assert!(validate_log(
+            LOG_ALERT_AGGREGATION,
+            LOG_ALERT_MAX_WINDOW_SECS,
+            log_threshold(Comparator::Gt, 20.0),
+            vec![],
+            false,
+        )
+        .is_ok());
+        let error = validate_log(
+            LOG_ALERT_AGGREGATION,
+            LOG_ALERT_MAX_WINDOW_SECS + 1,
+            log_threshold(Comparator::Gt, 20.0),
+            vec![],
+            false,
+        )
+        .expect_err("a wider window is rejected");
+        assert!(
+            error
+                .to_string()
+                .contains(&LOG_ALERT_MAX_WINDOW_SECS.to_string()),
+            "the message names the limit: {error}"
+        );
+    }
+
+    #[test]
+    fn a_log_rule_refuses_a_threshold_the_count_cap_can_never_reach() {
+        // Counting stops at the cap and reports a lower bound, so
+        // "more than the cap" would be an alert that can never fire.
+        let error = validate_log(
+            LOG_ALERT_AGGREGATION,
+            300,
+            log_threshold(Comparator::Gt, LOG_ALERT_COUNT_CAP as f64),
+            vec![],
+            false,
+        )
+        .expect_err("an unreachable threshold is rejected");
+        assert!(
+            error.to_string().contains("could never be exceeded"),
+            "unexpected: {error}"
+        );
+        // Below the cap is fine, and so is a "fewer than" rule at any value:
+        // a low count is always observable.
+        assert!(validate_log(
+            LOG_ALERT_AGGREGATION,
+            300,
+            log_threshold(Comparator::Gt, LOG_ALERT_COUNT_CAP as f64 - 1.0),
+            vec![],
+            false,
+        )
+        .is_ok());
+        assert!(validate_log(
+            LOG_ALERT_AGGREGATION,
+            300,
+            log_threshold(Comparator::Lt, LOG_ALERT_COUNT_CAP as f64 + 10.0),
+            vec![],
+            false,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn a_log_rule_refuses_a_negative_threshold() {
+        assert!(validate_log(
+            LOG_ALERT_AGGREGATION,
+            300,
+            log_threshold(Comparator::Gt, -1.0),
+            vec![],
+            false,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn a_log_rule_refuses_detectors_with_no_log_baseline() {
+        // An anomaly band is built from the metrics store, which holds no
+        // log counts, so scoring against it would be meaningless.
+        let anomaly = DetectionConfig::Anomaly(crate::detectors::AnomalyParams {
+            algorithm: Default::default(),
+            deviations: 3.0,
+            direction: Default::default(),
+            seasonality: Default::default(),
+            pct_anomalous: 1.0,
+            baseline_lookback_days: Some(14),
+        });
+        let error = validate_log(LOG_ALERT_AGGREGATION, 300, anomaly, vec![], false)
+            .expect_err("an anomaly log rule is rejected");
+        assert!(
+            error.to_string().contains("static detector"),
+            "unexpected: {error}"
+        );
+    }
+
+    #[test]
+    fn a_log_rule_refuses_breakdowns_and_an_aggregation_other_than_count() {
+        assert!(validate_log(
+            LOG_ALERT_AGGREGATION,
+            300,
+            log_threshold(Comparator::Gt, 20.0),
+            vec!["service".to_string()],
+            false,
+        )
+        .is_err());
+        assert!(validate_log(
+            "avg",
+            300,
+            log_threshold(Comparator::Gt, 20.0),
+            vec![],
+            false,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn the_stored_source_columns_round_trip() {
+        let logs = AlertSeriesSource::Logs { saved_search_id: 3 };
+        assert_eq!(logs.as_str(), "logs");
+        assert_eq!(logs.saved_search_id(), Some(3));
+        assert_eq!(AlertSeriesSource::from_columns("logs", Some(3)), Some(logs));
+        assert_eq!(
+            AlertSeriesSource::as_str(AlertSeriesSource::Metric),
+            "metric"
+        );
+        assert_eq!(
+            AlertSeriesSource::from_columns("metric", None),
+            Some(AlertSeriesSource::Metric)
+        );
+        // A metric rule that still carries an old saved search id reads as a
+        // metric rule: the discriminator decides.
+        assert_eq!(
+            AlertSeriesSource::from_columns("metric", Some(3)),
+            Some(AlertSeriesSource::Metric)
+        );
+        // Columns that disagree, or a discriminator this binary does not
+        // know, are refused rather than guessed.
+        assert_eq!(AlertSeriesSource::from_columns("logs", None), None);
+        assert_eq!(AlertSeriesSource::from_columns("traces", None), None);
+    }
+
+    #[test]
+    fn the_wire_form_of_a_source_is_tagged_by_kind() {
+        let logs: AlertSeriesSource =
+            serde_json::from_value(serde_json::json!({ "kind": "logs", "saved_search_id": 3 }))
+                .expect("a log source parses");
+        assert_eq!(logs, AlertSeriesSource::Logs { saved_search_id: 3 });
+        let metric: AlertSeriesSource =
+            serde_json::from_value(serde_json::json!({ "kind": "metric" }))
+                .expect("a metric source parses");
+        assert_eq!(metric, AlertSeriesSource::Metric);
+        // A log source with no saved search cannot be expressed at all.
+        assert!(
+            serde_json::from_value::<AlertSeriesSource>(serde_json::json!({ "kind": "logs" }))
+                .is_err()
+        );
     }
 }

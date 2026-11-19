@@ -38,8 +38,8 @@ use temps_otel::handlers::metric_alert_handler::{delete_alert, MetricAlertScopeP
 use temps_otel::ingest::auth::OtelAuthService;
 use temps_otel::ingest::rate_limit::RateLimiter;
 use temps_otel::services::{
-    CrossProjectTraceService, MetricAlertEvaluator, MetricAlertService, MetricDashboardService,
-    OtelService,
+    AlertSeriesSource, CrossProjectTraceService, MetricAlertEvaluator, MetricAlertService,
+    MetricDashboardService, OtelService,
 };
 use temps_otel::storage::timescaledb::TimescaleDbStorage;
 use temps_otel::storage::OtelStorage;
@@ -216,6 +216,8 @@ async fn setup_evaluator() -> Option<EvaluatorTestCtx> {
         alarm_service_dynamic,
         db.clone(),
         None,
+        // No log series source: these tests exercise metric rules only.
+        None,
     ));
 
     Some(EvaluatorTestCtx {
@@ -324,6 +326,7 @@ async fn test_dynamic_alert_fires_then_resolves_per_series() {
             true,                       // dynamic_alerts
             20,                         // max_series
             5,                          // grouped_notification_threshold
+            AlertSeriesSource::Metric,
         )
         .await
         .expect("create dynamic rule");
@@ -388,6 +391,7 @@ async fn test_dynamic_alert_fires_then_resolves_per_series() {
             None,
             None,
             Some(static_gt(500.0)),
+            None,
             None,
             None,
             None,
@@ -463,6 +467,7 @@ async fn test_dynamic_alert_cardinality_cap_limits_alarms() {
             true,
             2, // max_series — below the 3 seeded series
             5,
+            AlertSeriesSource::Metric,
         )
         .await
         .expect("create capped rule");
@@ -534,6 +539,7 @@ async fn test_grouped_non_dynamic_fires_single_aggregate_alarm() {
             false,                      // ...but NOT dynamic: collapse to max
             20,
             5,
+            AlertSeriesSource::Metric,
         )
         .await
         .expect("create collapse rule");
@@ -662,6 +668,7 @@ async fn test_delete_alert_rejects_cross_project_rule_id_before_touching_evaluat
             true,
             20,
             5,
+            AlertSeriesSource::Metric,
         )
         .await
         .expect("create victim rule");
@@ -793,5 +800,165 @@ async fn test_delete_alert_rejects_cross_project_rule_id_before_touching_evaluat
     assert!(
         legit_result.is_ok(),
         "the rule's real owner must still be able to delete it: {legit_result:?}"
+    );
+}
+
+// ── Log alerts (ADR 073 D1) ─────────────────────────────────────────────
+
+/// A log-line counter that returns whatever count the test sets, so the
+/// evaluator's log path runs against the real `alarms` table without a log
+/// store behind it.
+struct FixedLogCount(std::sync::atomic::AtomicU64);
+
+#[async_trait::async_trait]
+impl temps_core::log_series::LogSeriesSource for FixedLogCount {
+    async fn count_matching(
+        &self,
+        _project_id: i32,
+        _saved_search_id: i32,
+        _start: chrono::DateTime<Utc>,
+        _end: chrono::DateTime<Utc>,
+    ) -> Result<temps_core::log_series::LogSeriesSample, temps_core::log_series::LogSeriesError>
+    {
+        Ok(temps_core::log_series::LogSeriesSample {
+            count: self.0.load(std::sync::atomic::Ordering::Relaxed),
+            saturated: false,
+        })
+    }
+}
+
+async fn seed_saved_search(db: &sea_orm::DatabaseConnection, project_id: i32, name: &str) -> i32 {
+    temps_entities::log_saved_searches::ActiveModel {
+        project_id: Set(project_id),
+        name: Set(name.to_string()),
+        description: Set(None),
+        query: Set(serde_json::json!({ "text": "payment failed" })),
+        time_range: Set("1h".to_string()),
+        pinned: Set(false),
+        created_by: Set(None),
+        ..Default::default()
+    }
+    .insert(db)
+    .await
+    .expect("seed saved search")
+    .id
+}
+
+/// The whole point of D1's first piece: a count of matching lines over a
+/// window fires through the same alarm log a metric rule uses, and resolves
+/// when the count falls back.
+#[tokio::test]
+async fn test_log_alert_fires_on_a_line_count_and_resolves() {
+    let Some(ctx) = setup_evaluator().await else {
+        return;
+    };
+    let counter = Arc::new(FixedLogCount(std::sync::atomic::AtomicU64::new(42)));
+    ctx.evaluator.set_log_series(counter.clone());
+    let saved_search_id = seed_saved_search(&ctx.db, ctx.project_id, "Payment failures").await;
+
+    let rule = ctx
+        .alert_service
+        .create(
+            ctx.project_id,
+            "Payment failures".to_string(),
+            String::new(),
+            "count".to_string(),
+            static_gt(20.0),
+            300,
+            1,
+            "critical".to_string(),
+            true,
+            vec![],
+            vec![],
+            false,
+            20,
+            5,
+            AlertSeriesSource::Logs { saved_search_id },
+        )
+        .await
+        .expect("create log rule");
+    assert_eq!(rule.source, "logs");
+    assert_eq!(rule.saved_search_id, Some(saved_search_id));
+
+    ctx.evaluator.run_cycle().await.expect("cycle 1");
+    tokio::time::sleep(BREACH_PERSIST_WAIT).await;
+    ctx.evaluator.run_cycle().await.expect("cycle 2");
+
+    let firing = alarms_for(&ctx.db, ctx.project_id).await;
+    assert_eq!(firing.len(), 1, "one log alarm fires: {firing:?}");
+    let alarm = &firing[0];
+    assert_eq!(alarm.status, AlarmStatus::Firing.as_str());
+    assert_eq!(alarm.title, "Log alert: Payment failures");
+    let message = alarm.message.as_deref().unwrap_or_default();
+    assert!(
+        message.contains("42 log lines matched"),
+        "the message says what was counted: {message}"
+    );
+    let metadata = alarm.metadata.as_ref().expect("metadata recorded");
+    assert_eq!(
+        metadata["saved_search_id"],
+        serde_json::json!(saved_search_id)
+    );
+    assert_eq!(metadata["source"], serde_json::json!("log_alert"));
+
+    counter.0.store(3, std::sync::atomic::Ordering::Relaxed);
+    ctx.evaluator.run_cycle().await.expect("cycle 3");
+    let resolved = alarms_for(&ctx.db, ctx.project_id).await;
+    assert_eq!(resolved.len(), 1);
+    assert_eq!(
+        resolved[0].status,
+        AlarmStatus::Resolved.as_str(),
+        "the alarm resolves once the count is back under the threshold"
+    );
+}
+
+/// A rule may only count a saved search of its own project.
+#[tokio::test]
+async fn test_log_alert_refuses_another_projects_saved_search() {
+    let Some(ctx) = setup_evaluator().await else {
+        return;
+    };
+    let other_project = temps_entities::projects::ActiveModel {
+        name: Set("Other project".into()),
+        repo_name: Set("other-repo".into()),
+        repo_owner: Set("test-org".into()),
+        directory: Set("/".into()),
+        main_branch: Set("main".into()),
+        preset: Set(temps_entities::preset::Preset::Dockerfile),
+        slug: Set("log-alert-other-project".into()),
+        ..Default::default()
+    }
+    .insert(ctx.db.as_ref())
+    .await
+    .expect("insert other project");
+    let foreign = seed_saved_search(&ctx.db, other_project.id, "Not yours").await;
+
+    let error = ctx
+        .alert_service
+        .create(
+            ctx.project_id,
+            "Borrowed search".to_string(),
+            String::new(),
+            "count".to_string(),
+            static_gt(20.0),
+            300,
+            60,
+            "warning".to_string(),
+            true,
+            vec![],
+            vec![],
+            false,
+            20,
+            5,
+            AlertSeriesSource::Logs {
+                saved_search_id: foreign,
+            },
+        )
+        .await
+        .expect_err("a foreign saved search is refused");
+    let message = error.to_string();
+    assert!(
+        message.contains(&format!("Saved log search {foreign} not found in project")),
+        "unexpected: {message}"
     );
 }

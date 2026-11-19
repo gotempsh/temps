@@ -8,8 +8,8 @@ use temps_core::AuditLogger;
 
 use crate::index::LineIndex;
 use crate::services::{
-    ChunkWriterService, IngestBudget, LogMetadataService, LogSearchService, RetentionService,
-    TailService,
+    ChunkWriterService, IngestBudget, LogMetadataService, LogSavedSearchService, LogSearchService,
+    RetentionService, TailService,
 };
 use crate::store::manifest::ManifestRepo;
 use crate::store::LogLineStore;
@@ -44,6 +44,9 @@ pub struct LogAggregatorAppState {
     /// Per-container ingestion budget, for the throttled containers the
     /// capabilities endpoint reports.
     pub ingest_budget: Arc<IngestBudget>,
+    /// Saved log searches (ADR 073 D1): the named queries the console
+    /// offers and log alerts count.
+    pub saved_search_service: Arc<LogSavedSearchService>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -58,6 +61,7 @@ pub async fn create_log_aggregator_app_state(
     line_index: Arc<dyn LineIndex>,
     chunk_writer: Arc<ChunkWriterService>,
     ingest_budget: Arc<IngestBudget>,
+    saved_search_service: Arc<LogSavedSearchService>,
 ) -> Arc<LogAggregatorAppState> {
     let manifests = Arc::new(ManifestRepo::new(db.clone()));
     Arc::new(LogAggregatorAppState {
@@ -73,5 +77,6 @@ pub async fn create_log_aggregator_app_state(
         manifests,
         chunk_writer,
         ingest_budget,
+        saved_search_service,
     })
 }

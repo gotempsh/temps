@@ -289,6 +289,8 @@ async fn setup_e2e_as_full(
         alarm_service_dynamic,
         db.clone(),
         None,
+        // No log series source: these tests exercise metric rules only.
+        None,
     ));
     let facet_cache: temps_otel::services::FacetCache = Arc::new(arc_swap::ArcSwap::from_pointee(
         std::collections::HashMap::new(),

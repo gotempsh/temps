@@ -37,6 +37,7 @@ pub mod gate_access;
 pub mod internal_access;
 pub mod jobs;
 pub mod known_proxies;
+pub mod log_series;
 pub mod log_storage_config;
 /// Log recurring conditions on state transitions instead of on every tick.
 pub mod log_transitions;

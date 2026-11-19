@@ -93,6 +93,63 @@ impl From<LogAggregatorError> for Problem {
             LogAggregatorError::Validation { .. } => problemdetails::new(StatusCode::BAD_REQUEST)
                 .with_title("Validation Error")
                 .with_detail(error.to_string()),
+            // ── Saved searches and log ingest (ADR 073 D1) ──────────────
+            LogAggregatorError::SavedSearchNotFound { .. } => {
+                problemdetails::new(StatusCode::NOT_FOUND)
+                    .with_title("Saved Log Search Not Found")
+                    .with_detail(error.to_string())
+            }
+            LogAggregatorError::SavedSearchNameTaken { .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Saved Log Search Name Taken")
+                    .with_detail(error.to_string())
+            }
+            LogAggregatorError::SavedSearchInUse { .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Saved Log Search In Use")
+                    .with_detail(error.to_string())
+            }
+            LogAggregatorError::SavedSearchLimitReached { .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Saved Log Search Limit Reached")
+                    .with_detail(error.to_string())
+            }
+            LogAggregatorError::IngestKeyNotFound { .. } => {
+                problemdetails::new(StatusCode::NOT_FOUND)
+                    .with_title("Log Ingest Key Not Found")
+                    .with_detail(error.to_string())
+            }
+            // The presented key is not usable. Deliberately carries no hint
+            // about which part was wrong: a collector operator reads their
+            // own key from their own configuration.
+            LogAggregatorError::IngestKeyRejected => problemdetails::new(StatusCode::UNAUTHORIZED)
+                .with_title("Log Ingest Key Rejected")
+                .with_detail(error.to_string()),
+            LogAggregatorError::IngestKeyEnvironmentNotFound { .. } => {
+                problemdetails::new(StatusCode::NOT_FOUND)
+                    .with_title("Environment Not Found")
+                    .with_detail(error.to_string())
+            }
+            LogAggregatorError::ProjectNotFound { .. } => {
+                problemdetails::new(StatusCode::NOT_FOUND)
+                    .with_title("Project Not Found")
+                    .with_detail(error.to_string())
+            }
+            LogAggregatorError::IngestBudgetExceeded { .. } => {
+                problemdetails::new(StatusCode::TOO_MANY_REQUESTS)
+                    .with_title("Log Ingestion Budget Exceeded")
+                    .with_detail(error.to_string())
+            }
+            LogAggregatorError::IngestLineInvalid { .. } => {
+                problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_title("Invalid Log Ingest Line")
+                    .with_detail(error.to_string())
+            }
+            LogAggregatorError::IngestBodyTooLarge { .. } => {
+                problemdetails::new(StatusCode::PAYLOAD_TOO_LARGE)
+                    .with_title("Log Ingest Body Too Large")
+                    .with_detail(error.to_string())
+            }
             LogAggregatorError::Database(_) => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Database Error")
@@ -427,7 +484,12 @@ pub struct PurgeLogsRequest {
         search_logs,
         get_log_context,
         tail_logs,
-        purge_project_logs
+        purge_project_logs,
+        super::saved_searches::list_saved_searches,
+        super::saved_searches::create_saved_search,
+        super::saved_searches::get_saved_search,
+        super::saved_searches::update_saved_search,
+        super::saved_searches::delete_saved_search
     ),
     components(
         schemas(
@@ -469,6 +531,11 @@ pub struct PurgeLogsRequest {
             LineContext,
             LogLevel,
             LogStream,
+            super::saved_searches::CreateSavedSearchRequest,
+            super::saved_searches::UpdateSavedSearchRequest,
+            super::saved_searches::SavedSearchResponse,
+            super::saved_searches::SavedSearchesResponse,
+            crate::services::SavedSearchQuery,
         )
     ),
     info(
@@ -498,6 +565,7 @@ pub fn configure_routes() -> Router<Arc<LogAggregatorAppState>> {
         .route("/logs/context", get(get_log_context))
         .route("/logs/tail", get(tail_logs))
         .route("/projects/{project_id}/logs", delete(purge_project_logs))
+        .merge(super::saved_searches::configure_routes())
 }
 
 // ── Handlers ────────────────────────────────────────────────────────────
@@ -989,6 +1057,9 @@ mod tests {
             chunk_writer: chunk_writer.clone(),
             ingest_budget: Arc::new(crate::services::IngestBudget::new(
                 crate::services::IngestLimits::UNLIMITED,
+            )),
+            saved_search_service: Arc::new(crate::services::LogSavedSearchService::new(
+                db.connection_arc(),
             )),
         });
 
@@ -2207,6 +2278,7 @@ mod tests {
             manifests: base_state.manifests.clone(),
             chunk_writer: base_state.chunk_writer.clone(),
             ingest_budget: base_state.ingest_budget.clone(),
+            saved_search_service: base_state.saved_search_service.clone(),
         });
         build_test_server_with_role(app_state, temps_authz::Role::User)
     }

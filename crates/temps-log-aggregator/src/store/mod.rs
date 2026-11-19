@@ -37,7 +37,7 @@ pub mod access;
 pub mod chunk_store;
 pub mod manifest;
 
-pub use access::{resolve_log_access_scope, LogAccessError};
+pub use access::{resolve_log_access_scope, services_linked_to_projects, LogAccessError};
 pub use manifest::{Manifest, ManifestCursor, ManifestRepo};
 
 use async_trait::async_trait;

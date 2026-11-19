@@ -344,6 +344,26 @@ impl TempsPlugin for LogAggregatorPlugin {
             // Audit service
             let audit_service = context.require_service::<dyn temps_core::AuditLogger>();
 
+            // ── ADR 073 D1: saved searches and the log-alert series ─────
+            // The saved-search list is plain project configuration; the
+            // series source is what the metric alert evaluator pulls on its
+            // interval to count the lines a saved search matches. Both are
+            // registered unconditionally: a log alert must be configurable
+            // whether or not a line index exists, and the counter picks the
+            // index or a bounded chunk scan per query.
+            let saved_search_service =
+                Arc::new(crate::services::LogSavedSearchService::new(db.clone()));
+            context.register_service(saved_search_service.clone());
+            let log_series_service = Arc::new(crate::services::LogSeriesService::new(
+                saved_search_service.clone(),
+                store.clone(),
+                line_index.clone(),
+                db.clone(),
+            ));
+            context.register_service(
+                log_series_service as Arc<dyn temps_core::log_series::LogSeriesSource>,
+            );
+
             // App state for handlers
             let app_state = create_log_aggregator_app_state(
                 search_service,
@@ -356,6 +376,7 @@ impl TempsPlugin for LogAggregatorPlugin {
                 line_index,
                 chunk_writer.clone(),
                 ingest_budget,
+                saved_search_service,
             )
             .await;
             context.register_service(app_state);
@@ -737,6 +758,7 @@ impl TempsPlugin for LogAggregatorPlugin {
             manifests: old.manifests.clone(),
             chunk_writer: old.chunk_writer.clone(),
             ingest_budget: old.ingest_budget.clone(),
+            saved_search_service: old.saved_search_service.clone(),
         });
         let routes = handlers::configure_routes().with_state(app_state);
 

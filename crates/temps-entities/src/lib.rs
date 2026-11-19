@@ -271,6 +271,7 @@ pub mod vulnerability_scans;
 // Log aggregator entities
 pub mod log_chunks;
 pub mod log_events;
+pub mod log_saved_searches;
 
 // Standalone sandbox API (Vercel-compatible)
 pub mod sandbox_access_authorities;

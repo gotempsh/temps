@@ -48,6 +48,7 @@ export const previewPermissions = {
     "load_balancer:read",
     "load_balancer:write",
     "logs:read",
+    "logs:write",
     "logs:delete",
     "metrics:read",
     "notifications:read",

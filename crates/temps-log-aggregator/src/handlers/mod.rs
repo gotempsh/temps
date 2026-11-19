@@ -3,6 +3,7 @@
 
 pub(crate) mod global;
 pub(crate) mod log_handler;
+pub(crate) mod saved_searches;
 pub(crate) mod types;
 
 pub use log_handler::configure_routes;
