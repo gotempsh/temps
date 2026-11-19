@@ -21,15 +21,6 @@
 # Re-runnable: versions already on npm are checked and skipped.
 set -u
 
-if [ $# -ne 1 ] || [ ! -d "$1" ]; then
-  echo "usage: $0 <tarball-dir>   (directory with the .tgz files you staged)" >&2
-  exit 2
-fi
-TARBALL_DIR="$(cd "$1" && pwd)" || exit 2
-
-# Run from $HOME so the repo's .npmrc (auth = ${NPM_TOKEN}) does not shadow ~/.npmrc.
-cd "$HOME" || exit 1
-
 # Order matters: analytics-core first, the packages depending on it after.
 PACKAGES=(
   "@temps-sdk/analytics-core@0.0.6"
@@ -45,13 +36,19 @@ REQUIRED_FIRST="${PACKAGES[0]}"   # abort the whole run if this one fails
 VALIDATE_TIMEOUT=900   # seconds to wait for automated review
 PUBLISH_TIMEOUT=300    # seconds to wait for the registry after approving
 
-WORK_DIR="$(mktemp -d)" || exit 1
-trap 'rm -rf "$WORK_DIR"' EXIT
-
 published() { [ "$(npm view "$1" version 2>/dev/null)" = "${1##*@}" ]; }
 
-# npm's integrity string for a file: "sha512-<base64>", as in `npm view <spec> dist.integrity`
-integrity() { printf 'sha512-%s' "$(openssl dgst -sha512 -binary "$1" | openssl base64 -A)"; }
+# npm's integrity string for a file: "sha512-<base64>", as in `npm view <spec> dist.integrity`.
+# Fails (prints nothing, returns 1) unless both openssl steps succeed and the result is a
+# well-formed SHA-512 digest. It must never print a bare "sha512-": two failed hashes would
+# compare equal, and a stage nobody verified would be approved.
+integrity() {
+  local digest
+  digest="$(set -o pipefail; openssl dgst -sha512 -binary "$1" | openssl base64 -A)" || return 1
+  # 64 bytes of SHA-512 are always 88 base64 characters, the last two being padding.
+  [[ "$digest" =~ ^[A-Za-z0-9+/]{86}==$ ]] || return 1
+  printf 'sha512-%s' "$digest"
+}
 
 # local tarball for a spec, named the way `npm pack` names it: @scope/name@1.2.3 -> scope-name-1.2.3.tgz
 local_tarball() {
@@ -88,7 +85,12 @@ staged_matches_local() {
   if [ -z "$staged" ]; then
     echo "✗ $spec: npm stage download $id wrote no tarball"; return 1
   fi
-  want="$(integrity "$local_tgz")"; got="$(integrity "$staged")"
+  if ! want="$(integrity "$local_tgz")"; then
+    echo "✗ $spec: could not hash $local_tgz"; return 1
+  fi
+  if ! got="$(integrity "$staged")"; then
+    echo "✗ $spec: could not hash the tarball downloaded from stage $id"; return 1
+  fi
   if [ "$want" != "$got" ]; then
     echo "✗ $spec: stage $id does NOT match $local_tgz"
     echo "    local:  $want"
@@ -108,7 +110,9 @@ approve_one() {
   if [ ! -f "$local_tgz" ]; then
     echo "✗ $spec: no local tarball at $local_tgz to verify against"; return 1
   fi
-  want="$(integrity "$local_tgz")"
+  if ! want="$(integrity "$local_tgz")"; then
+    echo "✗ $spec: could not hash $local_tgz"; return 1
+  fi
 
   if published "$spec"; then
     if [ "$(npm view "$spec" dist.integrity 2>/dev/null)" != "$want" ]; then
@@ -156,6 +160,26 @@ approve_one() {
   fi
   echo "✓ $spec published ($want)"
 }
+
+# Sourced (by approve-packages.test.ts) for its functions: stop before doing anything.
+if [ "${BASH_SOURCE[0]}" != "$0" ]; then return 0; fi
+
+if [ $# -ne 1 ] || [ ! -d "$1" ]; then
+  echo "usage: $0 <tarball-dir>   (directory with the .tgz files you staged)" >&2
+  exit 2
+fi
+TARBALL_DIR="$(cd "$1" && pwd)" || exit 2
+
+if ! command -v openssl >/dev/null 2>&1; then
+  echo "✗ openssl is required to verify staged tarballs and was not found on PATH" >&2
+  exit 2
+fi
+
+# Run from $HOME so the repo's .npmrc (auth = ${NPM_TOKEN}) does not shadow ~/.npmrc.
+cd "$HOME" || exit 1
+
+WORK_DIR="$(mktemp -d)" || exit 1
+trap 'rm -rf "$WORK_DIR"' EXIT
 
 failed=()
 for spec in "${PACKAGES[@]}"; do
