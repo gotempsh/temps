@@ -4,9 +4,15 @@
 import { useEffect } from 'react'
 import { useLocation } from 'react-router'
 import { linkedSectionTargets } from '@/lib/linked-section'
+import { scrollElementToTop } from '@/lib/scroll-to-element'
 
-/** How long a linked page may take to render the section it points at. */
+/**
+ * How long a linked page may take to render the section it points at, and to
+ * finish loading the content above it.
+ */
 const WAIT_FOR_SECTION_MS = 10_000
+/** Input that means the reader has started moving around the page. */
+const READER_INPUT = ['wheel', 'touchstart', 'pointerdown', 'keydown'] as const
 const HIGHLIGHT_MS = 2_000
 const HIGHLIGHT_CLASSES = [
   'ring-2',
@@ -24,10 +30,18 @@ const HIGHLIGHT_CLASSES = [
 export function openSettingsSection(id: string): boolean {
   const element = document.getElementById(id)
   if (!element) return false
-  if (element instanceof HTMLDetailsElement) element.open = true
-  element.scrollIntoView({ block: 'start' })
-  highlight(element)
+  reveal(element)
   return true
+}
+
+/**
+ * Scrolls only the element's own scroll container (never the app shell or
+ * the locked document; see `scroll-to-element.ts`), then highlights it.
+ */
+function reveal(element: HTMLElement) {
+  if (element instanceof HTMLDetailsElement) element.open = true
+  scrollElementToTop(element)
+  highlight(element)
 }
 
 /** Highlights in progress, so a repeat restarts the timer instead of racing it. */
@@ -63,6 +77,11 @@ function highlight(element: Element) {
  * renders, so the page never sits at the top while a card loads; when the
  * setting itself appears it takes over. A setting this service does not have
  * leaves the reader on its group.
+ *
+ * Sections above the target keep loading after it renders (their queries
+ * resolve, skeletons become forms), which pushes it down. Until the reader
+ * scrolls, clicks or types, the target is kept where the link put it; from
+ * their first input on, the page is theirs and is never scrolled again.
  */
 export function useScrollToLinkedSection() {
   const { pathname, search, hash } = useLocation()
@@ -72,21 +91,43 @@ export function useScrollToLinkedSection() {
   useEffect(() => {
     const [primary, ...fallbacks] = JSON.parse(targets) as string[]
     if (!primary) return
-    if (openSettingsSection(primary)) return
-    let onFallback = fallbacks.some((id) => openSettingsSection(id))
-    const observer = new MutationObserver(() => {
-      if (openSettingsSection(primary)) {
-        stop()
+    // What the reader is shown: the setting, or its group until it renders.
+    let shown: HTMLElement | null = null
+    let onPrimary = false
+    const follow = () => {
+      if (!onPrimary) {
+        const target = document.getElementById(primary)
+        if (target) {
+          onPrimary = true
+          shown = target
+          reveal(target)
+          return
+        }
+      }
+      if (!shown) {
+        const group = fallbacks
+          .map((id) => document.getElementById(id))
+          .find((element) => element !== null)
+        if (group) {
+          shown = group
+          reveal(group)
+        }
         return
       }
-      if (!onFallback)
-        onFallback = fallbacks.some((id) => openSettingsSection(id))
-    })
+      // Something rendered: keep the section where the link put it.
+      scrollElementToTop(shown)
+    }
+    const observer = new MutationObserver(follow)
     const timer = window.setTimeout(() => stop(), WAIT_FOR_SECTION_MS)
     const stop = () => {
       observer.disconnect()
       window.clearTimeout(timer)
+      for (const type of READER_INPUT)
+        window.removeEventListener(type, stop, { capture: true })
     }
+    for (const type of READER_INPUT)
+      window.addEventListener(type, stop, { capture: true, passive: true })
+    follow()
     observer.observe(document.body, { childList: true, subtree: true })
     return stop
   }, [pathname, targets])
