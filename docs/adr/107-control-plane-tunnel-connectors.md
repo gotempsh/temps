@@ -99,9 +99,20 @@ another machine, and node `0` reports `down` with that reason.
 
 At startup the proxy binds `127.0.0.1:7480` (the default `edge_port`) as a
 second plain-HTTP listener, the **tunnel origin**. Pingora cannot add
-listeners after it starts, so it is bound whether or not a connector exists; a
-port already taken is logged and the listener skipped, and a connector placed
-on node `0` then reports why it cannot start.
+listeners after it starts, so it is bound whether or not a connector exists.
+
+A worker agent on the same machine (a control plane also enrolled as a
+worker) already holds `7480` for its own tunnel origin, so a taken port is
+not the end: the proxy takes the first free port up to `7489` and logs which.
+The port is part of the provider's tunnel configuration
+(`http://127.0.0.1:{edge_port}`), so a tunnel placed **only** on the control
+plane follows it: a new one is created on that port, and the connector loop
+moves an existing one, telling the provider first and keeping the new port
+only once the provider accepted it (a failure leaves the old port and the
+error on the tunnel, and is not retried every pass). A tunnel also placed on
+workers keeps its port, since every worker binds it itself; its control-plane
+replica reports why it does not run. With every port taken, the listener is
+skipped and a connector placed on node `0` reports why it cannot start.
 
 A request that arrived on the tunnel origin:
 
@@ -172,8 +183,8 @@ tunnel needs a worker.
   addresses on a control-plane tunnel answer `unknown_key`.
 - **Container and library drivers on the control plane.** The supervisor
   offers only the process driver there, as on workers today.
-- **A different tunnel origin port per install.** `edge_port` stays per
-  connector in the schema; the control plane serves only the default.
+- **A chosen tunnel origin port.** The control plane takes the first free
+  port from `7480` to `7489` (D3); an operator cannot pick one.
 
 ## Consequences
 

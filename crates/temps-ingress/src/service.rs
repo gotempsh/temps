@@ -35,6 +35,8 @@ use crate::provider::{DnsIntent, TunnelContext, TunnelHandle, TunnelProvider};
 use crate::registry::{FieldKind, ProviderDeps, ProviderInfo, ProviderRegistry, ProviderSetup};
 use crate::wire::{NodeConnectorSpec, NodeConnectorStatusReport, NodeConnectorsResponse};
 
+mod control_plane_ports;
+
 /// The DNS controller name stamped on the records this service owns.
 const DNS_CONTROLLER: &str = "ingress-connector";
 /// Every connector's tunnel origin port, on workers and on the control
@@ -1093,7 +1095,7 @@ impl IngressConnectorService {
             dns_provider_id: Set(setup.dns_provider.as_ref().map(|p| p.id)),
             domain: Set(setup.domain.clone().unwrap_or_default()),
             settings: Set(serde_json::Value::Object(settings)),
-            edge_port: Set(DEFAULT_EDGE_PORT),
+            edge_port: Set(self.edge_port_for(&request.node_ids)),
             auto_publish: Set(request.auto_publish.unwrap_or(true)),
             host_suffix: Set(host_suffix),
             status: Set("pending".into()),
@@ -1752,6 +1754,10 @@ impl IngressConnectorService {
                     .map_err(|e| IngressError::Encryption(e.to_string()))?;
                 let replaced = tunnel_replaced(current.external_id.as_deref(), &handle.external_id);
                 row.external_id = Set(Some(handle.external_id));
+                // The port the provider now sends visitors to: a tunnel
+                // moved to the control plane's origin keeps it only once the
+                // provider has it (`align_control_plane_edge_ports`).
+                row.edge_port = Set(connector.edge_port);
                 row.settings = Set(keep_setup(&current.settings, handle.settings));
                 row.secret_encrypted = Set(Some(secret));
                 row.status = Set("ready".into());
@@ -3506,6 +3512,9 @@ mod tests {
             ensure: AtomicUsize,
             delete: AtomicUsize,
             fail_delete_once: AtomicBool,
+            /// The `edge_port` the last `ensure` configured the tunnel for.
+            ensured_port: std::sync::atomic::AtomicU16,
+            fail_ensure: AtomicBool,
         }
 
         struct FakeTunnels(Arc<Calls>);
@@ -3518,6 +3527,10 @@ mod tests {
             async fn ensure(&self, ctx: &TunnelContext<'_>) -> Result<TunnelHandle, IngressError> {
                 // A real provider recreates a tunnel deleted at the provider.
                 self.0.ensure.fetch_add(1, Ordering::SeqCst);
+                if self.0.fail_ensure.load(Ordering::SeqCst) {
+                    return Err(IngressError::Provider("provider unavailable".into()));
+                }
+                self.0.ensured_port.store(ctx.edge_port, Ordering::SeqCst);
                 Ok(TunnelHandle {
                     external_id: format!("recreated-{}", ctx.connector_id),
                     settings: serde_json::json!({}),
@@ -3962,6 +3975,118 @@ mod tests {
             drop(test_db);
         }
 
+        /// ADR-107 D3: a worker agent on the same machine holds the default
+        /// tunnel origin port, so the control plane's proxy listens on a
+        /// later one. A tunnel placed only on the control plane moves there:
+        /// the provider is told first, then the row and node 0's spec follow.
+        #[tokio::test]
+        async fn a_control_plane_tunnel_moves_to_the_port_the_proxy_listens_on() {
+            let Some((test_db, service, calls, id)) = setup_with(Some(7481)).await else {
+                return;
+            };
+            service
+                .replace_nodes(id, &[CONTROL_PLANE_NODE_ID])
+                .await
+                .expect("placed on the control plane");
+            assert_eq!(service.find(id).await.expect("row").edge_port, 8443);
+
+            service
+                .align_control_plane_edge_ports(7481)
+                .await
+                .expect("aligned");
+            assert_eq!(calls.ensured_port.load(Ordering::SeqCst), 7481);
+            let row = service.find(id).await.expect("row");
+            assert_eq!(row.edge_port, 7481);
+            assert_eq!(row.status, "ready");
+            let specs = service
+                .node_specs(CONTROL_PLANE_NODE_ID)
+                .await
+                .expect("specs");
+            assert_eq!(specs.connectors[0].edge_port, 7481);
+
+            // Already there: no further provider call.
+            let ensured = calls.ensure.load(Ordering::SeqCst);
+            service
+                .align_control_plane_edge_ports(7481)
+                .await
+                .expect("aligned again");
+            assert_eq!(calls.ensure.load(Ordering::SeqCst), ensured);
+            drop(test_db);
+        }
+
+        /// A tunnel also placed on workers keeps its port: every worker
+        /// binds that port itself, and the control plane's replica says why
+        /// it cannot run instead.
+        #[tokio::test]
+        async fn a_tunnel_also_on_workers_keeps_its_port() {
+            let Some((test_db, service, calls, id)) = setup_with(Some(7481)).await else {
+                return;
+            };
+            let db = test_db.connection_arc();
+            let worker = insert_node(db.as_ref(), "worker-a", "worker", "active").await;
+            service
+                .replace_nodes(id, &[CONTROL_PLANE_NODE_ID, worker])
+                .await
+                .expect("mixed placement");
+
+            service
+                .align_control_plane_edge_ports(7481)
+                .await
+                .expect("aligned");
+            assert_eq!(calls.ensure.load(Ordering::SeqCst), 0);
+            assert_eq!(service.find(id).await.expect("row").edge_port, 8443);
+            drop(test_db);
+        }
+
+        /// The port changes only once the provider has it: a failed call
+        /// leaves the tunnel on its old port with the error shown, and the
+        /// next passes do not call the provider again for it.
+        #[tokio::test]
+        async fn a_failed_move_keeps_the_old_port_and_is_not_retried_every_pass() {
+            let Some((test_db, service, calls, id)) = setup_with(Some(7481)).await else {
+                return;
+            };
+            service
+                .replace_nodes(id, &[CONTROL_PLANE_NODE_ID])
+                .await
+                .expect("placed on the control plane");
+            calls.fail_ensure.store(true, Ordering::SeqCst);
+
+            service
+                .align_control_plane_edge_ports(7481)
+                .await
+                .expect("a provider failure is the connector's, not the pass's");
+            let row = service.find(id).await.expect("row");
+            assert_eq!(row.edge_port, 8443);
+            assert_eq!(row.status, "error");
+            assert_eq!(row.last_error.as_deref(), Some("provider unavailable"));
+
+            let ensured = calls.ensure.load(Ordering::SeqCst);
+            service
+                .align_control_plane_edge_ports(7481)
+                .await
+                .expect("aligned again");
+            assert_eq!(calls.ensure.load(Ordering::SeqCst), ensured);
+            drop(test_db);
+        }
+
+        /// A new tunnel placed only on the control plane starts on the
+        /// control plane's port; any placement with a worker on the default.
+        #[tokio::test]
+        async fn a_new_tunnel_takes_the_control_planes_port_only_when_it_runs_only_there() {
+            let Some((test_db, service, _calls, _id)) = setup_with(Some(7481)).await else {
+                return;
+            };
+            assert_eq!(service.edge_port_for(&[CONTROL_PLANE_NODE_ID]), 7481);
+            assert_eq!(
+                service.edge_port_for(&[CONTROL_PLANE_NODE_ID, 4]),
+                DEFAULT_EDGE_PORT
+            );
+            assert_eq!(service.edge_port_for(&[4]), DEFAULT_EDGE_PORT);
+            assert_eq!(service.edge_port_for(&[]), DEFAULT_EDGE_PORT);
+            drop(test_db);
+        }
+
         #[tokio::test]
         async fn placements_name_the_node_that_cannot_run_a_connector() {
             let Some((test_db, service, _calls, _id)) = setup().await else {
@@ -4151,20 +4276,51 @@ mod tests {
             assert_eq!(view.nodes[0].state, "ready");
             assert_eq!(view.nodes[0].ready_connections, Some(2));
 
-            // The proxy took tunnel traffic on another port: nothing runs,
-            // and the row says why.
+            // The proxy took tunnel traffic on another port (a worker agent
+            // on this machine held the first): a tunnel only on the control
+            // plane moves there and keeps running.
             origin.mark_bound(7480);
+            connectors.sync().await.expect("sync");
+            assert_eq!(
+                runtime.applied.lock().expect("lock").last(),
+                Some(&vec![id])
+            );
+            assert_eq!(service.find(id).await.expect("row").edge_port, 7480);
+
+            // One also placed on a worker keeps its port: the control plane's
+            // replica runs nothing, and its row says why.
+            let worker = insert_node(
+                test_db.connection_arc().as_ref(),
+                "worker-a",
+                "worker",
+                "active",
+            )
+            .await;
+            service
+                .replace_nodes(id, &[CONTROL_PLANE_NODE_ID, worker])
+                .await
+                .expect("mixed placement");
+            origin.mark_bound(7481);
             connectors.sync().await.expect("sync");
             assert_eq!(
                 runtime.applied.lock().expect("lock").last(),
                 Some(&Vec::new())
             );
             let view = service.get(id).await.expect("view");
-            assert_eq!(view.nodes[0].state, "down");
-            assert!(view.nodes[0]
-                .last_error
-                .as_deref()
-                .is_some_and(|e| e.contains("port 8443")));
+            let control_plane = view
+                .nodes
+                .iter()
+                .find(|node| node.node_id == CONTROL_PLANE_NODE_ID)
+                .expect("node 0");
+            assert_eq!(control_plane.state, "down");
+            assert!(
+                control_plane
+                    .last_error
+                    .as_deref()
+                    .is_some_and(|e| e.contains("port 7480") && e.contains("port 7481")),
+                "{:?}",
+                control_plane.last_error
+            );
             drop(test_db);
         }
 
