@@ -81,3 +81,16 @@ An External service does not receive variables from Temps, because Temps never s
 
 - **Errors**: use the service's DSN with any Sentry SDK (`bunx @temps-sdk/cli dsn` shows it). See [Error Tracking](/docs/error-tracking).
 - **Traces and metrics**: point the OpenTelemetry exporter at Temps. See [OpenTelemetry](/docs/opentelemetry).
+
+### No framework, or one without an SDK {{ anchor: true, id: 'plain-http' }}
+
+Every setup flow (analytics, errors, OpenTelemetry, and the empty logs page) has a **Plain HTTP / any framework** option. It shows this service's endpoints, built from your public ingress URL, plus the auth headers, a minimal payload and a `curl` you can run to send one test signal. **Copy AI prompt** gives the same details to a coding agent. The prompt names the environment variable to read each credential from; it never contains the credential.
+
+| Signal | Request | Auth |
+|---|---|---|
+| Page views and events | `POST {public URL}/api/_temps/event`, JSON with `event_name`, `request_path`, `request_query`, `event_data` | `X-Temps-Analytics-Key: $TEMPS_ANALYTICS_KEY`, or `?temps_key=` for `navigator.sendBeacon`. The key is public and write-only. |
+| Session replay | `POST {public URL}/api/_temps/session-replay/init`, then `/events` | Same analytics key |
+| Errors | `POST {public URL}/api/{project_id}/envelope/` (a Sentry envelope), or any Sentry SDK with the DSN | The DSN's public key, as `?sentry_key=` or `X-Sentry-Auth` |
+| Logs and traces | `POST {public URL}/api/otel/v1/logs` or `/v1/traces`, OTLP/HTTP **protobuf** only (no OTLP/JSON) | `Authorization: Bearer $TEMPS_API_KEY` and `X-Temps-Project-Id`. The API key is secret, so keep it server-side. |
+
+The same details, resolved for one service, come from `GET /api/projects/{project_id}/ingest-setup`.
