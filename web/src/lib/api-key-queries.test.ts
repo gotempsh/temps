@@ -2,8 +2,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { describe, expect, test } from 'bun:test'
-import { readdirSync, readFileSync, statSync } from 'node:fs'
-import { join, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { QueryClient } from '@tanstack/react-query'
 import {
@@ -37,30 +35,33 @@ const KEY_MUTATION =
 const CLIENT_IMPORT =
   /import\s*\{([^}]*)\}\s*from\s*['"]@\/api\/client[^'"]*['"]/g
 
-function sourceFiles(dir: string): string[] {
-  return readdirSync(dir).flatMap((name) => {
-    const path = join(dir, name)
-    if (statSync(path).isDirectory()) {
-      return name === 'api' ? [] : sourceFiles(path)
-    }
-    return /\.tsx?$/.test(name) && !/\.test\.tsx?$/.test(name) ? [path] : []
-  })
+/** Console modules outside the generated client, test files excluded. */
+async function sourceFiles(root: string): Promise<string[]> {
+  const files: string[] = []
+  for await (const path of new Bun.Glob('**/*.{ts,tsx}').scan(root)) {
+    if (path.startsWith('api/') || /\.test\.tsx?$/.test(path)) continue
+    files.push(path)
+  }
+  return files.sort()
 }
 
 describe('API key mutations', () => {
   // Every console module that changes an API key must refresh the AI
   // harness status too, or the setup checklist and banner keep a stale state.
-  test('every module that changes an API key refreshes the harness status', () => {
+  test('every module that changes an API key refreshes the harness status', async () => {
     // fileURLToPath, not `.pathname`: a checkout path with a space or other
-    // escaped character would stay percent-encoded and readdirSync would fail.
+    // escaped character would stay percent-encoded and the scan would fail.
     const src = fileURLToPath(new URL('../', import.meta.url))
-    const missing = sourceFiles(src).filter((file) => {
-      const source = readFileSync(file, 'utf8')
+    const missing: string[] = []
+    for (const file of await sourceFiles(src)) {
+      const source = await Bun.file(`${src}${file}`).text()
       const changesKeys = [...source.matchAll(CLIENT_IMPORT)].some((match) =>
         KEY_MUTATION.test(match[1])
       )
-      return changesKeys && !source.includes('invalidateApiKeyQueries(')
-    })
-    expect(missing.map((file) => relative(src, file))).toEqual([])
+      if (changesKeys && !source.includes('invalidateApiKeyQueries(')) {
+        missing.push(file)
+      }
+    }
+    expect(missing).toEqual([])
   })
 })
