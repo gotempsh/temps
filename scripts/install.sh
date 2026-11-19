@@ -135,14 +135,34 @@ Aborting installation."
 release_workflow=gotempsh/temps/.github/workflows/release.yml
 oidc_issuer=https://token.actions.githubusercontent.com
 
-# Run a verifier with a deadline where coreutils `timeout` exists (every
-# mainstream Linux); a verifier that is stopped counts as a failure.
+# How long a verifier (cosign, gh) may run before it is stopped; a verifier
+# that is stopped counts as a failed check.
+verifier_deadline=300
+
+# Run "$@" under verifier_deadline: with coreutils `timeout` where it exists
+# (every mainstream Linux), otherwise (macOS) with a watcher that sends
+# SIGTERM when the deadline passes. The watcher's output goes to /dev/null so
+# it never holds open the pipe of a `$(...)` that captures the command.
 with_deadline() {
     if command -v timeout >/dev/null 2>&1; then
-        timeout 300 "$@"
-    else
-        "$@"
+        timeout "$verifier_deadline" "$@"
+        return
     fi
+    local pid watcher status=0
+    "$@" &
+    pid=$!
+    (
+        sleep "$verifier_deadline" &
+        sleeper=$!
+        trap 'kill "$sleeper" 2>/dev/null; exit 0' TERM
+        wait "$sleeper"
+        kill -TERM "$pid" 2>/dev/null
+    ) >/dev/null 2>&1 &
+    watcher=$!
+    wait "$pid" || status=$?
+    kill -TERM "$watcher" 2>/dev/null || true
+    wait "$watcher" 2>/dev/null || true
+    return "$status"
 }
 
 verify_signature() {

@@ -22,6 +22,7 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
+import time
 import unittest
 
 
@@ -498,6 +499,55 @@ class CompletedInstallTests(unittest.TestCase):
         output = self.install(temps_already_on_path=True)
         self.assertIn("Run 'temps --help' to get started", output)
         self.assertIn(CAPABILITIES_URL, output)
+
+
+def with_deadline_source():
+    """The installer's `with_deadline` function, to run on its own."""
+    text = INSTALLER.read_text()
+    start = text.index("with_deadline() {")
+    end = text.index("\n}\n", start) + 3
+    return text[start:end]
+
+
+def run_with_deadline(command, deadline, with_timeout_tool):
+    """Run `with_deadline <command>` under bash with the given deadline, with
+    or without a `timeout` tool on PATH; returns (exit code, output, seconds)."""
+    with tempfile.TemporaryDirectory(prefix="temps-install-deadline-") as temporary:
+        root = Path(temporary)
+        farm = system_tool_dir(root)
+        if not with_timeout_tool and (farm / "timeout").exists():
+            (farm / "timeout").unlink()
+        script = (f"set -euo pipefail\nverifier_deadline={deadline}\n"
+                  f"{with_deadline_source()}\n"
+                  f'output=$(with_deadline {command}) && code=0 || code=$?\n'
+                  'printf "%s|%s" "$code" "$output"\n')
+        started = time.monotonic()
+        result = subprocess.run(["bash", "-c", script], env=dict(os.environ, PATH=str(farm)),
+                                capture_output=True, text=True, timeout=60)
+        elapsed = time.monotonic() - started
+    code, _, output = result.stdout.partition("|")
+    return int(code), output, elapsed
+
+
+class DeadlineTests(unittest.TestCase):
+    def test_a_hung_verifier_is_stopped_without_a_timeout_tool(self):
+        code, _, elapsed = run_with_deadline("sleep 30", 1, with_timeout_tool=False)
+        self.assertNotEqual(code, 0)
+        self.assertLess(elapsed, 15)
+
+    def test_a_verifier_keeps_its_output_and_status_without_a_timeout_tool(self):
+        code, output, elapsed = run_with_deadline("sh -c 'echo checked; exit 3'", 30,
+                                                  with_timeout_tool=False)
+        self.assertEqual((code, output), (3, "checked"))
+        # The watcher must not hold the captured pipe open until the deadline.
+        self.assertLess(elapsed, 15)
+
+    def test_a_hung_verifier_is_stopped_with_a_timeout_tool(self):
+        if not shutil.which("timeout"):
+            self.skipTest("no coreutils timeout on this host")
+        code, _, elapsed = run_with_deadline("sleep 30", 1, with_timeout_tool=True)
+        self.assertNotEqual(code, 0)
+        self.assertLess(elapsed, 15)
 
 
 class SignatureVerificationTests(unittest.TestCase):
