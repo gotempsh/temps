@@ -2108,13 +2108,13 @@ impl IngressConnectorService {
     }
 
     /// Every public hostname the control-plane proxy answers (ADR-107 D4):
-    /// its routes, and sleeping on-demand environments, which have no route
-    /// until a visit through the proxy wakes them.
+    /// its routes, published status pages, and sleeping on-demand
+    /// environments, which have no route until a visit through the proxy
+    /// wakes them. One snapshot, so an app waking up is never in neither.
     fn control_plane_hostnames(&self) -> HashSet<String> {
         self.peer_table
-            .public_hostnames()
+            .control_plane_public_hostnames()
             .into_iter()
-            .chain(self.peer_table.public_sleeping_hostnames())
             .map(|host| host.trim_end_matches('.').to_ascii_lowercase())
             .collect()
     }
@@ -3938,6 +3938,27 @@ mod tests {
                 },
                 "sleeping-app.example.com"
             ));
+            drop(test_db);
+        }
+
+        /// ADR-107 D4: a published status page's custom hostname is served
+        /// by the control-plane proxy only, so a tunnel there can carry it.
+        #[tokio::test]
+        async fn a_control_plane_tunnel_can_carry_a_status_page_hostname() {
+            let Some((test_db, service, _calls, id)) = setup().await else {
+                return;
+            };
+            service
+                .replace_nodes(id, &[CONTROL_PLANE_NODE_ID])
+                .await
+                .expect("placed on the control plane");
+            service
+                .peer_table
+                .insert_status_page_host_for_test("status.example.com", Some("my-page"));
+
+            let plan = service.plan().await.expect("plan");
+            let placement = plan.connector(id).expect("planned").placement;
+            assert!(plan.carries(placement, "status.example.com"));
             drop(test_db);
         }
 

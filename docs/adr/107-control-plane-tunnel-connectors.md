@@ -143,7 +143,7 @@ replica serves it:
 | Placement | Publishes |
 |---|---|
 | workers only | hostnames workers serve (unchanged) |
-| control plane only | every public hostname in the control plane's route table, and those of sleeping on-demand environments, which have no route until a visit through this proxy wakes them: the control-plane proxy serves them all, including those on workers, and applies every policy that keeps a host off workers (redirects, wake-up, attack mode, path routing) |
+| control plane only | every public hostname in the control plane's route table, published status pages' custom hostnames, and those of sleeping on-demand environments, which have no route until a visit through this proxy wakes them (read from the same route snapshot, so an app waking up or falling asleep is never in neither): the control-plane proxy serves them all, including those on workers, and applies every policy that keeps a host off workers (redirects, wake-up, attack mode, path routing) |
 | control plane and workers | hostnames workers serve: the control plane serves those too, so both replicas answer |
 
 A mixed placement is allowed. It behaves like the workers-only placement for

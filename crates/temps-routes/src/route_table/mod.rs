@@ -756,6 +756,29 @@ pub struct StatusPageHostRoute {
     pub slug: Option<Arc<str>>,
 }
 
+/// Whether `host` (normalized) is a hostname a tunnel can publish: a real
+/// name with a dot, not a wildcard and not an internal `.temps.local` one.
+fn is_public_hostname(host: &str) -> bool {
+    host.contains('.') && !host.starts_with("*.") && !host.ends_with(".temps.local")
+}
+
+/// The public hostnames of `sleeping` environments (see
+/// `RouteTableSnapshot::sleeping_public_hosts`): normalized, deduplicated,
+/// and without bare subdomains, wildcards, internal or private addresses.
+fn sleeping_public_hosts(
+    sleeping: &[SleepingEnvironmentEntry],
+    private_hosts: &HashSet<String>,
+) -> Arc<[String]> {
+    let mut hosts: Vec<String> = sleeping
+        .iter()
+        .map(|entry| normalize_route_hostname(&entry.domain).into_owned())
+        .filter(|host| is_public_hostname(host) && !private_hosts.contains(host))
+        .collect();
+    hosts.sort_unstable();
+    hosts.dedup();
+    hosts.into()
+}
+
 /// Lowercase `host`, dropping a `:port` suffix and a trailing dot, the same
 /// way the status-page hostname column is stored. Borrows when already
 /// normalized, which is the common case for proxy lookups.
@@ -1080,6 +1103,12 @@ struct RouteTableSnapshot {
     /// The gate of each signed-in address (ADR 065 D7), by lower-cased host.
     /// Empty on an install with no signed-in address.
     gated: HashMap<String, Arc<GatePolicy>>,
+    /// Public hostnames of sleeping on-demand environments (ADR-107 D4).
+    /// They have no route (the proxy wakes them on a visit), so a tunnel on
+    /// the control plane keeps publishing them. Part of the snapshot so a
+    /// reader sees an app either routed or sleeping, never neither, while it
+    /// wakes or falls asleep.
+    sleeping_public_hosts: Arc<[String]>,
 }
 
 impl RouteTableSnapshot {
@@ -1518,11 +1547,6 @@ pub struct CachedPeerTable {
     /// Optional callback invoked after each route reload with sleeping environment entries.
     on_sleeping_callback: parking_lot::Mutex<Option<OnSleepingCallback>>,
 
-    /// Public hostnames of sleeping on-demand environments as of the last
-    /// reload. They have no route (the proxy wakes them on a visit), so a
-    /// tunnel on the control plane keeps publishing them (ADR-107 D4).
-    sleeping_hosts: ArcSwap<Vec<String>>,
-
     /// Optional async callback invoked after each successful reload.
     /// Used to publish per-deployment internal DNS records (ADR-012-lite)
     /// in lockstep with the route table.
@@ -1698,7 +1722,6 @@ impl CachedPeerTable {
             db,
             runtime_context,
             on_sleeping_callback: parking_lot::Mutex::new(None),
-            sleeping_hosts: ArcSwap::from_pointee(Vec::new()),
             on_reload_callback: parking_lot::Mutex::new(None),
             on_cert_eligible_callback: parking_lot::Mutex::new(None),
             generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -2510,26 +2533,31 @@ impl CachedPeerTable {
     /// Public hostnames of sleeping on-demand environments: routed nowhere
     /// until a visit wakes them, but the control-plane proxy answers them.
     pub fn public_sleeping_hostnames(&self) -> Vec<String> {
-        self.sleeping_hosts.load().as_ref().clone()
+        self.route_snapshot.load().sleeping_public_hosts.to_vec()
     }
 
-    /// Record what [`Self::public_sleeping_hostnames`] returns: only real
-    /// public hostnames (a bare subdomain, a wildcard, an internal or a
-    /// private address is none), normalized and deduplicated.
-    pub(crate) fn record_sleeping_hosts(&self, sleeping: &[SleepingEnvironmentEntry]) {
-        let mut hosts: Vec<String> = sleeping
+    /// Every public hostname the control-plane proxy answers (ADR-107 D4),
+    /// read from one snapshot: its routes, the custom hostnames of published
+    /// status pages, and sleeping on-demand environments. The console's and
+    /// the public ingress's own hostnames are never among them.
+    pub fn control_plane_public_hostnames(&self) -> Vec<String> {
+        let snapshot = self.route_snapshot.load();
+        let routed = snapshot
+            .legacy
+            .exact
+            .keys()
+            .filter(|host| !host.ends_with(".temps.local"));
+        let status_pages = snapshot
+            .legacy
+            .status_page_hosts
             .iter()
-            .map(|entry| normalize_route_hostname(&entry.domain).into_owned())
-            .filter(|host| {
-                host.contains('.')
-                    && !host.starts_with("*.")
-                    && !host.ends_with(".temps.local")
-                    && !self.is_private_hostname(host)
-            })
-            .collect();
-        hosts.sort_unstable();
-        hosts.dedup();
-        self.sleeping_hosts.store(Arc::new(hosts));
+            .filter(|(host, route)| route.slug.is_some() && is_public_hostname(host))
+            .map(|(host, _)| host);
+        routed
+            .chain(status_pages)
+            .chain(snapshot.sleeping_public_hosts.iter())
+            .cloned()
+            .collect()
     }
 
     /// Marks `host` as a sleeping environment's, for callers in other
@@ -2537,9 +2565,11 @@ impl CachedPeerTable {
     /// the production path.
     #[doc(hidden)]
     pub fn insert_sleeping_host_for_test(&self, host: &str) {
-        let mut hosts = self.sleeping_hosts.load().as_ref().clone();
+        let mut snapshot = self.route_snapshot.load().as_ref().clone();
+        let mut hosts = snapshot.sleeping_public_hosts.to_vec();
         hosts.push(normalize_route_hostname(host).into_owned());
-        self.sleeping_hosts.store(Arc::new(hosts));
+        snapshot.sleeping_public_hosts = hosts.into();
+        self.route_snapshot.store(Arc::new(snapshot));
     }
 
     /// Every public hostname in the route table, whoever serves it.
@@ -4847,6 +4877,59 @@ mod tests {
             ]
         );
         assert!(tunnel_service_hostnames(None, "api").is_empty());
+    }
+
+    /// ADR-107 D4: a control-plane tunnel publishes what this proxy answers,
+    /// including a published status page's custom hostname, never a
+    /// status-page tombstone, which only answers 404.
+    #[test]
+    fn control_plane_hostnames_include_published_status_pages() {
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection();
+        let table = CachedPeerTable::new(Arc::new(db));
+        table.insert_status_page_host_for_test("Status.Example.com", Some("my-page"));
+        table.insert_status_page_host_for_test("old-status.example.com", None);
+        table.insert_sleeping_host_for_test("sleeping-app.example.com");
+
+        let hosts = table.control_plane_public_hostnames();
+        assert!(
+            hosts.contains(&"status.example.com".to_string()),
+            "{hosts:?}"
+        );
+        assert!(
+            hosts.contains(&"sleeping-app.example.com".to_string()),
+            "{hosts:?}"
+        );
+        assert!(
+            !hosts.contains(&"old-status.example.com".to_string()),
+            "{hosts:?}"
+        );
+    }
+
+    /// Sleeping hostnames ride in the route snapshot, so a reader sees an
+    /// app that wakes or falls asleep either routed or sleeping, never
+    /// neither; and only real public names are kept.
+    #[test]
+    fn sleeping_public_hosts_keep_only_public_names() {
+        let entry = |domain: &str| SleepingEnvironmentEntry {
+            domain: domain.to_string(),
+            environment_id: 1,
+            project_id: 1,
+            deployment_id: 1,
+            wake_timeout_seconds: 30,
+        };
+        let private: HashSet<String> = ["app.internal.example.com".to_string()].into();
+        let hosts = sleeping_public_hosts(
+            &[
+                entry("App.Example.com."),
+                entry("app.example.com"),
+                entry("bare-subdomain"),
+                entry("*.example.com"),
+                entry("shop.temps.local"),
+                entry("app.internal.example.com"),
+            ],
+            &private,
+        );
+        assert_eq!(hosts.as_ref(), ["app.example.com".to_string()]);
     }
 
     /// A sleeping Compose environment wakes on (and a control-plane tunnel

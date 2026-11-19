@@ -341,7 +341,6 @@ impl CachedPeerTable {
         }
 
         self.route_snapshot.store(new_snapshot);
-        self.record_sleeping_hosts(&sleeping_environments);
 
         if !sleeping_environments.is_empty() {
             info!(
@@ -2621,6 +2620,7 @@ impl CachedPeerTable {
                 .map(|entry| entry.domain.trim_end_matches('.').to_ascii_lowercase()),
         );
 
+        let sleeping_public_hosts = sleeping_public_hosts(&sleeping_environments, &private_hosts);
         let new_snapshot = Arc::new(RouteTableSnapshot {
             active_probes,
             owned_hosts,
@@ -2642,6 +2642,7 @@ impl CachedPeerTable {
             ingress,
             private: private_routes,
             gated,
+            sleeping_public_hosts,
         });
 
         Ok(AssembledRoutes {
@@ -3271,6 +3272,21 @@ mod tests {
             Some("phase-page")
         );
         assert!(table.status_page_host("old.example.com").is_some());
+        // ADR-107 D4: a control-plane tunnel publishes the published status
+        // page beside the routes, never the tombstone.
+        let control_plane = table.control_plane_public_hostnames();
+        assert!(
+            control_plane.contains(&"status.example.com".to_string()),
+            "{control_plane:?}"
+        );
+        assert!(
+            control_plane.contains(&"env-domain.example.com".to_string()),
+            "{control_plane:?}"
+        );
+        assert!(
+            !control_plane.contains(&"old.example.com".to_string()),
+            "{control_plane:?}"
+        );
         assert!(table.has_loaded());
 
         test_db.cleanup().await?;
