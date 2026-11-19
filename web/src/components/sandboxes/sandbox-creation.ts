@@ -112,16 +112,35 @@ export function creationRunning(
 }
 
 /**
- * Whether to poll a create's steps again: while it runs, and, before the
- * first answer, only as long as the create request itself is in flight.
+ * Whether a failed progress read means the server does not track the create
+ * (a 404: it was refused before it began, or the server restarted and lost
+ * it), as opposed to a failure worth retrying (network, 5xx).
+ */
+export function creationUntracked(error: unknown): boolean {
+  return httpStatusOf(error) === 404
+}
+
+/**
+ * Whether to poll a create's steps again (`error` is the last read's
+ * failure, or null).
+ *
+ * - No failure: while the create runs, or until the first answer.
+ * - A 404 stops polling, even over steps read earlier: the server no longer
+ *   tracks the create, so it will never finish there. The one exception is
+ *   a 404 before anything was read while the create request is still in
+ *   flight: the first read can race the server registering the id.
+ * - Any other failure is transient: keep polling while the create is
+ *   running or not read yet, so its steps (or its failure) come back once
+ *   the server answers.
  */
 export function keepPolling(
   creation: SandboxCreation | undefined,
-  lastPollFailed: boolean,
+  error: unknown,
   requestSettled: boolean
 ): boolean {
-  if (creation) return creation.status === 'running'
-  return !(lastPollFailed && requestSettled)
+  if (!error) return creationRunning(creation)
+  if (creationUntracked(error)) return creation === undefined && !requestSettled
+  return creationRunning(creation)
 }
 
 /**
@@ -136,7 +155,7 @@ export function keepPollingStartingSandbox(
   error: unknown
 ): boolean {
   if (!starting) return false
-  if (error) return httpStatusOf(error) !== 404
+  if (error) return !creationUntracked(error)
   return creationRunning(creation)
 }
 
@@ -152,7 +171,7 @@ export function showStartingSandboxSteps(
 ): boolean {
   if (!starting) return false
   if (creation !== undefined) return true
-  return !error || httpStatusOf(error) !== 404
+  return !error || !creationUntracked(error)
 }
 
 /** One line for a host's image state. */

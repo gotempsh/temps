@@ -12,6 +12,7 @@ import type {
 import {
   anyHostPulling,
   creationRunning,
+  creationUntracked,
   downloadLabel,
   downloadPercent,
   failedStep,
@@ -125,14 +126,40 @@ describe('creation state', () => {
   })
 
   test('stops polling a create the server never tracked once its request ended', () => {
-    // Before any answer: keep trying while the request is in flight.
-    expect(keepPolling(undefined, false, false)).toBe(true)
-    expect(keepPolling(undefined, true, false)).toBe(true)
-    // The request ended and the progress is still unknown: stop.
-    expect(keepPolling(undefined, true, true)).toBe(false)
+    const notFound = { status: 404, title: 'Not Found' }
+    // Before any answer: keep trying while the request is in flight, even
+    // over a 404 (the first read races the server registering the id).
+    expect(keepPolling(undefined, null, false)).toBe(true)
+    expect(keepPolling(undefined, notFound, false)).toBe(true)
+    // The request ended and the server does not track it: stop.
+    expect(keepPolling(undefined, notFound, true)).toBe(false)
     // A tracked create is followed until it finishes.
-    expect(keepPolling(base, true, true)).toBe(true)
-    expect(keepPolling({ ...base, status: 'failed' }, false, false)).toBe(false)
+    expect(keepPolling(base, null, true)).toBe(true)
+    expect(keepPolling({ ...base, status: 'failed' }, null, false)).toBe(false)
+  })
+
+  test('a 404 over steps read earlier stops polling: the server lost the create', () => {
+    const notFound = { status: 404, title: 'Not Found' }
+    expect(keepPolling(base, notFound, false)).toBe(false)
+    expect(keepPolling(base, notFound, true)).toBe(false)
+  })
+
+  test('a network or server error keeps polling while the create is unknown or running', () => {
+    const unavailable = { status: 503, title: 'Service Unavailable' }
+    const offline = new TypeError('Failed to fetch')
+    expect(keepPolling(undefined, unavailable, true)).toBe(true)
+    expect(keepPolling(undefined, offline, true)).toBe(true)
+    expect(keepPolling(base, unavailable, true)).toBe(true)
+    expect(
+      keepPolling({ ...base, status: 'succeeded' }, unavailable, true)
+    ).toBe(false)
+  })
+
+  test('only a 404 means the server does not track the create', () => {
+    expect(creationUntracked({ status: 404 })).toBe(true)
+    expect(creationUntracked({ status: 503 })).toBe(false)
+    expect(creationUntracked(new TypeError('Failed to fetch'))).toBe(false)
+    expect(creationUntracked(null)).toBe(false)
   })
 
   test('the failed step is the one marked failed', () => {

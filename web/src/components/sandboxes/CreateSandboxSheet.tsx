@@ -59,7 +59,7 @@ import {
 import { SandboxBackendLogo } from './SandboxBackendLogo'
 import { SandboxCreationSteps } from './SandboxCreationSteps'
 import { useSandboxCreation } from './useSandboxCreation'
-import { newCreationId } from './sandbox-creation'
+import { creationUntracked, newCreationId } from './sandbox-creation'
 
 const LIFECYCLES = [
   {
@@ -169,10 +169,15 @@ export function CreateSandboxSheet({
     create.mutate({ body: { ...toCreateSandboxBody(values), creation_id: id } })
   }
   // A refused create the server never tracked has no steps: its error
-  // alone says what happened.
+  // alone says what happened. Steps the server stopped tracking (a 404
+  // after they were read: it restarted) would stay "running" forever, so
+  // they are dropped too.
   const showSteps =
     creationId !== null &&
-    (create.isPending || (create.isError && creation.data !== undefined))
+    (create.isPending ||
+      (create.isError &&
+        creation.data !== undefined &&
+        !(creation.isError && creationUntracked(creation.error))))
 
   return (
     <Sheet
