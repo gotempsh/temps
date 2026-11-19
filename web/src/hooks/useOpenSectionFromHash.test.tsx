@@ -34,6 +34,39 @@ afterEach(() => {
   Element.prototype.scrollIntoView = originalScrollIntoView
 })
 
+/** Elements under a live `ResizeObserver`, and a way to report them resized. */
+const observedForResize = new Set<Element>()
+let resizeCallbacks: (() => void)[] = []
+const originalResizeObserver = globalThis.ResizeObserver
+beforeEach(() => {
+  observedForResize.clear()
+  resizeCallbacks = []
+  globalThis.ResizeObserver = class {
+    private readonly observed = new Set<Element>()
+    constructor(callback: ResizeObserverCallback) {
+      resizeCallbacks.push(() => {
+        if (this.observed.size) callback([], this as unknown as ResizeObserver)
+      })
+    }
+    observe(element: Element) {
+      this.observed.add(element)
+      observedForResize.add(element)
+    }
+    unobserve(element: Element) {
+      this.observed.delete(element)
+      observedForResize.delete(element)
+    }
+    disconnect() {
+      for (const element of this.observed) observedForResize.delete(element)
+      this.observed.clear()
+    }
+  } as unknown as typeof ResizeObserver
+})
+afterEach(() => {
+  globalThis.ResizeObserver = originalResizeObserver
+})
+const reportResize = () => act(() => resizeCallbacks.forEach((fn) => fn()))
+
 /**
  * Which section each scroll of the page brought to its top, in order, read
  * back from the offsets: `top:N` for a scroll that matches none.
@@ -139,7 +172,7 @@ test('stays on the group when this service does not have the setting', async () 
  * The delivery page: the linked section is the last one, and the sections
  * above it are still loading, so it moves down once they render.
  */
-function DeliveryPage() {
+function DeliveryPage({ grows = 'nodes' }: { grows?: 'nodes' | 'size' }) {
   useScrollToLinkedSection()
   const [loaded, setLoaded] = useState(false)
   // Before: 1,500px of skeletons above a 300px section. After: 2,400px.
@@ -150,7 +183,7 @@ function DeliveryPage() {
         <button type="button" onClick={() => setLoaded(true)}>
           Load
         </button>
-        {loaded && <p>Preview settings</p>}
+        {loaded && grows === 'nodes' && <p>Preview settings</p>}
       </section>
       <section id="settings-section-feature-flags" data-top={flagsTop}>
         Feature flags
@@ -183,6 +216,26 @@ test('keeps the section in view while the content above it loads', async () => {
   )
 })
 
+test('keeps the section in view when content above it grows without new nodes', async () => {
+  const { showSetting } = renderAt(
+    '/settings/delivery?section=feature-flags',
+    <DeliveryPage grows="size" />
+  )
+  await waitFor(() => expect(layout.scrolls).toHaveLength(1))
+  expect(
+    observedForResize.has(document.getElementById('page') as Element)
+  ).toBe(true)
+  // Only geometry changes: no node is added, so only a resize reports it.
+  showSetting()
+  await settle()
+  expect(layout.scrolls).toHaveLength(1)
+  reportResize()
+  expect(layout.scrolls).toEqual([
+    { target: 'page', top: 1200 },
+    { target: 'page', top: 2100 },
+  ])
+})
+
 test('once the reader scrolls, the page is theirs', async () => {
   const { showSetting } = renderAt(
     '/settings/delivery?section=feature-flags',
@@ -192,8 +245,10 @@ test('once the reader scrolls, the page is theirs', async () => {
   act(() => {
     window.dispatchEvent(new Event('wheel'))
   })
+  expect(observedForResize.size).toBe(0)
   showSetting()
   await settle()
+  reportResize()
   expect(layout.scrolls).toEqual([{ target: 'page', top: 1200 }])
 })
 

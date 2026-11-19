@@ -94,13 +94,30 @@ export function useScrollToLinkedSection() {
     // What the reader is shown: the setting, or its group until it renders.
     let shown: HTMLElement | null = null
     let onPrimary = false
+    // Content above the section can grow without a node being added (text
+    // filled in, a style applied); that resizes one of its ancestors.
+    const resized =
+      typeof ResizeObserver === 'undefined'
+        ? null
+        : new ResizeObserver(() => follow())
+    const show = (element: HTMLElement) => {
+      shown = element
+      reveal(element)
+      if (!resized) return
+      resized.disconnect()
+      for (
+        let node = element.parentElement;
+        node && node !== document.body;
+        node = node.parentElement
+      )
+        resized.observe(node)
+    }
     const follow = () => {
       if (!onPrimary) {
         const target = document.getElementById(primary)
         if (target) {
           onPrimary = true
-          shown = target
-          reveal(target)
+          show(target)
           return
         }
       }
@@ -108,19 +125,17 @@ export function useScrollToLinkedSection() {
         const group = fallbacks
           .map((id) => document.getElementById(id))
           .find((element) => element !== null)
-        if (group) {
-          shown = group
-          reveal(group)
-        }
+        if (group) show(group)
         return
       }
-      // Something rendered: keep the section where the link put it.
+      // Something rendered or resized: keep the section where the link put it.
       scrollElementToTop(shown)
     }
     const observer = new MutationObserver(follow)
     const timer = window.setTimeout(() => stop(), WAIT_FOR_SECTION_MS)
     const stop = () => {
       observer.disconnect()
+      resized?.disconnect()
       window.clearTimeout(timer)
       for (const type of READER_INPUT)
         window.removeEventListener(type, stop, { capture: true })
