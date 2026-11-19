@@ -341,6 +341,7 @@ impl CachedPeerTable {
         }
 
         self.route_snapshot.store(new_snapshot);
+        self.record_sleeping_hosts(&sleeping_environments);
 
         if !sleeping_environments.is_empty() {
             info!(

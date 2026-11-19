@@ -1588,7 +1588,12 @@ impl ReachabilityService {
                 (None, None)
             };
         // ADR-107 D5: whether a new tunnel can run on the control plane.
-        let control_plane_tunnel_refusal = self.deps.connectors.control_plane_tunnels().err();
+        let control_plane_tunnel_refusal = self
+            .deps
+            .connectors
+            .control_plane_tunnels()
+            .err()
+            .map(|refusal| refusal.to_string());
         let facts = PlanFacts {
             control_plane_tunnels: control_plane_tunnel_refusal.is_none(),
             control_plane_tunnel_refusal,

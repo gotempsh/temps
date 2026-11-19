@@ -27,7 +27,7 @@ use temps_core::CONTROL_PLANE_NODE_ID;
 use tokio::sync::Notify;
 use tracing::{debug, warn};
 
-use crate::error::IngressError;
+use crate::error::{ControlPlaneTunnelsUnavailable, IngressError};
 use crate::service::IngressConnectorService;
 use crate::wire::{ConnectorStatus, NodeConnectorSpec, NodeConnectorStatusReport};
 
@@ -59,8 +59,14 @@ impl ControlPlaneHandle {
         Self { origin, wake }
     }
 
-    /// `Err` with what to do when the proxy cannot carry a tunnel.
-    pub fn ready(&self) -> Result<(), String> {
+    /// A handle on `origin` with its own wake-up: one per process, shared
+    /// by every service instance that places connectors on node 0.
+    pub fn for_origin(origin: Arc<ControlPlaneTunnelOrigin>) -> Self {
+        Self::new(origin, Arc::new(Notify::new()))
+    }
+
+    /// `Err` with why, and what to do, when the proxy cannot carry a tunnel.
+    pub fn ready(&self) -> Result<(), ControlPlaneTunnelsUnavailable> {
         match self.origin.bound_port() {
             Some(_) => Ok(()),
             None => Err(origin_unbound(
@@ -84,19 +90,19 @@ pub struct ControlPlaneConnectors {
 
 impl ControlPlaneConnectors {
     /// Attach to `service`, which from now on accepts node 0 in placements
-    /// and wakes this loop when they change.
+    /// and wakes this loop when they change. Attach `handle` to any other
+    /// instance that places connectors (the console's) for the same.
     pub fn attach(
         service: Arc<IngressConnectorService>,
         runtime: Arc<dyn LocalConnectorRuntime>,
-        origin: Arc<ControlPlaneTunnelOrigin>,
+        handle: ControlPlaneHandle,
     ) -> Arc<Self> {
-        let wake = Arc::new(Notify::new());
-        service.attach_control_plane(ControlPlaneHandle::new(origin.clone(), wake.clone()));
+        service.attach_control_plane(handle.clone());
         Arc::new(Self {
             service,
             runtime,
-            origin,
-            wake,
+            origin: handle.origin,
+            wake: handle.wake,
         })
     }
 
@@ -166,7 +172,7 @@ fn split_by_origin(
     let mut held = Vec::new();
     for spec in specs {
         let reason = match bound {
-            None => Some(origin_unbound(spec.edge_port)),
+            None => Some(origin_unbound(spec.edge_port).to_string()),
             Some(port) if port != spec.edge_port => Some(format!(
                 "This tunnel sends visitors to port {}, but the control plane's proxy takes \
                  tunnel traffic on port {port} only. Run this tunnel on a worker instead.",
@@ -190,15 +196,10 @@ fn split_by_origin(
     (runnable, held)
 }
 
-fn origin_unbound(port: u16) -> String {
-    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
-    format!(
-        "The control plane's proxy is not listening on {addr}, so a tunnel here would have \
-         nowhere to send visitors. Either this server runs its proxy as a separate process \
-         (`temps serve --role console`), or another program held port {port} when Temps \
-         started (`ss -ltnp 'sport = :{port}'` shows which): free it and restart Temps, or \
-         run the tunnel on a worker."
-    )
+fn origin_unbound(port: u16) -> ControlPlaneTunnelsUnavailable {
+    ControlPlaneTunnelsUnavailable::OriginUnbound {
+        address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
+    }
 }
 
 /// The header the runnable connectors carry the visitor's address in. One
@@ -282,7 +283,13 @@ mod tests {
         let origin = ControlPlaneTunnelOrigin::new();
         let handle = ControlPlaneHandle::new(origin.clone(), Arc::new(Notify::new()));
         let why = handle.ready().unwrap_err();
-        assert!(why.contains("127.0.0.1:7480"), "{why}");
+        assert_eq!(
+            why,
+            ControlPlaneTunnelsUnavailable::OriginUnbound {
+                address: "127.0.0.1:7480".parse().unwrap()
+            }
+        );
+        assert!(why.to_string().contains("127.0.0.1:7480"), "{why}");
         origin.mark_bound(7480);
         handle.ready().expect("bound");
     }

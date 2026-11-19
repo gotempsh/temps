@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Step 6b: tunnel connectors placed on the control plane (ADR-107 D2).
+//! Tunnel connectors placed on the control plane (ADR-107 D2).
 //!
 //! `temps-ingress` decides what node `0` runs and records how it runs;
 //! `temps-node-agent`'s supervisor runs it, exactly as on a worker. The two
@@ -15,12 +15,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use temps_core::tunnel_origin::ControlPlaneTunnelOrigin;
+use temps_ingress::control_plane::ControlPlaneHandle;
 use temps_ingress::wire::{ConnectorStatus, NodeConnectorSpec};
 use temps_ingress::{ControlPlaneConnectors, IngressConnectorService, LocalConnectorRuntime};
 use temps_node_agent::connectors::{wire as agent_wire, ConnectorSupervisor};
 use tokio::sync::Notify;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 /// The node agent's supervisor, speaking `temps-ingress`'s wire types.
 struct AgentSupervisor {
@@ -89,26 +89,42 @@ fn from_agent_status(status: agent_wire::ConnectorStatus) -> ConnectorStatus {
     }
 }
 
-/// Run node `0`'s connectors in this process when the proxy shares it
-/// (`origin` is `Some`). Without it the service keeps refusing node `0`
-/// with the reason.
+/// Run node `0`'s connectors in this process, beside the proxy whose
+/// tunnel origin they forward to.
+///
+/// Started by `temps serve` itself rather than by the console, from what
+/// the proxy already has (database, encryption, route table): a console
+/// that fails to start leaves the proxy serving, and a tunnel that is the
+/// only way in must keep carrying that traffic. The console attaches
+/// `handle` to its own ingress service so placements on node 0 are
+/// accepted there and wake this loop.
 pub(super) fn start_control_plane_connectors(
-    service_context: &temps_core::plugin::ServiceRegistrationContext,
-    origin: Option<Arc<ControlPlaneTunnelOrigin>>,
+    db: Arc<sea_orm::DatabaseConnection>,
+    encryption: Arc<temps_core::EncryptionService>,
+    route_table: Arc<temps_routes::CachedPeerTable>,
     data_dir: PathBuf,
+    handle: ControlPlaneHandle,
 ) {
-    let Some(origin) = origin else {
-        debug!("the proxy runs in another process; the control plane runs no tunnel connectors");
-        return;
-    };
-    let Some(service) = service_context.get_service::<IngressConnectorService>() else {
-        debug!("ingress connectors are not registered; the control plane runs none");
-        return;
-    };
+    let dns_providers = Arc::new(temps_dns::DnsProviderService::new(
+        db.clone(),
+        encryption.clone(),
+    ));
+    let records = Arc::new(temps_dns::ManagedDnsRecordService::new(
+        db.clone(),
+        dns_providers.clone(),
+        encryption.clone(),
+    ));
+    let service = Arc::new(IngressConnectorService::new(
+        db,
+        encryption,
+        dns_providers,
+        records,
+        route_table,
+    ));
     let runtime = Arc::new(AgentSupervisor {
         supervisor: ConnectorSupervisor::for_external_origin(data_dir),
     });
-    let connectors = ControlPlaneConnectors::attach(service, runtime, origin);
+    let connectors = ControlPlaneConnectors::attach(service, runtime, handle);
     let shutdown = Arc::new(Notify::new());
     let on_signal = Arc::clone(&shutdown);
     tokio::spawn(async move {

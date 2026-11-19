@@ -1501,6 +1501,11 @@ pub struct CachedPeerTable {
     /// Optional callback invoked after each route reload with sleeping environment entries.
     on_sleeping_callback: parking_lot::Mutex<Option<OnSleepingCallback>>,
 
+    /// Public hostnames of sleeping on-demand environments as of the last
+    /// reload. They have no route (the proxy wakes them on a visit), so a
+    /// tunnel on the control plane keeps publishing them (ADR-107 D4).
+    sleeping_hosts: ArcSwap<Vec<String>>,
+
     /// Optional async callback invoked after each successful reload.
     /// Used to publish per-deployment internal DNS records (ADR-012-lite)
     /// in lockstep with the route table.
@@ -1676,6 +1681,7 @@ impl CachedPeerTable {
             db,
             runtime_context,
             on_sleeping_callback: parking_lot::Mutex::new(None),
+            sleeping_hosts: ArcSwap::from_pointee(Vec::new()),
             on_reload_callback: parking_lot::Mutex::new(None),
             on_cert_eligible_callback: parking_lot::Mutex::new(None),
             generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -2482,6 +2488,41 @@ impl CachedPeerTable {
             .keys()
             .filter(|host| !host.ends_with(".temps.local"))
             .count()
+    }
+
+    /// Public hostnames of sleeping on-demand environments: routed nowhere
+    /// until a visit wakes them, but the control-plane proxy answers them.
+    pub fn public_sleeping_hostnames(&self) -> Vec<String> {
+        self.sleeping_hosts.load().as_ref().clone()
+    }
+
+    /// Record what [`Self::public_sleeping_hostnames`] returns: only real
+    /// public hostnames (a bare subdomain, a wildcard, an internal or a
+    /// private address is none), normalized and deduplicated.
+    pub(crate) fn record_sleeping_hosts(&self, sleeping: &[SleepingEnvironmentEntry]) {
+        let mut hosts: Vec<String> = sleeping
+            .iter()
+            .map(|entry| normalize_route_hostname(&entry.domain).into_owned())
+            .filter(|host| {
+                host.contains('.')
+                    && !host.starts_with("*.")
+                    && !host.ends_with(".temps.local")
+                    && !self.is_private_hostname(host)
+            })
+            .collect();
+        hosts.sort_unstable();
+        hosts.dedup();
+        self.sleeping_hosts.store(Arc::new(hosts));
+    }
+
+    /// Marks `host` as a sleeping environment's, for callers in other
+    /// crates that need one without a database. `load_routes` owns this on
+    /// the production path.
+    #[doc(hidden)]
+    pub fn insert_sleeping_host_for_test(&self, host: &str) {
+        let mut hosts = self.sleeping_hosts.load().as_ref().clone();
+        hosts.push(normalize_route_hostname(host).into_owned());
+        self.sleeping_hosts.store(Arc::new(hosts));
     }
 
     /// Every public hostname in the route table, whoever serves it.
@@ -5397,6 +5438,14 @@ mod unavailable_route_tests {
                 .iter()
                 .any(|entry| entry.domain == host && entry.environment_id == environment.id),
             "the sleeping environment must still be handed to the wake path: {sleeping:?}"
+        );
+        // ADR-107 D4: a control-plane tunnel keeps publishing it, so a
+        // visit can reach the proxy that wakes it.
+        let published = route_table.public_sleeping_hostnames();
+        assert!(published.contains(&host.to_string()), "{published:?}");
+        assert!(
+            published.iter().all(|h| h.contains('.')),
+            "a bare subdomain is no hostname: {published:?}"
         );
 
         Ok(())

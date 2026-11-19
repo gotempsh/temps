@@ -79,7 +79,17 @@ specs are not cached on disk: the control plane is the source of truth.
 The supervisor gains one mode. On a worker it binds its own tunnel origin
 listener; on the control plane the origin is the proxy's (D3), already bound,
 so the supervisor only checks that the connector's `edge_port` is the port the
-proxy listens on and reports a clear `down` status when it is not.
+proxy listens on and reports a clear `down` status when it is not. Why the
+control plane cannot run a connector is a typed error
+(`ControlPlaneTunnelsUnavailable`: the proxy is another process, or its
+tunnel origin is not bound), turned into text only where it is shown.
+
+`temps serve` starts this loop itself, next to the proxy and from what the
+proxy already has (database, encryption, route table), not from the
+console's startup: a console that fails to start leaves the proxy serving
+apps, and a tunnel that is the only way in must keep carrying them. The
+console's ingress service shares the loop's handle, so it accepts node `0`
+and wakes the loop when a placement changes.
 
 Only the combined `temps serve` (console and proxy in one process) runs
 connectors. With `--role console` the proxy is another process, possibly on
@@ -96,7 +106,10 @@ on node `0` then reports why it cannot start.
 A request that arrived on the tunnel origin:
 
 - is **secure**: the visitor reached Cloudflare over HTTPS (ADR-070), so no
-  HTTPS redirect, `Secure` cookies, `X-Forwarded-Proto: https` upstream;
+  HTTPS redirect (an app's, the production default's, a status page's or an
+  on-demand certificate's), `Secure` cookies, Shield challenges instead of
+  "use HTTPS", `X-Forwarded-Proto: https` upstream. Every such check reads
+  the listener, never a header; only SNI validation stays TLS-only;
 - is **via a tunnel**: Cloudflare Access addresses (ADR-065 D9) are verified
   on it like on a worker's tunnel origin, and still refused on every other
   listener;
@@ -125,7 +138,7 @@ replica serves it:
 | Placement | Publishes |
 |---|---|
 | workers only | hostnames workers serve (unchanged) |
-| control plane only | every public hostname in the control plane's route table: the control-plane proxy serves them all, including those on workers, and applies every policy that keeps a host off workers (redirects, wake-up, attack mode, path routing) |
+| control plane only | every public hostname in the control plane's route table, and those of sleeping on-demand environments, which have no route until a visit through this proxy wakes them: the control-plane proxy serves them all, including those on workers, and applies every policy that keeps a host off workers (redirects, wake-up, attack mode, path routing) |
 | control plane and workers | hostnames workers serve: the control plane serves those too, so both replicas answer |
 
 A mixed placement is allowed. It behaves like the workers-only placement for

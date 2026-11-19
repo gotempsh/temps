@@ -30,9 +30,9 @@ pub enum IngressError {
         status: String,
     },
     /// A placement names the control plane, which cannot run a connector in
-    /// this process (ADR-107 D2); `reason` says why and what to do.
-    #[error("The control plane cannot run a connector: {reason}")]
-    ControlPlaneUnavailable { reason: String },
+    /// this process (ADR-107 D2); the source says why and what to do.
+    #[error("The control plane cannot run a connector: {0}")]
+    ControlPlaneUnavailable(#[from] ControlPlaneTunnelsUnavailable),
     /// The worker has not delegated public ingress (ADR 058 D7).
     #[error("{0}")]
     NotAllowed(String),
@@ -45,6 +45,30 @@ pub enum IngressError {
     Database(#[from] sea_orm::DbErr),
     #[error("Could not encrypt or decrypt the connector secret: {0}")]
     Encryption(String),
+}
+
+/// Why the control plane cannot run a connector placed on node 0 (ADR-107
+/// D2, D3). Each says what to do instead.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ControlPlaneTunnelsUnavailable {
+    /// `temps serve --role console`: the proxy is another process, so no
+    /// listener here would carry the tunnel's traffic.
+    #[error(
+        "this server does not run the proxy in the same process as the console \
+         (`temps serve --role console`), so nothing here would carry the tunnel's \
+         traffic. Run the tunnel on a worker."
+    )]
+    SeparateProxy,
+    /// The proxy could not bind its tunnel origin at startup.
+    #[error(
+        "The control plane's proxy is not listening on {address}, so a tunnel here would have \
+         nowhere to send visitors. Either this server runs its proxy as a separate process \
+         (`temps serve --role console`), or another program held port {port} when Temps \
+         started (`ss -ltnp 'sport = :{port}'` shows which): free it and restart Temps, or \
+         run the tunnel on a worker.",
+        port = address.port()
+    )]
+    OriginUnbound { address: std::net::SocketAddr },
 }
 
 impl From<IngressError> for Problem {
@@ -60,7 +84,7 @@ impl From<IngressError> for Problem {
             IngressError::NotAllowed(_) => {
                 (StatusCode::CONFLICT, "Worker Does Not Allow This Change")
             }
-            IngressError::ControlPlaneUnavailable { .. } => {
+            IngressError::ControlPlaneUnavailable(_) => {
                 (StatusCode::CONFLICT, "Control Plane Cannot Run Connectors")
             }
             IngressError::Provider(_) => (StatusCode::BAD_GATEWAY, "Tunnel Provider Error"),

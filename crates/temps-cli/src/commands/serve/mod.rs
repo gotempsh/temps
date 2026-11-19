@@ -14,6 +14,7 @@ mod shutdown;
 pub(crate) mod startup_failure;
 pub(crate) mod stateless;
 mod static_files;
+mod tunnel_connectors;
 pub(crate) mod upgrade_telemetry;
 
 use clap::{Args, ValueEnum};
@@ -1405,10 +1406,25 @@ impl ServeCommand {
         let console_startup_state =
             Arc::new(temps_core::console_startup::ConsoleStartupState::new());
 
-        // ADR-107 D3: only a proxy in this process can carry a tunnel the
+        // ADR-107 D2/D3: only a proxy in this process can carry a tunnel the
         // control plane runs, so the origin exists for `--role=all` only.
+        // The connectors start here, not in the console: a console that
+        // fails to start must not take a tunnel-only install offline.
         let tunnel_origin = (self.role == ServeRole::All)
             .then(temps_core::tunnel_origin::ControlPlaneTunnelOrigin::new);
+        let control_plane_tunnels = tunnel_origin
+            .clone()
+            .map(temps_ingress::control_plane::ControlPlaneHandle::for_origin);
+        if let Some(handle) = control_plane_tunnels.clone() {
+            let _runtime = rt.enter();
+            tunnel_connectors::start_control_plane_connectors(
+                db.clone(),
+                encryption_service.clone(),
+                route_table.clone(),
+                serve_config.data_dir.clone(),
+                handle,
+            );
+        }
 
         // Build the console params once; both roles consume them.
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
@@ -1442,7 +1458,7 @@ impl ServeCommand {
             external_plugin_registry,
             profile: self.profile,
             startup_state: console_startup_state.clone(),
-            tunnel_origin: tunnel_origin.clone(),
+            control_plane_tunnels,
         };
 
         if self.role == ServeRole::Console {

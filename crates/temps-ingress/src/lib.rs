@@ -24,7 +24,7 @@ pub mod tailscale;
 pub mod wire;
 
 pub use control_plane::{ControlPlaneConnectors, LocalConnectorRuntime};
-pub use error::IngressError;
+pub use error::{ControlPlaneTunnelsUnavailable, IngressError};
 pub use handlers::{node_routes, IngressNodeState};
 pub use plugin::IngressPlugin;
 pub use service::IngressConnectorService;
