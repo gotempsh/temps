@@ -14,7 +14,7 @@ import { toast } from 'sonner'
 import { useNavigate, useSearchParams } from 'react-router'
 import { useAuth } from '@/contexts/AuthContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
-import { consumeReturnTo } from '@/lib/return-to'
+import { consumeReturnTo, goToReturnTo } from '@/lib/return-to'
 
 /**
  * Maps opaque SSO error codes (from `login_error_code_for` in
@@ -119,7 +119,7 @@ export const Login = () => {
       toast.success('Logged in successfully')
       await queryClient.invalidateQueries({ queryKey: ['getCurrentUser'] })
       await refetch()
-      navigate(consumeReturnTo('/dashboard'), { replace: true })
+      goToReturnTo(navigate, consumeReturnTo('/dashboard'))
     },
   })
 

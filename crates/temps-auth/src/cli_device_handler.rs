@@ -542,7 +542,12 @@ pub async fn cli_device_approve(
         .as_deref()
         .map(sanitize_device_label)
         .unwrap_or_else(|| "cli".to_string());
-    let key_name = format!("cli-device:{}-{}", device_label, now.timestamp());
+    let key_name = format!(
+        "{}{}-{}",
+        crate::ai_harness::CLI_DEVICE_KEY_PREFIX,
+        device_label,
+        now.timestamp()
+    );
     let expires_at = Some(now + Duration::days(CLI_KEY_TTL_DAYS));
 
     let created = state
@@ -550,6 +555,8 @@ pub async fn cli_device_approve(
         .create_api_key(
             user.id,
             CreateApiKeyRequest {
+                project_id: None,
+                environment_id: None,
                 name: key_name,
                 role_type: role_name.clone(),
                 permissions: None,
@@ -1142,6 +1149,8 @@ mod tests {
             updated_at: now,
         };
         let api_key = temps_entities::api_keys::Model {
+            project_id: None,
+            environment_id: None,
             id: 9,
             name: "CLI login".to_string(),
             key_hash: "hash".to_string(),
@@ -1268,17 +1277,15 @@ mod tests {
     mod owner_demotion_http {
         use super::*;
         use crate::http_test_support::{auth_state, insert_user, router, send, session_cookie};
-        use temps_database::test_utils::TestDatabase;
         use temps_entities::types::RoleType;
+        use temps_test_utils::TestDatabase;
 
         #[tokio::test]
         async fn admin_and_cli_device_keys_lose_admin_access_after_demotion() {
             let test_db = match TestDatabase::with_migrations().await {
                 Ok(db) => db,
                 Err(error)
-                    if temps_database::test_utils::is_container_runtime_unavailable(
-                        &error.to_string(),
-                    ) =>
+                    if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
                 {
                     println!("Docker not available, skipping test: {error}");
                     return;
@@ -1341,6 +1348,8 @@ mod tests {
             let cli_key = format!("Bearer {}", polled["api_key"].as_str().unwrap());
 
             let mint = |name: &str, role: &str| CreateApiKeyRequest {
+                project_id: None,
+                environment_id: None,
                 name: name.to_string(),
                 role_type: role.to_string(),
                 permissions: None,

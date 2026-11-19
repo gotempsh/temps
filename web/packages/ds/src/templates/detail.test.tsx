@@ -28,8 +28,8 @@ test('detail main uses the full width unless an aside is present', () => {
   const full = renderToStaticMarkup(
     <Detail title="Variable" facts={[]} main={<p>History</p>} />
   )
-  expect(full).not.toContain('lg:grid-cols-3')
-  expect(full).not.toContain('lg:col-span-2')
+  expect(full).not.toContain('grid-cols-3')
+  expect(full).not.toContain('col-span-2')
   const split = renderToStaticMarkup(
     <Detail
       title="Variable"
@@ -38,6 +38,9 @@ test('detail main uses the full width unless an aside is present', () => {
       aside={<p>Metadata</p>}
     />
   )
-  expect(split).toContain('lg:grid-cols-3')
-  expect(split).toContain('lg:col-span-2')
+  // By the space the page has, which a window breakpoint cannot know.
+  expect(split).toContain('@container')
+  expect(split).toContain('@4xl:grid-cols-3')
+  expect(split).toContain('@4xl:col-span-2')
+  expect(split).not.toContain('lg:grid-cols-3')
 })

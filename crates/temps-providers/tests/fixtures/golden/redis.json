@@ -1,0 +1,74 @@
+[
+  {
+    "body": {
+      "Cmd": [
+        "redis-server",
+        "--appendonly",
+        "yes",
+        "--requirepass",
+        "testpass123"
+      ],
+      "Env": [
+        "REDIS_PASSWORD=testpass123"
+      ],
+      "ExposedPorts": {
+        "6379/tcp": {}
+      },
+      "Healthcheck": {
+        "Interval": 30000000000,
+        "Retries": 3,
+        "StartInterval": 2000000000,
+        "StartPeriod": 90000000000,
+        "Test": [
+          "CMD-SHELL",
+          "redis-cli ping"
+        ],
+        "Timeout": 5000000000
+      },
+      "HostConfig": {
+        "Init": true,
+        "LogConfig": {
+          "Config": {
+            "max-file": "3",
+            "max-size": "20m"
+          },
+          "Type": "json-file"
+        },
+        "Mounts": [
+          {
+            "Source": "redis_data_golden",
+            "Target": "/data",
+            "Type": "volume"
+          }
+        ],
+        "PidsLimit": 512,
+        "PortBindings": {
+          "6379/tcp": [
+            {
+              "HostIp": "127.0.0.1",
+              "HostPort": "16379"
+            }
+          ]
+        },
+        "RestartPolicy": {
+          "Name": "always"
+        },
+        "SecurityOpt": [
+          "no-new-privileges:true"
+        ]
+      },
+      "Image": "ghcr.io/gotempsh/redis-walg:8-trixie",
+      "Labels": {
+        "temps.service_name": "golden",
+        "temps.service_type": "redis"
+      },
+      "NetworkingConfig": {
+        "EndpointsConfig": {
+          "temps-app-network": {}
+        }
+      }
+    },
+    "name": "redis-golden",
+    "platform": null
+  }
+]

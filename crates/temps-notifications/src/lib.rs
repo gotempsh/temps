@@ -4,12 +4,14 @@
 //! notifications services and utilities
 
 pub mod digest;
+pub mod error;
 pub mod plugin;
 pub mod routing;
 pub mod services;
 pub mod telegram;
 pub mod vulnerability_notifications;
 pub use digest::{DigestSections, DigestService, WeeklyDigestData};
+pub use error::NotificationError;
 pub use handlers::{configure_routes, NotificationProvidersApiDoc};
 pub use plugin::NotificationsPlugin;
 pub use routing::*;

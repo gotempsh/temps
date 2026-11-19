@@ -124,16 +124,20 @@ pub struct OutageEvent {
 #[derive(Debug, Error)]
 pub enum OutageError {
     #[error("Database error: {0}")]
-    Database(String),
+    Database(sea_orm::DbErr),
     #[error("Monitor not found: {0}")]
     MonitorNotFound(i32),
-    #[error("Notification error: {0}")]
-    Notification(String),
+    #[error("Failed to send the {kind} notification for monitor {monitor_id}: {reason}")]
+    Notification {
+        monitor_id: i32,
+        kind: &'static str,
+        reason: String,
+    },
 }
 
 impl From<sea_orm::DbErr> for OutageError {
     fn from(err: sea_orm::DbErr) -> Self {
-        OutageError::Database(err.to_string())
+        OutageError::Database(err)
     }
 }
 
@@ -807,7 +811,11 @@ impl OutageDetectionService {
         self.notification_service
             .send_notification(notification)
             .await
-            .map_err(|e| OutageError::Notification(e.to_string()))?;
+            .map_err(|e| OutageError::Notification {
+                monitor_id: event.monitor_id,
+                kind: "outage",
+                reason: e.to_string(),
+            })?;
 
         Ok(())
     }
@@ -842,7 +850,11 @@ impl OutageDetectionService {
         self.notification_service
             .send_notification(notification)
             .await
-            .map_err(|e| OutageError::Notification(e.to_string()))?;
+            .map_err(|e| OutageError::Notification {
+                monitor_id: event.monitor_id,
+                kind: "recovery",
+                reason: e.to_string(),
+            })?;
 
         Ok(())
     }
@@ -883,6 +895,11 @@ impl OutageDetectionService {
                 .await?;
 
             if let Some(check) = recent_check {
+                // Nothing was probed (ADR 068 D4); read as a status it would
+                // be `operational`, which could resolve a real outage.
+                if check.status == temps_core::environment_address::NO_ADDRESS_CHECK_STATUS {
+                    continue;
+                }
                 let status = MonitorStatus::from_str(&check.status);
                 if let Some(event) = self
                     .process_check(monitor.id, status, check.error_message)
@@ -1020,6 +1037,16 @@ WHERE NOT EXISTS (
                         }
                         continue;
                     }
+                    // ADR 068 D4: nothing was probed because nobody can
+                    // reach the environment. Neither an outage nor a
+                    // recovery: an open incident stays as it was.
+                    if job.status == "no_address" {
+                        debug!(
+                            monitor_id = job.monitor_id,
+                            "monitor has no address to check; outage state unchanged"
+                        );
+                        continue;
+                    }
                     let status = MonitorStatus::from_str(&job.status);
                     match self
                         .process_check(job.monitor_id, status, job.error_message)
@@ -1065,7 +1092,6 @@ WHERE NOT EXISTS (
 
     /// Scan all monitors - this is now a fallback/diagnostic method
     /// The primary detection method is event-driven via start_monitoring()
-    #[allow(dead_code)]
     pub async fn start_monitoring_fallback(self: Arc<Self>, scan_interval_secs: u64) {
         info!(
             "Starting fallback outage detection with polling (interval: {}s)",
@@ -1412,14 +1438,25 @@ pub(crate) mod tests {
 
     #[test]
     fn test_outage_error_display() {
-        let db_err = OutageError::Database("connection refused".to_string());
-        assert_eq!(db_err.to_string(), "Database error: connection refused");
+        let db_err =
+            OutageError::Database(sea_orm::DbErr::Custom("connection refused".to_string()));
+        assert_eq!(
+            db_err.to_string(),
+            "Database error: Custom Error: connection refused"
+        );
 
         let not_found = OutageError::MonitorNotFound(42);
         assert_eq!(not_found.to_string(), "Monitor not found: 42");
 
-        let notif_err = OutageError::Notification("timeout".to_string());
-        assert_eq!(notif_err.to_string(), "Notification error: timeout");
+        let notif_err = OutageError::Notification {
+            monitor_id: 42,
+            kind: "recovery",
+            reason: "timeout".to_string(),
+        };
+        assert_eq!(
+            notif_err.to_string(),
+            "Failed to send the recovery notification for monitor 42: timeout"
+        );
     }
 
     // ── Alarm bridge tests ────────────────────────────────────────────
@@ -1506,8 +1543,12 @@ pub(crate) mod tests {
             protected: false,
             sleeping: false,
             attack_mode: None,
+            shield_mode: None,
+            shield_exempt_paths: Default::default(),
             force_https: None,
             last_activity_at: None,
+            ingress_mode: Default::default(),
+            workload_mode: Default::default(),
         }
     }
 
@@ -1516,6 +1557,8 @@ pub(crate) mod tests {
         temps_entities::projects::Model {
             id,
             image_retention_hours: None,
+            log_ingest_lines_per_sec: None,
+            log_ingest_kib_per_sec: None,
             cloud_telemetry_fidelity:
                 temps_entities::cloud_telemetry_fidelity::CloudTelemetryFidelity::Metered,
             cloud_telemetry_write_mode:
@@ -1559,6 +1602,7 @@ pub(crate) mod tests {
             bitbucket_webhook_hook_id: None,
             generic_webhook_token: None,
             attack_mode: false,
+            shield_mode: "log".to_string(),
             ai_alert_summaries_enabled: None,
             ai_api_traffic_summary_enabled: None,
             allow_alternate_sources: None,
@@ -1569,6 +1613,7 @@ pub(crate) mod tests {
             project_type: temps_entities::types::ProjectType::Server,
             service_template: None,
             cross_project_trace_sharing: true,
+            serves_own_temps_api: false,
         }
     }
 
@@ -1663,6 +1708,53 @@ pub(crate) mod tests {
             incident_id: Some(42),
             occurred_at: Utc::now(),
         }
+    }
+
+    #[tokio::test]
+    async fn a_monitor_with_no_address_is_neither_up_nor_down_in_the_scan() {
+        let check = temps_entities::status_checks::Model {
+            id: 1,
+            checked_at: Utc::now(),
+            monitor_id: 3,
+            status: temps_core::environment_address::NO_ADDRESS_CHECK_STATUS.to_string(),
+            response_time_ms: None,
+            error_message: Some("Nothing to check".to_string()),
+            created_at: Utc::now(),
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![make_status_monitor_model(3, Some(1))]])
+                .append_query_results([vec![check]])
+                .into_connection(),
+        );
+        let alarm_service = Arc::new(AlarmService::new(
+            db.clone(),
+            Arc::new(NoopNotificationService),
+            Arc::new(NoopJobQueue),
+        ));
+        let service = OutageDetectionService::new(
+            db.clone(),
+            Arc::new(NoopNotificationService),
+            alarm_service,
+        );
+        // It was down before its address went away.
+        service.monitor_states.write().await.insert(
+            3,
+            MonitorState {
+                status: MonitorStatus::Down,
+                active_incident_id: Some(42),
+                consecutive_failures: 3,
+            },
+        );
+
+        let events = service.scan_monitors().await.unwrap();
+
+        assert!(events.is_empty(), "{events:?}");
+        assert_eq!(
+            service.get_monitor_statuses().await.get(&3),
+            Some(&MonitorStatus::Down),
+            "no_address does not resolve the outage"
+        );
     }
 
     #[tokio::test]
@@ -2025,6 +2117,7 @@ pub(crate) mod tests {
             environment_id: Some(1),
             monitor_id: Some(1),
             title: "API Health is down".to_string(),
+            public_title: None,
             description: Some("Connection refused".to_string()),
             severity: "critical".to_string(),
             status: "investigating".to_string(),

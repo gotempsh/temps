@@ -62,6 +62,74 @@ impl AlertTriggerType {
     }
 }
 
+/// Longest window a frequency rule can count over (30 days).
+pub const MAX_FREQUENCY_WINDOW_MINUTES: i64 = 30 * 24 * 60;
+
+/// Refuse a trigger config that could never evaluate. A window that overflows
+/// date arithmetic used to panic ingest for every later event in a group, so
+/// one saved rule lost events until someone found and deleted it.
+fn validate_trigger_config(
+    trigger_type: &str,
+    trigger_config: &serde_json::Value,
+) -> Result<(), ErrorTrackingError> {
+    match AlertTriggerType::from_str(trigger_type) {
+        Some(AlertTriggerType::Frequency) => {}
+        Some(AlertTriggerType::UserCount) => return validate_user_count_config(trigger_config),
+        _ => return Ok(()),
+    }
+    let config: FrequencyConfig =
+        serde_json::from_value(trigger_config.clone()).map_err(|error| {
+            ErrorTrackingError::Validation(format!(
+                "Invalid trigger config for '{trigger_type}': expected count and \
+                 window_minutes: {error}"
+            ))
+        })?;
+    if config.count < 1 {
+        return Err(ErrorTrackingError::Validation(format!(
+            "Frequency rule count must be at least 1, got {}",
+            config.count
+        )));
+    }
+    if !(1..=MAX_FREQUENCY_WINDOW_MINUTES).contains(&config.window_minutes) {
+        return Err(ErrorTrackingError::Validation(format!(
+            "Frequency rule window_minutes must be between 1 and \
+             {MAX_FREQUENCY_WINDOW_MINUTES}, got {}",
+            config.window_minutes
+        )));
+    }
+    Ok(())
+}
+
+/// A user count rule without a count of at least 1 could never fire, and
+/// nothing would say so.
+fn validate_user_count_config(
+    trigger_config: &serde_json::Value,
+) -> Result<(), ErrorTrackingError> {
+    let config: UserCountConfig =
+        serde_json::from_value(trigger_config.clone()).map_err(|error| {
+            ErrorTrackingError::Validation(format!(
+                "Invalid trigger config for 'user_count': expected count: {error}"
+            ))
+        })?;
+    if config.count < 1 {
+        return Err(ErrorTrackingError::Validation(format!(
+            "User count rule count must be at least 1, got {}",
+            config.count
+        )));
+    }
+    Ok(())
+}
+
+/// Start of a frequency rule's window, or `None` when `window_minutes` can't be
+/// represented. Saves refuse such a value, but a rule stored before that check
+/// existed still reaches here on the ingest path, which must not panic.
+fn frequency_window_start(
+    now: chrono::DateTime<Utc>,
+    window_minutes: i64,
+) -> Option<chrono::DateTime<Utc>> {
+    now.checked_sub_signed(Duration::try_minutes(window_minutes)?)
+}
+
 /// Configuration for frequency-based triggers
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FrequencyConfig {
@@ -71,8 +139,33 @@ pub struct FrequencyConfig {
 
 /// Configuration for user count triggers
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(try_from = "StoredUserCountConfig")]
 pub struct UserCountConfig {
     pub count: i64,
+}
+
+/// A user count config as stored. Consoles before #1749 saved the value as
+/// `threshold`, which the server never read, and could also carry a `count`
+/// left over from a frequency rule. `count` wins when both are present (as the
+/// console reads it back); `threshold` alone is read as the count. A serde
+/// alias would refuse the both-present shape as a duplicate field, silencing
+/// rules that worked before.
+#[derive(Deserialize)]
+struct StoredUserCountConfig {
+    count: Option<i64>,
+    threshold: Option<i64>,
+}
+
+impl TryFrom<StoredUserCountConfig> for UserCountConfig {
+    type Error = &'static str;
+
+    fn try_from(stored: StoredUserCountConfig) -> Result<Self, Self::Error> {
+        stored
+            .count
+            .or(stored.threshold)
+            .map(|count| Self { count })
+            .ok_or("missing field `count`")
+    }
 }
 
 /// Configuration for status change triggers
@@ -329,6 +422,8 @@ impl ErrorAlertService {
             ));
         }
 
+        validate_trigger_config(&trigger_type, &trigger_config)?;
+
         let now = Utc::now();
         let rule = error_alert_rules::ActiveModel {
             project_id: Set(project_id),
@@ -389,6 +484,14 @@ impl ErrorAlertService {
         enabled: Option<bool>,
     ) -> Result<error_alert_rules::Model, ErrorTrackingError> {
         let existing = self.get_rule(rule_id, project_id).await?;
+        // Judged on what the rule will hold after this update, so changing only
+        // the type or only the config can't leave an invalid pair behind.
+        if trigger_type.is_some() || trigger_config.is_some() {
+            validate_trigger_config(
+                trigger_type.as_deref().unwrap_or(&existing.trigger_type),
+                trigger_config.as_ref().unwrap_or(&existing.trigger_config),
+            )?;
+        }
         let mut rule: error_alert_rules::ActiveModel = existing.into();
 
         if let Some(name) = name {
@@ -689,7 +792,15 @@ impl ErrorAlertService {
             Err(_) => return false,
         };
 
-        let window_start = Utc::now() - Duration::minutes(config.window_minutes);
+        let Some(window_start) = frequency_window_start(Utc::now(), config.window_minutes) else {
+            warn!(
+                rule_id = rule.id,
+                project_id = rule.project_id,
+                window_minutes = config.window_minutes,
+                "Skipping frequency alert rule: window_minutes is out of range"
+            );
+            return false;
+        };
 
         let count = error_events::Entity::find()
             .filter(error_events::Column::ErrorGroupId.eq(group.id))
@@ -774,6 +885,47 @@ mod tests {
     }
 
     #[test]
+    fn frequency_rule_config_is_refused_outside_its_range() {
+        let config = |count: i64, window_minutes: i64| serde_json::json!({"count": count, "window_minutes": window_minutes});
+        assert!(validate_trigger_config("frequency", &config(1, 1)).is_ok());
+        assert!(
+            validate_trigger_config("frequency", &config(10, MAX_FREQUENCY_WINDOW_MINUTES)).is_ok()
+        );
+
+        for bad in [
+            config(0, 60),
+            config(-1, 60),
+            config(10, 0),
+            config(10, -1),
+            config(10, MAX_FREQUENCY_WINDOW_MINUTES + 1),
+            config(10, i64::MAX),
+            serde_json::json!({"count": 10}),
+        ] {
+            assert!(
+                matches!(
+                    validate_trigger_config("frequency", &bad),
+                    Err(ErrorTrackingError::Validation(_))
+                ),
+                "{bad}"
+            );
+        }
+
+        // Other trigger types don't read these fields.
+        assert!(validate_trigger_config("new_issue", &config(0, 0)).is_ok());
+    }
+
+    #[test]
+    fn frequency_window_for_a_rule_saved_out_of_range_does_not_panic() {
+        let now = Utc::now();
+        assert_eq!(
+            frequency_window_start(now, 60),
+            Some(now - Duration::minutes(60))
+        );
+        assert_eq!(frequency_window_start(now, i64::MAX), None);
+        assert_eq!(frequency_window_start(now, i64::MIN), None);
+    }
+
+    #[test]
     fn test_frequency_config_deserialization() {
         let json = serde_json::json!({"count": 100, "window_minutes": 60});
         let config: FrequencyConfig = serde_json::from_value(json).unwrap();
@@ -786,6 +938,55 @@ mod tests {
         let json = serde_json::json!({"count": 10});
         let config: UserCountConfig = serde_json::from_value(json).unwrap();
         assert_eq!(config.count, 10);
+    }
+
+    /// #1749: rules the console saved under `threshold` never fired, because
+    /// the server only read `count`. They now read the same.
+    #[test]
+    fn user_count_rule_saved_as_threshold_reads_its_count() {
+        let config: UserCountConfig =
+            serde_json::from_value(serde_json::json!({"threshold": 3})).unwrap();
+        assert_eq!(config.count, 3);
+        assert!(
+            validate_trigger_config("user_count", &serde_json::json!({"threshold": 3})).is_ok()
+        );
+    }
+
+    /// A rule saved by an older console can hold both keys (a `count` left
+    /// from a frequency rule plus the `threshold` it showed). It must still
+    /// load, reading `count` first, rather than fail as a duplicate field.
+    #[test]
+    fn user_count_rule_with_both_count_and_threshold_reads_the_count() {
+        let both = serde_json::json!({"count": 5, "threshold": 9, "window_minutes": 60});
+        let config: UserCountConfig = serde_json::from_value(both.clone()).unwrap();
+        assert_eq!(config.count, 5);
+        assert!(validate_trigger_config("user_count", &both).is_ok());
+        assert_eq!(
+            serde_json::to_value(&config).unwrap(),
+            serde_json::json!({"count": 5})
+        );
+    }
+
+    /// #1749: a user count rule saved with no count never fired, silently.
+    #[test]
+    fn user_count_rule_config_is_refused_without_a_positive_count() {
+        assert!(validate_trigger_config("user_count", &serde_json::json!({"count": 1})).is_ok());
+        for bad in [
+            serde_json::json!({}),
+            serde_json::json!({"count": 0}),
+            serde_json::json!({"count": -2}),
+            serde_json::json!({"count": "ten"}),
+        ] {
+            match validate_trigger_config("user_count", &bad) {
+                Err(ErrorTrackingError::Validation(message)) => {
+                    assert!(
+                        message.contains("user_count") || message.contains("User count"),
+                        "{message}"
+                    );
+                }
+                other => panic!("{bad} must be refused, got {other:?}"),
+            }
+        }
     }
 
     #[test]
@@ -819,7 +1020,7 @@ mod tests {
     /// project's own rules, and reports a missing project as not found.
     #[tokio::test]
     async fn create_rule_stops_at_the_per_project_limit() {
-        use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
+        use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
         let test_db = match TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(error) if is_container_runtime_unavailable(&error.to_string()) => {

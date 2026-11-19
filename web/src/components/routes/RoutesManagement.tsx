@@ -105,23 +105,21 @@ export function RoutesManagement({
           host: data.host,
           port: data.port,
         },
+        throwOnError: true,
       }),
     meta: {
       errorTitle: 'Failed to update route',
     },
-    onSuccess: ({ response }: any) => {
-      if (response.status >= 300) {
-        toast.error('Failed to update route')
-      } else {
-        setEditRoute(null)
-        toast.success('Route updated successfully')
-        reloadRoutes()
-      }
+    onSuccess: () => {
+      setEditRoute(null)
+      toast.success('Route updated successfully')
+      reloadRoutes()
     },
   })
 
   const deleteRouteMutation = useMutation({
-    mutationFn: (domain: string) => deleteRoute({ path: { domain } }),
+    mutationFn: (domain: string) =>
+      deleteRoute({ path: { domain }, throwOnError: true }),
     meta: {
       errorTitle: 'Failed to delete route',
     },
@@ -188,7 +186,7 @@ export function RoutesManagement({
         {canManageRoutes && (
           <CreateActionButton
             to="/settings/load-balancer/add"
-            label="Add Route"
+            label="Add route"
           />
         )}
       </div>
@@ -242,7 +240,7 @@ export function RoutesManagement({
               <Button asChild>
                 <Link to="/settings/load-balancer/add">
                   <Plus className="mr-2 h-4 w-4" />
-                  Add Route
+                  Add route
                 </Link>
               </Button>
             ) : undefined
@@ -307,7 +305,7 @@ export function RoutesManagement({
       >
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Edit Route</DialogTitle>
+            <DialogTitle>Edit route</DialogTitle>
           </DialogHeader>
           <Form {...editForm}>
             <form
@@ -370,7 +368,7 @@ export function RoutesManagement({
 
               <div className="flex justify-end">
                 <Button type="submit" disabled={updateRouteMutation.isPending}>
-                  {updateRouteMutation.isPending ? 'Saving...' : 'Save Changes'}
+                  {updateRouteMutation.isPending ? 'Saving…' : 'Save'}
                 </Button>
               </div>
             </form>

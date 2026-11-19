@@ -238,7 +238,7 @@ impl TempsPlugin for ErrorTrackingPlugin {
                                 .await
                                 .ok()
                                 .flatten()
-                                .map(|r| temps_core::AppSettings::from_json(r.data))
+                                .map(|r| temps_config::AppSettings::from_json(r.data))
                                 .and_then(|s| s.external_url);
                             if let Some(base_url) = base_url {
                                 let url = format!(
@@ -472,7 +472,7 @@ impl TempsPlugin for ErrorTrackingPlugin {
             .get_service::<dyn temps_core::telemetry::TelemetryReporter>()
             .unwrap_or_else(|| Arc::new(temps_core::telemetry::NoopTelemetryReporter));
 
-        let route_table = context.require_service::<temps_proxy::CachedPeerTable>();
+        let route_table = context.require_service::<temps_routes::CachedPeerTable>();
         let tunnel_dsn_service = context.require_service::<DSNService>();
 
         let sentry_state = Arc::new(crate::sentry::handlers::AppState {

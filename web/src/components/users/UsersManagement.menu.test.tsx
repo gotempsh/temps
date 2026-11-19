@@ -73,7 +73,7 @@ test('an administrator can open the row menu', async () => {
       ctrlKey: false,
     })
   })
-  expect(await view.findByText('Manage Roles')).toBeTruthy()
+  expect(await view.findByText('Manage roles')).toBeTruthy()
 })
 
 test('a row menu left open when access is revoked stays closed when it is restored', async () => {
@@ -84,19 +84,19 @@ test('a row menu left open when access is revoked stays closed when it is restor
       ctrlKey: false,
     })
   })
-  expect(await view.findByText('Manage Roles')).toBeTruthy()
+  expect(await view.findByText('Manage roles')).toBeTruthy()
 
   await act(async () => {
     view.rerender(page('user'))
   })
-  expect(view.queryByText('Manage Roles')).toBeNull()
+  expect(view.queryByText('Manage roles')).toBeNull()
   expect(view.queryByRole('button', { name: 'Open menu' })).toBeNull()
 
   await act(async () => {
     view.rerender(page('admin'))
   })
   expect(view.getByRole('button', { name: 'Open menu' })).toBeTruthy()
-  expect(view.queryByText('Manage Roles')).toBeNull()
+  expect(view.queryByText('Manage roles')).toBeNull()
 })
 
 async function openMenu(view: ReturnType<typeof render>) {

@@ -64,9 +64,17 @@ pub struct PlatformFeatures {
     /// retained by this process. `true` when the backup scheduler is
     /// configured and worker credentials are present, regardless of profile.
     pub backups_remote: bool,
-    /// Agent sandboxes / workspace previews run in this process. Requires a
-    /// local Docker daemon.
+    /// The standalone sandbox API is served and sandboxes can run on some
+    /// node (ADR 063). `true` in both profiles: on a control plane they run
+    /// on worker nodes only, and a create with no usable worker answers the
+    /// worker-node-required problem pointing at Settings → Nodes.
     pub sandboxes: bool,
+    /// Sandboxes, AI agent runs and application workspaces can run on this
+    /// host itself. Requires local workloads (and so a local Docker daemon);
+    /// `false` in the `control-plane` profile, where the control plane's own
+    /// node takes no sandboxes (ADR 063).
+    #[serde(default)]
+    pub sandboxes_local: bool,
     /// Managed key-value store is registered and reachable.
     pub kv: bool,
     /// Workload importers (Compose, Coolify, Dokploy, Portainer, Kamal,
@@ -105,6 +113,7 @@ impl PlatformFeatures {
             backups_local: true,
             backups_remote: true,
             sandboxes: true,
+            sandboxes_local: true,
             kv: true,
             imports: true,
             log_aggregation: true,
@@ -142,8 +151,11 @@ impl PlatformFeatures {
             image_builds_local: false,
             managed_services: false,
             backups_local: false,
-            sandboxes: false,
+            sandboxes_local: false,
             imports: false,
+            // Served in every profile; on a control plane sandboxes are
+            // placed on worker nodes only (ADR 063).
+            sandboxes: true,
             vulnerability_scanning: false,
             // Caller-supplied: genuinely varies across CP deployments.
             backups_remote,
@@ -230,6 +242,7 @@ mod tests {
         assert!(features.backups_local);
         assert!(features.backups_remote);
         assert!(features.sandboxes);
+        assert!(features.sandboxes_local);
         assert!(features.kv);
         assert!(features.imports);
         assert!(features.log_aggregation);
@@ -256,9 +269,18 @@ mod tests {
         assert!(!features.image_builds_local);
         assert!(!features.managed_services);
         assert!(!features.backups_local);
-        assert!(!features.sandboxes);
+        assert!(!features.sandboxes_local);
         assert!(!features.imports);
         assert!(!features.vulnerability_scanning);
+    }
+
+    #[test]
+    fn control_plane_serves_sandboxes_on_worker_nodes_only() {
+        // ADR 063: the API is there (sandboxes run on workers), the control
+        // plane's own host runs none.
+        let features = PlatformFeatures::control_plane(false, true, false, true);
+        assert!(features.sandboxes);
+        assert!(!features.sandboxes_local);
     }
 
     #[test]
@@ -291,6 +313,7 @@ mod tests {
             "backups_local",
             "backups_remote",
             "sandboxes",
+            "sandboxes_local",
             "kv",
             "imports",
             "log_aggregation",

@@ -2852,7 +2852,7 @@ fn s3_client(
     let mut builder = Config::builder()
         .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
         .region(aws_sdk_s3::config::Region::new(source.region.clone()))
-        .force_path_style(source.force_path_style.unwrap_or(true))
+        .force_path_style(source.effective_path_style(true).force_path_style)
         .credentials_provider(credentials)
         .retry_config(aws_sdk_s3::config::retry::RetryConfig::standard().with_max_attempts(3))
         // Connect attempts are bounded, but no whole-operation timeout is set:
@@ -2863,11 +2863,7 @@ fn s3_client(
                 .build(),
         );
     if let Some(endpoint) = &source.endpoint {
-        builder = builder.endpoint_url(if endpoint.starts_with("http") {
-            endpoint.clone()
-        } else {
-            format!("http://{endpoint}")
-        });
+        builder = builder.endpoint_url(temps_core::s3_endpoint::endpoint_url(endpoint));
     }
     Ok(S3Client::from_conf(builder.build()))
 }
@@ -3348,6 +3344,7 @@ mod tests {
             managed_by_cloud: Set(true),
             lifecycle_reconcile_failed_at: Set(None),
             lifecycle_reconcile_generation: Set(0),
+            worker_credentials: sea_orm::ActiveValue::Set("scoped".to_string()),
             created_at: Set(now),
             updated_at: Set(now),
             backing_service_id: Set(None),
@@ -3500,6 +3497,7 @@ mod tests {
                 managed_by_cloud: Set(managed_by_cloud),
                 lifecycle_reconcile_failed_at: Set(None),
                 lifecycle_reconcile_generation: Set(0),
+                worker_credentials: sea_orm::ActiveValue::Set("scoped".to_string()),
                 created_at: Set(now),
                 updated_at: Set(now),
                 backing_service_id: Set(None),
@@ -3562,12 +3560,10 @@ mod tests {
 
     #[tokio::test]
     async fn indexed_state_selects_only_bounded_due_work_after_thousands_of_rows() {
-        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(database) => database,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Docker unavailable; skipping indexed mirror-state query test: {error}");
                 return;
@@ -3898,6 +3894,14 @@ mod tests {
             created_by_user_id: None,
             continuous_archive_s3_source_id: None,
             continuous_archive_pinned_at: None,
+            workload_mode: Default::default(),
+            log_ingest_lines_per_sec: None,
+            log_ingest_kib_per_sec: None,
+            healthcheck_interval_secs: None,
+            healthcheck_start_interval_secs: None,
+            healthcheck_start_period_secs: None,
+            healthcheck_timeout_secs: None,
+            healthcheck_retries: None,
         };
         let source = temps_entities::s3_sources::Model {
             id: 7,
@@ -3916,6 +3920,7 @@ mod tests {
             managed_by_cloud: false,
             lifecycle_reconcile_failed_at: None,
             lifecycle_reconcile_generation: 0,
+            worker_credentials: "scoped".to_string(),
             created_at: now,
             updated_at: now,
         };
@@ -4091,6 +4096,7 @@ mod tests {
             managed_by_cloud: Set(true),
             lifecycle_reconcile_failed_at: Set(None),
             lifecycle_reconcile_generation: Set(0),
+            worker_credentials: sea_orm::ActiveValue::Set("scoped".to_string()),
             created_at: Set(now),
             updated_at: Set(now),
             backing_service_id: Set(None),
@@ -4326,6 +4332,7 @@ mod tests {
             managed_by_cloud: Set(true),
             lifecycle_reconcile_failed_at: Set(None),
             lifecycle_reconcile_generation: Set(0),
+            worker_credentials: sea_orm::ActiveValue::Set("scoped".to_string()),
             created_at: Set(now),
             updated_at: Set(now),
         }
@@ -4356,6 +4363,14 @@ mod tests {
             created_by_user_id: None,
             continuous_archive_s3_source_id: None,
             continuous_archive_pinned_at: None,
+            workload_mode: Default::default(),
+            log_ingest_lines_per_sec: None,
+            log_ingest_kib_per_sec: None,
+            healthcheck_interval_secs: None,
+            healthcheck_start_interval_secs: None,
+            healthcheck_start_period_secs: None,
+            healthcheck_timeout_secs: None,
+            healthcheck_retries: None,
         }
         .into_active_model()
         .insert(&db)
@@ -4501,6 +4516,7 @@ mod tests {
             managed_by_cloud: Set(true),
             lifecycle_reconcile_failed_at: Set(None),
             lifecycle_reconcile_generation: Set(0),
+            worker_credentials: sea_orm::ActiveValue::Set("scoped".to_string()),
             created_at: Set(now),
             updated_at: Set(now),
         }
@@ -4616,6 +4632,7 @@ mod tests {
             managed_by_cloud: Set(true),
             lifecycle_reconcile_failed_at: Set(None),
             lifecycle_reconcile_generation: Set(0),
+            worker_credentials: sea_orm::ActiveValue::Set("scoped".to_string()),
             created_at: Set(now),
             updated_at: Set(now),
         }
@@ -4646,6 +4663,14 @@ mod tests {
             created_by_user_id: None,
             continuous_archive_s3_source_id: None,
             continuous_archive_pinned_at: None,
+            workload_mode: Default::default(),
+            log_ingest_lines_per_sec: None,
+            log_ingest_kib_per_sec: None,
+            healthcheck_interval_secs: None,
+            healthcheck_start_interval_secs: None,
+            healthcheck_start_period_secs: None,
+            healthcheck_timeout_secs: None,
+            healthcheck_retries: None,
         }
         .into_active_model()
         .insert(db)
@@ -5970,6 +5995,14 @@ mod tests {
             created_by_user_id: None,
             continuous_archive_s3_source_id: None,
             continuous_archive_pinned_at: None,
+            workload_mode: Default::default(),
+            log_ingest_lines_per_sec: None,
+            log_ingest_kib_per_sec: None,
+            healthcheck_interval_secs: None,
+            healthcheck_start_interval_secs: None,
+            healthcheck_start_period_secs: None,
+            healthcheck_timeout_secs: None,
+            healthcheck_retries: None,
         };
 
         assert_eq!(
@@ -6753,6 +6786,7 @@ mod tests {
             managed_by_cloud: Set(true),
             lifecycle_reconcile_failed_at: Set(None),
             lifecycle_reconcile_generation: Set(0),
+            worker_credentials: sea_orm::ActiveValue::Set("scoped".to_string()),
             created_at: Set(now),
             updated_at: Set(now),
         }
@@ -6783,6 +6817,14 @@ mod tests {
             created_by_user_id: None,
             continuous_archive_s3_source_id: None,
             continuous_archive_pinned_at: None,
+            workload_mode: Default::default(),
+            log_ingest_lines_per_sec: None,
+            log_ingest_kib_per_sec: None,
+            healthcheck_interval_secs: None,
+            healthcheck_start_interval_secs: None,
+            healthcheck_start_period_secs: None,
+            healthcheck_timeout_secs: None,
+            healthcheck_retries: None,
         }
         .into_active_model()
         .insert(&db)

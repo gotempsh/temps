@@ -14,6 +14,7 @@
  */
 
 import { Button } from '@/components/ui/button'
+import { Skeleton } from '@/components/ui/skeleton'
 import {
   TOOLTIP_CONTENT_STYLE,
   TOOLTIP_LABEL_STYLE,
@@ -59,18 +60,14 @@ import {
   externalServiceMetricsDeleteAlertRuleMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import type { ServiceAlertRuleResponse } from '@/api/client/types.gen'
-import {
-  Activity,
-  ArrowLeft,
-  Loader2,
-  Plus,
-  RefreshCw,
-  Trash2,
-} from 'lucide-react'
-import { createContext, useContext, useState } from 'react'
+import { Activity, Loader2, Plus, RefreshCw, Trash2 } from 'lucide-react'
+import { createContext, useContext, useEffect, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router'
+import { PageHeader } from '@/components/layout/PageContainer'
+import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { toast } from 'sonner'
+import { getErrorMessage } from '@/utils/errorHandling'
 import {
   LineChart,
   Line,
@@ -86,6 +83,40 @@ import {
   type ServiceAlertComparator,
 } from '@/lib/service-alert-comparator'
 import { telemetryFreshnessSummary } from '@/lib/telemetry-freshness'
+import {
+  CONTAINER_CPU_METRIC,
+  CONTAINER_CPU_METRIC_LABELS,
+  CONTAINER_CPU_TILE_HINT,
+  CONTAINER_CPU_TILE_LABEL,
+  CONTAINER_CPU_UTILIZATION_METRIC,
+  alertableMetrics,
+  containerCpuAxisWidth,
+  containerCpuChartMetric,
+  containerCpuHistoryMetric,
+  containerCpuTileText,
+  formatContainerCpuMetric,
+  withCpuHistory,
+} from '@/lib/container-cpu'
+import {
+  PG_CACHE_HIT_RATIO_METRIC,
+  formatPgCacheHitRatio,
+  metricTileValue,
+  pgCacheHitRatioDescription,
+  pgCacheHitRatioLabel,
+  pgCacheHitRatioScopedLabel,
+  type PgCacheHitScope,
+} from '@/lib/pg-cache-hit'
+import {
+  serviceMetricsEngine,
+  type ServiceMetricsEngine,
+} from '@/lib/service-metrics-engine'
+import {
+  MARIADB_FLAG_METRICS,
+  formatFlagValue,
+  MARIADB_METRIC_GROUPS,
+  MARIADB_METRIC_LABELS,
+  MARIADB_PER_DATABASE_GROUPS,
+} from '@/lib/mariadb-metrics'
 
 // ---------------------------------------------------------------------------
 // View-model types (derived from the generated SDK responses)
@@ -128,7 +159,7 @@ function isMonitoringUnavailable(err: unknown): boolean {
 // Metric metadata per engine
 // ---------------------------------------------------------------------------
 
-type EngineKind = 'postgres' | 'redis' | 'mongodb' | 's3' | 'rustfs'
+type EngineKind = ServiceMetricsEngine
 
 type MetricGroup = {
   title: string
@@ -292,6 +323,7 @@ const ENGINE_GROUPS: Record<EngineKind, MetricGroup[]> = {
       metrics: ['mongo.replication_buffer_ratio'],
     },
   ],
+  mariadb: MARIADB_METRIC_GROUPS,
   s3: [
     {
       title: 'Storage',
@@ -343,6 +375,8 @@ const ENGINE_GROUPS: Record<EngineKind, MetricGroup[]> = {
       ],
     },
   ],
+  // Only the engine-agnostic Resources group exists for these.
+  unsupported: [],
 }
 
 // Container resource metrics — CPU/memory of the docker container(s) backing
@@ -351,7 +385,8 @@ const ENGINE_GROUPS: Record<EngineKind, MetricGroup[]> = {
 const RESOURCES_GROUP: MetricGroup = {
   title: 'Resources',
   metrics: [
-    'container.cpu_percent',
+    CONTAINER_CPU_METRIC,
+    CONTAINER_CPU_UTILIZATION_METRIC,
     'container.memory_used_bytes',
     'container.memory_percent',
   ],
@@ -379,7 +414,7 @@ const PG_PER_DATABASE_GROUPS: MetricGroup[] = [
     ],
   },
   {
-    title: 'Write Activity',
+    title: 'Write activity',
     metrics: [
       'pg.tuples_inserted_total',
       'pg.tuples_updated_total',
@@ -388,21 +423,26 @@ const PG_PER_DATABASE_GROUPS: MetricGroup[] = [
   },
 ]
 
-// Flat list of every per-database metric name (for the by-database query).
-const PG_PER_DATABASE_METRICS: string[] = PG_PER_DATABASE_GROUPS.flatMap(
-  (g) => g.metrics
-)
+// Engines whose collector reports per-database series, shown in the
+// "Databases" section. Must match `per_database_layout` in
+// crates/temps-providers/src/handlers/metrics_handlers.rs.
+const PER_DATABASE_GROUPS: Partial<Record<EngineKind, MetricGroup[]>> = {
+  postgres: PG_PER_DATABASE_GROUPS,
+  mariadb: MARIADB_PER_DATABASE_GROUPS,
+}
 
-// All known metrics for alert rule creation. For Postgres this includes both
-// the global metrics (ENGINE_GROUPS) and the per-database metrics so alert
-// rules can target either scope.
+// All known metrics for alert rule creation: the global metrics
+// (ENGINE_GROUPS) and, where the engine has them, the per-database metrics so
+// alert rules can target either scope.
 const ALL_METRICS: Record<EngineKind, string[]> = Object.fromEntries(
   Object.entries(ENGINE_GROUPS).map(([engine, groups]) => [
     engine,
     [
       ...RESOURCES_GROUP.metrics,
       ...groups.flatMap((g) => g.metrics),
-      ...(engine === 'postgres' ? PG_PER_DATABASE_METRICS : []),
+      ...(PER_DATABASE_GROUPS[engine as EngineKind] ?? []).flatMap(
+        (g) => g.metrics
+      ),
     ],
   ])
 ) as Record<EngineKind, string[]>
@@ -427,6 +467,12 @@ const HERO_METRICS: Record<EngineKind, string[]> = {
     'mongo.op_query_total',
     'mongo.replication_buffer_ratio',
   ],
+  mariadb: [
+    'mariadb.connections',
+    'mariadb.queries_total',
+    'mariadb.buffer_pool_hit_ratio',
+    'mariadb.database_size_bytes',
+  ],
   s3: [
     's3.bucket_count',
     's3.total_size_bytes',
@@ -439,24 +485,17 @@ const HERO_METRICS: Record<EngineKind, string[]> = {
     'rustfs_cluster_capacity_free_bytes',
     'rustfs_s3_operations_total',
   ],
+  unsupported: [
+    CONTAINER_CPU_METRIC,
+    CONTAINER_CPU_UTILIZATION_METRIC,
+    'container.memory_used_bytes',
+    'container.memory_percent',
+  ],
 }
 
 // ---------------------------------------------------------------------------
 // Formatting helpers
 // ---------------------------------------------------------------------------
-
-function normalizeEngine(
-  engine: string,
-  dockerImage?: string | null
-): EngineKind {
-  // An s3 service running the rustfs image should use rustfs metric groups
-  if (engine === 's3' && dockerImage?.toLowerCase().includes('rustfs'))
-    return 'rustfs'
-  if (engine === 'rustfs') return 'rustfs'
-  if (['postgres', 'redis', 'mongodb', 's3'].includes(engine))
-    return engine as EngineKind
-  return 'postgres'
-}
 
 /** Compact relative time, e.g. "just now", "12s ago", "3m ago", "2h ago". */
 function formatRelativeTime(iso: string): string {
@@ -474,6 +513,13 @@ function formatRelativeTime(iso: string): string {
 }
 
 function formatMetricValue(name: string, value: number): string {
+  if (name === PG_CACHE_HIT_RATIO_METRIC) return formatPgCacheHitRatio(value)
+  const cpu = formatContainerCpuMetric(name, value)
+  if (cpu !== null) return cpu
+  if (MARIADB_FLAG_METRICS.has(name)) {
+    const flag = formatFlagValue(value)
+    if (flag !== null) return flag
+  }
   if (name.endsWith('_bytes') || name.endsWith('_bytes_total'))
     return formatBytes(value)
   if (name.endsWith('_ratio')) return `${(value * 100).toFixed(1)}%`
@@ -495,9 +541,9 @@ function formatMetricValue(name: string, value: number): string {
 }
 
 const METRIC_LABELS: Record<string, string> = {
-  // Container resources (all engines) — sampled from docker stats. CPU uses
-  // the docker CLI convention: 100% == one core fully used.
-  'container.cpu_percent': 'CPU',
+  // Container resources (all engines) — sampled from docker stats. CPU reads
+  // in cores (stored as Docker's 100% == one core) and as % of the limit.
+  ...CONTAINER_CPU_METRIC_LABELS,
   'container.memory_used_bytes': 'Memory',
   'container.memory_percent': 'Memory %',
   // Postgres connections — "Total" is the headline (client backends only;
@@ -507,6 +553,7 @@ const METRIC_LABELS: Record<string, string> = {
   'pg.connections_idle': 'Idle',
   'pg.connections_idle_in_transaction': 'Idle in Transaction',
   'pg.connections_other': 'Other',
+  [PG_CACHE_HIT_RATIO_METRIC]: pgCacheHitRatioLabel(),
   rustfs_cluster_buckets_total: 'Buckets',
   rustfs_cluster_objects_total: 'Objects',
   rustfs_cluster_capacity_usable_total_bytes: 'Usable Capacity',
@@ -524,6 +571,7 @@ const METRIC_LABELS: Record<string, string> = {
   'rustfs.request.body.bytes_total': 'Request Bytes',
   rustfs_system_process_cpu_usage: 'CPU Usage',
   rustfs_system_process_resident_memory_bytes: 'Resident Memory',
+  ...MARIADB_METRIC_LABELS,
 }
 
 function labelForMetric(name: string): string {
@@ -592,40 +640,79 @@ function storeRefreshInterval(value: number | null): void {
 }
 
 // ---------------------------------------------------------------------------
-// MetricTile — a single clickable stat item rendered inside a <dl> grid
+// MetricTile — a single stat item rendered inside a <dl> grid; clickable when
+// it has an `onClick`, plain otherwise
 // ---------------------------------------------------------------------------
 
 type MetricTileProps = {
   name: string
   value: number | undefined
   selected: boolean
-  onClick: () => void
+  /** Omit for a tile with no action, so it is not rendered as a button. */
+  onClick?: () => void
   alert?: 'warning' | 'critical'
   size?: 'hero' | 'group'
+  /** Databases the value covers, named in the label of a per-database
+   *  metric such as the cache hit ratio. */
+  scope?: PgCacheHitScope
+  /** Text to show instead of the formatted `value`, for a tile that reads
+   *  more than one metric (CPU used against the CPU limit). */
+  display?: string
 }
 
-function MetricTile({
+/** The label and tooltip of a tile, naming its scope where it matters. */
+function metricTileText(
+  name: string,
+  scope?: PgCacheHitScope
+): { label: string; hint?: string } {
+  if (name === PG_CACHE_HIT_RATIO_METRIC && scope) {
+    return {
+      label: pgCacheHitRatioScopedLabel(scope),
+      hint: pgCacheHitRatioDescription(scope),
+    }
+  }
+  if (name === CONTAINER_CPU_METRIC) {
+    return { label: CONTAINER_CPU_TILE_LABEL, hint: CONTAINER_CPU_TILE_HINT }
+  }
+  return { label: labelForMetric(name) }
+}
+
+/** A tile's text when it reads more than its own metric. */
+function metricTileDisplay(
+  name: string,
+  lookup: (metric: string) => number | undefined,
+  cluster: boolean
+): string | undefined {
+  if (name === CONTAINER_CPU_METRIC)
+    return containerCpuTileText(lookup, cluster)
+  return undefined
+}
+
+/** One metric's latest value, clickable to chart it. */
+export function MetricTile({
   name,
   value,
   selected,
   onClick,
   alert,
   size = 'group',
+  scope,
+  display,
 }: MetricTileProps) {
   const isHero = size === 'hero'
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className={[
-        'flex flex-col text-left transition-colors',
-        isHero ? 'gap-1 px-4 py-4' : 'gap-0.5 px-4 py-3',
-        'hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-primary',
-        selected ? 'bg-primary/5 ring-1 ring-inset ring-primary/30' : '',
-      ]
-        .filter(Boolean)
-        .join(' ')}
-    >
+  const { label, hint } = metricTileText(name, scope)
+  const className = [
+    'flex flex-col text-left transition-colors',
+    isHero ? 'gap-1 px-4 py-4' : 'gap-0.5 px-4 py-3',
+    onClick
+      ? 'hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-primary'
+      : '',
+    selected ? 'bg-primary/5 ring-1 ring-inset ring-primary/30' : '',
+  ]
+    .filter(Boolean)
+    .join(' ')
+  const content = (
+    <>
       <dt
         className={[
           'flex items-center gap-1.5 truncate font-medium text-muted-foreground',
@@ -638,7 +725,9 @@ function MetricTile({
         {alert === 'warning' && (
           <span className="inline-block size-1.5 shrink-0 rounded-full bg-amber-400" />
         )}
-        <span className="truncate">{labelForMetric(name)}</span>
+        <span className="truncate" title={hint ?? label}>
+          {label}
+        </span>
       </dt>
       <dd
         className={[
@@ -646,8 +735,14 @@ function MetricTile({
           isHero ? 'text-2xl' : 'text-lg',
         ].join(' ')}
       >
-        {value != null ? formatMetricValue(name, value) : '—'}
+        {display ?? (value != null ? formatMetricValue(name, value) : '—')}
       </dd>
+    </>
+  )
+  if (!onClick) return <div className={className}>{content}</div>
+  return (
+    <button type="button" onClick={onClick} className={className}>
+      {content}
     </button>
   )
 }
@@ -659,10 +754,17 @@ function MetricTile({
 type MetricChartProps = {
   serviceId: number
   metricName: string
+  /** Charted before `metricName` has readings; see `withCpuHistory`. */
+  historyMetric?: string
   range: string
 }
 
-function MetricChart({ serviceId, metricName, range }: MetricChartProps) {
+function MetricChart({
+  serviceId,
+  metricName,
+  historyMetric,
+  range,
+}: MetricChartProps) {
   const refetchInterval = useRefreshInterval()
   const { data, isLoading } = useQuery({
     ...externalServiceMetricsGetRangeOptions({
@@ -672,13 +774,25 @@ function MetricChart({ serviceId, metricName, range }: MetricChartProps) {
     staleTime: 15_000,
     refetchInterval,
   })
+  const { data: historyData, isLoading: historyLoading } = useQuery({
+    ...externalServiceMetricsGetRangeOptions({
+      path: { id: serviceId },
+      query: { metric: historyMetric ?? metricName, range },
+    }),
+    enabled: historyMetric != null,
+    staleTime: 15_000,
+    refetchInterval,
+  })
 
-  const chartData = (data ?? []).map((p) => ({
+  const points = historyMetric
+    ? withCpuHistory(data ?? [], historyData ?? [])
+    : (data ?? [])
+  const chartData = points.map((p) => ({
     time: new Date(p.time).getTime(),
     value: p.value,
   }))
 
-  if (isLoading) {
+  if (isLoading || (historyMetric != null && historyLoading)) {
     return (
       <div className="flex h-full items-center justify-center gap-2 text-sm text-muted-foreground">
         <Loader2 className="size-4 animate-spin text-muted-foreground" />
@@ -725,12 +839,13 @@ function MetricChart({ serviceId, metricName, range }: MetricChartProps) {
           tickLine={false}
           axisLine={false}
           width={
-            metricName.endsWith('_ratio') || metricName.endsWith('_percent')
+            containerCpuAxisWidth(metricName) ??
+            (metricName.endsWith('_ratio') || metricName.endsWith('_percent')
               ? 52
               : metricName.endsWith('_bytes') ||
                   metricName.endsWith('_bytes_total')
                 ? 70
-                : 44
+                : 44)
           }
           {...yAxisTickProps(
             chartData.map((p) => p.value),
@@ -783,7 +898,9 @@ function AddAlertRuleDialog({
   onSuccess,
 }: AddAlertRuleDialogProps) {
   const [name, setName] = useState('')
-  const [metricName, setMetricName] = useState(ALL_METRICS[engine][0] ?? '')
+  // CPU alerts threshold the share of the limit, never cores × 100.
+  const alertMetrics = alertableMetrics(ALL_METRICS[engine])
+  const [metricName, setMetricName] = useState(alertMetrics[0] ?? '')
   const [threshold, setThreshold] = useState('0')
   const [comparator, setComparator] = useState<ServiceAlertComparator>('>')
   const [severity, setSeverity] = useState<Severity>('warning')
@@ -807,7 +924,7 @@ function AddAlertRuleDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>Add Alert Rule</DialogTitle>
+          <DialogTitle>Add alert rule</DialogTitle>
           <DialogDescription>
             Fire an alarm when the chosen metric crosses the threshold.
           </DialogDescription>
@@ -839,7 +956,7 @@ function AddAlertRuleDialog({
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                {ALL_METRICS[engine].map((m) => (
+                {alertMetrics.map((m) => (
                   <SelectItem key={m} value={m}>
                     {labelForMetric(m)}
                   </SelectItem>
@@ -934,7 +1051,7 @@ function AddAlertRuleDialog({
             {create.isPending && (
               <Loader2 className="mr-2 size-4 animate-spin" />
             )}
-            Add Rule
+            Add rule
           </Button>
         </DialogFooter>
       </DialogContent>
@@ -943,7 +1060,8 @@ function AddAlertRuleDialog({
 }
 
 // ---------------------------------------------------------------------------
-// DatabasesSection — per-database breakdown for Postgres services
+// DatabasesSection — per-database breakdown (Postgres databases, MariaDB
+// schemas)
 // ---------------------------------------------------------------------------
 
 // Sentinel for the "All databases" selector option (instance-wide aggregate).
@@ -951,35 +1069,75 @@ const ALL_DATABASES = '__all__'
 
 type DatabasesSectionProps = {
   serviceId: number
+  /** The engine's per-database metric groups. */
+  groups: MetricGroup[]
   /** Instance-wide aggregate values (from query_latest) for "All databases". */
   aggregateByName: Map<string, number>
 }
 
 /**
- * Per-database Postgres metrics with a database selector.
+ * Per-database metrics with a database selector.
  *
- * A Postgres instance can host many unrelated databases; these metrics
- * (`pg_stat_database` + size) are emitted once per `datname`. The selector
+ * A Postgres or MariaDB instance can host many unrelated databases; these
+ * metrics (`pg_stat_database` + size, or MariaDB per-schema storage) are
+ * emitted once per database. The selector
  * chooses "All databases" (the instance aggregate) or a single database, and
  * the tile grids re-render for that scope. Kept separate from the global tiles
  * so a per-db sum is never shown unlabelled next to a true instance metric.
  */
 function DatabasesSection({
   serviceId,
+  groups,
   aggregateByName,
 }: DatabasesSectionProps) {
   const refetchInterval = useRefreshInterval()
   const [selected, setSelected] = useState<string>(ALL_DATABASES)
 
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, isError, error, refetch, isFetching } = useQuery({
     ...externalServiceMetricsByDatabaseOptions({ path: { id: serviceId } }),
     refetchInterval,
   })
 
   const databases = data?.databases ?? []
 
-  // Don't render until at least one database has reported per-db metrics.
-  if (!isLoading && databases.length === 0) return null
+  // A request that is still loading, or failed, says nothing about whether
+  // there are databases, so neither may fall through to the "none" case below.
+  if (isLoading) return <Skeleton className="h-40 w-full" />
+  // Failed request: say why, and offer a retry. With earlier data the values
+  // stay on screen under the same notice, so a failed refresh neither hides
+  // the failure nor throws the user's place away.
+  const failure = isError ? (
+    <div className="space-y-2 rounded-lg border border-border p-4">
+      <p className="text-sm text-muted-foreground">
+        {data
+          ? 'Could not refresh per-database metrics'
+          : 'Could not load per-database metrics'}
+        : {metricsErrorText(error)}
+      </p>
+      <Button
+        variant="outline"
+        size="sm"
+        onClick={() => refetch()}
+        disabled={isFetching}
+      >
+        <RefreshCw className="mr-2 size-4" />
+        Retry
+      </Button>
+    </div>
+  ) : null
+  if (isError && !data) {
+    return (
+      <div className="space-y-2">
+        <h2 className="text-[10px] font-semibold uppercase tracking-widest text-muted-foreground">
+          Databases
+        </h2>
+        {failure}
+      </div>
+    )
+  }
+
+  // Nothing to break down until at least one database has reported.
+  if (databases.length === 0) return null
 
   // Resolve the value map for the current selection.
   const valuesForSelection = (): Map<string, number> => {
@@ -1014,7 +1172,9 @@ function DatabasesSection({
         </Select>
       </div>
 
-      {PG_PER_DATABASE_GROUPS.map((group) => (
+      {failure}
+
+      {groups.map((group) => (
         <div key={group.title}>
           <div className="mb-2">
             <h3 className="text-[10px] font-medium uppercase tracking-widest text-muted-foreground">
@@ -1026,9 +1186,11 @@ function DatabasesSection({
               <MetricTile
                 key={name}
                 name={name}
-                value={values.get(name)}
+                value={metricTileValue(name, (m) => values.get(m))}
                 selected={false}
-                onClick={() => {}}
+                scope={
+                  selected === ALL_DATABASES ? 'all' : { database: selected }
+                }
               />
             ))}
           </dl>
@@ -1074,8 +1236,10 @@ function AlertRulesSection({ serviceId, engine }: AlertRulesSectionProps) {
       setRuleToDelete(null)
       invalidate()
     },
-    onError: (err: Error) =>
-      toast.error('Failed to delete rule', { description: err.message }),
+    onError: (err) =>
+      toast.error('Failed to delete rule', {
+        description: getErrorMessage(err),
+      }),
   })
 
   // The backend does not surface a per-rule firing state, so the badge count
@@ -1088,7 +1252,7 @@ function AlertRulesSection({ serviceId, engine }: AlertRulesSectionProps) {
         <div className="mb-3 flex items-center justify-between">
           <div className="flex items-center gap-2">
             <h2 className="text-[10px] font-semibold uppercase tracking-widest text-muted-foreground">
-              Alert Rules
+              Alert rules
             </h2>
             {firingCount > 0 && (
               <Badge variant="destructive" className="text-xs">
@@ -1103,7 +1267,7 @@ function AlertRulesSection({ serviceId, engine }: AlertRulesSectionProps) {
             onClick={() => setAddDialogOpen(true)}
           >
             <Plus className="size-3.5" />
-            Add Rule
+            Add rule
           </Button>
         </div>
 
@@ -1202,7 +1366,7 @@ function AlertRulesSection({ serviceId, engine }: AlertRulesSectionProps) {
       >
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Delete Alert Rule</DialogTitle>
+            <DialogTitle>Delete alert rule</DialogTitle>
             <DialogDescription>
               Delete{' '}
               <span className="font-medium text-foreground">
@@ -1244,24 +1408,34 @@ function AlertRulesSection({ serviceId, engine }: AlertRulesSectionProps) {
 type MonitoringDashboardProps = {
   serviceId: number
   engine: EngineKind
+  /** Raw service type, named in the notice for engines without a collector. */
+  serviceType: string
   latestMetrics: MetricLatest[]
+  /** The service runs as a cluster; see `containerCpuTileText`. */
+  cluster: boolean
 }
 
 function MonitoringDashboard({
   serviceId,
   engine,
+  serviceType,
   latestMetrics,
+  cluster,
 }: MonitoringDashboardProps) {
   const refetchInterval = useRefreshInterval()
   // Container CPU/memory first — resource saturation is the first thing an
   // operator checks — then the engine-specific groups.
   const groups = [RESOURCES_GROUP, ...ENGINE_GROUPS[engine]]
   const heroMetrics = HERO_METRICS[engine]
+  const perDatabaseGroups = PER_DATABASE_GROUPS[engine]
 
   const [selectedMetric, setSelectedMetric] = useState(
     heroMetrics[0] ?? groups[0]?.metrics[0] ?? ''
   )
   const [range, setRange] = useState('1h')
+  // The series behind the selected tile.
+  const chartMetric = containerCpuChartMetric(selectedMetric, cluster)
+  const historyMetric = containerCpuHistoryMetric(selectedMetric, chartMetric)
 
   const latestByName = new Map<string, number>()
   for (const m of latestMetrics) {
@@ -1299,6 +1473,17 @@ function MonitoringDashboard({
         </div>
       )}
 
+      {engine === 'unsupported' && (
+        <div className="rounded-lg border border-dashed border-border bg-card px-4 py-3 text-sm text-muted-foreground">
+          <span className="font-medium text-foreground">
+            {serviceType} metrics are not collected yet.
+          </span>{' '}
+          Connections, queries and storage are only reported for PostgreSQL,
+          MariaDB, Redis, MongoDB and S3/RustFS services. Container CPU and
+          memory are still sampled for this service.
+        </div>
+      )}
+
       {/* Hero stats */}
       <div>
         <div className="mb-2">
@@ -1311,11 +1496,17 @@ function MonitoringDashboard({
             <MetricTile
               key={name}
               name={name}
-              value={latestByName.get(name)}
+              value={metricTileValue(name, (m) => latestByName.get(m))}
+              display={metricTileDisplay(
+                name,
+                (m) => latestByName.get(m),
+                cluster
+              )}
               selected={selectedMetric === name}
               onClick={() => setSelectedMetric(name)}
               alert={firingBySeverity.get(name)}
               size="hero"
+              scope="all"
             />
           ))}
         </dl>
@@ -1326,10 +1517,10 @@ function MonitoringDashboard({
         <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border px-4 py-3">
           <div className="min-w-0">
             <p className="truncate text-sm font-medium text-foreground">
-              {labelForMetric(selectedMetric)}
+              {labelForMetric(chartMetric)}
             </p>
             <p className="mt-0.5 truncate font-mono text-xs text-muted-foreground">
-              {selectedMetric}
+              {chartMetric}
             </p>
           </div>
           <div className="flex shrink-0 gap-1">
@@ -1349,7 +1540,8 @@ function MonitoringDashboard({
         <div className="h-56 px-2 py-4 overflow-visible">
           <MetricChart
             serviceId={serviceId}
-            metricName={selectedMetric}
+            metricName={chartMetric}
+            historyMetric={historyMetric}
             range={range}
           />
         </div>
@@ -1368,7 +1560,12 @@ function MonitoringDashboard({
               <MetricTile
                 key={name}
                 name={name}
-                value={latestByName.get(name)}
+                value={metricTileValue(name, (m) => latestByName.get(m))}
+                display={metricTileDisplay(
+                  name,
+                  (m) => latestByName.get(m),
+                  cluster
+                )}
                 selected={selectedMetric === name}
                 onClick={() => setSelectedMetric(name)}
                 alert={firingBySeverity.get(name)}
@@ -1378,10 +1575,11 @@ function MonitoringDashboard({
         </div>
       ))}
 
-      {/* Per-database breakdown (Postgres) */}
-      {engine === 'postgres' && (
+      {/* Per-database breakdown (Postgres databases, MariaDB schemas) */}
+      {perDatabaseGroups && (
         <DatabasesSection
           serviceId={serviceId}
+          groups={perDatabaseGroups}
           aggregateByName={latestByName}
         />
       )}
@@ -1417,7 +1615,7 @@ export function ServiceMonitoring() {
     enabled: !!serviceId,
   })
 
-  const engine = normalizeEngine(
+  const engine = serviceMetricsEngine(
     serviceData?.service?.service_type ?? '',
     serviceData?.current_parameters?.docker_image
   )
@@ -1460,6 +1658,14 @@ export function ServiceMonitoring() {
     metricsError != null && isMonitoringUnavailable(metricsError)
 
   const serviceName = serviceData?.service?.name ?? 'Service'
+  const { setBreadcrumbs } = useBreadcrumbs()
+  useEffect(() => {
+    setBreadcrumbs([
+      { label: 'Databases', href: '/storage' },
+      { label: serviceName, href: `/storage/${id}` },
+      { label: 'Monitoring' },
+    ])
+  }, [setBreadcrumbs, serviceName, id])
 
   // Freshness status — cheap O(1) lookup of when metrics were last received.
   const { data: statusData } = useQuery({
@@ -1488,79 +1694,55 @@ export function ServiceMonitoring() {
       <div className="flex-1 overflow-auto">
         <div className="p-4 space-y-6 md:p-6">
           {/* Page header */}
-          <div className="flex items-start justify-between gap-4">
-            <div className="min-w-0">
-              {/* Breadcrumb */}
-              <div className="flex min-w-0 items-center gap-1.5 mb-1">
-                <button
-                  aria-label="Back"
-                  type="button"
-                  onClick={() => navigate(`/storage/${id}`)}
-                  className="text-muted-foreground hover:text-foreground transition-colors"
-                >
-                  <ArrowLeft className="size-3.5" />
-                </button>
-                <span className="text-muted-foreground text-xs">/</span>
-                <button
-                  type="button"
-                  onClick={() => navigate(`/storage/${id}`)}
-                  className="truncate text-xs text-muted-foreground hover:text-foreground transition-colors"
-                >
-                  {serviceName}
-                </button>
-                <span className="text-muted-foreground text-xs">/</span>
-                <span className="text-xs text-muted-foreground">
-                  Monitoring
-                </span>
-              </div>
-              {/* Page title */}
-              <h1 className="text-xl font-semibold text-foreground truncate">
-                {serviceName}
-              </h1>
-              <p className="text-sm text-muted-foreground mt-0.5">
+          <PageHeader
+            title={<span className="break-all">{serviceName}</span>}
+            description={
+              <>
                 Real-time metrics and performance monitoring
                 {freshnessSummary && <span> · {freshnessSummary}</span>}
-              </p>
-            </div>
-            <div className="flex shrink-0 items-center gap-2">
-              {/* Auto-refresh interval */}
-              <Select
-                value={refreshMs === null ? 'off' : String(refreshMs)}
-                onValueChange={(v) => {
-                  const next = v === 'off' ? null : parseInt(v, 10)
-                  setRefreshMs(next)
-                  storeRefreshInterval(next)
-                }}
-              >
-                <SelectTrigger className="h-8 w-[88px] gap-1.5 text-xs">
-                  <RefreshCw className="size-3.5 shrink-0 text-muted-foreground" />
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {REFRESH_OPTIONS.map((opt) => (
-                    <SelectItem
-                      key={opt.label}
-                      value={opt.value === null ? 'off' : String(opt.value)}
-                    >
-                      {opt.label}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-              <Button
-                variant="outline"
-                size="sm"
-                className="gap-1.5"
-                onClick={handleRefresh}
-                disabled={isFetching}
-              >
-                <RefreshCw
-                  className={`size-3.5 ${isFetching ? 'animate-spin' : ''}`}
-                />
-                <span>Refresh</span>
-              </Button>
-            </div>
-          </div>
+              </>
+            }
+            actions={
+              <>
+                {/* Auto-refresh interval */}
+                <Select
+                  value={refreshMs === null ? 'off' : String(refreshMs)}
+                  onValueChange={(v) => {
+                    const next = v === 'off' ? null : parseInt(v, 10)
+                    setRefreshMs(next)
+                    storeRefreshInterval(next)
+                  }}
+                >
+                  <SelectTrigger className="h-8 w-[88px] gap-1.5 text-xs">
+                    <RefreshCw className="size-3.5 shrink-0 text-muted-foreground" />
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {REFRESH_OPTIONS.map((opt) => (
+                      <SelectItem
+                        key={opt.label}
+                        value={opt.value === null ? 'off' : String(opt.value)}
+                      >
+                        {opt.label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="gap-1.5"
+                  onClick={handleRefresh}
+                  disabled={isFetching}
+                >
+                  <RefreshCw
+                    className={`size-3.5 ${isFetching ? 'animate-spin' : ''}`}
+                  />
+                  <span>Refresh</span>
+                </Button>
+              </>
+            }
+          />
 
           {/* Body */}
           {serviceLoading || metricsLoading ? (
@@ -1606,7 +1788,9 @@ export function ServiceMonitoring() {
             <MonitoringDashboard
               serviceId={serviceId}
               engine={engine}
+              serviceType={serviceData?.service?.service_type ?? ''}
               latestMetrics={latestMetrics}
+              cluster={serviceData?.service?.topology === 'cluster'}
             />
           )}
         </div>

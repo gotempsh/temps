@@ -57,6 +57,7 @@ import { useState } from 'react'
 import { ReadFailure } from '@/components/ui/read-failure'
 import {
   NODE_ALERT_METRIC_LABELS,
+  canDeleteNodeRule,
   canDeleteNodeRules,
   metricsWithoutRule,
   missingRecommendedAlerts,
@@ -125,6 +126,8 @@ type RuleRowProps = {
   onToggle: (rule: ServiceAlertRuleResponse, enabled: boolean) => void
   /** Present only where deleting sticks (workers); the control plane re-seeds. */
   onDelete?: (rule: ServiceAlertRuleResponse) => void
+  /** A default rule in a table that has a delete column: disable, not delete. */
+  deleteProtected?: boolean
   isSaving: boolean
 }
 
@@ -133,6 +136,7 @@ function RuleRow({
   onThresholdSave,
   onToggle,
   onDelete,
+  deleteProtected = false,
   isSaving,
 }: RuleRowProps) {
   // `null` means "not being edited" — the cell shows the server value. Any
@@ -217,7 +221,14 @@ function RuleRow({
           aria-label={`${rule.enabled ? 'Disable' : 'Enable'} ${rule.name}`}
         />
       </TableCell>
-      {onDelete && (
+      {onDelete && deleteProtected && (
+        <TableCell className="align-top">
+          <span className="sr-only">
+            Default rule: turn it off instead of deleting it
+          </span>
+        </TableCell>
+      )}
+      {onDelete && !deleteProtected && (
         <TableCell className="align-top">
           <Button
             size="icon"
@@ -460,6 +471,9 @@ export function NodeAlertRules({
                     onThresholdSave={handleThresholdSave}
                     onToggle={handleToggle}
                     onDelete={deletable ? setDeleteTarget : undefined}
+                    deleteProtected={
+                      !canDeleteNodeRule(nodeId, rule.metric_name)
+                    }
                     isSaving={updateMutation.isPending}
                   />
                 ))}

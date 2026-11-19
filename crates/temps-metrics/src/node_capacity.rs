@@ -6,7 +6,7 @@
 //! The control plane samples itself with [`crate::NodeMetricsCollector`] and
 //! stores the result under `node_id = 0`. Workers cannot be sampled from here,
 //! but every heartbeat already carries a `capacity` JSON (built by the agent's
-//! `CapacitySampler` in `temps-agent`). Converting that
+//! `CapacitySampler` in `temps-node-agent`). Converting that
 //! snapshot into the *same metric names* the control plane uses means the
 //! existing `/nodes/{id}/metrics*` endpoints, the monitoring page and the
 //! alert evaluator work for a worker with no further changes, and it works
@@ -22,6 +22,20 @@ use tokio::sync::Semaphore;
 use tracing::warn;
 
 use crate::store::{MetricKind, MetricPoint, MetricsStore, SourceKind};
+
+/// The series a heartbeat writes. A worker's metrics report
+/// ([`crate::worker_report`]) carries the same host gauges, and the control
+/// plane keeps only the heartbeat's copy, so each series has one writer and
+/// agents older than the report still fill it.
+pub const CAPACITY_METRIC_NAMES: &[&str] = &[
+    "node.cpu_percent",
+    "node.memory_used_bytes",
+    "node.memory_total_bytes",
+    "node.memory_percent",
+    "node.disk_used_bytes",
+    "node.disk_total_bytes",
+    "node.disk_percent",
+];
 
 /// Build the gauge points for one heartbeat.
 ///
@@ -97,7 +111,20 @@ pub async fn record_capacity(
     capacity: &serde_json::Value,
     time: DateTime<Utc>,
 ) -> usize {
-    let points = capacity_to_points(node_id, capacity, time);
+    record_heartbeat(store, node_id, capacity, Vec::new(), time).await
+}
+
+/// [`record_capacity`] plus `extra` points from the same heartbeat (its disk
+/// health, say), written in the same batch.
+async fn record_heartbeat(
+    store: &dyn MetricsStore,
+    node_id: i32,
+    capacity: &serde_json::Value,
+    extra: Vec<MetricPoint>,
+    time: DateTime<Utc>,
+) -> usize {
+    let mut points = capacity_to_points(node_id, capacity, time);
+    points.extend(extra);
     let count = points.len();
     if count == 0 {
         return 0;
@@ -164,6 +191,25 @@ pub fn spawn_record_capacity(
     spawn_record_capacity_with(write_limit().clone(), store, node_id, capacity)
 }
 
+/// [`spawn_record_capacity`] with `extra` points from the same heartbeat
+/// (the worker's disk health) stored in the same write, under the same cap
+/// and deadline, so they never cost the heartbeat a second store round trip.
+pub fn spawn_record_heartbeat(
+    store: Arc<dyn MetricsStore>,
+    node_id: i32,
+    capacity: serde_json::Value,
+    extra: Vec<MetricPoint>,
+) -> bool {
+    spawn_record_bounded(
+        write_limit().clone(),
+        CAPACITY_WRITE_TIMEOUT,
+        store,
+        node_id,
+        capacity,
+        extra,
+    )
+}
+
 fn spawn_record_capacity_with(
     limit: Arc<Semaphore>,
     store: Arc<dyn MetricsStore>,
@@ -179,6 +225,17 @@ fn spawn_record_capacity_bounded(
     store: Arc<dyn MetricsStore>,
     node_id: i32,
     capacity: serde_json::Value,
+) -> bool {
+    spawn_record_bounded(limit, deadline, store, node_id, capacity, Vec::new())
+}
+
+fn spawn_record_bounded(
+    limit: Arc<Semaphore>,
+    deadline: Duration,
+    store: Arc<dyn MetricsStore>,
+    node_id: i32,
+    capacity: serde_json::Value,
+    extra: Vec<MetricPoint>,
 ) -> bool {
     let Ok(permit) = limit.try_acquire_owned() else {
         let skipped = SKIPPED_CAPACITY_WRITES.fetch_add(1, Ordering::Relaxed) + 1;
@@ -197,7 +254,7 @@ fn spawn_record_capacity_bounded(
         // Held for the whole write; released when the task ends, including
         // when the deadline abandons a write the store never completes.
         let _permit = permit;
-        let write = record_capacity(store.as_ref(), node_id, &capacity, Utc::now());
+        let write = record_heartbeat(store.as_ref(), node_id, &capacity, extra, Utc::now());
         if tokio::time::timeout(deadline, write).await.is_err() {
             warn!(
                 node_id,
@@ -265,6 +322,8 @@ mod tests {
                 "node.disk_percent",
             ]
         );
+        // The list the worker report defers to is exactly what is written.
+        assert_eq!(names(&points), CAPACITY_METRIC_NAMES);
         assert_eq!(value(&points, "node.cpu_percent"), 42.5);
         assert_eq!(value(&points, "node.memory_percent"), 25.0);
         assert_eq!(value(&points, "node.disk_percent"), 25.0);
@@ -412,6 +471,33 @@ mod tests {
             failing,
             gate: None,
         }
+    }
+
+    #[tokio::test]
+    async fn heartbeat_extra_points_share_the_capacity_write() {
+        let store = spy(false);
+        let mut extra = capacity_to_points(9, &json!({ "cpu_percent": 1.0 }), Utc::now());
+        extra[0].name = "node.raid_degraded".to_string();
+        let written = record_heartbeat(
+            &store,
+            9,
+            &json!({ "cpu_percent": 5.0 }),
+            extra.clone(),
+            Utc::now(),
+        )
+        .await;
+        assert_eq!(written, 2, "capacity and disk health in one batch");
+        assert_eq!(
+            names(&store.written.lock().expect("spy store mutex")),
+            vec!["node.cpu_percent", "node.raid_degraded"]
+        );
+
+        // A heartbeat without usable capacity still stores its extra points.
+        let store = spy(false);
+        assert_eq!(
+            record_heartbeat(&store, 9, &json!({}), extra, Utc::now()).await,
+            1
+        );
     }
 
     #[tokio::test]

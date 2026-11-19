@@ -1,0 +1,863 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+import { SettingsLoadFailure } from '@/components/settings/SettingsLoadFailure'
+import { isForbiddenRead } from '@/lib/read-failure'
+import { useState } from 'react'
+import { useQuery } from '@tanstack/react-query'
+import { toast } from 'sonner'
+import {
+  AlertTriangle,
+  Bot,
+  CheckCircle2,
+  Cpu,
+  Loader2,
+  RefreshCw,
+  XCircle,
+} from 'lucide-react'
+
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from '@/components/ui/card'
+import { Alert, AlertDescription } from '@/components/ui/alert'
+import { Button } from '@/components/ui/button'
+import { SaveRow } from '@temps-sdk/ds'
+import { Input } from '@/components/ui/input'
+import { NumberInput } from '@/components/ui/number-input'
+import { Label } from '@/components/ui/label'
+import { Textarea } from '@/components/ui/textarea'
+import {
+  formatConfigRepoAllowlist,
+  configRepoAllowlistProblem,
+  invalidConfigRepoEntries,
+  parseConfigRepoAllowlist,
+} from './config-repo-allowlist'
+import { useSettingsPage, useUpdateSettings } from '@/hooks/useSettings'
+import {
+  CPU_LIMIT_RANGE,
+  MEMORY_LIMIT_RANGE,
+  SANDBOX_API_LIMIT_FIELDS,
+  WORKSPACE_FILE_LIMIT_FIELDS,
+  validateSandboxApiLimits,
+  validateSandboxLimits,
+  type SandboxApiLimitsDraft,
+  type WorkspaceFileLimitsDraft,
+} from './sandbox-limits'
+import { SandboxNodesCard } from '@/components/sandboxes/SandboxNodesCard'
+import {
+  MicrosandboxBackendOption,
+  type MicrosandboxCapability,
+} from '@/components/sandboxes/MicrosandboxBackendOption'
+import {
+  TerminalSupportNote,
+  type TerminalCapability,
+} from '@/components/sandboxes/TerminalSupportNote'
+
+interface SandboxStatus {
+  docker_available: boolean
+  image_ready: boolean
+  image_name: string
+  error: string | null
+  firecracker_available: boolean
+  firecracker_terminal: TerminalCapability
+  microsandbox: MicrosandboxCapability
+}
+
+const RUNTIME_PRESETS = [
+  {
+    value: 'node',
+    label: 'Node.js',
+    description: 'Node.js 20, npm, npx',
+    stacks: 'Next.js, Vite, Express, any JS/TS',
+  },
+  {
+    value: 'bun',
+    label: 'Bun',
+    description: 'Bun runtime',
+    stacks: 'Bun-based projects',
+  },
+  {
+    value: 'python',
+    label: 'Python',
+    description: 'Python 3.12, pip, uv',
+    stacks: 'Django, FastAPI, Flask',
+  },
+  {
+    value: 'rust',
+    label: 'Rust',
+    description: 'Rust stable, cargo',
+    stacks: 'Rust projects',
+  },
+  { value: 'go', label: 'Go', description: 'Go 1.23', stacks: 'Go projects' },
+  {
+    value: 'full',
+    label: 'Full',
+    description: 'Node, Python, Go, uv',
+    stacks: 'Multi-language projects',
+  },
+  {
+    value: 'custom',
+    label: 'Custom image',
+    description: 'Your own Docker image',
+    stacks: 'Any stack you pre-build',
+  },
+]
+
+const RESOURCE_PRESETS = [
+  { label: 'Light', cpu: 2, memory: 4096 },
+  { label: 'Standard', cpu: 4, memory: 8192 },
+  { label: 'Heavy', cpu: 8, memory: 16384 },
+  { label: 'Custom', cpu: 0, memory: 0 },
+]
+
+const DEFAULT_WORKSPACE_FILE_LIMITS: WorkspaceFileLimitsDraft = {
+  max_files_per_upload: 32,
+  max_file_size_mb: 16,
+  max_upload_size_mb: 32,
+  max_workspace_size_mb: 256,
+  max_workspace_entries: 5_000,
+  max_text_preview_kb: 256,
+  max_image_preview_size_mb: 8,
+  max_download_size_mb: 32,
+}
+
+const NO_API_LIMITS: SandboxApiLimitsDraft = {
+  max_cpu_limit: undefined,
+  max_memory_limit_mb: undefined,
+  max_pids_limit: undefined,
+  max_sandboxes_per_user: undefined,
+}
+
+function getResourcePresetLabel(cpu: number, memory: number): string {
+  const match = RESOURCE_PRESETS.find(
+    (p) => p.cpu === cpu && p.memory === memory
+  )
+  return match ? match.label : 'Custom'
+}
+
+export function SandboxRuntimeSettings() {
+  const { data: settings, isLoading, error, refetch } = useSettingsPage()
+  const updateSettings = useUpdateSettings()
+
+  const [runtime, setRuntime] = useState('node')
+  const [customImage, setCustomImage] = useState('')
+  const [cpuLimit, setCpuLimit] = useState<number | undefined>(4)
+  const [memoryLimitMb, setMemoryLimitMb] = useState<number | undefined>(8192)
+  const [resourcePreset, setResourcePreset] = useState('Standard')
+  const [globalConfigRepo, setGlobalConfigRepo] = useState('')
+  const [globalConfigRepoBranch, setGlobalConfigRepoBranch] = useState('main')
+  const [configRepoAllowlist, setConfigRepoAllowlist] = useState('')
+  const [defaultProvider, setDefaultProvider] = useState('claude_cli')
+  const [sandboxBackend, setSandboxBackend] = useState('docker')
+  const [workspaceFileLimits, setWorkspaceFileLimits] =
+    useState<WorkspaceFileLimitsDraft>(DEFAULT_WORKSPACE_FILE_LIMITS)
+  const [apiLimits, setApiLimits] =
+    useState<SandboxApiLimitsDraft>(NO_API_LIMITS)
+  const [isDirty, setIsDirty] = useState(false)
+
+  const [rebuilding, setRebuilding] = useState(false)
+  const [buildLog, setBuildLog] = useState<string[]>([])
+  // Starts empty so the first settings value hydrates the form, including
+  // one already in the shared query cache on mount. Starting from `settings`
+  // skipped that, and the next save sent the empty defaults back.
+  const [loadedSettings, setLoadedSettings] = useState<
+    typeof settings | undefined
+  >(undefined)
+
+  const {
+    data: sandboxStatus = null,
+    isFetching: statusLoading,
+    refetch: fetchSandboxStatus,
+  } = useQuery({
+    queryKey: ['sandbox-status'],
+    queryFn: async (): Promise<SandboxStatus | null> => {
+      // TODO(sdk-regen): migrate once /settings/sandbox-status endpoint is
+      // added to the generated SDK.
+      const r = await fetch('/api/settings/sandbox-status')
+      return r.ok ? ((await r.json()) as SandboxStatus) : null
+    },
+    retry: false,
+  })
+
+  if (settings !== loadedSettings) {
+    setLoadedSettings(settings)
+    if (settings?.agent_sandbox) {
+      const s = settings.agent_sandbox
+      setDefaultProvider(s.default_provider || 'claude_cli')
+      setRuntime(s.runtime || 'node')
+      setCustomImage(s.custom_image || '')
+      setCpuLimit(s.cpu_limit)
+      setMemoryLimitMb(s.memory_limit_mb)
+      setResourcePreset(getResourcePresetLabel(s.cpu_limit, s.memory_limit_mb))
+      setSandboxBackend(s.sandbox_backend || 'docker')
+      setApiLimits({
+        max_cpu_limit: s.max_cpu_limit ?? undefined,
+        max_memory_limit_mb: s.max_memory_limit_mb ?? undefined,
+        max_pids_limit: s.max_pids_limit ?? undefined,
+        max_sandboxes_per_user: s.max_sandboxes_per_user ?? undefined,
+      })
+    }
+    if (settings?.ai_config) {
+      setGlobalConfigRepo(settings.ai_config.config_repo || '')
+      setGlobalConfigRepoBranch(settings.ai_config.config_repo_branch || 'main')
+      setConfigRepoAllowlist(
+        formatConfigRepoAllowlist(settings.ai_config.config_repo_allowlist)
+      )
+    }
+    if (settings?.ai_workspace_file_limits) {
+      setWorkspaceFileLimits({
+        ...DEFAULT_WORKSPACE_FILE_LIMITS,
+        ...settings.ai_workspace_file_limits,
+      })
+    }
+  }
+
+  const handleRebuildImage = async () => {
+    setRebuilding(true)
+    setBuildLog([])
+    try {
+      // TODO(sdk-regen): migrate once /settings/sandbox-rebuild (streaming SSE)
+      // endpoint is added to the generated SDK.
+      const response = await fetch('/api/settings/sandbox-rebuild', {
+        method: 'POST',
+      })
+      if (!response.ok || !response.body) {
+        toast.error('Failed to start image rebuild')
+        setRebuilding(false)
+        return
+      }
+      const reader = response.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split('\n')
+        buffer = lines.pop() || ''
+        for (const line of lines) {
+          if (line.startsWith('data:')) {
+            const data = line.slice(5).trim()
+            if (!data) continue
+            try {
+              const parsed = JSON.parse(data)
+              if (parsed.type === 'done') {
+                if (parsed.success)
+                  toast.success(`Image rebuilt: ${parsed.image_name}`)
+                else toast.error(parsed.error || 'Build failed')
+                continue
+              }
+            } catch {
+              // not JSON — treat as a log line
+            }
+            setBuildLog((prev) => [...prev, data])
+          }
+        }
+      }
+      await fetchSandboxStatus()
+    } catch {
+      toast.error('Failed to rebuild image')
+    } finally {
+      setRebuilding(false)
+    }
+  }
+
+  const handleResourcePresetChange = (preset: string) => {
+    setResourcePreset(preset)
+    const p = RESOURCE_PRESETS.find((r) => r.label === preset)
+    if (p && p.cpu > 0) {
+      setCpuLimit(p.cpu)
+      setMemoryLimitMb(p.memory)
+    }
+    setIsDirty(true)
+  }
+
+  const handleSave = async () => {
+    // The boxes may be empty while editing; check them here and say which
+    // one is wrong rather than rewriting what the user typed.
+    const limits = validateSandboxLimits({
+      cpuLimit,
+      memoryLimitMb,
+      workspaceFileLimits,
+    })
+    if (!limits.ok) {
+      toast.error(limits.message)
+      return
+    }
+    const apiLimitValues = validateSandboxApiLimits(apiLimits)
+    if (!apiLimitValues.ok) {
+      toast.error(apiLimitValues.message)
+      return
+    }
+    // An entry the server would never match is a typo, not a choice: hold
+    // the save until it is fixed rather than storing it.
+    const allowlistProblem = configRepoAllowlistProblem(configRepoAllowlist)
+    if (allowlistProblem) {
+      toast.error(allowlistProblem)
+      return
+    }
+    try {
+      // Per-provider harness credentials are no longer edited in the console
+      // but are still stored — this mutation only touches platform-wide
+      // sandbox knobs. We pass
+      // through default_provider so we don't accidentally clobber it on
+      // save (it's also editable from the providers list).
+      await updateSettings.mutateAsync({
+        agent_sandbox: {
+          // Carry forward fields we don't edit on this page (providers map,
+          // legacy auth_type / api_key_encrypted) so a save here doesn't wipe
+          // stored per-provider credentials.
+          ...settings?.agent_sandbox,
+          default_provider: defaultProvider,
+          enabled: true,
+          runtime,
+          custom_image: customImage,
+          cpu_limit: limits.cpuLimit,
+          memory_limit_mb: limits.memoryLimitMb,
+          network_mode: settings?.agent_sandbox?.network_mode ?? 'full',
+          api_key_saved: settings?.agent_sandbox?.api_key_saved ?? false,
+          auth_type: settings?.agent_sandbox?.auth_type ?? '',
+          providers: settings?.agent_sandbox?.providers ?? {},
+          sandbox_backend: sandboxBackend,
+          ...apiLimitValues.limits,
+        },
+        ai_config: {
+          ...(settings?.ai_config ?? {}),
+          config_repo: globalConfigRepo,
+          config_repo_branch: globalConfigRepoBranch,
+          config_repo_allowlist: parseConfigRepoAllowlist(configRepoAllowlist),
+        },
+        ai_workspace_file_limits: limits.workspaceFileLimits,
+      })
+      setIsDirty(false)
+      toast.success('Sandbox settings saved')
+    } catch {
+      // useUpdateSettings already toasts this failure, with the server's reason.
+    }
+  }
+
+  if (isLoading) {
+    return (
+      <div className="flex justify-center py-12">
+        <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
+      </div>
+    )
+  }
+
+  if (error) {
+    return (
+      <SettingsLoadFailure
+        error={error}
+        onRetry={isForbiddenRead(error) ? undefined : () => void refetch()}
+      />
+    )
+  }
+
+  return (
+    <>
+      <div className="space-y-6">
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <Bot className="h-5 w-5" />
+              Sandbox runtime
+            </CardTitle>
+            <CardDescription>
+              Sandboxes and autofix runs execute inside isolated containers.
+              Code changes are contained and can&apos;t affect your server.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-6">
+            <div className="rounded-lg border p-4 space-y-3">
+              <div className="flex items-center justify-between">
+                <h4 className="text-sm font-medium">Docker status</h4>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => void fetchSandboxStatus()}
+                  disabled={statusLoading}
+                  aria-label="Refresh Docker status"
+                >
+                  {statusLoading ? (
+                    <Loader2
+                      className="h-3.5 w-3.5 animate-spin"
+                      aria-hidden="true"
+                    />
+                  ) : (
+                    <RefreshCw className="h-3.5 w-3.5" aria-hidden="true" />
+                  )}
+                </Button>
+              </div>
+              {sandboxStatus ? (
+                <div className="space-y-2">
+                  <div className="flex items-center gap-2 text-sm">
+                    {sandboxStatus.docker_available ? (
+                      <CheckCircle2 className="h-4 w-4 text-green-500" />
+                    ) : (
+                      <XCircle className="h-4 w-4 text-red-500" />
+                    )}
+                    <span>
+                      Docker:{' '}
+                      {sandboxStatus.docker_available
+                        ? 'connected'
+                        : 'not available'}
+                    </span>
+                  </div>
+                  {sandboxStatus.docker_available && (
+                    <div className="flex items-center gap-2 text-sm">
+                      {sandboxStatus.image_ready ? (
+                        <CheckCircle2 className="h-4 w-4 text-green-500" />
+                      ) : (
+                        <XCircle className="h-4 w-4 text-amber-500" />
+                      )}
+                      <span>
+                        Image:{' '}
+                        {sandboxStatus.image_ready
+                          ? sandboxStatus.image_name
+                          : 'not built (will build automatically on first run)'}
+                      </span>
+                    </div>
+                  )}
+                  {sandboxStatus.error && (
+                    <p className="text-xs text-red-700 dark:text-red-400 mt-1">
+                      {sandboxStatus.error}
+                    </p>
+                  )}
+                  {sandboxStatus.docker_available && (
+                    <div className="space-y-2 mt-2">
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={handleRebuildImage}
+                        disabled={rebuilding}
+                      >
+                        {rebuilding ? (
+                          <Loader2 className="h-3.5 w-3.5 animate-spin mr-2" />
+                        ) : (
+                          <RefreshCw className="h-3.5 w-3.5 mr-2" />
+                        )}
+                        {rebuilding ? 'Rebuilding...' : 'Rebuild Image'}
+                      </Button>
+                      {buildLog.length > 0 && (
+                        <div
+                          tabIndex={0}
+                          className="max-h-60 overflow-y-auto rounded border bg-black/80 p-3 font-mono text-xs text-green-400 space-y-0.5"
+                        >
+                          {buildLog.map((line, i) => (
+                            <div key={i}>{line}</div>
+                          ))}
+                          {rebuilding && (
+                            <div className="animate-pulse text-green-300">
+                              ...
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              ) : statusLoading ? (
+                <p className="text-sm text-muted-foreground">Checking...</p>
+              ) : null}
+            </div>
+
+            <Alert>
+              <AlertTriangle className="h-4 w-4" />
+              <AlertDescription>
+                Sandboxes always run in an isolated container — there is no
+                host-execution mode. Docker must be available for any sandbox to
+                start.
+              </AlertDescription>
+            </Alert>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-base">Workspace file limits</CardTitle>
+            <CardDescription>
+              Bound uploads, downloads, and previews handled by the Temps
+              control plane. Existing persistent files are not removed when
+              these limits change.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
+            {WORKSPACE_FILE_LIMIT_FIELDS.map(([key, label, min, max]) => (
+              <div className="space-y-2" key={key}>
+                <Label htmlFor={`workspace-limit-${key}`}>{label}</Label>
+                <NumberInput
+                  id={`workspace-limit-${key}`}
+                  max={max}
+                  min={min}
+                  inputMode="numeric"
+                  onValueChange={(value) => {
+                    setWorkspaceFileLimits((current) => ({
+                      ...current,
+                      [key]: value,
+                    }))
+                    setIsDirty(true)
+                  }}
+                  value={workspaceFileLimits[key]}
+                />
+              </div>
+            ))}
+            <p className="text-xs text-muted-foreground sm:col-span-2 lg:col-span-4">
+              A file must fit both the per-file and upload-batch limit. Raster
+              image previews support PNG, JPEG, GIF, and WebP; SVG remains a
+              downloadable file and is never rendered inline.
+            </p>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-base">Sandbox API limits</CardTitle>
+            <CardDescription>
+              Ceilings for sandboxes created through the API or SDK, whatever
+              the caller asks for. The CPU and memory above are only the
+              defaults for requests that leave them out. Leave a box empty for
+              the built-in maximum. For example, with 4096 MB as the memory
+              maximum, a request for 8192 MB is refused with a 400.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
+            {SANDBOX_API_LIMIT_FIELDS.map((field) => (
+              <div className="space-y-2" key={field.key}>
+                <Label htmlFor={`api-limit-${field.key}`}>{field.label}</Label>
+                <NumberInput
+                  id={`api-limit-${field.key}`}
+                  max={field.max}
+                  min={field.min}
+                  inputMode={field.integer ? 'numeric' : 'decimal'}
+                  placeholder={field.empty}
+                  onValueChange={(value) => {
+                    setApiLimits((current) => ({
+                      ...current,
+                      [field.key]: value,
+                    }))
+                    setIsDirty(true)
+                  }}
+                  value={apiLimits[field.key]}
+                />
+              </div>
+            ))}
+            <p className="text-xs text-muted-foreground sm:col-span-2 lg:col-span-4">
+              On the control plane a sandbox also cannot be given more memory
+              than the host has. Sandboxes already created are not changed, and
+              the per-user cap counts a user&apos;s sandboxes that are not
+              destroyed; workspace-owned sandboxes and autofix runs are exempt.
+            </p>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-base">Isolation backend</CardTitle>
+            <CardDescription>
+              Default isolation technology for new sandboxes and autofix runs.
+              Firecracker provides stronger isolation via KVM microVMs;
+              microsandbox is an experimental microVM backend that also runs on
+              Apple Silicon Macs; Docker is the standard default.
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
+              <button
+                onClick={() => {
+                  setSandboxBackend('docker')
+                  setIsDirty(true)
+                }}
+                className={`rounded-lg border p-3 text-left transition-colors ${
+                  sandboxBackend === 'docker'
+                    ? 'border-primary bg-primary/5'
+                    : 'border-border hover:border-primary/50'
+                }`}
+              >
+                <p className="text-sm font-medium">Docker</p>
+                <p className="text-xs text-muted-foreground">
+                  Container-based isolation — available on all hosts with
+                  Docker.
+                </p>
+              </button>
+              <div
+                title={
+                  sandboxStatus && !sandboxStatus.firecracker_available
+                    ? 'Firecracker is not yet available — run `temps firecracker setup` to provision this host'
+                    : undefined
+                }
+              >
+                <button
+                  onClick={() => {
+                    if (!sandboxStatus || sandboxStatus.firecracker_available) {
+                      setSandboxBackend('firecracker')
+                      setIsDirty(true)
+                    }
+                  }}
+                  disabled={
+                    sandboxStatus != null &&
+                    !sandboxStatus.firecracker_available
+                  }
+                  className={`w-full rounded-lg border p-3 text-left transition-colors ${
+                    sandboxBackend === 'firecracker'
+                      ? 'border-primary bg-primary/5'
+                      : 'border-border hover:border-primary/50'
+                  } disabled:opacity-50 disabled:cursor-not-allowed`}
+                >
+                  <p className="text-sm font-medium">Firecracker</p>
+                  <p className="text-xs text-muted-foreground">
+                    {sandboxStatus && !sandboxStatus.firecracker_available
+                      ? 'Not available — run `temps firecracker setup`'
+                      : 'KVM microVM isolation — stronger security boundary.'}
+                  </p>
+                </button>
+                {sandboxStatus?.firecracker_available && (
+                  <div className="mt-2">
+                    <TerminalSupportNote
+                      capability={sandboxStatus.firecracker_terminal}
+                    />
+                  </div>
+                )}
+              </div>
+              <MicrosandboxBackendOption
+                capability={sandboxStatus?.microsandbox}
+                selected={sandboxBackend === 'microsandbox'}
+                onSelect={() => {
+                  setSandboxBackend('microsandbox')
+                  setIsDirty(true)
+                }}
+              />
+            </div>
+          </CardContent>
+        </Card>
+
+        <SandboxNodesCard />
+
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-base">Runtime</CardTitle>
+            <CardDescription>
+              Choose the runtime environment for sandbox containers. Each preset
+              includes the language toolchain, git, and Claude CLI
+              pre-installed.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-2">
+              {RUNTIME_PRESETS.map((preset) => (
+                <button
+                  key={preset.value}
+                  onClick={() => {
+                    setRuntime(preset.value)
+                    setIsDirty(true)
+                  }}
+                  className={`rounded-lg border p-3 text-left transition-colors ${
+                    runtime === preset.value
+                      ? 'border-primary bg-primary/5'
+                      : 'border-border hover:border-primary/50'
+                  }`}
+                >
+                  <p className="text-sm font-medium">{preset.label}</p>
+                  <p className="text-xs text-muted-foreground">
+                    {preset.description}
+                  </p>
+                </button>
+              ))}
+            </div>
+
+            {runtime === 'custom' && (
+              <div className="space-y-2 pt-2">
+                <Label htmlFor="custom-image">Docker image</Label>
+                <Input
+                  id="custom-image"
+                  placeholder="e.g. your-registry/custom-agent:latest"
+                  value={customImage}
+                  onChange={(e) => {
+                    setCustomImage(e.target.value)
+                    setIsDirty(true)
+                  }}
+                />
+                <p className="text-xs text-muted-foreground">
+                  Custom images must have{' '}
+                  <code className="text-xs bg-muted px-1 rounded">git</code> and{' '}
+                  <code className="text-xs bg-muted px-1 rounded">claude</code>{' '}
+                  (Claude CLI) installed. The repository is mounted at{' '}
+                  <code className="text-xs bg-muted px-1 rounded">
+                    /workspace
+                  </code>
+                  .
+                </p>
+              </div>
+            )}
+
+            {runtime !== 'custom' && (
+              <p className="text-xs text-muted-foreground">
+                {RUNTIME_PRESETS.find((p) => p.value === runtime)?.stacks}
+              </p>
+            )}
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2 text-base">
+              <Cpu className="h-4 w-4" />
+              Resources
+            </CardTitle>
+            <CardDescription>
+              CPU and memory limits per sandbox container.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div className="space-y-2">
+              <Label>Preset</Label>
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                {RESOURCE_PRESETS.map((preset) => (
+                  <button
+                    key={preset.label}
+                    onClick={() => handleResourcePresetChange(preset.label)}
+                    className={`rounded-lg border p-3 text-left transition-colors ${
+                      resourcePreset === preset.label
+                        ? 'border-primary bg-primary/5'
+                        : 'border-border hover:border-primary/50'
+                    }`}
+                  >
+                    <p className="text-sm font-medium">{preset.label}</p>
+                    <p className="text-xs text-muted-foreground">
+                      {preset.label === 'Custom'
+                        ? 'Set your own'
+                        : `${preset.cpu} CPU, ${preset.memory >= 1024 ? `${preset.memory / 1024}GB` : `${preset.memory}MB`}`}
+                    </p>
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {resourcePreset === 'Custom' && (
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-2">
+                <div className="space-y-2">
+                  <Label htmlFor="cpu-limit">CPU cores</Label>
+                  <NumberInput
+                    id="cpu-limit"
+                    min={CPU_LIMIT_RANGE.min}
+                    max={CPU_LIMIT_RANGE.max}
+                    step={0.5}
+                    value={cpuLimit}
+                    onValueChange={(value) => {
+                      setCpuLimit(value)
+                      setIsDirty(true)
+                    }}
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="memory-limit">Memory (MB)</Label>
+                  <NumberInput
+                    id="memory-limit"
+                    inputMode="numeric"
+                    min={MEMORY_LIMIT_RANGE.min}
+                    max={MEMORY_LIMIT_RANGE.max}
+                    step={256}
+                    value={memoryLimitMb}
+                    onValueChange={(value) => {
+                      setMemoryLimitMb(value)
+                      setIsDirty(true)
+                    }}
+                  />
+                </div>
+              </div>
+            )}
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-base">
+              Global config repository
+            </CardTitle>
+            <CardDescription>
+              A shared config repository copied into every autofix run. Its{' '}
+              <code className="text-xs bg-muted px-1 rounded">.claude/</code>{' '}
+              directory supplies the coding agent&apos;s settings.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div className="space-y-2">
+              <Label htmlFor="global-config-repo">Repository</Label>
+              <Input
+                id="global-config-repo"
+                placeholder="org/claude-config"
+                value={globalConfigRepo}
+                onChange={(e) => {
+                  setGlobalConfigRepo(e.target.value)
+                  setIsDirty(true)
+                }}
+              />
+              <p className="text-xs text-muted-foreground">
+                GitHub repo path. The repo must be accessible via the
+                service&apos;s git provider connection. Leave empty to disable.
+              </p>
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="config-repo-allowlist">
+                Allowed workflow config repositories
+              </Label>
+              <Textarea
+                id="config-repo-allowlist"
+                rows={3}
+                placeholder={'org/claude-config\nplatform/*'}
+                value={configRepoAllowlist}
+                onChange={(e) => {
+                  setConfigRepoAllowlist(e.target.value)
+                  setIsDirty(true)
+                }}
+              />
+              <p className="text-xs text-muted-foreground">
+                A workflow can name its own config repository in{' '}
+                <code className="text-xs bg-muted px-1 rounded">
+                  .temps.yaml
+                </code>
+                . It is used only when it is the project&apos;s own repository
+                or listed here, one <code>owner/repo</code> (or{' '}
+                <code>owner/*</code>) per line. Any other repository is skipped
+                and the run log says so.
+              </p>
+              {invalidConfigRepoEntries(
+                parseConfigRepoAllowlist(configRepoAllowlist)
+              ).length > 0 && (
+                <p className="text-xs text-destructive" role="alert">
+                  Not a repository name, so it will never match:{' '}
+                  {invalidConfigRepoEntries(
+                    parseConfigRepoAllowlist(configRepoAllowlist)
+                  ).join(', ')}
+                </p>
+              )}
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="global-config-branch">Branch</Label>
+              <Input
+                id="global-config-branch"
+                placeholder="main"
+                value={globalConfigRepoBranch}
+                onChange={(e) => {
+                  setGlobalConfigRepoBranch(e.target.value)
+                  setIsDirty(true)
+                }}
+              />
+            </div>
+          </CardContent>
+        </Card>
+
+        <SaveRow
+          dirty={isDirty}
+          saving={updateSettings.isPending}
+          onSave={handleSave}
+          sticky
+        />
+      </div>
+    </>
+  )
+}

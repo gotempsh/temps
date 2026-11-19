@@ -2,7 +2,12 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { afterEach, expect, test } from 'bun:test'
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import {
+  QueryClient,
+  QueryClientProvider,
+  environmentManager,
+  focusManager,
+} from '@tanstack/react-query'
 import { cleanup, fireEvent, render, waitFor } from '@testing-library/react'
 import { MemoryRouter, Route, Routes } from 'react-router'
 import { installBrowserWindow } from '@/test/dom'
@@ -11,7 +16,26 @@ import { jsonResponse, mockApi } from '@/test/fetch-mock'
 import { CreateSandboxSheet } from './CreateSandboxSheet'
 
 installBrowserWindow()
-afterEach(cleanup)
+// Whether React Query treats this process as a server, as it decided when
+// first imported: restored after a test that needs interval polling.
+const queryRanAsServer = environmentManager.isServer()
+
+afterEach(() => {
+  cleanup()
+  focusManager.setFocused(undefined)
+  environmentManager.setIsServer(() => queryRanAsServer)
+})
+
+/**
+ * Let interval polls run. React Query schedules none when it took the
+ * process for a server, which it does if a server-rendering test imported it
+ * before any test installed a browser window; and none while the window is
+ * unfocused. Both are reset in `afterEach`.
+ */
+function allowIntervalPolling() {
+  environmentManager.setIsServer(() => false)
+  focusManager.setFocused(true)
+}
 
 const PLACEMENT = {
   allowed_node_ids: null,
@@ -89,6 +113,8 @@ test('creating sends only the filled fields and opens the new sandbox', async ()
     lifecycle: 'ephemeral',
     name: 'scratch',
     ports: [3000, 8080],
+    // Lets the sheet poll the create's steps while it waits.
+    creation_id: expect.stringMatching(/^[A-Za-z0-9_-]{8,64}$/),
   })
   api.restore()
 })
@@ -128,8 +154,315 @@ test('a refused create keeps the sheet open and shows the reason', async () => {
 
   await view.findByText(/Node worker-9 is offline/)
   expect(view.queryByText('detail page')).toBeNull()
+  // The server never tracked this create: no step list left loading.
+  await waitFor(() =>
+    expect(
+      view.queryByRole('list', { name: 'Sandbox creation steps' })
+    ).toBeNull()
+  )
   api.restore()
 })
+
+test('a slow create explains the wait and can be closed', async () => {
+  const api = mockApi({
+    'GET /v1/sandboxes/placement': () => jsonResponse(PLACEMENT),
+    // Never answers, like a first create that is still building its image.
+    'POST /v1/sandboxes': () => new Promise<Response>(() => {}),
+  })
+  const view = renderSheet()
+
+  fireEvent.click(await view.findByRole('button', { name: 'Create sandbox' }))
+
+  await view.findByText(/You can close this panel/)
+  // Steps load as skeleton rows until the first poll answers.
+  expect(
+    view
+      .getByRole('list', { name: 'Sandbox creation steps' })
+      .getAttribute('aria-busy')
+  ).toBe('true')
+  // The footer button and the sheet's own close control both stay usable.
+  const closers = view.getAllByRole('button', { name: 'Close' })
+  expect(closers.length).toBeGreaterThan(0)
+  for (const closer of closers) {
+    expect((closer as HTMLButtonElement).disabled).toBe(false)
+  }
+  api.restore()
+})
+
+const CREATION_ID = '00000000-0000-4000-8000-000000000001'
+
+/**
+ * Tests that wait on several real one-second polls: more than Bun's 5 s
+ * default, which a loaded CI runner can exceed.
+ */
+const POLLING_TEST_TIMEOUT_MS = 20_000
+
+/** Makes the sheet's next `creation_id` predictable, so its poll can be mocked. */
+function fixCreationId() {
+  const original = crypto.randomUUID.bind(crypto)
+  crypto.randomUUID = () => CREATION_ID
+  return () => {
+    crypto.randomUUID = original
+  }
+}
+
+function creationStep(
+  kind: string,
+  title: string,
+  status: string,
+  extra: Record<string, unknown> = {}
+) {
+  return {
+    kind,
+    title,
+    status,
+    detail: null,
+    error: null,
+    started_at: status === 'pending' ? null : '2026-01-01T00:00:00Z',
+    finished_at:
+      status === 'done' || status === 'failed' ? '2026-01-01T00:00:02Z' : null,
+    bytes_done: null,
+    bytes_total: null,
+    ...extra,
+  }
+}
+
+test('a running create shows its steps live, with the download progress', async () => {
+  const restoreId = fixCreationId()
+  const api = mockApi({
+    'GET /v1/sandboxes/placement': () => jsonResponse(PLACEMENT),
+    'POST /v1/sandboxes': () => new Promise<Response>(() => {}),
+    [`GET /v1/sandboxes/creations/${CREATION_ID}`]: () =>
+      jsonResponse({
+        creation_id: CREATION_ID,
+        sandbox_id: 'sbx_new1',
+        status: 'running',
+        started_at: '2026-01-01T00:00:00Z',
+        finished_at: null,
+        error: null,
+        steps: [
+          creationStep('check_request', 'Check the request', 'done'),
+          creationStep('pull_image', 'Pull the sandbox image', 'running', {
+            detail: 'downloading',
+            bytes_done: 1_000_000_000,
+            bytes_total: 4_000_000_000,
+          }),
+          creationStep('ready', 'Ready', 'pending'),
+        ],
+      }),
+  })
+  const view = renderSheet()
+
+  fireEvent.click(await view.findByRole('button', { name: 'Create sandbox' }))
+
+  await view.findByText('1.0 GB of 4.0 GB')
+  expect(view.getByText('Check the request')).toBeTruthy()
+  expect(view.getByText('2.0s')).toBeTruthy()
+  api.restore()
+  restoreId()
+})
+
+test('a failed create shows which step failed and why', async () => {
+  const restoreId = fixCreationId()
+  const api = mockApi({
+    'GET /v1/sandboxes/placement': () => jsonResponse(PLACEMENT),
+    'POST /v1/sandboxes': () =>
+      jsonResponse(
+        { title: 'Sandbox Creation Failed', detail: 'pulling image failed' },
+        500
+      ),
+    [`GET /v1/sandboxes/creations/${CREATION_ID}`]: () =>
+      jsonResponse({
+        creation_id: CREATION_ID,
+        sandbox_id: null,
+        status: 'failed',
+        started_at: '2026-01-01T00:00:00Z',
+        finished_at: '2026-01-01T00:00:02Z',
+        error: 'pulling image failed',
+        steps: [
+          creationStep('check_request', 'Check the request', 'done'),
+          creationStep('pull_image', 'Pull the sandbox image', 'failed', {
+            error: "pulling image 'img:1' failed: no space left on device",
+          }),
+          creationStep('ready', 'Ready', 'pending'),
+        ],
+      }),
+  })
+  const view = renderSheet()
+
+  fireEvent.click(await view.findByRole('button', { name: 'Create sandbox' }))
+
+  await view.findByText(/no space left on device/)
+  expect(view.getByText(/Failed at “Pull the sandbox image”/)).toBeTruthy()
+  expect(view.queryByText('detail page')).toBeNull()
+  api.restore()
+  restoreId()
+})
+
+test(
+  'a step read that fails for a moment recovers the failed step once the server answers',
+  async () => {
+    allowIntervalPolling()
+    const restoreId = fixCreationId()
+    let reads = 0
+    const api = mockApi({
+      'GET /v1/sandboxes/placement': () => jsonResponse(PLACEMENT),
+      'POST /v1/sandboxes': () =>
+        jsonResponse(
+          { title: 'Sandbox Creation Failed', detail: 'pulling image failed' },
+          500
+        ),
+      // The first reads hit a server that is briefly unavailable.
+      [`GET /v1/sandboxes/creations/${CREATION_ID}`]: () => {
+        reads += 1
+        if (reads <= 2) {
+          return jsonResponse({ title: 'Service Unavailable' }, 503)
+        }
+        return jsonResponse({
+          creation_id: CREATION_ID,
+          sandbox_id: null,
+          status: 'failed',
+          started_at: '2026-01-01T00:00:00Z',
+          finished_at: '2026-01-01T00:00:02Z',
+          error: 'pulling image failed',
+          steps: [
+            creationStep('pull_image', 'Pull the sandbox image', 'failed', {
+              error: "pulling image 'img:1' failed: no space left on device",
+            }),
+          ],
+        })
+      },
+    })
+    const view = renderSheet()
+
+    fireEvent.click(await view.findByRole('button', { name: 'Create sandbox' }))
+
+    await view.findByText(/no space left on device/, undefined, {
+      timeout: 15_000,
+    })
+    api.restore()
+    restoreId()
+  },
+  POLLING_TEST_TIMEOUT_MS
+)
+
+test(
+  'a 404 read before the server registered the create is read again once the request ends',
+  async () => {
+    allowIntervalPolling()
+    const restoreId = fixCreationId()
+    let reads = 0
+    let refuse: (response: Response) => void = () => {}
+    const api = mockApi({
+      'GET /v1/sandboxes/placement': () => jsonResponse(PLACEMENT),
+      // Fails only after the first read has already come back 404.
+      'POST /v1/sandboxes': () =>
+        new Promise<Response>((resolve) => {
+          refuse = resolve
+        }),
+      // The first read beats the registration; later reads see the failure.
+      [`GET /v1/sandboxes/creations/${CREATION_ID}`]: () => {
+        reads += 1
+        if (reads === 1) return jsonResponse({ title: 'Not Found' }, 404)
+        return jsonResponse({
+          creation_id: CREATION_ID,
+          sandbox_id: null,
+          status: 'failed',
+          started_at: '2026-01-01T00:00:00Z',
+          finished_at: '2026-01-01T00:00:02Z',
+          error: 'pulling image failed',
+          steps: [
+            creationStep('pull_image', 'Pull the sandbox image', 'failed', {
+              error: "pulling image 'img:1' failed: no space left on device",
+            }),
+          ],
+        })
+      },
+    })
+    const view = renderSheet()
+
+    fireEvent.click(await view.findByRole('button', { name: 'Create sandbox' }))
+    await waitFor(() => expect(reads).toBe(1), { timeout: 5_000 })
+    refuse(
+      jsonResponse(
+        { title: 'Sandbox Creation Failed', detail: 'pulling image failed' },
+        500
+      )
+    )
+
+    await view.findByText(/no space left on device/, undefined, {
+      timeout: 15_000,
+    })
+    api.restore()
+    restoreId()
+  },
+  POLLING_TEST_TIMEOUT_MS
+)
+
+test(
+  'steps the server stopped tracking are dropped, not left running',
+  async () => {
+    allowIntervalPolling()
+    const restoreId = fixCreationId()
+    let reads = 0
+    let refuse: (response: Response) => void = () => {}
+    const api = mockApi({
+      'GET /v1/sandboxes/placement': () => jsonResponse(PLACEMENT),
+      // Answers only after the server has lost the create.
+      'POST /v1/sandboxes': () =>
+        new Promise<Response>((resolve) => {
+          refuse = resolve
+        }),
+      // One running answer, then the server restarted and no longer knows it.
+      [`GET /v1/sandboxes/creations/${CREATION_ID}`]: () => {
+        reads += 1
+        if (reads === 1) {
+          return jsonResponse({
+            creation_id: CREATION_ID,
+            sandbox_id: 'sbx_new1',
+            status: 'running',
+            started_at: '2026-01-01T00:00:00Z',
+            finished_at: null,
+            error: null,
+            steps: [
+              creationStep('pull_image', 'Pull the sandbox image', 'running'),
+            ],
+          })
+        }
+        return jsonResponse({ title: 'Not Found' }, 404)
+      },
+    })
+    const view = renderSheet()
+
+    fireEvent.click(await view.findByRole('button', { name: 'Create sandbox' }))
+    await view.findByText('Pull the sandbox image')
+    await waitFor(() => expect(reads).toBeGreaterThanOrEqual(2), {
+      timeout: 15_000,
+    })
+    refuse(
+      jsonResponse(
+        { title: 'Sandbox Creation Failed', detail: 'the server restarted' },
+        503
+      )
+    )
+
+    await view.findByText(/the server restarted/, undefined, { timeout: 5_000 })
+    await waitFor(
+      () =>
+        expect(
+          view.queryByRole('list', { name: 'Sandbox creation steps' })
+        ).toBeNull(),
+      { timeout: 5_000 }
+    )
+    // And it stops asking.
+    const after = reads
+    await new Promise((resolve) => setTimeout(resolve, 1_500))
+    expect(reads).toBe(after)
+    api.restore()
+    restoreId()
+  },
+  POLLING_TEST_TIMEOUT_MS
+)
 
 test('says so, and cannot submit, when sandboxes are unavailable', async () => {
   const api = mockApi({})
@@ -197,5 +530,53 @@ test('creating invalidates every cached page of the sandbox list', async () => {
 
   expect(client.getQueryState(pageOne)?.isInvalidated).toBe(true)
   expect(client.getQueryState(pageTwo)?.isInvalidated).toBe(true)
+  api.restore()
+})
+
+const PLACEMENT_WITH_BACKENDS = {
+  allowed_node_ids: null,
+  nodes: [
+    {
+      ...PLACEMENT.nodes[0],
+      backends: [
+        { backend: 'docker', available: true, reason: null },
+        { backend: 'firecracker', available: true, reason: null },
+        {
+          backend: 'microsandbox',
+          available: false,
+          reason: 'run `temps microsandbox setup` on the server host',
+        },
+      ],
+    },
+  ],
+}
+
+test('offers the backends the node runs and explains the missing ones', async () => {
+  let body: unknown
+  const api = mockApi({
+    'GET /v1/sandboxes/placement': () => jsonResponse(PLACEMENT_WITH_BACKENDS),
+    'POST /v1/sandboxes': async (request) => {
+      body = await request.json()
+      return jsonResponse(CREATED, 201)
+    },
+  })
+  const view = renderSheet()
+
+  // The unavailable backend stays visible, disabled, with the server's fix.
+  await view.findByText(/temps microsandbox setup/)
+  const microsandbox = view.baseElement.querySelector('#backend-microsandbox')
+  expect(microsandbox?.hasAttribute('disabled')).toBe(true)
+
+  const firecracker = view.baseElement.querySelector('#backend-firecracker')
+  expect(firecracker?.hasAttribute('disabled')).toBe(false)
+  fireEvent.click(firecracker as Element)
+  fireEvent.click(view.getByRole('button', { name: 'Create sandbox' }))
+
+  await view.findByText('detail page')
+  expect(body).toEqual({
+    lifecycle: 'ephemeral',
+    backend: 'firecracker',
+    creation_id: expect.any(String),
+  })
   api.restore()
 })

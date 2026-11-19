@@ -165,6 +165,15 @@ impl From<FailureReportError> for Problem {
                      the redacted trace.",
             ),
             FailureReportError::Deployment(deployment_error) => deployment_error.into(),
+            error @ FailureReportError::SecretsUnavailable { .. } => {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Failure Report Secrets Unavailable")
+                    .with_detail(format!(
+                        "{error}. No report was sent, because the text could not be checked for \
+                         those values. Check that this instance still has the encryption key \
+                         this deployment was created with."
+                    ))
+            }
         }
     }
 }

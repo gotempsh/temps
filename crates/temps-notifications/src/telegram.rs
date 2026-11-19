@@ -11,11 +11,11 @@
 //! surfaced verbatim, with a short hint for the common setup mistakes, so a
 //! provider test tells the operator exactly what to fix.
 
+use crate::error::Result;
 use crate::services::{
     html_escape, is_slack_visible_metadata_key, metadata_label, NotificationProvider,
 };
 use crate::types::{Notification, NotificationSeverity};
-use anyhow::Result;
 use async_trait::async_trait;
 use sea_orm::DatabaseConnection;
 use serde::{Deserialize, Deserializer, Serialize};

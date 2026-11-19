@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use anyhow::Result;
 use serde::Serialize;
 use temps_core::{AuditContext, AuditOperation};
 
@@ -115,6 +114,44 @@ pub struct ExternalServiceStatusChangedAudit {
     pub new_status: String,
 }
 
+/// Operator changed a managed service's container log ingestion budget.
+///
+/// Audited because raising or lifting it lets one service fill the log
+/// store; lowering it silently drops that service's lines. Both ends are
+/// recorded (`None` = platform default, `Some(0)` = unlimited).
+#[derive(Debug, Clone, Serialize)]
+pub struct ExternalServiceLogIngestionUpdatedAudit {
+    pub context: AuditContext,
+    pub service_id: i32,
+    pub service_name: String,
+    pub previous_lines_per_sec: Option<i32>,
+    pub previous_kib_per_sec: Option<i32>,
+    pub lines_per_sec: Option<i32>,
+    pub kib_per_sec: Option<i32>,
+}
+
+impl AuditOperation for ExternalServiceLogIngestionUpdatedAudit {
+    fn operation_type(&self) -> String {
+        "EXTERNAL_SERVICE_LOG_INGESTION_UPDATED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
+    }
+}
+
 /// The AI assistant actually read row data from a service.
 ///
 /// The assistant reads data with the user's own permissions, and rows can carry
@@ -176,9 +213,8 @@ impl AuditOperation for AiRowsReadAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -251,9 +287,8 @@ impl AuditOperation for ExternalServiceCreatedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -274,9 +309,113 @@ impl AuditOperation for ContinuousArchiveSourceRepointedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
+    }
+}
+
+/// An administrator moved a database between `legacy`, `shadow` and
+/// `enforce` (ADR-055 Phase 4). `pending_change_fields` names what a
+/// recreate from the spec would change at the time of the move.
+#[derive(Debug, Clone, Serialize)]
+pub struct ExternalServiceWorkloadModeChangedAudit {
+    pub context: AuditContext,
+    pub service_id: i32,
+    pub name: String,
+    pub service_type: String,
+    pub previous_mode: String,
+    pub new_mode: String,
+    pub pending_change_fields: Vec<String>,
+}
+
+impl AuditOperation for ExternalServiceWorkloadModeChangedAudit {
+    fn operation_type(&self) -> String {
+        "EXTERNAL_SERVICE_WORKLOAD_MODE_CHANGED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
+    }
+}
+
+/// A service's server TLS mode changed (ADR 093). Records both modes; the
+/// certificate and its key are never part of the payload.
+#[derive(Debug, Clone, Serialize)]
+pub struct ExternalServiceTlsModeChangedAudit {
+    pub context: AuditContext,
+    pub service_id: i32,
+    pub name: String,
+    pub service_type: String,
+    pub previous_mode: temps_providers_core::externalsvc::server_tls::ServerTlsMode,
+    pub new_mode: temps_providers_core::externalsvc::server_tls::ServerTlsMode,
+}
+
+impl AuditOperation for ExternalServiceTlsModeChangedAudit {
+    fn operation_type(&self) -> String {
+        "EXTERNAL_SERVICE_TLS_MODE_CHANGED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
+    }
+}
+
+/// An administrator confirmed, and Temps performed, the recreate of an
+/// `enforce`-mode database's container from its workload spec.
+#[derive(Debug, Clone, Serialize)]
+pub struct ExternalServiceWorkloadRecreatedAudit {
+    pub context: AuditContext,
+    pub service_id: i32,
+    pub name: String,
+    pub node_id: Option<i32>,
+    pub confirmed_fingerprint: String,
+    pub applied_change_fields: Vec<String>,
+    pub remaining_change_fields: Vec<String>,
+}
+
+impl AuditOperation for ExternalServiceWorkloadRecreatedAudit {
+    fn operation_type(&self) -> String {
+        "EXTERNAL_SERVICE_WORKLOAD_RECREATED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -297,9 +436,8 @@ impl AuditOperation for ExternalServiceUpdatedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -320,9 +458,8 @@ impl AuditOperation for ExternalServiceS3MigratedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -343,9 +480,8 @@ impl AuditOperation for ExternalServiceParameterRevealedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -366,9 +502,8 @@ impl AuditOperation for ExternalServiceEnvironmentVariableRevealedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -389,9 +524,8 @@ impl AuditOperation for ExternalServiceEnvironmentVariablesRevealedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -412,9 +546,8 @@ impl AuditOperation for ExternalServiceRuntimeCredentialsIssuedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -435,9 +568,8 @@ impl AuditOperation for ExternalServiceDeletedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -458,9 +590,8 @@ impl AuditOperation for ExternalServiceStatusChangedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -481,9 +612,8 @@ impl AuditOperation for ExternalServiceProjectLinkedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -504,9 +634,8 @@ impl AuditOperation for ExternalServiceProjectUnlinkedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -527,9 +656,8 @@ impl AuditOperation for ServiceHealthChecked {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -550,9 +678,8 @@ impl AuditOperation for ExternalServiceClusterMemberAddedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -573,9 +700,8 @@ impl AuditOperation for ExternalServiceClusterMemberRemovedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -596,9 +722,8 @@ impl AuditOperation for ExternalServiceClusterMemberPromotedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -698,9 +823,8 @@ macro_rules! impl_node_alert_rule_audit {
                 &self.context.user_agent
             }
 
-            fn serialize(&self) -> Result<String> {
-                serde_json::to_string(self)
-                    .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+            fn serialize(&self) -> temps_core::AuditResult<String> {
+                temps_core::serialize_audit_operation(self)
             }
         }
     };
@@ -708,3 +832,74 @@ macro_rules! impl_node_alert_rule_audit {
 
 impl_node_alert_rule_audit!(NodeAlertRuleCreatedAudit, "NODE_ALERT_RULE_CREATED");
 impl_node_alert_rule_audit!(NodeAlertRuleDeletedAudit, "NODE_ALERT_RULE_DELETED");
+
+macro_rules! healthcheck_audit_operation {
+    ($audit:ty, $operation:literal) => {
+        impl AuditOperation for $audit {
+            fn operation_type(&self) -> String {
+                $operation.to_string()
+            }
+
+            fn user_id(&self) -> Option<i32> {
+                Some(self.context.user_id)
+            }
+
+            fn ip_address(&self) -> Option<String> {
+                self.context.ip_address.clone()
+            }
+
+            fn user_agent(&self) -> &str {
+                &self.context.user_agent
+            }
+
+            fn serialize(&self) -> temps_core::AuditResult<String> {
+                temps_core::serialize_audit_operation(self)
+            }
+        }
+    };
+}
+
+/// Operator changed a managed service's Docker healthcheck overrides. Both
+/// ends are recorded (null = inherit). Nothing running changed.
+#[derive(Debug, Clone, Serialize)]
+pub struct ExternalServiceHealthcheckUpdatedAudit {
+    pub context: AuditContext,
+    pub service_id: i32,
+    pub service_name: String,
+    pub previous: temps_providers_core::healthcheck::HealthcheckOverrides,
+    pub current: temps_providers_core::healthcheck::HealthcheckOverrides,
+}
+
+healthcheck_audit_operation!(
+    ExternalServiceHealthcheckUpdatedAudit,
+    "EXTERNAL_SERVICE_HEALTHCHECK_UPDATED"
+);
+
+/// Operator recreated a managed service's container to apply its
+/// healthcheck, which restarts the service briefly.
+#[derive(Debug, Clone, Serialize)]
+pub struct ExternalServiceHealthcheckAppliedAudit {
+    pub context: AuditContext,
+    pub service_id: i32,
+    pub service_name: String,
+    pub applied: temps_providers_core::healthcheck::HealthcheckTimings,
+}
+
+healthcheck_audit_operation!(
+    ExternalServiceHealthcheckAppliedAudit,
+    "EXTERNAL_SERVICE_HEALTHCHECK_APPLIED"
+);
+
+/// Admin changed the instance-wide default healthcheck of managed service
+/// containers. Both ends are recorded (null = built-in).
+#[derive(Debug, Clone, Serialize)]
+pub struct ManagedServiceHealthcheckDefaultsUpdatedAudit {
+    pub context: AuditContext,
+    pub previous: temps_providers_core::healthcheck::HealthcheckOverrides,
+    pub current: temps_providers_core::healthcheck::HealthcheckOverrides,
+}
+
+healthcheck_audit_operation!(
+    ManagedServiceHealthcheckDefaultsUpdatedAudit,
+    "MANAGED_SERVICE_HEALTHCHECK_DEFAULTS_UPDATED"
+);

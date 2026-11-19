@@ -36,24 +36,14 @@ export default function WorkspaceDetail() {
         title={name}
         description="Manage services, persistent files, and the compute attached to this workspace."
         actions={
-          <>
-            <Button variant="outline" asChild>
-              <Link to="/workspaces">
-                <ArrowLeft className="size-4" /> Workspaces
-              </Link>
-            </Button>
-            <Button asChild variant="outline">
-              <Link
-                to={
-                  global
-                    ? '/ai-first?scope=global'
-                    : `/ai-first?application=${encodeURIComponent(workspaceId)}`
-                }
-              >
-                Open AI threads
-              </Link>
-            </Button>
-          </>
+          // Workspaces belonged to the retired harness AI workspace. This page
+          // stays reachable from the Sandboxes operator view so their compute
+          // can still be inspected and cleaned up.
+          <Button variant="outline" asChild>
+            <Link to="/sandboxes">
+              <ArrowLeft className="size-4" /> Sandboxes
+            </Link>
+          </Button>
         }
       />
       {failed ? (

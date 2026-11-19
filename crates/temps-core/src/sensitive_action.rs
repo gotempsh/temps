@@ -55,6 +55,9 @@ pub enum SensitiveAction {
     /// Change the cluster compute pool (ADR 056): every never-applied
     /// overlay allocation is re-assigned from the new pool.
     ChangeClusterComputePool,
+    /// Give the cluster a new VXLAN network ID (ADR 062): every overlay is
+    /// rebuilt on it, and cross-node traffic pauses until each node follows.
+    ChangeClusterNetworkId,
     /// Destroy every sandbox on a worker node, from all owners, including
     /// their files (ADR-048). `node` is the name or id the caller gave.
     EvictNodeSandboxes {
@@ -109,6 +112,8 @@ pub enum SensitiveAction {
     DeleteGitProvider {
         provider_id: i32,
     },
+    /// Replace the upstream credentials used by an existing git connection.
+    ReauthorizeGitConnection,
     DeleteGitConnection {
         connection_id: i32,
     },
@@ -144,6 +149,32 @@ pub enum SensitiveAction {
     ChangeDockerSocketHealth {
         project_id: i32,
     },
+    /// Change who an existing address is for (ADR 064 Security), either
+    /// way: private to public exposes what it serves to the internet;
+    /// public to private locks out everyone outside the network.
+    ChangeAddressAudience {
+        hostname: String,
+        from: String,
+        to: String,
+    },
+    /// Delete a Tailscale Service Temps created (ADR 065 D4). The Services
+    /// API has no conditional delete, so a person confirms it, with the
+    /// definition they were shown.
+    DeleteTailscaleService {
+        tailnet: String,
+        name: String,
+    },
+    /// Change who a `tailnet_users` address admits (ADR 065 D6), on a run
+    /// or its undo: a longer list lets more people in.
+    ChangeTailnetPrincipals {
+        hostname: String,
+    },
+    /// Turn on a tunnel's environment hosts (ADR 068 D3): every environment,
+    /// preview environments included, gets a public name under the tunnel's
+    /// domain at once.
+    PublishEnvironmentHosts {
+        connector_id: Option<i32>,
+    },
 }
 
 impl SensitiveAction {
@@ -164,6 +195,7 @@ impl SensitiveAction {
             Self::AddNodeOverSsh => "add_node_over_ssh",
             Self::SetWireguardMeshHub => "set_wireguard_mesh_hub",
             Self::ChangeClusterComputePool => "change_cluster_compute_pool",
+            Self::ChangeClusterNetworkId => "change_cluster_network_id",
             Self::EvictNodeSandboxes { .. } => "evict_node_sandboxes",
             Self::CreateOidcProvider => "create_oidc_provider",
             Self::UpdateOidcProvider { .. } => "update_oidc_provider",
@@ -181,6 +213,7 @@ impl SensitiveAction {
             Self::DeleteTeam { .. } => "delete_team",
             Self::DeleteDomain { .. } => "delete_domain",
             Self::DeleteGitProvider { .. } => "delete_git_provider",
+            Self::ReauthorizeGitConnection => "reauthorize_git_connection",
             Self::DeleteGitConnection { .. } => "delete_git_connection",
             Self::RotateDeploymentToken { .. } => "rotate_deployment_token",
             Self::DeleteDeploymentToken { .. } => "delete_deployment_token",
@@ -188,6 +221,10 @@ impl SensitiveAction {
             Self::ClaimDockerSocketSlug { .. } => "claim_docker_socket_slug",
             Self::ReleaseDockerSocketSlug { .. } => "release_docker_socket_slug",
             Self::ChangeDockerSocketHealth { .. } => "change_docker_socket_health",
+            Self::ChangeAddressAudience { .. } => "change_address_audience",
+            Self::DeleteTailscaleService { .. } => "delete_tailscale_service",
+            Self::ChangeTailnetPrincipals { .. } => "change_tailnet_principals",
+            Self::PublishEnvironmentHosts { .. } => "publish_environment_hosts",
         }
     }
 }
@@ -385,6 +422,22 @@ mod tests {
         assert_eq!(
             SensitiveAction::RetentionRetroactiveApply { project_id: 42 }.as_str(),
             "retention_retroactive_apply"
+        );
+        assert_eq!(
+            SensitiveAction::ChangeAddressAudience {
+                hostname: "internal.example.com".to_string(),
+                from: "private".to_string(),
+                to: "public".to_string(),
+            }
+            .as_str(),
+            "change_address_audience"
+        );
+        assert_eq!(
+            SensitiveAction::PublishEnvironmentHosts {
+                connector_id: Some(3)
+            }
+            .as_str(),
+            "publish_environment_hosts"
         );
     }
 

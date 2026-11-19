@@ -34,6 +34,7 @@
 
 pub mod clickhouse;
 pub mod clickhouse_migrations;
+pub mod shield_stats;
 pub mod timescaledb;
 
 pub use clickhouse::{ClickHouseProxyLogConfig, ClickHouseProxyLogStore};

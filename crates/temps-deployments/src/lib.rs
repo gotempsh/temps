@@ -3,13 +3,22 @@
 
 //! deployments services and utilities
 
-pub mod cluster_ca;
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        reason = "tests read fixture configuration (database/service URLs) from the environment"
+    )
+)]
+pub use temps_nodes::cluster_ca;
 pub mod handlers;
 pub mod jobs;
 pub mod plugin;
 pub mod services;
 pub mod test_utils;
 pub mod utils;
+pub mod workflow;
+pub mod workflow_executor;
 
 #[allow(ambiguous_glob_reexports)]
 pub use handlers::*;

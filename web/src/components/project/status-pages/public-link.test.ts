@@ -77,7 +77,10 @@ describe('describePublicLink', () => {
 describe('publicLinkUrl', () => {
   it('never returns a URL for an unconfigured install', () => {
     expect(
-      publicLinkUrl({ public_url: null, public_url_status: { configured: false } })
+      publicLinkUrl({
+        public_url: null,
+        public_url_status: { configured: false },
+      })
     ).toBeNull()
   })
 

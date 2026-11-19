@@ -69,6 +69,19 @@ describe('cancelAvailability', () => {
     }
   })
 
+  test('a worker restore with an unknown outcome is released, not cancelled', () => {
+    expect(
+      cancelAvailability(
+        tracking(run({ phase: 'outcome_unknown', cancellable: true }))
+      )
+    ).toBe('release')
+    expect(
+      cancelAvailability(
+        tracking(run({ phase: 'outcome_unknown', cancellable: false }))
+      )
+    ).toBe('past_safe_point')
+  })
+
   test('there is nothing to cancel without a live active run', () => {
     expect(cancelAvailability(tracking(run({ status: 'completed' })))).toBe(
       'none'

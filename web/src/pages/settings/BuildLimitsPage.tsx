@@ -4,28 +4,30 @@
 import { SettingsFormSkeleton } from '@/components/settings/SettingsFormSkeleton'
 import { SettingsLoadFailure } from '@/components/settings/SettingsLoadFailure'
 import { isForbiddenRead } from '@/lib/read-failure'
-import { Button } from '@temps-sdk/ds'
+import { SaveRow } from '@temps-sdk/ds'
 import { PageHeader, SettingsGroup } from '@temps-sdk/ds'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useSettingsPage, useUpdateSettings } from '@/hooks/useSettings'
-import { Loader2, Save } from 'lucide-react'
 import { CiBuilderPanel } from '@/components/nodes/CiBuilderPanel'
 import { useEffect } from 'react'
 import { useForm } from 'react-hook-form'
+import { zodResolver } from '@hookform/resolvers/zod'
 import { toast } from 'sonner'
 import type { BuildLimitsSettings } from '@/api/platformSettings'
-
-interface BuildLimitsFormData {
-  build_limits: BuildLimitsSettings
-}
+import {
+  buildLimitsFormSchema,
+  type BuildLimitsFormData,
+} from '@/lib/build-limits'
 
 const DEFAULTS: BuildLimitsSettings = {
   max_concurrent: 2,
   cpu_limit_cores: 0,
   memory_limit_mb: 0,
+  build_cache_max_gb: 10,
+  build_cache_max_unused_days: 7,
 }
 
 export function BuildLimitsPage() {
@@ -39,22 +41,23 @@ export function BuildLimitsPage() {
     formState: { isDirty, isSubmitting, errors },
     reset,
   } = useForm<BuildLimitsFormData>({
+    resolver: zodResolver(buildLimitsFormSchema),
     defaultValues: { build_limits: DEFAULTS },
   })
 
   useEffect(() => {
     setBreadcrumbs([
       { label: 'Settings', href: '/settings' },
-      { label: 'Build Limits' },
+      { label: 'Build limits' },
     ])
   }, [setBreadcrumbs])
 
-  usePageTitle('Build Limits')
+  usePageTitle('Build limits')
 
   useEffect(() => {
     if (settings) {
       reset({
-        build_limits: settings.build_limits || DEFAULTS,
+        build_limits: { ...DEFAULTS, ...settings.build_limits },
       })
     }
   }, [settings, reset])
@@ -63,7 +66,9 @@ export function BuildLimitsPage() {
     try {
       await updateSettings.mutateAsync(data)
       reset(data)
-      toast.success('Build limits saved and applied')
+      toast.success(
+        'Build limits saved and applied. Cache limits take effect at the next nightly cleanup'
+      )
     } catch {
       // useUpdateSettings already toasts this failure, with the server's reason.
     }
@@ -104,9 +109,6 @@ export function BuildLimitsPage() {
                 max={32}
                 {...register('build_limits.max_concurrent', {
                   valueAsNumber: true,
-                  required: true,
-                  min: 1,
-                  max: 32,
                 })}
               />
               <p className="text-xs text-muted-foreground">
@@ -114,7 +116,7 @@ export function BuildLimitsPage() {
               </p>
               {errors.build_limits?.max_concurrent && (
                 <p className="text-xs text-destructive">
-                  Must be between 1 and 32
+                  {errors.build_limits.max_concurrent.message}
                 </p>
               )}
             </div>
@@ -129,8 +131,6 @@ export function BuildLimitsPage() {
                 max={64}
                 {...register('build_limits.cpu_limit_cores', {
                   valueAsNumber: true,
-                  min: 0,
-                  max: 64,
                 })}
               />
               <p className="text-xs text-muted-foreground">
@@ -139,7 +139,7 @@ export function BuildLimitsPage() {
               </p>
               {errors.build_limits?.cpu_limit_cores && (
                 <p className="text-xs text-destructive">
-                  Must be between 0 and 64
+                  {errors.build_limits.cpu_limit_cores.message}
                 </p>
               )}
             </div>
@@ -153,8 +153,6 @@ export function BuildLimitsPage() {
                 max={262144}
                 {...register('build_limits.memory_limit_mb', {
                   valueAsNumber: true,
-                  min: 0,
-                  max: 262144,
                 })}
               />
               <p className="text-xs text-muted-foreground">
@@ -163,38 +161,67 @@ export function BuildLimitsPage() {
               </p>
               {errors.build_limits?.memory_limit_mb && (
                 <p className="text-xs text-destructive">
-                  Must be between 0 and 262144
+                  {errors.build_limits.memory_limit_mb.message}
+                </p>
+              )}
+            </div>
+          </SettingsGroup>
+          <SettingsGroup title="Build cache">
+            <p className="text-sm text-muted-foreground">
+              Docker keeps layers from earlier builds to speed up later ones.
+              The nightly cleanup (2:00 UTC) keeps this cache bounded on this
+              host; worker nodes use the defaults.
+            </p>
+            <div className="space-y-2">
+              <Label htmlFor="build_cache_max_gb">
+                Maximum cache size (GB)
+              </Label>
+              <Input
+                id="build_cache_max_gb"
+                type="number"
+                min={0}
+                max={10000}
+                {...register('build_limits.build_cache_max_gb', {
+                  valueAsNumber: true,
+                })}
+              />
+              <p className="text-xs text-muted-foreground">
+                Least recently used cache that no build is using is removed
+                until the cache fits. 0 turns the size cap off. Default 10.
+              </p>
+              {errors.build_limits?.build_cache_max_gb && (
+                <p className="text-xs text-destructive">
+                  {errors.build_limits.build_cache_max_gb.message}
+                </p>
+              )}
+            </div>
+
+            <div className="space-y-2">
+              <Label htmlFor="build_cache_max_unused_days">
+                Remove cache unused for (days)
+              </Label>
+              <Input
+                id="build_cache_max_unused_days"
+                type="number"
+                min={1}
+                max={365}
+                {...register('build_limits.build_cache_max_unused_days', {
+                  valueAsNumber: true,
+                })}
+              />
+              <p className="text-xs text-muted-foreground">
+                Applies whatever the cache size. Min 1, max 365. Default 7.
+              </p>
+              {errors.build_limits?.build_cache_max_unused_days && (
+                <p className="text-xs text-destructive">
+                  {errors.build_limits.build_cache_max_unused_days.message}
                 </p>
               )}
             </div>
           </SettingsGroup>
         </div>
 
-        <div className="sticky bottom-0 bg-background border-t pt-4 pb-2">
-          <div className="flex flex-wrap justify-between items-center gap-3">
-            <p className="text-sm text-muted-foreground">
-              {isDirty ? 'You have unsaved changes' : 'All changes saved'}
-            </p>
-            <Button
-              type="submit"
-              busy={isSubmitting}
-              busyLabel="Saving…"
-              disabled={!isDirty && !isSubmitting}
-            >
-              {isSubmitting ? (
-                <>
-                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                  Saving...
-                </>
-              ) : (
-                <>
-                  <Save className="mr-2 h-4 w-4" />
-                  Save Changes
-                </>
-              )}
-            </Button>
-          </div>
-        </div>
+        <SaveRow sticky dirty={isDirty} saving={isSubmitting} />
       </form>
       <div className="max-w-5xl">
         <CiBuilderPanel />

@@ -17,7 +17,7 @@
 //!    (startup is incomplete or something went wrong), they surface a graceful error.
 //!
 //! `ApiToolsHandle` is `Clone` — each plugin/adapter clone is shallow (same `Arc`
-//! pointing to the same inner `OnceLock`), so the first `set()` is visible to all
+//! pointing to the same inner `ArcSwapOption`), so every `set()` is visible to all
 //! clones immediately.
 //!
 //! [`WriteApiToolsHandle`] is a distinct newtype for the write-only caller.
@@ -25,37 +25,35 @@
 //! the read-only `ApiToolsHandle` (two `Arc<ApiToolsHandle>` of the same type would
 //! silently shadow each other in the registry).
 
-use std::sync::{Arc, OnceLock};
+use arc_swap::ArcSwapOption;
+use std::sync::Arc;
 
 use crate::InternalApiCaller;
 
 /// A cloneable, lazily-populated handle to the shared [`InternalApiCaller`].
 ///
-/// - All clones share the same inner `OnceLock` (via `Arc`).
-/// - `set` succeeds at most once; subsequent calls are no-ops.
+/// - All clones share the same inner `ArcSwapOption` (via `Arc`).
+/// - `set` atomically replaces the caller; existing snapshots remain valid.
 /// - `get` returns `None` until `set` has been called.
 #[derive(Clone, Default)]
-pub struct ApiToolsHandle(Arc<OnceLock<Arc<InternalApiCaller>>>);
+pub struct ApiToolsHandle(Arc<ArcSwapOption<InternalApiCaller>>);
 
 impl ApiToolsHandle {
     /// Create a new, empty handle.
     pub fn new() -> Self {
-        Self(Arc::new(OnceLock::new()))
+        Self(Arc::new(ArcSwapOption::empty()))
     }
 
     /// Populate the handle with the constructed caller.
     ///
-    /// Silently ignores duplicate calls (the `OnceLock` enforces single
-    /// initialisation; in practice this is called exactly once from `console.rs`).
+    /// Atomically publishes a complete replacement to every clone.
     pub fn set(&self, caller: InternalApiCaller) {
-        // OnceLock::set returns Err(val) when already set; we discard it
-        // intentionally — duplicate set is a no-op, not an error.
-        let _ = self.0.set(Arc::new(caller));
+        self.0.store(Some(Arc::new(caller)));
     }
 
     /// Return the caller if it has been set, or `None` during startup.
     pub fn get(&self) -> Option<Arc<InternalApiCaller>> {
-        self.0.get().cloned()
+        self.0.load_full()
     }
 }
 
@@ -79,7 +77,7 @@ impl WriteApiToolsHandle {
 
     /// Populate the handle with the write-only caller.
     ///
-    /// Silently ignores duplicate calls (see [`ApiToolsHandle::set`]).
+    /// Atomically replaces the caller (see [`ApiToolsHandle::set`]).
     pub fn set(&self, caller: InternalApiCaller) {
         self.0.set(caller);
     }
@@ -87,5 +85,24 @@ impl WriteApiToolsHandle {
     /// Return the write caller if it has been set, or `None` during startup.
     pub fn get(&self) -> Option<Arc<InternalApiCaller>> {
         self.0.get()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replacement_is_visible_to_clones_and_preserves_inflight_snapshot() {
+        let handle = ApiToolsHandle::new();
+        let clone = handle.clone();
+        assert!(clone.get().is_none());
+        let api = utoipa::openapi::OpenApi::default();
+        handle.set(InternalApiCaller::new(axum::Router::new(), &api, vec![]));
+        let first = clone.get().unwrap();
+        handle.set(InternalApiCaller::new(axum::Router::new(), &api, vec![]));
+        let second = clone.get().unwrap();
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert!(Arc::ptr_eq(&second, &handle.get().unwrap()));
     }
 }

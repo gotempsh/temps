@@ -70,8 +70,6 @@ struct ManagedZonesResponse {
 
 #[derive(Debug, Deserialize)]
 struct ManagedZone {
-    #[allow(dead_code)]
-    id: String,
     name: String,
     #[serde(rename = "dnsName")]
     dns_name: String,
@@ -134,10 +132,6 @@ struct ChangeRequest {
 #[derive(Debug, Deserialize)]
 struct TokenResponse {
     access_token: String,
-    #[allow(dead_code)]
-    expires_in: u64,
-    #[allow(dead_code)]
-    token_type: String,
 }
 
 impl GcpProvider {

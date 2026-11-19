@@ -132,9 +132,7 @@ for (const width of [1440, 390]) {
     ).toHaveAttribute('aria-pressed', 'true')
     const beforeRefresh = new URL(page.url()).searchParams
     const refresh = waitForLogs(page, () => true)
-    await page
-      .getByRole('button', { name: 'Refresh AI crawler activity' })
-      .click()
+    await page.getByRole('button', { name: 'Refresh', exact: true }).click()
     await refresh
     expect(new URL(page.url()).searchParams.get('range')).toBe(
       beforeRefresh.get('range')
@@ -192,9 +190,7 @@ test('crawler custom dates survive reload and empty and failed requests are dist
       json: { logs: [], total: 0, total_pages: 0, page: 1, page_size: 50 },
     })
   )
-  await page
-    .getByRole('button', { name: 'Refresh AI crawler activity' })
-    .click()
+  await page.getByRole('button', { name: 'Refresh', exact: true }).click()
   await expect(page.getByText('0 requests in selected range')).toBeVisible()
   await expect(
     page.getByText('No AI crawler activity in this range')
@@ -202,9 +198,7 @@ test('crawler custom dates survive reload and empty and failed requests are dist
   await page.route('**/api/proxy-logs?**', (route) =>
     route.fulfill({ status: 400, json: { detail: 'Invalid range' } })
   )
-  await page
-    .getByRole('button', { name: 'Refresh AI crawler activity' })
-    .click()
+  await page.getByRole('button', { name: 'Refresh', exact: true }).click()
   await expect(
     page.getByText('Failed to load AI crawler activity. Please try again.')
   ).toBeVisible()

@@ -71,3 +71,27 @@ export function consumeReturnTo(fallback = '/dashboard'): string {
   }
   return fallback
 }
+
+/**
+ * Paths the server answers rather than the console's router: the signed-in
+ * gate's authorize step (`/_temps/gate/authorize`) sends a signed-out visitor
+ * here to sign in and must be loaded as a page afterwards, not routed to.
+ */
+export function isServerPath(path: string): boolean {
+  return path.startsWith('/_temps/')
+}
+
+/**
+ * Go to a post-login destination: a full page load for a server path, the
+ * router otherwise.
+ */
+export function goToReturnTo(
+  navigate: (to: string, options?: { replace?: boolean }) => void,
+  path: string
+): void {
+  if (isServerPath(path) && typeof window !== 'undefined') {
+    window.location.replace(path)
+    return
+  }
+  navigate(path, { replace: true })
+}

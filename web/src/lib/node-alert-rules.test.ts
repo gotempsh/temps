@@ -5,6 +5,7 @@ import { describe, expect, test } from 'bun:test'
 import {
   ALERTABLE_NODE_METRICS,
   RECOMMENDED_NODE_ALERTS,
+  canDeleteNodeRule,
   canDeleteNodeRules,
   defaultRuleName,
   isAlertableNodeMetric,
@@ -147,6 +148,14 @@ describe('helpers', () => {
   test('only workers can have rules deleted; the control plane re-seeds its own', () => {
     expect(canDeleteNodeRules(0)).toBe(false)
     expect(canDeleteNodeRules(4)).toBe(true)
+  })
+
+  test("a worker's default disk-health rules are disabled, not deleted", () => {
+    expect(canDeleteNodeRule(4, 'node.disk_percent')).toBe(true)
+    expect(canDeleteNodeRule(4, 'node.raid_degraded')).toBe(false)
+    expect(canDeleteNodeRule(4, 'node.disk_wear_percent')).toBe(false)
+    expect(canDeleteNodeRule(4, 'node.disk_media_errors')).toBe(false)
+    expect(canDeleteNodeRule(0, 'node.disk_percent')).toBe(false)
   })
 })
 

@@ -24,7 +24,7 @@ pub struct Model {
     /// FK to backups(id) — the mandatory pre-upgrade snapshot.
     /// SET NULL on backup deletion so the upgrade row survives audit history.
     pub pre_upgrade_backup_id: Option<i32>,
-    /// UUID for the JSONL log file in temps-logs.
+    /// UUID for the JSONL log file in temps-deployment-logs.
     pub log_id: String,
     /// Name of the renamed old PGDATA volume; null until swap phase.
     /// Kept for 7 days post-completion so the user can restore if the new

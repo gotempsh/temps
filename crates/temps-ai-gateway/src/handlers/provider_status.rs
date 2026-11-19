@@ -9,7 +9,6 @@
 //! Host-authenticated development harnesses are intentionally absent: they are
 //! selected by an application thread and run through the agent runtime.
 
-use anyhow::Result as AnyhowResult;
 use axum::{
     extract::State,
     http::StatusCode,
@@ -21,9 +20,9 @@ use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use temps_auth::permission_guard;
-use temps_auth::permissions::Permission;
-use temps_auth::RequireAuth;
+use temps_authz::permission_guard;
+use temps_authz::permissions::Permission;
+use temps_authz::RequireAuth;
 use temps_core::problemdetails::{Problem, ProblemDetails};
 use temps_core::{problemdetails, AuditContext, AuditOperation, RequestMetadata};
 use utoipa::{OpenApi, ToSchema};
@@ -314,9 +313,8 @@ impl AuditOperation for AiSummaryPreferenceUpdatedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> AnyhowResult<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation: {e}"))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -490,7 +488,7 @@ async fn get_ai_provider_status(
     Ok(Json(response))
 }
 
-fn can_read_provider_status(auth: &temps_auth::AuthContext) -> bool {
+fn can_read_provider_status(auth: &temps_authz::AuthContext) -> bool {
     provider_status_permission_granted(
         auth.has_permission(&Permission::AiGatewayRead),
         auth.has_permission(&Permission::ProjectsRead),

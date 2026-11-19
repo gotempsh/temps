@@ -34,6 +34,7 @@ import {
   HostnameChoice,
   TunnelHostnames,
 } from '@/components/domains/TunnelHostnames'
+import { TunnelEnvironmentHosts } from '@/components/domains/TunnelEnvironmentHosts'
 import { TunnelLinks } from '@/components/nodes/TunnelLinks'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
@@ -178,6 +179,7 @@ function ZoneDetail({
             </CardHeader>
             <CardContent>
               <TunnelHostnames connector={connector} />
+              <TunnelEnvironmentHosts connector={connector} />
             </CardContent>
           </Card>
         </>
@@ -289,7 +291,7 @@ export function TunnelDomainDetail() {
     <Button variant="outline" asChild>
       <Link to="/domains">
         <ArrowLeft className="mr-2 size-4" />
-        Back to Domains
+        Back to domains
       </Link>
     </Button>
   )

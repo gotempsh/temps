@@ -225,7 +225,7 @@ export function MajorUpgradeDialog({
               name="to_version"
               render={({ field }) => (
                 <FormItem>
-                  <FormLabel>Target Version</FormLabel>
+                  <FormLabel>Target version</FormLabel>
                   <Select
                     value={field.value}
                     onValueChange={onSelectTarget}
@@ -260,7 +260,7 @@ export function MajorUpgradeDialog({
               name="to_image"
               render={({ field }) => (
                 <FormItem>
-                  <FormLabel>Target Image</FormLabel>
+                  <FormLabel>Target image</FormLabel>
                   <FormControl>
                     <Input
                       {...field}

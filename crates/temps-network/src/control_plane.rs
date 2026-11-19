@@ -26,6 +26,12 @@ use crate::allocator::{AllocatorError, PostgresAllocator};
 use crate::{NetworkConfig, NetworkError, NetworkManager, NodeAlloc, Peer, Transport};
 
 const PEER_RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
+/// Every reconcile tick gives containers newly attached to the overlay their
+/// routes (one container listing, nothing spawned when there are none).
+/// Every container is refreshed when the peers change and otherwise every
+/// this many ticks (30 s), which repairs restarted containers: each refresh
+/// spawns a process per overlay-attached container.
+const ROUTE_SWEEP_EVERY_TICKS: u32 = 6;
 
 /// Why the last attempt to bring up this process's control-plane overlay
 /// failed, if it did. Set by whoever drives [`setup`] in the background (the
@@ -167,6 +173,8 @@ impl ControlPlaneOverlay {
         tokio::spawn(async move {
             let allocator = PostgresAllocator::new(db.clone());
             let mut tick: u32 = 0;
+            // Containers already given their overlay routes.
+            let mut routed = std::collections::HashSet::new();
             // Set when the mesh interface was recreated or reconfigured: the
             // overlay must be bootstrapped again, not just reconciled.
             let mut rebootstrap = false;
@@ -183,6 +191,22 @@ impl ControlPlaneOverlay {
                     Ok(_) => {}
                     Err(error) => {
                         warn!(error = %error, "could not read the WireGuard mesh settings")
+                    }
+                }
+                // A new network ID (ADR 062) means a new VXLAN device:
+                // setup builds the overlay again on it.
+                match network_config::Entity::find_by_id(1).one(db.as_ref()).await {
+                    Ok(Some(cfg)) if transport_changed(&config.transport, &cfg) => {
+                        info!(
+                            vni = cfg.vxlan_vni,
+                            port = cfg.vxlan_port,
+                            "the cluster's VXLAN network ID changed; setting the control-plane overlay up again"
+                        );
+                        return;
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        warn!(error = %error, "could not read the cluster's VXLAN network ID")
                     }
                 }
                 // WireGuard first: a new node's VXLAN peer is useless until
@@ -210,6 +234,7 @@ impl ControlPlaneOverlay {
                                 allowed
                             })
                             .collect();
+                        let sweep_peers = peers.clone();
                         let result = if rebootstrap {
                             manager
                                 .bootstrap(alloc.clone(), peers)
@@ -221,6 +246,12 @@ impl ControlPlaneOverlay {
                         } else {
                             reconcile_peer_snapshot(&manager, &docker, &config, &alloc, peers).await
                         };
+                        if matches!(result, Ok(true))
+                            || tick.is_multiple_of(ROUTE_SWEEP_EVERY_TICKS)
+                        {
+                            routed.clear();
+                        }
+                        sweep_routes(&docker, &config, &alloc, &sweep_peers, &mut routed).await;
                         match result {
                             Ok(_) => rebootstrap = false,
                             Err(error) => {
@@ -235,6 +266,18 @@ impl ControlPlaneOverlay {
                 tokio::time::sleep(PEER_RECONCILE_INTERVAL).await;
             }
         })
+    }
+}
+
+/// Whether the stored VXLAN network ID or port differ from the transport the
+/// overlay was built with. A native overlay has neither.
+fn transport_changed(built: &Transport, stored: &network_config::Model) -> bool {
+    match built {
+        Transport::Vxlan { vni, port } => {
+            i64::from(*vni) != i64::from(stored.vxlan_vni)
+                || i64::from(*port) != i64::from(stored.vxlan_port)
+        }
+        Transport::Native => false,
     }
 }
 
@@ -395,6 +438,32 @@ pub async fn reconcile_peer_snapshot(
     crate::preflight_compute_routes(config, &routed).await?;
     crate::docker::ensure_network_for_subnets(docker, config, alloc, &routed).await?;
     manager.reconcile_peers(peers).await
+}
+
+/// Gives every overlay-attached container on the control plane a route to
+/// each peer's subnet, as worker agents do on theirs: a managed service is
+/// attached to `temps-app-network` first, so without these its replies to
+/// a worker would leave by its default route. Best-effort, retried on the
+/// next tick.
+pub async fn sweep_routes(
+    docker: &Docker,
+    config: &NetworkConfig,
+    alloc: &NodeAlloc,
+    peers: &[Peer],
+    routed: &mut std::collections::HashSet<String>,
+) {
+    let gateway = alloc.bridge_address.to_string();
+    if let Err(error) = crate::overlay_routes::sweep_container_routes(
+        docker,
+        &config.docker_network_name,
+        &gateway,
+        peers,
+        routed,
+    )
+    .await
+    {
+        warn!(%error, "could not refresh overlay routes in control-plane containers; retrying next tick");
+    }
 }
 
 /// The overlay subnets a host routes: its own and every peer's (ADR 056).
@@ -677,12 +746,19 @@ pub async fn setup(
                 });
             }
         }
+        // The control plane runs the cluster's own overlay name (ADR 059).
+        let names = crate::OverlayNames::new(&persisted.docker_network_name).map_err(|e| {
+            ControlPlaneSetupError::InvalidVxlanConfig {
+                reason: e.to_string(),
+            }
+        })?;
         let config = NetworkConfig {
             transport,
             underlay_mtu: detected_mtu.min(configured_mtu),
             underlay_dev,
             ..NetworkConfig::default()
-        };
+        }
+        .with_overlay_names(&names);
         let routed = routed_subnets(&alloc, &peers);
         crate::preflight_compute_routes(&config, &routed).await?;
         crate::docker::preflight_network_for_subnets(docker, &config, &alloc, &routed).await?;
@@ -693,6 +769,16 @@ pub async fn setup(
         privileged_setup_started = true;
         manager.bootstrap(alloc.clone(), peers.clone()).await?;
         crate::docker::ensure_network_for_subnets(docker, &config, &alloc, &routed).await?;
+        if let Some(previous) = crate::overlay_name::set_current(names) {
+            tracing::warn!(
+                previous_network = %previous.docker_network,
+                network = %config.docker_network_name,
+                "the cluster's overlay network name changed; the control plane now runs '{}'. \
+                 '{}' is left in place with its containers until they are redeployed",
+                config.docker_network_name,
+                previous.docker_network,
+            );
+        }
         Ok::<_, ControlPlaneSetupError>((alloc, peers, config, manager))
     }
     .await;

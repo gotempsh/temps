@@ -2,7 +2,12 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { z } from 'zod'
-import type { CreateSandboxBody } from '@/api/client'
+import type {
+  CreateSandboxBody,
+  NodeBackend,
+  PlacementNode,
+  SandboxBackend,
+} from '@/api/client'
 
 /** The API clamps the idle timeout to this range (seconds). */
 export const SANDBOX_TIMEOUT_MIN_SECS = 60
@@ -12,6 +17,64 @@ export const PREVIEW_PASSWORD_MIN_LEN = 8
 export const PREVIEW_PASSWORD_MAX_LEN = 256
 /** `auto` lets Temps place the sandbox. */
 export const AUTO_NODE = 'auto'
+/** `default` leaves the isolation backend to the node's default. */
+export const DEFAULT_BACKEND = 'default'
+
+/** The backends a sandbox can ask for, in the order they are offered. */
+export const SELECTABLE_BACKENDS: SandboxBackend[] = [
+  'docker',
+  'firecracker',
+  'microsandbox',
+]
+
+/**
+ * The node a create would land on: the one asked for, or for automatic
+ * placement the one the server tries first (the control plane when it may
+ * take sandboxes, otherwise a worker). `undefined` when none can.
+ */
+export function targetNode(
+  nodes: PlacementNode[],
+  selected: string
+): PlacementNode | undefined {
+  const eligible = nodes.filter((node) => node.eligible)
+  if (selected !== AUTO_NODE) {
+    return eligible.find((node) => node.name === selected)
+  }
+  return (
+    eligible.find((node) => node.is_control_plane) ??
+    eligible.find((node) => !node.dedicated)
+  )
+}
+
+/**
+ * Every selectable backend and whether the target node can run it. A node
+ * that reports nothing (an older server) is read as unknown: the choice is
+ * offered and the server decides.
+ */
+export function backendChoices(
+  nodes: PlacementNode[],
+  selectedNode: string
+): NodeBackend[] {
+  const node = targetNode(nodes, selectedNode)
+  return SELECTABLE_BACKENDS.map((backend) => {
+    if (!node) {
+      return {
+        backend,
+        available: false,
+        reason: 'No node can take a new sandbox right now.',
+      }
+    }
+    const reported = (node.backends ?? []).find((b) => b.backend === backend)
+    return reported ?? { backend, available: true, reason: null }
+  })
+}
+
+/** Whether `node` can run `backend` (the default always qualifies). */
+export function nodeRunsBackend(node: PlacementNode, backend: string): boolean {
+  if (backend === DEFAULT_BACKEND) return true
+  const reported = (node.backends ?? []).find((b) => b.backend === backend)
+  return reported?.available ?? true
+}
 
 const optionalNumber = (label: string, min: number, max: number) =>
   z
@@ -76,6 +139,7 @@ export const createSandboxFormSchema = z.object({
       'Ports must be numbers from 1 to 65535, separated by commas'
     ),
   node: z.string(),
+  backend: z.string(),
   previewPassword: z
     .string()
     .refine(
@@ -99,6 +163,7 @@ export const createSandboxFormDefaults: CreateSandboxFormValues = {
   pidsLimit: '',
   ports: '',
   node: AUTO_NODE,
+  backend: DEFAULT_BACKEND,
   previewPassword: '',
 }
 
@@ -123,6 +188,9 @@ export function toCreateSandboxBody(
   const ports = parsePorts(values.ports)
   if (ports && ports.length > 0) body.ports = ports
   if (values.node && values.node !== AUTO_NODE) body.node = values.node
+  if (values.backend && values.backend !== DEFAULT_BACKEND) {
+    body.backend = values.backend
+  }
   if (values.previewPassword) body.preview_password = values.previewPassword
   return body
 }

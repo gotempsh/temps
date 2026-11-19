@@ -51,7 +51,7 @@ function restoreWindow() {
 }
 
 Object.defineProperty(globalThis, 'window', stubWindow)
-const { captureReturnTo, consumeReturnTo, rememberReturnTo } =
+const { captureReturnTo, consumeReturnTo, goToReturnTo, rememberReturnTo } =
   await import('./return-to')
 restoreWindow()
 
@@ -143,5 +143,23 @@ describe('rememberReturnTo', () => {
     rememberReturnTo(null)
 
     expect(consumeReturnTo('/dashboard')).toBe('/dashboard')
+  })
+})
+
+describe('goToReturnTo', () => {
+  test('loads the signed-in gate authorize step as a page after sign-in', () => {
+    const replaced: string[] = []
+    const location = stubWindow.value.location as Record<string, unknown>
+    location.replace = (path: string) => void replaced.push(path)
+    const routed: string[] = []
+
+    const authorize =
+      '/_temps/gate/authorize?address=custom%3A1&state=s&code_challenge=c'
+    goToReturnTo((to) => void routed.push(to), authorize)
+    goToReturnTo((to) => void routed.push(to), '/projects/web')
+
+    expect(replaced).toEqual([authorize])
+    expect(routed).toEqual(['/projects/web'])
+    delete location.replace
   })
 })

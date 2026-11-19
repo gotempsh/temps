@@ -6,10 +6,17 @@
 
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { CheckCircle2, Loader2, RefreshCw, Trash2, XCircle } from 'lucide-react'
+import {
+  CheckCircle2,
+  ChevronRight,
+  Loader2,
+  RefreshCw,
+  Trash2,
+  XCircle,
+} from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { useForm, type UseFormReturn } from 'react-hook-form'
-import { Link } from 'react-router'
+import { Link, useLocation } from 'react-router'
 import { toast } from 'sonner'
 import { z } from 'zod'
 import {
@@ -23,6 +30,15 @@ import {
   syncIngressConnectorMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import { allTunnelsOptions } from '@/lib/tunnel-domains'
+import { hostSuffixError, suffixedHost } from '@/lib/tunnel-host-suffix'
+import {
+  type DomainPick,
+  EMPTY_PICK,
+  type LabelLayout,
+  providerHostSuffix,
+  providerValues,
+  subdomainLabel,
+} from '@/components/nodes/tunnel-setup-values'
 import type {
   ConnectorNodeView,
   ConnectorView,
@@ -30,11 +46,24 @@ import type {
   ProviderInfo,
   SetupField,
 } from '@/api/client/types.gen'
+import {
+  CloudflareTokenChecklist,
+  CloudflareTokenGuide,
+} from '@/components/domains/CloudflareTokenGuide'
 import { TunnelHostnames } from '@/components/domains/TunnelHostnames'
+import {
+  TunnelEnvironmentHosts,
+  WithdrawnEnvironmentHosts,
+} from '@/components/domains/TunnelEnvironmentHosts'
 import { TunnelLinks } from '@/components/nodes/TunnelLinks'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from '@/components/ui/collapsible'
 import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import {
   Dialog,
@@ -54,6 +83,8 @@ import {
   FormMessage,
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
 import {
   Select,
   SelectContent,
@@ -251,6 +282,7 @@ export function WorkerTunnels({
               </>
             )}
             <TunnelHostnames connector={connector} />
+            <TunnelEnvironmentHosts connector={connector} />
           </div>
         )
       })}
@@ -301,10 +333,20 @@ export function WorkerTunnels({
                 {provider.summary}
               </p>
               <ul className="list-disc space-y-0.5 pl-4 text-xs text-muted-foreground">
-                {provider.requirements.map((r) => (
-                  <li key={r}>{r}</li>
-                ))}
+                {provider.requirements
+                  // The checklist below spells the token out.
+                  .filter(
+                    (r) =>
+                      provider.kind !== CLOUDFLARE_TUNNEL ||
+                      !r.startsWith('Its API token')
+                  )
+                  .map((r) => (
+                    <li key={r}>{r}</li>
+                  ))}
               </ul>
+              {provider.kind === CLOUDFLARE_TUNNEL && (
+                <CloudflareTokenChecklist />
+              )}
               <div className="mt-auto flex items-center gap-2 pt-1">
                 <Button
                   size="sm"
@@ -345,8 +387,14 @@ export function WorkerTunnels({
         resourceType="tunnel"
         resourceName={deleting?.name ?? ''}
         consequences={
-          deleting &&
-          `Apps under ${deleting.domain} stop being reachable through it, on every worker that runs it. Temps removes the tunnel and its DNS records at ${providerName(deleting.provider)}.`
+          deleting && (
+            <div className="space-y-2">
+              <p>
+                {`Apps under ${deleting.domain} stop being reachable through it, on every worker that runs it. Temps removes the tunnel and its DNS records at ${providerName(deleting.provider)}.`}
+              </p>
+              <WithdrawnEnvironmentHosts connector={deleting} />
+            </div>
+          )
         }
         onConfirm={() =>
           deleting && remove.mutate({ path: { id: deleting.id } })
@@ -384,20 +432,11 @@ function defaultName(node: NodeInfoResponse) {
   return (name || `worker-${node.id}`).slice(0, 50)
 }
 
-/** A managed domain as picked: a zone and an optional label under it. */
-interface DomainPick {
-  zone: string
-  subdomain: string
-}
-
-const EMPTY_PICK: DomainPick = { zone: '', subdomain: '' }
+/** `temps_ingress::cloudflare::KIND`. */
+const CLOUDFLARE_TUNNEL = 'cloudflare_tunnel'
 const TUNNEL_NAME = /^[A-Za-z0-9-]{1,50}$/
 const DNS_LABELS =
   /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$/
-
-function subdomainLabel(subdomain: string) {
-  return subdomain.trim().toLowerCase().replace(/\.+$/, '')
-}
 
 /** The answers for a provider: its own fields, checked against its descriptor. */
 function setupSchema(provider: ProviderInfo | null) {
@@ -411,7 +450,11 @@ function setupSchema(provider: ProviderInfo | null) {
       values: z.record(z.string(), z.string()),
       picks: z.record(
         z.string(),
-        z.object({ zone: z.string(), subdomain: z.string() })
+        z.object({
+          zone: z.string(),
+          subdomain: z.string(),
+          layout: z.enum(['suffix', 'subdomain']),
+        })
       ),
     })
     .superRefine((data, ctx) => {
@@ -425,6 +468,15 @@ function setupSchema(provider: ProviderInfo | null) {
               path: ['picks', field.key],
               message: 'Choose a domain.',
             })
+          } else if (label && pick.layout === 'suffix') {
+            const error = hostSuffixError(label)
+            if (error) {
+              ctx.addIssue({
+                code: 'custom',
+                path: ['picks', field.key],
+                message: error,
+              })
+            }
           } else if (label && !DNS_LABELS.test(label)) {
             ctx.addIssue({
               code: 'custom',
@@ -448,22 +500,6 @@ type SetupValues = z.infer<ReturnType<typeof setupSchema>>
 
 function setupDefaults(node: NodeInfoResponse): SetupValues {
   return { name: defaultName(node), values: {}, picks: {} }
-}
-
-/** The values the API takes: a picked domain becomes one hostname. */
-function providerValues(provider: ProviderInfo, answers: SetupValues) {
-  const values: Record<string, string> = {}
-  for (const [key, value] of Object.entries(answers.values)) {
-    if (value.trim()) values[key] = value
-  }
-  for (const field of provider.fields) {
-    if (field.kind.type !== 'managed_domain') continue
-    const pick = answers.picks[field.key] ?? EMPTY_PICK
-    const label = subdomainLabel(pick.subdomain)
-    const domain = pick.zone && label ? `${label}.${pick.zone}` : pick.zone
-    if (domain) values[field.key] = domain
-  }
-  return values
 }
 
 /**
@@ -505,7 +541,12 @@ function ProviderSetupDialog({
       toast.success(
         connector.status === 'ready'
           ? `${provider?.name ?? 'Tunnel'} created. The worker connects within a few seconds.`
-          : `${provider?.name ?? 'Tunnel'} saved`
+          : `${provider?.name ?? 'Tunnel'} saved`,
+        connector.domain
+          ? {
+              description: `No environment has a name through it yet. Choose Publish environments on the tunnel to give them names such as ${suffixedHost('app', connector.host_suffix, connector.domain)}.`,
+            }
+          : undefined
       )
       await onCreated()
       onOpenChange(false)
@@ -522,11 +563,13 @@ function ProviderSetupDialog({
 
   const submit = form.handleSubmit((answers) => {
     if (!provider) return
+    const hostSuffix = providerHostSuffix(provider, answers)
     create.mutate({
       body: {
         name: answers.name.trim(),
         provider: provider.kind,
         values: providerValues(provider, answers),
+        ...(hostSuffix ? { host_suffix: hostSuffix } : {}),
         node_ids: [node.id],
       },
     })
@@ -543,6 +586,20 @@ function ProviderSetupDialog({
                   <DialogTitle>Set up {provider.name}</DialogTitle>
                   <DialogDescription>{provider.summary}</DialogDescription>
                 </DialogHeader>
+                {provider.kind === CLOUDFLARE_TUNNEL && (
+                  <div className="space-y-2">
+                    <CloudflareTokenChecklist />
+                    <Collapsible>
+                      <CollapsibleTrigger className="group flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground">
+                        <ChevronRight className="h-4 w-4 transition-transform group-data-[state=open]:rotate-90" />
+                        Step by step in Cloudflare
+                      </CollapsibleTrigger>
+                      <CollapsibleContent className="pt-2">
+                        <CloudflareTokenGuide tunnel="required" />
+                      </CollapsibleContent>
+                    </Collapsible>
+                  </div>
+                )}
                 <FormField
                   control={form.control}
                   name="name"
@@ -679,6 +736,7 @@ function DnsProviderSelect({
   onChange: (value: string) => void
 }) {
   const query = useQuery(listDnsProvidersOptions())
+  const location = useLocation()
   const providers = (query.data ?? []).filter(
     (p) =>
       p.is_active &&
@@ -688,14 +746,23 @@ function DnsProviderSelect({
     return <Skeleton className="h-9 w-full" />
   }
   if (providers.length === 0) {
+    const cloudflare = providerType === 'cloudflare'
+    const label = cloudflare ? 'Cloudflare' : providerType
+    const back = `${location.pathname}${location.search}`
+    const add = providerType
+      ? `/dns-providers/add?provider=${encodeURIComponent(providerType)}&return=${encodeURIComponent(back)}`
+      : `/dns-providers/add?return=${encodeURIComponent(back)}`
     return (
       <Alert>
-        <AlertDescription>
-          No {providerType ? `${providerType} ` : ''}DNS provider yet.{' '}
-          <Link className="underline" to="/dns-providers/add">
-            Add one
-          </Link>
-          , then come back.
+        <AlertDescription className="space-y-2">
+          <p>
+            No {label ? `${label} ` : ''}DNS provider yet.{' '}
+            <Link className="underline" to={add}>
+              Add one
+            </Link>
+            ; you come back here once it is added.
+          </p>
+          {cloudflare && <CloudflareTokenChecklist className="bg-background" />}
         </AlertDescription>
       </Alert>
     )
@@ -733,7 +800,7 @@ function ManagedDomainSelect({
     ...listManagedDomainsOptions({ path: { id: providerId ?? 0 } }),
     enabled: providerId != null,
   })
-  const { zone, subdomain } = value
+  const { zone, subdomain, layout } = value
   if (providerId == null) {
     return (
       <Select disabled>
@@ -769,19 +836,23 @@ function ManagedDomainSelect({
         {allowSubdomain && (
           <>
             <Input
-              aria-label="Subdomain (optional)"
+              aria-label="Label (optional)"
               className="w-40"
-              placeholder="subdomain"
+              placeholder="label"
               autoComplete="off"
               value={subdomain}
-              onChange={(e) => onChange({ zone, subdomain: e.target.value })}
+              onChange={(e) =>
+                onChange({ ...value, subdomain: e.target.value })
+              }
             />
-            <span className="text-muted-foreground">.</span>
+            {(layout === 'subdomain' || !label) && (
+              <span className="text-muted-foreground">.</span>
+            )}
           </>
         )}
         <Select
           value={zone}
-          onValueChange={(next) => onChange({ zone: next, subdomain })}
+          onValueChange={(next) => onChange({ ...value, zone: next })}
         >
           <FormControl>
             <SelectTrigger className="flex-1">
@@ -800,11 +871,19 @@ function ManagedDomainSelect({
       </div>
       {allowSubdomain && !label && (
         <p className="text-xs text-muted-foreground">
-          Leave the subdomain empty to use the whole domain, or enter one (e.g.{' '}
-          <code>lab</code>) to keep this tunnel to it.
+          Leave the label empty to name apps directly under the domain, or enter
+          one (e.g. <code>lab</code>) to tell this tunnel&apos;s apps apart.
         </p>
       )}
       {label && zone && (
+        <LabelLayoutChoice
+          zone={zone}
+          label={label}
+          layout={layout}
+          onLayout={(next) => onChange({ ...value, layout: next })}
+        />
+      )}
+      {label && zone && layout === 'subdomain' && (
         <Alert>
           <AlertDescription className="space-y-1 text-xs">
             <p>
@@ -839,5 +918,65 @@ function ManagedDomainSelect({
         </Alert>
       )}
     </div>
+  )
+}
+
+/** One level deep with a suffix, or two levels under a subdomain. */
+function LabelLayoutChoice({
+  zone,
+  label,
+  layout,
+  onLayout,
+}: {
+  zone: string
+  label: string
+  layout: LabelLayout
+  onLayout: (layout: LabelLayout) => void
+}) {
+  return (
+    <RadioGroup
+      value={layout}
+      onValueChange={(next) => onLayout(next as LabelLayout)}
+      aria-label="Hostnames"
+      className="grid gap-2"
+    >
+      <Label
+        htmlFor="label-layout-suffix"
+        className="flex cursor-pointer items-start gap-2 font-normal"
+      >
+        <RadioGroupItem
+          id="label-layout-suffix"
+          value="suffix"
+          className="mt-0.5"
+        />
+        <span className="grid gap-0.5 text-sm">
+          <code>{suffixedHost('app', label, zone)}</code>
+          <span className="text-xs text-muted-foreground">
+            One level below {zone}: Cloudflare&apos;s free certificate covers
+            it. The tunnel serves {zone}. Environments get these names only once
+            you choose Publish environments on the tunnel, after creating it.
+          </span>
+        </span>
+      </Label>
+      <Label
+        htmlFor="label-layout-subdomain"
+        className="flex cursor-pointer items-start gap-2 font-normal"
+      >
+        <RadioGroupItem
+          id="label-layout-subdomain"
+          value="subdomain"
+          className="mt-0.5"
+        />
+        <span className="grid gap-0.5 text-sm">
+          <code>
+            app.{label}.{zone}
+          </code>
+          <span className="text-xs text-muted-foreground">
+            Two levels down, under {label}.{zone}: needs Advanced Certificate
+            Manager.
+          </span>
+        </span>
+      </Label>
+    </RadioGroup>
   )
 }

@@ -180,6 +180,11 @@ pub struct VisitorDetails {
     pub country_code: Option<String>,
     pub timezone: Option<String>,
     pub is_eu: Option<bool>,
+    /// Autonomous system (network) number the visitor's IP is announced from,
+    /// when an ASN database was loaded.
+    pub asn_number: Option<i32>,
+    /// Organisation operating that network.
+    pub asn_org: Option<String>,
     // First-visit attribution
     /// Full referrer URL from the visitor's first session
     pub first_referrer: Option<String>,

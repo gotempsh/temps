@@ -156,11 +156,14 @@ impl McpToolResult {
 
     /// Create a result with a single text block and an attached proposal token.
     ///
-    /// Used by `trigger_deployment`, which requires a subsequent
-    /// `confirm_action` call before the action is executed.
+    /// Include the token in standard content for clients that discard custom
+    /// result fields. Retain `_proposal_token` for existing integrations.
+    /// The client must obtain human approval before calling `confirm_action`.
     pub fn text_with_proposal_token(text: String, token: String) -> Self {
         Self {
-            content: vec![McpContentBlock::text(text)],
+            content: vec![McpContentBlock::text(format!(
+                "{text}\n\nAfter human approval, call confirm_action with token: {token}"
+            ))],
             proposal_token: Some(token),
         }
     }
@@ -239,6 +242,25 @@ impl McpQuery {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn proposal_token_is_available_in_standard_mcp_content() {
+        let token = "test-confirmation-token";
+        let result = super::McpToolResult::text_with_proposal_token(
+            "Proposed test operation; nothing executed.".into(),
+            token.into(),
+        );
+        let wire = serde_json::to_value(result).expect("serialize tool result");
+        // Claude Code renders content blocks and drops custom result fields.
+        let content = wire["content"][0]["text"].as_str().expect("text content");
+        assert!(content.contains("After human approval"));
+        assert!(content.contains("confirm_action with token: test-confirmation-token"));
+        assert_eq!(wire["_proposal_token"], token);
+        let read = serde_json::to_value(super::McpToolResult::text("read result".into()))
+            .expect("serialize read result");
+        assert!(read.get("_proposal_token").is_none());
+        assert_eq!(read["content"][0]["text"], "read result");
+    }
+
     use super::*;
 
     // ── JsonRpcRequest deserialization ────────────────────────────────────────

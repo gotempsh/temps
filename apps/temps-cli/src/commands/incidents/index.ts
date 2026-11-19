@@ -15,6 +15,7 @@ import {
 } from '../../api/sdk.gen.js'
 import type { IncidentResponse, IncidentUpdateResponse } from '../../api/types.gen.js'
 import { withSpinner } from '../../ui/spinner.js'
+import { ValidationError } from '../../utils/errors.js'
 import { printTable, statusBadge, type TableColumn } from '../../ui/table.js'
 import { promptText, promptSelect } from '../../ui/prompts.js'
 import {
@@ -49,6 +50,10 @@ interface CreateOptions {
   title?: string
   description?: string
   severity?: string
+  publicTitle?: string
+  message?: string
+  public?: boolean
+  monitorId?: string
   yes?: boolean
 }
 
@@ -111,6 +116,10 @@ export function registerIncidentsCommands(program: Command): void {
     .option('-t, --title <title>', 'Incident title')
     .option('-d, --description <description>', 'Incident description')
     .option('-s, --severity <severity>', 'Severity level (critical, major, minor)')
+    .option('--public-title <title>', 'Headline shown on published status pages (the title stays internal)')
+    .option('-m, --message <message>', 'First update, written by you instead of the automatic one')
+    .option('--public', 'Post the first update to published status pages (needs --message)')
+    .option('--monitor-id <id>', 'Monitor (status page component) the incident affects; omit for the whole project')
     .option('-y, --yes', 'Skip confirmation prompts (for automation)')
     .action(createIncidentAction)
 
@@ -208,6 +217,24 @@ export function extractIncidentsList(data: unknown): IncidentResponse[] {
 }
 
 /** `--public` / `--private` to a visibility, or an error message. */
+/** A `--monitor-id` value, or undefined when none was given. Rejects anything
+ * that is not a whole positive number, so `12abc` never becomes monitor 12. */
+export function parseMonitorId(raw?: string): number | undefined {
+  if (raw === undefined) return undefined
+  if (!/^[1-9]\d*$/.test(raw.trim())) {
+    throw new ValidationError(`Invalid monitor ID "${raw}": expected a positive whole number`)
+  }
+  return Number(raw.trim())
+}
+
+/** `--public` publishes the update you wrote, so it needs a non-blank
+ * `--message`; the server would otherwise record a private system update. */
+export function requirePublicMessage(isPublic?: boolean, message?: string): void {
+  if (isPublic && !message?.trim()) {
+    throw new ValidationError('--public needs --message: only an update you wrote can be published')
+  }
+}
+
 export function resolveVisibility(options: {
   public?: boolean
   private?: boolean
@@ -350,6 +377,9 @@ async function createIncidentAction(options: CreateOptions): Promise<void> {
     })
   }
 
+  const monitorId = parseMonitorId(options.monitorId)
+  requirePublicMessage(options.public, options.message)
+
   const incident = await withSpinner('Creating incident...', async () => {
     const { data, error } = await createIncident({
       client,
@@ -358,6 +388,10 @@ async function createIncidentAction(options: CreateOptions): Promise<void> {
         title,
         severity,
         ...(description && { description }),
+        ...(options.publicTitle && { public_title: options.publicTitle }),
+        ...(options.message && { message: options.message }),
+        ...(monitorId !== undefined && { monitor_id: monitorId }),
+        is_public: Boolean(options.public),
       },
     })
     if (error) {
@@ -427,7 +461,12 @@ async function showIncidentAction(options: ShowOptions): Promise<void> {
   newline()
 }
 
-async function updateStatusAction(options: UpdateStatusOptions): Promise<void> {
+export async function updateStatusAction(options: UpdateStatusOptions): Promise<void> {
+  // An explicit `--message ""` is a mistake to report, not a cue to prompt:
+  // check it before signing in or asking anything.
+  if (options.message !== undefined && !options.message.trim()) {
+    throw new ValidationError('--message cannot be blank')
+  }
   await requireAuth()
   await setupClient()
 
@@ -461,6 +500,7 @@ async function updateStatusAction(options: UpdateStatusOptions): Promise<void> {
     warning(`Invalid status: ${status}. Available: ${validStatuses.join(', ')}`)
     return
   }
+  requirePublicMessage(options.public, message)
 
   const incident = await withSpinner('Updating incident status...', async () => {
     const { data, error } = await updateIncidentStatus({

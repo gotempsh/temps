@@ -8,6 +8,11 @@
 //! Docker still passes (per the project's "skip gracefully at runtime"
 //! rule — no `#[ignore]` annotations).
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test helpers: panicking is how a test fails"
+)]
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -18,11 +23,11 @@ use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
 use sha2::Sha256;
 
 use temps_core::EncryptionService;
-use temps_database::test_utils::TestDatabase;
 use temps_revenue::{
     CreateIntegrationInput, IngestOutcome, ProviderRegistry, RevenueAnalyticsService,
     RevenueIngestionService, RevenueIntegrationService,
 };
+use temps_test_utils::TestDatabase;
 
 type HmacSha256 = Hmac<Sha256>;
 

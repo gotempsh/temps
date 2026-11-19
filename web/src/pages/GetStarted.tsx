@@ -4,8 +4,7 @@
 import { useEffect } from 'react'
 import { Link, useLocation, useSearchParams } from 'react-router'
 import { PageContainer, PageHeader } from '@/components/layout/PageContainer'
-import { DeployPathChoices } from '@/components/first-deploy/DeployPathChoices'
-import { SampleDeployCard } from '@/components/first-deploy/SampleDeployCard'
+import { OnboardingChoices } from '@/components/onboarding/OnboardingChoices'
 import type { SampleDeployNavigationState } from '@/components/first-deploy/SampleDeployCard'
 import { SampleDeployTracker } from '@/components/first-deploy/SampleDeployTracker'
 import { WorkerNodeRequiredBanner } from '@/components/nodes/WorkerNodeRequiredBanner'
@@ -13,14 +12,7 @@ import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { FIRST_DEPLOY_PATH } from '@/lib/first-deploy'
 
-/**
- * "Deploy your first app": the do-this-first path for a new installation.
- *
- * Without `?project=` it offers the one-click sample and the three ways to
- * deploy your own app. With it, it follows that project's deployment to a
- * live URL. Linked from the Platform setup checklist so it stays reachable
- * after the projects page stops showing its empty state.
- */
+/** Feature entry points, preserving existing sample-deployment tracking links. */
 export function GetStarted() {
   const { setBreadcrumbs } = useBreadcrumbs()
   const [searchParams] = useSearchParams()
@@ -36,27 +28,30 @@ export function GetStarted() {
             { label: 'Deploy your first app', href: FIRST_DEPLOY_PATH },
             { label: projectSlug },
           ]
-        : [{ label: 'Deploy your first app' }]
+        : [{ label: 'Get started' }]
     )
   }, [projectSlug, setBreadcrumbs])
 
-  usePageTitle('Deploy your first app')
+  usePageTitle(projectSlug ? 'Deploy your first app' : 'Get started')
 
   return (
     <PageContainer innerClassName="space-y-6">
       <PageHeader
-        title="Deploy your first app"
+        title={
+          projectSlug
+            ? 'Deploy your first app'
+            : 'What would you like to try first?'
+        }
         description={
           projectSlug
             ? 'Temps is pulling the image, starting the container and routing a URL to it.'
-            : 'Get something live on this server first. It proves Docker, image downloads and routing all work, and takes about a minute.'
+            : undefined
         }
       />
 
-      <WorkerNodeRequiredBanner />
-
       {projectSlug ? (
         <>
+          <WorkerNodeRequiredBanner />
           <SampleDeployTracker
             projectSlug={projectSlug}
             startError={startError}
@@ -67,21 +62,13 @@ export function GetStarted() {
               className="underline underline-offset-4"
               to={FIRST_DEPLOY_PATH}
             >
-              See all the ways to deploy
+              Explore the other features
             </Link>
             .
           </p>
         </>
       ) : (
-        <>
-          <SampleDeployCard />
-          <section aria-labelledby="own-app-title" className="space-y-3">
-            <h2 id="own-app-title" className="text-lg font-semibold">
-              Or deploy your own app
-            </h2>
-            <DeployPathChoices />
-          </section>
-        </>
+        <OnboardingChoices showHeading={false} />
       )}
     </PageContainer>
   )

@@ -168,10 +168,10 @@ function generateHeader(
 ## Installation
 
 \`\`\`bash
-bunx @temps-sdk/cli@${version} [command]
+bunx @temps-sdk/cli@latest [command]
 
 # Fallback when Bun is unavailable
-npx @temps-sdk/cli@${version} [command]
+npx @temps-sdk/cli@latest [command]
 \`\`\`
 
 ## Authentication
@@ -180,10 +180,10 @@ Before using most commands, you need to authenticate:
 
 \`\`\`bash
 # Login interactively
-bunx @temps-sdk/cli@${version} login
+bunx @temps-sdk/cli@latest login
 
 # Or configure with wizard
-bunx @temps-sdk/cli@${version} configure
+bunx @temps-sdk/cli@latest configure
 \`\`\`
 
 ## Global Options
@@ -209,51 +209,51 @@ function generateFooter(version: string): string {
 
 \`\`\`bash
 # Login to Temps
-bunx @temps-sdk/cli@${version} login
+bunx @temps-sdk/cli@latest login
 
 # Create a new project on the intended server
-bunx @temps-sdk/cli@${version} --target-context production projects create --name my-app
+bunx @temps-sdk/cli@latest --target-context production projects create --name my-app
 
 # Deploy to production
-bunx @temps-sdk/cli@${version} --target-context production deploy --project my-app --environment production
+bunx @temps-sdk/cli@latest --target-context production deploy --project my-app --environment production
 
 # View deployment logs
-bunx @temps-sdk/cli@${version} deployments logs --project my-app --follow
+bunx @temps-sdk/cli@latest deployments logs --project my-app --follow
 
 # Stream runtime container logs
-bunx @temps-sdk/cli@${version} runtime-logs --project my-app
+bunx @temps-sdk/cli@latest runtime-logs --project my-app
 
 # List containers
-bunx @temps-sdk/cli@${version} containers list --project-id 1 --environment-id 1
+bunx @temps-sdk/cli@latest containers list --project-id 1 --environment-id 1
 \`\`\`
 
 ### Managing Environments
 
 \`\`\`bash
 # List environments
-bunx @temps-sdk/cli@${version} environments list --project my-app
+bunx @temps-sdk/cli@latest environments list --project my-app
 
 # Set an environment variable on the intended server (prompts for the value)
-bunx @temps-sdk/cli@${version} --target-context production environments vars set --project my-app DATABASE_URL --environments production
+bunx @temps-sdk/cli@latest --target-context production environments vars set --project my-app DATABASE_URL --environments production
 
 # View environment variables
-bunx @temps-sdk/cli@${version} environments vars list --project my-app
+bunx @temps-sdk/cli@latest environments vars list --project my-app
 \`\`\`
 
 ### Managing Domains
 
 \`\`\`bash
 # Request a certificate for a domain on the intended server
-bunx @temps-sdk/cli@${version} --target-context production domains add --domain app.example.com
+bunx @temps-sdk/cli@latest --target-context production domains add --domain app.example.com
 
 # Route the domain to a project environment
-bunx @temps-sdk/cli@${version} --target-context production custom-domains create --project-id 1 --environment-id 1 --domain app.example.com
+bunx @temps-sdk/cli@latest --target-context production custom-domains create --project-id 1 --environment-id 1 --domain app.example.com
 
 # List domains
-bunx @temps-sdk/cli@${version} domains list
+bunx @temps-sdk/cli@latest domains list
 
 # Remove a domain from the intended server
-bunx @temps-sdk/cli@${version} --target-context production domains remove --domain app.example.com
+bunx @temps-sdk/cli@latest --target-context production domains remove --domain app.example.com
 \`\`\`
 
 ## Environment Variables
@@ -273,7 +273,7 @@ Configuration is stored in:
 - **Config file**: \`~/.temps/config.json\`
 - **Credentials**: Stored securely in \`~/.temps/\` with restricted file permissions
 
-Use \`bunx @temps-sdk/cli@${version} configure show\` to view current configuration.
+Use \`bunx @temps-sdk/cli@latest configure show\` to view current configuration.
 
 ## Support
 

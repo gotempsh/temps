@@ -45,7 +45,7 @@ describe('GlobalWorkspaceStatusPanel', () => {
     expect(html).toContain('sbx_abcdef0123456789')
     expect(html).toContain('Persistent volume')
     expect(html).toContain('Healthy')
-    expect(html).toContain('href="/agent-sandbox/sandbox"')
+    expect(html).toContain('href="/sandboxes/settings"')
     expect(html).not.toContain('/sandboxes/sbx_abcdef0123456789')
   })
 })

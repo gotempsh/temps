@@ -172,6 +172,53 @@ pub async fn remove(handle: &Handle, cidr: Ipv4Net) -> crate::Result<()> {
     Ok(())
 }
 
+/// Remove the route for `cidr` that goes out through `dev`, leaving a route
+/// for the same prefix through any other device alone. Idempotent: a missing
+/// device or route is not an error.
+pub async fn remove_via_dev(handle: &Handle, cidr: Ipv4Net, dev: &str) -> crate::Result<()> {
+    use futures::TryStreamExt;
+    use netlink_packet_route::route::{RouteAddress, RouteAttribute};
+
+    let Some(dev_idx) = link_index_by_name(handle, dev).await? else {
+        return Ok(());
+    };
+    let mut routes = handle
+        .route()
+        .get(RouteMessageBuilder::<Ipv4Addr>::new().build())
+        .execute();
+    while let Some(msg) = routes.try_next().await.map_err(|e| NetworkError::Route {
+        op: "list_routes",
+        cidr,
+        via: dev.into(),
+        reason: e.to_string(),
+    })? {
+        if msg.header.destination_prefix_length != cidr.prefix_len() {
+            continue;
+        }
+        let matches = msg.attributes.iter().any(|attr| {
+            matches!(attr, RouteAttribute::Destination(RouteAddress::Inet(v4)) if *v4 == cidr.network())
+        }) && msg
+            .attributes
+            .iter()
+            .any(|attr| matches!(attr, RouteAttribute::Oif(idx) if *idx == dev_idx));
+        if matches {
+            return handle
+                .route()
+                .del(msg.clone())
+                .execute()
+                .await
+                .map_err(|e| NetworkError::Route {
+                    op: "remove_via_dev",
+                    cidr,
+                    via: dev.into(),
+                    reason: e.to_string(),
+                });
+        }
+    }
+    debug!(%cidr, dev, "route via device already absent");
+    Ok(())
+}
+
 fn handle_route_result(
     res: Result<(), rtnetlink::Error>,
     op: &'static str,

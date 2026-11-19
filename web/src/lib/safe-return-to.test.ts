@@ -12,6 +12,21 @@ import {
 } from './safe-return-to'
 
 describe('safeReturnTo', () => {
+  test('rejects paths whose dot segments normalise to another origin', () => {
+    for (const value of [
+      '/projects/..//example.com',
+      '/a/../..//example.com/x',
+      '/%2e%2e//example.com',
+    ]) {
+      expect(safeReturnTo(value)).toBeNull()
+      expect(
+        returnToFromSearch(new URLSearchParams({ returnTo: value }))
+      ).toBeNull()
+    }
+    // Dot segments that stay in-app are still accepted, normalised.
+    expect(safeReturnTo('/projects/../settings')).toBe('/settings')
+  })
+
   test('accepts in-app paths with query and hash', () => {
     expect(safeReturnTo('/projects/demo/errors/alert-rules/new')).toBe(
       '/projects/demo/errors/alert-rules/new'

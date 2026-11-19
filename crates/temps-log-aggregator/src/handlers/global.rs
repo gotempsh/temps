@@ -41,7 +41,7 @@ use axum_extra::extract::Query;
 use chrono::{DateTime, Utc};
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use temps_auth::{permission_guard, AuthContext, RequireAuth};
+use temps_authz::{permission_guard, AuthContext, RequireAuth};
 use temps_core::problemdetails::{self, Problem, ProblemDetails};
 
 /// Backstop deadline. The store's own per-request time/byte budget is tighter
@@ -887,10 +887,31 @@ pub(crate) async fn global_log_histogram(
     let group_by = extra.group_by.as_deref().map(parse_group_key).transpose()?;
     let bucket_secs = extra.bucket_secs.unwrap_or(60).clamp(1, 86_400 * 7);
     let max_groups = extra.max_groups.unwrap_or(8).clamp(1, 50);
-    let buckets = state
+    let indexed = state
         .line_index
         .histogram(&query, &attrs, bucket_secs, group_by.as_ref(), max_groups)
         .await?;
+    // The index holds sealed chunks only; the newest minutes are still in
+    // head buffers. Count those too, or a live chart ends in an empty tail.
+    // Attribute groups are left to the index: a head line has no indexed
+    // attribute columns to group by the same way.
+    let head_group = match group_by.as_ref() {
+        Some(GroupKey::Attr(_)) => None,
+        Some(GroupKey::Label(field)) => Some(Some(*field)),
+        None => Some(None),
+    };
+    let unsealed = match head_group {
+        Some(field) => {
+            let mut head_query = query.clone();
+            head_query.attrs = attrs.clone();
+            state
+                .store
+                .unsealed_histogram(&head_query, bucket_secs, field)
+                .await?
+        }
+        None => Vec::new(),
+    };
+    let buckets = crate::index::analytics::merge_histogram(indexed, unsealed, max_groups);
     Ok(Json(HistogramResponse { buckets }))
 }
 
@@ -1242,6 +1263,9 @@ mod ingest_budget_tests {
             dropped_lines: 10,
             dropped_bytes: 800,
             reason: IngestDropReason::LinesPerSec,
+            lines_per_sec_limit: 250,
+            bytes_per_sec_limit: 256 * 1024,
+            limit_overridden: false,
             throttled_since: Utc::now(),
             last_dropped_at: Utc::now(),
         }

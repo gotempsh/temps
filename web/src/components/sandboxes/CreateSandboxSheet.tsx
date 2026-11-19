@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useEffect } from 'react'
+import { useEffect, useState, type ReactNode } from 'react'
 import { useNavigate } from 'react-router'
 import { useForm } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
@@ -46,12 +46,20 @@ import { problemDetail } from '@/lib/api-problem'
 import { cn } from '@/lib/utils'
 import {
   AUTO_NODE,
+  DEFAULT_BACKEND,
   PREVIEW_PASSWORD_MIN_LEN,
+  backendChoices,
   createSandboxFormDefaults,
   createSandboxFormSchema,
+  nodeRunsBackend,
+  targetNode,
   toCreateSandboxBody,
   type CreateSandboxFormValues,
 } from './sandbox-create'
+import { SandboxBackendLogo } from './SandboxBackendLogo'
+import { SandboxCreationSteps } from './SandboxCreationSteps'
+import { useSandboxCreation } from './useSandboxCreation'
+import { creationUntracked, newCreationId } from './sandbox-creation'
 
 const LIFECYCLES = [
   {
@@ -67,6 +75,27 @@ const LIFECYCLES = [
       'A long-lived place to work. It sleeps when idle and wakes on the next use; nothing deletes it automatically.',
   },
 ] as const
+
+const BACKEND_DESCRIPTIONS: Record<
+  string,
+  { title: string; description: string }
+> = {
+  docker: {
+    title: 'Docker',
+    description:
+      'A namespaced container. Starts fastest and runs on every node.',
+  },
+  firecracker: {
+    title: 'Firecracker',
+    description:
+      'A hardware-virtualized microVM (KVM). The strongest isolation, for untrusted code.',
+  },
+  microsandbox: {
+    title: 'microsandbox',
+    description:
+      'A libkrun microVM (experimental). For trusted and agent workloads.',
+  },
+}
 
 interface CreateSandboxSheetProps {
   open: boolean
@@ -108,12 +137,22 @@ export function CreateSandboxSheet({
   })
   const { reset: resetCreate } = create
 
+  // The id the current attempt's steps are tracked under. Set on submit,
+  // kept after a failure so the failed step stays on screen.
+  const [creationId, setCreationId] = useState<string | null>(null)
+  // When this attempt's create request ended: a 404 read before then may
+  // predate the server registering the id, so it is read again after.
+  const [requestEndedAt, setRequestEndedAt] = useState<number | null>(null)
+  const creation = useSandboxCreation(creationId, requestEndedAt)
+
   // Start from a clean form, and without the previous attempt's error, each
   // time the sheet is opened (it stays mounted while closed).
   useEffect(() => {
     if (!open) return
     form.reset(createSandboxFormDefaults)
     resetCreate()
+    setCreationId(null)
+    setRequestEndedAt(null)
   }, [open, form, resetCreate])
 
   const placement = useQuery({
@@ -121,18 +160,39 @@ export function CreateSandboxSheet({
     enabled: open && available,
     retry: false,
   })
-  const nodes = (placement.data?.nodes ?? []).filter((node) => node.eligible)
+  const allNodes = placement.data?.nodes ?? []
+  const nodes = allNodes.filter((node) => node.eligible)
+  const selectedNode = form.watch('node')
+  const selectedBackend = form.watch('backend')
+  const backends = backendChoices(allNodes, selectedNode)
+  const target = targetNode(allNodes, selectedNode)
 
-  const submit = (values: CreateSandboxFormValues) =>
-    create.mutate({ body: toCreateSandboxBody(values) })
+  const submit = (values: CreateSandboxFormValues) => {
+    const id = newCreationId()
+    setCreationId(id)
+    setRequestEndedAt(null)
+    create.mutate(
+      { body: { ...toCreateSandboxBody(values), creation_id: id } },
+      { onSettled: () => setRequestEndedAt(Date.now()) }
+    )
+  }
+  // A refused create the server never tracked has no steps: its error
+  // alone says what happened. Steps the server stopped tracking (a 404
+  // after they were read: it restarted) would stay "running" forever, so
+  // they are dropped too.
+  const showSteps =
+    creationId !== null &&
+    (create.isPending ||
+      (create.isError &&
+        creation.data !== undefined &&
+        !(creation.isError && creationUntracked(creation.error))))
 
   return (
     <Sheet
       open={open}
-      onOpenChange={(next) => {
-        if (create.isPending) return
-        onOpenChange(next)
-      }}
+      // Closing while a create is in flight is safe: the server finishes it
+      // whether or not anyone is still waiting, and it shows up in the list.
+      onOpenChange={onOpenChange}
     >
       <SheetContent className="flex w-full flex-col gap-0 overflow-y-auto sm:max-w-lg">
         <SheetHeader>
@@ -338,7 +398,21 @@ export function CreateSandboxSheet({
                 render={({ field }) => (
                   <FormItem>
                     <FormLabel>Node</FormLabel>
-                    <Select value={field.value} onValueChange={field.onChange}>
+                    <Select
+                      value={field.value}
+                      onValueChange={(value) => {
+                        field.onChange(value)
+                        // A backend the new node cannot run goes back to the
+                        // default rather than failing the create.
+                        const still = backendChoices(allNodes, value).find(
+                          (choice) =>
+                            choice.backend === form.getValues('backend')
+                        )
+                        if (still && !still.available) {
+                          form.setValue('backend', DEFAULT_BACKEND)
+                        }
+                      }}
+                    >
                       <FormControl>
                         <SelectTrigger>
                           <SelectValue />
@@ -348,11 +422,19 @@ export function CreateSandboxSheet({
                         <SelectItem value={AUTO_NODE}>
                           Automatic placement
                         </SelectItem>
-                        {nodes.map((node) => (
-                          <SelectItem key={node.id} value={node.name}>
-                            {node.name} ({node.live_sandboxes} running)
-                          </SelectItem>
-                        ))}
+                        {nodes.map((node) => {
+                          const runs = nodeRunsBackend(node, selectedBackend)
+                          return (
+                            <SelectItem
+                              key={node.id}
+                              value={node.name}
+                              disabled={!runs}
+                            >
+                              {node.name} ({node.live_sandboxes} running)
+                              {!runs && ` · no ${selectedBackend}`}
+                            </SelectItem>
+                          )
+                        })}
                       </SelectContent>
                     </Select>
                     <FormMessage />
@@ -360,6 +442,56 @@ export function CreateSandboxSheet({
                 )}
               />
             </div>
+
+            <FormField
+              control={form.control}
+              name="backend"
+              render={({ field }) => (
+                <FormItem>
+                  <FormLabel>Backend</FormLabel>
+                  <FormControl>
+                    <RadioGroup
+                      value={field.value}
+                      onValueChange={field.onChange}
+                      className="grid gap-2"
+                    >
+                      <BackendCard
+                        value={DEFAULT_BACKEND}
+                        selected={field.value === DEFAULT_BACKEND}
+                        title="Platform default"
+                        description={
+                          target
+                            ? `Whatever ${target.name} runs by default.`
+                            : 'Whatever the node runs by default.'
+                        }
+                      />
+                      {backends.map((choice) => {
+                        const text = BACKEND_DESCRIPTIONS[choice.backend]
+                        return (
+                          <BackendCard
+                            key={choice.backend}
+                            value={choice.backend}
+                            selected={field.value === choice.backend}
+                            disabled={!choice.available}
+                            title={text?.title ?? choice.backend}
+                            description={text?.description ?? ''}
+                            reason={choice.available ? null : choice.reason}
+                            logo={
+                              <SandboxBackendLogo backend={choice.backend} />
+                            }
+                          />
+                        )
+                      })}
+                    </RadioGroup>
+                  </FormControl>
+                  <FormDescription>
+                    Which backends you can pick depends on the node: worker
+                    nodes run Docker sandboxes only.
+                  </FormDescription>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
 
             <FormField
               control={form.control}
@@ -385,6 +517,18 @@ export function CreateSandboxSheet({
               )}
             />
 
+            {showSteps && (
+              <div className="space-y-2 rounded-lg border p-3">
+                <SandboxCreationSteps creation={creation.data} />
+                {create.isPending && (
+                  <p className="text-xs text-muted-foreground">
+                    You can close this panel: the sandbox keeps starting and
+                    appears in the sandbox list when it is ready.
+                  </p>
+                )}
+              </div>
+            )}
+
             {create.isError && (
               <Alert variant="destructive">
                 <AlertDescription>
@@ -401,9 +545,8 @@ export function CreateSandboxSheet({
                 type="button"
                 variant="outline"
                 onClick={() => onOpenChange(false)}
-                disabled={create.isPending}
               >
-                Cancel
+                {create.isPending ? 'Close' : 'Cancel'}
               </Button>
               <Button type="submit" disabled={create.isPending || !available}>
                 {create.isPending && (
@@ -416,5 +559,60 @@ export function CreateSandboxSheet({
         </Form>
       </SheetContent>
     </Sheet>
+  )
+}
+
+/** One choice in the backend picker. An unavailable one stays visible and says why. */
+function BackendCard({
+  value,
+  selected,
+  disabled = false,
+  title,
+  description,
+  reason,
+  logo,
+}: {
+  value: string
+  selected: boolean
+  disabled?: boolean
+  title: string
+  description: string
+  reason?: string | null
+  logo?: ReactNode
+}) {
+  const id = `backend-${value}`
+  return (
+    <Label
+      htmlFor={id}
+      className={cn(
+        'flex items-start gap-3 rounded-lg border p-3 font-normal',
+        disabled ? 'cursor-not-allowed opacity-60' : 'cursor-pointer',
+        selected && 'border-primary bg-primary/5'
+      )}
+    >
+      <RadioGroupItem
+        id={id}
+        value={value}
+        disabled={disabled}
+        className="mt-0.5"
+      />
+      <span className="min-w-0 space-y-1">
+        <span className="flex items-center gap-1.5 text-sm font-medium">
+          {logo}
+          {title}
+        </span>
+        <span className="block text-xs text-muted-foreground">
+          {description}
+        </span>
+        {reason && (
+          <span className="block break-words text-xs text-muted-foreground">
+            <span className="font-medium text-foreground">
+              Not available here:
+            </span>{' '}
+            {reason}
+          </span>
+        )}
+      </span>
+    </Label>
   )
 }

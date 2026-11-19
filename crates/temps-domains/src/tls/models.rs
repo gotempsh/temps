@@ -365,7 +365,9 @@ mod tests {
             domain: "example.com".to_string(),
             certificate_pem: String::new(),
             private_key_pem: String::new(),
-            expiration_time: chrono::Utc::now() + Duration::days(45),
+            // Stay away from the day boundary so clock resolution cannot
+            // change the expected number of whole days remaining.
+            expiration_time: chrono::Utc::now() + Duration::hours(44 * 24 + 12),
             last_renewed: None,
             is_wildcard: false,
             verification_method: "tls-alpn-01".to_string(),
@@ -374,7 +376,7 @@ mod tests {
 
         assert!(!cert.is_expired());
         assert!(!cert.needs_renewal());
-        assert_eq!(cert.days_until_expiry(), 44); // Roughly 44-45 days
+        assert_eq!(cert.days_until_expiry(), 44);
 
         // Test needs renewal (< 30 days)
         cert.expiration_time = chrono::Utc::now() + Duration::days(25);

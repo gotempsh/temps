@@ -44,6 +44,8 @@ pub struct Model {
     pub step_index: i32,
     /// Machine-readable operation identifier, e.g. `"redeploy_deployment"`.
     pub operation_id: String,
+    /// Publication of the plugin tool that was proposed; core actions have none.
+    pub plugin_revision: Option<String>,
     /// HTTP method the operation will use: `"POST"`, `"PUT"`, `"PATCH"`, or `"DELETE"`.
     pub method: String,
     /// Human-readable one-liner shown in the confirmation UI.

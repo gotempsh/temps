@@ -24,6 +24,7 @@
 //! PATCH /deployments/{id}/metrics/enable
 //!
 //! GET  /nodes/{id}/metrics
+//! GET  /nodes/{id}/metrics/disk-health
 //! ```
 //!
 //! The `range` query param accepts `"1h"` | `"6h"` | `"24h"` | `"7d"`.
@@ -43,7 +44,6 @@ use axum::{
 use chrono::{DateTime, Duration, Utc};
 use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, Set};
 use serde::{Deserialize, Serialize};
-#[cfg(test)]
 use temps_auth::Permission;
 use temps_auth::{permission_guard, RequireAuth};
 use temps_core::{
@@ -78,9 +78,9 @@ use crate::node_alert_rule_service::{
 /// Compute a histogram quantile via linear interpolation (same algorithm as
 /// Prometheus `histogram_quantile()`).
 ///
-/// This is exposed for future use when `MetricsStore::query_range_histogram()`
-/// lands (tracked in issue #12).  Currently used only in tests.
-#[allow(dead_code)]
+/// Test-only until `MetricsStore::query_range_histogram()` lands (tracked in
+/// issue #12); move it out of `cfg(test)` when a handler needs it.
+#[cfg(test)]
 fn histogram_quantile(q: f64, bounds: &[f64], counts: &[u64]) -> f64 {
     if bounds.is_empty() || counts.is_empty() {
         return f64::NAN;
@@ -301,16 +301,17 @@ pub struct UpdateAlertRuleRequest {
 
 /// Request body for creating a resource alert on a node.
 ///
-/// Only the usage percentages can be alerted on: `node.cpu_percent`,
-/// `node.memory_percent` and `node.disk_percent`. `threshold` is a percentage
-/// (0-100). A node has at most one rule per metric.
+/// A rule watches a usage percentage (`node.cpu_percent`, `node.memory_percent`,
+/// `node.disk_percent`; `threshold` 0-100) or a disk-health metric
+/// (`node.raid_degraded`, `node.disk_wear_percent`, `node.disk_media_errors`;
+/// `threshold` 0 or more). A node has at most one rule per metric.
 #[derive(Debug, Deserialize, ToSchema)]
 #[schema(as = NodeCreateAlertRuleRequest)]
 pub struct CreateNodeAlertRuleRequest {
     pub name: String,
-    /// One of `node.cpu_percent`, `node.memory_percent`, `node.disk_percent`.
+    /// One of the usage percentages or disk-health metrics listed above.
     pub metric_name: String,
-    /// Percentage between 0 and 100.
+    /// 0-100 for a usage percentage; 0 or more for a disk-health metric.
     pub threshold: f64,
     /// One of `>`, `<`, `>=`, `<=`.
     pub comparator: String,
@@ -522,26 +523,37 @@ async fn get_service_metrics_status(
     ))
 }
 
-/// Per-database metric values for a Postgres service.
+/// Per-database metric values for a Postgres or MariaDB service.
 ///
-/// A Postgres instance can host many databases (some unrelated to this
-/// service). The collector records per-`datname` series; this groups the
-/// latest value of each requested metric by database so the UI can render a
-/// "Databases" breakdown table instead of one collapsed number.
+/// A Postgres or MariaDB instance can host many databases (some unrelated to
+/// this service). The collector records one series per database — labelled
+/// `datname` for Postgres, `schema` for MariaDB; this groups the latest value
+/// of each of the engine's per-database metrics by database so the UI can
+/// render a "Databases" breakdown table instead of one collapsed number.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct DatabaseMetricsRow {
-    /// Database name (`datname`).
+    /// Database name: the `datname` of a Postgres database, or the schema
+    /// name of a MariaDB database.
     pub database: String,
-    /// Latest value of each requested metric for this database
-    /// (e.g. `{"pg.database_size_bytes": 7943871, "pg.cache_hit_ratio": 0.99}`).
+    /// Latest value of each of the engine's per-database metrics for this
+    /// database, keyed by metric name (e.g. `{"pg.database_size_bytes":
+    /// 7943871, "pg.cache_hit_ratio": 0.99}` for Postgres, or
+    /// `{"mariadb.database_size_bytes": 1589248, "mariadb.tables": 3}` for
+    /// MariaDB). A metric that has not been reported is absent.
     pub metrics: HashMap<String, f64>,
 }
 
 /// Response for the per-database metrics breakdown.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct DatabaseMetricsResponse {
-    /// One entry per database, sorted by the first metric descending
-    /// (largest first) so the biggest database leads the table.
+    /// One entry per database, largest first by the engine's
+    /// `*.database_size_bytes` metric (ties broken by name) so the biggest
+    /// database leads the table. Empty when the service's engine has no
+    /// per-database series (for example Redis or S3) or nothing has been
+    /// scraped yet. The MariaDB collector labels at most the 100 largest
+    /// schemas per scrape; the response covers the latest lookback window, so
+    /// during schema churn it can briefly include schemas from an earlier
+    /// scrape as well.
     pub databases: Vec<DatabaseMetricsRow>,
 }
 
@@ -551,9 +563,13 @@ pub struct DatabaseMetricsResponse {
 // Must stay in sync with the web `PG_PER_DATABASE_GROUPS` list in
 // ServiceMonitoring.tsx — every metric the per-database section displays has to
 // be requested here, or the UI shows "—" for the missing ones.
-const PER_DATABASE_METRICS: &[&str] = &[
+// `pg.cache_blocks_accessed_15m` is not a tile: the UI reads it to show the cache
+// hit ratio as empty when the same scrape's 15-minute window saw no block
+// access (the latest stored ratio can be older than that window).
+const PG_PER_DATABASE_METRICS: &[&str] = &[
     "pg.database_size_bytes",
     "pg.cache_hit_ratio",
+    "pg.cache_blocks_accessed_15m",
     "pg.tuple_fetch_ratio",
     "pg.commits_total",
     "pg.rollbacks_total",
@@ -565,11 +581,56 @@ const PER_DATABASE_METRICS: &[&str] = &[
     "pg.tuples_deleted_total",
 ];
 
-/// Return the latest per-database metric values for a Postgres service.
+// Per-schema series of the MariaDB collector (`temps_metrics::collector::
+// mariadb`). Must stay in sync with the web `MARIADB_PER_DATABASE_GROUPS` list
+// in web/src/lib/mariadb-metrics.ts.
+const MARIADB_PER_DATABASE_METRICS: &[&str] = &[
+    "mariadb.database_size_bytes",
+    "mariadb.data_size_bytes",
+    "mariadb.index_size_bytes",
+    "mariadb.data_free_bytes",
+    "mariadb.tables",
+    "mariadb.rows_estimated",
+];
+
+/// Where an engine's collector records per-database series.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PerDatabaseLayout {
+    /// Label carrying the database name.
+    label_key: &'static str,
+    metrics: &'static [&'static str],
+    /// Metric the breakdown is sorted by, largest first.
+    size_metric: &'static str,
+}
+
+/// The per-database layout of `service_type`, or `None` when its collector
+/// records no per-database series.
+fn per_database_layout(service_type: &str) -> Option<PerDatabaseLayout> {
+    match service_type.trim().to_ascii_lowercase().as_str() {
+        "postgres" => Some(PerDatabaseLayout {
+            label_key: "datname",
+            metrics: PG_PER_DATABASE_METRICS,
+            size_metric: "pg.database_size_bytes",
+        }),
+        // MariaDB calls databases schemas; one series per schema.
+        "mariadb" => Some(PerDatabaseLayout {
+            label_key: "schema",
+            metrics: MARIADB_PER_DATABASE_METRICS,
+            size_metric: "mariadb.database_size_bytes",
+        }),
+        _ => None,
+    }
+}
+
+/// Return the latest per-database metric values for a Postgres or MariaDB
+/// service.
 ///
-/// Groups `pg_stat_database` / size metrics by `datname` so the UI can show a
-/// breakdown table (each database with its own size, cache-hit ratio, etc.)
-/// rather than collapsing every database into one value.
+/// Postgres: groups `pg_stat_database` and size metrics by `datname` (size,
+/// cache-hit ratio, commits, tuple activity). MariaDB: groups storage metrics
+/// by schema (data, index and free-space size, table count, estimated rows).
+/// The UI shows this as a breakdown table instead of collapsing every database
+/// into one value. Engines without per-database series get an empty list
+/// while the metrics store is available; without it the endpoint returns 503.
 #[utoipa::path(
     get,
     path = "/external-services/{id}/metrics/by-database",
@@ -577,8 +638,9 @@ const PER_DATABASE_METRICS: &[&str] = &[
     tag = "Metrics",
     params(("id" = i32, Path, description = "External service ID")),
     responses(
-        (status = 200, description = "Per-database metric breakdown", body = DatabaseMetricsResponse),
+        (status = 200, description = "Per-database metric breakdown; empty for engines without per-database series", body = DatabaseMetricsResponse),
         (status = 401, description = "Unauthorized"),
+        (status = 404, description = "External service not found"),
         (status = 503, description = "Metrics not available"),
         (status = 500, description = "Internal server error"),
     ),
@@ -599,12 +661,39 @@ async fn get_service_metrics_by_database(
             .build()
     })?;
 
+    let service = state
+        .external_service_manager
+        .get_service(id)
+        .await
+        .map_err(|e| match e {
+            crate::services::ExternalServiceError::ServiceNotFound { .. } => not_found()
+                .detail(format!("External service {} not found", id))
+                .build(),
+            other => {
+                error!(service_id = id, error = %other, "Failed to load service for per-database metrics");
+                internal_server_error()
+                    .detail(format!(
+                        "Failed to load external service {} for per-database metrics: {}",
+                        id, other
+                    ))
+                    .build()
+            }
+        })?;
+    let Some(layout) = per_database_layout(&service.service_type) else {
+        return Ok((
+            StatusCode::OK,
+            Json(DatabaseMetricsResponse {
+                databases: Vec::new(),
+            }),
+        ));
+    };
+
     let rows = store
         .query_latest_by_label(LatestByLabelQuery {
             source_kind: SourceKind::Database,
             source_id: id,
-            names: PER_DATABASE_METRICS.iter().map(|s| s.to_string()).collect(),
-            label_key: "datname".to_string(),
+            names: layout.metrics.iter().map(|s| s.to_string()).collect(),
+            label_key: layout.label_key.to_string(),
         })
         .await
         .map_err(|e| {
@@ -631,16 +720,8 @@ async fn get_service_metrics_by_database(
 
     // Largest database first (by the headline size metric); fall back to name.
     databases.sort_by(|a, b| {
-        let av = a
-            .metrics
-            .get("pg.database_size_bytes")
-            .copied()
-            .unwrap_or(0.0);
-        let bv = b
-            .metrics
-            .get("pg.database_size_bytes")
-            .copied()
-            .unwrap_or(0.0);
+        let av = a.metrics.get(layout.size_metric).copied().unwrap_or(0.0);
+        let bv = b.metrics.get(layout.size_metric).copied().unwrap_or(0.0);
         bv.partial_cmp(&av)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.database.cmp(&b.database))
@@ -950,7 +1031,7 @@ async fn delete_service_alert_rule(
 /// Enable or disable metric collection for an external service.
 ///
 /// When `enabled=true`, seeds the default alert rules for the service's engine
-/// via [`temps_monitoring::seed_default_rules`] (idempotent).
+/// via [`temps_alarms::seed_default_rules`] (idempotent).
 #[utoipa::path(
     patch,
     path = "/external-services/{id}/metrics/enable",
@@ -970,7 +1051,7 @@ async fn delete_service_alert_rule(
     ),
     security(("bearer_auth" = []))
 )]
-async fn toggle_service_metrics(
+pub(super) async fn toggle_service_metrics(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<AppState>>,
     Path(id): Path<i32>,
@@ -989,26 +1070,24 @@ async fn toggle_service_metrics(
             .external_service_manager
             .get_service(id)
             .await
-            .map_err(|e| {
-                let msg = e.to_string();
-                if msg.contains("not found") {
-                    not_found().detail("Service not found").build()
-                } else {
-                    internal_server_error()
-                        .detail(format!("Failed to load service: {}", e))
-                        .build()
+            .map_err(|error| match error {
+                crate::services::ExternalServiceError::ServiceNotFound { .. } => {
+                    not_found().detail(error.to_string()).build()
                 }
+                error => internal_server_error()
+                    .detail(format!("Failed to load service: {}", error))
+                    .build(),
             })?;
 
         if let Err(e) =
-            temps_monitoring::seed_default_rules(state.db.as_ref(), id, &service.service_type).await
+            temps_alarms::seed_default_rules(state.db.as_ref(), id, &service.service_type).await
         {
             // Do not enable metrics while silently omitting built-in alerts.
             return Err(match e {
-                temps_monitoring::DefaultRuleSeedError::Capacity { .. } => {
+                temps_alarms::DefaultRuleSeedError::Capacity { .. } => {
                     bad_request().detail(e.to_string()).build()
                 }
-                temps_monitoring::DefaultRuleSeedError::Database(_) => internal_server_error()
+                temps_alarms::DefaultRuleSeedError::Database(_) => internal_server_error()
                     .detail("Failed to install built-in alert rules")
                     .build(),
             });
@@ -1254,7 +1333,7 @@ async fn get_deployment_metrics_latest(
 /// Enable or disable OTLP metric ingestion for a deployment.
 ///
 /// When `enabled=true`, seeds the default container alert rules for the
-/// deployment via [`temps_monitoring::seed_default_container_rules`] (idempotent).
+/// deployment via [`temps_alarms::seed_default_container_rules`] (idempotent).
 #[utoipa::path(
     patch,
     path = "/deployments/{id}/metrics/enable",
@@ -1283,8 +1362,7 @@ async fn toggle_deployment_metrics(
     assert_deployment_owned_by_caller(id, &auth, &state).await?;
 
     if request.enabled {
-        if let Err(e) = temps_monitoring::seed_default_container_rules(state.db.as_ref(), id).await
-        {
+        if let Err(e) = temps_alarms::seed_default_container_rules(state.db.as_ref(), id).await {
             error!(
                 deployment_id = id,
                 error = %e,
@@ -1419,6 +1497,499 @@ async fn get_node_metrics_latest(
     })?;
 
     Ok((StatusCode::OK, Json(values)))
+}
+
+/// Console path where a node's disk health is shown: the server monitoring
+/// page for the control plane (node 0), the node's own page for a worker.
+fn disk_health_setup_path(node_id: i32) -> String {
+    if node_id == 0 {
+        "/monitoring/server".to_string()
+    } else {
+        format!("/settings/nodes/{node_id}")
+    }
+}
+
+/// One software RAID array on a node.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct RaidArrayHealth {
+    /// md device name, e.g. `md0`.
+    pub name: String,
+    /// Fewer members are active than the array was configured with.
+    pub degraded: bool,
+    /// Members missing or marked failed.
+    pub devices_failed: u32,
+}
+
+/// SMART health of one drive on a node.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct DriveHealthRow {
+    /// Device name, e.g. `nvme0` or `sda`.
+    pub device: String,
+    /// Percentage of rated endurance used (can exceed 100).
+    pub wear_percent: Option<f64>,
+    /// Media / reallocated-sector errors the drive has recorded.
+    pub media_errors: Option<u64>,
+    /// Bytes written over the drive's lifetime.
+    pub bytes_written: Option<u64>,
+}
+
+/// Latest disk-array and drive health for a node.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct NodeDiskHealthResponse {
+    /// `false` when the node has never reported disk health.
+    pub reported: bool,
+    pub raid_arrays: Vec<RaidArrayHealth>,
+    pub drives: Vec<DriveHealthRow>,
+    /// Physical drives found on the node.
+    pub drives_detected: u32,
+    /// Drives whose SMART data could be read.
+    pub drives_read: u32,
+    /// `true` when the node has not reported recently: the arrays and
+    /// drives above are the last values it sent, not its current state, so
+    /// they must not be presented as the node's health now.
+    pub stale: bool,
+    /// Why some or all drive health is missing, when it is.
+    pub reason: Option<String>,
+    /// Console path that shows this node's disk health.
+    pub setup_path: String,
+}
+
+/// Disk health from a node whose newest sample is older than this is
+/// reported as stale: it is the last thing the node said, not its state now.
+const DISK_HEALTH_MAX_AGE_MINUTES: i64 = 10;
+
+/// When the node last reported, if that is too long ago to call its disk
+/// health current.
+fn disk_health_stale_since(
+    health: &temps_metrics::collector::disk_health::NodeDiskHealth,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    health
+        .reported_at
+        .filter(|at| now - *at > Duration::minutes(DISK_HEALTH_MAX_AGE_MINUTES))
+}
+
+fn disk_health_reason(
+    health: &temps_metrics::collector::disk_health::NodeDiskHealth,
+    now: DateTime<Utc>,
+) -> Option<String> {
+    if !health.reported {
+        return Some(
+            "This node has not reported disk health. It is read on Linux hosts: by the \
+             control plane for itself, and by `temps agent` on a worker node, which sends \
+             it with every heartbeat. A worker running an older agent does not report it \
+             until the agent is upgraded."
+                .into(),
+        );
+    }
+    if let Some(reported_at) = disk_health_stale_since(health, now) {
+        return Some(format!(
+            "This node has not reported metrics since {}. The disk health shown is \
+             from then, not its current state: check that the node is online and, \
+             on a worker, that `temps agent` is running.",
+            reported_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        ));
+    }
+    if health.drives_detected > health.drives_read {
+        let missing = health.drives_detected - health.drives_read;
+        return Some(format!(
+            "SMART data could not be read for {missing} of {} drive(s). NVMe drives need \
+             temps (the server, or the agent on a worker) to run as root; SATA/SAS \
+             drives also need smartmontools (`smartctl`) installed.",
+            health.drives_detected
+        ));
+    }
+    None
+}
+
+impl NodeDiskHealthResponse {
+    fn new(
+        node_id: i32,
+        health: temps_metrics::collector::disk_health::NodeDiskHealth,
+        now: DateTime<Utc>,
+    ) -> Self {
+        let reason = disk_health_reason(&health, now);
+        let stale = health.reported && disk_health_stale_since(&health, now).is_some();
+        Self {
+            reported: health.reported,
+            raid_arrays: health
+                .raid_arrays
+                .into_iter()
+                .map(|a| RaidArrayHealth {
+                    name: a.name,
+                    degraded: a.degraded,
+                    devices_failed: a.devices_failed,
+                })
+                .collect(),
+            drives: health
+                .drives
+                .into_iter()
+                .map(|d| DriveHealthRow {
+                    device: d.device,
+                    wear_percent: d.wear_percent,
+                    media_errors: d.media_errors,
+                    bytes_written: d.bytes_written,
+                })
+                .collect(),
+            drives_detected: health.drives_detected,
+            drives_read: health.drives_read,
+            stale,
+            reason,
+            setup_path: disk_health_setup_path(node_id),
+        }
+    }
+}
+
+/// Latest software RAID and drive SMART health for a node.
+///
+/// Backs the disk-health panel on the server monitoring page. The headline
+/// values are also plain node metrics (`node.raid_degraded`,
+/// `node.disk_wear_percent`, `node.disk_media_errors`) that alert rules read.
+#[utoipa::path(
+    get,
+    path = "/nodes/{id}/metrics/disk-health",
+    operation_id = "NodeMetricsGetDiskHealth",
+    tag = "Metrics",
+    params(
+        ("id" = i32, Path, description = "Node ID (0 = control plane)"),
+    ),
+    responses(
+        (status = 200, description = "Disk health", body = NodeDiskHealthResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 503, description = "Metrics store not available"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn get_node_disk_health(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i32>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, SettingsRead);
+
+    let store = state.metrics_store.as_ref().ok_or_else(|| {
+        ErrorBuilder::new(StatusCode::SERVICE_UNAVAILABLE)
+            .title("Metrics Unavailable")
+            .detail("Metric collection is not enabled on this server")
+            .build()
+    })?;
+
+    let health = temps_metrics::collector::disk_health::read_node_disk_health(store.as_ref(), id)
+        .await
+        .map_err(|e| {
+            error!(node_id = id, error = %e, "Failed to query node disk health");
+            internal_server_error()
+                .detail(format!("Failed to query disk health for node {id}: {e}"))
+                .build()
+        })?;
+
+    Ok((
+        StatusCode::OK,
+        Json(NodeDiskHealthResponse::new(id, health, Utc::now())),
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// Nodes — all nodes at once (ADR 061)
+// ---------------------------------------------------------------------------
+
+/// Most nodes one cluster query may combine.
+const MAX_CLUSTER_NODES: usize = 64;
+
+/// A node whose newest sample is older than this is left out of the
+/// "All nodes" headline numbers rather than adding a stale value to them.
+const CLUSTER_LATEST_MAX_AGE_MINUTES: i64 = 10;
+
+/// Query for one metric combined across several nodes.
+#[derive(Debug, Deserialize, IntoParams, ToSchema)]
+#[into_params(parameter_in = Query)]
+pub struct ClusterMetricsRangeQuery {
+    /// Metric name, e.g. `"proxy.requests"`.
+    pub metric: String,
+    /// Comma-separated node ids (`0` = control plane), at most 64.
+    pub node_ids: String,
+    /// Time window: `"1h"` | `"6h"` | `"24h"` | `"7d"`.
+    /// Ignored when `start_time` and `end_time` are both set.
+    #[serde(default = "default_range")]
+    pub range: String,
+    /// Explicit window start (ISO 8601). Must be paired with `end_time`.
+    #[param(value_type = Option<String>, example = "2026-08-13T00:00:00Z")]
+    #[schema(value_type = Option<String>)]
+    pub start_time: Option<UtcDateTime>,
+    /// Explicit window end (ISO 8601). Must be paired with `start_time`.
+    #[param(value_type = Option<String>, example = "2026-08-13T12:00:00Z")]
+    #[schema(value_type = Option<String>)]
+    pub end_time: Option<UtcDateTime>,
+}
+
+/// Nodes to combine for the latest values.
+#[derive(Debug, Deserialize, IntoParams, ToSchema)]
+#[into_params(parameter_in = Query)]
+pub struct ClusterMetricsLatestQuery {
+    /// Comma-separated node ids (`0` = control plane), at most 64.
+    pub node_ids: String,
+}
+
+/// Whether a worker is reporting metrics to the control plane.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct NodeMetricsReportingStatus {
+    pub node_id: i32,
+    /// `reporting`, `agent_too_old`, `unreachable`, `rejected` or `invalid`.
+    pub state: String,
+    /// ISO 8601, when the control plane last pulled.
+    pub last_attempt_at: String,
+    /// ISO 8601, when a report from the node was last stored.
+    pub last_report_at: Option<String>,
+    /// What went wrong, when `state` is not `reporting`.
+    pub detail: Option<String>,
+}
+
+fn parse_node_ids(raw: &str) -> Result<Vec<i32>, Problem> {
+    let mut ids: Vec<i32> = Vec::new();
+    for part in raw.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        let id: i32 = part.parse().map_err(|_| {
+            bad_request()
+                .detail(format!("node_ids: '{part}' is not a node id"))
+                .build()
+        })?;
+        if id < 0 {
+            return Err(bad_request()
+                .detail(format!("node_ids: {id} is not a node id"))
+                .build());
+        }
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+        if ids.len() > MAX_CLUSTER_NODES {
+            return Err(bad_request()
+                .detail(format!(
+                    "node_ids: at most {MAX_CLUSTER_NODES} nodes can be combined"
+                ))
+                .build());
+        }
+    }
+    if ids.is_empty() {
+        return Err(bad_request()
+            .detail("node_ids: name at least one node")
+            .build());
+    }
+    Ok(ids)
+}
+
+fn require_metrics_store(
+    state: &AppState,
+) -> Result<&Arc<dyn temps_metrics::MetricsStore>, Problem> {
+    state.metrics_store.as_ref().ok_or_else(|| {
+        ErrorBuilder::new(StatusCode::SERVICE_UNAVAILABLE)
+            .title("Metrics Unavailable")
+            .detail("Metric collection is not enabled on this server")
+            .build()
+    })
+}
+
+type NodeSeries = Vec<(DateTime<Utc>, Option<f64>)>;
+
+/// One metric's series for each node, over the same window and step so the
+/// buckets line up.
+async fn node_series(
+    store: &Arc<dyn temps_metrics::MetricsStore>,
+    node_ids: &[i32],
+    metric: &str,
+    window: (DateTime<Utc>, DateTime<Utc>, Duration),
+) -> Result<Vec<NodeSeries>, Problem> {
+    let (from, to, step) = window;
+    futures::future::try_join_all(node_ids.iter().map(|id| {
+        store.query_range_filled(RangeQuery {
+            source_kind: SourceKind::Node,
+            source_id: *id,
+            monotonic: is_monotonic_counter(metric),
+            name: metric.to_string(),
+            from,
+            to,
+            step,
+        })
+    }))
+    .await
+    .map_err(|e| {
+        error!(metric = %metric, error = %e, "Failed to query cluster metric range");
+        internal_server_error()
+            .detail(format!("Failed to query metrics: {e}"))
+            .build()
+    })
+}
+
+/// Fetch one metric combined across several nodes: summed counters, ratios
+/// of summed parts, the slowest node's latency, otherwise the mean.
+#[utoipa::path(
+    get,
+    path = "/nodes/metrics/cluster",
+    operation_id = "NodeMetricsGetClusterRange",
+    tag = "Metrics",
+    params(ClusterMetricsRangeQuery),
+    responses(
+        (status = 200, description = "Combined metric time series", body = Vec<MetricDataPoint>),
+        (status = 400, description = "Invalid query parameters"),
+        (status = 401, description = "Unauthorized"),
+        (status = 503, description = "Metrics store not available"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn get_cluster_metrics_range(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<ClusterMetricsRangeQuery>,
+) -> Result<impl IntoResponse, Problem> {
+    use temps_metrics::cluster::{
+        cluster_aggregate, combine_series, ratio_series, ClusterAggregate,
+    };
+    permission_guard!(auth, SettingsRead);
+    let store = require_metrics_store(&state)?;
+    let node_ids = parse_node_ids(&params.node_ids)?;
+    let window = resolve_range_window(&MetricsRangeQuery {
+        metric: params.metric.clone(),
+        range: params.range.clone(),
+        percentile: None,
+        start_time: params.start_time,
+        end_time: params.end_time,
+    })?;
+
+    let series = match cluster_aggregate(&params.metric) {
+        ClusterAggregate::Ratio {
+            numerator,
+            denominator,
+            scale,
+        } => {
+            let num = node_series(store, &node_ids, numerator, window).await?;
+            let den = node_series(store, &node_ids, denominator, window).await?;
+            ratio_series(
+                &combine_series(&num, ClusterAggregate::Sum),
+                &combine_series(&den, ClusterAggregate::Sum),
+                scale,
+            )
+        }
+        how => combine_series(
+            &node_series(store, &node_ids, &params.metric, window).await?,
+            how,
+        ),
+    };
+
+    let response: Vec<MetricDataPoint> = series
+        .into_iter()
+        .map(|(ts, v)| MetricDataPoint {
+            time: ts.to_rfc3339(),
+            value: v,
+        })
+        .collect();
+    Ok((StatusCode::OK, Json(response)))
+}
+
+/// Latest value of every metric, combined across several nodes. Nodes with
+/// nothing recorded in the last 10 minutes are left out.
+#[utoipa::path(
+    get,
+    path = "/nodes/metrics/cluster/latest",
+    operation_id = "NodeMetricsGetClusterLatest",
+    tag = "Metrics",
+    params(ClusterMetricsLatestQuery),
+    responses(
+        (status = 200, description = "Map of metric name to combined latest value", body = HashMap<String, f64>),
+        (status = 400, description = "Invalid query parameters"),
+        (status = 401, description = "Unauthorized"),
+        (status = 503, description = "Metrics store not available"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn get_cluster_metrics_latest(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<ClusterMetricsLatestQuery>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, SettingsRead);
+    let store = require_metrics_store(&state)?;
+    let node_ids = parse_node_ids(&params.node_ids)?;
+    let fresh_after = Utc::now() - Duration::minutes(CLUSTER_LATEST_MAX_AGE_MINUTES);
+
+    let per_node = futures::future::try_join_all(node_ids.iter().map(|id| async move {
+        let newest = store.latest_timestamp(SourceKind::Node, *id).await?;
+        if newest.is_none_or(|at| at < fresh_after) {
+            return Ok(None);
+        }
+        store
+            .query_latest(LatestQuery {
+                source_kind: SourceKind::Node,
+                source_id: *id,
+                names: vec![],
+            })
+            .await
+            .map(Some)
+    }))
+    .await
+    .map_err(|e: temps_metrics::MetricsError| {
+        error!(error = %e, "Failed to query latest cluster metrics");
+        internal_server_error()
+            .detail(format!("Failed to query latest metrics: {e}"))
+            .build()
+    })?;
+    let per_node: Vec<HashMap<String, f64>> = per_node.into_iter().flatten().collect();
+
+    Ok((
+        StatusCode::OK,
+        Json(temps_metrics::cluster::combine_latest(&per_node)),
+    ))
+}
+
+/// Whether each worker is reporting metrics, and why not. Workers the
+/// control plane does not pull yet (and the control plane itself) are absent.
+#[utoipa::path(
+    get,
+    path = "/nodes/metrics/reporting",
+    operation_id = "NodeMetricsGetReporting",
+    tag = "Metrics",
+    responses(
+        (status = 200, description = "Reporting status per worker", body = Vec<NodeMetricsReportingStatus>),
+        (status = 401, description = "Unauthorized"),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn get_node_metrics_reporting(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, SettingsRead);
+    let statuses: Vec<NodeMetricsReportingStatus> = state
+        .worker_metrics_status
+        .as_ref()
+        .map(|board| board.snapshot())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(node_id, status)| NodeMetricsReportingStatus {
+            node_id,
+            state: reporting_state_name(status.state).to_string(),
+            last_attempt_at: iso8601(status.last_attempt_at),
+            last_report_at: status.last_report_at.map(iso8601),
+            detail: status.detail,
+        })
+        .collect();
+    Ok((StatusCode::OK, Json(statuses)))
+}
+
+fn reporting_state_name(state: temps_metrics::WorkerReportState) -> &'static str {
+    use temps_metrics::WorkerReportState as S;
+    match state {
+        S::Reporting => "reporting",
+        S::AgentTooOld => "agent_too_old",
+        S::Unreachable => "unreachable",
+        S::Rejected => "rejected",
+        S::Invalid => "invalid",
+    }
+}
+
+fn iso8601(at: DateTime<Utc>) -> String {
+    at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
 // ---------------------------------------------------------------------------
@@ -1708,6 +2279,7 @@ fn log_and_convert(node_id: i32, error: NodeAlertRuleError) -> Problem {
         | NodeAlertRuleError::RuleNotFound { .. }
         | NodeAlertRuleError::AlreadyExists { .. }
         | NodeAlertRuleError::ControlPlaneRuleProtected { .. }
+        | NodeAlertRuleError::DefaultRuleProtected { .. }
         | NodeAlertRuleError::Validation { .. } => {
             info!(node_id, "Rejected node alert rule operation: {}", error)
         }
@@ -1735,6 +2307,13 @@ impl From<NodeAlertRuleError> for Problem {
                 ErrorBuilder::new(StatusCode::CONFLICT)
                     .type_("https://temps.sh/probs/control-plane-alert-rule-protected")
                     .title("Control-Plane Rule Cannot Be Deleted")
+                    .detail(error.to_string())
+                    .build()
+            }
+            NodeAlertRuleError::DefaultRuleProtected { .. } => {
+                ErrorBuilder::new(StatusCode::CONFLICT)
+                    .type_("https://temps.sh/probs/default-alert-rule-protected")
+                    .title("Default Rule Cannot Be Deleted")
                     .detail(error.to_string())
                     .build()
             }
@@ -1808,6 +2387,29 @@ pub(crate) async fn assert_service_owned_by_caller(
     auth: &temps_auth::AuthContext,
     state: &AppState,
 ) -> Result<(), Problem> {
+    authorize_service_caller(service_id, auth, state, None).await
+}
+
+/// [`assert_service_owned_by_caller`], plus: when project-scoped roles are
+/// configured, a session/API-key/CLI caller must hold `required` *within* a
+/// project the service is linked to, not just be a member of one. The
+/// instance-level `permission_guard!` alone would let a member whose project
+/// role is read-only change a service of that project.
+pub(crate) async fn assert_service_permission_for_caller(
+    service_id: i32,
+    auth: &temps_auth::AuthContext,
+    state: &AppState,
+    required: Permission,
+) -> Result<(), Problem> {
+    authorize_service_caller(service_id, auth, state, Some(required)).await
+}
+
+async fn authorize_service_caller(
+    service_id: i32,
+    auth: &temps_auth::AuthContext,
+    state: &AppState,
+    required: Option<Permission>,
+) -> Result<(), Problem> {
     use temps_entities::project_services;
 
     // For deployment tokens, check against the token's bound project.
@@ -1876,12 +2478,14 @@ pub(crate) async fn assert_service_owned_by_caller(
         return Ok(());
     }
 
-    session_caller_may_access_linked_projects(
-        auth,
-        &project_ids,
-        state.project_access_checker.as_deref(),
-    )
-    .await
+    let checker = state.project_access_checker.as_deref();
+    match required {
+        None => session_caller_may_access_linked_projects(auth, &project_ids, checker).await,
+        Some(required) => {
+            session_caller_has_permission_on_linked_projects(auth, &project_ids, checker, &required)
+                .await
+        }
+    }
 }
 
 fn unlinked_service_creator_may_access(
@@ -1930,7 +2534,10 @@ async fn session_caller_may_access_linked_projects(
 /// service. Installations without scoped project roles retain the existing
 /// membership behavior, while configured roles cannot use an instance-level
 /// permission to mutate a service outside their effective project grants.
-#[cfg(test)]
+///
+/// Per linked project: `Some(perms)` decides on its own (holds `required` or
+/// not); `None` (no scoped opinion) falls back to membership. Both lookups
+/// are batched, and any checker error or omitted project denies.
 async fn session_caller_has_permission_on_linked_projects(
     auth: &temps_auth::AuthContext,
     project_ids: &[i32],
@@ -1945,37 +2552,55 @@ async fn session_caller_has_permission_on_linked_projects(
         return Ok(());
     };
     let required = required.to_string();
-    for &project_id in project_ids {
-        let effective = checker
-            .effective_project_permissions(auth.user_id(), project_id)
+    let effective = checker
+        .effective_project_permissions_batch(auth.user_id(), project_ids)
+        .await
+        .map_err(|error| {
+            error!(
+                project_ids = ?project_ids,
+                error = %error,
+                "external service permission resolution failed closed"
+            );
+            internal_server_error()
+                .detail(format!(
+                    "Could not verify project permissions for external service access: {error}"
+                ))
+                .build()
+        })?;
+    if effective.values().any(
+        |permissions| matches!(permissions, Some(permissions) if permissions.contains(&required)),
+    ) {
+        return Ok(());
+    }
+
+    // Projects the checker returned no scoped opinion for. A project it
+    // omitted is not in this list, so it can only deny.
+    let membership_only: Vec<i32> = effective
+        .iter()
+        .filter(|(_, permissions)| permissions.is_none())
+        .map(|(project_id, _)| *project_id)
+        .collect();
+    if !membership_only.is_empty() {
+        let access = checker
+            .user_can_access_projects(auth.user_id(), &membership_only)
             .await
             .map_err(|error| {
+                error!(
+                    project_ids = ?membership_only,
+                    error = %error,
+                    "external service membership resolution failed closed"
+                );
                 internal_server_error()
                     .detail(format!(
-                        "Could not verify project permissions for external service access: {error}"
+                        "Could not verify project access for external service: {error}"
                     ))
                     .build()
             })?;
-        match effective {
-            Some(permissions) if permissions.iter().any(|permission| permission == &required) => {
-                return Ok(());
-            }
-            Some(_) => {}
-            None => {
-                let is_member = checker
-                    .user_can_access_project(auth.user_id(), project_id)
-                    .await
-                    .map_err(|error| {
-                        internal_server_error()
-                            .detail(format!(
-                                "Could not verify project access for external service: {error}"
-                            ))
-                            .build()
-                    })?;
-                if is_member {
-                    return Ok(());
-                }
-            }
+        if membership_only
+            .iter()
+            .any(|project_id| access.get(project_id).copied().unwrap_or(false))
+        {
+            return Ok(());
         }
     }
 
@@ -2159,8 +2784,15 @@ pub fn configure_metrics_routes() -> Router<Arc<AppState>> {
             patch(toggle_deployment_metrics),
         )
         // Node metrics
+        .route("/nodes/metrics/cluster", get(get_cluster_metrics_range))
+        .route(
+            "/nodes/metrics/cluster/latest",
+            get(get_cluster_metrics_latest),
+        )
+        .route("/nodes/metrics/reporting", get(get_node_metrics_reporting))
         .route("/nodes/{id}/metrics", get(get_node_metrics_range))
         .route("/nodes/{id}/metrics/latest", get(get_node_metrics_latest))
+        .route("/nodes/{id}/metrics/disk-health", get(get_node_disk_health))
         .route(
             "/nodes/{id}/metrics/alert-rules",
             get(list_node_alert_rules).post(create_node_alert_rule),
@@ -2192,6 +2824,10 @@ pub fn configure_metrics_routes() -> Router<Arc<AppState>> {
         toggle_deployment_metrics,
         get_node_metrics_range,
         get_node_metrics_latest,
+        get_node_disk_health,
+        get_cluster_metrics_range,
+        get_cluster_metrics_latest,
+        get_node_metrics_reporting,
         list_node_alert_rules,
         create_node_alert_rule,
         update_node_alert_rule,
@@ -2200,6 +2836,9 @@ pub fn configure_metrics_routes() -> Router<Arc<AppState>> {
     components(schemas(
         MetricDataPoint,
         MetricsRangeQuery,
+        ClusterMetricsRangeQuery,
+        ClusterMetricsLatestQuery,
+        NodeMetricsReportingStatus,
         MetricsStatusResponse,
         DatabaseMetricsRow,
         DatabaseMetricsResponse,
@@ -2209,6 +2848,9 @@ pub fn configure_metrics_routes() -> Router<Arc<AppState>> {
         CreateNodeAlertRuleRequest,
         ToggleServiceMetricsRequest,
         ToggleDeploymentMetricsRequest,
+        NodeDiskHealthResponse,
+        RaidArrayHealth,
+        DriveHealthRow,
     )),
     info(
         title = "Metrics API",
@@ -2225,6 +2867,67 @@ pub struct MetricsApiDoc;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: the per-database breakdown only ever queried Postgres
+    /// series, so a MariaDB service's per-schema metrics were never shown.
+    #[test]
+    fn mariadb_breakdown_reads_per_schema_series() {
+        let layout = per_database_layout("mariadb").expect("mariadb has a breakdown");
+        assert_eq!(layout.label_key, "schema");
+        assert_eq!(layout.size_metric, "mariadb.database_size_bytes");
+        assert!(layout.metrics.contains(&layout.size_metric));
+        assert!(layout.metrics.iter().all(|m| m.starts_with("mariadb.")));
+        assert_eq!(per_database_layout(" MariaDB "), Some(layout));
+    }
+
+    #[test]
+    fn postgres_breakdown_reads_per_datname_series() {
+        let layout = per_database_layout("postgres").expect("postgres has a breakdown");
+        assert_eq!(layout.label_key, "datname");
+        assert!(layout.metrics.contains(&layout.size_metric));
+        assert!(layout.metrics.iter().all(|m| m.starts_with("pg.")));
+        // The UI needs the ratio's own volume to tell a stale ratio from a
+        // current one.
+        assert!(layout.metrics.contains(&"pg.cache_hit_ratio"));
+        assert!(layout.metrics.contains(&"pg.cache_blocks_accessed_15m"));
+    }
+
+    #[test]
+    fn engines_without_per_database_series_have_no_breakdown() {
+        for engine in ["redis", "mongodb", "s3", "rustfs", ""] {
+            assert_eq!(per_database_layout(engine), None, "{engine}");
+        }
+    }
+
+    #[test]
+    fn cluster_node_ids_are_bounded_and_deduplicated() {
+        assert_eq!(parse_node_ids("0, 2,2,5").unwrap(), vec![0, 2, 5]);
+        assert!(parse_node_ids("").is_err());
+        assert!(parse_node_ids("1,x").is_err());
+        assert!(parse_node_ids("-1").is_err());
+        let too_many: Vec<String> = (0..=MAX_CLUSTER_NODES as i32)
+            .map(|i| i.to_string())
+            .collect();
+        assert!(parse_node_ids(&too_many.join(",")).is_err());
+        let max: Vec<String> = (0..MAX_CLUSTER_NODES as i32)
+            .map(|i| i.to_string())
+            .collect();
+        assert_eq!(
+            parse_node_ids(&max.join(",")).unwrap().len(),
+            MAX_CLUSTER_NODES
+        );
+    }
+
+    #[test]
+    fn reporting_timestamps_are_utc_with_a_z() {
+        use chrono::TimeZone;
+        let at = Utc.with_ymd_and_hms(2026, 10, 23, 19, 40, 0).unwrap();
+        assert_eq!(iso8601(at), "2026-10-23T19:40:00Z");
+        assert_eq!(
+            reporting_state_name(temps_metrics::WorkerReportState::AgentTooOld),
+            "agent_too_old"
+        );
+    }
 
     #[test]
     fn test_histogram_quantile_p50() {
@@ -2345,7 +3048,7 @@ mod tests {
 
     #[tokio::test]
     async fn alert_rule_creation_stops_at_the_per_service_limit() {
-        use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
+        use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
 
         let test_db = match TestDatabase::with_migrations().await {
             Ok(db) => db,
@@ -2410,7 +3113,7 @@ mod tests {
             .expect("fill to one slot below the cap");
         }
         let (seeded, custom) = tokio::join!(
-            temps_monitoring::seed_default_rules(db.as_ref(), a, "postgres"),
+            temps_alarms::seed_default_rules(db.as_ref(), a, "postgres"),
             insert_alert_rule_within_limit(
                 db.as_ref(),
                 a,
@@ -2420,15 +3123,15 @@ mod tests {
         );
         assert!(matches!(
             seeded,
-            Err(temps_monitoring::DefaultRuleSeedError::Capacity { .. })
+            Err(temps_alarms::DefaultRuleSeedError::Capacity { .. })
         ));
         assert!(custom.is_ok() || matches!(custom, Err(AlertRuleCreateError::LimitReached { .. })));
-        let error = temps_monitoring::seed_default_rules(db.as_ref(), a, "postgres")
+        let error = temps_alarms::seed_default_rules(db.as_ref(), a, "postgres")
             .await
             .expect_err("full custom-rule budget must report missing defaults");
         assert!(matches!(
             error,
-            temps_monitoring::DefaultRuleSeedError::Capacity { existing: 100, .. }
+            temps_alarms::DefaultRuleSeedError::Capacity { existing: 100, .. }
         ));
         use sea_orm::PaginatorTrait;
         assert_eq!(
@@ -2459,7 +3162,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        temps_monitoring::seed_default_rules(db.as_ref(), a, "postgres")
+        temps_alarms::seed_default_rules(db.as_ref(), a, "postgres")
             .await
             .expect("complete defaults fit after freeing capacity");
         let after_seed = monitoring_alert_rules::Entity::find()
@@ -2468,7 +3171,7 @@ mod tests {
             .await
             .unwrap();
         assert!(after_seed > 90 && after_seed <= 100);
-        temps_monitoring::seed_default_rules(db.as_ref(), a, "postgres")
+        temps_alarms::seed_default_rules(db.as_ref(), a, "postgres")
             .await
             .expect("idempotent retry");
         assert_eq!(
@@ -2675,6 +3378,77 @@ mod tests {
         assert_eq!(problem.into_response().status(), StatusCode::FORBIDDEN);
     }
 
+    /// Project 10 has scoped roles (read only); project 11 has none, so its
+    /// membership decides. Failing to resolve permissions denies.
+    struct MixedServicePermissionChecker {
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl temps_core::ProjectAccessChecker for MixedServicePermissionChecker {
+        async fn user_can_access_project(
+            &self,
+            _user_id: i32,
+            project_id: i32,
+        ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(project_id == 11)
+        }
+
+        async fn effective_project_permissions(
+            &self,
+            _user_id: i32,
+            project_id: i32,
+        ) -> Result<Option<Vec<String>>, Box<dyn std::error::Error + Send + Sync>> {
+            if self.fail {
+                return Err("permission store unavailable".into());
+            }
+            Ok((project_id == 10).then(|| vec![Permission::ExternalServicesRead.to_string()]))
+        }
+    }
+
+    #[tokio::test]
+    async fn service_mutation_uses_membership_only_where_no_scoped_role_applies() {
+        let auth = test_session_auth(temps_auth::Role::User);
+        let checker = MixedServicePermissionChecker { fail: false };
+        let required = Permission::ExternalServicesWrite;
+
+        session_caller_has_permission_on_linked_projects(
+            &auth,
+            &[10, 11],
+            Some(&checker),
+            &required,
+        )
+        .await
+        .expect("membership of the unscoped project 11 authorizes");
+
+        let problem = session_caller_has_permission_on_linked_projects(
+            &auth,
+            &[10],
+            Some(&checker),
+            &required,
+        )
+        .await
+        .expect_err("project 10's read-only role must not authorize a write");
+        assert_eq!(problem.into_response().status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn service_mutation_fails_closed_when_permissions_cannot_be_resolved() {
+        let checker = MixedServicePermissionChecker { fail: true };
+        let problem = session_caller_has_permission_on_linked_projects(
+            &test_session_auth(temps_auth::Role::User),
+            &[11],
+            Some(&checker),
+            &Permission::ExternalServicesWrite,
+        )
+        .await
+        .expect_err("an unverifiable permission must deny");
+        assert_eq!(
+            problem.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
     #[tokio::test]
     async fn service_mutation_falls_back_to_membership_without_scoped_permissions() {
         let checker = EffectiveServicePermissionChecker {
@@ -2775,6 +3549,109 @@ mod tests {
                  declared operations: {served:?}"
             );
         }
+    }
+
+    #[test]
+    fn disk_health_response_explains_unread_drives() {
+        use temps_metrics::collector::disk_health::{DriveHealth, NodeDiskHealth};
+
+        let now = Utc::now();
+        let none = NodeDiskHealthResponse::new(0, NodeDiskHealth::default(), now);
+        assert_eq!(none.setup_path, "/monitoring/server");
+        assert_eq!(
+            NodeDiskHealthResponse::new(4, NodeDiskHealth::default(), now).setup_path,
+            "/settings/nodes/4"
+        );
+        assert!(!none.reported);
+        assert!(none
+            .reason
+            .as_deref()
+            .unwrap_or("")
+            .contains("not reported"));
+
+        let partial = NodeDiskHealthResponse::new(
+            0,
+            NodeDiskHealth {
+                reported: true,
+                drives: vec![DriveHealth {
+                    device: "nvme0".into(),
+                    wear_percent: Some(12.0),
+                    ..Default::default()
+                }],
+                drives_detected: 3,
+                drives_read: 1,
+                reported_at: Some(now - Duration::minutes(1)),
+                ..Default::default()
+            },
+            now,
+        );
+        let reason = partial.reason.expect("two drives were not read");
+        assert!(reason.contains("2 of 3"), "{reason}");
+        assert!(reason.contains("smartctl"), "{reason}");
+        assert_eq!(partial.drives[0].wear_percent, Some(12.0));
+
+        let complete = NodeDiskHealthResponse::new(
+            0,
+            NodeDiskHealth {
+                reported: true,
+                drives_detected: 1,
+                drives_read: 1,
+                ..Default::default()
+            },
+            now,
+        );
+        assert!(complete.reason.is_none());
+    }
+
+    /// The store keeps returning the last values a node sent after it stops
+    /// reporting, so old health must be called out instead of passing as
+    /// current.
+    #[test]
+    fn disk_health_from_a_node_that_stopped_reporting_is_marked_stale() {
+        use temps_metrics::collector::disk_health::{NodeDiskHealth, RaidArrayStatus};
+
+        let now = Utc::now();
+        let health = |age_minutes: i64| NodeDiskHealth {
+            reported: true,
+            raid_arrays: vec![RaidArrayStatus {
+                name: "md0".into(),
+                degraded: false,
+                devices_failed: 0,
+            }],
+            drives_detected: 1,
+            drives_read: 1,
+            reported_at: Some(now - Duration::minutes(age_minutes)),
+            ..Default::default()
+        };
+
+        let stale = NodeDiskHealthResponse::new(3, health(DISK_HEALTH_MAX_AGE_MINUTES + 50), now);
+        assert!(
+            stale.stale,
+            "old health must be flagged, not only explained"
+        );
+        let reason = stale.reason.expect("old health must be explained");
+        assert!(reason.contains("not reported metrics since"), "{reason}");
+        assert!(reason.contains("not its current state"), "{reason}");
+        assert_eq!(
+            stale.raid_arrays.len(),
+            1,
+            "the last values are still shown"
+        );
+
+        let fresh = NodeDiskHealthResponse::new(3, health(2), now);
+        assert!(!fresh.stale);
+        assert!(fresh.reason.is_none(), "{:?}", fresh.reason);
+    }
+
+    #[test]
+    fn disk_health_endpoint_is_in_the_served_openapi_doc() {
+        use utoipa::OpenApi as _;
+
+        let served = operation_keys(&crate::handlers::handlers::ExternalServiceApiDoc::openapi());
+        assert!(
+            served.contains("NodeMetricsGetDiskHealth (/nodes/{id}/metrics/disk-health)"),
+            "disk-health endpoint missing from the served OpenAPI document: {served:?}"
+        );
     }
 
     #[tokio::test]

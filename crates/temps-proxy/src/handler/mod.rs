@@ -1,8 +1,9 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-#[allow(clippy::module_inception)]
-pub mod captcha;
+pub(crate) mod audit;
+pub mod edge_rules;
+pub mod gate;
 #[allow(clippy::module_inception)]
 pub mod handler;
 pub mod ip_access_control;
@@ -10,4 +11,5 @@ pub mod password_wall;
 pub mod preview_wall;
 pub mod project_ip_access;
 pub mod proxy_logs;
+pub mod shield;
 pub mod types;

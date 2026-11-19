@@ -49,18 +49,22 @@ impl BitbucketProvider {
     }
 
     /// Standard API client: 30-second timeout, no redirects (SSRF defense).
-    fn get_client(&self) -> reqwest::Client {
+    fn get_client(&self) -> Result<reqwest::Client, GitProviderError> {
         reqwest::Client::builder()
             .user_agent("Temps-Engine/1.0")
             .timeout(std::time::Duration::from_secs(30))
             // SSRF defense-in-depth: never follow redirects automatically.
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .expect("Failed to build reqwest client with static config")
+            .map_err(|e| GitProviderError::HttpClientBuild {
+                provider: "Bitbucket".to_string(),
+                purpose: "API".to_string(),
+                reason: e.to_string(),
+            })
     }
 
     /// Archive download client: 15-minute total timeout, no redirects.
-    fn get_archive_client(&self) -> reqwest::Client {
+    fn get_archive_client(&self) -> Result<reqwest::Client, GitProviderError> {
         reqwest::Client::builder()
             .user_agent("Temps-Engine/1.0")
             .timeout(std::time::Duration::from_secs(15 * 60))
@@ -68,7 +72,11 @@ impl BitbucketProvider {
             .read_timeout(std::time::Duration::from_secs(60))
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .expect("Failed to build reqwest archive client with static config")
+            .map_err(|e| GitProviderError::HttpClientBuild {
+                provider: "Bitbucket".to_string(),
+                purpose: "archive download".to_string(),
+                reason: e.to_string(),
+            })
     }
 
     /// Build an authenticated `reqwest::RequestBuilder`.
@@ -152,7 +160,7 @@ impl BitbucketProvider {
 
     /// Validate the access token by calling `GET /2.0/user`.
     async fn validate_token_internal(&self, _access_token: &str) -> Result<bool, GitProviderError> {
-        let client = self.get_client();
+        let client = self.get_client()?;
         let url = format!("{}/user", API_BASE);
 
         let response = self
@@ -244,9 +252,6 @@ struct BitbucketCloneLink {
 struct BitbucketOwner {
     #[serde(rename = "nickname", default)]
     nickname: Option<String>,
-    #[allow(dead_code)]
-    #[serde(rename = "account_id", default)]
-    account_id: Option<String>,
 }
 
 impl BitbucketRepo {
@@ -365,8 +370,6 @@ struct BitbucketCommit {
 #[derive(Deserialize)]
 struct BitbucketCommitAuthor {
     raw: String,
-    #[allow(dead_code)]
-    user: Option<BitbucketUser>,
 }
 
 /// Bitbucket cursor-based paginated response.
@@ -461,7 +464,7 @@ impl GitProviderService for BitbucketProvider {
     }
 
     async fn get_user(&self, _access_token: &str) -> Result<User, GitProviderError> {
-        let client = self.get_client();
+        let client = self.get_client()?;
         let url = format!("{}/user", API_BASE);
 
         let response = self
@@ -525,7 +528,7 @@ impl GitProviderService for BitbucketProvider {
         organization: Option<&str>,
         page: u32,
     ) -> Result<RepositoryPage, GitProviderError> {
-        let client = self.get_client();
+        let client = self.get_client()?;
         const PAGE_LEN: u32 = 50;
         let page = page.max(1);
 
@@ -604,7 +607,7 @@ impl GitProviderService for BitbucketProvider {
         owner: &str,
         repo: &str,
     ) -> Result<Repository, GitProviderError> {
-        let client = self.get_client();
+        let client = self.get_client()?;
         let url = format!("{}/repositories/{}/{}", API_BASE, owner, repo);
 
         let response = self
@@ -633,7 +636,7 @@ impl GitProviderService for BitbucketProvider {
         owner: &str,
         repo: &str,
     ) -> Result<Vec<Branch>, GitProviderError> {
-        let client = self.get_client();
+        let client = self.get_client()?;
         let mut all_branches: Vec<Branch> = Vec::new();
         let per_page: u32 = 50;
         let mut page: u32 = 1;
@@ -684,7 +687,7 @@ impl GitProviderService for BitbucketProvider {
         owner: &str,
         repo: &str,
     ) -> Result<Vec<GitProviderTag>, GitProviderError> {
-        let client = self.get_client();
+        let client = self.get_client()?;
         let mut all_tags: Vec<GitProviderTag> = Vec::new();
         let per_page: u32 = 50;
         let mut page: u32 = 1;
@@ -737,7 +740,7 @@ impl GitProviderService for BitbucketProvider {
         path: &str,
         branch: Option<&str>,
     ) -> Result<FileContent, GitProviderError> {
-        let client = self.get_client();
+        let client = self.get_client()?;
 
         // Bitbucket src endpoint: /2.0/repositories/{workspace}/{repo_slug}/src/{commit}/{path}
         // When branch is given we use the branch name as the commit specifier.
@@ -791,7 +794,7 @@ impl GitProviderService for BitbucketProvider {
         path: &str,
         reference: Option<&str>,
     ) -> Result<Vec<RepoDirEntry>, GitProviderError> {
-        let client = self.get_client();
+        let client = self.get_client()?;
 
         // The `src` endpoint needs a node (branch/tag/commit). Bitbucket has no
         // "default ref" shortcut that also accepts a path, so resolve the repo's
@@ -894,7 +897,7 @@ impl GitProviderService for BitbucketProvider {
         repo: &str,
         branch: &str,
     ) -> Result<Commit, GitProviderError> {
-        let client = self.get_client();
+        let client = self.get_client()?;
         let url = format!(
             "{}/repositories/{}/{}/commits/{}?pagelen=1",
             API_BASE,
@@ -942,7 +945,7 @@ impl GitProviderService for BitbucketProvider {
         repo: &str,
         reference: &str,
     ) -> Result<Commit, GitProviderError> {
-        let client = self.get_client();
+        let client = self.get_client()?;
         let url = format!(
             "{}/repositories/{}/{}/commit/{}",
             API_BASE,
@@ -986,7 +989,7 @@ impl GitProviderService for BitbucketProvider {
         repo: &str,
         commit_sha: &str,
     ) -> Result<bool, GitProviderError> {
-        let client = self.get_client();
+        let client = self.get_client()?;
         let url = format!(
             "{}/repositories/{}/{}/commit/{}",
             API_BASE, owner, repo, commit_sha
@@ -1017,7 +1020,7 @@ impl GitProviderService for BitbucketProvider {
         branch: &str,
         per_page: u32,
     ) -> Result<Vec<Commit>, GitProviderError> {
-        let client = self.get_client();
+        let client = self.get_client()?;
         let url = format!(
             "{}/repositories/{}/{}/commits/{}?pagelen={}",
             API_BASE,
@@ -1069,7 +1072,7 @@ impl GitProviderService for BitbucketProvider {
         repo: &str,
         config: WebhookConfig,
     ) -> Result<String, GitProviderError> {
-        let client = self.get_client();
+        let client = self.get_client()?;
         let url = format!("{}/repositories/{}/{}/hooks", API_BASE, owner, repo);
 
         #[derive(serde::Serialize)]
@@ -1138,7 +1141,7 @@ impl GitProviderService for BitbucketProvider {
         repo: &str,
         webhook_id: &str,
     ) -> Result<(), GitProviderError> {
-        let client = self.get_client();
+        let client = self.get_client()?;
         let url = format!(
             "{}/repositories/{}/{}/hooks/{}",
             API_BASE, owner, repo, webhook_id
@@ -1187,7 +1190,7 @@ impl GitProviderService for BitbucketProvider {
         owner: &str,
         repo: &str,
     ) -> Result<bool, GitProviderError> {
-        let client = self.get_client();
+        let client = self.get_client()?;
         let url = format!("{}/repositories/{}/{}", API_BASE, owner, repo);
         let response = self
             .send_with_retry(|| self.apply_auth(client.get(&url)))
@@ -1282,7 +1285,7 @@ impl GitProviderService for BitbucketProvider {
             API_BASE, owner, repo, encoded_ref
         );
 
-        let client = self.get_archive_client();
+        let client = self.get_archive_client()?;
 
         let response = self
             .send_with_retry(|| self.apply_auth(client.get(&url)))
@@ -1389,7 +1392,7 @@ impl GitProviderService for BitbucketProvider {
 
             if let Some(tx) = progress {
                 if written >= next_progress_at {
-                    let _ = tx.send(crate::services::git_provider::ArchiveProgress {
+                    let _ = tx.try_send(crate::services::git_provider::ArchiveProgress {
                         downloaded_bytes: written,
                         total_bytes,
                     });
@@ -1418,7 +1421,7 @@ impl GitProviderService for BitbucketProvider {
         reference: &str,
     ) -> Result<Box<dyn temps_presets::source::ProjectSource>, GitProviderError> {
         Ok(Box::new(crate::sources::BitbucketSource::new(
-            std::sync::Arc::new(self.get_client()),
+            std::sync::Arc::new(self.get_client()?),
             self.auth_method.clone(),
             owner.to_string(),
             repo.to_string(),
@@ -1446,7 +1449,7 @@ impl GitProviderService for BitbucketProvider {
         description: Option<&str>,
         private: bool,
     ) -> Result<Repository, GitProviderError> {
-        let client = self.get_client();
+        let client = self.get_client()?;
 
         // Bitbucket requires a workspace slug — use the owner arg or resolve it.
         let workspace = match owner {
@@ -1532,7 +1535,7 @@ impl GitProviderService for BitbucketProvider {
         head_branch: &str,
         base_branch: &str,
     ) -> Result<PullRequest, GitProviderError> {
-        let client = self.get_client();
+        let client = self.get_client()?;
         let url = format!("{}/repositories/{}/{}/pullrequests", API_BASE, owner, repo);
 
         #[derive(Serialize)]

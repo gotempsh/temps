@@ -20,7 +20,7 @@
 //!    contributing project's `OtelStorage::get_trace` call, annotates spans, and
 //!    assembles the merged waterfall.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -226,6 +226,24 @@ impl CrossProjectTraceService {
         Ok(())
     }
 
+    /// [`Self::record_hint`] for hints from several projects, written in a
+    /// single storage call (one insert on ClickHouse). Used by the hint
+    /// writer, which coalesces a few seconds of ingest into one flush.
+    pub async fn record_hints(
+        &self,
+        hints: HashMap<i32, HashSet<String>>,
+    ) -> Result<u64, CrossProjectTraceError> {
+        let refs: Vec<(i32, Vec<String>)> = hints
+            .into_iter()
+            .filter(|(_, ids)| !ids.is_empty())
+            .map(|(project_id, ids)| (project_id, ids.into_iter().collect()))
+            .collect();
+        if refs.is_empty() {
+            return Ok(0);
+        }
+        Ok(self.storage.record_trace_refs_batch(&refs).await?)
+    }
+
     /// For a batch of `trace_id`s, resolve the "canonical" root span name +
     /// service from whichever **sharing** project owns the trace's root span.
     ///
@@ -237,8 +255,7 @@ impl CrossProjectTraceService {
     pub async fn resolve_root_names(
         &self,
         trace_ids: &[String],
-    ) -> Result<std::collections::HashMap<String, (String, String)>, CrossProjectTraceError> {
-        use std::collections::HashMap;
+    ) -> Result<HashMap<String, (String, String)>, CrossProjectTraceError> {
         if trace_ids.is_empty() {
             return Ok(HashMap::new());
         }
@@ -418,7 +435,6 @@ impl CrossProjectTraceService {
         &self,
         project_ids: &[i32],
     ) -> Result<std::collections::HashMap<i32, ProjectMeta>, sea_orm::DbErr> {
-        use std::collections::HashMap;
         if project_ids.is_empty() {
             return Ok(HashMap::new());
         }

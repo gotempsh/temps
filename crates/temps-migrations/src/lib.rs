@@ -6,10 +6,22 @@
 //! This crate contains all database migration files that will be
 //! moved from src/migration/
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        reason = "tests read fixture configuration (database/service URLs) from the environment"
+    )
+)]
 pub use sea_orm_migration::prelude::*;
 
-// Module removed for initial build
+mod general_vault_backfill;
+pub use general_vault_backfill::backfill_legacy_vault_links;
+mod vault_audit_backfill;
+pub use vault_audit_backfill::{backfill_vault_audit_attribution, VaultAuditBackfillSummary};
 mod migration;
+#[cfg(test)]
+mod migration_order;
 // Re-export for convenience
 // Re-export removed
 pub use migration::m20260805_000001_index_normalized_managed_domains::Migration as NormalizedManagedDomainIndexMigration;
@@ -18,7 +30,28 @@ pub use migration::m20260916_000001_reconcile_otel_trace_summaries::Migration as
 pub use migration::m20260916_000001_reconcile_otel_trace_summaries::{
     trace_summary_rebuild_delta_sql, trace_summary_rebuild_initial_sql,
 };
+pub use migration::m20261107_000003_unique_custom_domain_hostname::Migration as UniqueCustomDomainHostnameMigration;
+pub use migration::m20261112_000001_seed_postgres_wal_archiving_alert_rules::Migration as SeedPostgresWalArchivingAlertRulesMigration;
+pub use migration::m20261113_000009_legacy_standalone_vault_coverage::Migration as LegacyStandaloneVaultCoverageMigration;
+pub use migration::m20261113_000010_legacy_vault_revocation_fence::Migration as LegacyVaultRevocationFenceMigration;
+pub use migration::m20261113_000011_vault_membership_fence::Migration as VaultMembershipFenceMigration;
 pub use migration::Migrator;
+
+pub use migration::m20261022_000001_dns_name_claims::{
+    backfill_sql as dns_name_claims_backfill_sql, Migration as DnsNameClaimsMigration,
+};
+
+pub use migration::m20261022_000002_workloads::{
+    Migration as WorkloadsMigration, WORKLOAD_TABLES_SQL,
+};
+
+pub use migration::m20261022_000003_node_state_changes::{
+    Migration as NodeStateChangesMigration, NODE_STATE_DNS_SQL, NODE_STATE_TABLES_SQL,
+};
+
+pub use migration::m20261023_000009_workload_instance_ports::{
+    Migration as WorkloadInstancePortsMigration, UP_SQL as WORKLOAD_INSTANCE_PORTS_SQL,
+};
 
 pub use migration::m20260921_000001_http_checks::Migration as HttpChecksMigration;
 
@@ -37,3 +70,38 @@ pub use migration::m20261017_000001_retain_ci_cancellation::Migration as RetainC
 pub use migration::m20261017_000002_runtime_health::Migration as RuntimeHealthMigration;
 
 pub use migration::m20261019_000002_reconcile_error_group_counts::Migration as ReconcileErrorGroupCountsMigration;
+
+pub use migration::m20261022_000007_network_policy::{
+    backfill_sql as network_policy_backfill_sql, Migration as NetworkPolicyMigration,
+};
+pub use migration::m20261022_000008_ingress_endpoints::Migration as IngressEndpointsMigration;
+pub use migration::m20261023_000010_workload_volumes::{
+    Migration as WorkloadVolumesMigration, VOLUME_TABLES_SQL,
+};
+pub use migration::m20261023_000030_environment_workload_isolation::Migration as EnvironmentWorkloadIsolationMigration;
+
+pub use migration::m20261022_000004_external_services_workload_mode::Migration as ExternalServicesWorkloadModeMigration;
+pub use migration::m20261022_000005_deployment_workload_mode::Migration as DeploymentWorkloadModeMigration;
+pub use migration::m20261024_000001_drop_sandbox_driver_mode::{
+    Migration as DropSandboxDriverModeMigration, DOWN_SQL as DROP_SANDBOX_DRIVER_MODE_DOWN_SQL,
+    UP_SQL as DROP_SANDBOX_DRIVER_MODE_UP_SQL,
+};
+
+/// Telemetry tables detached from the project delete cascade; the projects
+/// crate's purger must cover exactly these.
+pub use migration::m20261105_000001_project_data_purges::PURGED_TABLES as PROJECT_DATA_PURGED_TABLES;
+
+/// Parents the telemetry tables hold no foreign keys to once
+/// `temps_schema`'s post-migration step has dropped them.
+pub use migration::m20261105_000001_project_data_purges::DETACHED_PARENTS as PROJECT_DATA_DETACHED_PARENTS;
+
+/// Foreign key columns under `projects` without a leading index, and the name
+/// of the index built for each. Built concurrently after boot by
+/// `temps_schema::run_post_migration_indexes`, not inside the migration.
+pub use migration::m20261105_000001_project_data_purges::{
+    fk_index_name as project_fk_index_name, FK_INDEXES as PROJECT_FK_INDEXES,
+};
+
+pub use migration::m20261113_000002_general_access_vaults::{
+    GENERAL_VAULT_CONSUMER_INDEXES, GENERAL_VAULT_MIGRATION,
+};

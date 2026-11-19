@@ -733,7 +733,7 @@ pub fn validate(application_id: i64, document: &BlueprintDocument) -> Result<(),
     // Field names that hold credentials are refused anywhere in the document,
     // the same rule as every other artifact the model writes.
     if let Ok(value) = serde_json::to_value(document) {
-        if let Err(crate::applications::ApplicationError::SecretValue(path)) =
+        if let Err(crate::applications::ApplicationError::SecretValue { path }) =
             crate::applications::validate_secret_free_payload(&value, "$")
         {
             problems.push(format!(
@@ -1053,14 +1053,13 @@ impl BlueprintService {
             application_id,
             "listing the versions of",
         ))?;
-        let rows =
-            paginator
-                .fetch_page(page.saturating_sub(1))
-                .await
-                .map_err(BlueprintError::db(
-                    application_id,
-                    "listing the versions of",
-                ))?;
+        let rows = paginator
+            .fetch_page(temps_core::config::page_index(page))
+            .await
+            .map_err(BlueprintError::db(
+                application_id,
+                "listing the versions of",
+            ))?;
         let versions = rows
             .into_iter()
             .map(|row| decode_version(application_id, row))

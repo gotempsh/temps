@@ -1,0 +1,38 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "temps-deployment-logs"
+version.workspace = true
+edition.workspace = true
+description = "Deployment and pipeline logs: structured JSONL log files, Docker container log streaming and S3 log archiving"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+chrono = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+async-stream = { workspace = true }
+bollard = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+aws-sdk-s3 = { workspace = true }
+hex = { workspace = true }
+# Plugin dependencies
+temps-core = { path = "../temps-core" }
+temps-config = { path = "../temps-config" }
+temps-file-store = { path = "../temps-file-store" }
+utoipa = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["full", "test-util"] }
+
+[lints]
+workspace = true

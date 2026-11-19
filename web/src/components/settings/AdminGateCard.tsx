@@ -3,13 +3,7 @@
 
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from '@/components/ui/card'
+import { Card, CardContent } from '@/components/ui/card'
 import { Label } from '@/components/ui/label'
 import { ReadFailure } from '@/components/ui/read-failure'
 import { isForbiddenRead } from '@/lib/read-failure'
@@ -21,9 +15,15 @@ import {
   patchAdminGateMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Loader2, Lock, Save, Shield } from 'lucide-react'
+import { Globe, Loader2, Lock, Save } from 'lucide-react'
 import { useState } from 'react'
 import { toast } from 'sonner'
+import { adminGateIsOpen, suggestedConsoleHost } from './admin-gate'
+
+/** The hostname the admin is using right now, when rendered in a browser. */
+function currentHostname(): string {
+  return typeof window === 'undefined' ? '' : window.location.hostname
+}
 
 /**
  * Admin Gate management card.
@@ -76,15 +76,6 @@ export function AdminGateCard() {
   if (isLoading) {
     return (
       <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <Shield className="h-5 w-5" />
-            Admin Access Gate
-          </CardTitle>
-          <CardDescription>
-            Restrict which IPs and hostnames can reach the admin console.
-          </CardDescription>
-        </CardHeader>
         <CardContent className="space-y-4">
           <Skeleton className="h-24 w-full" />
           <Skeleton className="h-24 w-full" />
@@ -97,12 +88,6 @@ export function AdminGateCard() {
   if (error || !data) {
     return (
       <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <Shield className="h-5 w-5" />
-            Admin Access Gate
-          </CardTitle>
-        </CardHeader>
         <CardContent>
           <ReadFailure
             resource="Admin access gate"
@@ -116,6 +101,18 @@ export function AdminGateCard() {
 
   const editable = data.editable === true
   const envOverride = data.source === 'env'
+  const open = adminGateIsOpen(data)
+  const suggestedHost = suggestedConsoleHost(currentHostname())
+
+  const restrictToHost = (host: string) => {
+    updateMutation.mutate({
+      body: {
+        allowed_ips: data.allowed_ips ?? [],
+        allowed_hosts: [host],
+        trust_forwarded_for: Boolean(data.trust_forwarded_for),
+      },
+    })
+  }
 
   const onSubmit = () => {
     const allowed_ips = allowedIpsText
@@ -137,21 +134,6 @@ export function AdminGateCard() {
 
   return (
     <Card>
-      <CardHeader>
-        <CardTitle className="flex items-center gap-2">
-          <Shield className="h-5 w-5" />
-          Admin Access Gate
-        </CardTitle>
-        <CardDescription>
-          Restrict which hostnames and source IPs can reach the management
-          surface (dashboard, <code>/api/projects</code>, etc.) through the
-          public load balancer. Hosts that don&apos;t match are served as normal
-          LB traffic — if they resolve to a deployed app it serves; otherwise
-          they 404. Public ingest (<code>/api/_temps/*</code>) is always
-          reachable from any host. Empty lists = no restriction. Bare IPs are
-          accepted as /32 (or /128 for IPv6). CIDR allowed for ranges.
-        </CardDescription>
-      </CardHeader>
       <CardContent className="space-y-4">
         {envOverride && (
           <Alert>
@@ -163,6 +145,53 @@ export function AdminGateCard() {
               <code>TEMPS_ADMIN_TRUST_FORWARDED_FOR</code> are set on the
               process — the lists below are read-only. Unset those env vars and
               restart the server to manage the gate from this page.
+            </AlertDescription>
+          </Alert>
+        )}
+
+        {open && editable && (
+          <Alert>
+            <Globe className="h-4 w-4" />
+            <AlertTitle>
+              The console answers on any hostname and address
+            </AlertTitle>
+            <AlertDescription className="space-y-2">
+              <p>
+                Anyone who reaches this server, including by its IP address,
+                gets the login page.{' '}
+                {suggestedHost ? (
+                  <>
+                    Restrict it to <code>{suggestedHost}</code>, the hostname
+                    you are using now.
+                  </>
+                ) : (
+                  <>
+                    Open the console through its domain name to restrict it to
+                    that hostname, or add allowed IPs below.
+                  </>
+                )}
+              </p>
+              {suggestedHost && (
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  // The shortcut saves the stored rules plus this hostname;
+                  // with unsaved edits below it would silently discard them.
+                  disabled={updateMutation.isPending || dirty}
+                  onClick={() => restrictToHost(suggestedHost)}
+                >
+                  {updateMutation.isPending && (
+                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                  )}
+                  Only answer on {suggestedHost}
+                </Button>
+              )}
+              {suggestedHost && dirty && (
+                <p className="text-xs text-muted-foreground">
+                  Save the edits below first; this shortcut would replace them.
+                </p>
+              )}
             </AlertDescription>
           </Alert>
         )}
@@ -186,7 +215,7 @@ export function AdminGateCard() {
         </div>
 
         <div className="space-y-2">
-          <Label htmlFor="admin-gate-hosts">Allowed Host headers</Label>
+          <Label htmlFor="admin-gate-hosts">Allowed host headers</Label>
           <Textarea
             id="admin-gate-hosts"
             placeholder={'admin.example.com\nconsole.internal'}

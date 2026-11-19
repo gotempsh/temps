@@ -36,6 +36,9 @@ pub enum GitLabWebhookError {
 
     #[error("JSON serialization error: {0}")]
     Json(#[from] serde_json::Error),
+
+    #[error("GitLab webhook HTTP client for {base_url} is unavailable: {reason}")]
+    HttpClientUnavailable { base_url: String, reason: String },
 }
 
 // ── API response shapes ──────────────────────────────────────────────────────
@@ -120,7 +123,9 @@ impl WebhookAuthMethod {
 /// All methods take a resolved `access_token` and the GitLab `base_url`
 /// (e.g. `https://gitlab.com`); token resolution is the caller's job.
 pub struct GitLabWebhookClient {
-    http: reqwest::Client,
+    /// `Err` holds why the client could not be built; every call then fails
+    /// with that reason instead of the constructor panicking.
+    http: Result<reqwest::Client, String>,
     base_url: String,
     access_token: String,
     auth_method: WebhookAuthMethod,
@@ -134,7 +139,7 @@ impl GitLabWebhookClient {
             .user_agent("Temps-Engine/1.0")
             .timeout(std::time::Duration::from_secs(30))
             .build()
-            .expect("Failed to build reqwest client with static config");
+            .map_err(|e| e.to_string());
 
         Self {
             http,
@@ -149,6 +154,15 @@ impl GitLabWebhookClient {
     ///
     /// - OAuth tokens must use `Authorization: Bearer <token>` (RFC 6750).
     /// - PAT / App / unknown tokens use the GitLab-specific `PRIVATE-TOKEN` header.
+    fn http(&self) -> Result<&reqwest::Client, GitLabWebhookError> {
+        self.http
+            .as_ref()
+            .map_err(|reason| GitLabWebhookError::HttpClientUnavailable {
+                base_url: self.base_url.clone(),
+                reason: reason.clone(),
+            })
+    }
+
     fn auth_header(&self) -> (&'static str, String) {
         match self.auth_method {
             WebhookAuthMethod::OAuth => ("Authorization", format!("Bearer {}", self.access_token)),
@@ -179,7 +193,7 @@ impl GitLabWebhookClient {
 
         let (header_name, header_value) = self.auth_header();
         let response = self
-            .http
+            .http()?
             .get(&url)
             .header(header_name, &header_value)
             .send()
@@ -240,12 +254,12 @@ impl GitLabWebhookClient {
             push_events: true,
             tag_push_events: true,
             enable_ssl_verification: true,
-            merge_requests_events: false,
+            merge_requests_events: true,
         };
 
         let (header_name, header_value) = self.auth_header();
         let response = self
-            .http
+            .http()?
             .post(&url)
             .header(header_name, &header_value)
             .json(&body)
@@ -285,7 +299,7 @@ impl GitLabWebhookClient {
 
         let (header_name, header_value) = self.auth_header();
         let response = self
-            .http
+            .http()?
             .delete(&url)
             .header(header_name, &header_value)
             .send()
@@ -739,6 +753,32 @@ mod tests {
             .install_webhook("myorg", "myrepo", "https://example.com/wh", "secret")
             .await
             .expect("install should succeed with PAT");
+
+        mock.assert_async().await;
+    }
+
+    /// Merge request events carry closes and merges, which retire the
+    /// branch's preview; pushes and tag pushes still deploy.
+    #[tokio::test]
+    async fn installed_webhook_subscribes_to_pushes_and_merge_requests() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/api/v4/projects/myorg%2Fmyrepo/hooks")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "push_events": true,
+                "tag_push_events": true,
+                "merge_requests_events": true
+            })))
+            .with_status(201)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"id": 30}"#)
+            .create_async()
+            .await;
+
+        GitLabWebhookClient::new(server.url(), "token".to_string(), WebhookAuthMethod::Pat)
+            .install_webhook("myorg", "myrepo", "https://example.com/wh", "secret")
+            .await
+            .expect("install should succeed");
 
         mock.assert_async().await;
     }

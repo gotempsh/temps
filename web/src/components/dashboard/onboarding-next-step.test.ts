@@ -3,11 +3,7 @@
 
 import { describe, expect, test } from 'bun:test'
 import type { GettingStartedItem } from '@/hooks/useGettingStarted'
-import {
-  firstIncompleteGettingStartedIndex,
-  nextIncompleteGettingStartedItem,
-  onboardingStepPosition,
-} from './onboarding-next-step'
+import { nextIncompleteGettingStartedItem } from './onboarding-next-step'
 
 function step(key: string, done: boolean): GettingStartedItem {
   return {
@@ -35,25 +31,5 @@ describe('dashboard onboarding next step', () => {
     expect(
       nextIncompleteGettingStartedItem([step('ai', true), step('git', true)])
     ).toBeUndefined()
-  })
-
-  test('returns the first incomplete step index for the dashboard navigator', () => {
-    expect(
-      firstIncompleteGettingStartedIndex([
-        step('ai', true),
-        step('git', true),
-        step('domain', false),
-      ])
-    ).toBe(2)
-  })
-
-  test('returns -1 when every setup step is complete', () => {
-    expect(
-      firstIncompleteGettingStartedIndex([step('ai', true), step('git', true)])
-    ).toBe(-1)
-  })
-
-  test('labels carousel position as a step rather than completion progress', () => {
-    expect(onboardingStepPosition(0, 8)).toBe('Step 1 of 8')
   })
 })

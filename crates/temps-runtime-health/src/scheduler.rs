@@ -357,7 +357,14 @@ impl ProbeEngine {
                         }
                     }
                 }
-                _ => match network_probe(&assignment.probe, &snapshot, deadline).await {
+                _ => match network_probe(
+                    &assignment.probe,
+                    &snapshot,
+                    deadline,
+                    self.inspector.dialer(),
+                )
+                .await
+                {
                     Ok(()) => (HealthState::Healthy, HealthReason::Passed),
                     Err(HealthReason::EndpointUnavailable) => {
                         (HealthState::Unknown, HealthReason::EndpointUnavailable)

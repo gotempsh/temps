@@ -5,17 +5,17 @@
 name = "temps-mcp-server"
 version.workspace = true
 edition.workspace = true
+description = "Axum-native MCP server exposing Temps tools to AI clients, with propose-then-confirm execution for write tools"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
-temps-auth = { path = "../temps-auth" }
+temps-ai-api-tools = { path = "../temps-ai-api-tools" }
+temps-authz = { path = "../temps-authz" }
 temps-core = { path = "../temps-core" }
 temps-config = { path = "../temps-config" }
-temps-projects = { path = "../temps-projects" }
-temps-deployments = { path = "../temps-deployments" }
 
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -25,9 +25,12 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+utoipa = { workspace = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }
 temps-entities = { path = "../temps-entities" }
 async-trait = { workspace = true }
-sea-orm = { workspace = true }
 chrono = { workspace = true }
+
+[lints]
+workspace = true

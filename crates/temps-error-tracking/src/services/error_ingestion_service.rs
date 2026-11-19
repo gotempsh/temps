@@ -9,10 +9,10 @@ use sea_orm::{
 };
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
-use temps_embeddings::tokenizer::{HashTokenizer, Tokenizer};
 use temps_entities::{error_events, error_groups};
 
 use super::types::{CreateErrorEventData, ErrorTrackingError};
+use crate::tokenizer::{create_embedding_from_tokens, HashTokenizer};
 
 /// Pull a 32-hex-char OTel trace_id out of an error event's JSONB `data`
 /// blob. Probes both the Sentry layout (`contexts.trace.trace_id`) and our
@@ -175,27 +175,16 @@ fn is_transaction_abort(error: &ErrorTrackingError) -> bool {
 /// Service for ingesting and processing error events
 pub struct ErrorIngestionService {
     db: Arc<DatabaseConnection>,
-    tokenizer: Arc<dyn Tokenizer>,
+    tokenizer: HashTokenizer,
     // One lock-free range per service/database, never a per-project/key cache.
     chunk_range: ArcSwapOption<ErrorChunkRange>,
 }
 
 impl ErrorIngestionService {
     pub fn new(db: Arc<DatabaseConnection>) -> Self {
-        // Use HashTokenizer with vocab_size=10000 for production
-        let tokenizer = Arc::new(HashTokenizer::new(10000)) as Arc<dyn Tokenizer>;
         Self {
             db,
-            tokenizer,
-            chunk_range: ArcSwapOption::empty(),
-        }
-    }
-
-    /// Create with custom tokenizer
-    pub fn with_tokenizer(db: Arc<DatabaseConnection>, tokenizer: Arc<dyn Tokenizer>) -> Self {
-        Self {
-            db,
-            tokenizer,
+            tokenizer: HashTokenizer::new(10000),
             chunk_range: ArcSwapOption::empty(),
         }
     }
@@ -203,10 +192,10 @@ impl ErrorIngestionService {
     /// Create an embedding from error message
     fn create_embedding(&self, message: &str) -> Option<error_groups::PgVector> {
         // Tokenize the message
-        let tokens = self.tokenizer.encode(message).ok()?;
+        let tokens = self.tokenizer.encode(message);
 
         // Create embedding from tokens (384 dimensions to match database)
-        let embedding = error_groups::Model::create_embedding_from_tokens(&tokens, 384);
+        let embedding = create_embedding_from_tokens(&tokens, 384);
 
         Some(embedding)
     }
@@ -542,26 +531,33 @@ impl ErrorIngestionService {
         use regex::Regex;
         use std::sync::LazyLock;
 
+        /// Compile one of the fixed patterns below. Every caller passes a
+        /// string literal, and every pattern is exercised by this module's
+        /// normalization tests, so compilation cannot fail at runtime.
+        #[allow(
+            clippy::expect_used,
+            reason = "only called with the compile-time literal patterns below, all covered by the normalize_error_message tests"
+        )]
+        fn literal_regex(pattern: &str) -> Regex {
+            Regex::new(pattern).expect("error normalization regex literal must compile")
+        }
+
         static UUID_RE: LazyLock<Regex> = LazyLock::new(|| {
-            Regex::new(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}").unwrap()
+            literal_regex(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
         });
-        static HEX_RE: LazyLock<Regex> =
-            LazyLock::new(|| Regex::new(r"\b(0x)?[0-9a-f]{8,}\b").unwrap());
-        static URL_RE: LazyLock<Regex> =
-            LazyLock::new(|| Regex::new(r"https?://[\w./\-?=&%]+").unwrap());
+        static HEX_RE: LazyLock<Regex> = LazyLock::new(|| literal_regex(r"\b(0x)?[0-9a-f]{8,}\b"));
+        static URL_RE: LazyLock<Regex> = LazyLock::new(|| literal_regex(r"https?://[\w./\-?=&%]+"));
         static EMAIL_RE: LazyLock<Regex> =
-            LazyLock::new(|| Regex::new(r"\b[\w._%+-]+@[\w.-]+\.[a-z]{2,}\b").unwrap());
-        static UNIX_PATH_RE: LazyLock<Regex> =
-            LazyLock::new(|| Regex::new(r"/[\w/.]+\.[\w]+").unwrap());
+            LazyLock::new(|| literal_regex(r"\b[\w._%+-]+@[\w.-]+\.[a-z]{2,}\b"));
+        static UNIX_PATH_RE: LazyLock<Regex> = LazyLock::new(|| literal_regex(r"/[\w/.]+\.[\w]+"));
         static WIN_PATH_RE: LazyLock<Regex> =
-            LazyLock::new(|| Regex::new(r"[a-z]:\\[\w\\]+\.[\w]+").unwrap());
+            LazyLock::new(|| literal_regex(r"[a-z]:\\[\w\\]+\.[\w]+"));
         static IP_RE: LazyLock<Regex> =
-            LazyLock::new(|| Regex::new(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b").unwrap());
-        static TABLE_REF_RE: LazyLock<Regex> =
-            LazyLock::new(|| Regex::new(r"\b(\w+)_\d+\b").unwrap());
-        static NUMBER_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b\d{4,}\b").unwrap());
+            LazyLock::new(|| literal_regex(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b"));
+        static TABLE_REF_RE: LazyLock<Regex> = LazyLock::new(|| literal_regex(r"\b(\w+)_\d+\b"));
+        static NUMBER_RE: LazyLock<Regex> = LazyLock::new(|| literal_regex(r"\b\d{4,}\b"));
         static QUOTED_RE: LazyLock<Regex> =
-            LazyLock::new(|| Regex::new(r#"["']([^"']{10,})["']"#).unwrap());
+            LazyLock::new(|| literal_regex(r#"["']([^"']{10,})["']"#));
 
         let mut normalized = message.to_lowercase();
 
@@ -963,14 +959,8 @@ mod tests {
     use super::*;
     use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter};
     use std::sync::Arc;
-    use temps_database::test_utils::TestDatabase;
     use temps_entities::{error_events, error_groups, projects};
-
-    async fn setup_test_db() -> TestDatabase {
-        TestDatabase::with_migrations()
-            .await
-            .expect("Failed to create test database")
-    }
+    use temps_test_utils::TestDatabase;
 
     async fn create_test_project(db: &Arc<DatabaseConnection>) -> i32 {
         use temps_entities::preset::Preset;
@@ -1017,7 +1007,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial_test::serial]
     async fn concurrent_distinct_groups_survive_first_timescale_chunk_creation() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let first = create_test_project(&db).await;
         let second = create_test_project(&db).await;
@@ -1049,7 +1039,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial_test::serial]
     async fn concurrent_first_and_repeated_events_have_one_group_and_exact_count() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let project = create_test_project(&db).await;
         let other_project = create_test_project(&db).await;
@@ -1163,7 +1153,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_process_error_event_creates_new_group() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorIngestionService::new(db.clone());
 
@@ -1190,7 +1180,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_process_error_event_groups_similar_errors() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorIngestionService::new(db.clone());
 
@@ -1226,7 +1216,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_generate_fingerprint_is_consistent() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorIngestionService::new(db);
 
@@ -1248,7 +1238,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_generate_fingerprint_differs_for_different_errors() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorIngestionService::new(db);
 
@@ -1277,7 +1267,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_normalize_error_message() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorIngestionService::new(db);
 
@@ -1293,7 +1283,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_process_error_event_creates_event() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorIngestionService::new(db.clone());
 
@@ -1319,7 +1309,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn legacy_fingerprint_fallback_ignores_events_of_deleted_group() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorIngestionService::new(db.clone());
         let project_id = create_test_project(&db).await;
@@ -1368,7 +1358,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_extract_stack_signature() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorIngestionService::new(db);
 
@@ -1387,7 +1377,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_normalize_error_message_replaces_uuids() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorIngestionService::new(db);
 
@@ -1401,7 +1391,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_normalize_error_message_replaces_hex_ids() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorIngestionService::new(db);
 
@@ -1415,7 +1405,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_normalize_error_message_replaces_numbers() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorIngestionService::new(db);
 
@@ -1429,7 +1419,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_normalize_error_message_replaces_paths() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorIngestionService::new(db);
 
@@ -1445,7 +1435,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_normalize_error_message_replaces_urls() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorIngestionService::new(db);
 
@@ -1459,7 +1449,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_normalize_error_message_replaces_emails() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorIngestionService::new(db);
 
@@ -1473,7 +1463,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_normalize_error_message_replaces_ips() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorIngestionService::new(db);
 
@@ -1487,7 +1477,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_normalize_error_message_replaces_table_refs() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorIngestionService::new(db);
 
@@ -1501,7 +1491,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_normalize_error_message_groups_similar_errors() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorIngestionService::new(db);
 
@@ -1546,7 +1536,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_process_error_event_groups_by_embedding_when_fingerprint_differs() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorIngestionService::new(db.clone());
         let project_id = create_test_project(&db).await;
@@ -1593,7 +1583,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_similarity_lookup_skips_resolved_groups() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorIngestionService::new(db.clone());
         let project_id = create_test_project(&db).await;
@@ -1630,7 +1620,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_similarity_lookup_is_scoped_to_project() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorIngestionService::new(db.clone());
         let project_a = create_test_project(&db).await;
@@ -1656,7 +1646,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_similarity_lookup_requires_same_error_type() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorIngestionService::new(db.clone());
         let project_id = create_test_project(&db).await;
@@ -1688,7 +1678,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_similarity_grouping_for_exception_array_payloads() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorIngestionService::new(db.clone());
         let project_id = create_test_project(&db).await;
@@ -1735,9 +1725,7 @@ mod tests {
         let test_db = match TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("SDK atomic ingestion test not run: container runtime unavailable");
                 return;

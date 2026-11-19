@@ -107,6 +107,7 @@ pub(crate) mod test_support {
             git_url: None,
             git_provider_connection_id: None,
             attack_mode: false,
+            shield_mode: "log".to_string(),
             ai_alert_summaries_enabled: None,
             ai_api_traffic_summary_enabled: None,
             allow_alternate_sources: None,
@@ -134,6 +135,7 @@ pub(crate) mod test_support {
             bitbucket_webhook_hook_id: None,
             generic_webhook_token: None,
             cross_project_trace_sharing: false,
+            serves_own_temps_api: false,
             image_retention_hours: None,
             cloud_telemetry_fidelity:
                 temps_entities::cloud_telemetry_fidelity::CloudTelemetryFidelity::Metered,
@@ -142,6 +144,8 @@ pub(crate) mod test_support {
             cloud_analytics_write_mode:
                 temps_entities::cloud_analytics_write_mode::CloudAnalyticsWriteMode::Local,
             cloud_telemetry_attribute_allowlist: Vec::new(),
+            log_ingest_lines_per_sec: None,
+            log_ingest_kib_per_sec: None,
         }
     }
 }

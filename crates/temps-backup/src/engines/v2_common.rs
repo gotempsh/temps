@@ -27,7 +27,7 @@ use sea_orm::{ActiveModelTrait, DatabaseConnection, EntityTrait, IntoActiveModel
 use serde_json::{json, Value};
 use tracing::warn;
 
-use temps_backup_core::engine_v2::BackupError;
+use crate::execution::engine_v2::BackupError;
 use temps_core::EncryptionService;
 
 /// Shared HTTPS client backed by the Mozilla CA bundle compiled in via
@@ -50,6 +50,12 @@ pub(crate) fn bundled_roots_http_client() -> SharedHttpClient {
                 let pem = pem::Pem::new("CERTIFICATE", der.to_vec());
                 trust_store = trust_store.with_pem_certificate(pem::encode(&pem).into_bytes());
             }
+            #[allow(
+                clippy::expect_used,
+                reason = "TlsContextBuilder::build performs no validation and always returns Ok \
+                          (aws-smithy-http-client 1.x); the trust store is the compiled-in \
+                          webpki root bundle"
+            )]
             let tls_context = TlsContext::builder()
                 .with_trust_store(trust_store)
                 .build()
@@ -420,13 +426,7 @@ pub async fn record_walg_identity(
 /// Explicitly disabling deltas overrides any inherited container setting;
 /// otherwise deleting one target may also delete newer dependent snapshots.
 pub fn walg_identity_env(backup_uuid: &str) -> [String; 2] {
-    [
-        "WALG_DELTA_MAX_STEPS=0".to_string(),
-        format!(
-            "WALG_SENTINEL_USER_DATA={}",
-            json!({ "temps_backup_id": backup_uuid })
-        ),
-    ]
+    temps_providers::externalsvc::postgres_walg_backup::walg_identity_env(backup_uuid)
 }
 
 /// Decrypt the optional STS session token on an S3 source row.
@@ -479,7 +479,7 @@ pub fn build_s3_client(
 
     let builder = s3_config_builder(
         &s3_source.region,
-        s3_source.force_path_style.unwrap_or(true),
+        s3_source.effective_path_style(true).force_path_style,
         creds,
         s3_source.endpoint.as_deref(),
     );
@@ -1227,6 +1227,7 @@ mod tests {
             managed_by_cloud: false,
             lifecycle_reconcile_failed_at: None,
             lifecycle_reconcile_generation: 0,
+            worker_credentials: "scoped".to_string(),
             created_at: now,
             updated_at: now,
         }

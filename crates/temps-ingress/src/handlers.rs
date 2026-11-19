@@ -59,9 +59,8 @@ impl AuditOperation for IngressAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation: {e}"))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -256,9 +255,13 @@ async fn create_ingress_connector(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<IngressAppState>>,
     Extension(metadata): Extension<RequestMetadata>,
+    ai_call: Option<Extension<temps_core::ai_tool_call::AiToolCall>>,
     Json(request): Json<CreateConnectorRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsWrite);
+    if ai_call.is_some() {
+        state.service.ensure_secret_answers_sealed(&request)?;
+    }
     let provider = request.provider.clone();
     let node_ids = request.node_ids.clone();
     let view = match state.service.create(request).await {
@@ -291,6 +294,7 @@ async fn create_ingress_connector(
             "domain": view.domain,
             "node_ids": view.nodes.iter().map(|n| n.node_id).collect::<Vec<_>>(),
             "auto_publish": view.auto_publish,
+            "host_suffix": view.host_suffix,
             "outcome": "created",
         }))
         .record(&state)

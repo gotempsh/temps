@@ -37,6 +37,9 @@ pub struct DockerfilePresetConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub build_context: Option<String>,
 
+    #[serde(flatten)]
+    pub runtime: temps_entities::preset::ContainerRuntimeOverrides,
+
     /// Durable runtime selected for a curated single-container image template.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image_runtime: Option<ImageRuntimeConfig>,
@@ -157,6 +160,7 @@ mod tests {
             dockerfile_path: Some("docker/Dockerfile".to_string()),
             build_context: Some("./api".to_string()),
             image_runtime: None,
+            runtime: Default::default(),
         };
 
         let json = serde_json::to_value(&config).unwrap();
@@ -207,10 +211,7 @@ mod tests {
 
         let json = serde_json::to_value(&config).unwrap();
         assert_eq!(json["providers"], serde_json::json!(["...", "python"]));
-        assert_eq!(
-            json["nixpacksConfig"],
-            "[start]\ncmd = \"python main.py\""
-        );
+        assert_eq!(json["nixpacksConfig"], "[start]\ncmd = \"python main.py\"");
     }
 
     #[test]
@@ -220,6 +221,7 @@ mod tests {
             dockerfile_path: Some("Dockerfile.prod".to_string()),
             build_context: None,
             image_runtime: None,
+            runtime: Default::default(),
         });
 
         let json = serde_json::to_value(&dockerfile_config).unwrap();

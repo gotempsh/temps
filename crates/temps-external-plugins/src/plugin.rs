@@ -79,9 +79,12 @@ impl TempsPlugin for ExternalPluginsPlugin {
             // machinery is not part of the build.
             let remote_builder =
                 context.get_service::<dyn temps_core::plugin_builder::RemotePluginBuilder>();
+            let ai_tools = Arc::new(temps_ai_api_tools::PluginToolsRegistry::default());
+            context.register_service(ai_tools.clone());
             let service = Arc::new(
                 ExternalPluginsService::new_empty(self.config.clone(), queue, db)
-                    .with_remote_builder(remote_builder),
+                    .with_remote_builder(remote_builder)
+                    .with_ai_tools_registry(ai_tools),
             );
             service
                 .manager()

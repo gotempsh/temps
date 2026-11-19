@@ -6,6 +6,7 @@ import { useNavigate } from 'react-router'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { Button } from '@/components/ui/button'
+import { PageHeader } from '@/components/layout/PageContainer'
 import { GitProviderFlow } from '@/components/git-providers/GitProviderFlow'
 import { ArrowLeft } from 'lucide-react'
 import { useFeedback } from '@/hooks/useFeedback'
@@ -18,12 +19,12 @@ export function AddGitProvider() {
 
   useEffect(() => {
     setBreadcrumbs([
-      { label: 'Git Providers', href: '/git-providers' },
-      { label: 'Add Provider' },
+      { label: 'Git providers', href: '/git-providers' },
+      { label: 'Add provider' },
     ])
   }, [setBreadcrumbs])
 
-  usePageTitle('Add Git Provider')
+  usePageTitle('Add Git provider')
 
   const handleSuccess = () => {
     showSuccess('Git provider added successfully!')
@@ -39,7 +40,7 @@ export function AddGitProvider() {
   return (
     <div className="flex-1 overflow-auto">
       <div className="space-y-6 p-4 sm:p-6 lg:p-8">
-        <div className="flex items-center gap-4">
+        <div className="flex items-start gap-4">
           <Button
             aria-label="Back"
             variant="ghost"
@@ -49,12 +50,11 @@ export function AddGitProvider() {
           >
             <ArrowLeft className="h-4 w-4" />
           </Button>
-          <div>
-            <h1 className="text-xl sm:text-2xl font-bold">Add Git Provider</h1>
-            <p className="text-sm sm:text-base text-muted-foreground">
-              Connect a Git provider to deploy and manage your services
-            </p>
-          </div>
+          <PageHeader
+            className="min-w-0 flex-1"
+            title="Add Git provider"
+            description="Connect a Git provider to deploy and manage your services"
+          />
         </div>
 
         {/* Feedback Alert */}

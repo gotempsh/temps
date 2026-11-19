@@ -3,10 +3,10 @@
 
 use serde::{Deserialize, Serialize};
 use temps_core::docker_socket_grant::DockerSocketCapability;
-use temps_core::templates::{EnvVarTemplate, ServiceTemplateInstance, TemplateService};
 use temps_core::UtcDateTime;
 use temps_entities::deployment_config::DeploymentConfig;
 use temps_entities::source_type::SourceType;
+use temps_presets::templates::{EnvVarTemplate, ServiceTemplateInstance, TemplateService};
 use utoipa::ToSchema;
 
 use crate::services::custom_domains::CustomDomainService;
@@ -30,6 +30,9 @@ pub struct AppState {
     pub config_service: Arc<temps_config::ConfigService>,
     pub public_hostname_resolver: Arc<dyn temps_core::PublicHostnameResolver>,
     pub project_archive_cleaner: Arc<dyn temps_core::ProjectArchiveCleaner>,
+    /// Removes a deleted project's built images from the runtimes holding
+    /// them, best-effort, after its rows are gone.
+    pub project_image_cleaner: Arc<dyn temps_core::ProjectImageCleaner>,
     pub telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
     /// Optional checker enforcing team-based project access for human sessions.
     ///
@@ -47,10 +50,14 @@ pub struct AppState {
     /// in the handler, so the challenge cannot drift away from the guard it
     /// protects. See [`temps_core::SensitiveActionAuthorizer`].
     pub sensitive_action_authorizer: Arc<dyn temps_core::SensitiveActionAuthorizer>,
-    /// Optional hook run right after the deletion fence commits, so features
-    /// that serve project data publicly stop doing so before cleanup starts.
-    /// `None` when no plugin registers one.
-    pub project_deletion_hook: Option<Arc<dyn temps_core::ProjectDeletionHook>>,
+    /// Hooks run right after the deletion fence commits and before the
+    /// project's rows are deleted, so features that serve project data
+    /// publicly stop doing so before cleanup starts, and features that run
+    /// something for the project (functions) retire it while their rows
+    /// still say what to retire. Registered by plugins; empty when none
+    /// does. A failing hook fails the deletion, leaving the project fenced
+    /// for a retried `DELETE`.
+    pub project_deletion_hooks: Arc<temps_core::ProjectDeletionHooks>,
 }
 
 // Domain-related types
@@ -422,7 +429,13 @@ pub struct ProjectResponse {
     /// Deployment configuration (resources, autoscaling, features)
     pub deployment_config: DeploymentConfig,
     /// Attack mode - when enabled, requires CAPTCHA verification for all project environments
+    ///
+    /// Kept for one release for consoles that predate Shield modes; it is
+    /// true exactly when `shield_mode` is `attack`.
     pub attack_mode: bool,
+    /// How Shield acts on verdicts in the project's environments (ADR 066
+    /// D1); an environment can set its own.
+    pub shield_mode: temps_shield::ShieldMode,
     /// Opt-in to AI summarization of metric alert notifications (NULL/false = off).
     pub ai_alert_summaries_enabled: Option<bool>,
     /// Opt-in to AI summarization of API traffic analytics (NULL/false = off).
@@ -477,10 +490,22 @@ pub struct ProjectResponse {
     /// OSS global-observability model where any OtelRead holder can query any
     /// project's telemetry).
     pub cross_project_trace_sharing: bool,
+    /// When true, `/api/_temps*` and `/api/otel*` requests on this project's
+    /// domains go to the project's app instead of this Temps instance's
+    /// console. Only for an app that is itself a Temps console or API.
+    pub serves_own_temps_api: bool,
     /// Hours to retain built Docker images before nightly cleanup. Null = use the
     /// system-wide default from settings.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image_retention_hours: Option<i32>,
+    /// This project's container log ingestion budget in lines/s. Absent =
+    /// the platform default (Settings → Monitoring); 0 = unlimited.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log_ingest_lines_per_sec: Option<i32>,
+    /// This project's container log ingestion budget in KiB/s. Absent = the
+    /// platform default; 0 = unlimited.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log_ingest_kib_per_sec: Option<i32>,
     /// Where this project is granted host Docker access (ADR 045), and what to
     /// set when it is granted nowhere.
     ///
@@ -490,6 +515,11 @@ pub struct ProjectResponse {
     /// clients read `granted` from the object, not from its presence.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub docker_socket: Option<DockerSocketCapability>,
+    /// ADR 068 D5: nobody can open the production environment's current
+    /// deployment, and how to fix it. Computed on the single-project detail
+    /// responses only; `null` there means there is nothing to warn about.
+    #[serde(default)]
+    pub reachability_warning: Option<temps_core::environment_address::ReachabilityWarning>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -507,6 +537,15 @@ impl ProjectResponse {
     /// operator, not disappear from the response.
     pub fn with_docker_socket(mut self, capability: DockerSocketCapability) -> Self {
         self.docker_socket = Some(capability);
+        self
+    }
+
+    /// ADR 068 D5, on the single-project detail responses.
+    pub fn with_reachability_warning(
+        mut self,
+        warning: Option<temps_core::environment_address::ReachabilityWarning>,
+    ) -> Self {
+        self.reachability_warning = warning;
         self
     }
 
@@ -534,6 +573,12 @@ impl ProjectResponse {
             is_public_repo: project.is_public_repo,
             git_url: project.git_url,
             attack_mode: project.attack_mode,
+            shield_mode: temps_shield::ShieldMode::effective(
+                None,
+                &project.shield_mode,
+                None,
+                project.attack_mode,
+            ),
             ai_alert_summaries_enabled: project.ai_alert_summaries_enabled,
             ai_api_traffic_summary_enabled: project.ai_api_traffic_summary_enabled,
             error_source_context_enabled: project.error_source_context_enabled,
@@ -549,10 +594,14 @@ impl ProjectResponse {
             gitlab_webhook_id: project.gitlab_webhook_id,
             github_webhook_id: project.github_webhook_id,
             cross_project_trace_sharing: project.cross_project_trace_sharing,
+            serves_own_temps_api: project.serves_own_temps_api,
             image_retention_hours: project.image_retention_hours,
+            log_ingest_lines_per_sec: project.log_ingest_lines_per_sec,
+            log_ingest_kib_per_sec: project.log_ingest_kib_per_sec,
             // Filled in by the detail handlers via `with_docker_socket`; the
             // list path deliberately leaves it unset.
             docker_socket: None,
+            reachability_warning: None,
             deployment_config: DeploymentConfig {
                 cpu_request: project
                     .deployment_config
@@ -643,6 +692,10 @@ impl ProjectResponse {
                     .deployment_config
                     .clone()
                     .and_then(|c| c.max_concurrent_connections),
+                load_balancing: project
+                    .deployment_config
+                    .as_ref()
+                    .and_then(|c| c.load_balancing.clone()),
                 health: project
                     .deployment_config
                     .as_ref()
@@ -651,6 +704,10 @@ impl ProjectResponse {
                     .deployment_config
                     .clone()
                     .and_then(|c| c.health_check_timeout_seconds),
+                stop_timeout_seconds: project
+                    .deployment_config
+                    .as_ref()
+                    .and_then(|c| c.stop_timeout_seconds),
                 container_exec_enabled: project
                     .deployment_config
                     .clone()
@@ -798,6 +855,7 @@ pub struct UpdateDeploymentSettingsRequest {
 #[derive(Serialize, Deserialize, Clone, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateDeploymentConfigRequest {
+    pub load_balancing: Option<temps_entities::deployment_config::LoadBalancingConfig>,
     pub cpu_request: Option<i32>,
     pub cpu_limit: Option<i32>,
     pub memory_request: Option<i32>,
@@ -852,6 +910,12 @@ pub struct UpdateDeploymentConfigRequest {
     /// 300 seconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health_check_timeout_seconds: Option<i32>,
+    /// How long, in seconds (1-3600), the previous deployment's containers get
+    /// to finish in-flight requests after SIGTERM, once a new deployment is
+    /// live, before they are killed. Absent leaves the current value
+    /// unchanged; the platform default is 10 seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_timeout_seconds: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health: Option<temps_core::repo_config::HealthCheckConfig>,
 }
@@ -953,7 +1017,16 @@ pub struct UpdateProjectSettingsRequest {
     pub preset: Option<String>,
     pub directory: Option<String>,
     /// Enable/disable attack mode (CAPTCHA protection) for all project environments
+    ///
+    /// Kept for consoles that predate Shield modes: `true` sets the Shield
+    /// mode to `attack`, `false` turns attack back to `log`. When
+    /// `shield_mode` is also sent, `shield_mode` wins.
     pub attack_mode: Option<bool>,
+    /// How Shield acts on verdicts in the project's environments (ADR 066
+    /// D1): `off`, `log`, `selective` or `attack`. `attack_mode` is written
+    /// to match for one release. Omit to leave it unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shield_mode: Option<temps_shield::ShieldMode>,
     /// Opt in to AI summarization of metric alert notifications (ADR-021).
     pub ai_alert_summaries_enabled: Option<bool>,
     /// Opt in to AI summarization of API traffic analytics.
@@ -989,6 +1062,22 @@ pub struct UpdateProjectSettingsRequest {
         skip_serializing_if = "Option::is_none"
     )]
     pub image_retention_hours: Option<Option<i32>>,
+    /// Container log ingestion budget for this project's containers, in
+    /// lines per second (0–1,000,000). `0` lifts the limit; explicit `null`
+    /// returns to the platform default; omit to leave unchanged.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_optional_i32",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub log_ingest_lines_per_sec: Option<Option<i32>>,
+    /// Same as `log_ingest_lines_per_sec`, in KiB per second (0–1,048,576).
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_optional_i32",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub log_ingest_kib_per_sec: Option<Option<i32>>,
     /// Preset-specific configuration (e.g., Dockerfile path for Docker preset)
     ///
     /// Example for Dockerfile preset:
@@ -1005,6 +1094,12 @@ pub struct UpdateProjectSettingsRequest {
     /// from appearing in cross-project discovery results. Default true (consistent
     /// with the OSS global-observability model). Omit to leave unchanged.
     pub cross_project_trace_sharing: Option<bool>,
+    /// Send `/api/_temps*` and `/api/otel*` requests on this project's domains
+    /// to the project's app instead of this Temps instance's console. Turn on
+    /// only when the app is itself a Temps console or API: with it on, this
+    /// instance's analytics and OpenTelemetry ingest stop receiving the
+    /// project's traffic. Omit to leave unchanged.
+    pub serves_own_temps_api: Option<bool>,
 }
 
 impl From<UpdateProjectSettingsRequest> for crate::services::types::UpdateProjectSettingsParams {
@@ -1019,6 +1114,7 @@ impl From<UpdateProjectSettingsRequest> for crate::services::types::UpdateProjec
             preset: request.preset,
             directory: request.directory,
             attack_mode: request.attack_mode,
+            shield_mode: request.shield_mode,
             enable_preview_environments: request.enable_preview_environments,
             preview_envs_on_demand: request.preview_envs_on_demand,
             preview_envs_idle_timeout_seconds: request.preview_envs_idle_timeout_seconds,
@@ -1026,11 +1122,14 @@ impl From<UpdateProjectSettingsRequest> for crate::services::types::UpdateProjec
             preset_config: request.preset_config,
             ai_alert_summaries_enabled: request.ai_alert_summaries_enabled,
             cross_project_trace_sharing: request.cross_project_trace_sharing,
+            serves_own_temps_api: request.serves_own_temps_api,
             error_source_context_enabled: request.error_source_context_enabled,
             vulnerability_scanning_enabled: request.vulnerability_scanning_enabled,
             error_source_root: request.error_source_root,
             ai_api_traffic_summary_enabled: request.ai_api_traffic_summary_enabled,
             image_retention_hours: request.image_retention_hours,
+            log_ingest_lines_per_sec: request.log_ingest_lines_per_sec,
+            log_ingest_kib_per_sec: request.log_ingest_kib_per_sec,
         }
     }
 }
@@ -1237,6 +1336,11 @@ pub struct CreateEnvironmentRequest {
 impl From<ProjectError> for Problem {
     fn from(error: ProjectError) -> Self {
         match error {
+            ProjectError::PipelineEnvironmentNotFound { project_id, environment_id } => problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("Environment Not Found").with_detail(format!("Active environment {environment_id} in project {project_id} was not found")),
+            ProjectError::PipelineEnvironmentLookup { project_id, environment_id, source } => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Environment Lookup Failed").with_detail(format!("Failed to load environment {environment_id} in project {project_id}: {source}")),
+
             ProjectError::DatabaseConnectionError(reason) => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Database Error")
@@ -1337,6 +1441,12 @@ impl From<ProjectError> for Problem {
                     .with_detail(error.to_string())
             }
 
+            ProjectError::TelemetryDetachPending { .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Database Maintenance Pending")
+                    .with_detail(error.to_string())
+            }
+
             ProjectError::Other(msg) => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Internal Server Error")
                 .with_detail(msg),
@@ -1424,6 +1534,11 @@ impl From<crate::services::custom_domains::CustomDomainError> for Problem {
             CustomDomainError::DeliveryBindingBlocksChange { .. } => {
                 problemdetails::new(StatusCode::CONFLICT)
                     .with_title("Domain delivery is configured")
+                    .with_detail(error.to_string())
+            }
+            CustomDomainError::InvalidRedirectStatusCode { .. } => {
+                problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_title("Invalid Redirect Status Code")
                     .with_detail(error.to_string())
             }
             CustomDomainError::InvalidRedirectUrl(msg) => {
@@ -1601,6 +1716,19 @@ mod tests {
             updated_at: now,
             certificate_id: None,
             service_name: None,
+            audience: "public".to_string(),
+            private_range: None,
+            private_node_id: None,
+            private_listener: None,
+            gate: None,
+            gate_allow: None,
+            gate_not_before: None,
+            gate_access_provider_id: None,
+            gate_access_app_id: None,
+            gate_access_aud: None,
+            private_via: None,
+            private_service: None,
+            http_policy: None,
         };
         let response = CustomDomainLookupResponse::from(Some(CustomDomainWithInfo {
             custom_domain: model,
@@ -1709,6 +1837,18 @@ mod tests {
         assert_eq!(omitted.image_retention_hours, None);
         assert_eq!(cleared.image_retention_hours, Some(None));
         assert_eq!(set.image_retention_hours, Some(Some(72)));
+
+        let lifted: UpdateProjectSettingsRequest =
+            serde_json::from_str(r#"{"log_ingest_lines_per_sec":0,"log_ingest_kib_per_sec":null}"#)
+                .unwrap();
+        assert_eq!(lifted.log_ingest_lines_per_sec, Some(Some(0)));
+        assert_eq!(lifted.log_ingest_kib_per_sec, Some(None));
+        assert_eq!(omitted.log_ingest_lines_per_sec, None);
+        let round_trip = serde_json::to_string(&omitted).unwrap();
+        assert!(
+            !round_trip.contains("log_ingest"),
+            "an omitted override must not re-serialize as a reset: {round_trip}"
+        );
     }
 
     /// ADR 045 refusals are 403, not 400: an admin sending the identical

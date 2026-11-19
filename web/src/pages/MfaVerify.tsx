@@ -23,7 +23,11 @@ import { useAuth } from '@/contexts/AuthContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { isMfaChallengeEnded } from '@/lib/mfaChallengeProblem'
 import { announceMutationFailure } from '@/lib/mutation-error-toast'
-import { consumeReturnTo, rememberReturnTo } from '@/lib/return-to'
+import {
+  consumeReturnTo,
+  goToReturnTo,
+  rememberReturnTo,
+} from '@/lib/return-to'
 import * as z from 'zod'
 
 const formSchema = z.object({
@@ -97,7 +101,7 @@ export const MfaVerify = () => {
       const target = isSafeRelativePath(queryReturnTo)
         ? queryReturnTo
         : consumeReturnTo('/dashboard')
-      navigate(target, { replace: true })
+      goToReturnTo(navigate, target)
     },
   })
   const onSubmit = async (data: FormValues) => {

@@ -111,6 +111,136 @@ Aborting installation."
     success "Checksum verified (sha256)."
 }
 
+# Verify WHO published a download, best effort. The `.sha256` checked above
+# ships in the same release as the tarball, so it proves integrity, not
+# origin: whoever can replace the tarball can replace its checksum too. Every
+# signed release publishes a keyless Sigstore bundle (`<tarball>.sigstore.json`)
+# and a GitHub build-provenance attestation, both bound to the release workflow
+# of gotempsh/temps at this exact tag.
+#
+# - The bundle must exist. A release without one is refused unless
+#   --allow-unsigned is passed (only releases from before signing lack it),
+#   so deleting the signature is not a way around this check.
+# - `cosign` on PATH: `cosign verify-blob` against the bundle, with the
+#   identity and issuer pinned.
+# - Otherwise an authenticated `gh`: `gh attestation verify` pinned to the
+#   release workflow and the tag. (`gh` refuses to run unauthenticated, so an
+#   unauthenticated one is treated as absent.)
+# - Neither: keep the checksum result and say plainly that the origin was not
+#   verified, with the commands to verify it by hand. A bare server keeps a
+#   working one-line install.
+#
+# Any verification that runs and fails aborts the install; --allow-unsigned
+# never excuses a signature that is present but does not verify.
+release_workflow=gotempsh/temps/.github/workflows/release.yml
+oidc_issuer=https://token.actions.githubusercontent.com
+
+# How long a verifier (cosign, gh) may run before it is stopped; a verifier
+# that is stopped counts as a failed check.
+verifier_deadline=300
+
+# Run "$@" under verifier_deadline: with coreutils `timeout` where it exists
+# (every mainstream Linux), otherwise (macOS) with a watcher that sends
+# SIGTERM when the deadline passes. The watcher's output goes to /dev/null so
+# it never holds open the pipe of a `$(...)` that captures the command.
+with_deadline() {
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "$verifier_deadline" "$@"
+        return
+    fi
+    local pid watcher status=0
+    "$@" &
+    pid=$!
+    (
+        sleep "$verifier_deadline" &
+        sleeper=$!
+        trap 'kill "$sleeper" 2>/dev/null; exit 0' TERM
+        wait "$sleeper"
+        kill -TERM "$pid" 2>/dev/null
+    ) >/dev/null 2>&1 &
+    watcher=$!
+    wait "$pid" || status=$?
+    kill -TERM "$watcher" 2>/dev/null || true
+    wait "$watcher" 2>/dev/null || true
+    return "$status"
+}
+
+verify_signature() {
+    local file="$1" url="$2" tag="$3" asset="$4"
+    local bundle="$file.sigstore.json" identity status output
+    identity="https://github.com/$release_workflow@refs/tags/$tag"
+
+    # Bounded: 15 s to connect and 60 s per attempt, with up to 3 retries
+    # (exponential backoff) on timeouts, HTTP 408/429 and 5xx.
+    status=$(curl --silent --location --connect-timeout 15 --max-time 60 --retry 3 \
+        --output "$bundle" --write-out '%{http_code}' \
+        "$url.sigstore.json" 2>/dev/null) || status=000
+    if [[ "$status" = "404" ]]; then
+        rm -f "$bundle"
+        if [[ "$allow_unsigned" = "1" ]]; then
+            warning "Release $tag publishes no signature ($asset.sigstore.json); its origin was NOT
+verified. Installing on the strength of its SHA-256 checksum alone because --allow-unsigned was passed."
+            return 0
+        fi
+        rm -f "$file"
+        error "Release $tag publishes no Sigstore signature for $asset (no $asset.sigstore.json
+asset), so its origin cannot be verified. Refusing to install an unsigned release.
+Releases published before signing was introduced have none; to install one anyway on its
+checksum alone, re-run with --allow-unsigned:
+    curl -fsSL https://raw.githubusercontent.com/gotempsh/temps/main/scripts/install.sh | bash -s -- --allow-unsigned $tag"
+    fi
+    if [[ "$status" != "200" ]]; then
+        rm -f "$bundle" "$file"
+        error "Could not download the signature \"$url.sigstore.json\" (HTTP $status).
+Refusing to install $tag without checking it. Retry in a moment."
+    fi
+
+    if command -v cosign >/dev/null 2>&1; then
+        info "Verifying signature with cosign..."
+        if ! output=$(with_deadline cosign verify-blob --bundle "$bundle" \
+                --certificate-identity "$identity" \
+                --certificate-oidc-issuer "$oidc_issuer" "$file" 2>&1); then
+            rm -f "$bundle" "$file"
+            error "Signature verification FAILED: $asset is not signed by the Temps release
+workflow at $tag. The download may have been tampered with. Aborting installation.
+  expected signer: $identity
+  expected issuer: $oidc_issuer
+cosign said:
+$output
+(cosign older than v2.4 cannot read this bundle format; upgrade it if that is the error.)"
+        fi
+        rm -f "$bundle"
+        success "Signature verified (cosign): signed by $identity"
+        return 0
+    fi
+    rm -f "$bundle"
+
+    if command -v gh >/dev/null 2>&1 && with_deadline gh auth status >/dev/null 2>&1; then
+        info "Verifying build provenance with the GitHub CLI..."
+        if ! output=$(with_deadline gh attestation verify "$file" --repo gotempsh/temps \
+                --cert-identity "$identity" \
+                --source-ref "refs/tags/$tag" \
+                --cert-oidc-issuer "$oidc_issuer" 2>&1); then
+            rm -f "$file"
+            error "Build provenance verification FAILED: $asset has no attestation from the Temps
+release workflow at $tag. The download may have been tampered with. Aborting installation.
+  expected signer: $identity
+  expected issuer: $oidc_issuer
+gh said:
+$output"
+        fi
+        success "Build provenance verified (gh): built by $identity"
+        return 0
+    fi
+
+    warning "Neither cosign nor an authenticated GitHub CLI (gh) is installed, so the origin of
+this download was NOT verified; only its checksum was. To verify the release yourself:
+    gh release download $tag --repo gotempsh/temps --pattern $asset --pattern $asset.sigstore.json
+    cosign verify-blob --bundle $asset.sigstore.json \\
+      --certificate-identity $identity \\
+      --certificate-oidc-issuer $oidc_issuer $asset"
+}
+
 command -v curl >/dev/null ||
     error 'curl is required to install temps'
 
@@ -281,9 +411,14 @@ Available versions: https://github.com/gotempsh/temps/releases"
 # `--channel beta` or `--channel nightly` explicitly to opt into prereleases.
 # `bash install.sh` always lands on stable — same contract as `temps upgrade`.
 channel="stable"
+allow_unsigned=0
 positional=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --allow-unsigned)
+            allow_unsigned=1
+            shift
+            ;;
         --channel=*)
             channel="${1#--channel=}"
             shift
@@ -309,7 +444,7 @@ case "$channel" in
 esac
 
 if [[ ${#positional[@]} -gt 1 ]]; then
-    error 'Too many arguments. Usage: install.sh [--channel stable|beta|nightly] [version]'
+    error 'Too many arguments. Usage: install.sh [--channel stable|beta|nightly] [--allow-unsigned] [version]'
 fi
 
 case $platform in
@@ -467,7 +602,7 @@ else
         error "'${positional[0]}' is not a release version. Expected something like
 'v0.1.0', '0.1.0' or 'v0.1.0-rc.1'.
 
-Usage: install.sh [--channel stable|beta|nightly] [version]
+Usage: install.sh [--channel stable|beta|nightly] [--allow-unsigned] [version]
 Available versions: https://github.com/gotempsh/temps/releases"
     fi
     info "Installing pinned version: $temps_tag"
@@ -496,6 +631,8 @@ curl --fail --location --progress-bar --output "$tarball" "$temps_uri" ||
 info "Verifying download integrity..."
 
 verify_checksum "$tarball" "$temps_uri.sha256"
+
+verify_signature "$tarball" "$temps_uri" "$temps_tag" "$asset_name"
 
 info "Extracting temps..."
 
@@ -545,8 +682,11 @@ tildify() {
 
 success "temps was installed successfully to $Bold_Green$(tildify "$exe")"
 
+capabilities_url=https://temps.sh/docs/capabilities
+
 if command -v temps >/dev/null; then
     echo "Run 'temps --help' to get started"
+    info "What Temps supports (platforms, worker and builder nodes, upgrades, backups): $capabilities_url"
     exit
 fi
 
@@ -685,3 +825,6 @@ if [[ $refresh_command ]]; then
 fi
 
 info_bold "  temps --help"
+echo
+info "What Temps supports (platforms, worker and builder nodes, upgrades, backups):"
+info_bold "  $capabilities_url"

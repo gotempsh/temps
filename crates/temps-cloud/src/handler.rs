@@ -171,8 +171,8 @@ impl AuditOperation for CloudTelemetryActivationStartedAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self).map_err(Into::into)
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -189,8 +189,8 @@ impl AuditOperation for CloudLinkAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self).map_err(Into::into)
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -227,6 +227,7 @@ fn problem(error: CloudServiceError) -> Problem {
         ) => StatusCode::FORBIDDEN,
         CloudServiceError::Client(
             temps_cloud_client::CloudError::Rejected { .. }
+            | temps_cloud_client::CloudError::RouteUnavailable { .. }
             | temps_cloud_client::CloudError::InvalidAcknowledgement { .. }
             | temps_cloud_client::CloudError::InvalidBackupTarget { .. },
         ) => StatusCode::BAD_GATEWAY,
@@ -805,8 +806,8 @@ impl AuditOperation for CloudBackendUrlBootstrappedAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self).map_err(Into::into)
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -874,6 +875,12 @@ pub const CLOUD_CONSOLE_OIDC_BOOTSTRAPPED: &str = "CLOUD_CONSOLE_OIDC_BOOTSTRAPP
 pub const CLOUD_CONSOLE_ACCESS_ENABLED_BY_BOOTSTRAP: &str =
     "CLOUD_CONSOLE_ACCESS_ENABLED_BY_BOOTSTRAP";
 
+/// Audit action recorded when consuming `cloud-oidc.json` turned
+/// `cloud.telemetry_enabled` on: the file Temps Cloud drops on a hosted plane
+/// asks for telemetry export, and its presence is the operator's consent (see
+/// [`crate::TelemetryConsent`]). Carries the before/after feature switches.
+pub const CLOUD_TELEMETRY_ENABLED_BY_BOOTSTRAP: &str = "CLOUD_TELEMETRY_ENABLED_BY_BOOTSTRAP";
+
 /// Audit action recorded when consuming `cloud-oidc.json` *failed after
 /// attempting to turn console access on*. The bootstrap as a whole failed, but
 /// the settings row may have been written and the compensating write may have
@@ -905,8 +912,8 @@ impl AuditOperation for CloudConsoleAccessBootstrapFailedAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self).map_err(Into::into)
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -974,8 +981,8 @@ impl AuditOperation for CloudConsoleOidcBootstrapAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self).map_err(Into::into)
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -1016,6 +1023,28 @@ pub async fn record_console_oidc_bootstrap_outcome_audit(
             audit,
             actor,
             CLOUD_CONSOLE_ACCESS_ENABLED_BY_BOOTSTRAP,
+            Some(*previous),
+            Some(*new),
+        )
+        .await;
+    }
+}
+
+/// Record that the bootstrap file turned telemetry export on. Nothing is
+/// written for the other [`crate::TelemetryConsent`] outcomes: they changed no
+/// setting (a failed write is logged by the caller, and the settings
+/// transaction it attempted either committed -- and the link then blocks
+/// outbound -- or rolled back).
+pub async fn record_telemetry_bootstrap_audit(
+    audit: &dyn AuditLogger,
+    actor: CloudEnrollmentActor,
+    telemetry: &crate::TelemetryConsent,
+) {
+    if let crate::TelemetryConsent::GrantedByBootstrap { previous, new } = telemetry {
+        write_cloud_link_audit(
+            audit,
+            actor,
+            CLOUD_TELEMETRY_ENABLED_BY_BOOTSTRAP,
             Some(*previous),
             Some(*new),
         )
@@ -1117,13 +1146,19 @@ mod tests {
 
     #[temps_core::async_trait::async_trait]
     impl AuditLogger for RecordingAudit {
-        async fn create_audit_log(&self, operation: &dyn AuditOperation) -> anyhow::Result<()> {
+        async fn create_audit_log(
+            &self,
+            operation: &dyn AuditOperation,
+        ) -> temps_core::AuditResult<()> {
             self.recorded
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .push(operation.operation_type());
             if self.fail {
-                anyhow::bail!("audit store is unavailable");
+                return Err(temps_core::AuditError::write(
+                    operation.operation_type(),
+                    "audit store is unavailable",
+                ));
             }
             Ok(())
         }
@@ -1611,7 +1646,10 @@ mod tests {
 
     #[temps_core::async_trait::async_trait]
     impl AuditLogger for ActorRecordingAudit {
-        async fn create_audit_log(&self, operation: &dyn AuditOperation) -> anyhow::Result<()> {
+        async fn create_audit_log(
+            &self,
+            operation: &dyn AuditOperation,
+        ) -> temps_core::AuditResult<()> {
             self.recorded
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())

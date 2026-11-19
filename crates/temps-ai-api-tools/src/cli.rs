@@ -45,6 +45,7 @@ pub(crate) enum CliMode {
 pub(crate) enum CliAction<'a> {
     /// Help or an error — already-rendered text to return to the model verbatim.
     Terminal(String),
+    Invalid(String),
     /// A resolved operation to execute with the given flat parameter object.
     Execute(&'a ApiOperation, Value),
 }
@@ -69,6 +70,17 @@ pub(crate) fn resolve<'a>(
     command: &str,
     permit: &dyn Fn(&ApiOperation) -> bool,
     mode: CliMode,
+) -> CliAction<'a> {
+    resolve_with_project_context(index, command, permit, mode, true)
+}
+
+/// Render selectors explicitly unless a single selected project supplies them.
+pub(crate) fn resolve_with_project_context<'a>(
+    index: &'a ReadOnlyApiIndex,
+    command: &str,
+    permit: &dyn Fn(&ApiOperation) -> bool,
+    mode: CliMode,
+    project_selected: bool,
 ) -> CliAction<'a> {
     let tokens = tokenize(command);
     // Tolerate a leading program name — the model may write `temps deploy …`.
@@ -106,8 +118,8 @@ pub(crate) fn resolve<'a>(
             .iter()
             .find(|o| o.operation_id.eq_ignore_ascii_case(op_name))
         {
-            Some(op) => resolve_operation(op, &tokens[2..]),
-            None => CliAction::Terminal(format!(
+            Some(op) => resolve_operation(op, &tokens[2..], project_selected),
+            None => CliAction::Invalid(format!(
                 "Unknown operation '{op_name}' in section '{}'.{}\n\n{}",
                 sec.slug,
                 mutation_redirect_for(mode, op_name),
@@ -125,11 +137,11 @@ pub(crate) fn resolve<'a>(
     // should never have been.
     if let Some(op) = index.get(first) {
         if permit(op) {
-            return resolve_operation(op, &tokens[1..]);
+            return resolve_operation(op, &tokens[1..], project_selected);
         }
     }
 
-    CliAction::Terminal(format!(
+    CliAction::Invalid(format!(
         "Unknown command '{first}'. Run `--help` to list sections.{}{}",
         mutation_redirect_for(mode, first),
         suggest_operations(&secs, first),
@@ -236,13 +248,17 @@ fn mutation_redirect(op_name: &str) -> String {
 }
 
 /// Resolve the tail of `… <operation_id> [tail]` — either help or execution.
-fn resolve_operation<'a>(op: &'a ApiOperation, tail: &[String]) -> CliAction<'a> {
+fn resolve_operation<'a>(
+    op: &'a ApiOperation,
+    tail: &[String],
+    project_selected: bool,
+) -> CliAction<'a> {
     if tail.first().map(|t| is_help(t)).unwrap_or(false) {
-        return CliAction::Terminal(render_operation_help(op));
+        return CliAction::Terminal(render_operation_help_with_context(op, project_selected));
     }
     match parse_flags(tail, Some(op)) {
         Ok(params) => CliAction::Execute(op, params),
-        Err(e) => CliAction::Terminal(e),
+        Err(e) => CliAction::Invalid(e),
     }
 }
 
@@ -319,7 +335,12 @@ fn render_section_help(sec: &Section) -> String {
     out
 }
 
+#[cfg(test)]
 fn render_operation_help(op: &ApiOperation) -> String {
+    render_operation_help_with_context(op, true)
+}
+
+fn render_operation_help_with_context(op: &ApiOperation, project_selected: bool) -> String {
     let mut out = format!("{} — {} {}\n", op.operation_id, op.method, op.path);
     if let Some(s) = &op.summary {
         out.push_str(s);
@@ -336,27 +357,25 @@ fn render_operation_help(op: &ApiOperation) -> String {
         .params
         .iter()
         .find(|param| is_project_scope_param(op, param));
-    // Hide the context-supplied project selector — the model must not put it
-    // inside the virtual command.
+    // Only hide a selector when the request builder can auto-fill it.
     let flags: Vec<&_> = op
         .params
         .iter()
-        .filter(|p| !is_project_scope_param(op, p))
+        .filter(|p| !project_selected || !is_project_scope_param(op, p))
         .collect();
     if flags.is_empty() {
         out.push_str("Flags: none\n");
     } else {
         out.push_str("Flags:\n");
         for p in flags {
-            // Path params are structurally required, and so are body fields the
-            // schema marks required — a write call fails without them, so the
-            // help has to say which ones they are. (Query params stay unmarked:
-            // they're optional filters, and OpenAPI required-ness is frequently
-            // wrong for them, so claiming "required" would send the model
-            // inventing values for filters it should simply omit.)
+            // Plugin query contracts are authoritative. Curated core queries
+            // retain their compatibility exception for inaccurate required flags.
             let req = match p.location {
                 ParamLocation::Path => " (required)",
                 ParamLocation::Body if p.required => " (required)",
+                ParamLocation::Query if p.required && op.operation_id.starts_with("plugin.") => {
+                    " (required)"
+                }
                 _ => "",
             };
             out.push_str(&format!("  --{} {}{}", p.name, flag_value_label(p), req));
@@ -385,7 +404,7 @@ fn render_operation_help(op: &ApiOperation) -> String {
              `--ids 1,2`, `--ids '[1,2]'`, `--ids 1 --ids 2`.)\n",
         );
     }
-    if let Some(selector) = project_selector {
+    if let Some(selector) = project_selector.filter(|_| project_selected) {
         if matches!(selector.location, ParamLocation::Body) && !selector.required {
             out.push_str(
                 "(project_id is optional: it is supplied by the selected tool context when one exists; otherwise the resource remains unlinked.)\n",
@@ -544,9 +563,7 @@ fn parse_flags(tokens: &[String], operation: Option<&ApiOperation>) -> Result<Va
     while i < tokens.len() {
         let t = &tokens[i];
         let Some(rest) = t.strip_prefix("--") else {
-            return Err(format!(
-                "Unexpected argument '{t}'. Flags must look like `--name value` or `--name=value`."
-            ));
+            return Err("Unexpected positional argument. Flags must look like `--name value` or `--name=value`.".to_string());
         };
         let (name, inline) = match rest.split_once('=') {
             Some((k, v)) => (k, Some(v)),
@@ -612,7 +629,7 @@ fn parameter_spec<'a>(operation: Option<&'a ApiOperation>, flag: &str) -> Option
 /// Accepts a single value (`15`), comma-separated values (`15,16`), a JSON array
 /// (`[15,16]`, even when the shell-level tokenizer split it at spaces), or
 /// several tokens (`15 16`). Every item is coerced to `item_ty`; an item that
-/// cannot be is an error naming the flag, the position and the offending value,
+/// cannot be is an error naming the flag, the position and the expected type,
 /// so the model corrects the call instead of sending it to be rejected by the
 /// API after a human approved it.
 fn coerce_array(flag: &str, raw: &[&str], item_ty: Option<&str>) -> Result<Vec<Value>, String> {
@@ -640,8 +657,9 @@ fn coerce_array(flag: &str, raw: &[&str], item_ty: Option<&str>) -> Result<Vec<V
         }
         if chunk.starts_with('[') {
             let parsed = serde_json::from_str::<Vec<Value>>(chunk).map_err(|error| {
+                let (line, column) = (error.line(), error.column());
                 format!(
-                    "Invalid JSON array for `--{flag}`: {error}. Pass a list as \
+                    "Invalid JSON array for `--{flag}`: invalid JSON at line {line}, column {column}. Pass a list as \
                      `--{flag} 1,2` or `--{flag} '[1,2]'`."
                 )
             })?;
@@ -660,7 +678,7 @@ fn coerce_array(flag: &str, raw: &[&str], item_ty: Option<&str>) -> Result<Vec<V
                 let position = items.len() + 1;
                 if piece.is_empty() {
                     return Err(format!(
-                        "Empty item {position} in `--{flag}`: '{chunk}'. Separate values with a \
+                        "Empty item {position} in `--{flag}`. Separate values with a \
                          single comma, for example `--{flag} 1,2`."
                     ));
                 }
@@ -690,13 +708,9 @@ fn coerce_array_item(
     value: Value,
     item_ty: Option<&str>,
 ) -> Result<Value, String> {
-    let mismatch = |expected: &str, value: &Value| {
-        let shown = match value {
-            Value::String(s) => format!("the string \"{s}\""),
-            other => other.to_string(),
-        };
+    let mismatch = |expected: &str, _value: &Value| {
         format!(
-            "Invalid item {position} for `--{flag}`: {shown} is not {expected}. Pass a list as \
+            "Invalid item {position} for `--{flag}`: expected {expected}. Pass a list as \
              `--{flag} a,b`, a JSON array `--{flag} '[a,b]'`, or repeat the flag."
         )
     };
@@ -750,12 +764,24 @@ fn coerce(flag: &str, s: &str, expected_type: Option<&str>) -> Result<Value, Str
     // turned `--version 18` into JSON number 18 and made a human-approved
     // create-service proposal fail only after confirmation.
     match expected_type {
+        Some("json") => {
+            return serde_json::from_str(s.trim()).map_err(|error| {
+                let (line, column) = (error.line(), error.column());
+                format!("Invalid JSON value for `--{flag}`: invalid JSON at line {line}, column {column}. Use a JSON number, boolean, null, object, array or double-quoted string.")
+            });
+        }
         Some("string") => {
             let trimmed = s.trim();
             if trimmed.starts_with('"') && trimmed.ends_with('"') {
                 return serde_json::from_str::<String>(trimmed)
                     .map(Value::String)
-                    .map_err(|error| format!("Invalid JSON string for `--{flag}`: {error}."));
+                    .map_err(|error| {
+                        format!(
+                            "Invalid JSON string for `--{flag}` at line {}, column {}.",
+                            error.line(),
+                            error.column()
+                        )
+                    });
             }
             return Ok(Value::String(s.to_string()));
         }
@@ -763,7 +789,7 @@ fn coerce(flag: &str, s: &str, expected_type: Option<&str>) -> Result<Value, Str
             return s
                 .parse::<i64>()
                 .map(Value::from)
-                .map_err(|error| format!("Invalid integer for `--{flag}`: '{s}' ({error})."));
+                .map_err(|_| format!("Invalid integer for `--{flag}`."));
         }
         Some("number") => {
             return s
@@ -772,14 +798,14 @@ fn coerce(flag: &str, s: &str, expected_type: Option<&str>) -> Result<Value, Str
                 .filter(|number| number.is_finite())
                 .and_then(serde_json::Number::from_f64)
                 .map(Value::Number)
-                .ok_or_else(|| format!("Invalid number for `--{flag}`: '{s}'."));
+                .ok_or_else(|| format!("Invalid number for `--{flag}`."));
         }
         Some("boolean") => {
             return match s {
                 "true" => Ok(Value::Bool(true)),
                 "false" => Ok(Value::Bool(false)),
                 _ => Err(format!(
-                    "Invalid boolean for `--{flag}`: '{s}'. Use `true` or `false`."
+                    "Invalid boolean for `--{flag}`. Use `true` or `false`."
                 )),
             };
         }
@@ -828,8 +854,9 @@ fn coerce(flag: &str, s: &str, expected_type: Option<&str>) -> Result<Value, Str
 
 fn parse_structured_value(flag: &str, s: &str) -> Result<Value, String> {
     serde_json::from_str::<Value>(s.trim()).map_err(|error| {
+                let (line, column) = (error.line(), error.column());
         format!(
-            "Invalid JSON for `--{flag}`: {error}. Object and array values must be \
+            "Invalid JSON for `--{flag}`: invalid JSON at line {line}, column {column}. Object and array values must be \
              valid JSON with double-quoted keys and string values, for example \
              `--{flag} '{{\"database\":\"postgres\",\"username\":\"postgres\"}}'`."
         )
@@ -848,6 +875,20 @@ fn first_line(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn validation_errors_omit_raw_values() {
+        let secret = "arbitrary-private-input";
+        for ty in ["integer", "number", "boolean", "json", "object"] {
+            assert!(!coerce("field", secret, Some(ty))
+                .unwrap_err()
+                .contains(secret));
+        }
+        let error = coerce_array("environment_ids", &["1", secret], Some("integer")).unwrap_err();
+        assert!(error.contains("item 2"));
+        assert!(error.contains("environment_ids"));
+        assert!(!error.contains(secret));
+    }
+
     use utoipa::openapi::{
         path::{OperationBuilder, PathItem, PathsBuilder},
         OpenApiBuilder,
@@ -888,8 +929,35 @@ mod tests {
     use crate::index::ParamSpec;
 
     #[test]
+    fn operation_help_marks_required_plugin_queries_but_preserves_core_compatibility() {
+        for method in ["get", "post"] {
+            let spec = serde_json::from_value(serde_json::json!({
+                "openapi":"3.1.0", "info":{"title":"Reports","version":"1"},
+                "paths":{"/reports":{method:{
+                    "operationId":"list", "x-temps-ai-tool":{},
+                    "parameters":[
+                        {"name":"report_name","in":"query","required":true,"schema":{"type":"string"}},
+                        {"name":"filter","in":"query","required":false,"schema":{"type":"string"}}
+                    ],
+                    "responses":{"200":{"description":"OK"}}
+                }}}
+            })).unwrap();
+            let plugin = crate::PluginToolsIndex::from_openapi("reports", &spec, true).unwrap();
+            let mut operation = plugin.tools()[0].operation.clone();
+            let help = render_operation_help(&operation);
+            assert!(help.contains("--report_name <string> (required)"), "{help}");
+            assert!(help.contains("--filter <string>\n"), "{help}");
+            operation.operation_id = "list_reports".into();
+            let core_help = render_operation_help(&operation);
+            assert!(!core_help.contains("(required)"), "{core_help}");
+        }
+    }
+
+    #[test]
     fn operation_help_explains_optional_project_linkage() {
         let operation = ApiOperation {
+            has_json_body: false,
+            plugin_enabled: None,
             operation_id: "create_service".to_string(),
             path: "/external-services".to_string(),
             method: "POST".to_string(),
@@ -897,6 +965,7 @@ mod tests {
             description: None,
             tags: vec!["External Services".to_string()],
             params: vec![ParamSpec {
+                query_serialization: None,
                 name: "project_id".to_string(),
                 location: ParamLocation::Body,
                 required: false,
@@ -1043,6 +1112,8 @@ mod tests {
     #[test]
     fn operation_schema_preserves_number_looking_string_flags() {
         let operation = ApiOperation {
+            has_json_body: false,
+            plugin_enabled: None,
             operation_id: "create_service".to_string(),
             path: "/external-services".to_string(),
             method: "POST".to_string(),
@@ -1050,6 +1121,7 @@ mod tests {
             description: None,
             tags: vec!["External Services".to_string()],
             params: vec![crate::index::ParamSpec {
+                query_serialization: None,
                 name: "version".to_string(),
                 location: ParamLocation::Body,
                 required: true,
@@ -1134,7 +1206,7 @@ mod tests {
             &|_| true,
             CliMode::ReadOnly,
         );
-        let CliAction::Terminal(message) = result else {
+        let CliAction::Invalid(message) = result else {
             panic!("unknown analytics operation unexpectedly resolved");
         };
 
@@ -1159,7 +1231,7 @@ mod tests {
             &|op| op.operation_id != "get_analytics_visitor_sessions",
             CliMode::ReadOnly,
         );
-        let CliAction::Terminal(message) = result else {
+        let CliAction::Invalid(message) = result else {
             panic!("unknown analytics operation unexpectedly resolved");
         };
 
@@ -1180,7 +1252,7 @@ mod tests {
             &|_| true,
             CliMode::ReadOnly,
         );
-        let CliAction::Terminal(message) = result else {
+        let CliAction::Invalid(message) = result else {
             panic!("unknown analytics mutation unexpectedly resolved");
         };
 
@@ -1196,6 +1268,7 @@ mod tests {
 
     fn array_param(name: &str, item_ty: Option<&str>) -> ParamSpec {
         ParamSpec {
+            query_serialization: None,
             name: name.to_string(),
             location: ParamLocation::Body,
             required: true,
@@ -1209,6 +1282,7 @@ mod tests {
 
     fn env_var_operation() -> ApiOperation {
         let scalar = |name: &str, ty: &str| ParamSpec {
+            query_serialization: None,
             name: name.to_string(),
             location: ParamLocation::Body,
             required: true,
@@ -1219,6 +1293,8 @@ mod tests {
             object_shape: None,
         };
         ApiOperation {
+            has_json_body: false,
+            plugin_enabled: None,
             operation_id: "create_environment_variable".to_string(),
             path: "/projects/{project_id}/env-vars".to_string(),
             method: "POST".to_string(),
@@ -1319,11 +1395,11 @@ mod tests {
     }
 
     #[test]
-    fn array_item_mismatches_are_typed_errors_naming_flag_position_and_value() {
+    fn array_item_mismatches_name_flag_position_and_type_without_value() {
         let error = parsed("--environment_ids 15,abc", "environment_ids").unwrap_err();
         assert!(error.contains("`--environment_ids`"), "{error}");
         assert!(error.contains("item 2"), "{error}");
-        assert!(error.contains("\"abc\""), "{error}");
+        assert!(!error.contains("abc"), "{error}");
         assert!(error.contains("an integer"), "{error}");
 
         let error = parsed("--environment_ids [1.5]", "environment_ids").unwrap_err();
@@ -1405,7 +1481,10 @@ mod tests {
     #[test]
     fn help_without_list_flags_has_no_list_hint() {
         let help = render_operation_help(&ApiOperation {
+            has_json_body: false,
+            plugin_enabled: None,
             params: vec![ParamSpec {
+                query_serialization: None,
                 name: "name".to_string(),
                 location: ParamLocation::Body,
                 required: true,
@@ -1447,7 +1526,7 @@ mod tests {
     fn write_mode_does_not_redirect_unknown_mutations_to_itself() {
         let index = analytics_discovery_index();
 
-        let CliAction::Terminal(message) = resolve(
+        let CliAction::Invalid(message) = resolve(
             &index,
             "analytics delete_analytics",
             &|_| true,

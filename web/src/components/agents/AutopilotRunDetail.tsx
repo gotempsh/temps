@@ -30,9 +30,12 @@ import {
   ArrowLeft,
   ExternalLink,
   FileCode,
+  FileText,
   Hash,
+  Info,
   Loader2,
   RefreshCw,
+  ScrollText,
   Terminal,
   Webhook,
 } from 'lucide-react'
@@ -52,6 +55,8 @@ import {
   retryRun,
   startFix,
 } from '@/api/client/sdk.gen'
+import { CancelRunButton } from './CancelRunButton'
+import { useCancelRun } from './useCancelRun'
 import { cn } from '@/lib/utils'
 import { toast } from 'sonner'
 import {
@@ -988,6 +993,11 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
   // Retry/start-over config dialog: prefilled from the run's stored config
   // so the user can change harness/model/turns/branch and add retry notes.
   const [showRetryConfig, setShowRetryConfig] = useState(false)
+  // Owned here, not by the button: the button unmounts when the run stops
+  // being active, which can happen while a cancel is still in flight.
+  const cancelMutation = useCancelRun(project.id, Number(runId), () =>
+    window.location.reload()
+  )
 
   const runQueryOptions = getRunWithLogsOptions({
     path: { project_id: project.id, run_id: Number(runId) },
@@ -1232,17 +1242,6 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
     setShowRetryConfig(true)
   }
 
-  const onCancel = async () => {
-    try {
-      await fetch(`/api/projects/${project.id}/agents/runs/${run.id}/cancel`, {
-        method: 'POST',
-      })
-      window.location.reload()
-    } catch {
-      // ignore
-    }
-  }
-
   const durationText = formatDuration(run.started_at, run.completed_at)
   const costText =
     run.estimated_cost_cents != null
@@ -1301,9 +1300,10 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
         </Button>
       )}
       {isActive && (
-        <Button size="sm" variant="destructive" onClick={onCancel}>
-          Cancel
-        </Button>
+        <CancelRunButton
+          pending={cancelMutation.isPending}
+          onCancel={() => cancelMutation.mutate()}
+        />
       )}
     </>
   )
@@ -1365,7 +1365,7 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
               ) && (
                 <Button variant="outline" size="sm" onClick={onStartOver}>
                   <RefreshCw className="h-4 w-4 mr-2" />
-                  Start Over
+                  Start over
                 </Button>
               )}
               {(phase === 'analyzing' || phase === 'analyzed') && (
@@ -1391,7 +1391,7 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
                   ) : (
                     <Sparkles className="h-4 w-4 mr-2" />
                   )}
-                  Generate Fix
+                  Generate fix
                 </Button>
               )}
               {phase === 'fix_ready' && (
@@ -1793,8 +1793,12 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
             className="shrink-0 -ml-2 h-7 w-7"
           >
             <Link
-              to={settingsSectionHref(project.slug, 'automation', 'agents')}
-              aria-label="Back to agents"
+              to={settingsSectionHref(
+                project.slug,
+                'automation',
+                'automations'
+              )}
+              aria-label="Back to automation"
             >
               <ArrowLeft className="h-4 w-4" />
             </Link>
@@ -1831,24 +1835,28 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
           <TabsList className="h-auto bg-transparent p-0 gap-4 justify-start border-b border-border w-full rounded-none">
             <TabsTrigger
               value="conversation"
+              icon={MessageSquare}
               className="data-[state=active]:bg-transparent data-[state=active]:shadow-none data-[state=active]:border-b-2 data-[state=active]:border-foreground rounded-none px-0 pb-2 text-sm font-medium text-muted-foreground data-[state=active]:text-foreground"
             >
               Conversation
             </TabsTrigger>
             <TabsTrigger
               value="report"
+              icon={FileText}
               className="data-[state=active]:bg-transparent data-[state=active]:shadow-none data-[state=active]:border-b-2 data-[state=active]:border-foreground rounded-none px-0 pb-2 text-sm font-medium text-muted-foreground data-[state=active]:text-foreground"
             >
               Report
             </TabsTrigger>
             <TabsTrigger
               value="details"
+              icon={Info}
               className="data-[state=active]:bg-transparent data-[state=active]:shadow-none data-[state=active]:border-b-2 data-[state=active]:border-foreground rounded-none px-0 pb-2 text-sm font-medium text-muted-foreground data-[state=active]:text-foreground"
             >
               Details
             </TabsTrigger>
             <TabsTrigger
               value="logs"
+              icon={ScrollText}
               className="data-[state=active]:bg-transparent data-[state=active]:shadow-none data-[state=active]:border-b-2 data-[state=active]:border-foreground rounded-none px-0 pb-2 text-sm font-medium text-muted-foreground data-[state=active]:text-foreground"
             >
               Logs

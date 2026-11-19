@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use temps_core::crypto::constant_time_eq;
 
 use axum::body::{to_bytes, Body};
 use axum::extract::{DefaultBodyLimit, Path, State};
@@ -259,15 +260,13 @@ impl SandboxModelRelayService {
                 purpose: "chat.application.model_relay".to_string(),
                 reason: format!("could not initialize the sandbox model relay: {error}"),
             })?;
-        let compatible_client = temps_agents::ai_cli::openai_compatible::external_only_http_client(
-            None,
-        )
-        .map_err(|error| AiError::Provider {
-            purpose: "chat.application.model_relay".to_string(),
-            reason: format!(
-                "could not initialize the OpenAI-compatible model relay client: {error}"
-            ),
-        })?;
+        let compatible_client = temps_ai_cli::openai_compatible::external_only_http_client(None)
+            .map_err(|error| AiError::Provider {
+                purpose: "chat.application.model_relay".to_string(),
+                reason: format!(
+                    "could not initialize the OpenAI-compatible model relay client: {error}"
+                ),
+            })?;
         Ok(Self {
             client,
             compatible_client,
@@ -325,14 +324,12 @@ impl SandboxModelRelayService {
             SandboxProviderCredential::OpenAiCompatible { .. } => selected_model
                 .as_deref()
                 .map(|selection| {
-                    temps_agents::ai_cli::openai_compatible::upstream_model_from_selection(
-                        selection,
-                    )
-                    .map(str::to_string)
-                    .map_err(|error| AiError::Provider {
-                        purpose: "chat.application.model_relay".to_string(),
-                        reason: error.to_string(),
-                    })
+                    temps_ai_cli::openai_compatible::upstream_model_from_selection(selection)
+                        .map(str::to_string)
+                        .map_err(|error| AiError::Provider {
+                            purpose: "chat.application.model_relay".to_string(),
+                            reason: error.to_string(),
+                        })
                 })
                 .transpose()?,
             _ => None,
@@ -343,7 +340,7 @@ impl SandboxModelRelayService {
                 SandboxProviderCredential::AnthropicApiKey(_) => Some("anthropic"),
                 SandboxProviderCredential::OpenAiApiKey(_) => Some("openai"),
                 SandboxProviderCredential::OpenAiCompatible { .. } => {
-                    Some(temps_agents::ai_cli::openai_compatible::OPENCODE_COMPATIBLE_PROVIDER_ID)
+                    Some(temps_ai_cli::openai_compatible::OPENCODE_COMPATIBLE_PROVIDER_ID)
                 }
                 _ => None,
             }
@@ -848,7 +845,7 @@ fn resolve_opencode_model(
         SandboxProviderCredential::AnthropicApiKey(_) => "anthropic/",
         SandboxProviderCredential::OpenAiApiKey(_) => "openai/",
         SandboxProviderCredential::OpenAiCompatible { .. } => {
-            return temps_agents::ai_cli::openai_compatible::upstream_model_from_selection(model)
+            return temps_ai_cli::openai_compatible::upstream_model_from_selection(model)
                 .map(|_| model.to_string())
                 .map_err(|error| AiError::Provider {
                     purpose: "chat.application.model_relay".to_string(),
@@ -1206,18 +1203,6 @@ impl IntoResponse for RelayError {
         };
         (status, self.to_string()).into_response()
     }
-}
-
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    left.iter()
-        .zip(right)
-        .fold(0_u8, |difference, (left, right)| {
-            difference | (left ^ right)
-        })
-        == 0
 }
 
 async fn relay_handler(

@@ -851,18 +851,11 @@ mod tests {
 
     const STEP_UP_SECRET: &str = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP";
 
-    async fn step_up_env() -> Option<(
-        temps_database::test_utils::TestDatabase,
-        StepUpService,
-        i32,
-        i32,
-    )> {
-        let db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+    async fn step_up_env() -> Option<(temps_test_utils::TestDatabase, StepUpService, i32, i32)> {
+        let db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 println!("Docker not available, skipping test: {error}");
                 return None;

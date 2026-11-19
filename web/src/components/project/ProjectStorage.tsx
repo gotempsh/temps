@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { PageHeader } from '@/components/layout/PageContainer'
 import {
   ExternalServiceInfo,
   ProjectResponse,
@@ -52,6 +53,13 @@ import { serviceCreateHref } from '@/lib/service-project-link'
 import type { ServiceLinkChange } from '@/lib/service-link-redeploy'
 import { ServiceLinkRedeployPrompt } from './ServiceLinkRedeployPrompt'
 import { projectServiceResourcePath } from '@/lib/database-provisioning'
+import {
+  CONTAINER_CPU_METRIC,
+  containerCpuChartMetric,
+  containerCpuHistoryMetric,
+  withCpuHistory,
+} from '@/lib/container-cpu'
+import { formatCpuUsage } from '@/lib/cpu-format'
 import { serviceBackupsHref } from '@/lib/service-backup-setup'
 import { toast } from 'sonner'
 
@@ -63,11 +71,14 @@ import { toast } from 'sonner'
 function ResourceSparkline({
   serviceId,
   metric,
+  historyMetric,
   label,
   format,
 }: {
   serviceId: number
   metric: string
+  /** Charted before `metric` has readings; see `withCpuHistory`. */
+  historyMetric?: string
   label: string
   format: (value: number) => string
 }) {
@@ -81,9 +92,22 @@ function ResourceSparkline({
     // Metrics disabled on the service → the endpoint 503s; don't retry-spam.
     retry: false,
   })
+  const { data: historyData } = useQuery({
+    ...externalServiceMetricsGetRangeOptions({
+      path: { id: serviceId },
+      query: { metric: historyMetric ?? metric, range: '1h' },
+    }),
+    enabled: historyMetric != null,
+    staleTime: 30_000,
+    refetchInterval: 30_000,
+    retry: false,
+  })
 
+  const points = historyMetric
+    ? withCpuHistory(data ?? [], historyData ?? [])
+    : (data ?? [])
   // Trend glyph only: buckets nothing was sampled in (`null`) are dropped.
-  const values = (data ?? [])
+  const values = points
     .map((p) => p.value)
     .filter((v): v is number => v != null && Number.isFinite(v))
   if (values.length === 0) return null
@@ -99,7 +123,7 @@ function ResourceSparkline({
   )
 }
 
-function ServiceRow({
+export function ServiceRow({
   service,
   isLinked,
   isBusy,
@@ -128,6 +152,12 @@ function ServiceRow({
     : `/storage/${service.id}`
 
   const goToPrimary = () => navigate(primaryHref)
+  // A cluster's `container.cpu_percent` is one series per member, which a
+  // range query averages; read its busiest member, as its service page does.
+  const cpuMetric = containerCpuChartMetric(
+    CONTAINER_CPU_METRIC,
+    service.topology === 'cluster'
+  )
 
   return (
     <li
@@ -191,9 +221,13 @@ function ServiceRow({
         <>
           <ResourceSparkline
             serviceId={service.id}
-            metric="container.cpu_percent"
+            metric={cpuMetric}
+            historyMetric={containerCpuHistoryMetric(
+              CONTAINER_CPU_METRIC,
+              cpuMetric
+            )}
             label="CPU"
-            format={(v) => `${v.toFixed(1)}%`}
+            format={(v) => formatCpuUsage(v, null)}
           />
           <ResourceSparkline
             serviceId={service.id}
@@ -526,32 +560,32 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
   )
 
   const header = (
-    <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-      <div>
-        <h1 className="text-xl font-semibold tracking-tight sm:text-2xl">
-          Databases
-        </h1>
-        <p className="mt-1 text-sm text-muted-foreground">
+    <PageHeader
+      title="Databases"
+      description={
+        <>
           Link an existing database or create a new one for this service.
           {totalCount > 0 ? (
             <span className="ml-1 tabular-nums">
               {linkedCount} of {totalCount} linked.
             </span>
           ) : null}
-        </p>
-      </div>
-      <CreateServiceButton
-        projectId={project.id}
-        label="Create database"
-        open={isCreateDropdownOpen}
-        onOpenChange={setIsCreateDropdownOpen}
-      />
-    </div>
+        </>
+      }
+      actions={
+        <CreateServiceButton
+          projectId={project.id}
+          label="Create database"
+          open={isCreateDropdownOpen}
+          onOpenChange={setIsCreateDropdownOpen}
+        />
+      }
+    />
   )
 
   if (servicesError || linksError) {
     return (
-      <div className="space-y-6 p-4 md:p-6">
+      <div className="space-y-6">
         {header}
         <Alert variant="destructive">
           <AlertTitle>Databases could not be loaded</AlertTitle>
@@ -578,7 +612,7 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
   if (isLoadingServices || loadingLinks) {
     return (
       <div className="flex-1 overflow-auto">
-        <div className="space-y-6 p-4 md:p-6">
+        <div className="space-y-6">
           {header}
           <ul
             role="list"
@@ -603,7 +637,7 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
   if (!services?.length) {
     return (
       <div className="flex-1 overflow-auto">
-        <div className="space-y-6 p-4 md:p-6">
+        <div className="space-y-6">
           {header}
           {databaseTypes}
         </div>
@@ -622,7 +656,7 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
 
   return (
     <div className="flex-1 overflow-auto">
-      <div className="space-y-8 p-4 md:p-6">
+      <div className="space-y-8">
         {header}
 
         <p className="text-sm text-muted-foreground">

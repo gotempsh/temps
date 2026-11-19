@@ -45,9 +45,37 @@ test('removes plugin operations and exclusive transitive schemas while retaining
 
 test('recognizes only the external plugin namespace', () => {
   expect(['/x', '/x/plugins', '/x/plugins/a/grants'].every(isPluginPath)).toBe(
-    true,
+    true
   )
   expect(['/xray', '/api/x', '/projects'].some(isPluginPath)).toBe(false)
+})
+
+test('retains core AI consent operations and their schemas without importing plugin APIs', () => {
+  const spec = {
+    paths: {
+      '/x/plugins/{name}/ai-tools': { get: ref('Consent'), put: ref('Update') },
+      '/x/reports/tools/list': { get: ref('Report') },
+    },
+    components: {
+      schemas: {
+        Consent: ref('Tool'),
+        Update: { type: 'object' },
+        Tool: { type: 'object' },
+        Report: { type: 'object' },
+      },
+    },
+  }
+  const result = coreOpenApi(spec) as typeof spec
+  expect(Object.keys(result.paths)).toEqual(['/x/plugins/{name}/ai-tools'])
+  expect(result.paths['/x/plugins/{name}/ai-tools']).toEqual(
+    spec.paths['/x/plugins/{name}/ai-tools']
+  )
+  expect(Object.keys(result.components.schemas).sort()).toEqual([
+    'Consent',
+    'Tool',
+    'Update',
+  ])
+  expect(coreOpenApi(result)).toEqual(result)
 })
 
 test('preserves documents without components and lets the caller reject malformed paths', () => {

@@ -144,7 +144,7 @@ services:
 
   # ClickHouse analytics and OpenTelemetry backend
   clickhouse:
-    image: clickhouse/clickhouse-server:26.7.5.10-alpine
+    image: clickhouse/clickhouse-server:26.8.36.3-alpine
     container_name: temps-clickhouse
     restart: always
     environment:

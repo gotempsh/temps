@@ -25,21 +25,36 @@ function card(hosting: Hosting) {
   )
 }
 
+function saveButton(view: ReturnType<typeof render>) {
+  return view.getByRole('button', { name: 'Save' }) as HTMLButtonElement
+}
+
+function radio(view: ReturnType<typeof render>, name: string) {
+  return view.getByRole('radio', { name }) as HTMLButtonElement
+}
+
 test('follows a hosting change made elsewhere instead of offering to save it', async () => {
   const view = render(card('hosted'))
-  expect(view.getByText('Temps hosts this app.')).not.toBeNull()
+  expect(radio(view, 'Temps runs it').getAttribute('aria-checked')).toBe('true')
+  expect(saveButton(view).disabled).toBe(true)
 
   // The project is marked external elsewhere (another tab, a refetch).
   await act(async () => {
     view.rerender(card('external'))
   })
-  expect(view.getByText('This app runs outside Temps.')).not.toBeNull()
+  expect(radio(view, 'It runs elsewhere').getAttribute('aria-checked')).toBe(
+    'true'
+  )
+  expect(saveButton(view).disabled).toBe(true)
 })
 
-test('an unsaved choice shows the save controls instead of the status line', async () => {
+test('an unsaved choice enables Save and says what saving it does', async () => {
   const view = render(card('hosted'))
   await act(async () => {
     fireEvent.click(view.getByText('It runs elsewhere'))
   })
-  expect(view.queryByText('Temps hosts this app.')).toBeNull()
+  expect(saveButton(view).disabled).toBe(false)
+  expect(
+    view.getByText(/Running deployments keep running; Temps refuses new ones/)
+  ).not.toBeNull()
 })

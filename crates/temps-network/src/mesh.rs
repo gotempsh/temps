@@ -64,7 +64,14 @@ pub async fn ensure_lockdown(lockdown: &MeshLockdown) -> Result<bool, NetworkErr
     crate::linux::firewall::ensure_mesh_lockdown(lockdown).await
 }
 
-#[cfg(not(target_os = "linux"))]
+/// macOS: the same ruleset, installed in the Docker app's VM, where the mesh
+/// interface and every published port live (ADR 090).
+#[cfg(target_os = "macos")]
+pub async fn ensure_lockdown(lockdown: &MeshLockdown) -> Result<bool, NetworkError> {
+    crate::vm::ensure_lockdown(lockdown).await
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub async fn ensure_lockdown(_lockdown: &MeshLockdown) -> Result<bool, NetworkError> {
     Err(NetworkError::UnsupportedPlatform {
         target: std::env::consts::OS,
@@ -115,7 +122,12 @@ pub async fn lockdown_state(lockdown: &MeshLockdown) -> Result<LockdownState, Ne
     crate::linux::firewall::mesh_lockdown_state(lockdown).await
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+pub async fn lockdown_state(lockdown: &MeshLockdown) -> Result<LockdownState, NetworkError> {
+    crate::vm::lockdown_state(lockdown).await
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub async fn lockdown_state(_lockdown: &MeshLockdown) -> Result<LockdownState, NetworkError> {
     Err(NetworkError::UnsupportedPlatform {
         target: std::env::consts::OS,
@@ -129,7 +141,12 @@ pub async fn preflight_routes(pool: Ipv4Net) -> Result<(), NetworkError> {
     crate::linux::preflight_mesh_routes(pool).await
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+pub async fn preflight_routes(pool: Ipv4Net) -> Result<(), NetworkError> {
+    crate::vm::preflight_mesh_routes(pool).await
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub async fn preflight_routes(_pool: Ipv4Net) -> Result<(), NetworkError> {
     Err(NetworkError::UnsupportedPlatform {
         target: std::env::consts::OS,
@@ -140,11 +157,91 @@ pub async fn preflight_routes(_pool: Ipv4Net) -> Result<(), NetworkError> {
 /// to the operator's `configured` underlay MTU if smaller, minus WireGuard's
 /// overhead (see [`mesh_mtu_for`]).
 pub async fn detect_mtu(configured: Option<u32>) -> Result<u32, NetworkError> {
-    let device = crate::detect_underlay_device().await?;
-    let detected = crate::detect_underlay_mtu(&device).await?;
+    #[cfg(target_os = "macos")]
+    let detected = crate::vm::default_route_mtu().await?;
+    #[cfg(not(target_os = "macos"))]
+    let detected = {
+        let device = crate::detect_underlay_device().await?;
+        crate::detect_underlay_mtu(&device).await?
+    };
     Ok(mesh_mtu_for(
         configured.map_or(detected, |configured| configured.min(detected)),
     ))
+}
+
+/// The nftables table owning the mesh lockdown (see [`render_lockdown`]).
+pub const MESH_TABLE: &str = "temps_mesh";
+
+/// The mesh carries VXLAN between nodes, plus (on workers) the control
+/// plane's connections to published container ports. Without this table it
+/// would also be a path from every peer to anything the host binds on
+/// 0.0.0.0 (the control plane's database, agent APIs) and, since Docker
+/// enables forwarding, a route through the node into its own LAN — reachable
+/// even where a cloud firewall guards the public addresses. The icmp rule is
+/// IPv4-only on purpose: the mesh carries no IPv6.
+pub(crate) fn render_lockdown(lockdown: &MeshLockdown) -> String {
+    let wg = MESH_INTERFACE;
+    let vxlan_port = lockdown.vxlan_port;
+    let mesh = lockdown.mesh;
+    let marker = lockdown_marker(lockdown);
+    let node_api = lockdown
+        .node_api_port
+        .map(|port| {
+            format!(
+                "add rule inet {MESH_TABLE} input iifname \"{wg}\" ip saddr {mesh} tcp dport {port} accept\n"
+            )
+        })
+        .unwrap_or_default();
+    // A worker's agent API, for the control plane only (mutual TLS on top).
+    let agent_api = lockdown
+        .agent_api
+        .map(|api| {
+            format!(
+                "add rule inet {MESH_TABLE} input iifname \"{wg}\" ip saddr {} tcp dport {} accept\n",
+                api.from, api.port
+            )
+        })
+        .unwrap_or_default();
+    // A hub forwards between members (ADR 048 D4): in from the tunnel and
+    // straight back into it, mesh address to mesh address. Each member's own
+    // input rules still decide what it accepts.
+    let relay = if lockdown.relay {
+        format!(
+            "add rule inet {MESH_TABLE} forward iifname \"{wg}\" oifname \"{wg}\" ip saddr {mesh} ip daddr {mesh} accept\n"
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "
+add table inet {MESH_TABLE}
+delete table inet {MESH_TABLE}
+add table inet {MESH_TABLE}
+
+# Ahead of temps_network (-100) and Docker's chains.
+add chain inet {MESH_TABLE} input {{ type filter hook input priority -110; policy accept; }}
+add rule inet {MESH_TABLE} input counter comment \"{marker}\"
+add rule inet {MESH_TABLE} input iifname \"{wg}\" ct state established,related accept
+add rule inet {MESH_TABLE} input iifname \"{wg}\" udp dport {vxlan_port} accept
+add rule inet {MESH_TABLE} input iifname \"{wg}\" icmp type echo-request accept
+{node_api}{agent_api}add rule inet {MESH_TABLE} input iifname \"{wg}\" counter drop
+
+add chain inet {MESH_TABLE} forward {{ type filter hook forward priority -110; policy accept; }}
+add rule inet {MESH_TABLE} forward oifname \"{wg}\" ct state established,related accept
+{relay}add rule inet {MESH_TABLE} forward iifname \"{wg}\" ip saddr {mesh} ct status dnat accept
+add rule inet {MESH_TABLE} forward iifname \"{wg}\" counter drop
+add rule inet {MESH_TABLE} forward oifname \"{wg}\" counter drop
+"
+    )
+}
+
+pub(crate) fn lockdown_marker(lockdown: &MeshLockdown) -> String {
+    const MESH_LOCKDOWN_VERSION: &str = "v1";
+    let signature = format!("{MESH_LOCKDOWN_VERSION}|{lockdown:?}");
+    format!(
+        "temps-mesh-{MESH_LOCKDOWN_VERSION}-{}",
+        uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, signature.as_bytes())
+    )
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -153,6 +250,10 @@ pub enum MeshError {
     Disabled,
     #[error("wireguard_cidr {value:?} is invalid: {reason}")]
     InvalidCidr { value: String, reason: String },
+    /// The cluster CA was created before Temps recorded the addresses its
+    /// worker certificates name, so no pool can be proven free of them.
+    #[error("the mesh cannot use {pool} yet: this cluster's CA was created before Temps recorded which addresses its worker certificates name, and those certificates are never revoked (deleted nodes keep theirs), so Temps cannot prove none of them covers the pool. The pool is fine. Rotate the cluster CA (Settings > Worker Nodes > Cluster trust), re-enroll any workers, then turn the mesh on")]
+    CaPredatesCertificateHistory { pool: Ipv4Net },
     #[error("wireguard_cidr {mesh} overlaps the compute pool {pool}")]
     OverlapsComputePool { mesh: Ipv4Net, pool: Ipv4Net },
     #[error("wireguard_cidr {cidr} has no free address left for another node")]
@@ -360,14 +461,24 @@ pub struct MeshIdentityClaim {
     pub holder: MeshIdentityHolder,
 }
 
-/// The one mesh-pool address a registration may claim (ADR 055): the
-/// address `pairing_id` reserved, for a registration that came through that
-/// pairing, over the node API, from that address. A worker that joined
-/// outbound only registers under its own mesh address.
+/// The one mesh-pool address a registration may claim: its own, reached
+/// over the node API from that very address, which WireGuard routes only to
+/// the key that holds it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OwnMeshAddress {
-    pub pairing_id: i32,
+    pub owner: MeshAddressOwner,
     pub address: Ipv4Addr,
+}
+
+/// Whose mesh address an [`OwnMeshAddress`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeshAddressOwner {
+    /// The pairing that reserved it, for a worker that joined outbound only
+    /// and registers through that pairing (ADR 055).
+    Pairing(i32),
+    /// The node that already holds it, re-registering under its own name
+    /// when it joins the same control plane again (ADR 060).
+    Node(i32),
 }
 
 /// `addresses` without the registration's own mesh address (ADR 055). The
@@ -715,18 +826,9 @@ mod db {
         db: &C,
     ) -> Result<std::collections::HashSet<Ipv4Addr>, MeshError> {
         use sea_orm::{FromQueryResult, Statement};
-        let settings = temps_entities::settings::Entity::find_by_id(1)
-            .one(db)
-            .await?;
-        let Some(ca) = settings
-            .as_ref()
-            .and_then(|row| row.data.get("multi_node"))
-            .and_then(|value| value.get("cluster_ca_cert_pem"))
-            .and_then(|value| value.as_str())
-        else {
+        let Some(ca_key) = current_ca_key(db).await? else {
             return Ok(Default::default());
         };
-        let ca_key = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(ca.as_bytes()));
         #[derive(FromQueryResult)]
         struct Address {
             address: String,
@@ -743,6 +845,50 @@ mod db {
         .collect())
     }
 
+    /// Key of the current cluster CA in the certificate history tables, or
+    /// `None` while no CA exists (nothing has been issued).
+    async fn current_ca_key<C: sea_orm::ConnectionTrait>(
+        db: &C,
+    ) -> Result<Option<String>, MeshError> {
+        let settings = temps_entities::settings::Entity::find_by_id(1)
+            .one(db)
+            .await?;
+        Ok(settings
+            .as_ref()
+            .and_then(|row| row.data.get("multi_node"))
+            .and_then(|value| value.get("cluster_ca_cert_pem"))
+            .and_then(|value| value.as_str())
+            .map(|ca| hex::encode(<sha2::Sha256 as sha2::Digest>::digest(ca.as_bytes()))))
+    }
+
+    async fn ca_has_history<C: sea_orm::ConnectionTrait>(
+        db: &C,
+        ca_key: &str,
+    ) -> Result<bool, MeshError> {
+        use sea_orm::Statement;
+        Ok(db
+            .query_one(Statement::from_sql_and_values(
+                db.get_database_backend(),
+                "SELECT ca_key FROM cluster_certificate_history WHERE ca_key = $1",
+                [ca_key.into()],
+            ))
+            .await?
+            .is_some())
+    }
+
+    /// Whether the cluster CA was created before Temps recorded the addresses
+    /// its leaves name. Such a CA blocks turning the mesh on or moving it
+    /// until it is rotated, whatever the pool: see
+    /// [`MeshError::CaPredatesCertificateHistory`].
+    pub async fn ca_predates_certificate_history<C: sea_orm::ConnectionTrait>(
+        db: &C,
+    ) -> Result<bool, MeshError> {
+        match current_ca_key(db).await? {
+            Some(ca_key) => Ok(!ca_has_history(db, &ca_key).await?),
+            None => Ok(false),
+        }
+    }
+
     /// A pre-history CA may have issued certificates for deleted or renamed
     /// nodes. Current rows cannot prove safety; rotate that CA explicitly.
     async fn check_certificate_history<C: sea_orm::ConnectionTrait>(
@@ -750,33 +896,13 @@ mod db {
         pool: Ipv4Net,
     ) -> Result<(), MeshError> {
         use sea_orm::{FromQueryResult, Statement};
-        let settings = temps_entities::settings::Entity::find_by_id(1)
-            .one(txn)
-            .await?;
-        let Some(ca) = settings
-            .as_ref()
-            .and_then(|row| row.data.get("multi_node"))
-            .and_then(|value| value.get("cluster_ca_cert_pem"))
-            .and_then(|value| value.as_str())
-        else {
+        let Some(ca_key) = current_ca_key(txn).await? else {
             return Ok(());
         };
-        let ca_key = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(ca.as_bytes()));
-        let backend = txn.get_database_backend();
-        if txn
-            .query_one(Statement::from_sql_and_values(
-                backend,
-                "SELECT ca_key FROM cluster_certificate_history WHERE ca_key = $1",
-                [ca_key.clone().into()],
-            ))
-            .await?
-            .is_none()
-        {
-            return Err(MeshError::InvalidCidr {
-                value: pool.to_string(),
-                reason: "the cluster CA predates certificate address history; deleted nodes may still hold certificates for this pool. Rotate the cluster CA in Settings > Worker Nodes and re-enroll workers before enabling or changing the mesh".into(),
-            });
+        if !ca_has_history(txn, &ca_key).await? {
+            return Err(MeshError::CaPredatesCertificateHistory { pool });
         }
+        let backend = txn.get_database_backend();
         #[derive(FromQueryResult)]
         struct Address {
             address: String,
@@ -820,7 +946,12 @@ mod db {
         if i32::from(requested_port) == cfg.vxlan_port {
             return Err(MeshError::PortClashesWithVxlan(requested_port));
         }
-        let current = parse_mesh_cidr(&cfg.wireguard_cidr, pool)?;
+        // The stored pool is only compared against, never validated here:
+        // until the mesh is first turned on it is the migration's default,
+        // which can overlap an upgraded cluster's compute pool. Validating it
+        // refused every request, including one that names a clear range.
+        // The requested pool was checked above, and is what gets stored.
+        let current = reserved_mesh_pool(&cfg.wireguard_cidr);
         // Addresses are in use as underlays and every endpoint (the control
         // plane's, --wg-endpoint values) carries the port: both are frozen
         // once any node is on the mesh.
@@ -953,9 +1084,11 @@ mod db {
     /// node and pairing lookups keep that true for rows written before the
     /// pool was frozen for pending pairings, and name the holder.
     ///
-    /// `own` is the registration's own mesh address (ADR 055): exempt from
-    /// the pool check and from its own pairing's reservation, but never from
-    /// a node holding it or from being the control plane's address.
+    /// `own` is the registration's own mesh address: exempt from the pool
+    /// check and from its own pairing's reservation (ADR 055), or from the
+    /// node that holds it when that node re-registers (ADR 060), but never
+    /// from another node holding it or from being the control plane's
+    /// address.
     pub async fn mesh_identity_claimed(
         db: &DatabaseConnection,
         claimed: &[String],
@@ -981,12 +1114,22 @@ mod db {
                 .map(|(value, _)| value.clone())
                 .unwrap_or_else(|| address.to_string())
         };
-        if let Some(node) = nodes::Entity::find()
-            .filter(nodes::Column::MeshWgAddress.is_in(texts.clone()))
-            .order_by_asc(nodes::Column::Id)
-            .one(db)
-            .await?
+        let mut holders =
+            nodes::Entity::find().filter(nodes::Column::MeshWgAddress.is_in(texts.clone()));
+        // A node re-registering is not refused for the address it holds
+        // itself (ADR 060); any other node holding a claimed address is.
+        if let Some(OwnMeshAddress {
+            owner: MeshAddressOwner::Node(node_id),
+            address,
+        }) = own
         {
+            holders = holders.filter(
+                sea_orm::Condition::any()
+                    .add(nodes::Column::Id.ne(node_id))
+                    .add(nodes::Column::MeshWgAddress.ne(address.to_string())),
+            );
+        }
+        if let Some(node) = holders.order_by_asc(nodes::Column::Id).one(db).await? {
             return Ok(Some(MeshIdentityClaim {
                 claimed: claimed_text(node.mesh_wg_address.as_deref().unwrap_or_default()),
                 holder: MeshIdentityHolder::Node {
@@ -998,9 +1141,12 @@ mod db {
         let mut pairings = temps_entities::node_pairings::Entity::find()
             .filter(temps_entities::node_pairings::Column::MeshAddress.is_in(texts))
             .filter(temps_entities::node_pairings::Column::Status.is_in(crate::pairing::PENDING));
-        if let Some(own) = own {
-            pairings =
-                pairings.filter(temps_entities::node_pairings::Column::Id.ne(own.pairing_id));
+        if let Some(OwnMeshAddress {
+            owner: MeshAddressOwner::Pairing(pairing_id),
+            ..
+        }) = own
+        {
+            pairings = pairings.filter(temps_entities::node_pairings::Column::Id.ne(pairing_id));
         }
         if let Some(pairing) = pairings
             .order_by_asc(temps_entities::node_pairings::Column::Id)
@@ -1066,6 +1212,12 @@ mod db {
     pub async fn configured_port(db: &DatabaseConnection) -> Result<u16, MeshError> {
         let cfg = load_config(db).await?;
         parse_mesh_port(cfg.wireguard_port)
+    }
+
+    /// The pool turning the mesh on would use when no other is asked for.
+    pub async fn configured_pool(db: &DatabaseConnection) -> Result<Ipv4Net, MeshError> {
+        let cfg = load_config(db).await?;
+        Ok(reserved_mesh_pool(&cfg.wireguard_cidr))
     }
 
     /// What a node needs to bring its end of the mesh up.

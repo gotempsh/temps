@@ -8,7 +8,16 @@
 //! - Generating appropriate Dockerfiles for different frameworks
 //! - Managing build system configurations
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        reason = "tests read fixture configuration (database/service URLs) from the environment"
+    )
+)]
 pub use mod_rs::*;
+
+pub mod templates;
 
 mod mod_rs {
     include!("mod.rs");
@@ -473,14 +482,14 @@ mod tests {
     fn template_validation_accepts_exactly_the_catalog_presets() {
         let mut catalog: Vec<String> = all_presets().iter().map(|p| p.slug()).collect();
         catalog.sort();
-        let mut templates: Vec<String> = temps_core::templates::VALID_PRESETS
+        let mut templates: Vec<String> = crate::templates::VALID_PRESETS
             .iter()
             .map(|slug| slug.to_string())
             .collect();
         templates.sort();
         assert_eq!(
             templates, catalog,
-            "temps_core::templates::VALID_PRESETS must list the slugs of temps_presets::all_presets()"
+            "temps_presets::templates::VALID_PRESETS must list the slugs of temps_presets::all_presets()"
         );
     }
 

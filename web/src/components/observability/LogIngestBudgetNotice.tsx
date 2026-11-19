@@ -25,7 +25,9 @@ function formatRate(bytesPerSec: number): string {
   return `${unit === 0 ? value : value.toFixed(1)} ${units[unit]}`
 }
 
-function describeBudget(budget: LogIngestBudgetStatus): string {
+function describeBudget(
+  budget: Pick<LogIngestBudgetStatus, 'lines_per_sec' | 'bytes_per_sec'>
+): string {
   const parts = [
     budget.lines_per_sec > 0
       ? `${number.format(budget.lines_per_sec)} lines/s`
@@ -46,6 +48,15 @@ function sourceName(
       : 'database service'
   const node = source.node_name ? ` on ${source.node_name}` : ''
   return `${source.service} (${owner})${node}`
+}
+
+/** `?settings=` value that opens a managed service's log settings on its
+    Logs page. */
+export const SERVICE_LOG_SETTINGS_PARAM = 'log-ingestion'
+
+/** A managed service's log settings, on its Logs page. */
+export function serviceLogSettingsPath(serviceId: number): string {
+  return `/storage/${serviceId}/logs?settings=${SERVICE_LOG_SETTINGS_PARAM}`
 }
 
 export type LogIngestScope =
@@ -121,20 +132,40 @@ export function LogIngestBudgetNotice({
             {' · '}
             {number.format(source.dropped_lines)} lines dropped since{' '}
             {new Date(source.throttled_since).toLocaleTimeString()}
+            {source.limit_overridden
+              ? ` · own budget: ${describeBudget({
+                  lines_per_sec: source.lines_per_sec_limit,
+                  bytes_per_sec: source.bytes_per_sec_limit,
+                })}`
+              : null}
           </li>
         ))}
       </ul>
       {hidden > 0 ? <p className="mt-1 text-xs">and {hidden} more.</p> : null}
-      <p className="mt-2 text-xs">
-        Make the container log less, or{' '}
-        <Link
-          to={budget.setup_path}
-          className="underline underline-offset-2 hover:text-foreground"
-        >
-          change the ingestion budget in Settings
-        </Link>
-        .
-      </p>
+      {scope?.externalServiceId != null ? (
+        <p className="mt-2 text-xs">
+          Make the container log less, or{' '}
+          <Link
+            to={serviceLogSettingsPath(scope.externalServiceId)}
+            className="underline underline-offset-2 hover:text-foreground"
+          >
+            change this service&apos;s ingestion budget
+          </Link>
+          .
+        </p>
+      ) : (
+        <p className="mt-2 text-xs">
+          Make the container log less, or{' '}
+          <Link
+            to={budget.setup_path}
+            className="underline underline-offset-2 hover:text-foreground"
+          >
+            change the ingestion budget in Settings
+          </Link>
+          . A project or managed service with its own budget changes it in its
+          own settings.
+        </p>
+      )}
     </Callout>
   )
 }

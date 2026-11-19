@@ -143,7 +143,7 @@ pub async fn baseline_is_current(
 /// Table owning the WireGuard mesh lockdown. Separate from [`TABLE`] so it
 /// can be in place before `temps-wg0` exists, independently of whether the
 /// overlay itself has bootstrapped.
-const MESH_TABLE: &str = "temps_mesh";
+const MESH_TABLE: &str = crate::mesh::MESH_TABLE;
 
 /// Whether the mesh lockdown this host should have is installed.
 pub async fn mesh_lockdown_state(lockdown: &MeshLockdown) -> crate::Result<LockdownState> {
@@ -185,76 +185,12 @@ pub async fn ensure_mesh_lockdown(lockdown: &MeshLockdown) -> crate::Result<bool
     Ok(true)
 }
 
-/// The mesh carries VXLAN between nodes, plus (on workers) the control
-/// plane's connections to published container ports. Without this table it
-/// would also be a path from every peer to anything the host binds on
-/// 0.0.0.0 (the control plane's database, agent APIs) and, since Docker
-/// enables forwarding, a route through the node into its own LAN — reachable
-/// even where a cloud firewall guards the public addresses. The icmp rule is
-/// IPv4-only on purpose: the mesh carries no IPv6.
 fn render_mesh_lockdown(lockdown: &MeshLockdown) -> String {
-    let wg = MESH_INTERFACE;
-    let vxlan_port = lockdown.vxlan_port;
-    let mesh = lockdown.mesh;
-    let marker = mesh_lockdown_marker(lockdown);
-    let node_api = lockdown
-        .node_api_port
-        .map(|port| {
-            format!(
-                "add rule inet {MESH_TABLE} input iifname \"{wg}\" ip saddr {mesh} tcp dport {port} accept\n"
-            )
-        })
-        .unwrap_or_default();
-    // A worker's agent API, for the control plane only (mutual TLS on top).
-    let agent_api = lockdown
-        .agent_api
-        .map(|api| {
-            format!(
-                "add rule inet {MESH_TABLE} input iifname \"{wg}\" ip saddr {} tcp dport {} accept\n",
-                api.from, api.port
-            )
-        })
-        .unwrap_or_default();
-    // A hub forwards between members (ADR 048 D4): in from the tunnel and
-    // straight back into it, mesh address to mesh address. Each member's own
-    // input rules still decide what it accepts.
-    let relay = if lockdown.relay {
-        format!(
-            "add rule inet {MESH_TABLE} forward iifname \"{wg}\" oifname \"{wg}\" ip saddr {mesh} ip daddr {mesh} accept\n"
-        )
-    } else {
-        String::new()
-    };
-    format!(
-        "
-add table inet {MESH_TABLE}
-delete table inet {MESH_TABLE}
-add table inet {MESH_TABLE}
-
-# Ahead of temps_network (-100) and Docker's chains.
-add chain inet {MESH_TABLE} input {{ type filter hook input priority -110; policy accept; }}
-add rule inet {MESH_TABLE} input counter comment \"{marker}\"
-add rule inet {MESH_TABLE} input iifname \"{wg}\" ct state established,related accept
-add rule inet {MESH_TABLE} input iifname \"{wg}\" udp dport {vxlan_port} accept
-add rule inet {MESH_TABLE} input iifname \"{wg}\" icmp type echo-request accept
-{node_api}{agent_api}add rule inet {MESH_TABLE} input iifname \"{wg}\" counter drop
-
-add chain inet {MESH_TABLE} forward {{ type filter hook forward priority -110; policy accept; }}
-add rule inet {MESH_TABLE} forward oifname \"{wg}\" ct state established,related accept
-{relay}add rule inet {MESH_TABLE} forward iifname \"{wg}\" ip saddr {mesh} ct status dnat accept
-add rule inet {MESH_TABLE} forward iifname \"{wg}\" counter drop
-add rule inet {MESH_TABLE} forward oifname \"{wg}\" counter drop
-"
-    )
+    crate::mesh::render_lockdown(lockdown)
 }
 
 fn mesh_lockdown_marker(lockdown: &MeshLockdown) -> String {
-    const MESH_LOCKDOWN_VERSION: &str = "v1";
-    let signature = format!("{MESH_LOCKDOWN_VERSION}|{lockdown:?}");
-    format!(
-        "temps-mesh-{MESH_LOCKDOWN_VERSION}-{}",
-        uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, signature.as_bytes())
-    )
+    crate::mesh::lockdown_marker(lockdown)
 }
 
 /// Make this host relay mesh traffic between members (ADR 048 D4), or stop.
@@ -1212,19 +1148,13 @@ fn render_baseline(config: &NetworkConfig, alloc: &NodeAlloc, peers: &[Peer]) ->
         Transport::Vxlan { vni, port } => render_vxlan_ingress(config, alloc, peers, vni, port),
         Transport::Native => String::new(),
     };
-    // A service may already be attached to `temps-app-network` before it is
-    // attached to the overlay. Linux then keeps that first network as the
-    // container's default route, so replies to a remote overlay CIDR leave via
-    // the wrong interface and never traverse VXLAN. SNAT remote-node traffic
-    // to this node's overlay gateway. Conntrack reverses it on return, while
-    // local same-node traffic keeps its original source address.
-    let mut cross_node_snat = String::new();
-    for peer in peers {
-        cross_node_snat.push_str(&format!(
-            "add rule inet {TABLE} postrouting ip saddr {} ip daddr {cidr} snat to {}\n",
-            peer.compute_cidr, alloc.bridge_address
-        ));
-    }
+    // Cross-node traffic keeps its source address: a workload's overlay
+    // address is its identity to the receiving node's network policy (and
+    // the client address its logs show). The return path that address needs
+    // comes from the per-peer routes injected into every overlay-attached
+    // container on both workers and the control plane
+    // (`overlay_routes::sweep_container_routes`), not from SNAT to the local
+    // bridge, which would make every remote client look like this node.
     let marker = baseline_marker(config, alloc, peers);
     format!(
         "
@@ -1252,20 +1182,18 @@ add chain inet {table} input {{ type filter hook input priority -100; policy acc
 add rule inet {table} input counter comment \"{marker}\"
 
 add chain inet {table} postrouting {{ type nat hook postrouting priority 100; policy accept; }}
-{cross_node_snat}
 add rule inet {table} postrouting ip saddr {cidr} oifname != \"{bridge}\" masquerade
 ",
         table = TABLE,
         bridge = bridge,
         cidr = cidr,
         vxlan_ingress = vxlan_ingress,
-        cross_node_snat = cross_node_snat,
         marker = marker,
     )
 }
 
 fn baseline_marker(config: &NetworkConfig, alloc: &NodeAlloc, peers: &[Peer]) -> String {
-    const BASELINE_SCHEMA_VERSION: &str = "v7";
+    const BASELINE_SCHEMA_VERSION: &str = "v8";
 
     let mut peers = peers.to_vec();
     peers.sort_by_key(|peer| (peer.compute_cidr, peer.underlay_address, peer.node_id));
@@ -1982,11 +1910,11 @@ mod tests {
             baseline_marker(&cfg, &alloc, &[a.clone(), b.clone()]),
             baseline_marker(&cfg, &alloc, &[b, a])
         );
-        assert!(baseline_marker(&cfg, &alloc, &[]).starts_with("temps-baseline-v7-"));
+        assert!(baseline_marker(&cfg, &alloc, &[]).starts_with("temps-baseline-v8-"));
     }
 
     #[test]
-    fn baseline_snat_gives_dual_network_services_a_symmetric_return_path() {
+    fn baseline_keeps_the_source_address_of_cross_node_traffic() {
         let cfg = NetworkConfig::default();
         let alloc = NodeAlloc {
             node_id: Uuid::nil(),
@@ -2001,9 +1929,12 @@ mod tests {
         };
 
         let script = render_baseline(&cfg, &alloc, &[peer]);
-        assert!(script.contains(
-            "postrouting ip saddr 172.20.0.0/24 ip daddr 172.20.255.0/24 snat to 172.20.255.1"
-        ));
+        assert!(
+            !script.contains("snat"),
+            "a remote workload must reach local ones under its own address: {script}"
+        );
+        assert!(script
+            .contains("postrouting ip saddr 172.20.255.0/24 oifname != \"br-temps0\" masquerade"));
     }
 
     #[test]

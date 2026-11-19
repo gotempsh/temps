@@ -119,7 +119,7 @@ export function GlobalWorkspaceStatusPanel({
           </p>
         </div>
         <Button asChild className="w-full" size="sm" variant="outline">
-          <Link to="/agent-sandbox/sandbox">
+          <Link to="/sandboxes/settings">
             <Settings2 className="mr-1.5 size-3.5" /> Open sandbox settings
           </Link>
         </Button>

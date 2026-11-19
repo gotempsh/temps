@@ -21,14 +21,97 @@ use super::{ai_read_allowlist, ai_read_safe_posts, ai_write_allowlist};
 /// Operations withheld from the assistant, grouped by the reason they are.
 pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
     (
+        "vault configuration is managed by instance administrators; general sessions have a separate human confirmation path",
+        &[
+            "create_access_bundle", "create_access_vault_general",
+            "update_access_bundle_general", "update_access_vault_general",
+            "delete_access_vault_general", "delete_access_bundle_general", "delete_access_service_general",
+            "create_access_service_general", "update_access_service_general",
+            "create_access_session", "create_access_vault", "get_access_session", "get_access_vault",
+            "list_access_bundles", "list_access_sessions", "list_access_vaults", "revoke_access_session", "update_access_bundle", "update_access_vault",
+        ],
+    ),
+    (
+        "live sandbox service grants require direct operator consent; assistants cannot approve their own access",
+        &["approve_service_grant"],
+    ),
+    (
+        "pre-integration service access is console/API-only; credentials and fresh grant consent are managed directly until runtime enforcement is available",
+        &[
+            "access_capability",
+            "create_access_service",
+            "list_service_grants",
+            "request_service_grant",
+            "revoke_service_grant",
+            "update_access_service",
+        ],
+    ),
+    (
+        "plugin AI consent is inspected in the operator console; assistant discovery already lists declared tools and disabled access",
+        &["get_plugin_ai_tools"],
+    ),
+    (
+        "granting plugin AI access is an operator decision behind step-up; the assistant must not enable its own tools",
+        &["put_plugin_ai_tools"],
+    ),
+    (
+        "durable workflow configuration, credentials, grants and development sessions remain operator-console operations",
+        &[
+            "update_workflow_settings",
+            "issue_workflow_credential",
+            "revoke_workflow_credential",
+            "shred_workflow_project_key",
+            "open_workflow_dev","configure_workflow_dev","close_workflow_dev","poll_workflow_dev","respond_workflow_dev",
+            "create_workflow_grant",
+            "revoke_workflow_grant",
+            "app_start_granted_workflow",
+            "app_send_granted_event",
+        ],
+    ),
+    (
+        "the workflow executor and app protocol (ADR-106): called by the SDK inside a deployment with an invocation token or the environment's workflow credential, never by a user or the assistant",
+        &[
+            "get_invocation_key",
+            "get_run_journal",
+            "record_run_step",
+            "heartbeat_run",
+            "report_run_outcome",
+            "app_start_workflow_run",
+            "app_get_workflow_run",
+            "app_send_workflow_event",
+        ],
+    ),
+    (
+        "revokes every visitor's gate session for an address; a security action the user takes themselves, behind step-up",
+        &["sign_everyone_out_of_address"],
+    ),
+    (
+        "ends the caller's own app sessions; tied to their browser session, not an assistant action",
+        &["sign_out_of_apps"],
+    ),
+    (
         "irreversible data loss or an availability risk; the console shows the user the plan first",
         &[
             "ExternalServiceEnablePgStatStatements",
+            "admin_delete_environment_volume",
+            "admin_detach_environment_volume",
+            // *Make it reachable*: changes DNS records, tunnels and
+            // certificates for a live address, and can take a Cloudflare token
+            // again on resume. The console shows the plan and asks.
+            "apply_environment_reachability",
+            "decide_reachability_conflict",
+            "resume_reachability_run",
+            "undo_reachability_run",
+            // Recreates a managed database's container to apply new
+            // healthcheck timings; it restarts briefly, and the console
+            // confirms first.
+            "apply_service_healthcheck",
             "blob_disable",
             "cancel_data_import",
             "cancel_pg_upgrade",
             "cancel_restore_run",
             "cleanup_expired_backups",
+            "delete_access_provider",
             "delete_backup",
             "delete_connection",
             "delete_delivery_profile",
@@ -38,6 +121,9 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
             "delete_email_provider",
             "delete_environment",
             "delete_environment_ip_access",
+            // Starts a Compose stack on another node with empty volumes; the
+            // user acknowledges the data loss in the console's Move dialog.
+            "move_compose_stack",
             "delete_git_provider",
             "delete_ingress_connector",
             "delete_project",
@@ -51,14 +137,23 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
             "kv_disable",
             "plan_restore",
             "promote_cluster_member",
+            // Drops the asset versions the proxy keeps for pages still open
+            // on an older deployment, which then fail to load their scripts;
+            // the console asks before purging.
+            "purge_asset_cache",
+            "purge_environment_asset_cache",
             "purge_project_logs",
             "put_environment_ip_access",
             "put_project_ip_access",
+            "recreate_from_workload_spec",
             "remove_cluster_member",
             "repointContinuousArchiveSource",
             "retry_pg_upgrade",
             "rollback_pg_upgrade",
             "rotate_status_page_url",
+            // Makes every environment publicly reachable under a tunnel's zone
+            // and publishes DNS records; a user decision behind step-up.
+            "set_connector_environment_hosts",
             "set_ingress_connector_nodes",
             "set_project_hosting",
             "start_data_import",
@@ -84,6 +179,9 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
     (
         "cluster topology and node enrollment; operator only",
         &[
+            // Moves every node's overlay to a new VXLAN network ID, pausing
+            // cross-node traffic until each has rebuilt; behind step-up.
+            "ClusterNetworkIdChange",
             "ClusterNetworkUpdate",
             "NodePairingCancel",
             "NodePairingCreate",
@@ -93,14 +191,18 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
             "NodeSshHostKey",
             "WireguardMeshEnable",
             "WireguardMeshHubSet",
+            "admin_attach_environment_volume",
             "admin_check_node_public_ingress",
+            "admin_create_environment_volume",
             "admin_drain_node",
             "admin_remove_node",
             "admin_set_node_build_limits",
             "admin_set_node_public_ingress",
+            "admin_set_node_resources",
             "admin_undrain_node",
             "admin_update_node_public_ingress_settings",
             "list_peers",
+            "set_node_mode",
         ],
     ),
     (
@@ -108,12 +210,16 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
         &[
             "WireguardMeshHandshakesReport",
             "WireguardMeshRegister",
+            "ack_node_state",
             "attach_application_workspace_terminal",
             "attach_global_workspace_terminal",
             "get_dns_changes",
             "mesh_enroll",
             "node_heartbeat",
+            "node_instance_env",
+            "plane_identity",
             "post_dns_ack",
+            "read_node_state",
             "register_node",
             "stream_container_metrics",
         ],
@@ -159,6 +265,8 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
             "create_deployment_token",
             "create_oidc_provider",
             "create_oidc_role_mapping",
+            // Returns a Shield bypass token in plaintext.
+            "create_shield_token",
             "create_user",
             "deactivate_api_key",
             "deleteProjectSecret",
@@ -181,6 +289,7 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
             "reset_user_mfa",
             "reset_user_password",
             "restore_user",
+            "revoke_shield_token",
             "rotate_api_key",
             "rotate_deployment_token",
             "setup_mfa",
@@ -256,15 +365,30 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
         "changes who can access the platform; a prompt injection could escalate privilege",
         &[
             "add_team_member",
+            "approve_shield_proposal",
             "create_ip_access_control",
+            "create_platform_shield_entry",
+            "create_project_shield_entry",
+            "create_rule",
             "create_team",
             "delete_ip_access_control",
+            "delete_platform_shield_entry",
+            "delete_project_shield_entry",
+            "delete_rule",
             "delete_team",
             "grant_project_access",
+            "reject_shield_proposal",
             "remove_team_member",
             "revoke_project_access",
+            "set_egress_policy",
+            "set_profile",
             "update_compose_security",
+            "update_ingress_settings",
             "update_ip_access_control",
+            "update_platform_shield_entry",
+            "update_preview_access",
+            "update_project_shield_entry",
+            "update_shield_settings",
             "update_team",
             "update_team_member_role",
         ],
@@ -295,6 +419,8 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
             "list_agent_runs",
             "list_all_runs",
             "list_data_imports",
+            "list_shield_events",
+            "list_shield_proposals",
             "observability_full_event",
             "observability_list_events",
             "revenue_global_events",
@@ -433,25 +559,24 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        "untyped config: a credential inside it is invisible to the secret-slot layer and would be typed into the chat; the assistant uses the typed create_*_provider / update_*_provider operations, whose credentials are SecretString",
+        &["create_notification_provider", "update_notification_provider"],
+    ),
+    (
+        "replaces a Git connection's token by id without binding the connection to the caller, unlike the repository operations; it stays in the console until the service scopes it",
+        &["update_connection_token"],
+    ),
+    (
         "payload carries a credential; it must be entered in the console until sealed secret input exists",
         &[
             "blob_enable",
             "createHttpCheck",
             "create_agent",
-            "create_bitbucket_provider",
-            "create_delivery_profile",
-            "create_dns_provider",
-            "create_email_provider",
-            "create_generic_provider",
             "create_git_provider",
-            "create_gitea_pat_provider",
-            "create_github_pat_provider",
-            "create_gitlab_pat_provider",
             "create_global_mcp",
             "create_mcp",
             "create_plan",
             "create_provider_key",
-            "create_webhook",
             "discover_workloads",
             "execute_import",
             "import_external_service",
@@ -464,17 +589,12 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
             "test_provider_key_inline",
             "updateHttpCheck",
             "update_agent",
-            "update_connection_token",
-            "update_email_provider",
-            "update_git_provider_credentials",
             "update_global_mcp",
             "update_mcp",
             "update_project_deployment_config",
-            "update_provider",
             "update_provider_key",
             "update_service",
             "update_settings",
-            "update_webhook",
         ],
     ),
     (
@@ -493,6 +613,8 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
     (
         "host-level operator policy or cluster edge routing, not a per-project setting",
         &[
+            "admin_set_environment_workload_isolation",
+            "admin_set_environment_workload_mode",
             "blob_get_settings",
             "blob_update_settings",
             "cancel_bulk_activation_job",
@@ -514,8 +636,13 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
             "update_cloud_features",
             "update_route",
             "update_telemetry_settings",
+            "update_workload_mode",
             "upgrade_preview_gateway",
         ],
+    ),
+    (
+        "pulling the multi-gigabyte sandbox image onto hosts, and whether each host keeps it pulled, are administrator decisions about disk and bandwidth made in the console",
+        &["prepare_sandbox_images", "update_host_image_preparation"],
     ),
     (
         "the node platform's own platform lifecycle and trust root; operator only",
@@ -583,6 +710,8 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
         "response returns a plaintext secret or mints a credential",
         &[
             "create_dsn",
+            "create_ingress_login_grant",
+            "create_sandbox_preview_session",
             "detectEnvCredential",
             "detectSecretCredential",
             "get_challenge_token",
@@ -591,7 +720,6 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
             "get_or_create_dsn",
             "get_provider_key",
             "get_resolved_environment_variable_value",
-            "get_s3_credentials",
             "get_service_environment_variable",
             "get_settings",
             "issue_runtime_credentials",
@@ -610,12 +738,20 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        "OAuth credential replacement requires the owner's browser consent and step-up; one-time codes must not pass through the assistant",
+        &["complete_connection_reauthorization", "reauthorize_connection"],
+    ),
+    (
         "browser OAuth callback",
         &[
             "create_gitlab_oauth_provider",
             "handle_git_provider_oauth_callback",
             "start_git_provider_oauth",
         ],
+    ),
+    (
+        "starts a browser flow: the state it issues is a credential for the setup flow, so it must not pass through the assistant",
+        &["start_github_manifest_flow"],
     ),
     (
         "static bundles and image archives need an upload the assistant cannot perform",
@@ -670,6 +806,23 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
         "tail_logs streams; use get_container_logs",
         &[
             "tail_logs",
+        ],
+    ),
+    (
+        "edge rules decide who reaches the app and can contain secret match values; manage them in the console or REST API until the shared CLI has a redacted representation",
+        &[
+            "create_edge_rule",
+            "delete_edge_rule",
+            "reorder_edge_rules",
+            "update_edge_rule",
+        ],
+    ),
+    (
+        "edge rule values are returned verbatim and can hold a shared secret, such as the header or cookie value an allow rule lets through",
+        &[
+            "evaluate_edge_rules",
+            "get_edge_rule",
+            "list_edge_rules",
         ],
     ),
     (
@@ -730,6 +883,7 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
             "list_status_pages",
             "list_telemetry_releases",
             "migrate_s3_service",
+            "preview_status_page",
             "publish_status_page",
             "remove_project_from_group",
             "remove_status_page_domain",
@@ -746,6 +900,7 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
             "unsilenceSystemAlarm",
             "updateCronMonitor",
             "update_group_env_var",
+            "update_incident",
             "update_project_feedback",
             "update_project_group",
             "update_runtime_health",
@@ -919,7 +1074,10 @@ mod tests {
     /// so deleting it later fails here instead of opening a self-approval path.
     #[test]
     fn controls_that_bound_the_assistant_refuse_the_assistant() {
-        const HANDLERS: &str = include_str!("../../../../../temps-ai-chat/src/handlers.rs");
+        const HANDLERS: &str = concat!(
+            include_str!("../../../../../temps-ai-chat/src/handlers/permissions.rs"),
+            include_str!("../../../../../temps-ai-chat/src/handlers/pending_actions.rs"),
+        );
         const HUMAN_ONLY: &[&str] = &[
             "confirm_pending_action",
             "reject_pending_action",

@@ -28,6 +28,10 @@ const EXEMPT: Record<string, string> = {
     'Exports a thin deleteEmailProvider helper; its callers (EmailProvidersManagement, EmailProviderDetail) own the ConfirmDeleteDialog.',
   'src/lib/backup-cleanup.ts':
     'Exports a thin deleteBackup helper; its only caller (BackupDetail) owns the ConfirmDeleteDialog.',
+  'src/lib/network-policy.ts':
+    'Exports a thin deleteNetworkPolicyRule helper; its only caller (NetworkPolicyPage) owns the ConfirmDeleteDialog.',
+  'src/components/project/settings/edge-rules/store.ts':
+    'Hook module exporting useDeleteEdgeRule; its only caller (EdgeRulesPage) owns the ConfirmDeleteDialog.',
   'src/hooks/usePlugins.ts':
     'Hook module exporting useUninstallPlugin; its only caller (PluginsPage) owns the ConfirmDeleteDialog.',
   'src/components/ai/ChatSandbox.tsx':
@@ -36,6 +40,8 @@ const EXEMPT: Record<string, string> = {
     "Calls disconnectChatSandboxProject, which only revokes the sandbox's access to a service's databases; the same button connects it again.",
   'src/pages/Drop.tsx':
     'Calls deleteProject only to roll back the service this same Drop flow just created after a failed upload; automatic cleanup, never user-triggered.',
+  'src/components/nodes/ingress-setup.ts':
+    'The ingress setup run deletes only the tunnel, managed domain and Cloudflare account that this same run created, to roll back a failed or abandoned setup; pre-existing resources are never touched.',
 }
 
 const root = new URL('../../../', import.meta.url).pathname

@@ -7,7 +7,7 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use temps_auth::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
+use temps_authz::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
 use temps_core::{
     problemdetails::{self, Problem},
     AuditContext, AuditOperation, RequestMetadata,
@@ -23,7 +23,7 @@ pub struct CronMonitorsState {
 impl From<CronMonitorError> for Problem {
     fn from(error: CronMonitorError) -> Self {
         let status = match &error {
-            CronMonitorError::Invalid(_) => StatusCode::BAD_REQUEST,
+            CronMonitorError::Invalid { .. } => StatusCode::BAD_REQUEST,
             CronMonitorError::NotFound { .. } | CronMonitorError::ScopeNotFound { .. } => {
                 StatusCode::NOT_FOUND
             }
@@ -40,7 +40,12 @@ impl From<CronMonitorError> for Problem {
             CronMonitorError::Database(_) | CronMonitorError::Alarm(_) => {
                 "Cron monitor operation failed; check the server logs for details".into()
             }
-            _ => error.to_string(),
+            CronMonitorError::Invalid { .. }
+            | CronMonitorError::Limit
+            | CronMonitorError::NotFound { .. }
+            | CronMonitorError::Conflict
+            | CronMonitorError::ScopeNotFound { .. }
+            | CronMonitorError::StoredConfiguration { .. } => error.to_string(),
         };
         problemdetails::new(status)
             .with_title("Cron monitor operation failed")
@@ -72,8 +77,8 @@ impl AuditOperation for CronAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> anyhow::Result<String> {
-        Ok(serde_json::to_string(self)?)
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 async fn audit(
@@ -277,6 +282,53 @@ mod tests {
     use axum::{body::Body, http::Request};
     use sea_orm::{DatabaseBackend, MockDatabase};
     use tower::ServiceExt;
+    #[test]
+    fn caller_facing_errors_keep_their_status_and_message() {
+        for (error, status, expected) in [
+            (
+                CronMonitorError::Invalid {
+                    reason: "schedule is empty".into(),
+                },
+                StatusCode::BAD_REQUEST,
+                "Invalid cron monitor: schedule is empty",
+            ),
+            (
+                CronMonitorError::Limit,
+                StatusCode::TOO_MANY_REQUESTS,
+                "Cron monitor limit reached",
+            ),
+            (
+                CronMonitorError::NotFound {
+                    project_id: 3,
+                    monitor_id: 9,
+                },
+                StatusCode::NOT_FOUND,
+                "Cron monitor 9 was not found in project 3",
+            ),
+            (
+                CronMonitorError::Conflict,
+                StatusCode::CONFLICT,
+                "Cron monitor already exists in this project and environment",
+            ),
+            (
+                CronMonitorError::ScopeNotFound {
+                    project_id: 3,
+                    environment_id: Some(5),
+                },
+                StatusCode::NOT_FOUND,
+                "Cron monitoring scope was not found: project 3, environment Some(5)",
+            ),
+            (
+                CronMonitorError::StoredConfiguration { monitor_id: 9 },
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Stored cron monitor 9 has invalid configuration",
+            ),
+        ] {
+            let problem = Problem::from(error);
+            assert_eq!(problem.status_code, status);
+            assert_eq!(problem.body["detail"].as_str(), Some(expected));
+        }
+    }
     #[tokio::test]
     async fn storage_and_alarm_causes_do_not_escape_http_problems() {
         use axum::response::IntoResponse;
@@ -298,7 +350,7 @@ mod tests {
             assert!(!detail.contains("synthetic internal"));
         }
     }
-    fn session(role: temps_auth::Role) -> temps_auth::AuthContext {
+    fn session(role: temps_authz::Role) -> temps_authz::AuthContext {
         let user = temps_entities::users::Model {
             id: 1,
             name: "Test".into(),
@@ -319,13 +371,13 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
-        temps_auth::AuthContext::new_session(user, role)
+        temps_authz::AuthContext::new_session(user, role)
     }
 
     struct NoAudit;
     #[async_trait::async_trait]
     impl temps_core::AuditLogger for NoAudit {
-        async fn create_audit_log(&self, _: &dyn AuditOperation) -> anyhow::Result<()> {
+        async fn create_audit_log(&self, _: &dyn AuditOperation) -> temps_core::AuditResult<()> {
             Ok(())
         }
     }
@@ -340,7 +392,7 @@ mod tests {
             Ok(false)
         }
     }
-    async fn call(auth: Option<temps_auth::AuthContext>, method: &str, uri: &str) -> StatusCode {
+    async fn call(auth: Option<temps_authz::AuthContext>, method: &str, uri: &str) -> StatusCode {
         let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
         let state = Arc::new(CronMonitorsState {
             service: Arc::new(CronMonitorService::new(db.clone())),
@@ -400,17 +452,17 @@ mod tests {
                 "{method} {uri}"
             );
             assert_eq!(
-                call(Some(session(temps_auth::Role::Reader)), method, uri).await,
+                call(Some(session(temps_authz::Role::Reader)), method, uri).await,
                 StatusCode::FORBIDDEN,
                 "{method} {uri}"
             );
             assert_eq!(
-                call(Some(session(temps_auth::Role::User)), method, uri).await,
+                call(Some(session(temps_authz::Role::User)), method, uri).await,
                 StatusCode::FORBIDDEN,
                 "project membership: {method} {uri}"
             );
         }
-        let auth = temps_auth::AuthContext::new_deployment_token(
+        let auth = temps_authz::AuthContext::new_deployment_token(
             2,
             None,
             None,

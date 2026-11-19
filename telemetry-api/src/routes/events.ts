@@ -6,6 +6,21 @@ import { countryForRequest } from "../geo.js";
 import { backfillTargets, insertEvent, type IngestBody } from "../db/events.js";
 import type { CountryBackfillQueue } from "../backfill.js";
 import { errorFields, log } from "../log.js";
+import { ingestLimitsFromEnv, type IngestLimits } from "../limits.js";
+import {
+  createRateLimiter,
+  rateLimitAddress,
+  rateLimitedResponse,
+  type RateLimiter,
+} from "../rate-limit.js";
+
+// The limits the event routes enforce (see limits.ts for each variable).
+// temps_version is capped as well as properties, or it could carry what the
+// properties cap refuses.
+export type EventLimits = Pick<
+  IngestLimits,
+  "eventPropertiesMaxBytes" | "eventsBatchMaxEvents" | "tempsVersionMaxChars"
+>;
 
 // Runtime event types are kept in lockstep with the Rust binary's
 // `TelemetryEventKind::as_str()` (temps-core/src/telemetry.rs). The validator
@@ -30,9 +45,11 @@ export const KNOWN_EVENT_TYPES = new Set([
   "deploy_cancelled",
   "rollback_triggered",
   "first_deploy_succeeded",
+  "first_deploy_attempted",
 
   // Project & environment
   "project_created",
+  "first_project_created",
   "project_created_from_template",
   "environment_created",
   "scale_to_zero_configured",
@@ -41,6 +58,7 @@ export const KNOWN_EVENT_TYPES = new Set([
 
   // Git & source
   "git_provider_connected",
+  "first_git_provider_connected",
   "git_provider_connect_failed",
 
   // Domains & networking
@@ -119,7 +137,11 @@ function sanitizeProperties(raw: Record<string, unknown>): Record<string, unknow
   );
 }
 
-function parseEvent(raw: unknown): IngestBody | { error: string } {
+function jsonByteLength(value: unknown): number {
+  return Buffer.byteLength(JSON.stringify(value), "utf8");
+}
+
+function parseEvent(raw: unknown, limits: EventLimits): IngestBody | { error: string } {
   if (typeof raw !== "object" || raw === null) {
     return { error: "event must be an object" };
   }
@@ -138,6 +160,16 @@ function parseEvent(raw: unknown): IngestBody | { error: string } {
     obj.properties !== undefined && isValidProperties(obj.properties)
       ? sanitizeProperties(obj.properties)
       : {};
+
+  if (jsonByteLength(properties) > limits.eventPropertiesMaxBytes) {
+    return { error: `properties exceeds ${limits.eventPropertiesMaxBytes} bytes` };
+  }
+  if (
+    typeof obj.temps_version === "string" &&
+    obj.temps_version.length > limits.tempsVersionMaxChars
+  ) {
+    return { error: `temps_version exceeds ${limits.tempsVersionMaxChars} chars` };
+  }
 
   if (obj.event_type === "cli_setup_step") {
     const allowed: Record<string, readonly string[]> = {
@@ -188,14 +220,36 @@ export interface EventsRoutesDeps {
   // the database on the request path (see backfill.ts).
   backfill: CountryBackfillQueue;
   resolveCountry?: (req: Request) => string | null;
+  // Per-IP event budget shared by both routes; a batch spends one per event.
+  rateLimiter?: RateLimiter;
+  // Rate-limit key for a request and its TCP peer; see rateLimitAddress.
+  resolveClientIp?: (req: Request, peer: string | null) => string | null;
+  limits?: EventLimits;
 }
 
 export function createEventsRoutes(pool: Pool, deps: EventsRoutesDeps) {
   const resolveCountry = deps.resolveCountry ?? countryForRequest;
+  const resolveClientIp = deps.resolveClientIp ?? rateLimitAddress;
+  const rateLimiter =
+    deps.rateLimiter ?? createRateLimiter(ingestLimitsFromEnv().eventsPerMinute);
+  const limits: EventLimits = deps.limits ?? ingestLimitsFromEnv();
+  const batchMax = limits.eventsBatchMaxEvents;
+
+  // No resolvable address (neither a forwarded header nor a peer, which only
+  // happens when a handler is called outside the server) fails open; the body
+  // and properties caps still apply either way.
+  const overBudget = (req: Request, peer: string | null, cost: number): boolean => {
+    const ip = resolveClientIp(req, peer);
+    return ip !== null && rateLimiter.isLimited(ip, cost);
+  };
 
   return {
     // POST /v1/events — single event
-    async postEvent(req: Request): Promise<Response> {
+    // `peer` is the TCP peer address, from the server.
+    async postEvent(req: Request, peer: string | null = null): Promise<Response> {
+      // Budget first, so rejected payloads spend it too.
+      if (overBudget(req, peer, 1)) return rateLimitedResponse();
+
       let body: unknown;
       try {
         body = await req.json();
@@ -203,7 +257,7 @@ export function createEventsRoutes(pool: Pool, deps: EventsRoutesDeps) {
         return Response.json({ error: "invalid JSON body" }, { status: 400 });
       }
 
-      const parsed = parseEvent(body);
+      const parsed = parseEvent(body, limits);
       if ("error" in parsed) {
         return Response.json({ error: parsed.error }, { status: 422 });
       }
@@ -223,29 +277,42 @@ export function createEventsRoutes(pool: Pool, deps: EventsRoutesDeps) {
     },
 
     // POST /v1/events/batch — up to 100 events in one request
-    async postBatch(req: Request): Promise<Response> {
+    async postBatch(req: Request, peer: string | null = null): Promise<Response> {
+      // Spend the budget before validating, so neither batching nor a stream
+      // of rejected requests gets more than the per-event budget: one unit
+      // per event, one for a body that isn't JSON or has no events array, the
+      // batch maximum for an oversized batch. Each request is charged once.
       let body: unknown;
       try {
         body = await req.json();
       } catch {
+        if (overBudget(req, peer, 1)) return rateLimitedResponse();
         return Response.json({ error: "invalid JSON body" }, { status: 400 });
       }
 
       const b = body as BatchIngestBody;
+      const cost = Array.isArray(b?.events)
+        ? Math.min(Math.max(b.events.length, 1), batchMax)
+        : 1;
+      if (overBudget(req, peer, cost)) return rateLimitedResponse();
+
       if (!Array.isArray(b?.events)) {
         return Response.json({ error: "body must have an 'events' array" }, { status: 422 });
       }
       if (b.events.length === 0) {
         return Response.json({ error: "events array must not be empty" }, { status: 422 });
       }
-      if (b.events.length > 100) {
-        return Response.json({ error: "max 100 events per batch" }, { status: 422 });
+      if (b.events.length > batchMax) {
+        return Response.json(
+          { error: `max ${batchMax} events per batch` },
+          { status: 422 }
+        );
       }
 
       const parsed: IngestBody[] = [];
       const errors: { index: number; error: string }[] = [];
       for (let i = 0; i < b.events.length; i++) {
-        const result = parseEvent(b.events[i]);
+        const result = parseEvent(b.events[i], limits);
         if ("error" in result) {
           errors.push({ index: i, error: result.error });
         } else {

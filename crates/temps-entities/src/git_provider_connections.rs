@@ -25,7 +25,11 @@ pub struct Model {
     pub installation_id: Option<String>, // Provider-specific installation ID
     pub metadata: Option<Json>,          // Provider-specific metadata
     pub is_active: bool,
-    pub is_expired: bool, // True if PAT token has been validated and found to be expired
+    /// True once the stored credential is known to be dead: a PAT that failed
+    /// validation, or an OAuth refresh token the provider rejected. An OAuth
+    /// connection in this state makes no provider calls until it is reauthorized
+    /// or a health check succeeds.
+    pub is_expired: bool,
     pub syncing: bool,
     pub last_synced_at: Option<DBDateTime>,
     /// Running count of repositories the current (or most recent) sync has
@@ -41,6 +45,17 @@ pub struct Model {
     /// reaches the API instead of just the server log.
     pub last_sync_error: Option<String>,
     pub last_sync_error_at: Option<DBDateTime>,
+    /// Bumped whenever the grant is replaced (reauthorization, a token entered
+    /// by the user), never by a refresh. A refresh only writes while the
+    /// generation it started from is current.
+    #[serde(default, skip_serializing)]
+    pub credential_generation: i32,
+    /// Holder of the per-connection refresh lease; `None` when nobody holds it.
+    #[serde(default, skip_serializing)]
+    pub token_refresh_lease_id: Option<Uuid>,
+    /// When the refresh lease lapses, so a crashed holder cannot block refreshes.
+    #[serde(default, skip_serializing)]
+    pub token_refresh_lease_expires_at: Option<DBDateTime>,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
 }

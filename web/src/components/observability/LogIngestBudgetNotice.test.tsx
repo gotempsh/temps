@@ -30,6 +30,9 @@ const noisy: ThrottledLogSource = {
   reason: 'lines_per_sec',
   throttled_since: '2026-01-01T00:00:00Z',
   last_dropped_at: '2026-01-01T00:01:00Z',
+  lines_per_sec_limit: 250,
+  bytes_per_sec_limit: 256 * 1024,
+  limit_overridden: false,
 }
 
 const render = (
@@ -57,6 +60,25 @@ test('names the throttled container, its rate and what was dropped', () => {
   expect(markup).toContain('~1,200 lines/s (96.0 KiB/s)')
   expect(markup).toContain('12,345 lines dropped')
   expect(markup).toContain('250 lines/s and 256.0 KiB/s')
+})
+
+test('a source on its own budget shows that budget, not the platform one', () => {
+  const inherited = render({ ...budget, throttled: [noisy] })
+  expect(inherited).not.toContain('own budget:')
+
+  const overridden = render({
+    ...budget,
+    throttled: [
+      {
+        ...noisy,
+        lines_per_sec_limit: 50,
+        bytes_per_sec_limit: 0,
+        limit_overridden: true,
+      },
+    ],
+  })
+  expect(overridden).toContain('own budget: 50 lines/s')
+  expect(overridden).not.toContain('own budget: 50 lines/s and')
 })
 
 test('links straight to the setting that changes the budget', () => {
@@ -132,4 +154,30 @@ test("a project's log view lists only that project's containers", () => {
     </MemoryRouter>
   )
   expect(quiet).toBe('')
+})
+
+test('a service-scoped notice links to that service’s own log settings', () => {
+  const html = renderToStaticMarkup(
+    <MemoryRouter>
+      <LogIngestBudgetNotice
+        budget={{
+          ...budget,
+          throttled: [
+            { ...noisy, project_id: undefined, external_service_id: 9 },
+          ],
+        }}
+        scope={{ externalServiceId: 9 }}
+      />
+    </MemoryRouter>
+  )
+  expect(html).toContain('href="/storage/9/logs?settings=log-ingestion"')
+  expect(html).toContain('change this service&#x27;s ingestion budget')
+  expect(html).not.toContain(budget.setup_path)
+})
+
+test('an unscoped notice still links to the platform budget', () => {
+  const html = render({ ...budget, throttled: [noisy] })
+  expect(html).toContain(
+    'href="/settings/metrics-monitoring#container-log-ingest-budget"'
+  )
 })

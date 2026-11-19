@@ -45,6 +45,21 @@ function render(project: Partial<ProjectResponse> | null) {
   )
 }
 
+describe('GeneratedProjectCollection labels', () => {
+  test('calls projects projects, so Vault services are not confused with them', () => {
+    const markup = render({
+      id: 2,
+      name: 'example-web',
+      slug: 'example-web',
+      preset: 'nextjs',
+      source_type: 'git',
+    })
+    expect(markup).toContain('Projects')
+    expect(markup).toContain('1 project')
+    expect(markup).not.toMatch(/service/i)
+  })
+})
+
 describe('GeneratedProjectCollection icons', () => {
   test('shows the preset logo and the project initial, not two letters of the name', () => {
     const markup = render({
@@ -57,7 +72,7 @@ describe('GeneratedProjectCollection icons', () => {
       repo_owner: 'acme',
       repo_name: 'examples',
     })
-    expect(markup).toContain('example-web service image')
+    expect(markup).toMatch(/>E</)
     expect(markup).toContain('Next.js logo')
     expect(markup).not.toMatch(/>ex</)
   })
@@ -65,6 +80,6 @@ describe('GeneratedProjectCollection icons', () => {
   test('still shows the preset logo while the project is not loaded', () => {
     const markup = render(null)
     expect(markup).toContain('Next.js logo')
-    expect(markup).toContain('example-web service image')
+    expect(markup).toMatch(/>E</)
   })
 })

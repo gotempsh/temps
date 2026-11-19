@@ -358,6 +358,76 @@ pub(crate) fn reject_references_in_url(
     Ok(())
 }
 
+/// Fail before requesting approval when a credential cannot be supplied safely.
+pub(crate) fn validate_without_resolver(
+    operation_id: &str,
+    body: &Value,
+    paths: &[SecretPath],
+) -> Result<(), ApiToolError> {
+    for pointer in credential_pointers(body, paths) {
+        if matches!(body.pointer(&pointer), Some(Value::String(text)) if !text.is_empty()) {
+            return Err(ApiToolError::SecretsUnavailable {
+                operation_id: operation_id.into(),
+                field: pointer,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Fail before a write is staged when a credential field holds anything but a
+/// well-formed handle, or a handle sits outside a credential field.
+///
+/// [`substitute`] makes the same checks, but only once the person has
+/// approved the request. Checking at proposal time means a value the model
+/// typed is never stored on a pending action nor shown on an approval card,
+/// and the model learns at once to call `request_secret`. The errors name the
+/// field, never the value.
+pub(crate) fn validate_handles(
+    operation_id: &str,
+    body: &Value,
+    paths: &[SecretPath],
+) -> Result<(), ApiToolError> {
+    let credential_slots = credential_pointers(body, paths);
+    if let Some(location) = first_misplaced_reference(body, "", &credential_slots) {
+        return Err(ApiToolError::SecretReferenceMisplaced {
+            operation_id: operation_id.to_string(),
+            location: format!("body field '{location}' (not a credential field)"),
+        });
+    }
+    for pointer in credential_slots {
+        match body.pointer(&pointer) {
+            Some(Value::String(text)) if is_secret_ref(text) => {}
+            Some(Value::String(text)) if text.contains(SECRET_REF_PREFIX) => {
+                return Err(ApiToolError::SecretReferenceMisplaced {
+                    operation_id: operation_id.to_string(),
+                    location: format!(
+                        "body field '{pointer}' (a handle must be the whole value, nothing around it)"
+                    ),
+                });
+            }
+            Some(Value::String(text)) if !text.is_empty() => {
+                return Err(ApiToolError::SecretLiteralRejected {
+                    operation_id: operation_id.to_string(),
+                    field: pointer,
+                });
+            }
+            // An empty string or null leaves the field unset.
+            Some(Value::String(_)) | Some(Value::Null) | None => {}
+            // A credential is a string. An object, array, number or bool
+            // there is a value the model typed (`{"token": "..."}`), so it
+            // must not be staged either.
+            Some(_) => {
+                return Err(ApiToolError::SecretLiteralRejected {
+                    operation_id: operation_id.to_string(),
+                    field: pointer,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Replace every handle at a credential path with the user's value.
 ///
 /// Returns the values that were substituted, so the caller can scrub them from
@@ -389,7 +459,15 @@ pub(crate) async fn substitute(
                     field: pointer,
                 });
             }
-            _ => continue,
+            Some(Value::String(_)) | Some(Value::Null) | None => continue,
+            // Not a string, so not a handle: a structured value the model
+            // typed into a credential field is refused, never sent.
+            Some(_) => {
+                return Err(ApiToolError::SecretLiteralRejected {
+                    operation_id: operation_id.to_string(),
+                    field: pointer,
+                });
+            }
         };
         if !is_secret_ref(&handle) {
             return Err(ApiToolError::SecretReferenceMisplaced {
@@ -442,7 +520,25 @@ pub(crate) fn scrub(value: &mut Value, secrets: &[SecretString]) {
             }
         }
         Value::Array(items) => items.iter_mut().for_each(|item| scrub(item, secrets)),
-        Value::Object(map) => map.values_mut().for_each(|item| scrub(item, secrets)),
+        Value::Object(map) => {
+            let original = std::mem::take(map);
+            for (key, mut item) in original {
+                let mut masked = Value::String(key);
+                scrub(&mut masked, secrets);
+                let Value::String(mut key) = masked else {
+                    continue;
+                };
+                scrub(&mut item, secrets);
+                // Preserve every value when masking makes distinct keys equal.
+                let base = key.clone();
+                let mut suffix = 2;
+                while map.contains_key(&key) {
+                    key = format!("{base} ({suffix})");
+                    suffix += 1;
+                }
+                map.insert(key, item);
+            }
+        }
         _ => {}
     }
 }
@@ -452,6 +548,72 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::collections::HashMap;
+
+    #[test]
+    fn a_structured_value_in_a_credential_field_is_refused_at_proposal() {
+        let paths = collect_secret_paths(
+            &json!({"type":"object","properties":{"credentials":{"type":"object","properties":{
+                "api_token":{"type":"string","x-temps-secret":true}
+            }}}}),
+            &json!({}),
+        );
+        for value in [
+            json!({"token": "fixture-private-value"}),
+            json!(["fixture-private-value"]),
+            json!(42),
+            json!(true),
+        ] {
+            let body = json!({"credentials": {"api_token": value}});
+            let error = validate_handles("create_dns_provider", &body, &paths)
+                .expect_err("only a handle, an empty string or null may sit in a credential field");
+            assert!(
+                matches!(&error, ApiToolError::SecretLiteralRejected { field, .. }
+                    if field == "/credentials/api_token"),
+                "{error:?}"
+            );
+            assert!(!error.to_string().contains("fixture-private-value"));
+        }
+        for unset in [json!(""), json!(null)] {
+            validate_handles(
+                "create_dns_provider",
+                &json!({"credentials": {"api_token": unset}}),
+                &paths,
+            )
+            .expect("an unset credential is not a literal");
+        }
+        validate_handles("create_dns_provider", &json!({"credentials": {}}), &paths)
+            .expect("an absent credential is not a literal");
+    }
+
+    #[test]
+    fn unavailable_secret_input_checks_nested_slots_without_echoing_values() {
+        let paths = collect_secret_paths(
+            &json!({"type":"object","properties":{"items":{"type":"array","items":{
+                "type":"object","properties":{"password":{"type":"string","x-temps-secret":true}}
+            }}}}),
+            &json!({}),
+        );
+        for value in [
+            "fixture-private-value",
+            "secret_ref:v1:0123456789abcdef0123456789abcdef",
+        ] {
+            let error = validate_without_resolver(
+                "fixture_write",
+                &json!({"items":[{"password":value}]}),
+                &paths,
+            )
+            .unwrap_err();
+            assert!(matches!(error, ApiToolError::SecretsUnavailable { .. }));
+            assert!(!error.to_string().contains(value));
+        }
+        for body in [
+            json!({}),
+            json!({"items":[{}]}),
+            json!({"items":[{"password":""}]}),
+        ] {
+            assert!(validate_without_resolver("fixture_write", &body, &paths).is_ok());
+        }
+    }
 
     const VALUE: &str = "wJalr-example-not-a-real-secret";
     const HANDLE: &str = "secret_ref:v1:0123456789abcdef0123456789abcdef";
@@ -538,6 +700,28 @@ mod tests {
             &json!({"$ref": "#/components/schemas/CreateSource"}),
             &components(),
         )
+    }
+
+    #[test]
+    fn scrub_masks_object_keys_without_losing_colliding_values() {
+        let mut value = json!({"credential-one":1,"credential-two":2,"***":3,"nested":{"credential-one":"credential-two"}});
+        scrub(
+            &mut value,
+            &[
+                SecretString::new("credential-one"),
+                SecretString::new("credential-two"),
+            ],
+        );
+        assert!(!value.to_string().contains("credential-"));
+        let values: Vec<_> = value
+            .as_object()
+            .unwrap()
+            .values()
+            .filter_map(Value::as_i64)
+            .collect();
+        assert_eq!(values.len(), 3);
+        assert!(values.contains(&1) && values.contains(&2) && values.contains(&3));
+        assert_eq!(value["nested"]["***"], "***");
     }
 
     #[test]

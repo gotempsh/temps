@@ -40,7 +40,7 @@ Current evidence sources in a Temps checkout:
 
 - `apps/temps-cli/src/commands/plugin/`: init, build, install, update, grants and dev simulator.
 - `crates/temps-external-plugins/src/repository.rs`: actual source-installer build contract.
-- `crates/temps-core/src/external_plugin/`: protocol, permissions, manifest and events.
+- `crates/temps-plugin-protocol/`: protocol, permissions, manifest and events.
 - `sdks/node/packages/plugin-sdk/src/` and `crates/temps-plugin-sdk/src/`: SDK APIs.
 - Root `DESIGN.md`, `web/src/components/ui/`, and `web/src/globals.css`: current console design.
 

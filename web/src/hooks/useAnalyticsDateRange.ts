@@ -10,8 +10,8 @@ export const QUICK_FILTERS = [
   { label: 'Today', value: 'today' },
   { label: 'Yesterday', value: 'yesterday' },
   { label: 'Last 24 hours', value: '24hours' },
-  { label: 'Last 7 Days', value: '7days' },
-  { label: 'Last 30 Days', value: '30days' },
+  { label: 'Last 7 days', value: '7days' },
+  { label: 'Last 30 days', value: '30days' },
   { label: 'Custom', value: 'custom' },
 ] as const
 

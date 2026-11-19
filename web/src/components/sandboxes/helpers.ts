@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import type {
+  SandboxEgressPolicy,
   SandboxInner,
+  SandboxPreviewAccess,
   SandboxResponse,
   JobSummaryResponse,
 } from '@/api/client/types.gen'
@@ -19,6 +21,12 @@ export type SandboxView = {
   expires_at: string
   preview_url_template: string
   preview_password_hint?: string | null
+  /** Who may open the preview URLs; `temps_login` by default. */
+  preview_access: SandboxPreviewAccess
+  /** Client CIDRs allowed to open previews. Empty = any address. */
+  preview_allowed_cidrs: string[]
+  /** Where the sandbox may connect to. */
+  egress_policy: SandboxEgressPolicy
   /**
    * `'ephemeral'` or `'workspace'` (ADR-036). A workspace suspends on idle
    * like an ephemeral sandbox but wakes on the next access instead of
@@ -75,6 +83,9 @@ export function toSandboxView(inner: SandboxInner): SandboxView {
     expires_at: new Date(expiresMs).toISOString(),
     preview_url_template: inner.preview_url_template,
     preview_password_hint: inner.preview_password_hint ?? undefined,
+    preview_access: inner.preview_access,
+    preview_allowed_cidrs: inner.preview_allowed_cidrs,
+    egress_policy: inner.egress_policy,
     lifecycle: inner.lifecycle,
     project_id: inner.project_id ?? null,
     source_repo_url: inner.source_repo_url ?? null,

@@ -2,12 +2,16 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 pub mod custom_domains;
+pub mod data_purge;
 pub mod env_vars;
 pub mod operations;
 pub mod project;
 pub mod types;
 
 pub use custom_domains::{CustomDomainError, CustomDomainService};
+pub use data_purge::{
+    PassOutcome, ProjectDataPurgeConfig, ProjectDataPurgeError, ProjectDataPurger,
+};
 pub use env_vars::{EnvVarError, EnvVarService};
 pub use operations::{OperationsError, OperationsService};
 pub use project::*;

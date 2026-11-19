@@ -26,13 +26,9 @@ use crate::handlers::types::{
 /// Stored import session
 #[derive(Debug, Clone)]
 struct ImportSession {
-    #[allow(dead_code)]
-    session_id: String,
     user_id: i32,
     plan: ImportPlan,
     validation: ValidationReport,
-    #[allow(dead_code)]
-    repository_id: Option<i32>,
     git_provider_connection_id: Option<i32>,
     repo_owner: Option<String>,
     repo_name: Option<String>,
@@ -506,11 +502,9 @@ impl ImportOrchestrator {
 
         // Store session in memory (will be replaced with database storage later)
         let session = ImportSession {
-            session_id: session_id.clone(),
             user_id,
             plan: plan.clone(),
             validation: validation.clone(),
-            repository_id,
             git_provider_connection_id,
             repo_owner,
             repo_name,
@@ -904,17 +898,7 @@ mod tests {
     use super::*;
     use temps_import_types::plan::*;
     use temps_import_types::validation::*;
-    use temps_import_types::{
-        ImportSelector, ImportSource, ImportValidationRule, WorkloadDescriptor, WorkloadId,
-        WorkloadImporter, WorkloadSnapshot,
-    };
-
-    #[allow(dead_code)]
-    fn create_test_db() -> Arc<DatabaseConnection> {
-        // For unit tests, we create a mock database
-        use sea_orm::{DatabaseBackend, MockDatabase};
-        Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection())
-    }
+    use temps_import_types::ImportSource;
 
     // NOTE: Unit tests for ImportOrchestrator are limited because it now requires
     // fully initialized services (ProjectService, DeploymentService, GitProviderManager).
@@ -1055,11 +1039,9 @@ mod tests {
 
     fn test_session(user_id: i32) -> ImportSession {
         ImportSession {
-            session_id: "sess-1".to_string(),
             user_id,
             plan: create_test_plan(),
             validation: create_test_validation(true),
-            repository_id: None,
             git_provider_connection_id: None,
             repo_owner: None,
             repo_name: None,
@@ -1096,11 +1078,9 @@ mod tests {
     #[test]
     fn prune_expired_sessions_drops_only_stale_entries() {
         let mut fresh = test_session(1);
-        fresh.session_id = "fresh".to_string();
         fresh.created_at = chrono::Utc::now();
 
         let mut stale = test_session(1);
-        stale.session_id = "stale".to_string();
         stale.created_at = chrono::Utc::now() - (SESSION_TTL + chrono::Duration::minutes(1));
 
         let lock = std::sync::RwLock::new(HashMap::from([
@@ -1261,31 +1241,6 @@ mod tests {
             .contains("hunter2"));
     }
 
-    // Tests commented out - they require full service initialization which is complex in unit tests.
-    // These should be converted to integration tests with proper database and service setup.
-
-    /*
-    #[tokio::test]
-    async fn test_list_sources_returns_empty_when_no_importers_registered() {
-        // Requires full orchestrator with services
-    }
-
-    #[tokio::test]
-    async fn test_execute_import_returns_error_for_nonexistent_session() {
-        // Requires full orchestrator with services
-    }
-
-    #[tokio::test]
-    async fn test_execute_import_dry_run_returns_completed_status() {
-        // Requires full orchestrator with services
-    }
-
-    #[tokio::test]
-    async fn test_get_status_returns_error_for_nonexistent_session() {
-        // Requires full orchestrator with services
-    }
-    */
-
     // Basic test that doesn't require full orchestrator - just tests data structures
     #[tokio::test]
     async fn test_create_test_plan_structure() {
@@ -1350,11 +1305,9 @@ mod tests {
     async fn test_import_session_stores_git_provider_connection_id() {
         // Arrange & Act
         let session = ImportSession {
-            session_id: "test-session".to_string(),
             user_id: 1,
             plan: create_test_plan(),
             validation: create_test_validation(true),
-            repository_id: Some(10),
             git_provider_connection_id: Some(42),
             repo_owner: Some("test-owner".to_string()),
             repo_name: Some("test-repo".to_string()),
@@ -1364,378 +1317,10 @@ mod tests {
 
         // Assert
         assert_eq!(session.git_provider_connection_id, Some(42));
-        assert_eq!(session.repository_id, Some(10));
         assert_eq!(session.repo_owner, Some("test-owner".to_string()));
         assert_eq!(session.repo_name, Some("test-repo".to_string()));
         assert_eq!(session.user_id, 1);
     }
-
-    // NOTE: The following tests require full orchestrator initialization with real services,
-    // which have complex dependencies. They should be rewritten as integration tests.
-    /*
-    #[tokio::test]
-    async fn test_execute_import_delegates_to_importer() {
-        // Arrange
-        let db = create_test_db();
-        let git_provider_manager = Arc::new(create_mock_git_provider_manager());
-        let project_service = Arc::new(create_mock_project_service_for_orchestrator());
-        let deployment_service = Arc::new(create_mock_deployment_service());
-
-        let mut orchestrator = ImportOrchestrator::new(
-            db.clone(),
-            git_provider_manager,
-            project_service,
-            deployment_service,
-        );
-
-        // Register a mock importer
-        let mock_importer = Arc::new(MockWorkloadImporter::new());
-        orchestrator.register_importer(mock_importer.clone());
-
-        // Create a session
-        let session_id = "test-execute-session".to_string();
-        let plan = create_test_plan();
-        let validation = create_test_validation(true);
-        let session = ImportSession {
-            session_id: session_id.clone(),
-            user_id: 1,
-            plan: plan.clone(),
-            validation,
-            created_at: chrono::Utc::now(),
-        };
-
-        {
-            let mut sessions = orchestrator.sessions.write().unwrap();
-            sessions.insert(session_id.clone(), session);
-        }
-
-        // Act
-        let result = orchestrator.execute_import(
-            1,
-            session_id.clone(),
-            "test-project".to_string(),
-            "nodejs".to_string(),
-            ".".to_string(),
-            "main".to_string(),
-            false,
-        ).await;
-
-        // Assert
-        assert!(result.is_ok(), "Execute should delegate to importer successfully");
-        let response = result.unwrap();
-        assert_eq!(response.session_id, session_id);
-        assert_eq!(response.status, ImportExecutionStatus::Completed);
-    }
-
-    #[tokio::test]
-    async fn test_execute_import_validates_session_ownership() {
-        // Arrange
-        let db = create_test_db();
-        let git_provider_manager = Arc::new(create_mock_git_provider_manager());
-        let project_service = Arc::new(create_mock_project_service_for_orchestrator());
-        let deployment_service = Arc::new(create_mock_deployment_service());
-
-        let orchestrator = ImportOrchestrator::new(
-            db.clone(),
-            git_provider_manager,
-            project_service,
-            deployment_service,
-        );
-
-        // Create a session owned by user 1
-        let session_id = "ownership-test-session".to_string();
-        let plan = create_test_plan();
-        let validation = create_test_validation(true);
-        let session = ImportSession {
-            session_id: session_id.clone(),
-            user_id: 1,
-            plan: plan.clone(),
-            validation,
-            created_at: chrono::Utc::now(),
-        };
-
-        {
-            let mut sessions = orchestrator.sessions.write().unwrap();
-            sessions.insert(session_id.clone(), session);
-        }
-
-        // Act - Try to execute as user 2
-        let result = orchestrator.execute_import(
-            2, // Different user
-            session_id.clone(),
-            "test-project".to_string(),
-            "nodejs".to_string(),
-            ".".to_string(),
-            "main".to_string(),
-            false,
-        ).await;
-
-        // Assert
-        assert!(result.is_err(), "Should reject session access by wrong user");
-        match result {
-            Err(ImportServiceError::SessionNotFound(_)) => {
-                // Expected error
-            }
-            _ => panic!("Should return SessionNotFound error"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_execute_import_rejects_invalid_validation() {
-        // Arrange
-        let db = create_test_db();
-        let git_provider_manager = Arc::new(create_mock_git_provider_manager());
-        let project_service = Arc::new(create_mock_project_service_for_orchestrator());
-        let deployment_service = Arc::new(create_mock_deployment_service());
-
-        let orchestrator = ImportOrchestrator::new(
-            db.clone(),
-            git_provider_manager,
-            project_service,
-            deployment_service,
-        );
-
-        // Create a session with failed validation
-        let session_id = "invalid-validation-session".to_string();
-        let plan = create_test_plan();
-        let validation = create_test_validation(false); // Failed validation
-        let session = ImportSession {
-            session_id: session_id.clone(),
-            user_id: 1,
-            plan: plan.clone(),
-            validation,
-            created_at: chrono::Utc::now(),
-        };
-
-        {
-            let mut sessions = orchestrator.sessions.write().unwrap();
-            sessions.insert(session_id.clone(), session);
-        }
-
-        // Act
-        let result = orchestrator.execute_import(
-            1,
-            session_id.clone(),
-            "test-project".to_string(),
-            "nodejs".to_string(),
-            ".".to_string(),
-            "main".to_string(),
-            false,
-        ).await;
-
-        // Assert
-        assert!(result.is_err(), "Should reject execution with failed validation");
-        match result {
-            Err(ImportServiceError::ValidationFailed) => {
-                // Expected error
-            }
-            _ => panic!("Should return ValidationFailed error"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_orchestrator_implements_service_provider_trait() {
-        // Arrange
-        let db = create_test_db();
-        let git_provider_manager = Arc::new(create_mock_git_provider_manager());
-        let project_service = Arc::new(create_mock_project_service_for_orchestrator());
-        let deployment_service = Arc::new(create_mock_deployment_service());
-
-        let orchestrator = ImportOrchestrator::new(
-            db.clone(),
-            git_provider_manager.clone(),
-            project_service.clone(),
-            deployment_service.clone(),
-        );
-
-        // Act & Assert - Test that orchestrator implements ImportServiceProvider
-        let service_provider: &dyn temps_import_types::ImportServiceProvider = &orchestrator;
-
-        // Verify db access
-        let _ = service_provider.db();
-
-        // Verify service access
-        let _ = service_provider.project_service();
-        let _ = service_provider.deployment_service();
-        let _ = service_provider.git_provider_manager();
-    }
-    */
-
-    // Mock implementations for testing (kept for potential future integration tests)
-
-    /// Mock Git Provider Manager
-    #[allow(dead_code)]
-    struct MockGitProviderManager;
-
-    #[allow(dead_code)]
-    fn create_mock_git_provider_manager() -> MockGitProviderManager {
-        MockGitProviderManager
-    }
-
-    /// Mock Project Service for orchestrator tests
-    #[allow(dead_code)]
-    struct MockProjectServiceForOrchestrator;
-
-    #[allow(dead_code)]
-    fn create_mock_project_service_for_orchestrator() -> MockProjectServiceForOrchestrator {
-        MockProjectServiceForOrchestrator
-    }
-
-    /// Mock Deployment Service
-    #[allow(dead_code)]
-    struct MockDeploymentService;
-
-    #[allow(dead_code)]
-    fn create_mock_deployment_service() -> MockDeploymentService {
-        MockDeploymentService
-    }
-
-    /// Mock Workload Importer for testing
-    #[allow(dead_code)]
-    struct MockWorkloadImporter {
-        source: ImportSource,
-    }
-
-    #[allow(dead_code)]
-    impl MockWorkloadImporter {
-        fn new() -> Self {
-            Self {
-                source: ImportSource::Docker,
-            }
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl WorkloadImporter for MockWorkloadImporter {
-        fn source(&self) -> ImportSource {
-            self.source
-        }
-
-        fn name(&self) -> &str {
-            "Mock Importer"
-        }
-
-        fn version(&self) -> &str {
-            "1.0.0-test"
-        }
-
-        async fn health_check(&self) -> temps_import_types::ImportResult<bool> {
-            Ok(true)
-        }
-
-        async fn discover(
-            &self,
-            _credentials: &ImportCredentials,
-            _selector: ImportSelector,
-        ) -> temps_import_types::ImportResult<Vec<WorkloadDescriptor>> {
-            Ok(vec![])
-        }
-
-        async fn describe(
-            &self,
-            _credentials: &ImportCredentials,
-            _workload_id: &WorkloadId,
-        ) -> temps_import_types::ImportResult<WorkloadSnapshot> {
-            Err(temps_import_types::ImportError::Internal(
-                "Mock importer".to_string(),
-            ))
-        }
-
-        fn generate_plan(
-            &self,
-            _snapshot: WorkloadSnapshot,
-        ) -> temps_import_types::ImportResult<ImportPlan> {
-            Ok(create_test_plan())
-        }
-
-        fn validation_rules(&self) -> Vec<Box<dyn ImportValidationRule>> {
-            vec![]
-        }
-
-        async fn execute(
-            &self,
-            context: temps_import_types::ImportContext,
-            _plan: ImportPlan,
-            _services: &dyn temps_import_types::ImportServiceProvider,
-        ) -> temps_import_types::ImportResult<temps_import_types::ImportOutcome> {
-            // Mock successful execution
-            Ok(temps_import_types::ImportOutcome {
-                session_id: context.session_id,
-                success: true,
-                project_id: Some(1),
-                environment_id: Some(1),
-                deployment_id: Some(1),
-                warnings: vec![],
-                errors: vec![],
-                created_resources: vec![],
-                step_results: vec![],
-                duration_seconds: 0.1,
-            })
-        }
-
-        fn capabilities(&self) -> temps_import_types::ImporterCapabilities {
-            temps_import_types::ImporterCapabilities::default()
-        }
-    }
-
-    /*
-    #[tokio::test]
-    async fn test_get_status_returns_session_details() {
-        // Arrange
-        let orchestrator = create_test_orchestrator();
-
-        // Create a fake session with validation results
-        let session_id = Uuid::new_v4().to_string();
-        let validation = temps_import_types::ValidationReport {
-            results: vec![
-                temps_import_types::ValidationResult {
-                    rule_id: "test.warning".to_string(),
-                    rule_name: "Test Warning".to_string(),
-                    level: temps_import_types::ValidationLevel::Warning,
-                    passed: true,
-                    message: "This is a warning".to_string(),
-                    remediation: None,
-                    affected_resources: vec![],
-                },
-            ],
-            overall_status: ValidationStatus::PassedWithWarnings,
-            summary: ValidationSummary {
-                total_count: 1,
-                passed_count: 1,
-                failed_count: 0,
-                error_count: 0,
-                info_count: 0,
-                warning_count: 1,
-                critical_count: 0,
-            },
-        };
-
-        let session = ImportSession {
-            session_id: session_id.clone(),
-            user_id: 1,
-            plan: create_test_plan(),
-            validation,
-            created_at: chrono::Utc::now(),
-        };
-
-        {
-            let mut sessions = orchestrator.sessions.write().unwrap();
-            sessions.insert(session_id.clone(), session.clone());
-        }
-
-        // Act
-        let result = orchestrator.get_status(1, &session_id).await;
-
-        // Assert
-        assert!(result.is_ok(), "Should return status for existing session");
-        let status = result.unwrap();
-        assert_eq!(status.session_id, session_id);
-        assert!(status.plan.is_some(), "Should include plan");
-        assert!(status.validation.is_some(), "Should include validation");
-        assert_eq!(status.warnings.len(), 1, "Should extract warnings from validation");
-        assert_eq!(status.warnings[0], "This is a warning");
-    }
-    */
 
     // -----------------------------------------------------------------------
     // Fix #16 — ImportCredentials base_url SSRF validation

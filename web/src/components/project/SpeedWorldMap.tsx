@@ -11,9 +11,9 @@ import {
   CardTitle,
 } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
-import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { SegmentedControl } from '@/components/ui/segmented-control'
 import { cn } from '@/lib/utils'
-import { useQuery } from '@tanstack/react-query'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
 import { iso31661Alpha2ToNumeric } from 'iso-3166/1-a2-to-1-n'
 import { useMemo, useState } from 'react'
 import type { GeoJsonObject } from 'geojson'
@@ -109,7 +109,7 @@ export function SpeedWorldMap({
   const [metric, setMetric] = useState<MapMetric>('ttfb')
   const [hover, setHover] = useState<HoverInfo | null>(null)
 
-  const { data, isLoading } = useQuery({
+  const { data, isLoading } = useWindowQuery({
     ...getGroupedPageMetricsOptions({
       query: {
         start_date: startDate,
@@ -157,19 +157,12 @@ export function SpeedWorldMap({
               country · click a country to filter
             </CardDescription>
           </div>
-          <Tabs value={metric} onValueChange={(v) => setMetric(v as MapMetric)}>
-            <TabsList className="h-8">
-              {MAP_METRICS.map((m) => (
-                <TabsTrigger
-                  key={m.value}
-                  value={m.value}
-                  className="h-6 px-2.5 text-xs"
-                >
-                  {m.label}
-                </TabsTrigger>
-              ))}
-            </TabsList>
-          </Tabs>
+          <SegmentedControl
+            label="Map metric"
+            value={metric}
+            onValueChange={setMetric}
+            options={MAP_METRICS}
+          />
         </div>
       </CardHeader>
       <CardContent>

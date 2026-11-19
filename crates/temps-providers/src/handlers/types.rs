@@ -29,6 +29,9 @@ pub struct AppState {
     /// Metrics store for time-series metric queries and writes.
     /// Optional — present only when the metrics subsystem is enabled in config.
     pub metrics_store: Option<Arc<dyn temps_metrics::MetricsStore>>,
+    /// Worker metrics reporting status (ADR 061); `None` when the control
+    /// plane runs without a metrics store.
+    pub worker_metrics_status: Option<Arc<temps_metrics::WorkerMetricsStatusBoard>>,
     /// Direct DB connection for alert rule CRUD (monitoring_alert_rules table).
     pub db: Arc<DatabaseConnection>,
     /// API key service — used to provision `si_` ingest keys when metrics are
@@ -188,9 +191,16 @@ impl From<CreatableServiceTypeRoute> for crate::externalsvc::ServiceType {
     }
 }
 
+/// A route segment that names no service type.
+#[derive(Debug, thiserror::Error)]
+#[error("Invalid service type: {service_type}")]
+pub struct InvalidServiceTypeRoute {
+    pub service_type: String,
+}
+
 impl ServiceTypeRoute {
     #[allow(clippy::should_implement_trait)]
-    pub fn from_str(s: &str) -> anyhow::Result<Self> {
+    pub fn from_str(s: &str) -> Result<Self, InvalidServiceTypeRoute> {
         match s.to_lowercase().as_str() {
             "mariadb" => Ok(ServiceTypeRoute::Mariadb),
             "mongodb" => Ok(ServiceTypeRoute::Mongodb),
@@ -201,7 +211,9 @@ impl ServiceTypeRoute {
             "blob" => Ok(ServiceTypeRoute::Blob),
             "rustfs" => Ok(ServiceTypeRoute::Rustfs),
             "minio" => Ok(ServiceTypeRoute::Minio),
-            _ => Err(anyhow::anyhow!("Invalid service type: {}", s)),
+            _ => Err(InvalidServiceTypeRoute {
+                service_type: s.to_string(),
+            }),
         }
     }
 

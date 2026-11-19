@@ -338,6 +338,7 @@ mod tests {
             trust_idp_email: true,
             managed_by_cloud: false,
             admin_only_role_required: false,
+            cloud_sessions_confirmed_at: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };

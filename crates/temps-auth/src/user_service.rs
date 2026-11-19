@@ -162,6 +162,9 @@ pub enum UserServiceError {
     #[error("Validation error: {0}")]
     Validation(String),
 
+    #[error("A user with email {email} already exists")]
+    EmailTaken { email: String },
+
     #[error("Encryption error: {0}")]
     Encryption(String),
 
@@ -192,6 +195,15 @@ pub enum UserServiceError {
     MfaLocked {
         user_id: i32,
         retry_after_seconds: i64,
+    },
+
+    #[error(
+        "Failed to revoke the ingress login grants of user {user_id} while {operation}: {reason}"
+    )]
+    IngressGrantRevocation {
+        user_id: i32,
+        operation: &'static str,
+        reason: String,
     },
 
     #[error("Internal error: {0}")]
@@ -459,19 +471,42 @@ where
     Ok((permit, result?))
 }
 
-/// Delete every session (full or pending) for `user_id` except `keep`.
-/// Returns how many rows were removed.
+/// What [`revoke_sessions_except`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RevokedAccess {
+    /// Console sessions (full or pending) deleted.
+    pub sessions: u64,
+    /// Temps-login ingress grants revoked.
+    pub ingress_grants: u64,
+}
+
+/// Delete every session (full or pending) for `user_id` except `keep`, and
+/// revoke every live Temps-login ingress grant the user holds.
+///
+/// The grants go too because each was minted from one of those console
+/// sessions and is honoured by the proxy for hours without consulting the
+/// session again: a sweep that left them in place would let a session it
+/// just ended keep opening protected environments. A grant records no link
+/// to the session that minted it, so the one belonging to `keep` cannot be
+/// spared; that browser signs in to the environment again through the same
+/// redirect. Run it inside the caller's transaction so the sweep and the
+/// change that warranted it commit together.
 pub(crate) async fn revoke_sessions_except<C: sea_orm::ConnectionTrait>(
     conn: &C,
     user_id: i32,
     keep: Option<i32>,
-) -> Result<u64, sea_orm::DbErr> {
+) -> Result<RevokedAccess, sea_orm::DbErr> {
     let mut query = temps_entities::sessions::Entity::delete_many()
         .filter(temps_entities::sessions::Column::UserId.eq(user_id));
     if let Some(keep) = keep {
         query = query.filter(temps_entities::sessions::Column::Id.ne(keep));
     }
-    Ok(query.exec(conn).await?.rows_affected)
+    let sessions = query.exec(conn).await?.rows_affected;
+    let ingress_grants = crate::ingress_grants::revoke_for_user(conn, user_id).await?;
+    Ok(RevokedAccess {
+        sessions,
+        ingress_grants,
+    })
 }
 
 impl UserService {
@@ -875,7 +910,10 @@ impl UserService {
             ..Default::default()
         };
 
-        let user = new_user.insert(&transaction).await?;
+        let user = new_user
+            .insert(&transaction)
+            .await
+            .map_err(|error| email_taken_or(error, &email))?;
 
         // Build the response from the records already resolved inside this
         // transaction. Once commit succeeds there must be no fallible read
@@ -931,11 +969,23 @@ impl UserService {
         user_update.deleted_at = Set(Some(now));
         user_update.email = Set(deleted_email);
 
-        let deleted_user = user_update.update(self.db.as_ref()).await?;
+        // The soft delete and the revocation of the user's Temps-login
+        // ingress grants commit together: a deleted user must not keep
+        // opening protected environments on a cookie minted earlier.
+        let transaction = self.db.begin().await?;
+        let deleted_user = user_update.update(&transaction).await?;
+        let revoked = crate::ingress_grants::revoke_for_user(&transaction, user_id)
+            .await
+            .map_err(|e| UserServiceError::IngressGrantRevocation {
+                user_id,
+                operation: "deleting the user",
+                reason: e.to_string(),
+            })?;
+        transaction.commit().await?;
 
         info!(
-            "Soft deleted user with id: {}, email changed to prevent duplicates",
-            user_id
+            "Soft deleted user with id: {}, email changed to prevent duplicates; revoked {} ingress login grant(s)",
+            user_id, revoked
         );
         Ok(deleted_user)
     }
@@ -954,11 +1004,14 @@ impl UserService {
                 UserServiceError::RoleNotFound(format!("Role {} not found", role_type.as_str()))
             })?;
 
-        // Delete the user_role entry
+        // Delete the user_role entry. Losing a role can take away the
+        // permission a Temps-login ingress grant was minted on, so the
+        // user's grants are revoked in the same transaction.
+        let transaction = self.db.begin().await?;
         let delete_result = temps_entities::user_roles::Entity::delete_many()
             .filter(temps_entities::user_roles::Column::UserId.eq(user_id_val))
             .filter(temps_entities::user_roles::Column::RoleId.eq(role.id))
-            .exec(self.db.as_ref())
+            .exec(&transaction)
             .await?;
 
         if delete_result.rows_affected == 0 {
@@ -969,10 +1022,20 @@ impl UserService {
             )));
         }
 
+        let revoked = crate::ingress_grants::revoke_for_user(&transaction, user_id_val)
+            .await
+            .map_err(|e| UserServiceError::IngressGrantRevocation {
+                user_id: user_id_val,
+                operation: "removing a role",
+                reason: e.to_string(),
+            })?;
+        transaction.commit().await?;
+
         info!(
-            "Removed role {} from user {}",
+            "Removed role {} from user {}; revoked {} ingress login grant(s)",
             role_type.as_str(),
-            user_id_val
+            user_id_val,
+            revoked
         );
         Ok(())
     }
@@ -1057,11 +1120,20 @@ impl UserService {
             .filter(temps_entities::sessions::Column::UserId.eq(user_id))
             .exec(&transaction)
             .await?;
+        // Ingress login grants are minted from those sessions; a reset that
+        // assumes the old credentials are compromised ends them too.
+        crate::ingress_grants::revoke_for_user(&transaction, user_id)
+            .await
+            .map_err(|e| UserServiceError::IngressGrantRevocation {
+                user_id,
+                operation: "resetting the password",
+                reason: e.to_string(),
+            })?;
 
         transaction.commit().await?;
 
         info!(
-            "Temporary password issued for user {}; existing sessions revoked",
+            "Temporary password issued for user {}; existing sessions and ingress login grants revoked",
             user_id
         );
         Ok((updated_user, temporary_password))
@@ -1301,8 +1373,9 @@ impl UserService {
 
         info!(
             user_id,
-            revoked_sessions = revoked,
-            "MFA enabled; other sessions revoked"
+            revoked_sessions = revoked.sessions,
+            revoked_ingress_grants = revoked.ingress_grants,
+            "MFA enabled; other sessions and ingress login grants revoked"
         );
         Ok(())
     }
@@ -1433,9 +1506,45 @@ impl UserService {
     }
 }
 
+/// A duplicate email on insert is the caller's to fix, not a database
+/// failure: `users.email` carries the unique index `idx_users_email_unique`.
+/// Matched by that name so a collision on another unique column keeps its own
+/// error.
+fn email_taken_or(error: sea_orm::DbErr, email: &str) -> UserServiceError {
+    if error.to_string().contains("idx_users_email_unique") {
+        UserServiceError::EmailTaken {
+            email: email.to_string(),
+        }
+    } else {
+        error.into()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_taken_email_is_reported_as_taken_not_as_a_database_error() {
+        let duplicate = sea_orm::DbErr::Custom(
+            "error returned from database: duplicate key value violates unique constraint \"idx_users_email_unique\"".to_string(),
+        );
+        let error = email_taken_or(duplicate, "ops@example.com");
+        assert!(
+            matches!(&error, UserServiceError::EmailTaken { email } if email == "ops@example.com"),
+            "{error:?}"
+        );
+        assert_eq!(
+            error.to_string(),
+            "A user with email ops@example.com already exists"
+        );
+
+        let other = sea_orm::DbErr::Custom("connection reset by peer".to_string());
+        assert!(!matches!(
+            email_taken_or(other, "ops@example.com"),
+            UserServiceError::EmailTaken { .. }
+        ));
+    }
     use argon2::PasswordHasher;
     use sea_orm::{DatabaseBackend, DbErr, MockDatabase, MockExecResult};
 
@@ -2038,12 +2147,10 @@ mod tests {
 
     #[tokio::test]
     async fn enabling_mfa_revokes_every_other_session_and_keeps_the_current_one() {
-        let db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 println!("Docker not available, skipping test: {error}");
                 return;
@@ -2076,6 +2183,7 @@ mod tests {
             .unwrap();
             ids.push(session.id);
         }
+        let grant = crate::ingress_grants::test_support::live_grant(&db.db, user.id).await;
 
         let service = UserService::new(db.db.clone(), crate::mfa_guard::test_support::encryption());
         let code = crate::mfa_guard::test_support::code_at(&secret, Utc::now());
@@ -2083,6 +2191,10 @@ mod tests {
             .verify_and_enable_mfa(user.id, &code, Some(ids[0]))
             .await
             .expect("valid enrolment code enables MFA");
+        assert!(
+            crate::ingress_grants::test_support::is_revoked(&db.db, grant).await,
+            "an ingress grant minted before enrolment must not outlive the session sweep"
+        );
 
         let remaining: Vec<i32> = temps_entities::sessions::Entity::find()
             .filter(temps_entities::sessions::Column::UserId.eq(user.id))
@@ -2106,13 +2218,11 @@ mod tests {
             .unwrap());
     }
 
-    async fn mfa_db() -> Option<temps_database::test_utils::TestDatabase> {
-        match temps_database::test_utils::TestDatabase::with_migrations().await {
+    async fn mfa_db() -> Option<temps_test_utils::TestDatabase> {
+        match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => Some(db),
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 println!("Docker not available, skipping test: {error}");
                 None
@@ -2230,12 +2340,10 @@ mod tests {
 
     #[tokio::test]
     async fn legacy_plaintext_mfa_secret_is_encrypted_after_a_successful_verification() {
-        let db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 println!("Docker not available, skipping test: {error}");
                 return;

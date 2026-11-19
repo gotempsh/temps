@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { PageHeader } from '@/components/layout/PageContainer'
 import { TimeRangeFilter } from '@/components/ui/time-range-filter'
 import { resolveTimeRange } from '@/lib/time-range-filter'
 
@@ -8,11 +9,16 @@ import { ProjectResponse } from '@/api/client'
 import {
   getEnvironmentsOptions,
   getGroupedPageMetricsOptions,
+  getGroupedPageMetricsQueryKey,
   getMetricsOverTimeOptions,
+  getMetricsOverTimeQueryKey,
   hasPerformanceMetricsOptions,
+  hasPerformanceMetricsQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
+import { RefreshButton } from '@/components/ui/refresh-button'
+import { queryKeyPrefix } from '@/lib/refresh'
 import {
   Card,
   CardContent,
@@ -48,7 +54,7 @@ import {
   SortableTableHead,
   type SortDirection,
 } from '@/components/ui/sortable-table-head'
-import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { SegmentedControl } from '@/components/ui/segmented-control'
 import { SpeedWorldMap } from '@/components/project/SpeedWorldMap'
 import { cn } from '@/lib/utils'
 import { useQuery } from '@tanstack/react-query'
@@ -59,13 +65,13 @@ import {
   Code2,
   Info,
   Monitor,
-  RefreshCw,
   Smartphone,
   X,
   Zap,
 } from 'lucide-react'
-import { useMemo, useState } from 'react'
+import { useMemo, useReducer, useState } from 'react'
 import { Link } from 'react-router'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
 
 type MetricKey = 'lcp' | 'inp' | 'cls' | 'ttfb' | 'fcp'
 
@@ -255,6 +261,11 @@ type BreakdownDimension =
   | 'browser'
   | 'operating_system'
 
+const DEVICE_OPTIONS = [
+  { value: 'desktop', label: 'Desktop', icon: Monitor },
+  { value: 'mobile', label: 'Mobile', icon: Smartphone },
+] as const
+
 const BREAKDOWN_DIMENSIONS: {
   value: BreakdownDimension
   label: string
@@ -355,7 +366,7 @@ function SpeedBreakdownCard({
   const [sortKey, setSortKey] = useState<BreakdownSortKey>('events')
   const [sortDirection, setSortDirection] = useState<SortDirection>('desc')
 
-  const { data, isLoading, isError } = useQuery({
+  const { data, isLoading, isError } = useWindowQuery({
     ...getGroupedPageMetricsOptions({
       query: {
         start_date: startDate,
@@ -428,26 +439,16 @@ function SpeedBreakdownCard({
               Average per group · sorted by samples · click a value to filter
             </CardDescription>
           </div>
-          <Tabs
+          <SegmentedControl
+            label="Break down by"
             value={dimension}
-            onValueChange={(v) => {
-              setDimension(v as BreakdownDimension)
+            onValueChange={(next) => {
+              setDimension(next)
               setSortKey('events')
               setSortDirection('desc')
             }}
-          >
-            <TabsList className="h-8">
-              {BREAKDOWN_DIMENSIONS.map((d) => (
-                <TabsTrigger
-                  key={d.value}
-                  value={d.value}
-                  className="h-6 px-2.5 text-xs"
-                >
-                  {d.label}
-                </TabsTrigger>
-              ))}
-            </TabsList>
-          </Tabs>
+            options={BREAKDOWN_DIMENSIONS}
+          />
         </div>
       </CardHeader>
       <CardContent>
@@ -582,7 +583,13 @@ export function ProjectSpeedInsights({ project }: ProjectSpeedInsightsProps) {
   const effectiveEnvironment =
     selectedEnvironment ?? environmentsData?.[0]?.id ?? null
 
-  const window = useMemo(() => resolveTimeRange(timeRange), [timeRange])
+  // A preset ("last 24 hours") is resolved against now; Refresh resolves it
+  // again so the refetch asks for the window that ends now.
+  const [windowMoves, moveWindow] = useReducer((n: number) => n + 1, 0)
+  const window = useMemo(() => {
+    void windowMoves
+    return resolveTimeRange(timeRange)
+  }, [timeRange, windowMoves])
   const startDate = window.from
   const endDate = window.to
 
@@ -596,8 +603,7 @@ export function ProjectSpeedInsights({ project }: ProjectSpeedInsightsProps) {
     data: metrics,
     isLoading,
     error,
-    refetch,
-  } = useQuery({
+  } = useWindowQuery({
     ...getMetricsOverTimeOptions({
       query: {
         start_date: startDate,
@@ -683,7 +689,7 @@ export function ProjectSpeedInsights({ project }: ProjectSpeedInsightsProps) {
                 <Info className="h-5 w-5 text-primary" />
               </div>
               <div className="space-y-1">
-                <CardTitle>Performance Metrics Setup Required</CardTitle>
+                <CardTitle>Performance metrics setup required</CardTitle>
                 <CardDescription>
                   Performance metrics are automatically collected when you set
                   up analytics
@@ -711,7 +717,7 @@ export function ProjectSpeedInsights({ project }: ProjectSpeedInsightsProps) {
 
         <Card>
           <CardHeader>
-            <CardTitle>Setup Analytics to Track Performance</CardTitle>
+            <CardTitle>Set up analytics to track performance</CardTitle>
             <CardDescription>
               The Temps analytics SDK automatically tracks Core Web Vitals
               alongside page views and events
@@ -724,7 +730,7 @@ export function ProjectSpeedInsights({ project }: ProjectSpeedInsightsProps) {
                   <CheckCircle2 className="h-5 w-5 text-green-600 mt-0.5 flex-shrink-0" />
                   <div>
                     <h4 className="font-medium mb-1">
-                      Automatic Web Vitals Tracking
+                      Automatic Web Vitals tracking
                     </h4>
                     <p className="text-sm text-muted-foreground">
                       When you install the Temps analytics SDK, it automatically
@@ -735,7 +741,7 @@ export function ProjectSpeedInsights({ project }: ProjectSpeedInsightsProps) {
                 <div className="flex items-start gap-3">
                   <Zap className="h-5 w-5 text-blue-600 mt-0.5 flex-shrink-0" />
                   <div>
-                    <h4 className="font-medium mb-1">Real User Monitoring</h4>
+                    <h4 className="font-medium mb-1">Real user monitoring</h4>
                     <p className="text-sm text-muted-foreground">
                       Performance data is collected from real users, giving you
                       accurate insights into how your application performs in
@@ -750,7 +756,7 @@ export function ProjectSpeedInsights({ project }: ProjectSpeedInsightsProps) {
               <Link to={`/projects/${project.slug}/analytics/setup`}>
                 <Button className="w-full sm:w-auto">
                   <Code2 className="mr-2 h-4 w-4" />
-                  Go to Analytics Setup
+                  Go to analytics setup
                 </Button>
               </Link>
               <p className="text-sm text-muted-foreground">
@@ -805,79 +811,67 @@ export function ProjectSpeedInsights({ project }: ProjectSpeedInsightsProps) {
 
   return (
     <div className="space-y-5">
-      {/* Compact header with inline controls */}
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-        <div className="space-y-0.5">
-          <h2 className="text-xl font-semibold tracking-tight">
-            Performance Insights
-          </h2>
-          <p className="text-sm text-muted-foreground">
-            Real user Core Web Vitals
-          </p>
-        </div>
-        <div className="flex flex-wrap items-center gap-2">
-          <Select
-            value={effectiveEnvironment?.toString()}
-            onValueChange={(value) => setSelectedEnvironment(Number(value))}
-            disabled={!environmentsData || environmentsData.length === 0}
-          >
-            <SelectTrigger className="h-8 w-[130px] text-xs">
-              <SelectValue placeholder="Environment" />
-            </SelectTrigger>
-            <SelectContent>
-              {environmentsData?.map((env) => (
-                <SelectItem key={env.id} value={env.id.toString()}>
-                  {env.name}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
+      <PageHeader
+        title="Web performance"
+        description="Core Web Vitals measured in your visitors' browsers."
+        actions={
+          <div className="flex flex-wrap items-center gap-2">
+            <Select
+              value={effectiveEnvironment?.toString()}
+              onValueChange={(value) => setSelectedEnvironment(Number(value))}
+              disabled={!environmentsData || environmentsData.length === 0}
+            >
+              <SelectTrigger className="h-8 w-[130px] text-xs">
+                <SelectValue placeholder="Environment" />
+              </SelectTrigger>
+              <SelectContent>
+                {environmentsData?.map((env) => (
+                  <SelectItem key={env.id} value={env.id.toString()}>
+                    {env.name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
 
-          <Tabs
-            value={device}
-            onValueChange={(v) => setDevice(v as 'desktop' | 'mobile')}
-          >
-            <TabsList className="h-8">
-              <TabsTrigger value="desktop" className="h-6 gap-1.5 px-2 text-xs">
-                <Monitor className="h-3.5 w-3.5" />
-                Desktop
-              </TabsTrigger>
-              <TabsTrigger value="mobile" className="h-6 gap-1.5 px-2 text-xs">
-                <Smartphone className="h-3.5 w-3.5" />
-                Mobile
-              </TabsTrigger>
-            </TabsList>
-          </Tabs>
-
-          <TimeRangeFilter value={timeRange} onChange={setTimeRange} />
-
-          <Select
-            value={includeBots ? 'all' : 'human'}
-            onValueChange={(v) => setIncludeBots(v === 'all')}
-          >
-            <SelectTrigger className="h-8 w-[130px] text-xs">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="human">Human traffic</SelectItem>
-              <SelectItem value="all">All traffic</SelectItem>
-            </SelectContent>
-          </Select>
-
-          <Button
-            aria-label="Refresh"
-            variant="outline"
-            size="sm"
-            className="h-8"
-            onClick={() => refetch()}
-            disabled={isLoading}
-          >
-            <RefreshCw
-              className={cn('h-3.5 w-3.5', isLoading && 'animate-spin')}
+            <SegmentedControl
+              label="Device"
+              value={device}
+              onValueChange={setDevice}
+              options={DEVICE_OPTIONS}
             />
-          </Button>
-        </div>
-      </div>
+
+            <TimeRangeFilter value={timeRange} onChange={setTimeRange} />
+
+            <Select
+              value={includeBots ? 'all' : 'human'}
+              onValueChange={(v) => setIncludeBots(v === 'all')}
+            >
+              <SelectTrigger className="h-8 w-[130px] text-xs">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="human">Human traffic</SelectItem>
+                <SelectItem value="all">All traffic</SelectItem>
+              </SelectContent>
+            </Select>
+
+            <RefreshButton
+              queryKeys={[
+                queryKeyPrefix(hasPerformanceMetricsQueryKey, {
+                  query: { project_id: project.id },
+                }),
+                queryKeyPrefix(getMetricsOverTimeQueryKey, {
+                  query: { project_id: project.id },
+                }),
+                queryKeyPrefix(getGroupedPageMetricsQueryKey, {
+                  query: { project_id: project.id },
+                }),
+              ]}
+              onRefresh={moveWindow}
+            />
+          </div>
+        }
+      />
 
       {/* Active segment filters — applied to every card on this page */}
       {activeFilters.length > 0 && (
@@ -974,22 +968,15 @@ export function ProjectSpeedInsights({ project }: ProjectSpeedInsightsProps) {
                     thresholds
                   </CardDescription>
                 </div>
-                <Tabs
+                <SegmentedControl
+                  label="Chart metric"
                   value={activeMetric}
-                  onValueChange={(v) => setActiveMetric(v as MetricKey)}
-                >
-                  <TabsList className="h-8">
-                    {tileMetrics.map((m) => (
-                      <TabsTrigger
-                        key={m}
-                        value={m}
-                        className="h-6 px-2.5 text-xs"
-                      >
-                        {METRIC_THRESHOLDS[m].short}
-                      </TabsTrigger>
-                    ))}
-                  </TabsList>
-                </Tabs>
+                  onValueChange={setActiveMetric}
+                  options={tileMetrics.map((m) => ({
+                    value: m,
+                    label: METRIC_THRESHOLDS[m].short,
+                  }))}
+                />
               </div>
             </CardHeader>
             <CardContent>

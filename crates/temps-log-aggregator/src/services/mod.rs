@@ -28,8 +28,9 @@ pub use forget_sweeper::{
     FORGET_SWEEP_INTERVAL,
 };
 pub use ingest_budget::{
-    Admission, IngestBudget, IngestDropReason, IngestLimiter, IngestLimits, IngestSource,
-    ThrottledLogSource, BURST_SECONDS, STATS_WINDOW, THROTTLED_VISIBLE_FOR,
+    Admission, IngestBudget, IngestDropReason, IngestLimiter, IngestLimits, IngestOverride,
+    IngestOverrides, IngestSource, ThrottledLogSource, BURST_SECONDS, STATS_WINDOW,
+    THROTTLED_VISIBLE_FOR,
 };
 pub use metadata::{LogEventsQuery, LogMetadataService};
 pub use reindexer::{ReindexReport, ReindexService, DEFAULT_REINDEX_BATCH};

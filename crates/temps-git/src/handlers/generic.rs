@@ -15,6 +15,7 @@ use tracing::{error, info, warn};
 use utoipa::ToSchema;
 
 use super::types::GitAppState as AppState;
+use crate::services::git_provider_manager::GitProviderManager;
 
 /// Register Generic/Manual webhook routes.
 ///
@@ -161,20 +162,9 @@ async fn generic_webhook_events(
     }
 
     // Derive branch/tag from the git ref.
-    let branch = if git_ref.starts_with("refs/heads/") {
-        Some(git_ref.replace("refs/heads/", ""))
-    } else if !git_ref.starts_with("refs/") {
-        // Some forges send just the branch name without the refs/heads/ prefix.
-        Some(git_ref.clone())
-    } else {
-        None
-    };
+    let branch = super::branch_from_ref(&git_ref, true);
 
-    let tag = if git_ref.starts_with("refs/tags/") {
-        Some(git_ref.replace("refs/tags/", ""))
-    } else {
-        None
-    };
+    let tag = git_ref.strip_prefix("refs/tags/").map(str::to_owned);
 
     // Optional: extract commit SHA if present.
     let commit_sha = extract_commit_sha(&payload);
@@ -249,10 +239,14 @@ async fn generic_webhook_events(
 /// - `after` (GitHub-style)
 /// - `commits[0].id` (GitLab-style)
 /// - `head_commit.id`
+///
+/// A deletion push (an all-zeros `after` and no commit elsewhere) returns
+/// that all-zeros SHA, which retires the deleted branch's preview downstream.
 fn extract_commit_sha(payload: &serde_json::Value) -> String {
     // GitHub-style: `after`
-    if let Some(sha) = payload.get("after").and_then(|v| v.as_str()) {
-        if !sha.is_empty() && sha != "0000000000000000000000000000000000000000" {
+    let after = payload.get("after").and_then(|v| v.as_str());
+    if let Some(sha) = after {
+        if !sha.is_empty() && !GitProviderManager::is_ref_deletion(sha) {
             return sha.to_string();
         }
     }
@@ -281,7 +275,10 @@ fn extract_commit_sha(payload: &serde_json::Value) -> String {
         }
     }
 
-    String::new()
+    match after {
+        Some(sha) if GitProviderManager::is_ref_deletion(sha) => sha.to_string(),
+        _ => String::new(),
+    }
 }
 
 /// Extract repo owner and name from a generic JSON push payload (best-effort).
@@ -351,6 +348,28 @@ fn authorized_projects_for_repository_payload(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn branch_refs_preserve_embedded_prefixes() {
+        for (input, expected) in [
+            (
+                "refs/heads/feat/refs/heads/victim",
+                Some("feat/refs/heads/victim"),
+            ),
+            ("refs/heads/x", Some("x")),
+            ("refs/heads/feat/topic", Some("feat/topic")),
+            ("refs/tags/release", None),
+        ] {
+            assert_eq!(
+                super::super::branch_from_ref(input, true).as_deref(),
+                expected
+            );
+        }
+        assert_eq!(
+            super::super::branch_from_ref("feat/topic", true).as_deref(),
+            Some("feat/topic")
+        );
+    }
+
     use super::*;
 
     fn test_project(id: i32, repo_owner: &str, repo_name: &str) -> temps_entities::projects::Model {
@@ -377,6 +396,7 @@ mod tests {
             git_url: None,
             git_provider_connection_id: None,
             attack_mode: false,
+            shield_mode: "log".to_string(),
             ai_alert_summaries_enabled: None,
             ai_api_traffic_summary_enabled: None,
             allow_alternate_sources: None,
@@ -384,10 +404,13 @@ mod tests {
             ai_debug_chat_enabled: None,
             ai_write_actions_enabled: false,
             cross_project_trace_sharing: true,
+            serves_own_temps_api: false,
             error_source_context_enabled: false,
             vulnerability_scanning_enabled: false,
             error_source_root: None,
             image_retention_hours: None,
+            log_ingest_lines_per_sec: None,
+            log_ingest_kib_per_sec: None,
             cloud_telemetry_fidelity:
                 temps_entities::cloud_telemetry_fidelity::CloudTelemetryFidelity::Metered,
             cloud_telemetry_write_mode:
@@ -471,14 +494,24 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_commit_sha_deletion_push_returns_empty() {
-        // All-zeros SHA means a deletion push — should be ignored
+    fn test_extract_commit_sha_deletion_push_keeps_the_null_sha() {
+        // An all-zeros SHA with no commit is a deletion: it is kept so the
+        // deleted branch's preview is retired rather than the push ignored.
         let payload = serde_json::json!({
             "ref": "refs/heads/main",
             "after": "0000000000000000000000000000000000000000"
         });
-        // Falls through to next strategy; no commits array → empty
-        assert_eq!(extract_commit_sha(&payload), "");
+        assert_eq!(
+            extract_commit_sha(&payload),
+            "0000000000000000000000000000000000000000"
+        );
+
+        // A commit elsewhere in the payload still wins over the null `after`.
+        let payload = serde_json::json!({
+            "after": "0000000000000000000000000000000000000000",
+            "head_commit": { "id": "cafebabe1234" }
+        });
+        assert_eq!(extract_commit_sha(&payload), "cafebabe1234");
     }
 
     #[test]
@@ -560,11 +593,7 @@ mod tests {
     #[test]
     fn test_refs_tags_stripped_to_tag() {
         let git_ref = "refs/tags/v1.2.3".to_string();
-        let tag = if git_ref.starts_with("refs/tags/") {
-            Some(git_ref.replace("refs/tags/", ""))
-        } else {
-            None
-        };
+        let tag = git_ref.strip_prefix("refs/tags/").map(str::to_owned);
         assert_eq!(tag, Some("v1.2.3".to_string()));
     }
 

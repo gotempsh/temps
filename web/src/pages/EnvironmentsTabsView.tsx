@@ -16,7 +16,8 @@ import { ContainerDetailPage } from './ContainerDetailPage'
 import { ProjectResponse } from '@/api/client'
 import { CreateEnvironmentDialog } from '@/components/project/settings/environments/CreateEnvironmentDialog'
 import { Button } from '@/components/ui/button'
-import { Plus } from 'lucide-react'
+import { PageState } from '@temps-sdk/ds'
+import { Layers, Plus } from 'lucide-react'
 import { toast } from 'sonner'
 import {
   resolveEnvironmentSelection,
@@ -25,8 +26,11 @@ import {
 
 export function EnvironmentsTabsView({
   project,
+  selectedEnvironmentId,
 }: {
   project: ProjectResponse
+  /** The environment picked in the project bar. */
+  selectedEnvironmentId?: number
 }) {
   const [searchParams, setSearchParams] = useSearchParams()
   const [isCreateDialogOpen, setIsCreateDialogOpen] = useState(false)
@@ -56,10 +60,12 @@ export function EnvironmentsTabsView({
     },
   })
 
-  const activeEnvId = resolveEnvironmentSelection(
-    searchParams.get('environment'),
-    environments ?? []
-  )
+  const activeEnvId =
+    selectedEnvironmentId ??
+    resolveEnvironmentSelection(
+      searchParams.get('environment'),
+      environments ?? []
+    )
 
   if (isEnvironmentsLoading) {
     return <EnvironmentDashboardSkeleton />
@@ -68,23 +74,19 @@ export function EnvironmentsTabsView({
   if (!environments || environments.length === 0) {
     return (
       <div className="flex flex-col h-full">
-        <div className="p-6 border-b bg-background">
-          <div className="flex items-center justify-between gap-2">
-            <div className="min-w-0">
-              <h1 className="text-2xl sm:text-3xl font-bold">Environments</h1>
-              <p className="text-sm text-muted-foreground mt-1">
-                Manage and monitor your environments
-              </p>
-            </div>
+        <PageState
+          variant="empty"
+          size="compact"
+          icon={Layers}
+          title="No environments"
+          description="Environments are where this service runs: production, staging or a preview."
+          action={
             <Button onClick={() => setIsCreateDialogOpen(true)}>
-              <Plus className="h-4 w-4 sm:mr-2" />
-              <span className="max-sm:sr-only">Add Environment</span>
+              <Plus className="size-4" aria-hidden="true" />
+              New environment
             </Button>
-          </div>
-        </div>
-        <div className="flex-1 flex items-center justify-center">
-          <p className="text-muted-foreground">No environments found</p>
-        </div>
+          }
+        />
         <CreateEnvironmentDialog
           open={isCreateDialogOpen}
           onOpenChange={setIsCreateDialogOpen}
@@ -111,13 +113,6 @@ export function EnvironmentsTabsView({
     setSearchParams(nextParams, { replace: true })
   }
 
-  const handleEnvironmentChange = (id: number) => {
-    const nextParams = updateEnvironmentSearchParams(searchParams, {
-      environmentId: id,
-    })
-    setSearchParams(nextParams)
-  }
-
   return (
     <div className="flex flex-col h-full">
       <Routes>
@@ -132,8 +127,6 @@ export function EnvironmentsTabsView({
               key={activeEnvId}
               project={project}
               environmentId={activeEnvId}
-              environments={environments}
-              onEnvironmentChange={handleEnvironmentChange}
               onCreateEnvironment={() => setIsCreateDialogOpen(true)}
               onDelete={() => handleDelete(activeEnvId)}
             />

@@ -1,0 +1,159 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+// Container CPU as recorded by the health monitor for a managed service, and
+// how the console shows it. One definition everywhere: cores used, against
+// the container's CPU limit when it has one — what the resources card shows.
+//
+// `container.cpu_percent` is stored in Docker's convention (100 == one core,
+// so it exceeds 100 on a multi-core container). Printed as a bare "68.1%" it
+// reads as a share of something; it is 0.68 cores.
+
+import { formatCpuUsage } from '@/lib/cpu-format'
+
+/** Cores used × 100, averaged since the previous health check. */
+export const CONTAINER_CPU_METRIC = 'container.cpu_percent'
+/** Share of the cores the container may use: its limit, else every host core. */
+export const CONTAINER_CPU_UTILIZATION_METRIC =
+  'container.cpu_utilization_percent'
+/** The container's CPU limit in cores; 0 when uncapped. Recorded on every
+ *  scrape where the limit is known, so removing a cap shows up as 0 rather
+ *  than the last capped value lingering in the latest-values window. */
+export const CONTAINER_CPU_LIMIT_METRIC = 'container.cpu_limit_cores'
+/** A cluster's busiest member's cores used × 100, recorded in the same tick as
+ *  that member's limit and share (the cluster's unlabelled
+ *  `cpu_limit_cores` / `cpu_utilization_percent`). Clusters only. */
+export const CONTAINER_CLUSTER_CPU_METRIC = 'container.cluster_cpu_percent'
+
+export const CONTAINER_CPU_TILE_LABEL = 'CPU (cores, last scrape)'
+
+export const CONTAINER_CPU_TILE_HINT =
+  'Cores used, averaged since the previous health check (about every 30 seconds), ' +
+  "against the container's CPU limit (for a cluster, its busiest member's). " +
+  'The resources card samples one second ' +
+  'every few seconds, so its reading moves more.'
+
+/** Chart and alert-picker labels for the container CPU metrics. */
+export const CONTAINER_CPU_METRIC_LABELS: Record<string, string> = {
+  [CONTAINER_CPU_METRIC]: 'CPU (cores)',
+  // Uncapped containers are measured against the host's cores, not a limit.
+  [CONTAINER_CPU_UTILIZATION_METRIC]: 'CPU (% of limit or host)',
+  [CONTAINER_CPU_LIMIT_METRIC]: 'CPU limit',
+  [CONTAINER_CLUSTER_CPU_METRIC]: 'CPU (cores, busiest member)',
+}
+
+/**
+ * The series a selected tile charts. A cluster's CPU tile shows its busiest
+ * member's cores, so its chart is that series too: charting
+ * `container.cpu_percent` would plot the mean of every member's labelled
+ * series, a different reading under the same tile.
+ */
+export function containerCpuChartMetric(
+  name: string,
+  cluster: boolean
+): string {
+  return cluster && name === CONTAINER_CPU_METRIC
+    ? CONTAINER_CLUSTER_CPU_METRIC
+    : name
+}
+
+/**
+ * The series whose history fills a chart before `chartMetric` has any:
+ * `container.cpu_percent` behind a cluster's busiest-member series, which only
+ * exists from the upgrade that records it. `undefined` when the tile charts its
+ * own metric.
+ */
+export function containerCpuHistoryMetric(
+  name: string,
+  chartMetric: string
+): string | undefined {
+  return chartMetric === CONTAINER_CLUSTER_CPU_METRIC && name !== chartMetric
+    ? name
+    : undefined
+}
+
+/**
+ * A cluster's CPU chart points: the busiest member's series from its first
+ * reading on, and before that the members' `container.cpu_percent` history,
+ * so a range reaching back past the upgrade (or a cluster that has not
+ * recorded a busiest member yet) still charts. Gaps after the first reading
+ * stay gaps: they are ticks where no member had a complete reading.
+ */
+export function withCpuHistory<
+  P extends { time: string; value?: number | null },
+>(busiest: P[], history: P[]): P[] {
+  const first = busiest.find((p) => p.value != null)
+  if (!first) return history.some((p) => p.value != null) ? history : busiest
+  const since = Date.parse(first.time)
+  return [
+    ...history.filter((p) => Date.parse(p.time) < since),
+    ...busiest.filter((p) => Date.parse(p.time) >= since),
+  ]
+}
+
+/**
+ * The metrics an alert rule may be created on, from a page's metric list.
+ * `container.cpu_percent` is dropped: a threshold on it is cores × 100, so a
+ * user reading "0.68 cores" who types 2 would get a rule at 0.02 cores. CPU
+ * alerts use the share of the limit instead, offered first.
+ */
+export function alertableMetrics(metrics: string[]): string[] {
+  const rest = metrics.filter(
+    (m) =>
+      m !== CONTAINER_CPU_METRIC &&
+      m !== CONTAINER_CPU_UTILIZATION_METRIC &&
+      m !== CONTAINER_CPU_LIMIT_METRIC
+  )
+  return [CONTAINER_CPU_UTILIZATION_METRIC, ...rest]
+}
+
+/**
+ * Y-axis width (px) for a chart of `name`, when it is a container CPU metric
+ * read in cores. Its ticks ("0.050 cores", "12.40 cores") are about twice as
+ * long as the "68.1%" a `_percent` width was sized for, and clip at 10px
+ * text in a 52px axis. `undefined` for any other metric.
+ */
+export function containerCpuAxisWidth(name: string): number | undefined {
+  return name === CONTAINER_CPU_METRIC || name === CONTAINER_CLUSTER_CPU_METRIC
+    ? 64
+    : undefined
+}
+
+/**
+ * The CPU tile's text, e.g. "0.68 / 6 cores", from the latest values.
+ *
+ * A single container reads its own `container.cpu_percent`, recorded every
+ * health check, against its limit. A cluster's limit is its busiest
+ * member's, while its latest `container.cpu_percent` may be any member's: a
+ * cluster reads that member's own cores (`container.cluster_cpu_percent`,
+ * written with the limit), so usage and limit belong to one container,
+ * capped or not. Until the first such reading after an upgrade it falls back
+ * to `container.cpu_percent`.
+ */
+export function containerCpuTileText(
+  lookup: (metric: string) => number | undefined,
+  cluster: boolean
+): string {
+  const cpuPercent =
+    (cluster ? lookup(CONTAINER_CLUSTER_CPU_METRIC) : undefined) ??
+    lookup(CONTAINER_CPU_METRIC)
+  return formatCpuUsage(cpuPercent, lookup(CONTAINER_CPU_LIMIT_METRIC))
+}
+
+/**
+ * A container CPU value in its unit, or `null` for any other metric (or the
+ * utilization, which is a plain percentage).
+ */
+export function formatContainerCpuMetric(
+  name: string,
+  value: number
+): string | null {
+  if (name === CONTAINER_CPU_METRIC || name === CONTAINER_CLUSTER_CPU_METRIC)
+    return formatCpuUsage(value, null)
+  if (name === CONTAINER_CPU_LIMIT_METRIC) {
+    if (value <= 0) return 'unlimited'
+    const cores = parseFloat(value.toFixed(3))
+    return `${cores} ${cores === 1 ? 'core' : 'cores'}`
+  }
+  return null
+}

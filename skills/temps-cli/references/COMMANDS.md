@@ -10,10 +10,10 @@
 ## Installation
 
 ```bash
-bunx @temps-sdk/cli@0.1.38 [command]
+bunx @temps-sdk/cli@latest [command]
 
 # Fallback when Bun is unavailable
-npx @temps-sdk/cli@0.1.38 [command]
+npx @temps-sdk/cli@latest [command]
 ```
 
 ## Authentication
@@ -22,10 +22,10 @@ Before using most commands, you need to authenticate:
 
 ```bash
 # Login interactively
-bunx @temps-sdk/cli@0.1.38 login
+bunx @temps-sdk/cli@latest login
 
 # Or configure with wizard
-bunx @temps-sdk/cli@0.1.38 configure
+bunx @temps-sdk/cli@latest configure
 ```
 
 ## Global Options
@@ -92,13 +92,15 @@ Use this index or search for a top-level command heading to load only the releva
 - [`delivery-profiles`](#delivery-profiles) - Manage traffic delivery profiles (Cloudflare proxy, Bunny CDN) used by project domains
 - [`delivery`](#delivery) - Route project domains through a delivery provider (Cloudflare proxy, Bunny CDN)
 - [`ip-access`](#ip-access) - Manage instance-wide IP access control rules, and per-project lists (ip-access project)
+- [`edge-rules`](#edge-rules) - Block, allow, challenge, redirect or log requests before they reach the app. Rules run top to bottom; the first match decides
+- [`network-policy`](#network-policy) - Manage network policy for workloads: rules, egress/ingress profiles and the effective policy
 - [`audit`](#audit) - View audit logs
 - [`proxy-logs`](#proxy-logs) - View proxy request logs and statistics
 - [`logs`](#logs) - Search collected logs across every project and database you can access
 - [`email-domains`](#email-domains) - Manage email domains for transactional email
 - [`email-providers`](#email-providers) - Manage email providers (SES, Scaleway) for transactional email
 - [`incidents`](#incidents) - Manage incidents for status pages and monitoring
-- [`status-pages`](#status-pages) - Publish public status pages for selected monitors
+- [`status-pages`](#status-pages) - Publish public status pages showing monitors from any of your projects
 - [`alarms`](#alarms) - List, acknowledge, and resolve alarms (container crashes, uptime, metrics, databases)
 - [`emails`](#emails) - Manage and send emails
 - [`load-balancer`](#load-balancer) - Manage load balancer routes
@@ -115,6 +117,7 @@ Use this index or search for a top-level command heading to load only the releva
 - [`secrets`](#secrets) - Manage agent secrets. env-type: reference as ${TEMPS_SECRET:name} in MCP config. file-type: written to --mount-path in sandbox; reference that path.
 - [`sandbox`](#sandbox) - Manage standalone sandboxes (/v1/sandbox API)
 - [`workflow`](#workflow) - Trigger and inspect agent/workflow runs
+- [`workflows`](#workflows) - Durable application workflows
 - [`revenue`](#revenue) - Manage revenue integrations and import historical data
 - [`session-replay`](#session-replay) - Manage session replay recordings
 - [`traefik-discovery`](#traefik-discovery) - Route containers Temps did not deploy by reading their Traefik labels (an existing docker-compose / Coolify / Dokploy stack)
@@ -675,6 +678,7 @@ Rollback to previous deployment
 | `-p, --project <project>` | Project slug or ID (defaults to the linked project) | - | No |
 | `-e, --environment <env>` | Target environment | `production` | No |
 | `--to <deployment>` | Rollback to specific deployment ID | - | No |
+| `-y, --yes` | Skip confirmation | - | No |
 
 ### `deployments cancel`
 
@@ -823,6 +827,7 @@ Add a custom domain
 |------|-------------|---------|----------|
 | `-d, --domain <domain>` | Domain name | - | Yes |
 | `-c, --challenge <type>` | Challenge type (http-01 or dns-01) | `http-01` | No |
+| `--manual-dns` | With dns-01, print the TXT record to add by hand even when a DNS provider in Temps manages the zone | - | No |
 | `-y, --yes` | Skip confirmation prompts | - | No |
 
 ### `domains verify`
@@ -982,6 +987,10 @@ Manage environments and environment variables
 - `timeouts` - View or set upstream request/idle timeouts for an environment
 - `force-https` - View or set the HTTP to HTTPS redirect override for an environment
 - `scale` - View or set the number of replicas for an environment
+- `placement` - Where the scheduler would run an environment's replicas, and why
+- `isolation` - How an environment's replicas are isolated: a container (process) or a Firecracker microVM (micro_vm). Honoured only for environments whose deployments run on the workload plane
+- `volumes` - Persistent volumes mounted into an environment's replicas; a replica that mounts one is pinned to its node
+- `ingress` - Whether visitors must sign in to Temps to open an environment
 - `crons` - Manage cron jobs
 
 ### `environments list` (alias: `ls`)
@@ -1162,6 +1171,191 @@ View or set the number of replicas for an environment
 | `-p, --project <project>` | Project slug or ID | - | No |
 | `-e, --environment <env>` | Environment name or slug | `production` | No |
 | `-r, --replicas <count>` | Number of replicas to set | - | No |
+| `--load-balancing <json>` | Replica routing policy as JSON; null restores project inheritance | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `environments placement`
+
+Where the scheduler would run an environment's replicas, and why
+
+**Subcommands:**
+
+- `explain` - Show the nodes each replica would run on now, the eligible nodes ranked, and the ones excluded with the reason
+- `recommend` - Recommend target nodes from where the environment actually ran (recommended, never applied)
+
+#### `environments placement explain`
+
+Show the nodes each replica would run on now, the eligible nodes ranked, and the ones excluded with the reason
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments placement recommend`
+
+Recommend target nodes from where the environment actually ran (recommended, never applied)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug | - | No |
+| `--window-days <days>` | How many days of history to consider (1-90, default 7) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `environments isolation`
+
+How an environment's replicas are isolated: a container (process) or a Firecracker microVM (micro_vm). Honoured only for environments whose deployments run on the workload plane
+
+**Subcommands:**
+
+- `show` - Show the isolation and whether it takes effect
+- `set` - Set the isolation: process or micro_vm (a microVM replica only runs on a node that provides one)
+
+#### `environments isolation show`
+
+Show the isolation and whether it takes effect
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments isolation set`
+
+Set the isolation: process or micro_vm (a microVM replica only runs on a node that provides one)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `environments volumes`
+
+Persistent volumes mounted into an environment's replicas; a replica that mounts one is pinned to its node
+
+**Subcommands:**
+
+- `list` (`ls`) - List the environment's volumes, newest first
+- `create` - Create a volume (attach it to mount it)
+- `status` - Show whether the next deploy mounts the attached volumes, and what to fix if not
+- `attach` - Mount a volume (id or name) into every replica at --mount-path
+- `detach` - Stop mounting a volume (id or name); its data is kept
+- `rm` (`delete`) - Delete a volume (id or name), and its data unless it was created with --retain
+
+#### `environments volumes list` (alias: `ls`)
+
+List the environment's volumes, newest first
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug | - | No |
+| `--page <page>` | Page number (default 1) | - | No |
+| `--page-size <size>` | Results per page (default 20, max 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments volumes create`
+
+Create a volume (attach it to mount it)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug | - | No |
+| `-n, --name <name>` | Volume name: 2-64 characters of a-z, 0-9, "_", "." or "-" | - | Yes |
+| `--size-mb <mb>` | Size in MB, when the backend supports a size | - | No |
+| `--retain` | Keep the data when the volume is deleted | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments volumes status`
+
+Show whether the next deploy mounts the attached volumes, and what to fix if not
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments volumes attach`
+
+Mount a volume (id or name) into every replica at --mount-path
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug | - | No |
+| `--mount-path <path>` | Absolute path inside each replica | - | Yes |
+| `--read-only` | Mount it read-only | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments volumes detach`
+
+Stop mounting a volume (id or name); its data is kept
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments volumes rm` (alias: `delete`)
+
+Delete a volume (id or name), and its data unless it was created with --retain
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug | - | No |
+| `-f, --force` | Skip confirmation | - | No |
+| `-y, --yes` | Skip confirmation (alias for --force) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `environments ingress`
+
+Whether visitors must sign in to Temps to open an environment
+
+**Subcommands:**
+
+- `show` - Show the login requirement and whether the proxy enforces it now
+- `set` - Require visitors to sign in to Temps, or stop requiring it
+
+#### `environments ingress show`
+
+Show the login requirement and whether the proxy enforces it now
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments ingress set`
+
+Require visitors to sign in to Temps, or stop requiring it
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug | - | No |
+| `--require-login` | Require sign-in only when ingress mode is enforce. Check login_enforced in JSON output or Enforced now in text output | - | No |
+| `--no-require-login` | Visitors do not need to sign in | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `environments crons`
@@ -1808,6 +2002,7 @@ Add a new notification provider
 | `--to-addresses <addresses>` | Comma-separated recipient addresses (for email) | - | No |
 | `--url <url>` | Webhook URL (for webhook) | - | No |
 | `--method <method>` | HTTP method: POST, PUT, PATCH (for webhook, default: POST) | - | No |
+| `--header <header>` | Request header "Name: value" (for webhook, repeatable) | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 
 ### `notifications update`
@@ -1832,6 +2027,7 @@ Update a notification provider
 | `--to-addresses <addresses>` | Comma-separated recipient addresses (for email) | - | No |
 | `--url <url>` | Webhook URL (for webhook) | - | No |
 | `--method <method>` | HTTP method: POST, PUT, PATCH (for webhook) | - | No |
+| `--header <header>` | Request header "Name: value" (for webhook, repeatable; replaces the stored headers) | - | No |
 | `--json` | Output in JSON format | - | No |
 | `-y, --yes` | Skip confirmation prompts | - | No |
 
@@ -2831,6 +3027,7 @@ Manage platform users
 - `remove` (`rm`) - Remove a user
 - `restore` - Restore a deleted user
 - `reset-password` - Reset another user's password to a generated temporary one. The user is signed out of every browser session and must choose a new password at next sign-in
+- `reset-mfa` - Remove another user's MFA (authenticator and recovery codes) after they lost both. The user is signed out of every session. Password sign-in is blocked when require_mfa_for_admins applies; arrange SSO access or a temporary policy change before resetting MFA. Otherwise, sign in with a password to enroll again
 - `role` - Manage user roles
 
 ### `users list` (alias: `ls`)
@@ -2892,6 +3089,18 @@ Restore a deleted user
 ### `users reset-password`
 
 Reset another user's password to a generated temporary one. The user is signed out of every browser session and must choose a new password at next sign-in
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | User ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+| `-y, --yes` | Skip confirmation prompt (for automation) | - | No |
+
+### `users reset-mfa`
+
+Remove another user's MFA (authenticator and recovery codes) after they lost both. The user is signed out of every session. Password sign-in is blocked when require_mfa_for_admins applies; arrange SSO access or a temporary policy change before resetting MFA. Otherwise, sign in with a password to enroll again
 
 **Options:**
 
@@ -3415,6 +3624,8 @@ Create a new API key
 | `-r, --role <role>` | Role type (admin, platform_admin, user, reader, api_reader, custom, metrics_ingest) | - | No |
 | `-e, --expires-in <days>` | Expires in N days (7, 30, 90, 365) | - | No |
 | `-p, --permissions <permissions>` | Comma-separated list of permissions | - | No |
+| `--project-id <id>` | Confine to one project’s deployment and environment APIs | - | No |
+| `--environment-id <id>` | Confine to one environment (requires --project-id) | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 
 ### `apikeys show`
@@ -3858,6 +4069,8 @@ Worker nodes and workload placement
 - `mesh` - WireGuard mesh: lets nodes that only share the internet with the control plane join it, encrypted. Shows whether it is on and how each node is connected
 - `pair` - Pair nodes this control plane dials: for a control plane nodes cannot reach (a laptop, a server behind NAT). Lists recent pairings and their progress
 - `ssh` - Add servers over SSH: the control plane logs in, installs temps if needed, pairs the server and starts its agent. Lists recent ones and their progress
+- `resources` - What the scheduler keeps for the OS and Temps on a node, and whether a placement that does not fit the remaining capacity is refused
+- `state-status` - Show the workload plane's desired-state stream: whether it runs here, its lag and counters
 
 ### `nodes capability`
 
@@ -4036,6 +4249,48 @@ Read the SSH host key of the server at --host, to verify it before `nodes ssh ad
 #### `nodes ssh show`
 
 Show one enrollment: its progress and the log with the server output
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `nodes resources`
+
+What the scheduler keeps for the OS and Temps on a node, and whether a placement that does not fit the remaining capacity is refused
+
+**Subcommands:**
+
+- `show` - Show a node's reservation and resource policy (node id; 0 or "control-plane" for the control plane)
+- `set` - Change a node's resource policy or reservation. Giving only one of --reserve-cpu and --reserve-memory keeps the node's current value for the other
+
+#### `nodes resources show`
+
+Show a node's reservation and resource policy (node id; 0 or "control-plane" for the control plane)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `nodes resources set`
+
+Change a node's resource policy or reservation. Giving only one of --reserve-cpu and --reserve-memory keeps the node's current value for the other
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--policy <policy>` | best_effort (reservations not checked) or enforced (placements that do not fit are refused) | - | No |
+| `--reserve-cpu <millis>` | CPU kept for the OS and Temps, in millicores (1000 = one core) | - | No |
+| `--reserve-memory <mb>` | Memory kept for the OS and Temps, in MB | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `nodes state-status`
+
+Show the workload plane's desired-state stream: whether it runs here, its lag and counters
 
 **Options:**
 
@@ -5932,6 +6187,310 @@ Check whether an address would be allowed
 | `--ip <ip>` | Address to evaluate | - | Yes |
 | `--json` | Output in JSON format | - | No |
 
+## `edge-rules` (alias: `edge-rule`)
+
+Block, allow, challenge, redirect or log requests before they reach the app. Rules run top to bottom; the first match decides
+
+**Subcommands:**
+
+- `list` (`ls`) - List the rules in evaluation order
+- `get` - Show one rule
+- `create` - Add a rule. New rules start in log-only mode unless --mode enforce is given
+- `update` - Change a rule; only the given parts change
+- `delete` (`rm`) - Delete a rule
+- `move` - Move a rule to another position
+- `enable` - Enable a rule
+- `disable` - Disable a rule (kept, never evaluated)
+- `enforce` - Act on matches
+- `log-only` - Only record matches, never act on them
+- `test` - Dry-run a request against the saved rules (or a rules file) and show the trace
+- `export` - Print the rules as a file apply accepts
+- `apply` - Make the project rules match a file: rules are matched by name, changed ones updated, missing ones created, others deleted, then ordered as in the file
+
+### `edge-rules list` (alias: `ls`)
+
+List the rules in evaluation order
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `edge-rules get`
+
+Show one rule
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `edge-rules create`
+
+Add a rule. New rules start in log-only mode unless --mode enforce is given
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--file <path>` | JSON file with the rule: {name?, expression, action, mode?, enabled?, environment_id?} | - | No |
+| `--name <name>` | Rule name (generated from the rule when omitted) | - | No |
+| `--expression <json>` | Match expression as JSON, e.g. {"combinator":"all","children":[...]} | - | No |
+| `--action <json>` | Action as JSON, e.g. {"type":"block","status":403} | - | No |
+| `--environment-id <id>` | Apply only to this environment | - | No |
+| `--project-id <id>` | Project ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+| `--mode <mode>` | enforce or log-only (default: the file's mode, else log-only) | - | No |
+| `--disabled` | Create it disabled | - | No |
+| `--position <n>` | Insert at this 1-based position (default: last) | - | No |
+
+### `edge-rules update`
+
+Change a rule; only the given parts change
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--file <path>` | JSON file with the rule: {name?, expression, action, mode?, enabled?, environment_id?} | - | No |
+| `--name <name>` | Rule name (generated from the rule when omitted) | - | No |
+| `--expression <json>` | Match expression as JSON, e.g. {"combinator":"all","children":[...]} | - | No |
+| `--action <json>` | Action as JSON, e.g. {"type":"block","status":403} | - | No |
+| `--environment-id <id>` | Apply only to this environment | - | No |
+| `--project-id <id>` | Project ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+| `--mode <mode>` | enforce or log-only | - | No |
+| `--all-environments` | Apply to every environment | - | No |
+| `--revision <n>` | Fail if the rule changed since this revision (default: the current one) | - | No |
+
+### `edge-rules delete` (alias: `rm`)
+
+Delete a rule
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+| `-y, --yes` | Skip confirmation | - | No |
+
+### `edge-rules move`
+
+Move a rule to another position
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+| `--to <n>` | New 1-based position | - | Yes |
+
+### `edge-rules enable`
+
+Enable a rule
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `edge-rules disable`
+
+Disable a rule (kept, never evaluated)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `edge-rules enforce`
+
+Act on matches
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `edge-rules log-only`
+
+Only record matches, never act on them
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `edge-rules test`
+
+Dry-run a request against the saved rules (or a rules file) and show the trace
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+| `--url <url>` | Request URL or path, e.g. https://app.example.com/admin?x=1 | - | Yes |
+| `--method <method>` | HTTP method | `GET` | No |
+| `--header <header>` | "Name: value"; repeatable | `` | No |
+| `--ip <ip>` | Client address | - | No |
+| `--country <code>` | ISO country code, e.g. DE | - | No |
+| `--continent <code>` | Continent code, e.g. EU | - | No |
+| `--asn <n>` | Autonomous system number | - | No |
+| `--user-agent <ua>` | User agent | - | No |
+| `--bot-class <class>` | human, search_engine, ai_crawler, ai_agent or unknown_bot | - | No |
+| `--environment-id <id>` | Environment the request is for | - | No |
+| `--cleared` | The visitor already solved a challenge | - | No |
+| `--file <path>` | Evaluate these rules instead of the saved ones (same format as export) | - | No |
+
+### `edge-rules export`
+
+Print the rules as a file apply accepts
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+| `--output <path>` | Write to a file instead of stdout | - | No |
+
+### `edge-rules apply`
+
+Make the project rules match a file: rules are matched by name, changed ones updated, missing ones created, others deleted, then ordered as in the file
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+| `--file <path>` | Rules file ({"rules": [...]}, as written by export) | - | Yes |
+| `--dry-run` | Show the plan without changing anything | - | No |
+| `-y, --yes` | Skip confirmation | - | No |
+
+## `network-policy` (alias: `netpol`)
+
+Manage network policy for workloads: rules, egress/ingress profiles and the effective policy
+
+**Subcommands:**
+
+- `rules` - Manage network policy rules
+- `effective` - Show the policy in force for a workload: profile, rules, inbound links and where it is enforced. <kind> is one of deployment, sandbox, service, function, job; <id> is the environment id for a deployment
+- `profile` - Manage a workload's egress and ingress profile
+
+### `network-policy rules`
+
+Manage network policy rules
+
+**Subcommands:**
+
+- `list` (`ls`) - List network policy rules
+- `show` - Show one network policy rule
+- `create` (`add`) - Create a network policy rule
+- `rm` (`remove`) - Delete a network policy rule (link rules are removed by unlinking instead)
+
+#### `network-policy rules list` (alias: `ls`)
+
+List network policy rules
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--subject-kind <kind>` | Only rules for this kind (deployment, sandbox, service, function, job) | - | No |
+| `--subject-id <id>` | Only rules for this subject (environment id for deployments) | - | No |
+| `--origin <origin>` | Only rules of this origin (link, operator, system) | - | No |
+| `--page <n>` | Page number (default 1) | - | No |
+| `--page-size <n>` | Rules per page (default 20, max 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `network-policy rules show`
+
+Show one network policy rule
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `network-policy rules create` (alias: `add`)
+
+Create a network policy rule
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--subject-kind <kind>` | Workload kind (deployment, sandbox, service, function, job) | - | Yes |
+| `--subject-id <id>` | Environment id for a deployment; the row id for other kinds | - | Yes |
+| `--direction <direction>` | Traffic direction (egress, ingress) | - | Yes |
+| `--peer-kind <kind>` | Peer type: service (by id), workload (<kind>/<id>) or cidr. host rules are refused until a node runs the shared egress proxy | - | Yes |
+| `--peer <ref>` | Peer reference: a service id, <kind>/<id>, or a CIDR | - | Yes |
+| `--action <action>` | What to do with matching traffic (allow, deny) | - | Yes |
+| `--protocol <protocol>` | tcp, udp, any (default tcp) | - | No |
+| `--port <port>` | Port, or the start of a range. Omit for every port | - | No |
+| `--port-end <port>` | End of the port range (needs --port) | - | No |
+| `--description <text>` | Why this rule exists | - | No |
+| `--json` | Output the created rule in JSON format | - | No |
+
+#### `network-policy rules rm` (alias: `remove`)
+
+Delete a network policy rule (link rules are removed by unlinking instead)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-f, --force` | Skip confirmation | - | No |
+| `-y, --yes` | Skip confirmation (alias for --force) | - | No |
+
+### `network-policy effective`
+
+Show the policy in force for a workload: profile, rules, inbound links and where it is enforced. <kind> is one of deployment, sandbox, service, function, job; <id> is the environment id for a deployment
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `network-policy profile`
+
+Manage a workload's egress and ingress profile
+
+**Subcommands:**
+
+- `set` - Set a workload's profile. Each direction is open, restricted, none; a direction left out is reset to the kind's default
+
+#### `network-policy profile set`
+
+Set a workload's profile. Each direction is open, restricted, none; a direction left out is reset to the kind's default
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--egress <profile>` | Outbound profile (open, restricted, none). Omit for the kind's default | - | No |
+| `--ingress <profile>` | Inbound profile (open, restricted, none). Omit for the kind's default | - | No |
+| `--json` | Output in JSON format | - | No |
+
 ## `audit`
 
 View audit logs
@@ -6492,6 +7051,10 @@ Create a new incident
 | `-t, --title <title>` | Incident title | - | No |
 | `-d, --description <description>` | Incident description | - | No |
 | `-s, --severity <severity>` | Severity level (critical, major, minor) | - | No |
+| `--public-title <title>` | Headline shown on published status pages (the title stays internal) | - | No |
+| `-m, --message <message>` | First update, written by you instead of the automatic one | - | No |
+| `--public` | Post the first update to published status pages (needs --message) | - | No |
+| `--monitor-id <id>` | Monitor (status page component) the incident affects; omit for the whole project | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 
 ### `incidents show`
@@ -6559,12 +7122,12 @@ Get bucketed incident data for a project
 
 ## `status-pages` (alias: `status-page`)
 
-Publish public status pages for selected monitors
+Publish public status pages showing monitors from any of your projects
 
 **Subcommands:**
 
-- `list` (`ls`) - List a project's status pages
-- `create` - Create a draft status page
+- `list` (`ls`) - List status pages, optionally only those showing one project
+- `create` - Create a draft status page; monitors may come from any project
 - `show` - Show a status page
 - `update` - Change the title, description or monitor selection
 - `publish` - Publish the page at its public URL
@@ -6575,27 +7138,27 @@ Publish public status pages for selected monitors
 
 ### `status-pages list` (alias: `ls`)
 
-List a project's status pages
+List status pages, optionally only those showing one project
 
 **Options:**
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `--project-id <id>` | Project ID | - | Yes |
+| `--project-id <id>` | Only pages with a component from this project | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `status-pages create`
 
-Create a draft status page
+Create a draft status page; monitors may come from any project
 
 **Options:**
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `--project-id <id>` | Project ID | - | Yes |
 | `-t, --title <title>` | Public page title | - | Yes |
+| `-m, --monitor <id=name>` | Monitor to show and its public name (repeatable) | - | Yes |
+| `-g, --group <name=ids>` | Show monitors together under a group, e.g. "Cloud=12,13" (repeatable) | - | No |
 | `-d, --description <text>` | Public description | - | No |
-| `-m, --monitor <id=name>` | Monitor to show and its public name (repeatable) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `status-pages show`
@@ -6621,7 +7184,7 @@ Change the title, description or monitor selection
 | `-t, --title <title>` | Public page title | - | No |
 | `-d, --description <text>` | Public description ("" clears it) | - | No |
 | `-m, --monitor <id=name>` | Replace the selection; repeat for each monitor | - | No |
-| `--clear-monitors` | Remove every monitor (drafts only) | - | No |
+| `-g, --group <name=ids>` | With --monitor: group monitors, e.g. "Cloud=12,13" (repeatable) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `status-pages publish`
@@ -7957,7 +8520,7 @@ Configure an AI client to connect to this Temps instance over MCP. Clients: clau
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-g, --groups <groups>` | Comma-separated tool groups to enable (default: all) | - | No |
+| `-g, --groups <groups>` | Legacy tool-group filter (optional; does not restrict temps/temps_write permissions) | - | No |
 | `-w, --write` | Enable write tools (deploy, delete, restart, etc). Default: read-only | - | No |
 | `-k, --api-key <key>` | Use this API key instead of creating or prompting for one | - | No |
 | `-u, --url <url>` | Target this Temps instance directly (e.g. copied from the Settings UI), without needing a saved CLI context or changing the active one. Defaults to the current context/login when omitted. | - | No |
@@ -8058,6 +8621,8 @@ Manage standalone sandboxes (/v1/sandbox API)
 - `logs` - Stream logs from a detached job (SSE)
 - `domain` - Resolve the preview URL for a port inside a sandbox
 - `password` - Generate, rotate, or clear the preview-URL password for a sandbox
+- `preview-access` - Show or set who may open the preview URLs: Temps login (default), the preview password, or anyone, optionally from listed networks only
+- `egress` - Show or set where the sandbox may connect to: the internet, nothing, or only listed hosts and CIDRs. Private, loopback and metadata addresses are always refused
 - `fs` - Filesystem operations inside a sandbox
 - `snapshots` - Manage sandbox snapshots (ADR-037)
 - `snapshot` - Take a snapshot of a sandbox
@@ -8090,6 +8655,8 @@ Create a new sandbox
 | `--new-branch <name>` | Create and switch to a new branch after cloning, based on whatever was checked out | - | No |
 | `--preview-password` | Generate a random preview-URL password and print it once on stdout | - | No |
 | `--preview-password-length <n>` | Length of the generated preview password (8..=256, default 24) | - | No |
+| `--egress-allow <host|cidr[:ports]>` | Restrict outbound traffic to this destination (repeatable; no ports = 80 and 443). IPv6 with ports: [addr/prefix]:port | - | No |
+| `--egress-deny-all` | Allow no outbound traffic at all | - | No |
 | `--from-snapshot <snap-id>` | Create sandbox from a snapshot (mutually exclusive with --image) | - | No |
 | `--node <name|id>` | Node to run the sandbox on (name, id, or 'control-plane'). Omit to let Temps place it; see `sandbox nodes` | - | No |
 | `--backend <backend>` | Isolation backend: docker, firecracker, microsandbox. Omit for the host default. An unavailable backend fails instead of downgrading | - | No |
@@ -8316,6 +8883,32 @@ Generate, rotate, or clear the preview-URL password for a sandbox
 | `--length <n>` | Length of the generated password (8..=256, default 24) | - | No |
 | `--clear` | Remove the preview password — preview URLs become open again | - | No |
 
+### `sandbox preview-access`
+
+Show or set who may open the preview URLs: Temps login (default), the preview password, or anyone, optionally from listed networks only
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--access <mode>` | temps_login (alias 'login'), password, or public. 'password' needs a preview password first (`sandbox password`) | - | No |
+| `--allow-ip <ip|cidr>` | Only these client networks may open previews, in every mode (repeatable; replaces the list) | - | No |
+| `--any-ip` | Clear the allow-list: any client address may open previews | - | No |
+| `--json` | Output as JSON | - | No |
+
+### `sandbox egress`
+
+Show or set where the sandbox may connect to: the internet, nothing, or only listed hosts and CIDRs. Private, loopback and metadata addresses are always refused
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--internet` | Remove the restriction | - | No |
+| `--deny-all` | Allow no outbound traffic at all | - | No |
+| `--allow <host|cidr[:ports]>` | Allow only these destinations (repeatable; replaces the policy; no ports = 80 and 443). IPv6 with ports: [addr/prefix]:port | - | No |
+| `--json` | Output as JSON | - | No |
+
 ### `sandbox fs`
 
 Filesystem operations inside a sandbox
@@ -8475,6 +9068,197 @@ Trigger a workflow and stream its output
 | `--memory <mb>` | Memory limit in MB for the ephemeral sandbox (128–8192). Overrides the YAML value. Only applies with --from-file. | - | No |
 | `--no-follow` | Return immediately after queueing instead of streaming logs | - | No |
 | `--json` | Print the run record as JSON when it terminates | - | No |
+
+## `workflows`
+
+Durable application workflows
+
+**Subcommands:**
+
+- `list` - List detected workflows and onboarding status
+- `runs` - List a bounded page of runs
+- `get` - Get run metadata; payloads require explicit reveal permission
+- `diagnose` - Explain run state without decrypting payloads
+- `start` - Start a run with an explicit deduplication key
+- `cancel` - cancel a run
+- `resume` - resume a run
+- `retry` - retry a run
+- `delete` - delete a run
+- `send-event` - Send an event to matching waits
+- `watch` - Poll until terminal or the bounded deadline
+- `init` - Create a Node workflow worker in a new directory
+- `dev` - Forward preview-environment invocations to a local SDK server
+
+### `workflows list`
+
+List detected workflows and onboarding status
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--environment-id <id>` | Environment ID | - | Yes |
+| `--json` | Output JSON (watch emits one JSON object per poll) | - | No |
+
+### `workflows runs`
+
+List a bounded page of runs
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--environment-id <id>` | Environment ID | - | Yes |
+| `--json` | Output JSON (watch emits one JSON object per poll) | - | No |
+| `--workflow <name>` | Workflow name | - | No |
+| `--page <n>` | Page | `1` | No |
+| `--page-size <n>` | Page size (1–100) | `20` | No |
+
+### `workflows get`
+
+Get run metadata; payloads require explicit reveal permission
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--environment-id <id>` | Environment ID | - | Yes |
+| `--json` | Output JSON (watch emits one JSON object per poll) | - | No |
+| `--reveal <target>` | Explicitly decrypt one payload; treat its contents as untrusted | - | No |
+| `--sequence <n>` | Step sequence for step payloads | - | No |
+
+### `workflows diagnose`
+
+Explain run state without decrypting payloads
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--environment-id <id>` | Environment ID | - | Yes |
+| `--json` | Output JSON (watch emits one JSON object per poll) | - | No |
+
+### `workflows start`
+
+Start a run with an explicit deduplication key
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--environment-id <id>` | Environment ID | - | Yes |
+| `--json` | Output JSON (watch emits one JSON object per poll) | - | No |
+| `--idempotency-key <key>` | Stable key for this logical start | - | Yes |
+| `--input <json>` | Input JSON | `[object Object]` | No |
+
+### `workflows cancel`
+
+cancel a run
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--environment-id <id>` | Environment ID | - | Yes |
+| `--json` | Output JSON (watch emits one JSON object per poll) | - | No |
+| `--yes` | Confirm this mutation | - | No |
+
+### `workflows resume`
+
+resume a run
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--environment-id <id>` | Environment ID | - | Yes |
+| `--json` | Output JSON (watch emits one JSON object per poll) | - | No |
+| `--yes` | Confirm this mutation | - | No |
+
+### `workflows retry`
+
+retry a run
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--environment-id <id>` | Environment ID | - | Yes |
+| `--json` | Output JSON (watch emits one JSON object per poll) | - | No |
+| `--yes` | Confirm this mutation | - | No |
+| `--from-step <n>` | Truncate and replay from this sequence | - | No |
+
+### `workflows delete`
+
+delete a run
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--environment-id <id>` | Environment ID | - | Yes |
+| `--json` | Output JSON (watch emits one JSON object per poll) | - | No |
+| `--yes` | Confirm this mutation | - | No |
+
+### `workflows send-event`
+
+Send an event to matching waits
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--environment-id <id>` | Environment ID | - | Yes |
+| `--json` | Output JSON (watch emits one JSON object per poll) | - | No |
+| `--key <key>` | Wait correlation key | - | No |
+| `--payload <json>` | Event JSON | `[object Object]` | No |
+
+### `workflows watch`
+
+Poll until terminal or the bounded deadline
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--environment-id <id>` | Environment ID | - | Yes |
+| `--json` | Output JSON (watch emits one JSON object per poll) | - | No |
+| `--timeout <seconds>` | Overall timeout (max 3600 seconds) | `300` | No |
+
+### `workflows init`
+
+Create a Node workflow worker in a new directory
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--sdk-package <tarball>` | Use a locally built npm pack tarball before SDK publication | - | No |
+| `--json` | Output the created path and next steps as JSON | - | No |
+
+### `workflows dev`
+
+Forward preview-environment invocations to a local SDK server
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--environment-id <id>` | Undeployed, unprotected preview environment ID | - | Yes |
+| `--port <port>` | Local SDK server port | `3000` | No |
+| `--json` | Output tunnel readiness as JSON | - | No |
 
 ## `revenue`
 
@@ -9458,6 +10242,7 @@ Run Temps on this computer, sign in the CLI and add the Temps skill for your cod
 |------|-------------|---------|----------|
 | `--channel <channel>` | Release channel for a fresh install: stable, beta or nightly | `beta` | No |
 | `--runtime-version <tag>` | Run this exact Temps release | - | No |
+| `--allow-unsigned` | Run a release that publishes no Sigstore signature (only releases from before signing), trusting its checksum alone | - | No |
 | `--skills <scope>` | Where to add the Temps agent skill: project, global or none (default: project inside a project, otherwise global) | - | No |
 | `--port <port>` | Port for your apps and the console on a fresh install (default: 8080 or the next free port) | - | No |
 | `--make-default` | Make "local" the default CLI context even if another one is active | - | No |
@@ -9483,51 +10268,51 @@ Stop the Temps server and database started by `temps start`
 
 ```bash
 # Login to Temps
-bunx @temps-sdk/cli@0.1.38 login
+bunx @temps-sdk/cli@latest login
 
 # Create a new project on the intended server
-bunx @temps-sdk/cli@0.1.38 --target-context production projects create --name my-app
+bunx @temps-sdk/cli@latest --target-context production projects create --name my-app
 
 # Deploy to production
-bunx @temps-sdk/cli@0.1.38 --target-context production deploy --project my-app --environment production
+bunx @temps-sdk/cli@latest --target-context production deploy --project my-app --environment production
 
 # View deployment logs
-bunx @temps-sdk/cli@0.1.38 deployments logs --project my-app --follow
+bunx @temps-sdk/cli@latest deployments logs --project my-app --follow
 
 # Stream runtime container logs
-bunx @temps-sdk/cli@0.1.38 runtime-logs --project my-app
+bunx @temps-sdk/cli@latest runtime-logs --project my-app
 
 # List containers
-bunx @temps-sdk/cli@0.1.38 containers list --project-id 1 --environment-id 1
+bunx @temps-sdk/cli@latest containers list --project-id 1 --environment-id 1
 ```
 
 ### Managing Environments
 
 ```bash
 # List environments
-bunx @temps-sdk/cli@0.1.38 environments list --project my-app
+bunx @temps-sdk/cli@latest environments list --project my-app
 
 # Set an environment variable on the intended server (prompts for the value)
-bunx @temps-sdk/cli@0.1.38 --target-context production environments vars set --project my-app DATABASE_URL --environments production
+bunx @temps-sdk/cli@latest --target-context production environments vars set --project my-app DATABASE_URL --environments production
 
 # View environment variables
-bunx @temps-sdk/cli@0.1.38 environments vars list --project my-app
+bunx @temps-sdk/cli@latest environments vars list --project my-app
 ```
 
 ### Managing Domains
 
 ```bash
 # Request a certificate for a domain on the intended server
-bunx @temps-sdk/cli@0.1.38 --target-context production domains add --domain app.example.com
+bunx @temps-sdk/cli@latest --target-context production domains add --domain app.example.com
 
 # Route the domain to a project environment
-bunx @temps-sdk/cli@0.1.38 --target-context production custom-domains create --project-id 1 --environment-id 1 --domain app.example.com
+bunx @temps-sdk/cli@latest --target-context production custom-domains create --project-id 1 --environment-id 1 --domain app.example.com
 
 # List domains
-bunx @temps-sdk/cli@0.1.38 domains list
+bunx @temps-sdk/cli@latest domains list
 
 # Remove a domain from the intended server
-bunx @temps-sdk/cli@0.1.38 --target-context production domains remove --domain app.example.com
+bunx @temps-sdk/cli@latest --target-context production domains remove --domain app.example.com
 ```
 
 ## Environment Variables
@@ -9547,7 +10332,7 @@ Configuration is stored in:
 - **Config file**: `~/.temps/config.json`
 - **Credentials**: Stored securely in `~/.temps/` with restricted file permissions
 
-Use `bunx @temps-sdk/cli@0.1.38 configure show` to view current configuration.
+Use `bunx @temps-sdk/cli@latest configure show` to view current configuration.
 
 ## Support
 

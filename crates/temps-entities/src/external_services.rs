@@ -48,11 +48,11 @@ pub struct Model {
     /// `m20260601_000002_add_monitoring_settings`.
     #[sea_orm(default_value = false)]
     pub metrics_enabled: bool,
-    /// Whether the auto-provisioning reconcile loop has already created a
-    /// default daily full-backup schedule for this service. Acts as a one-shot
-    /// latch: provisioning happens exactly once (when `false`), then this is
-    /// set to `true` so we never recreate a schedule the operator later
-    /// deletes. Added by migration
+    /// Whether legacy automatic schedule provisioning is closed for this
+    /// service. New managed services set this to `true` so backup setup stays
+    /// an explicit operator choice. Older rows remain eligible while `false`;
+    /// the reconciler sets it to `true` after provisioning, preventing it from
+    /// recreating a schedule the operator later deletes. Added by migration
     /// `m20260623_000001_add_external_services_default_backup_provisioned`.
     #[sea_orm(default_value = false)]
     pub default_backup_provisioned: bool,
@@ -89,6 +89,30 @@ pub struct Model {
     /// permanent, not worth retrying forever. Added by
     /// `m20260904_000003_add_continuous_archive_source_to_external_services`.
     pub continuous_archive_pinned_at: Option<DBDateTime>,
+    /// How this database's containers are created (ADR-055 Phase 4): the
+    /// engine's own request (`legacy`), the same with the workload spec
+    /// compared in the background (`shadow`), or the admitted spec through
+    /// the Docker driver (`enforce`). Changed only by an administrator, and
+    /// audit-logged. A serialized row from before the column reads as
+    /// `legacy`. Added by `m20261022_000004_external_services_workload_mode`.
+    #[serde(default)]
+    pub workload_mode: super::external_service_workload_mode::ServiceWorkloadMode,
+    /// Container log ingestion budget for this service's containers, in
+    /// lines per second. NULL inherits the platform budget
+    /// (`AppSettings.container_logs.ingest_lines_per_sec`); 0 disables it.
+    pub log_ingest_lines_per_sec: Option<i32>,
+    /// As `log_ingest_lines_per_sec`, in KiB per second.
+    pub log_ingest_kib_per_sec: Option<i32>,
+    /// Docker healthcheck overrides for this service's container, in seconds
+    /// (`healthcheck_retries` is a count). NULL inherits the instance default
+    /// (`AppSettings.managed_service_healthchecks`), then Temps' built-in
+    /// value. Applied when the container is next created or recreated. Added
+    /// by `m20261113_000001_add_external_services_healthcheck_overrides`.
+    pub healthcheck_interval_secs: Option<i32>,
+    pub healthcheck_start_interval_secs: Option<i32>,
+    pub healthcheck_start_period_secs: Option<i32>,
+    pub healthcheck_timeout_secs: Option<i32>,
+    pub healthcheck_retries: Option<i32>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

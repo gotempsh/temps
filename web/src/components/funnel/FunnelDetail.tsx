@@ -178,7 +178,7 @@ export function FunnelDetail({ project, funnelId }: FunnelDetailProps) {
       ) : (
         <Card>
           <CardHeader>
-            <CardTitle>Funnel Analysis</CardTitle>
+            <CardTitle>Funnel analysis</CardTitle>
             <CardDescription>
               User progression and conversion metrics
             </CardDescription>

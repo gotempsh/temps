@@ -32,7 +32,17 @@ pub struct Model {
     /// Publish every worker-served hostname under `domain` (true), or only
     /// the hostnames chosen for this tunnel (false).
     pub auto_publish: bool,
-    /// `pending`, `ready` or `error`.
+    /// Publish every environment as `<label>.<domain>` (ADR 068 D3). At
+    /// most one connector has it on.
+    #[serde(default)]
+    pub environment_hosts: bool,
+    /// Name environment hosts `<label>-<host_suffix>.<domain>` instead of
+    /// `<label>.<domain>`, so a tunnel on a zone keeps them one level deep
+    /// (which Cloudflare's free certificate covers). `None`: no suffix.
+    #[serde(default)]
+    pub host_suffix: Option<String>,
+    /// `pending`, `ready`, `error`, or `deleting` while it is being removed
+    /// (ADR 064 D4): sync and reconcile skip it, and it is never reverted.
     pub status: String,
     pub last_error: Option<String>,
     pub created_at: DBDateTime,

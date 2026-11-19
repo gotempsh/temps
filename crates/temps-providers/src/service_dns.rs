@@ -15,7 +15,7 @@
 //! The only address that works across nodes is the container's IP on the
 //! multi-host overlay (`temps-network`), and the only stable way to hand
 //! that IP to a workload is a name in the internal `*.temps.local` zone
-//! served by the per-node Hickory resolvers (`temps-dns-resolver`).
+//! served by the per-node Hickory resolvers (`temps-node-dns`).
 //! Cluster members already work this way; standalone services (a single
 //! Postgres/MySQL/MongoDB/Redis container) get the same treatment through
 //! the helpers here.
@@ -75,14 +75,26 @@ pub fn dns_label(raw: &str) -> Option<String> {
 /// container or a Postgres cluster. A service is either standalone or a
 /// cluster, never both, so the two writers can never contend for the name.
 ///
-/// Prefers the stored `slug` (already normalized at creation time) and
-/// falls back to normalizing `name` for rows created before slugs existed.
+/// Preserves separators in the display name; legacy slugs may have stripped them.
 pub fn standalone_service_fqdn(name: &str, slug: Option<&str>) -> Option<String> {
-    let label = slug
-        .and_then(dns_label)
-        .or_else(|| dns_label(name))
+    let label = dns_label(name)
+        .or_else(|| slug.and_then(dns_label))
         .filter(|l| !l.is_empty())?;
     Some(format!("{}.{}", label, INTERNAL_DNS_ZONE))
+}
+
+/// Canonical name plus the previously published slug, for existing clients.
+pub fn standalone_service_names(name: &str, slug: Option<&str>) -> Vec<String> {
+    let mut names: Vec<String> = standalone_service_fqdn(name, slug).into_iter().collect();
+    if let Some(legacy) = slug
+        .and_then(dns_label)
+        .map(|s| format!("{s}.{INTERNAL_DNS_ZONE}"))
+    {
+        if !names.contains(&legacy) {
+            names.push(legacy);
+        }
+    }
+    names
 }
 
 /// Everything the deployment planner needs to address one linked external
@@ -171,8 +183,9 @@ impl CrossNodeBlockReason {
     /// exact page rather than to documentation.
     pub fn setup_path(&self, service_id: i32) -> String {
         match self {
-            // The cluster-DNS switch lives on the Worker Nodes settings page.
-            CrossNodeBlockReason::ClusterDnsDisabled => "/settings/nodes".to_string(),
+            // The cluster-DNS switch lives in the Worker Nodes page's
+            // Advanced section; the anchor opens it and scrolls to the card.
+            CrossNodeBlockReason::ClusterDnsDisabled => "/settings/nodes#cluster-dns".to_string(),
             CrossNodeBlockReason::DnsRecordMissing | CrossNodeBlockReason::NoDnsName => {
                 format!("/storage/{}", service_id)
             }
@@ -208,10 +221,10 @@ mod tests {
     }
 
     #[test]
-    fn standalone_fqdn_prefers_slug_over_name() {
+    fn standalone_fqdn_preserves_hyphens_and_legacy_alias() {
         assert_eq!(
-            standalone_service_fqdn("Orders DB", Some("orders-db")).as_deref(),
-            Some("orders-db.temps.local")
+            standalone_service_names("orders-db", Some("ordersdb")),
+            vec!["orders-db.temps.local", "ordersdb.temps.local"]
         );
     }
 
@@ -251,7 +264,7 @@ mod tests {
     fn setup_path_deep_links_to_the_page_that_fixes_it() {
         assert_eq!(
             CrossNodeBlockReason::ClusterDnsDisabled.setup_path(42),
-            "/settings/nodes"
+            "/settings/nodes#cluster-dns"
         );
         assert_eq!(
             CrossNodeBlockReason::DnsRecordMissing.setup_path(42),

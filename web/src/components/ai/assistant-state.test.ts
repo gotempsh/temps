@@ -4,6 +4,8 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import {
   ASSISTANT_EXAMPLE_PROMPTS,
+  ASSISTANT_OPERATE_PROMPTS,
+  assistantExamplePrompts,
   NO_PROVIDER_REASON,
   OPENROUTER_SETUP_PATH,
   ASK_BEFORE_CHANGES_MODE,
@@ -123,6 +125,41 @@ describe('example prompts', () => {
     for (const prompt of ASSISTANT_EXAMPLE_PROMPTS) {
       expect(prompt.trim().length).toBeGreaterThan(10)
     }
+  })
+})
+
+describe('assistantExamplePrompts', () => {
+  test('a new instance gets goals that need nothing yet', () => {
+    expect(assistantExamplePrompts({ hasProjects: false })).toEqual(
+      ASSISTANT_EXAMPLE_PROMPTS
+    )
+  })
+
+  test('with services, it asks about them and keeps one build goal', () => {
+    const prompts = assistantExamplePrompts({ hasProjects: true })
+    for (const prompt of ASSISTANT_OPERATE_PROMPTS) {
+      expect(prompts).toContain(prompt)
+    }
+    expect(
+      prompts.filter((prompt) => ASSISTANT_EXAMPLE_PROMPTS.includes(prompt))
+    ).toHaveLength(1)
+  })
+
+  test('a chat scoped to a project asks about that project', () => {
+    const prompts = assistantExamplePrompts({
+      hasProjects: true,
+      projectName: 'checkout-api',
+    })
+    expect(prompts.length).toBeGreaterThan(0)
+    for (const prompt of prompts) {
+      expect(prompt).toContain('checkout-api')
+    }
+  })
+
+  test('an empty project name falls back to the instance-wide suggestions', () => {
+    expect(
+      assistantExamplePrompts({ hasProjects: true, projectName: '' })
+    ).toEqual(assistantExamplePrompts({ hasProjects: true }))
   })
 })
 

@@ -25,12 +25,33 @@ use temps_entities::{monitoring_alert_rules, nodes};
 /// Synthetic node ID of the control plane. It has no `nodes` row.
 pub(crate) const CONTROL_PLANE_NODE_ID: i32 = 0;
 
-/// Metrics an operator can alert on, for any node. Percentages, so a threshold
-/// is meaningful on a 4 GB worker and a 512 GB one alike.
-pub(crate) const ALERTABLE_NODE_METRICS: [&str; 3] = [
+/// Usage metrics an operator can alert on, for any node. Percentages, so a
+/// threshold is meaningful on a 4 GB worker and a 512 GB one alike, and is
+/// held to 0..=100.
+const USAGE_PERCENT_NODE_METRICS: [&str; 3] = [
     "node.cpu_percent",
     "node.memory_percent",
     "node.disk_percent",
+];
+
+/// Disk-health metrics every Linux node reports, and that worker nodes get
+/// default rules for. Not usage percentages: degraded arrays and media
+/// errors are counts, and drive wear can pass 100% of rated endurance, so
+/// their thresholds only have to be finite and non-negative.
+const DISK_HEALTH_NODE_METRICS: [&str; 3] = [
+    "node.raid_degraded",
+    "node.disk_wear_percent",
+    "node.disk_media_errors",
+];
+
+/// Every metric a worker node's rule may use.
+pub(crate) const ALERTABLE_NODE_METRICS: [&str; 6] = [
+    USAGE_PERCENT_NODE_METRICS[0],
+    USAGE_PERCENT_NODE_METRICS[1],
+    USAGE_PERCENT_NODE_METRICS[2],
+    DISK_HEALTH_NODE_METRICS[0],
+    DISK_HEALTH_NODE_METRICS[1],
+    DISK_HEALTH_NODE_METRICS[2],
 ];
 
 /// Longest rule name accepted; names are shown in notifications.
@@ -96,6 +117,15 @@ pub(crate) enum NodeAlertRuleError {
          on every start; disable it instead of deleting it"
     )]
     ControlPlaneRuleProtected { rule_id: i32 },
+    #[error(
+        "Alert rule {rule_id} on node {node_id} is the default '{metric_name}' rule, which is \
+         re-created when the node has no disk-health rule left; disable it instead of deleting it"
+    )]
+    DefaultRuleProtected {
+        node_id: i32,
+        rule_id: i32,
+        metric_name: String,
+    },
     #[error("Invalid alert rule for node {node_id}: {message}")]
     Validation { node_id: i32, message: String },
     #[error("Database error while managing an alert rule on node {node_id}: {source}")]
@@ -191,8 +221,10 @@ impl NodeAlertRuleService {
     /// it will be stored (the merge of the existing rule and `changes`).
     ///
     /// A worker's rule keeps to what `create` allows: one of the usage
-    /// percentages and a threshold between 0 and 100, so an edit cannot leave
-    /// a rule that can never fire or that has no series to evaluate. The
+    /// percentages with a threshold between 0 and 100, or one of the
+    /// disk-health metrics its default rules use with a non-negative
+    /// threshold, so an edit cannot leave a rule that can never fire or that
+    /// has no series to evaluate. The
     /// control plane's seeded rules cover metrics that are not percentages
     /// (file descriptors, ingest rates), so for node `0` only the shape of the
     /// rule is checked, not the metric or the threshold range.
@@ -216,6 +248,23 @@ impl NodeAlertRuleService {
 
         if changes.is_empty() {
             return Ok(existing);
+        }
+        // A default disk-health rule keeps its metric: renamed, it would
+        // escape the delete refusal and leave the node without that alert,
+        // which seeding does not restore while another default remains.
+        if let Some(metric_name) = &changes.metric_name {
+            if *metric_name != existing.metric_name
+                && DISK_HEALTH_NODE_METRICS.contains(&existing.metric_name.as_str())
+            {
+                return Err(NodeAlertRuleError::Validation {
+                    node_id,
+                    message: format!(
+                        "rule {rule_id} is the default '{}' rule and keeps its metric; \
+                         add a separate rule for '{metric_name}' instead",
+                        existing.metric_name
+                    ),
+                });
+            }
         }
 
         let merged = NewNodeAlertRule {
@@ -316,7 +365,9 @@ impl NodeAlertRuleService {
     ///
     /// The control plane's rules are refused: its defaults are re-seeded on
     /// every start, so a deleted one silently comes back while `enabled: false`
-    /// survives. Refusing says so up front instead of appearing to work.
+    /// survives. Refusing says so up front instead of appearing to work. A
+    /// worker's default disk-health rules are refused for the same reason: a
+    /// worker with none of them left is seeded again.
     pub(crate) async fn delete(
         &self,
         node_id: i32,
@@ -333,6 +384,15 @@ impl NodeAlertRuleService {
             .await
             .map_err(db_err)?
             .ok_or(NodeAlertRuleError::RuleNotFound { node_id, rule_id })?;
+        // A worker is seeded again whenever it has no disk-health rule (that
+        // is the only record of "seeded"), so deleting these would not stick.
+        if DISK_HEALTH_NODE_METRICS.contains(&rule.metric_name.as_str()) {
+            return Err(NodeAlertRuleError::DefaultRuleProtected {
+                node_id,
+                rule_id,
+                metric_name: rule.metric_name,
+            });
+        }
 
         monitoring_alert_rules::Entity::delete_by_id(rule_id)
             .exec(self.db.as_ref())
@@ -344,22 +404,31 @@ impl NodeAlertRuleService {
 }
 
 /// Full validation for a worker rule: its shape, a supported metric and a
-/// percentage threshold.
+/// threshold in that metric's range.
 fn validate(node_id: i32, rule: &NewNodeAlertRule) -> Result<(), NodeAlertRuleError> {
     let invalid = |message: String| NodeAlertRuleError::Validation { node_id, message };
 
     validate_shape(node_id, rule)?;
-    if !ALERTABLE_NODE_METRICS.contains(&rule.metric_name.as_str()) {
+    let metric = rule.metric_name.as_str();
+    if USAGE_PERCENT_NODE_METRICS.contains(&metric) {
+        if !(rule.threshold.is_finite() && (0.0..=100.0).contains(&rule.threshold)) {
+            return Err(invalid(format!(
+                "threshold {} for {metric} is not a percentage between 0 and 100",
+                rule.threshold
+            )));
+        }
+    } else if DISK_HEALTH_NODE_METRICS.contains(&metric) {
+        if !(rule.threshold.is_finite() && rule.threshold >= 0.0) {
+            return Err(invalid(format!(
+                "threshold {} for {metric} must be a finite number of 0 or more",
+                rule.threshold
+            )));
+        }
+    } else {
         return Err(invalid(format!(
             "metric_name '{}' cannot be alerted on; choose one of: {}",
             rule.metric_name,
             ALERTABLE_NODE_METRICS.join(", ")
-        )));
-    }
-    if !(rule.threshold.is_finite() && (0.0..=100.0).contains(&rule.threshold)) {
-        return Err(invalid(format!(
-            "threshold {} is not a percentage between 0 and 100",
-            rule.threshold
         )));
     }
     Ok(())
@@ -602,6 +671,35 @@ mod tests {
         ));
     }
 
+    /// Workers are re-seeded when they have no disk-health rule, so deleting
+    /// the defaults would quietly undo itself after a restart: they are
+    /// refused, with the way out (disable), and nothing is deleted.
+    #[tokio::test]
+    async fn a_worker_default_disk_health_rule_cannot_be_deleted() {
+        let svc = service(
+            MockDatabase::new(DatabaseBackend::Postgres).append_query_results([vec![stored(
+                9,
+                7,
+                "node.raid_degraded",
+            )]]),
+        );
+
+        let err = svc.delete(7, 9).await.unwrap_err();
+
+        assert!(
+            matches!(
+                &err,
+                NodeAlertRuleError::DefaultRuleProtected {
+                    node_id: 7,
+                    rule_id: 9,
+                    metric_name,
+                } if metric_name == "node.raid_degraded"
+            ),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("disable"));
+    }
+
     #[tokio::test]
     async fn control_plane_rules_cannot_be_deleted() {
         let svc = service(MockDatabase::new(DatabaseBackend::Postgres));
@@ -659,6 +757,114 @@ mod tests {
 
         assert_eq!(updated.threshold, 80.0);
         assert_eq!(updated.metric_name, "node.disk_percent");
+    }
+
+    /// The disk-health rules seeded on every worker can be edited: turned
+    /// off, or given a count threshold above 100, which only usage
+    /// percentages refuse.
+    #[tokio::test]
+    async fn a_seeded_worker_disk_health_rule_can_be_disabled_and_retuned() {
+        let mut after = stored(9, 7, "node.disk_media_errors");
+        after.enabled = false;
+        after.threshold = 250.0;
+        let svc = service(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![stored(9, 7, "node.disk_media_errors")]])
+                .append_query_results([vec![after]]),
+        );
+
+        let updated = svc
+            .update(
+                7,
+                9,
+                NodeAlertRuleChanges {
+                    enabled: Some(false),
+                    threshold: Some(250.0),
+                    ..changes()
+                },
+            )
+            .await
+            .expect("a seeded disk-health rule must be editable");
+
+        assert!(!updated.enabled);
+        assert_eq!(updated.threshold, 250.0);
+    }
+
+    /// Renaming a default disk-health rule would leave the node without that
+    /// alert and slip past the delete refusal, so the metric is fixed.
+    #[tokio::test]
+    async fn a_default_disk_health_rule_keeps_its_metric() {
+        let svc = service(
+            MockDatabase::new(DatabaseBackend::Postgres).append_query_results([vec![stored(
+                9,
+                7,
+                "node.raid_degraded",
+            )]]),
+        );
+
+        let result = svc
+            .update(
+                7,
+                9,
+                NodeAlertRuleChanges {
+                    metric_name: Some("node.cpu_percent".to_string()),
+                    ..changes()
+                },
+            )
+            .await;
+
+        assert_invalid(result, "keeps its metric");
+    }
+
+    /// Restating the same metric is not a rename.
+    #[tokio::test]
+    async fn a_default_disk_health_rule_accepts_its_own_metric() {
+        let mut after = stored(9, 7, "node.raid_degraded");
+        after.enabled = false;
+        let svc = service(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![stored(9, 7, "node.raid_degraded")]])
+                .append_query_results([vec![after]]),
+        );
+
+        let updated = svc
+            .update(
+                7,
+                9,
+                NodeAlertRuleChanges {
+                    metric_name: Some("node.raid_degraded".to_string()),
+                    enabled: Some(false),
+                    ..changes()
+                },
+            )
+            .await
+            .expect("same metric with another change is an ordinary edit");
+
+        assert!(!updated.enabled);
+    }
+
+    #[tokio::test]
+    async fn a_negative_disk_health_threshold_is_rejected_before_any_write() {
+        let svc = service(
+            MockDatabase::new(DatabaseBackend::Postgres).append_query_results([vec![stored(
+                9,
+                7,
+                "node.raid_degraded",
+            )]]),
+        );
+
+        let result = svc
+            .update(
+                7,
+                9,
+                NodeAlertRuleChanges {
+                    threshold: Some(-1.0),
+                    ..changes()
+                },
+            )
+            .await;
+
+        assert_invalid(result, "node.raid_degraded");
     }
 
     #[tokio::test]

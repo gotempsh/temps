@@ -28,7 +28,6 @@ import {
 } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import {
   Dialog,
   DialogContent,
@@ -45,7 +44,6 @@ import {
   CheckCircle2,
   XCircle,
   Loader2,
-  Info,
   Power,
   PowerOff,
   Settings,
@@ -105,19 +103,19 @@ function EditDockerImageDialog({
         </DialogHeader>
         <div className="space-y-4 py-4">
           <div className="space-y-2">
-            <Label htmlFor="docker-image">Docker Image</Label>
+            <Label htmlFor="docker-image">Docker image</Label>
             <Input
               id="docker-image"
               value={dockerImage}
               onChange={(e) => onDockerImageChange(e.target.value)}
               placeholder={
-                serviceName === 'KV Store'
+                serviceName === 'KV store'
                   ? 'redis:8-alpine'
                   : DEFAULT_RUSTFS_IMAGE
               }
             />
             <p className="text-xs text-muted-foreground">
-              {serviceName === 'KV Store'
+              {serviceName === 'KV store'
                 ? 'Examples: redis:8-alpine, valkey/valkey:8-alpine'
                 : `Examples: ${DEFAULT_RUSTFS_IMAGE}, rustfs/rustfs:latest`}
             </p>
@@ -189,7 +187,7 @@ export function PlatformServices() {
   const kvSettingsMut = useMutation({
     ...kvUpdateSettingsMutation(),
     onSuccess: () => {
-      toast.success('KV Store container name saved')
+      toast.success('KV store container name saved')
       queryClient.invalidateQueries({
         queryKey: kvGetSettingsOptions().queryKey,
       })
@@ -202,7 +200,7 @@ export function PlatformServices() {
   const blobSettingsMut = useMutation({
     ...blobUpdateSettingsMutation(),
     onSuccess: () => {
-      toast.success('Blob Storage container name saved')
+      toast.success('Blob storage container name saved')
       queryClient.invalidateQueries({
         queryKey: blobGetSettingsOptions().queryKey,
       })
@@ -216,38 +214,38 @@ export function PlatformServices() {
   const kvEnableMut = useMutation({
     ...kvEnableMutation(),
     onSuccess: () => {
-      toast.success('KV Store enabled successfully')
+      toast.success('KV store enabled successfully')
       queryClient.invalidateQueries({ queryKey: kvStatusOptions().queryKey })
       queryClient.invalidateQueries({
         queryKey: kvGetSettingsOptions().queryKey,
       })
     },
     onError: (error: unknown) => {
-      toast.error(failureMessage(error, 'Failed to enable KV Store'))
+      toast.error(failureMessage(error, 'Failed to enable KV store'))
     },
   })
 
   const kvDisableMut = useMutation({
     ...kvDisableMutation(),
     onSuccess: () => {
-      toast.success('KV Store disabled successfully')
+      toast.success('KV store disabled successfully')
       queryClient.invalidateQueries({ queryKey: kvStatusOptions().queryKey })
     },
     onError: (error: Error) => {
-      toast.error(error.message || 'Failed to disable KV Store')
+      toast.error(error.message || 'Failed to disable KV store')
     },
   })
 
   const kvUpdateMut = useMutation({
     ...kvUpdateMutation(),
     onSuccess: () => {
-      toast.success('KV Store updated successfully')
+      toast.success('KV store updated successfully')
       queryClient.invalidateQueries({ queryKey: kvStatusOptions().queryKey })
       setEditDialogOpen(false)
       setEditingService(null)
     },
     onError: (error: Error) => {
-      toast.error(error.message || 'Failed to update KV Store')
+      toast.error(error.message || 'Failed to update KV store')
     },
   })
 
@@ -255,38 +253,38 @@ export function PlatformServices() {
   const blobEnableMut = useMutation({
     ...blobEnableMutation(),
     onSuccess: () => {
-      toast.success('Blob Storage enabled successfully')
+      toast.success('Blob storage enabled successfully')
       queryClient.invalidateQueries({ queryKey: blobStatusOptions().queryKey })
       queryClient.invalidateQueries({
         queryKey: blobGetSettingsOptions().queryKey,
       })
     },
     onError: (error: unknown) => {
-      toast.error(failureMessage(error, 'Failed to enable Blob Storage'))
+      toast.error(failureMessage(error, 'Failed to enable Blob storage'))
     },
   })
 
   const blobDisableMut = useMutation({
     ...blobDisableMutation(),
     onSuccess: () => {
-      toast.success('Blob Storage disabled successfully')
+      toast.success('Blob storage disabled successfully')
       queryClient.invalidateQueries({ queryKey: blobStatusOptions().queryKey })
     },
     onError: (error: Error) => {
-      toast.error(error.message || 'Failed to disable Blob Storage')
+      toast.error(error.message || 'Failed to disable Blob storage')
     },
   })
 
   const blobUpdateMut = useMutation({
     ...blobUpdateMutation(),
     onSuccess: () => {
-      toast.success('Blob Storage updated successfully')
+      toast.success('Blob storage updated successfully')
       queryClient.invalidateQueries({ queryKey: blobStatusOptions().queryKey })
       setEditDialogOpen(false)
       setEditingService(null)
     },
     onError: (error: Error) => {
-      toast.error(error.message || 'Failed to update Blob Storage')
+      toast.error(error.message || 'Failed to update Blob storage')
     },
   })
 
@@ -315,24 +313,14 @@ export function PlatformServices() {
   }
 
   const currentServiceName =
-    editingService === 'kv' ? 'KV Store' : 'Blob Storage'
+    editingService === 'kv' ? 'KV store' : 'Blob storage'
 
   return (
     <div className="space-y-6">
-      <Alert>
-        <Info className="h-4 w-4" />
-        <AlertTitle>Platform Services</AlertTitle>
-        <AlertDescription>
-          Platform services are shared by every deployed service. Each service’s
-          data is isolated by namespace. Enable one to make it available
-          everywhere.
-        </AlertDescription>
-      </Alert>
-
       <div className="grid gap-6 md:grid-cols-2">
-        {/* KV Store Service */}
+        {/* KV store Service */}
         <ServiceCard
-          name="KV Store"
+          name="KV store"
           description="Redis-backed key-value storage for caching, sessions, and real-time data"
           icon={Database}
           loading={kvQuery.isPending}
@@ -353,7 +341,7 @@ export function PlatformServices() {
           ]}
           containerName={
             <ContainerNameField
-              serviceName="KV Store"
+              serviceName="KV store"
               settings={kvSettingsQuery.data}
               isLoading={kvSettingsQuery.isPending}
               error={kvSettingsQuery.isError ? kvSettingsQuery.error : undefined}
@@ -375,9 +363,9 @@ export function PlatformServices() {
           isDisabling={kvDisableMut.isPending}
         />
 
-        {/* Blob Storage Service */}
+        {/* Blob storage Service */}
         <ServiceCard
-          name="Blob Storage"
+          name="Blob storage"
           description="S3-compatible object storage for files, images, and large data"
           icon={HardDrive}
           loading={blobQuery.isPending}
@@ -398,7 +386,7 @@ export function PlatformServices() {
           ]}
           containerName={
             <ContainerNameField
-              serviceName="Blob Storage"
+              serviceName="Blob storage"
               settings={blobSettingsQuery.data}
               isLoading={blobSettingsQuery.isPending}
               error={

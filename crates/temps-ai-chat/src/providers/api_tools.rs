@@ -193,6 +193,12 @@ fn temps_schema(project_selector_scope: bool, _global_scope: bool) -> Value {
 
 #[async_trait]
 impl ConversationContextProvider for ApiToolsProvider {
+    fn api_tools_revision(&self) -> Option<String> {
+        self.handle
+            .get()
+            .and_then(|caller| caller.plugin_tools_revision())
+    }
+
     fn context_type(&self) -> &'static str {
         // This provider is special — it augments ALL contexts, not a specific
         // context_type.  We use a sentinel that is never stored in a conversation

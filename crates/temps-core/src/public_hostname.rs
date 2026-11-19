@@ -246,13 +246,32 @@ pub fn environment_label(
         .filter(|t| !t.is_empty())
         .unwrap_or(DEFAULT_ENVIRONMENT_LABEL_TEMPLATE);
     let raw = chosen.replace("{project}", project).replace("{env}", env);
-    let label = sanitize_label(&raw);
+    single_dns_label(&raw)
+}
+
+/// `raw` as one DNS label: ASCII letters and digits with single hyphens
+/// between them (dots and anything non-ASCII become hyphens, so no IDN
+/// look-alike survives), cut to 63 characters with a short hash of the
+/// whole when longer.
+pub fn single_dns_label(raw: &str) -> String {
+    let label = sanitize_label(raw);
     if label.len() <= DNS_LABEL_MAX_LEN {
         return label;
     }
     let hash = short_hash(&label);
     let keep = DNS_LABEL_MAX_LEN - SHORT_HASH_LEN - 1;
     format!("{}-{hash}", label[..keep].trim_end_matches('-'))
+}
+
+/// `label` with a short hash of `seed`: the fallback name when `label` is
+/// taken under a zone by a record Temps does not own (ADR 068 D3). The
+/// result is one DNS label, `<label>-<hash>`, cut to fit.
+pub fn hashed_label(label: &str, seed: &str) -> String {
+    let label = sanitize_label(label);
+    let hash = short_hash(seed);
+    let keep = DNS_LABEL_MAX_LEN - SHORT_HASH_LEN - 1;
+    let prefix: String = label.chars().take(keep).collect();
+    format!("{}-{hash}", prefix.trim_end_matches('-'))
 }
 
 /// Check a hostname label template. `require_env`: every environment of a
@@ -315,6 +334,37 @@ fn short_hash(seed: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_single_dns_label_is_ascii_one_level_and_capped() {
+        assert_eq!(single_dns_label("Shop.Staging"), "shop-staging");
+        // A Cyrillic `а` is not kept as a look-alike of `a`.
+        assert_eq!(single_dns_label("p\u{0430}y-feature"), "p-y-feature");
+        let long = single_dns_label(&"feature-".repeat(20));
+        assert_eq!(long.len(), DNS_LABEL_MAX_LEN);
+        assert!(!long.contains('.'));
+        assert_ne!(long, single_dns_label(&"feature-".repeat(21)));
+        assert_eq!(single_dns_label("---"), "x");
+    }
+
+    #[test]
+    fn hashed_label_is_one_stable_label() {
+        let short = hashed_label("shop-production", "shop-production@example.com#4");
+        assert!(short.starts_with("shop-production-"));
+        assert_eq!(short.len(), "shop-production-".len() + SHORT_HASH_LEN);
+        assert_eq!(
+            short,
+            hashed_label("shop-production", "shop-production@example.com#4"),
+            "the same environment keeps the same fallback name"
+        );
+        assert_ne!(
+            short,
+            hashed_label("shop-production", "shop-production@example.com#5")
+        );
+        let long = hashed_label(&"a".repeat(80), "seed");
+        assert!(long.len() <= DNS_LABEL_MAX_LEN);
+        assert!(!long.contains('.'));
+    }
 
     #[test]
     fn base_domain_strips_wildcard_prefix() {

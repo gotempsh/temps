@@ -133,6 +133,10 @@ impl ExternalPlugin for GoogleIndexingPlugin {
             .build()
     }
 
+    #[allow(
+        clippy::expect_used,
+        reason = "the plugin SDK's router() cannot return an error; a plugin that cannot open its store at startup has nothing to serve and must exit"
+    )]
     fn router(&self, ctx: PluginContext) -> axum::Router {
         let data_dir = ctx.data_dir().to_path_buf();
 
@@ -770,8 +774,7 @@ async fn get_quota(State(state): State<Arc<AppState>>) -> Result<Json<QuotaStatu
     let now = chrono::Utc::now();
     let tomorrow = (now + chrono::Duration::days(1))
         .date_naive()
-        .and_hms_opt(0, 0, 0)
-        .unwrap();
+        .and_time(chrono::NaiveTime::MIN);
     let resets_at =
         chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(tomorrow, chrono::Utc)
             .to_rfc3339();

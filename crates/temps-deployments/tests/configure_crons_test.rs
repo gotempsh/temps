@@ -5,6 +5,15 @@
 //!
 //! These tests can be run independently from the main test suite
 
+// Integration-test crate: clippy's `allow-*-in-tests` only covers `#[test]`
+// fns and `cfg(test)` modules, not the fixture helpers here, where a panic is
+// the intended failure.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test fixtures; a panic fails the test"
+)]
+
 use async_trait::async_trait;
 use std::sync::Arc;
 use temps_core::TempsConfig;
@@ -163,6 +172,8 @@ cron:
         .map(|job| CronConfig {
             path: job.path.clone(),
             schedule: job.schedule.clone(),
+            job: None,
+            workflow: None,
         })
         .collect();
 
@@ -181,6 +192,8 @@ fn test_noop_cron_service() {
     let configs = vec![CronConfig {
         path: "/test".to_string(),
         schedule: "* * * * *".to_string(),
+        job: None,
+        workflow: None,
     }];
 
     // Should succeed without doing anything
@@ -195,10 +208,14 @@ async fn test_mock_cron_service_success() {
         CronConfig {
             path: "/api/cron/task1".to_string(),
             schedule: "0 0 * * *".to_string(),
+            job: None,
+            workflow: None,
         },
         CronConfig {
             path: "/api/cron/task2".to_string(),
             schedule: "0 12 * * *".to_string(),
+            job: None,
+            workflow: None,
         },
     ];
 
@@ -217,6 +234,8 @@ async fn test_mock_cron_service_failure() {
     let configs = vec![CronConfig {
         path: "/api/cron/task".to_string(),
         schedule: "0 0 * * *".to_string(),
+        job: None,
+        workflow: None,
     }];
 
     let result = service.configure_crons(1, 1, configs).await;
@@ -283,6 +302,8 @@ cron: []
         .map(|job| CronConfig {
             path: job.path.clone(),
             schedule: job.schedule.clone(),
+            job: None,
+            workflow: None,
         })
         .collect();
 

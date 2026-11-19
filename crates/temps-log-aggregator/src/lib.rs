@@ -13,6 +13,13 @@
 //! - Live tail via SSE for real-time log streaming
 //! - Retention management with per-project policies
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        reason = "tests read fixture configuration (database/service URLs) from the environment"
+    )
+)]
 pub mod chunk;
 pub mod error;
 pub mod handlers;

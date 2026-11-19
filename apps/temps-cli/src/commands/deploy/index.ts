@@ -142,6 +142,7 @@ export function registerDeployCommands(program: Command): void {
     .option('-p, --project <project>', 'Project slug or ID (defaults to the linked project)')
     .option('-e, --environment <env>', 'Target environment', 'production')
     .option('--to <deployment>', 'Rollback to specific deployment ID')
+    .option('-y, --yes', 'Skip confirmation')
     .action(rollback)
 
   deployments

@@ -14,7 +14,6 @@ import {
   isMetricsUnavailable,
   lastSampleOf,
   mergeSeries,
-  nodeMetricCapabilities,
   peakOf,
   diskProjectionCaption,
   projectDisk,
@@ -360,18 +359,14 @@ describe('currentDiskPercent', () => {
   })
 })
 
-describe('nodeMetricCapabilities', () => {
-  test('the control plane has I/O counters and a Docker daemon to query', () => {
-    expect(nodeMetricCapabilities(0)).toEqual({
-      ioCounters: true,
-      dockerUsage: true,
-    })
-  })
-
-  test('a worker only reports CPU, memory and disk, so those panels are left out', () => {
-    expect(nodeMetricCapabilities(3)).toEqual({
-      ioCounters: false,
-      dockerUsage: false,
-    })
-  })
+test('aggregate disk history never produces a forecast', () => {
+  const points = Array.from({ length: 24 }, (_, i) => ({
+    time: new Date(Date.UTC(2026, 0, 1, i)).toISOString(),
+    value: (20 + i) * 1e9,
+  }))
+  expect(projectDisk(points, 100e9)?.kind).toBe('growing')
+  expect(projectDisk(points, 100e9, undefined, false)).toBeNull()
+  expect(
+    diskProjectionCaption(57e9, projectDisk(points, 100e9, undefined, false))
+  ).toBe('57.0 GB free')
 })

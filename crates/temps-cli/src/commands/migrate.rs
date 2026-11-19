@@ -9,7 +9,7 @@
 //!
 //! ```text
 //!   1. Download the new temps binary
-//!   2. TEMPS_DATABASE_URL=... temps migrate   # apply schema changes, server down
+//!   2. temps migrate                          # apply schema changes, server down
 //!   3. Restart the server with the new binary
 //! ```
 //!
@@ -21,6 +21,15 @@
 //! `temps serve` still applies pending migrations automatically so simple
 //! single-node installs keep their zero-step upgrade; this command is for
 //! operators who want explicit control.
+//!
+//! ## Which database
+//!
+//! The URL comes from `--database-url`, `TEMPS_DATABASE_URL`,
+//! `TEMPS_DATABASE_URL_FILE` or the systemd credential, as for `temps serve`;
+//! when none is set (a shell on the server's host) it is read from the
+//! installed `temps serve` service, together with that server's data
+//! directory, so the step above needs no flags. See
+//! [`crate::database_url_source::resolve_database_url`].
 //!
 //! ## Plan, confirm, apply
 //!
@@ -40,13 +49,14 @@ use colored::Colorize;
 use std::future::Future;
 use std::io::{IsTerminal, Write};
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 
 #[derive(Args)]
 pub struct MigrateCommand {
-    /// Database connection URL (set via TEMPS_DATABASE_URL env var; not accepted as a flag to prevent credentials leaking into process listings)
+    /// Database connection URL. Prefer TEMPS_DATABASE_URL (or TEMPS_DATABASE_URL_FILE / the systemd credential temps_database_url): the flag form puts the password in the process command line
+    /// When unset, the installed `temps serve` service's URL is used.
     #[arg(long, env = "TEMPS_DATABASE_URL", hide_env_values = true)]
-    pub database_url: String,
+    pub database_url: Option<String>,
 
     /// Show the pending migrations and exit without applying them.
     #[arg(long)]
@@ -58,7 +68,10 @@ pub struct MigrateCommand {
 
     /// Data directory of the installation (same as `temps serve`). With
     /// `--pre-migration-backup` the backup is written to
-    /// `<data dir>/backups/pre-migration/`. Defaults to `~/.temps`.
+    /// `<data dir>/backups/pre-migration/`. Defaults to the installed
+    /// server's data directory when the database is that server's, else
+    /// `~/.temps`. When it is (or may be) the server's but that directory
+    /// cannot be read, a backup is refused rather than written to `~/.temps`.
     #[arg(long, env = "TEMPS_DATA_DIR")]
     pub data_dir: Option<std::path::PathBuf>,
 
@@ -108,6 +121,17 @@ pub struct MigrateCommand {
     pub progress_format: Option<String>,
 }
 
+/// What `temps migrate` acts on.
+struct MigrateTarget {
+    database: crate::database_url_source::ResolvedDatabaseUrl,
+    /// `--data-dir`, else the installed server's; `None` means `~/.temps`.
+    data_dir: Option<std::path::PathBuf>,
+    /// Why the installed server's data directory is unknown, when this is
+    /// (or may be) its database: a backup in `~/.temps` would land away
+    /// from the server's data, where nobody looks for it.
+    server_data_dir_unknown: Option<String>,
+}
+
 enum MaintenanceRace<T> {
     Completed(T),
     Interrupted,
@@ -145,12 +169,28 @@ async fn interrupted_maintenance_error(
     }
 }
 
+/// How post-migration maintenance ended, when it was not interrupted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MaintenanceOutcome {
+    Complete,
+    /// An index build failed and was left to `temps serve`, which retries it
+    /// in the background from startup.
+    IndexesDeferred,
+}
+
+/// `maintenance_indexes_deferred` NDJSON line for `--progress-format=json`.
+#[derive(serde::Serialize)]
+struct IndexesDeferredLine {
+    event: &'static str,
+    error: String,
+}
+
 async fn run_post_migration_maintenance(
     db: &Arc<temps_database::DbConnection>,
     database_url: &str,
     backend_pid: i32,
     use_json: bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<MaintenanceOutcome> {
     // Announce the phase BEFORE any work starts. Concurrent index builds and
     // continuous-aggregate refreshes routinely take minutes on a large install;
     // without a header and per-step lines the operator stares at a terminal that
@@ -181,8 +221,8 @@ async fn run_post_migration_maintenance(
 
     let report_progress = {
         let phase_pid = phase_pid.clone();
-        move |progress: temps_database::MaintenanceProgress<'_>| {
-            if let temps_database::MaintenanceProgress::PhaseBackend { pid } = &progress {
+        move |progress: temps_schema::MaintenanceProgress<'_>| {
+            if let temps_schema::MaintenanceProgress::PhaseBackend { pid } = &progress {
                 phase_pid.store(*pid, std::sync::atomic::Ordering::SeqCst);
             }
             if use_json {
@@ -194,13 +234,48 @@ async fn run_post_migration_maintenance(
     };
     let current_pid = || phase_pid.load(std::sync::atomic::Ordering::SeqCst);
 
+    let mut outcome = MaintenanceOutcome::Complete;
     match race_maintenance(
-        temps_database::run_post_migration_indexes_streaming(db, &report_progress),
+        temps_schema::run_post_migration_indexes_streaming(db, &report_progress),
         tokio::signal::ctrl_c(),
     )
     .await
     {
-        MaintenanceRace::Completed(result) => result?,
+        MaintenanceRace::Completed(Ok(())) => {}
+        // Every migration is committed by now, so this is deferred work, not a
+        // failed upgrade: `temps serve` builds these indexes in the background
+        // from startup and retries until they exist. A concurrent build has to
+        // wait for every transaction older than it, and on a live install a
+        // long query, export or backup can outlast the build's lock timeout.
+        // Failing here made an online update stop on a fully migrated schema
+        // and keep the previous release running against it.
+        MaintenanceRace::Completed(Err(error)) => {
+            outcome = MaintenanceOutcome::IndexesDeferred;
+            warn!(
+                "Post-migration index build did not finish; every migration is applied and \
+                 the server builds the remaining indexes at startup: {error}"
+            );
+            if use_json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&IndexesDeferredLine {
+                        event: "maintenance_indexes_deferred",
+                        error: error.to_string(),
+                    })?
+                );
+                let _ = std::io::stdout().flush();
+            } else {
+                println!(
+                    "  {} {}",
+                    "!".yellow(),
+                    format!(
+                        "Index build deferred: {error} (every migration is applied; the server \
+                         builds the remaining indexes at startup, or re-run `temps migrate`)"
+                    )
+                    .yellow()
+                );
+            }
+        }
         MaintenanceRace::Interrupted => {
             return Err(interrupted_maintenance_error(
                 database_url,
@@ -212,7 +287,7 @@ async fn run_post_migration_maintenance(
     }
 
     match race_maintenance(
-        temps_database::run_post_migration_backfill_streaming(db, &report_progress),
+        temps_schema::run_post_migration_backfill_streaming(db, &report_progress),
         tokio::signal::ctrl_c(),
     )
     .await
@@ -239,11 +314,89 @@ async fn run_post_migration_maintenance(
         }
     }
 
-    Ok(())
+    // Audit events written before vault attribution existed, in committed
+    // batches. Vault audit pages use the slower read-time enumeration until it
+    // completes; an interrupted or skipped run resumes at the next start.
+    match race_maintenance(
+        temps_schema::run_vault_audit_backfill(db),
+        tokio::signal::ctrl_c(),
+    )
+    .await
+    {
+        MaintenanceRace::Completed(Ok(summary)) => {
+            if summary.batches > 0 {
+                info!(
+                    batches = summary.batches,
+                    attributed = summary.attributed,
+                    "Attributed pre-migration audit events to their access vaults"
+                );
+                if !use_json {
+                    println!(
+                        "  {} Attributed {} audit events to their access vaults",
+                        "✓".green(),
+                        summary.attributed
+                    );
+                }
+            }
+        }
+        MaintenanceRace::Completed(Err(error)) => {
+            info!("Vault audit attribution skipped/failed (the server resumes it at startup): {error}");
+            if !use_json {
+                println!(
+                    "  {} {}",
+                    "!".yellow(),
+                    format!("Vault audit attribution skipped: {error} (the server resumes it at startup)")
+                        .yellow()
+                );
+            }
+        }
+        MaintenanceRace::Interrupted => {
+            return Err(interrupted_maintenance_error(
+                database_url,
+                current_pid(),
+                "vault audit attribution",
+            )
+            .await)
+        }
+    }
+
+    Ok(outcome)
 }
 
 impl MigrateCommand {
+    /// The database to migrate and the data directory for its backup, from
+    /// the shared resolver: this command's own sources first, then the
+    /// installed service at `locations` (with that server's data directory).
+    fn target(
+        &self,
+        locations: &crate::service_definition::ServiceLocations,
+    ) -> Result<MigrateTarget, crate::database_url_source::DatabaseUrlNotFound> {
+        let database = crate::database_url_source::resolve_database_url_in(
+            self.database_url.as_deref(),
+            crate::database_url_source::UrlDiscovery::InstalledService,
+            locations,
+        )?;
+        let (service_dir, server_data_dir_unknown) =
+            match crate::server_secrets::service_data_dir(&database) {
+                Ok(dir) => (dir, None),
+                Err(error) => (None, Some(error.to_string())),
+            };
+        Ok(MigrateTarget {
+            data_dir: self.data_dir.clone().or(service_dir),
+            database,
+            server_data_dir_unknown,
+        })
+    }
+
     pub fn execute(self) -> anyhow::Result<()> {
+        let MigrateTarget {
+            database,
+            data_dir: configured_data_dir,
+            server_data_dir_unknown,
+        } = self.target(&crate::service_definition::ServiceLocations::installed())?;
+        database.announce_discovery();
+        let database_url = database.into_url();
+
         // Local runtime — keep execute() synchronous (pingora compatibility).
         let rt = tokio::runtime::Runtime::new()?;
 
@@ -263,20 +416,20 @@ impl MigrateCommand {
             // in-flight migration server-side on Ctrl+C — otherwise the Postgres
             // backend keeps running the DDL after the CLI exits, and a re-run
             // would race a second backend against it.
-            let (db, backend_pid) = temps_database::connect_for_migrate(&self.database_url)
+            let (db, backend_pid) = temps_database::connect_for_migrate(&database_url)
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to connect to database: {}", e))?;
 
             // Read the plan up front (read-only) so we can show it before
             // applying anything — both for --dry-run and the confirmation gate.
-            let pending = temps_database::get_pending_migration_names(&db)
+            let pending = temps_schema::get_pending_migration_names(&db)
                 .await
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
 
             // A database migrated by a newer release is not "up to date" for
             // this binary, even with nothing of its own to apply: say so on
             // stdout, not only in the stderr log.
-            let schema_status = temps_database::check_schema_compatibility(&db)
+            let schema_status = temps_schema::check_schema_compatibility(&db)
                 .await
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
             if let Some(warning) = schema_status.newer_schema_warning() {
@@ -316,11 +469,25 @@ impl MigrateCommand {
                     println!("{} {}", "✓".green(), message.green());
                 }
                 if !self.dry_run {
+                    // The schema ledger can be current while a committed-batch
+                    // authorization backfill is unfinished. Resume it before
+                    // reporting maintenance success, preserving Ctrl+C cancellation.
+                    tokio::select! {
+                        result = temps_schema::run_migrations(&db) => {
+                            result.map_err(|error| anyhow::anyhow!("{error}"))?;
+                        }
+                        _ = tokio::signal::ctrl_c() => {
+                            return Err(interrupted_maintenance_error(
+                                &database_url, backend_pid, "legacy vault-link backfill",
+                            ).await);
+                        }
+                    }
                     // Non-transactional maintenance must remain retryable even
                     // after every schema migration is already recorded.
-                    run_post_migration_maintenance(&db, &self.database_url, backend_pid, use_json)
-                        .await?;
-                    if !use_json {
+                    let outcome =
+                        run_post_migration_maintenance(&db, &database_url, backend_pid, use_json)
+                            .await?;
+                    if !use_json && outcome == MaintenanceOutcome::Complete {
                         println!("{}", "✓ Post-migration maintenance complete.".green());
                     }
                 }
@@ -345,6 +512,21 @@ impl MigrateCommand {
                 return Ok(());
             }
 
+            // Only a run that takes the backup writes into the data directory,
+            // so only it is refused over where that would be, and before the
+            // operator is asked to confirm.
+            let data_dir = resolve_data_dir(configured_data_dir.as_deref())?;
+            let policy =
+                crate::commands::schema_upgrade::BackupPolicy::from_flag(self.pre_migration_backup);
+            if crate::commands::schema_upgrade::takes_backup(&schema_status, policy) {
+                check_backup_destination(
+                    configured_data_dir.as_deref(),
+                    server_data_dir_unknown.as_deref(),
+                    &data_dir,
+                    effective_uid(),
+                )?;
+            }
+
             // Confirmation gate. Skipped with --yes, in JSON mode (machine-driven),
             // or when stdin is not a TTY (piped/CI/systemd) so existing automation
             // never hangs on a prompt.
@@ -359,7 +541,6 @@ impl MigrateCommand {
 
             // Schema guard + pre-migration backup, after the operator agreed
             // to the plan and before the first migration is applied.
-            let data_dir = resolve_data_dir(self.data_dir.as_deref())?;
             if !use_json {
                 if self.pre_migration_backup {
                     println!(
@@ -384,9 +565,9 @@ impl MigrateCommand {
             }
             let prepared = crate::commands::schema_upgrade::prepare_schema_upgrade(
                 &db,
-                &self.database_url,
+                &database_url,
                 &data_dir,
-                crate::commands::schema_upgrade::BackupPolicy::from_flag(self.pre_migration_backup),
+                policy,
             )
             .await
             .map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -429,12 +610,12 @@ impl MigrateCommand {
             // transaction rolls back, leaving the DB at the last applied step.
             let report = if use_json {
                 tokio::select! {
-                    res = temps_database::run_migrations_streaming(&db, print_progress_json) => {
+                    res = temps_schema::run_migrations_streaming(&db, print_progress_json) => {
                         res.map_err(|e| anyhow::anyhow!("{}", e))?
                     }
                     _ = tokio::signal::ctrl_c() => {
                         return Err(interrupted_maintenance_error(
-                            &self.database_url,
+                            &database_url,
                             backend_pid,
                             "migration execution",
                         ).await);
@@ -442,12 +623,12 @@ impl MigrateCommand {
                 }
             } else {
                 tokio::select! {
-                    res = temps_database::run_migrations_streaming(&db, print_progress) => {
+                    res = temps_schema::run_migrations_streaming(&db, print_progress) => {
                         res.map_err(|e| anyhow::anyhow!("{}", e))?
                     }
                     _ = tokio::signal::ctrl_c() => {
                         return Err(interrupted_maintenance_error(
-                            &self.database_url,
+                            &database_url,
                             backend_pid,
                             "migration execution",
                         ).await);
@@ -479,7 +660,7 @@ impl MigrateCommand {
             // Tokio's process-wide signal handler remains installed after the
             // migration select above, so awaiting these phases directly would
             // swallow a later SIGINT and leave the operator unable to cancel.
-            run_post_migration_maintenance(&db, &self.database_url, backend_pid, use_json).await?;
+            run_post_migration_maintenance(&db, &database_url, backend_pid, use_json).await?;
 
             let total: std::time::Duration = report.results.iter().map(|r| r.elapsed).sum();
             if use_json {
@@ -517,8 +698,83 @@ struct BackupCompletedLine {
     elapsed_ms: u64,
 }
 
-/// `--data-dir`/`TEMPS_DATA_DIR`, else `~/.temps` — the same resolution as
-/// `temps serve`.
+/// Refuse a pre-migration backup that is about to be written to `data_dir`
+/// where it does not belong:
+/// - into `~/.temps` for the installed server's database when the server's
+///   own data directory is unknown, away from its data;
+/// - as root, into a directory another account owns (a `User=` service's):
+///   the backup directory and its lock would be root's, and `temps serve`
+///   running as that account could no longer take its own backups. Root
+///   writing into a directory that account controls is unsafe as well.
+///
+/// Only called when a backup will be taken: otherwise the data directory
+/// only names leftovers to clean up.
+fn check_backup_destination(
+    configured: Option<&std::path::Path>,
+    server_data_dir_unknown: Option<&str>,
+    data_dir: &std::path::Path,
+    euid: Option<u32>,
+) -> anyhow::Result<()> {
+    if let (None, Some(reason)) = (configured, server_data_dir_unknown) {
+        return Err(anyhow::anyhow!(
+            "Not taking the pre-migration backup: it would be written to this user's \
+             ~/.temps, away from the server's data. {reason}. Nothing was changed"
+        ));
+    }
+    if let Some((owner, path)) = euid.and_then(|euid| owned_by_another_account(data_dir, euid)) {
+        return Err(anyhow::anyhow!(
+            "Not taking the pre-migration backup as root: {} belongs to uid {owner}, so the \
+             backup directory and its lock would be root's and `temps serve` running as that \
+             account could no longer take its own backups. Run the command as that account \
+             (`sudo -u '#{owner}' temps migrate {}`), or pass --data-dir with a directory \
+             root owns. Nothing was changed",
+            path.display(),
+            crate::commands::schema_upgrade::BACKUP_FLAG
+        ));
+    }
+    Ok(())
+}
+
+/// This process's effective uid, where there is one.
+fn effective_uid() -> Option<u32> {
+    #[cfg(unix)]
+    {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        Some(unsafe { libc::geteuid() })
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+/// For a root `euid`, the owner of `dir` (or of its nearest existing
+/// ancestor, which a missing `dir` would be created in) when that is not
+/// root, with the path it was read from.
+fn owned_by_another_account(dir: &std::path::Path, euid: u32) -> Option<(u32, std::path::PathBuf)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if euid != 0 {
+            return None;
+        }
+        let (path, metadata) = dir.ancestors().find_map(|path| {
+            std::fs::metadata(path)
+                .ok()
+                .map(|metadata| (path, metadata))
+        })?;
+        (metadata.uid() != 0).then(|| (metadata.uid(), path.to_path_buf()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (dir, euid);
+        None
+    }
+}
+
+/// `--data-dir`/`TEMPS_DATA_DIR` (or the installed server's data directory,
+/// when the URL came from its service definition), else `~/.temps` — the
+/// same resolution as `temps serve`.
 fn resolve_data_dir(configured: Option<&std::path::Path>) -> anyhow::Result<std::path::PathBuf> {
     match configured {
         Some(dir) => Ok(dir.to_path_buf()),
@@ -571,13 +827,13 @@ fn confirm_apply(count: usize) -> anyhow::Result<bool> {
     Ok(input == "y" || input == "yes")
 }
 
-/// Live progress callback for [`temps_database::run_migrations_streaming`].
+/// Live progress callback for [`temps_schema::run_migrations_streaming`].
 ///
 /// On `Started`, prints the in-flight line WITHOUT a newline (and flushes) so a
 /// slow migration is visibly "the one running" while it works. On `Finished`,
 /// overwrites that line in place with the ✓/✗ result and timing.
-fn print_progress(progress: temps_database::MigrationProgress<'_>) {
-    use temps_database::MigrationProgress;
+fn print_progress(progress: temps_schema::MigrationProgress<'_>) {
+    use temps_schema::MigrationProgress;
     match progress {
         MigrationProgress::Started { index, total, name } => {
             // `\r` + no newline: the Finished branch rewrites this same line.
@@ -628,8 +884,8 @@ fn print_progress(progress: temps_database::MigrationProgress<'_>) {
 /// {"event":"finished","index":1,"total":5,"name":"...","success":true,"elapsed_ms":123}
 /// {"event":"finished","index":1,"total":5,"name":"...","success":false,"elapsed_ms":123,"error":"..."}
 /// ```
-fn print_progress_json(progress: temps_database::MigrationProgress<'_>) {
-    use temps_database::MigrationProgress;
+fn print_progress_json(progress: temps_schema::MigrationProgress<'_>) {
+    use temps_schema::MigrationProgress;
     match progress {
         MigrationProgress::Started { index, total, name } => {
             // Use serde_json::json! to avoid any escaping bugs in hand-rolled JSON.
@@ -676,8 +932,8 @@ fn print_progress_json(progress: temps_database::MigrationProgress<'_>) {
 ///
 /// When `interactive` is false (piped output, CI, systemd) every event gets its
 /// own complete line — `\r` rewriting is unreadable in a log file.
-fn print_maintenance(progress: temps_database::MaintenanceProgress<'_>, interactive: bool) {
-    use temps_database::MaintenanceProgress;
+fn print_maintenance(progress: temps_schema::MaintenanceProgress<'_>, interactive: bool) {
+    use temps_schema::MaintenanceProgress;
     match progress {
         // Bookkeeping for the interrupt path, not something to show an operator
         // mid-run; the PID is surfaced in the interruption error if it matters.
@@ -697,6 +953,48 @@ fn print_maintenance(progress: temps_database::MaintenanceProgress<'_>, interact
                 "✓".green(),
                 name,
                 format!("({})", format_elapsed(elapsed)).dimmed()
+            );
+        }
+        MaintenanceProgress::ForeignKeyDetachStarted {
+            table,
+            constraint,
+            chunks,
+        } => {
+            let line = format!(
+                "  {} drop foreign key {} from {} ({} chunk(s)) …",
+                "→".cyan(),
+                constraint,
+                table,
+                chunks
+            );
+            if interactive {
+                print!("{line}");
+                let _ = std::io::stdout().flush();
+            } else {
+                println!("{line}");
+            }
+        }
+        MaintenanceProgress::ForeignKeyDetachFinished {
+            table,
+            constraint,
+            chunks,
+            per_chunk,
+            elapsed,
+        } => {
+            let how = if per_chunk {
+                format!("{chunks} chunk(s), one per transaction")
+            } else if chunks > 0 {
+                format!("{chunks} chunk(s) in one transaction")
+            } else {
+                "plain table".to_string()
+            };
+            println!(
+                "{}  {} dropped foreign key {} from {} {}",
+                if interactive { "\r" } else { "" },
+                "✓".green(),
+                constraint,
+                table,
+                format!("({how}, {})", format_elapsed(elapsed)).dimmed()
             );
         }
         MaintenanceProgress::AggregateStarted { view, windows } => {
@@ -791,15 +1089,15 @@ fn print_maintenance(progress: temps_database::MaintenanceProgress<'_>, interact
 /// Mirrors [`print_maintenance`] as NDJSON so the "Update Now" orchestration
 /// worker can show the same phase to the user instead of a stalled progress
 /// bar between the last migration and completion.
-fn print_maintenance_json(progress: temps_database::MaintenanceProgress<'_>) {
+fn print_maintenance_json(progress: temps_schema::MaintenanceProgress<'_>) {
     println!("{}", maintenance_json(progress));
     let _ = std::io::stdout().flush();
 }
 
 /// The NDJSON line for one maintenance event. Split out from
 /// [`print_maintenance_json`] so the wire contract is unit-testable.
-fn maintenance_json(progress: temps_database::MaintenanceProgress<'_>) -> serde_json::Value {
-    use temps_database::MaintenanceProgress;
+fn maintenance_json(progress: temps_schema::MaintenanceProgress<'_>) -> serde_json::Value {
+    use temps_schema::MaintenanceProgress;
     match progress {
         // Emitted so a parent process can report/kill the exact backend if the
         // child is terminated out from under it.
@@ -814,6 +1112,30 @@ fn maintenance_json(progress: temps_database::MaintenanceProgress<'_>) -> serde_
         MaintenanceProgress::IndexFinished { name, elapsed } => serde_json::json!({
             "event": "maintenance_index_finished",
             "name": name,
+            "elapsed_ms": elapsed.as_millis() as u64,
+        }),
+        MaintenanceProgress::ForeignKeyDetachStarted {
+            table,
+            constraint,
+            chunks,
+        } => serde_json::json!({
+            "event": "maintenance_foreign_key_detach_started",
+            "table": table,
+            "constraint": constraint,
+            "chunks": chunks,
+        }),
+        MaintenanceProgress::ForeignKeyDetachFinished {
+            table,
+            constraint,
+            chunks,
+            per_chunk,
+            elapsed,
+        } => serde_json::json!({
+            "event": "maintenance_foreign_key_detach_finished",
+            "table": table,
+            "constraint": constraint,
+            "chunks": chunks,
+            "per_chunk": per_chunk,
             "elapsed_ms": elapsed.as_millis() as u64,
         }),
         MaintenanceProgress::AggregateStarted { view, windows } => serde_json::json!({
@@ -854,7 +1176,7 @@ fn maintenance_json(progress: temps_database::MaintenanceProgress<'_>) -> serde_
 /// After a streaming apply, surface any planned migrations that were never
 /// attempted (everything after a failure) so the operator knows the set is
 /// incomplete. No-op on a fully successful run.
-fn print_unattempted(report: &temps_database::MigrationRunReport) {
+fn print_unattempted(report: &temps_schema::MigrationRunReport) {
     let attempted = report.results.len();
     if attempted < report.planned.len() {
         println!();
@@ -888,6 +1210,106 @@ fn format_elapsed(d: std::time::Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::{race_maintenance, MaintenanceRace};
+
+    /// An online update runs `temps migrate` while the previous release keeps
+    /// serving. A concurrent index build waits for every older transaction,
+    /// so one long reader (an export, a backup, a slow report) used to turn a
+    /// fully applied schema into a failed migrate, and the update then kept
+    /// the old binary running on the new schema. The build is left to the
+    /// server instead, which finishes it once that reader is gone.
+    #[tokio::test]
+    async fn an_index_build_blocked_by_a_long_reader_is_deferred_not_failed() {
+        use sea_orm::{ConnectionTrait, DatabaseBackend, Statement, TransactionTrait};
+        if !temps_test_utils::external_database_configured()
+            && !temps_test_utils::docker_available().await
+        {
+            eprintln!("Skipping deferred index build: database unavailable");
+            return;
+        }
+        let mut test = temps_test_utils::TestDatabase::with_migrations()
+            .await
+            .unwrap();
+        let db = test.connection_arc();
+        // A cancelled concurrent build leaves an invalid index behind, so ask
+        // for a usable one rather than any relation of that name.
+        let index_exists = || async {
+            db.query_one(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "SELECT COALESCE((SELECT indisvalid FROM pg_index WHERE indexrelid = \
+                 to_regclass('idx_audit_logs_permission_denied_retention')), false) AS present",
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get::<bool>("", "present")
+            .unwrap()
+        };
+        db.execute_unprepared(
+            "DROP INDEX CONCURRENTLY IF EXISTS idx_audit_logs_permission_denied_retention",
+        )
+        .await
+        .unwrap();
+
+        // A reader on its own connection whose snapshot predates the build.
+        let reader_db = sea_orm::Database::connect(test.database_url.as_str())
+            .await
+            .unwrap();
+        let reader = reader_db
+            .begin_with_config(Some(sea_orm::IsolationLevel::RepeatableRead), None)
+            .await
+            .unwrap();
+        reader.execute_unprepared("SELECT 1").await.unwrap();
+
+        let outcome = super::run_post_migration_maintenance(&db, &test.database_url, 0, true)
+            .await
+            .expect("an index build that has to wait must not fail the migrate");
+        assert_eq!(outcome, super::MaintenanceOutcome::IndexesDeferred);
+        assert!(!index_exists().await, "the reader was still open");
+
+        // Once the reader is gone a retry builds it: the server's background
+        // one, or `temps migrate` run again.
+        reader.commit().await.unwrap();
+        reader_db.close().await.unwrap();
+        let outcome = super::run_post_migration_maintenance(&db, &test.database_url, 0, true)
+            .await
+            .unwrap();
+        assert_eq!(outcome, super::MaintenanceOutcome::Complete);
+        assert!(index_exists().await);
+        test.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn migrate_command_resumes_links_with_no_pending_schema_and_dry_run_does_not_write() {
+        use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+        if !temps_test_utils::external_database_configured()
+            && !temps_test_utils::docker_available().await
+        {
+            eprintln!("Skipping migrate command retry: database unavailable");
+            return;
+        }
+        let mut test = temps_test_utils::TestDatabase::with_migrations()
+            .await
+            .unwrap();
+        let db = test.connection();
+        db.execute_unprepared("INSERT INTO projects(id,name,repo_name,repo_owner,directory,main_branch,preset,slug,created_at,updated_at) VALUES(9951,'Fixture','repo','owner','/','main','nodejs','cli-backfill-fixture',now(),now()); INSERT INTO access_vaults(id,project_id,name,service_ids) VALUES('vault_cli_retry',9951,'Fixture',ARRAY[]::text[])").await.unwrap();
+        assert!(temps_schema::get_pending_migration_names(db)
+            .await
+            .unwrap()
+            .is_empty());
+        for dry_run in [true, false] {
+            let mut command = parse(&["--yes"]).unwrap();
+            command.database_url = Some(test.database_url.clone());
+            command.dry_run = dry_run;
+            tokio::task::spawn_blocking(move || command.execute())
+                .await
+                .unwrap()
+                .unwrap();
+            let row = db.query_one(Statement::from_string(DatabaseBackend::Postgres,
+                "SELECT EXISTS(SELECT 1 FROM access_vault_links WHERE id='link_legacy_vault_cli_retry') AS linked")).await.unwrap().unwrap();
+            assert_eq!(row.try_get::<bool>("", "linked").unwrap(), !dry_run);
+        }
+        test.cleanup().await;
+    }
 
     #[test]
     fn data_dir_prefers_the_configured_directory() {
@@ -933,7 +1355,7 @@ mod tests {
 
     #[test]
     fn maintenance_backfill_window_json_reports_progress_and_failure() {
-        use temps_database::MaintenanceProgress;
+        use temps_schema::MaintenanceProgress;
 
         let ok = super::maintenance_json(MaintenanceProgress::AggregateWindow {
             view: "proxy_logs_stats_1m",
@@ -963,7 +1385,7 @@ mod tests {
 
     #[test]
     fn maintenance_index_json_events_are_distinguishable() {
-        use temps_database::MaintenanceProgress;
+        use temps_schema::MaintenanceProgress;
 
         let started = super::maintenance_json(MaintenanceProgress::IndexStarted { name: "idx_a" });
         assert_eq!(started["event"], "maintenance_index_started");
@@ -975,6 +1397,31 @@ mod tests {
         });
         assert_eq!(finished["event"], "maintenance_index_finished");
         assert_eq!(finished["elapsed_ms"], 3_000);
+    }
+
+    #[test]
+    fn maintenance_foreign_key_detach_json_events_report_how_it_went() {
+        use temps_schema::MaintenanceProgress;
+
+        let started = super::maintenance_json(MaintenanceProgress::ForeignKeyDetachStarted {
+            table: "events",
+            constraint: "fk_events_project_id",
+            chunks: 1_460,
+        });
+        assert_eq!(started["event"], "maintenance_foreign_key_detach_started");
+        assert_eq!(started["chunks"], 1_460);
+
+        let finished = super::maintenance_json(MaintenanceProgress::ForeignKeyDetachFinished {
+            table: "events",
+            constraint: "fk_events_project_id",
+            chunks: 1_460,
+            per_chunk: true,
+            elapsed: std::time::Duration::from_secs(2),
+        });
+        assert_eq!(finished["event"], "maintenance_foreign_key_detach_finished");
+        assert_eq!(finished["table"], "events");
+        assert_eq!(finished["per_chunk"], true);
+        assert_eq!(finished["elapsed_ms"], 2_000);
     }
 
     #[tokio::test]
@@ -1084,5 +1531,193 @@ mod tests {
             parse(&["--pre-migration-backup", "--skip-pre-migration-backup"]).is_err(),
             "asking for and against the backup at once must be rejected"
         );
+    }
+
+    /// `MigrateCommand` parsed from `extra` with its env-backed arguments
+    /// pointed at variable names nothing sets, so the host's environment
+    /// cannot leak into the test.
+    fn parse_isolated(extra: &[&str]) -> super::MigrateCommand {
+        use clap::{Args, FromArgMatches};
+        let command = super::MigrateCommand::augment_args(clap::Command::new("temps"))
+            .mut_arg("database_url", |a| {
+                a.env("TEMPS_TEST_MIGRATE_UNSET_DATABASE_URL")
+            })
+            .mut_arg("data_dir", |a| a.env("TEMPS_TEST_MIGRATE_UNSET_DATA_DIR"))
+            .mut_arg("pre_migration_backup", |a| {
+                a.env("TEMPS_TEST_MIGRATE_UNSET_PRE_MIGRATION_BACKUP")
+            });
+        let mut argv = vec!["temps"];
+        argv.extend_from_slice(extra);
+        let matches = command.try_get_matches_from(argv).expect("migrate parses");
+        super::MigrateCommand::from_arg_matches(&matches).expect("migrate arguments")
+    }
+
+    fn installer_unit(home: &std::path::Path) -> crate::service_definition::ServiceLocations {
+        let unit = home.join("temps.service");
+        crate::service_definition::test_support::write_trusted(
+            &unit,
+            format!(
+                "[Service]\nExecStart={h}/.temps/bin/temps serve \\\n  \
+                 --database-url=\"postgresql://temps:pw@127.0.0.1:5432/temps\" \\\n  \
+                 --data-dir=\"{h}/.temps/data\"\n",
+                h = home.display()
+            ),
+        )
+        .unwrap();
+        crate::service_definition::ServiceLocations {
+            systemd_unit: Some(unit),
+            launchd_agent: None,
+        }
+    }
+
+    #[test]
+    fn migrate_no_longer_requires_database_url() {
+        assert!(parse_isolated(&[]).database_url.is_none());
+    }
+
+    #[test]
+    fn migrate_uses_the_installed_services_database_and_data_dir() {
+        let home = tempfile::tempdir().unwrap();
+        let locations = installer_unit(home.path());
+        let target = parse_isolated(&[])
+            .target(&locations)
+            .expect("found in the unit");
+        assert_eq!(
+            target.database.url(),
+            "postgresql://temps:pw@127.0.0.1:5432/temps"
+        );
+        assert_eq!(target.data_dir, Some(home.path().join(".temps/data")));
+    }
+
+    #[test]
+    fn migrate_flags_still_win_over_the_installed_service() {
+        let home = tempfile::tempdir().unwrap();
+        let locations = installer_unit(home.path());
+        let target = parse_isolated(&[
+            "--database-url",
+            "postgres://elsewhere/temps",
+            "--data-dir",
+            "/srv/backups",
+        ])
+        .target(&locations)
+        .expect("explicit values");
+        assert_eq!(target.database.url(), "postgres://elsewhere/temps");
+        assert_eq!(
+            target.data_dir,
+            Some(std::path::PathBuf::from("/srv/backups"))
+        );
+        // Another database: not the service's, so not its data dir either.
+        let target = parse_isolated(&["--database-url", "postgres://elsewhere/temps"])
+            .target(&locations)
+            .expect("explicit url");
+        assert_eq!(target.data_dir, None);
+    }
+
+    #[test]
+    fn a_backup_never_goes_to_home_when_the_servers_data_dir_is_unknown() {
+        let home = tempfile::tempdir().unwrap();
+        let unit = home.path().join("temps.service");
+        // No --data-dir and an account without a home: serve's data
+        // directory cannot be told.
+        crate::service_definition::test_support::write_trusted(
+            &unit,
+            "[Service]\nUser=temps-test-no-such-user\n\
+             ExecStart=/usr/bin/temps serve --database-url=postgresql://temps:pw@127.0.0.1:5432/temps\n",
+        )
+        .unwrap();
+        let locations = crate::service_definition::ServiceLocations {
+            systemd_unit: Some(unit),
+            launchd_agent: None,
+        };
+        let target = parse_isolated(&[])
+            .target(&locations)
+            .expect("found in the unit");
+        assert_eq!(target.data_dir, None);
+        let reason = target
+            .server_data_dir_unknown
+            .expect("the reason it is unknown");
+        assert!(reason.contains("--data-dir"), "{reason}");
+
+        let data = home.path().join(".temps");
+        let error = super::check_backup_destination(None, Some(&reason), &data, None).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("Not taking the pre-migration backup")
+                && message.contains("--data-dir"),
+            "{message}"
+        );
+        // With --data-dir, nothing is in the way.
+        let explicit = std::path::Path::new("/srv/temps-data");
+        assert!(
+            super::check_backup_destination(Some(explicit), Some(&reason), explicit, None).is_ok()
+        );
+
+        // With the service's data dir known, there is no reason to refuse.
+        let locations = installer_unit(home.path());
+        let target = parse_isolated(&[])
+            .target(&locations)
+            .expect("found in the unit");
+        assert!(target.server_data_dir_unknown.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_never_writes_the_backup_into_another_accounts_data_dir() {
+        use std::os::unix::fs::MetadataExt;
+        let home = tempfile::tempdir().unwrap();
+        let owner = std::fs::metadata(home.path()).unwrap().uid();
+        if owner == 0 {
+            // Running as root: no directory here belongs to another account.
+            return;
+        }
+        // A data directory that does not exist yet would be created in its
+        // parent, so the parent's owner is the one that counts.
+        let data = home.path().join(".temps/data");
+        assert_eq!(
+            super::owned_by_another_account(&data, 0),
+            Some((owner, home.path().to_path_buf()))
+        );
+        let error = super::check_backup_destination(None, None, &data, Some(0)).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!("uid {owner}"))
+                && message.contains(&format!("sudo -u '#{owner}'"))
+                && message.contains("Nothing was changed"),
+            "{message}"
+        );
+        // The account itself, or any account not root, writes as itself.
+        assert!(super::check_backup_destination(None, None, &data, Some(owner)).is_ok());
+        assert_eq!(super::owned_by_another_account(&data, owner), None);
+    }
+
+    #[test]
+    fn only_a_run_that_takes_the_backup_checks_where_it_goes() {
+        use crate::commands::schema_upgrade::{takes_backup, BackupPolicy};
+        let pending = temps_schema::SchemaStatus::PendingUpgrade {
+            applied: 3,
+            pending: vec!["m20990101_000001_example".to_string()],
+        };
+        assert!(takes_backup(&pending, BackupPolicy::Enabled));
+        assert!(!takes_backup(&pending, BackupPolicy::Disabled));
+        // An up-to-date or fresh database takes none, flag or not.
+        assert!(!takes_backup(
+            &temps_schema::SchemaStatus::Fresh,
+            BackupPolicy::Enabled
+        ));
+    }
+
+    #[test]
+    fn migrate_without_any_source_lists_what_it_checked() {
+        let home = tempfile::tempdir().unwrap();
+        let locations = crate::service_definition::ServiceLocations {
+            systemd_unit: Some(home.path().join("temps.service")),
+            launchd_agent: None,
+        };
+        let error = match parse_isolated(&[]).target(&locations) {
+            Ok(_) => panic!("nothing configured must not resolve"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("TEMPS_DATABASE_URL_FILE"), "{error}");
+        assert!(error.contains("temps.service: not found"), "{error}");
     }
 }

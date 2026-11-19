@@ -62,72 +62,39 @@ pub fn compute_tls_fingerprint_from_arc(ssl_digest: &Arc<SslDigest>) -> Option<S
     compute_tls_fingerprint(ssl_digest.as_ref())
 }
 
-/// Compute a fingerprint with client characteristics
-///
-/// Extended fingerprint includes:
-/// - TLS version
-/// - Negotiated cipher suite
-/// - Client IP address
-/// - User-Agent header
-///
-/// This creates a unique identifier per person/device/location,
-/// ensuring different users get different fingerprints even with
-/// the same TLS configuration.
-pub fn compute_fingerprint(
-    ssl_digest: &SslDigest,
-    ip_address: Option<&str>,
-    user_agent: &str,
-) -> Option<String> {
-    // Get TLS version and cipher as &str (Cow<'static, str> in Pingora 0.7.0)
-    let version: &str = ssl_digest.version.as_ref();
-    let cipher: &str = ssl_digest.cipher.as_ref();
-
-    // Construct fingerprint components
-    let protocol = match version {
-        "TLSv1.3" => "t13",
-        "TLSv1.2" => "t12",
-        "TLSv1.1" => "t11",
-        "TLSv1.0" => "t10",
-        _ => "tun", // Unknown TLS version
-    };
-
-    // Create composite fingerprint data string with all characteristics
-    // This ensures different people get different fingerprints
-    let ip_part = ip_address.unwrap_or("unknown");
-    let fingerprint_data = format!("{}-{}-{}-{}", version, cipher, ip_part, user_agent);
-
-    // Hash the composite data (first 12 bytes = 24 hex chars)
-    let mut hasher = Sha256::new();
-    hasher.update(fingerprint_data.as_bytes());
-    let hash = hasher.finalize();
-    let hash_str = hex::encode(&hash[..12]);
-
-    let fingerprint = format!("{}_{}", protocol, hash_str);
-
-    debug!(
-        version = version,
-        cipher = cipher,
-        ip_address = ip_part,
-        user_agent = user_agent,
-        fingerprint = fingerprint,
-        "Computed client fingerprint"
-    );
-
-    Some(fingerprint)
-}
-
-/// Compute fingerprint from Arc<SslDigest> with client characteristics
-pub fn compute_fingerprint_from_arc(
-    ssl_digest: &Arc<SslDigest>,
-    ip_address: Option<&str>,
-    user_agent: &str,
-) -> Option<String> {
-    compute_fingerprint(ssl_digest.as_ref(), ip_address, user_agent)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::borrow::Cow;
+
+    fn digest(version: &'static str, cipher: &'static str) -> SslDigest {
+        SslDigest {
+            cipher: Cow::Borrowed(cipher),
+            version: Cow::Borrowed(version),
+            organization: None,
+            serial_number: None,
+            cert_digest: Vec::new(),
+            extension: Default::default(),
+        }
+    }
+
+    /// The attack-mode clearance binds to this value next to the client's
+    /// /24 or /64 and User-Agent (ADR 066, D3). It must describe only the
+    /// TLS session, or a visitor moving within their network would lose
+    /// their clearance.
+    #[test]
+    fn fingerprint_depends_only_on_the_tls_session() {
+        let a = compute_tls_fingerprint(&digest("TLSv1.3", "TLS_AES_128_GCM_SHA256"));
+        assert_eq!(
+            a,
+            compute_tls_fingerprint(&digest("TLSv1.3", "TLS_AES_128_GCM_SHA256"))
+        );
+        assert_ne!(
+            a,
+            compute_tls_fingerprint(&digest("TLSv1.3", "TLS_AES_256_GCM_SHA384"))
+        );
+        assert!(a.is_some_and(|f| f.starts_with("t13_") && f.len() == 28));
+    }
 
     #[test]
     fn test_fingerprint_format() {

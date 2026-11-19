@@ -1,0 +1,148 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+# ADR-055 phase 3 mixed-version e2e: a new control plane, an old worker
+# (built from an older revision) and a new worker, as privileged DinD
+# containers. Driven by run.py; everything is labelled
+# sh.temps.test=adr055-p3 and removed by `run.py down`.
+name: adr055-p3
+
+x-labels: &labels
+  sh.temps.test: adr055-p3
+
+networks:
+  net:
+    name: adr055-p3-net
+    labels: *labels
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.233.0.0/24
+
+volumes:
+  new-target: { name: adr055-p3-new-target, external: true }
+  old-target: { name: adr055-p3-old-target, external: true }
+  scripts: { name: adr055-p3-scripts, external: true }
+  pg: { name: adr055-p3-pg, labels: *labels }
+  cp-docker: { name: adr055-p3-cp-docker, labels: *labels }
+  cp-data: { name: adr055-p3-cp-data, labels: *labels }
+  state: { name: adr055-p3-state, labels: *labels }
+  state-new: { name: adr055-p3-state-new, labels: *labels }
+  wo-docker: { name: adr055-p3-wo-docker, labels: *labels }
+  wo-data: { name: adr055-p3-wo-data, labels: *labels }
+  wo-home: { name: adr055-p3-wo-home, labels: *labels }
+  wn-docker: { name: adr055-p3-wn-docker, labels: *labels }
+  wn-data: { name: adr055-p3-wn-data, labels: *labels }
+  wn-home: { name: adr055-p3-wn-home, labels: *labels }
+
+services:
+  postgres:
+    image: timescale/timescaledb-ha:pg18
+    container_name: adr055-p3-postgres
+    labels: *labels
+    networks: { net: { ipv4_address: 10.233.0.5 } }
+    environment:
+      POSTGRES_DB: temps
+      POSTGRES_USER: temps
+      POSTGRES_PASSWORD: temps
+      POSTGRES_HOST_AUTH_METHOD: trust
+    volumes: [ "pg:/home/postgres/pgdata" ]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "temps", "-d", "temps"]
+      interval: 2s
+      timeout: 2s
+      retries: 60
+
+  control-plane:
+    image: adr055-p3-dind:latest
+    container_name: adr055-p3-cp
+    labels: *labels
+    privileged: true
+    hostname: control-plane
+    cgroup: private
+    networks: { net: { ipv4_address: 10.233.0.10 } }
+    ports: [ "127.0.0.1:${MIXED_VERSION_API_PORT:-18363}:80" ]
+    environment:
+      TEMPS_DATABASE_URL: postgres://temps:temps@10.233.0.5:5432/temps
+      TEMPS_ADDRESS: 0.0.0.0:80
+      TEMPS_TLS_ADDRESS: 0.0.0.0:443
+      TEMPS_DATA_DIR: /var/lib/temps
+      TEMPS_LOG_LEVEL: info
+      TEMPS_NETWORK_NAME: temps-app-network
+      TEMPS_TELEMETRY: "0"
+      DEV_CLUSTER_STATE_DIR: /run/temps-bootstrap
+      DEV_CLUSTER_USE_ENROLLMENT_TOKEN: "true"
+      DEV_CLUSTER_ENROLLMENT_NODE_NAME: worker-old
+      DEV_CLUSTER_GENERATE_TLS_CERT: "true"
+      DEV_CLUSTER_TLS_HOST: control-plane.temps.test
+      DEV_CLUSTER_WILDCARD_DOMAIN: "*.temps.test"
+      DEV_CLUSTER_EXTERNAL_URL: https://control-plane.temps.test
+      DEV_CLUSTER_PREBUILT_TEMPS_BIN: /newt/debug/temps
+      TEMPS_DISABLE_HTTPS_REDIRECT: "true"
+    volumes:
+      - scripts:/workspace:ro
+      - new-target:/newt:ro
+      - cp-docker:/var/lib/docker
+      - cp-data:/var/lib/temps
+      - state:/run/temps-bootstrap
+      - state-new:/run/state-new
+    depends_on: { postgres: { condition: service_healthy } }
+    command: ["bash", "/workspace/tools/dev-cluster/role-control-plane.sh"]
+
+  worker-old:
+    image: adr055-p3-dind:latest
+    container_name: adr055-p3-worker-old
+    labels: *labels
+    privileged: true
+    hostname: worker-old
+    cgroup: private
+    networks: { net: { ipv4_address: 10.233.0.21 } }
+    extra_hosts: [ "control-plane.temps.test:10.233.0.10" ]
+    environment:
+      WORKER_NAME: worker-old
+      WORKER_UNDERLAY_IP: 10.233.0.21
+      CONTROL_PLANE_URL: https://control-plane.temps.test
+      TEMPS_LOG_LEVEL: info
+      TEMPS_NETWORK_NAME: temps-app-network
+      TEMPS_AGENT_ADDRESS: 0.0.0.0:3100
+      TEMPS_TELEMETRY: "0"
+      DEV_CLUSTER_STATE_DIR: /run/temps-bootstrap
+      DEV_CLUSTER_CONTROL_PLANE_CA: /run/temps-bootstrap/control-plane.crt
+      DEV_CLUSTER_PREBUILT_TEMPS_BIN: /oldt/debug/temps
+    volumes:
+      - scripts:/workspace:ro
+      - old-target:/oldt:ro
+      - wo-docker:/var/lib/docker
+      - wo-data:/var/lib/temps
+      - wo-home:/root
+      - state:/run/temps-bootstrap
+    command: ["bash", "/workspace/tools/dev-cluster/role-worker.sh"]
+
+  worker-new:
+    image: adr055-p3-dind:latest
+    container_name: adr055-p3-worker-new
+    labels: *labels
+    privileged: true
+    hostname: worker-new
+    cgroup: private
+    networks: { net: { ipv4_address: 10.233.0.22 } }
+    extra_hosts: [ "control-plane.temps.test:10.233.0.10" ]
+    environment:
+      WORKER_NAME: worker-new
+      WORKER_UNDERLAY_IP: 10.233.0.22
+      CONTROL_PLANE_URL: https://control-plane.temps.test
+      TEMPS_LOG_LEVEL: info
+      TEMPS_NETWORK_NAME: temps-app-network
+      TEMPS_AGENT_ADDRESS: 0.0.0.0:3100
+      TEMPS_TELEMETRY: "0"
+      DEV_CLUSTER_STATE_DIR: /run/state-new
+      DEV_CLUSTER_CONTROL_PLANE_CA: /run/state-new/control-plane.crt
+      DEV_CLUSTER_PREBUILT_TEMPS_BIN: /newt/debug/temps
+    volumes:
+      - scripts:/workspace:ro
+      - new-target:/newt:ro
+      - wn-docker:/var/lib/docker
+      - wn-data:/var/lib/temps
+      - wn-home:/root
+      - state-new:/run/state-new
+    command: ["bash", "/workspace/tools/dev-cluster/role-worker.sh"]

@@ -46,9 +46,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use sea_orm::sea_query::Expr;
-#[cfg(test)]
-use sea_orm::Set;
-use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
+use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QuerySelect};
 use temps_core::log_transitions::{FailureLatch, FailureLog, KeyedFailureLatch};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
@@ -115,6 +113,10 @@ pub struct AlertEvaluator {
     /// unreachable metrics store or a failing alarm write logged the same line
     /// every 30 seconds, forever. See [`temps_core::log_transitions`].
     log_state: EvaluatorLogState,
+    /// Worker node ids whose default disk-health rules have been seeded;
+    /// `None` until the first sync. Lets each cycle seed only nodes that
+    /// joined since the last one, instead of re-inserting for every node.
+    worker_nodes: std::sync::Mutex<Option<std::collections::BTreeSet<i32>>>,
 }
 
 /// Failure latches for [`AlertEvaluator`]'s recurring conditions.
@@ -222,7 +224,95 @@ impl AlertEvaluator {
             breach_start: Arc::new(RwLock::new(HashMap::new())),
             firing_alarms: Arc::new(RwLock::new(HashMap::new())),
             log_state: EvaluatorLogState::default(),
+            worker_nodes: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Give every worker node the default disk-health rules, and drop the
+    /// node-scoped rules of workers that were removed. Cheap when nothing
+    /// changed: one `SELECT id FROM nodes`. A worker that already has any
+    /// disk-health rule is left alone, and those rules cannot be deleted
+    /// (`NodeAlertRuleService::delete` refuses; they are disabled instead),
+    /// so an operator's changes to them survive restarts. Worker nodes report RAID and
+    /// SMART health in their heartbeat, so these rules have data to read;
+    /// the file-descriptor defaults stay control-plane only, since workers
+    /// don't report those metrics.
+    async fn sync_worker_node_rules(&self) -> Result<(), MetricsError> {
+        use sea_orm::{ConnectionTrait, Statement};
+        let rows = self
+            .db
+            .query_all(Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT id FROM nodes WHERE id <> 0",
+            ))
+            .await
+            .map_err(MetricsError::DatabaseError)?;
+        let current: std::collections::BTreeSet<i32> = rows
+            .iter()
+            .filter_map(|row| row.try_get::<i32>("", "id").ok())
+            .collect();
+        let previous = match self.worker_nodes.lock() {
+            Ok(known) => known.clone(),
+            Err(_) => None,
+        };
+        if previous.as_ref() == Some(&current) {
+            return Ok(());
+        }
+        let previous = previous.unwrap_or_default();
+        let seeds = node_disk_health_default_seeds();
+        let new_nodes: Vec<i32> = current.difference(&previous).copied().collect();
+        let already_seeded: std::collections::BTreeSet<i32> = if new_nodes.is_empty() {
+            Default::default()
+        } else {
+            let placeholders: Vec<String> = (1..=seeds.len()).map(|i| format!("${i}")).collect();
+            let rows = self
+                .db
+                .query_all(Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Postgres,
+                    format!(
+                        "SELECT DISTINCT node_id FROM monitoring_alert_rules \
+                         WHERE node_id IS NOT NULL AND node_id <> 0 \
+                         AND metric_name IN ({})",
+                        placeholders.join(", ")
+                    ),
+                    seeds.iter().map(|seed| seed.metric_name.into()),
+                ))
+                .await
+                .map_err(MetricsError::DatabaseError)?;
+            rows.iter()
+                .filter_map(|row| row.try_get::<i32>("", "node_id").ok())
+                .collect()
+        };
+        for node_id in new_nodes.iter().filter(|id| !already_seeded.contains(id)) {
+            seed_node_rules(
+                self.db.as_ref(),
+                "seed_worker_disk_health_rules",
+                *node_id,
+                &seeds,
+            )
+            .await?;
+        }
+        // No FK can do this: node 0 has no row, so `node_id` has none.
+        let removed = self
+            .db
+            .execute(Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                "DELETE FROM monitoring_alert_rules r \
+                 WHERE r.node_id IS NOT NULL AND r.node_id <> 0 \
+                 AND NOT EXISTS (SELECT 1 FROM nodes n WHERE n.id = r.node_id)",
+            ))
+            .await
+            .map_err(MetricsError::DatabaseError)?;
+        if removed.rows_affected() > 0 {
+            info!(
+                rules = removed.rows_affected(),
+                "AlertEvaluator: removed alert rules of worker nodes that no longer exist"
+            );
+        }
+        if let Ok(mut known) = self.worker_nodes.lock() {
+            *known = Some(current);
+        }
+        Ok(())
     }
 
     /// Run the evaluation loop forever.  Spawn this on a background task.
@@ -627,6 +717,12 @@ impl AlertEvaluator {
     async fn run_cycle(&self) -> Result<(), String> {
         let now_ts = Utc::now();
 
+        // A failure here only delays a new node's default rules; the cycle
+        // still evaluates the rules that exist.
+        if let Err(e) = self.sync_worker_node_rules().await {
+            warn!("AlertEvaluator: failed to sync worker node alert rules: {e}");
+        }
+
         // Load all enabled rules that are not currently silenced.
         let rules = monitoring_alert_rules::Entity::find()
             .filter(monitoring_alert_rules::Column::Enabled.eq(true))
@@ -744,19 +840,7 @@ impl AlertEvaluator {
                 }
             };
 
-            // Deduplicate metric names for this source. A rule whose metric
-            // has a volume gate also needs the gating metric, fetched in the
-            // same query so gating costs no extra round trip.
-            let names: Vec<String> = group
-                .iter()
-                .flat_map(|r| {
-                    std::iter::once(r.metric_name.as_str())
-                        .chain(default_volume_gate(r).map(|g| g.metric_name))
-                })
-                .map(str::to_string)
-                .collect::<HashSet<_>>()
-                .into_iter()
-                .collect();
+            let names = latest_metric_names(group);
 
             let source_key = (source_kind_str.clone(), *source_id);
             let latest = match self
@@ -831,8 +915,24 @@ impl AlertEvaluator {
         let value = match latest.get(&rule.metric_name) {
             Some(v) => *v,
             None => {
-                // No data yet — clear any breach state and return.
-                self.clear_breach(rule.id).await;
+                // A gated ratio can be absent because its volume metric shows
+                // too little traffic to compute one: an idle Postgres window
+                // writes `pg.cache_blocks_accessed_15m = 0` and no ratio. That is
+                // the same healthy state as a present ratio below the gate,
+                // so resolve an alarm it fired. Zero volume over the ratio's
+                // own window resolves an edited rule too, which is never
+                // gated: a ratio over no traffic cannot be breaching, and
+                // nothing else would ever resolve its alarm while the source
+                // stays idle. With no volume metric either, there is simply
+                // no data yet.
+                let below_default_gate = default_volume_gate(rule)
+                    .is_some_and(|gate| latest.contains_key(gate.metric_name))
+                    && !meets_volume_gate(&rule.metric_name, latest);
+                if below_default_gate || has_no_volume(&rule.metric_name, latest) {
+                    self.handle_recovery(rule, ctx).await;
+                } else {
+                    self.clear_breach(rule.id).await;
+                }
                 return Ok(());
             }
         };
@@ -859,6 +959,15 @@ impl AlertEvaluator {
             return Ok(());
         }
         if default_volume_gate(rule).is_some() && !meets_volume_gate(&rule.metric_name, latest) {
+            self.handle_recovery(rule, ctx).await;
+            return Ok(());
+        }
+
+        // The store's latest values are picked per metric over the last 15
+        // minutes, so a cache hit window gone idle since pairs its zero
+        // volume with the last ratio written while it had traffic. That ratio
+        // no longer describes the source, gated rule or edited one.
+        if has_no_volume(&rule.metric_name, latest) {
             self.handle_recovery(rule, ctx).await;
             return Ok(());
         }
@@ -1179,6 +1288,18 @@ impl AlertEvaluator {
                 // (and its notification) records which service breached.
                 return (Some(ps.project_id), None, None, Some(svc_id));
             }
+            // Not linked to a project (a database run on its own): still a
+            // host-wide alarm, but one that names the service, as long as
+            // it still exists (the column is a foreign key).
+            if let Ok(Some(_)) = temps_entities::external_services::Entity::find_by_id(svc_id)
+                .select_only()
+                .column(temps_entities::external_services::Column::Id)
+                .into_tuple::<i32>()
+                .one(self.db.as_ref())
+                .await
+            {
+                return (None, None, None, Some(svc_id));
+            }
         }
 
         // Node-scoped rules (and the fallback for a rule whose deployment/
@@ -1203,10 +1324,25 @@ pub const REDIS_FRAGMENTATION_MIN_USED_BYTES: f64 = 100.0 * 1024.0 * 1024.0;
 /// evaluated. One `GET` of a missing key on a new instance is a 0% hit ratio.
 pub const REDIS_HIT_RATIO_MIN_LOOKUPS: f64 = 10_000.0;
 
-/// Lifetime shared-buffer block accesses (hits + reads) before the Postgres
-/// cache hit ratio is evaluated. A new server's first reads all come from
-/// disk, so its ratio starts low and only becomes meaningful with volume.
-pub const PG_CACHE_HIT_RATIO_MIN_BLOCKS: f64 = 100_000.0;
+/// Shared-buffer block accesses (hits + reads) in the cache hit ratio's
+/// trailing 15-minute window (`temps_metrics::cache_hit_window::CACHE_HIT_WINDOW`)
+/// before the Postgres cache hit ratio is evaluated. Both metrics cover the
+/// same window, and the scraper scales the volume to the whole window at any
+/// scrape interval, so this is a rate: about 11 block accesses per second,
+/// sustained. A nearly idle database (health checks, autovacuum ticks), whose
+/// ratio rests on a handful of reads, never raises the alarm; a small
+/// application database doing tens of accesses per second is evaluated. The
+/// scraper writes the ratio and the volume only for a whole window, never for
+/// one still refilling after a restart, a failover or a scrape gap, so a
+/// latest pair describes the same 15 minutes. After an upgrade the latest
+/// ratio is a lifetime one until the first whole window; the windowed volume
+/// has its own name, so it is missing then and the rule is not evaluated.
+pub const PG_CACHE_HIT_RATIO_MIN_BLOCKS: f64 = 10_000.0;
+
+/// Lifetime InnoDB buffer pool read requests before the MariaDB buffer pool
+/// hit ratio is evaluated: a new instance's first reads all miss, so its
+/// early ratio says nothing about the buffer pool size.
+pub const MARIADB_BUFFER_POOL_MIN_READ_REQUESTS: f64 = 100_000.0;
 
 /// Requests in one proxy sample interval before error-rate and latency
 /// percentiles are evaluated. On an idle host a single 502 is a 100% error
@@ -1234,7 +1370,14 @@ pub fn volume_gate(metric_name: &str) -> Option<VolumeGate> {
             REDIS_FRAGMENTATION_MIN_USED_BYTES,
         ),
         "redis.keyspace_hit_ratio" => ("redis.keyspace_lookups", REDIS_HIT_RATIO_MIN_LOOKUPS),
-        "pg.cache_hit_ratio" => ("pg.cache_blocks_accessed", PG_CACHE_HIT_RATIO_MIN_BLOCKS),
+        "pg.cache_hit_ratio" => (
+            "pg.cache_blocks_accessed_15m",
+            PG_CACHE_HIT_RATIO_MIN_BLOCKS,
+        ),
+        "mariadb.buffer_pool_hit_ratio" => (
+            "mariadb.buffer_pool_read_requests",
+            MARIADB_BUFFER_POOL_MIN_READ_REQUESTS,
+        ),
         "proxy.error_rate_percent" | "proxy.request_duration_p99_ms" => {
             ("proxy.requests", PROXY_MIN_REQUESTS_PER_SAMPLE)
         }
@@ -1254,6 +1397,7 @@ fn default_volume_gate(rule: &monitoring_alert_rules::Model) -> Option<VolumeGat
     postgres_default_seeds()
         .into_iter()
         .chain(redis_default_seeds())
+        .chain(mariadb_default_seeds())
         .chain(proxy_default_seeds())
         .any(|seed| {
             seed.name == rule.name
@@ -1262,6 +1406,42 @@ fn default_volume_gate(rule: &monitoring_alert_rules::Model) -> Option<VolumeGat
                 && seed.comparator == rule.comparator
         })
         .then_some(gate)
+}
+
+/// The deduplicated metric names a source group's rules read, fetched in one
+/// `query_latest` call. A rule with its default volume gate also needs the
+/// gating metric, and a rule over a windowed ratio needs that window's
+/// volume, edited rules included: they are not gated, but zero volume is what
+/// resolves their alarm once the ratio is gone.
+fn latest_metric_names(group: &[&monitoring_alert_rules::Model]) -> Vec<String> {
+    group
+        .iter()
+        .flat_map(|r| {
+            std::iter::once(r.metric_name.as_str())
+                .chain(default_volume_gate(r).map(|g| g.metric_name))
+                .chain(window_volume_metric(&r.metric_name))
+        })
+        .map(str::to_string)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// The volume over the same trailing window as `metric_name`, for a ratio
+/// the scraper writes only while that window saw traffic. Only the Postgres
+/// cache hit ratio: the proxy's request count, for one, covers a single
+/// sample, and an idle sample says nothing about the error rate before it.
+fn window_volume_metric(metric_name: &str) -> Option<&'static str> {
+    (metric_name == "pg.cache_hit_ratio").then_some("pg.cache_blocks_accessed_15m")
+}
+
+/// Whether the window behind `metric_name` saw no traffic at all, so no ratio
+/// over it can be breaching. False for any other metric, or when the volume
+/// is missing.
+fn has_no_volume(metric_name: &str, latest: &HashMap<String, f64>) -> bool {
+    window_volume_metric(metric_name)
+        .and_then(|name| latest.get(name))
+        .is_some_and(|volume| *volume <= 0.0)
 }
 
 /// Whether `latest` carries enough volume for a rule over `metric_name` to be
@@ -1322,732 +1502,20 @@ fn alarm_type_for_rule(rule: &monitoring_alert_rules::Model) -> AlarmType {
 /// Error type for seeding operations — re-exported from `temps_metrics`.
 pub use temps_metrics::MetricsError;
 
-/// Install all missing built-in alert rules atomically within the service budget.
-///
-/// Uses `INSERT … ON CONFLICT DO NOTHING` against the unique index
-/// `(service_id, metric_name)` so concurrent calls are safe — no TOCTOU race.
-///
-/// # Engines supported
-///
-/// - `"postgres"` — 6 default rules covering connections, cache hit ratio,
-///   replication lag and deadlocks.
-/// - `"redis"` — 4 default rules covering memory fragmentation, eviction,
-///   client count and keyspace hit ratio. The two ratio rules are only
-///   evaluated once the instance has real volume (see [`volume_gate`]), so an
-///   empty instance does not alert.
-/// - `"mongodb"` — 6 default rules covering connections, queued operations,
-///   WiredTiger cache pressure, replication buffer pressure, and asserts.
-/// - `"rustfs"` — 3 default rules covering offline nodes and free-capacity
-///   pressure, tied to the Prometheus metrics emitted by RustFS / MinIO.
-/// - `"s3"` — no defaults: the AWS S3 collector only emits `s3.bucket_count`,
-///   which is informational, not actionable. Self-hosted deployments use the
-///   `"rustfs"` service_type and get real alerts via the Prometheus scrape.
-/// - Anything else — no rules inserted.
-pub const MAX_ALERT_RULES_PER_SERVICE: u64 = 100;
-
-/// Failure to install a complete set of built-in service alerts.
-#[derive(Debug, thiserror::Error)]
-pub enum DefaultRuleSeedError {
-    #[error("Database error: {0}")]
-    Database(#[from] sea_orm::DbErr),
-    #[error("Service {service_id} has {existing} alert rules and needs {missing} additional built-in rules; the limit is {limit}. Remove enough custom rules before enabling metrics.")]
-    Capacity {
-        service_id: i32,
-        existing: u64,
-        missing: u64,
-        limit: u64,
-    },
-}
-
-pub async fn seed_default_rules(
-    db: &DatabaseConnection,
-    service_id: i32,
-    engine: &str,
-) -> Result<(), DefaultRuleSeedError> {
-    let seeds: Vec<RuleSeed> = match engine.to_lowercase().as_str() {
-        "postgres" => postgres_default_seeds(),
-        "redis" => redis_default_seeds(),
-        "mongodb" => mongodb_default_seeds(),
-        "rustfs" => rustfs_default_seeds(),
-        _ => {
-            debug!(
-                service_id,
-                engine, "seed_default_rules: no defaults for engine, skipping"
-            );
-            return Ok(());
-        }
-    };
-
-    use sea_orm::{
-        ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, QuerySelect, TransactionTrait,
-    };
-    let transaction = db.begin().await.map_err(DefaultRuleSeedError::Database)?;
-    if temps_entities::external_services::Entity::find_by_id(service_id)
-        .lock_exclusive()
-        .one(&transaction)
-        .await
-        .map_err(DefaultRuleSeedError::Database)?
-        .is_none()
-    {
-        transaction
-            .rollback()
-            .await
-            .map_err(DefaultRuleSeedError::Database)?;
-        return Ok(());
-    }
-    let count = temps_entities::monitoring_alert_rules::Entity::find()
-        .filter(temps_entities::monitoring_alert_rules::Column::ServiceId.eq(service_id))
-        .count(&transaction)
-        .await
-        .map_err(DefaultRuleSeedError::Database)?;
-
-    let existing_metrics = temps_entities::monitoring_alert_rules::Entity::find()
-        .filter(temps_entities::monitoring_alert_rules::Column::ServiceId.eq(service_id))
-        .all(&transaction)
-        .await?;
-    let missing = seeds
-        .iter()
-        .filter(|seed| {
-            !existing_metrics
-                .iter()
-                .any(|rule| rule.metric_name == seed.metric_name)
-        })
-        .map(|seed| seed.metric_name)
-        .collect::<std::collections::HashSet<_>>()
-        .len() as u64;
-    if count.saturating_add(missing) > MAX_ALERT_RULES_PER_SERVICE {
-        transaction.rollback().await?;
-        return Err(DefaultRuleSeedError::Capacity {
-            service_id,
-            existing: count,
-            missing,
-            limit: MAX_ALERT_RULES_PER_SERVICE,
-        });
-    }
-
-    // Insert each rule individually with ON CONFLICT DO NOTHING so concurrent
-    // invocations (e.g. rapid retries or parallel API calls) are safely handled
-    // by the unique index on (service_id, metric_name).
-    use sea_orm::ConnectionTrait;
-    for seed in &seeds {
-        let sql = format!(
-            "INSERT INTO monitoring_alert_rules \
-             (service_id, deployment_id, name, metric_name, threshold, comparator, severity, for_duration_secs, enabled) \
-             VALUES ({service_id}, NULL, '{name}', '{metric_name}', {threshold}, '{comparator}', '{severity}', {for_duration}, true) \
-             ON CONFLICT (service_id, metric_name) WHERE service_id IS NOT NULL DO NOTHING",
-            service_id = service_id,
-            name = seed.name.replace('\'', "''"),
-            metric_name = seed.metric_name.replace('\'', "''"),
-            threshold = seed.threshold,
-            comparator = seed.comparator.replace('\'', "''"),
-            severity = seed.severity.replace('\'', "''"),
-            for_duration = seed.for_duration_secs,
-        );
-
-        transaction
-            .execute(sea_orm::Statement::from_string(
-                sea_orm::DatabaseBackend::Postgres,
-                sql,
-            ))
-            .await
-            .map_err(DefaultRuleSeedError::Database)?;
-    }
-    transaction
-        .commit()
-        .await
-        .map_err(DefaultRuleSeedError::Database)?;
-
-    info!(
-        service_id,
-        engine, "seed_default_rules: seeded default alert rules (ON CONFLICT DO NOTHING)"
-    );
-
-    Ok(())
-}
-
-/// Insert default container alert rules for `deployment_id` if none exist yet.
-///
-/// Uses `INSERT … ON CONFLICT DO NOTHING` against the unique index
-/// `(deployment_id, metric_name)` so concurrent calls are safe.
-pub async fn seed_default_container_rules(
-    db: &DatabaseConnection,
-    deployment_id: i32,
-) -> Result<(), MetricsError> {
-    let seeds = container_default_seeds();
-
-    use sea_orm::ConnectionTrait;
-    for seed in &seeds {
-        let sql = format!(
-            "INSERT INTO monitoring_alert_rules \
-             (service_id, deployment_id, name, metric_name, threshold, comparator, severity, for_duration_secs, enabled) \
-             VALUES (NULL, {deployment_id}, '{name}', '{metric_name}', {threshold}, '{comparator}', '{severity}', {for_duration}, true) \
-             ON CONFLICT (deployment_id, metric_name) WHERE deployment_id IS NOT NULL DO NOTHING",
-            deployment_id = deployment_id,
-            name = seed.name.replace('\'', "''"),
-            metric_name = seed.metric_name.replace('\'', "''"),
-            threshold = seed.threshold,
-            comparator = seed.comparator.replace('\'', "''"),
-            severity = seed.severity.replace('\'', "''"),
-            for_duration = seed.for_duration_secs,
-        );
-
-        db.execute(sea_orm::Statement::from_string(
-            sea_orm::DatabaseBackend::Postgres,
-            sql,
-        ))
-        .await
-        .map_err(MetricsError::DatabaseError)?;
-    }
-
-    info!(
-        deployment_id,
-        "seed_default_container_rules: seeded default container alert rules (ON CONFLICT DO NOTHING)"
-    );
-
-    Ok(())
-}
-
-/// Synthetic node ID of the control plane (mirrors `CONTROL_PLANE_NODE_ID`
-/// in temps-deployments' nodes handler and the proxy metrics sampler).
-const CONTROL_PLANE_NODE_ID: i32 = 0;
-
-/// Insert default proxy alert rules for the control-plane node if none exist.
-///
-/// Uses `INSERT … ON CONFLICT DO NOTHING` against the unique index
-/// `(node_id, metric_name)` so concurrent calls are safe.
-pub async fn seed_default_proxy_rules(db: &DatabaseConnection) -> Result<(), MetricsError> {
-    seed_node_rules(db, "seed_default_proxy_rules", &proxy_default_seeds()).await
-}
-
-/// Insert a default alert rule that fires when OTLP ingest requests are being
-/// rate-limited at a sustained high rate, indicating either a noisy client or
-/// a quota that is too low for legitimate traffic.
-///
-/// The metric `otel.rate_limited_requests` is written to the metrics store by
-/// the OTel plugin's background pipeline-stats sampler (SourceKind::Node,
-/// node_id 0) every 60 seconds as a delta counter. The default threshold of
-/// 10 rejected requests per 60-second sample fires a warning if any project
-/// is being consistently turned away. Operators can tighten or loosen this by
-/// editing the seeded rule.
-///
-/// Uses `INSERT … ON CONFLICT DO NOTHING` against the unique index
-/// `(node_id, metric_name)` so concurrent calls are safe.
-pub async fn seed_default_otel_rate_limit_rules(
-    db: &DatabaseConnection,
-) -> Result<(), MetricsError> {
-    seed_node_rules(
-        db,
-        "seed_default_otel_rate_limit_rules",
-        &otel_rate_limit_default_seeds(),
-    )
-    .await
-}
-
-/// Insert default file-descriptor/socket exhaustion alert rules for the
-/// control-plane node if none exist.
-///
-/// `NodeMetricsSampler` writes `node.fd_percent` (system-wide) and
-/// `node.process_fd_percent` (this process's own `RLIMIT_NOFILE`) points for
-/// node 0 on every install where the proxy runs, so the defaults always have
-/// data to evaluate. Uses the same `(node_id, metric_name)` unique index as
-/// [`seed_default_proxy_rules`], so this is safe to call alongside it.
-pub async fn seed_default_node_resource_rules(db: &DatabaseConnection) -> Result<(), MetricsError> {
-    seed_node_rules(
-        db,
-        "seed_default_node_resource_rules",
-        &node_fd_default_seeds(),
-    )
-    .await
-}
-
-/// Shared `INSERT … ON CONFLICT DO NOTHING` loop for control-plane-node
-/// -scoped default rules, keyed on the `(node_id, metric_name)` unique index.
-///
-/// Every `RuleSeed` field is a `&'static str`/literal defined in this file
-/// (see `proxy_default_seeds`/`node_fd_default_seeds`), never user input, but
-/// this still binds via `$1..$7` rather than `format!()`-ing the SQL — the
-/// project's raw-query rule (CLAUDE.md: `$1`, `$2` parameter binding) applies
-/// regardless of whether today's callers happen to be safe, since a future
-/// caller passing an operator-supplied `String` would silently inherit
-/// whatever escaping this function does or doesn't do.
-///
-/// `caller` names the public wrapper that supplied `seeds` and is emitted as
-/// the log line's prefix, so operators grepping for `seed_default_proxy_rules`
-/// (the pre-refactor log text) still match.
-async fn seed_node_rules(
-    db: &DatabaseConnection,
-    caller: &str,
-    seeds: &[RuleSeed],
-) -> Result<(), MetricsError> {
-    use sea_orm::ConnectionTrait;
-    for seed in seeds {
-        let statement = sea_orm::Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "INSERT INTO monitoring_alert_rules \
-             (service_id, deployment_id, node_id, name, metric_name, threshold, comparator, severity, for_duration_secs, enabled) \
-             VALUES (NULL, NULL, $1, $2, $3, $4, $5, $6, $7, true) \
-             ON CONFLICT (node_id, metric_name) WHERE node_id IS NOT NULL DO NOTHING",
-            [
-                CONTROL_PLANE_NODE_ID.into(),
-                seed.name.into(),
-                seed.metric_name.into(),
-                seed.threshold.into(),
-                seed.comparator.into(),
-                seed.severity.into(),
-                seed.for_duration_secs.into(),
-            ],
-        );
-
-        db.execute(statement)
-            .await
-            .map_err(MetricsError::DatabaseError)?;
-    }
-
-    info!(
-        rule_count = seeds.len(),
-        "{caller}: seeded default control-plane node alert rules (ON CONFLICT DO NOTHING)"
-    );
-
-    Ok(())
-}
-
-// ── Default rule builders ─────────────────────────────────────────────────────
-
-/// Plain-data representation of a rule definition used in seed functions.
-/// Avoids Sea-ORM `ActiveValue` wrappers in seed SQL generation.
-struct RuleSeed {
-    name: &'static str,
-    metric_name: &'static str,
-    threshold: f64,
-    comparator: &'static str,
-    severity: &'static str,
-    for_duration_secs: i32,
-}
-
-#[cfg(test)]
-fn make_service_rule(
-    service_id: i32,
-    name: &str,
-    metric_name: &str,
-    threshold: f64,
-    comparator: &str,
-    severity: &str,
-    for_duration_secs: i32,
-) -> monitoring_alert_rules::ActiveModel {
-    monitoring_alert_rules::ActiveModel {
-        service_id: Set(Some(service_id)),
-        deployment_id: Set(None),
-        name: Set(name.to_string()),
-        metric_name: Set(metric_name.to_string()),
-        threshold: Set(threshold),
-        comparator: Set(comparator.to_string()),
-        severity: Set(severity.to_string()),
-        for_duration_secs: Set(for_duration_secs),
-        enabled: Set(true),
-        silenced_until: Set(None),
-        ..Default::default()
-    }
-}
-
-#[cfg(test)]
-fn make_deployment_rule(
-    deployment_id: i32,
-    name: &str,
-    metric_name: &str,
-    threshold: f64,
-    comparator: &str,
-    severity: &str,
-    for_duration_secs: i32,
-) -> monitoring_alert_rules::ActiveModel {
-    monitoring_alert_rules::ActiveModel {
-        service_id: Set(None),
-        deployment_id: Set(Some(deployment_id)),
-        name: Set(name.to_string()),
-        metric_name: Set(metric_name.to_string()),
-        threshold: Set(threshold),
-        comparator: Set(comparator.to_string()),
-        severity: Set(severity.to_string()),
-        for_duration_secs: Set(for_duration_secs),
-        enabled: Set(true),
-        silenced_until: Set(None),
-        ..Default::default()
-    }
-}
-
-fn postgres_default_seeds() -> Vec<RuleSeed> {
-    // NOTE(metrics-correctness-A): The Postgres collector emits
-    // `pg.replication_replay_lag_seconds` and `pg.replication_write_lag_seconds`
-    // (per-replica Gauge metrics).  Earlier versions of this seed used the
-    // non-existent name `pg.replication_lag_seconds` which caused the rules to
-    // silently never fire.  We use `pg.replication_replay_lag_seconds` here
-    // because replay lag is the operationally critical measure (it reflects
-    // how far behind standby databases are from the primary).
-    //
-    // If `label`-based filtering (e.g. per `replica_addr`) is required in
-    // future, the alert rule schema must be extended to support JSONB label
-    // matchers.  For now, `query_latest` returns the latest value across all
-    // replicas regardless of label, which fires if ANY replica breaches the
-    // threshold.
-    vec![
-        RuleSeed {
-            name: "High active connections (warning)",
-            metric_name: "pg.connections_active",
-            threshold: 80.0,
-            comparator: ">",
-            severity: "warning",
-            for_duration_secs: 60,
-        },
-        RuleSeed {
-            name: "High active connections (critical)",
-            metric_name: "pg.connections_active",
-            threshold: 95.0,
-            comparator: ">",
-            severity: "critical",
-            for_duration_secs: 30,
-        },
-        RuleSeed {
-            name: "Low cache hit ratio",
-            metric_name: "pg.cache_hit_ratio",
-            threshold: 0.90,
-            comparator: "<",
-            severity: "warning",
-            for_duration_secs: 300,
-        },
-        RuleSeed {
-            name: "Replication replay lag (warning)",
-            metric_name: "pg.replication_replay_lag_seconds",
-            threshold: 30.0,
-            comparator: ">",
-            severity: "warning",
-            for_duration_secs: 60,
-        },
-        RuleSeed {
-            name: "Replication replay lag (critical)",
-            metric_name: "pg.replication_replay_lag_seconds",
-            threshold: 120.0,
-            comparator: ">",
-            severity: "critical",
-            for_duration_secs: 30,
-        },
-        RuleSeed {
-            name: "Deadlocks detected",
-            metric_name: "pg.deadlocks_total",
-            threshold: 0.0,
-            comparator: ">",
-            severity: "warning",
-            for_duration_secs: 0,
-        },
-    ]
-}
-
-fn redis_default_seeds() -> Vec<RuleSeed> {
-    vec![
-        RuleSeed {
-            name: "High memory fragmentation ratio",
-            metric_name: "redis.memory_fragmentation_ratio",
-            threshold: 1.5,
-            comparator: ">",
-            severity: "warning",
-            for_duration_secs: 300,
-        },
-        RuleSeed {
-            name: "Keys being evicted",
-            metric_name: "redis.evicted_keys_total",
-            threshold: 0.0,
-            comparator: ">",
-            severity: "warning",
-            for_duration_secs: 60,
-        },
-        RuleSeed {
-            name: "High connected clients",
-            metric_name: "redis.connected_clients",
-            threshold: 1000.0,
-            comparator: ">",
-            severity: "warning",
-            for_duration_secs: 60,
-        },
-        RuleSeed {
-            name: "Low keyspace hit ratio",
-            metric_name: "redis.keyspace_hit_ratio",
-            threshold: 0.90,
-            comparator: "<",
-            severity: "warning",
-            for_duration_secs: 300,
-        },
-    ]
-}
-
-fn mongodb_default_seeds() -> Vec<RuleSeed> {
-    // Metric names mirror the MongoDB collector's serverStatus extractor
-    // (see `temps_metrics::collector::mongodb`). Connection limits are based on
-    // mongod's default `maxIncomingConnections = 65536`, but most deployments
-    // run with the container default of ~819 (80% of 1024 ulimit) — the
-    // ratio-style metric we don't have, so absolute thresholds are used.
-    vec![
-        RuleSeed {
-            name: "High current connections (warning)",
-            metric_name: "mongo.connections_current",
-            threshold: 500.0,
-            comparator: ">",
-            severity: "warning",
-            for_duration_secs: 60,
-        },
-        RuleSeed {
-            name: "Operations queued for reads",
-            metric_name: "mongo.queued_reads",
-            threshold: 5.0,
-            comparator: ">",
-            severity: "warning",
-            for_duration_secs: 60,
-        },
-        RuleSeed {
-            name: "Operations queued for writes",
-            metric_name: "mongo.queued_writes",
-            threshold: 5.0,
-            comparator: ">",
-            severity: "warning",
-            for_duration_secs: 60,
-        },
-        RuleSeed {
-            name: "WiredTiger cache near full",
-            metric_name: "mongo.wiredtiger_cache_ratio",
-            threshold: 0.95,
-            comparator: ">",
-            severity: "warning",
-            for_duration_secs: 300,
-        },
-        RuleSeed {
-            name: "Replication buffer pressure",
-            metric_name: "mongo.replication_buffer_ratio",
-            threshold: 0.80,
-            comparator: ">",
-            severity: "warning",
-            for_duration_secs: 120,
-        },
-        RuleSeed {
-            name: "Cursor timeouts detected",
-            metric_name: "mongo.cursor_timed_out_total",
-            threshold: 0.0,
-            comparator: ">",
-            severity: "warning",
-            for_duration_secs: 0,
-        },
-    ]
-}
-
-fn rustfs_default_seeds() -> Vec<RuleSeed> {
-    // The pinned RustFS image exports these exact names through OTLP. Do not use the
-    // legacy `s3.*` Prometheus aliases here: RustFS has no functional MinIO
-    // `/minio/v2/metrics/cluster` scrape path, so those rules never receive
-    // samples for a managed RustFS service.
-    //
-    // Two raw thresholds we can trust:
-    //   - `rustfs_cluster_health_drives_offline_count` > 0 — any offline
-    //     drive degrades availability
-    //   - `rustfs_cluster_capacity_free_bytes` — absolute byte thresholds are the
-    //     only safe option; the collector does not emit a free/used ratio.
-    //     The thresholds below assume a small-to-medium deployment. Users on
-    //     larger clusters should tune these per-rule via the UI.
-    vec![
-        RuleSeed {
-            name: "Storage nodes offline",
-            metric_name: "rustfs_cluster_health_drives_offline_count",
-            threshold: 0.0,
-            comparator: ">",
-            severity: "critical",
-            for_duration_secs: 60,
-        },
-        RuleSeed {
-            name: "Low free capacity (warning)",
-            // 10 GiB free
-            metric_name: "rustfs_cluster_capacity_free_bytes",
-            threshold: 10.0 * 1024.0 * 1024.0 * 1024.0,
-            comparator: "<",
-            severity: "warning",
-            for_duration_secs: 300,
-        },
-        RuleSeed {
-            name: "Low free capacity (critical)",
-            // 2 GiB free
-            metric_name: "rustfs_cluster_capacity_free_bytes",
-            threshold: 2.0 * 1024.0 * 1024.0 * 1024.0,
-            comparator: "<",
-            severity: "critical",
-            for_duration_secs: 60,
-        },
-    ]
-}
-
-/// Default alert rules over the proxy hot-path metrics written by the proxy
-/// metrics sampler (`proxy.*`, `SourceKind::Node`, control-plane node).
-/// Thresholds are rate/latency based — never absolute request counts — so
-/// they hold at any traffic volume.
-///
-/// One rule per metric name: the `uidx_monitoring_alert_rules_node_metric`
-/// unique index (mirroring the service/deployment indexes) makes a second
-/// seed on the same metric a silent ON CONFLICT no-op.
-fn proxy_default_seeds() -> Vec<RuleSeed> {
-    vec![
-        RuleSeed {
-            name: "High proxy error rate",
-            metric_name: "proxy.error_rate_percent",
-            threshold: 20.0,
-            comparator: ">",
-            severity: "warning",
-            for_duration_secs: 300,
-        },
-        RuleSeed {
-            name: "Slow proxy responses (p99)",
-            metric_name: "proxy.request_duration_p99_ms",
-            threshold: 5000.0,
-            comparator: ">",
-            severity: "warning",
-            for_duration_secs: 300,
-        },
-    ]
-}
-
-/// Default alert rules over the node resource metrics written by
-/// `NodeMetricsSampler` (`node.*`, `SourceKind::Node`, control-plane node).
-/// Covers file descriptor / socket exhaustion specifically: both the
-/// system-wide ceiling (`fs.file-max`, which every open socket counts
-/// against) and this process's own `RLIMIT_NOFILE`, since either one alone
-/// can be near 100% while the other has headroom — a container typically
-/// reports an effectively infinite `fs.file-max` while its process nofile
-/// limit is the real, much lower ceiling.
-///
-/// One rule per metric, not a warning/critical pair: the
-/// `uidx_monitoring_alert_rules_node_metric` unique index is on
-/// `(node_id, metric_name)` alone (no `severity` column), so a second seed
-/// on the same metric name is a silent `ON CONFLICT DO NOTHING` no-op — a
-/// warning+critical pair here would leave the critical row never inserted.
-/// (The same trap already exists in `postgres_default_seeds`'s
-/// warning/critical pairs on `pg.connections_active`, which is scoped to
-/// `service_id` instead and pre-dates this file; out of scope to fix here.)
-/// `severity: "critical"` reflects that "near exhaustion" already means the
-/// machine may start refusing new connections.
-fn node_fd_default_seeds() -> Vec<RuleSeed> {
-    vec![
-        RuleSeed {
-            name: "System file descriptors near exhaustion",
-            metric_name: "node.fd_percent",
-            threshold: 90.0,
-            comparator: ">",
-            severity: "critical",
-            for_duration_secs: 30,
-        },
-        RuleSeed {
-            name: "Process file descriptors near limit",
-            metric_name: "node.process_fd_percent",
-            threshold: 90.0,
-            comparator: ">",
-            severity: "critical",
-            for_duration_secs: 30,
-        },
-    ]
-}
-
-/// Default alert rule for OTel ingest rate limiting.
-///
-/// Fires when the 60-second pipeline-stats sample reports more than 10 ingest
-/// requests rejected by the rate limiter.  A single noisy batch that briefly
-/// tips over the limit will not fire (it fires only when the threshold is
-/// crossed on a single sample, not sustained over time — `for_duration_secs`
-/// is 0 for immediacy).  Operators who want sustained-breach semantics can
-/// edit the rule and set `for_duration_secs`.
-fn otel_rate_limit_default_seeds() -> Vec<RuleSeed> {
-    vec![RuleSeed {
-        name: "OTel ingest rate-limited",
-        metric_name: "otel.rate_limited_requests",
-        threshold: 10.0,
-        comparator: ">",
-        severity: "warning",
-        for_duration_secs: 0,
-    }]
-}
-
-fn container_default_seeds() -> Vec<RuleSeed> {
-    vec![
-        RuleSeed {
-            // Threshold against utilisation relative to the CPU the container
-            // may use — its limit when set, else the host's core count (100% ==
-            // saturated) — NOT raw `container.cpu_percent` where 100% == one
-            // core. A 2-core container would otherwise fire at ~95% raw (≈47%
-            // of its limit), and an uncapped container would fire the moment it
-            // used a single core of a many-core host.
-            name: "High CPU usage",
-            metric_name: "container.cpu_utilization_percent",
-            threshold: 90.0,
-            comparator: ">",
-            severity: "warning",
-            for_duration_secs: 120,
-        },
-        RuleSeed {
-            name: "High memory usage",
-            metric_name: "container.memory_percent",
-            threshold: 85.0,
-            comparator: ">",
-            severity: "warning",
-            for_duration_secs: 60,
-        },
-    ]
-}
-
-#[cfg(test)]
-fn postgres_defaults(service_id: i32) -> Vec<monitoring_alert_rules::ActiveModel> {
-    postgres_default_seeds()
-        .into_iter()
-        .map(|s| {
-            make_service_rule(
-                service_id,
-                s.name,
-                s.metric_name,
-                s.threshold,
-                s.comparator,
-                s.severity,
-                s.for_duration_secs,
-            )
-        })
-        .collect()
-}
-
-#[cfg(test)]
-fn redis_defaults(service_id: i32) -> Vec<monitoring_alert_rules::ActiveModel> {
-    redis_default_seeds()
-        .into_iter()
-        .map(|s| {
-            make_service_rule(
-                service_id,
-                s.name,
-                s.metric_name,
-                s.threshold,
-                s.comparator,
-                s.severity,
-                s.for_duration_secs,
-            )
-        })
-        .collect()
-}
-
-#[cfg(test)]
-fn container_defaults(deployment_id: i32) -> Vec<monitoring_alert_rules::ActiveModel> {
-    container_default_seeds()
-        .into_iter()
-        .map(|s| {
-            make_deployment_rule(
-                deployment_id,
-                s.name,
-                s.metric_name,
-                s.threshold,
-                s.comparator,
-                s.severity,
-                s.for_duration_secs,
-            )
-        })
-        .collect()
-}
+use temps_alarms::default_rules::{
+    mariadb_default_seeds, node_disk_health_default_seeds, postgres_default_seeds,
+    proxy_default_seeds, redis_default_seeds, seed_node_rules,
+};
+pub use temps_alarms::default_rules::{
+    seed_default_container_rules, seed_default_node_resource_rules,
+    seed_default_otel_rate_limit_rules, seed_default_proxy_rules, seed_default_rules,
+    DefaultRuleSeedError, MAX_ALERT_RULES_PER_SERVICE,
+};
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod wal_archiving_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2160,7 +1628,7 @@ mod tests {
 
     // ── alarm_type_for_rule() ───────────────────────────────────────────────────
 
-    fn make_rule(
+    pub(super) fn make_rule(
         service_id: Option<i32>,
         deployment_id: Option<i32>,
     ) -> monitoring_alert_rules::Model {
@@ -2231,152 +1699,44 @@ mod tests {
     }
 
     #[test]
-    fn otel_rate_limit_default_seeds_target_the_sampler_written_metric() {
-        let seeds = otel_rate_limit_default_seeds();
-        assert_eq!(seeds.len(), 1);
-        let seed = &seeds[0];
-        // Must match the metric name the plugin.rs pipeline-stats sampler
-        // actually writes, and the one `alarm_type_for_rule` recognizes above
-        // — a drift between these three would seed a rule that never fires.
-        assert_eq!(seed.metric_name, "otel.rate_limited_requests");
-        assert_eq!(seed.comparator, ">");
-        assert!(seed.threshold > 0.0);
-    }
-
-    #[test]
-    fn proxy_default_seeds_are_rate_based_and_unique_per_metric() {
-        let seeds = proxy_default_seeds();
-        assert_eq!(seeds.len(), 2);
+    fn mariadb_default_seeds_are_unique_per_metric_and_collected() {
+        let seeds = mariadb_default_seeds();
+        assert_eq!(seeds.len(), 10);
         let mut names = std::collections::HashSet::new();
         for s in &seeds {
-            assert!(s.metric_name.starts_with("proxy."));
-            // Rules must be rate/latency based, never absolute counts.
-            assert!(
-                s.metric_name.contains("percent") || s.metric_name.contains("_ms"),
-                "seed {} is not rate/latency based",
-                s.metric_name
-            );
-            // One rule per metric: (node_id, metric_name) is a unique index,
-            // a duplicate metric would be a silent ON CONFLICT no-op.
+            assert!(s.metric_name.starts_with("mariadb."), "{}", s.metric_name);
+            assert!(is_known_comparator(s.comparator), "{}", s.metric_name);
+            // One rule per metric: (service_id, metric_name) is a unique
+            // index, a duplicate metric would be a silent ON CONFLICT no-op.
             assert!(
                 names.insert(s.metric_name),
                 "duplicate seed metric {}",
                 s.metric_name
             );
         }
-    }
-
-    #[test]
-    fn node_fd_default_seeds_are_unique_per_metric_and_critical() {
-        let seeds = node_fd_default_seeds();
-        assert_eq!(seeds.len(), 2);
-        let mut names = std::collections::HashSet::new();
-        for s in &seeds {
-            assert!(s.metric_name.starts_with("node."));
-            assert!(
-                s.metric_name.contains("fd_percent"),
-                "seed {} is not an fd/socket exhaustion metric",
-                s.metric_name
-            );
-            // "Near exhaustion" is inherently a critical condition — see the
-            // doc comment on node_fd_default_seeds for why this can't be a
-            // warning+critical pair under the current unique index.
-            assert_eq!(s.severity, "critical");
-            // One rule per metric: (node_id, metric_name) is a unique index,
-            // a duplicate metric would be a silent ON CONFLICT no-op.
-            assert!(
-                names.insert(s.metric_name),
-                "duplicate seed metric {}",
-                s.metric_name
-            );
+        // Thread-state rules fire when the flag drops from 1 to 0.
+        for metric in ["mariadb.replica_sql_running", "mariadb.replica_io_running"] {
+            let seed = seeds
+                .iter()
+                .find(|s| s.metric_name == metric)
+                .unwrap_or_else(|| panic!("{metric} is not seeded"));
+            assert!(compare(0.0, seed.threshold, seed.comparator));
+            assert!(!compare(1.0, seed.threshold, seed.comparator));
         }
     }
 
     #[test]
-    fn rustfs_default_seeds_use_beta6_otlp_metric_names() {
-        let names: Vec<&str> = rustfs_default_seeds()
-            .iter()
-            .map(|seed| seed.metric_name)
-            .collect();
-
-        assert!(names.contains(&"rustfs_cluster_health_drives_offline_count"));
-        assert!(names.contains(&"rustfs_cluster_capacity_free_bytes"));
-        assert!(names.iter().all(|name| !name.starts_with("s3.")));
-    }
-
-    // ── default rule builders ──────────────────────────────────────────────────
-
-    #[test]
-    fn postgres_defaults_generates_six_rules() {
-        let rules = postgres_defaults(42);
-        assert_eq!(rules.len(), 6);
-        for r in &rules {
-            assert_eq!(r.service_id.clone().unwrap(), Some(42));
-            assert_eq!(r.deployment_id.clone().unwrap(), None);
-        }
-        // Correctness fix: replication lag rules must reference the actual
-        // collected metric name (pg.replication_replay_lag_seconds), not the
-        // non-existent pg.replication_lag_seconds.
-        let repl_names: Vec<String> = rules
-            .iter()
-            .filter(|r| r.metric_name.clone().unwrap().contains("replication"))
-            .map(|r| r.metric_name.clone().unwrap())
-            .collect();
-        assert!(
-            !repl_names.is_empty(),
-            "should have at least one replication rule"
+    fn mariadb_hit_ratio_waits_for_buffer_pool_volume() {
+        let mut values = HashMap::new();
+        values.insert("mariadb.buffer_pool_hit_ratio".to_string(), 0.2);
+        assert!(!meets_volume_gate("mariadb.buffer_pool_hit_ratio", &values));
+        values.insert("mariadb.buffer_pool_read_requests".to_string(), 99.0);
+        assert!(!meets_volume_gate("mariadb.buffer_pool_hit_ratio", &values));
+        values.insert(
+            "mariadb.buffer_pool_read_requests".to_string(),
+            MARIADB_BUFFER_POOL_MIN_READ_REQUESTS,
         );
-        for name in &repl_names {
-            assert_eq!(
-                name, "pg.replication_replay_lag_seconds",
-                "replication lag rule should reference pg.replication_replay_lag_seconds, got: {name}"
-            );
-        }
-    }
-
-    #[test]
-    fn redis_defaults_generates_four_rules() {
-        let rules = redis_defaults(7);
-        assert_eq!(rules.len(), 4);
-    }
-
-    #[test]
-    fn container_defaults_generates_two_rules() {
-        let rules = container_defaults(99);
-        assert_eq!(rules.len(), 2);
-        for r in &rules {
-            assert_eq!(r.deployment_id.clone().unwrap(), Some(99));
-            assert_eq!(r.service_id.clone().unwrap(), None);
-        }
-    }
-
-    #[test]
-    fn postgres_defaults_severities_correct() {
-        let rules = postgres_defaults(1);
-        let conn_rules: Vec<_> = rules
-            .iter()
-            .filter(|r| r.metric_name.clone().unwrap() == "pg.connections_active")
-            .collect();
-        assert_eq!(conn_rules.len(), 2);
-        let severities: std::collections::HashSet<String> = conn_rules
-            .iter()
-            .map(|r| r.severity.clone().unwrap())
-            .collect();
-        assert!(severities.contains("warning"));
-        assert!(severities.contains("critical"));
-    }
-
-    #[test]
-    fn container_defaults_metric_names() {
-        let rules = container_defaults(1);
-        let names: Vec<String> = rules
-            .iter()
-            .map(|r| r.metric_name.clone().unwrap())
-            .collect();
-        // The CPU rule thresholds limit-relative utilisation, not raw
-        // `container.cpu_percent` (100% == one core) — see the seed comment.
-        assert!(names.contains(&"container.cpu_utilization_percent".to_string()));
-        assert!(names.contains(&"container.memory_percent".to_string()));
+        assert!(meets_volume_gate("mariadb.buffer_pool_hit_ratio", &values));
     }
 
     // ── resolve_alarm_context() ─────────────────────────────────────────────────
@@ -2392,7 +1752,7 @@ mod tests {
     };
 
     /// No-op metrics store — `resolve_alarm_context` never touches it.
-    struct NoopStore;
+    pub(super) struct NoopStore;
 
     #[async_trait]
     impl MetricsStore for NoopStore {
@@ -2429,7 +1789,7 @@ mod tests {
         }
     }
 
-    struct NoopNotifications;
+    pub(super) struct NoopNotifications;
 
     #[async_trait]
     impl NotificationService for NoopNotifications {
@@ -2444,7 +1804,7 @@ mod tests {
         }
     }
 
-    struct NoopQueue;
+    pub(super) struct NoopQueue;
 
     #[async_trait]
     impl temps_core::JobQueue for NoopQueue {
@@ -2456,7 +1816,7 @@ mod tests {
         }
     }
 
-    fn evaluator_with_db(db: DatabaseConnection) -> AlertEvaluator {
+    pub(super) fn evaluator_with_db(db: DatabaseConnection) -> AlertEvaluator {
         evaluator_with_shared_db(Arc::new(db))
     }
 
@@ -2467,6 +1827,95 @@ mod tests {
             Arc::new(NoopQueue),
         ));
         AlertEvaluator::new(db, Arc::new(NoopStore), alarm_service)
+    }
+
+    fn node_rows(ids: &[i32]) -> Vec<std::collections::BTreeMap<&'static str, sea_orm::Value>> {
+        ids.iter()
+            .map(|id| std::collections::BTreeMap::from([("id", (*id).into())]))
+            .collect()
+    }
+
+    fn seeded_rows(ids: &[i32]) -> Vec<std::collections::BTreeMap<&'static str, sea_orm::Value>> {
+        ids.iter()
+            .map(|id| std::collections::BTreeMap::from([("node_id", (*id).into())]))
+            .collect()
+    }
+
+    fn exec_ok(rows_affected: u64) -> sea_orm::MockExecResult {
+        sea_orm::MockExecResult {
+            last_insert_id: 0,
+            rows_affected,
+        }
+    }
+
+    /// #1618: a new worker gets the disk-health rules once, unless it already
+    /// has some; an unchanged node set costs one SELECT; a removed worker's
+    /// rules are deleted.
+    #[tokio::test]
+    async fn worker_disk_health_rules_follow_the_node_set() {
+        let seeds = node_disk_health_default_seeds().len();
+        let mock = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            // Cycle 1: workers 5 and 6 appear; 6 already has a disk-health
+            // rule (the operator deleted the others), so only 5 is seeded.
+            .append_query_results([node_rows(&[5, 6])])
+            .append_query_results([seeded_rows(&[6])])
+            // One statement seeds every rule of worker 5.
+            .append_exec_results([exec_ok(seeds as u64)]);
+        let db = Arc::new(
+            mock.append_exec_results([exec_ok(0)])
+                // Cycle 2: unchanged.
+                .append_query_results([node_rows(&[5, 6])])
+                // Cycle 3: both workers removed.
+                .append_query_results([node_rows(&[])])
+                .append_exec_results([exec_ok(seeds as u64)])
+                .into_connection(),
+        );
+        let evaluator = evaluator_with_shared_db(db.clone());
+        for _ in 0..3 {
+            evaluator.sync_worker_node_rules().await.expect("sync");
+        }
+
+        let log: Vec<String> = transaction_log(evaluator, db)
+            .iter()
+            .map(|t| format!("{t:?}"))
+            .collect();
+        let inserts = log
+            .iter()
+            .filter(|s| s.contains("INSERT INTO monitoring_alert_rules"));
+        assert_eq!(
+            inserts.clone().count(),
+            1,
+            "seeded once, in one statement, not on the unchanged cycle"
+        );
+        assert!(
+            inserts.clone().all(|s| s.contains("Int(Some(5))")),
+            "only the worker without disk-health rules is seeded: {log:#?}"
+        );
+        assert_eq!(
+            log.iter()
+                .filter(|s| s.contains("SELECT DISTINCT node_id FROM monitoring_alert_rules"))
+                .count(),
+            1,
+            "the seeded-check runs only when new workers appear"
+        );
+        assert!(
+            inserts.clone().any(|s| s.contains("node.raid_degraded")),
+            "disk-health rules, not the fd defaults: {log:#?}"
+        );
+        assert!(!log.iter().any(|s| s.contains("node.fd_")), "{log:#?}");
+        assert_eq!(
+            log.iter()
+                .filter(|s| s.contains("SELECT id FROM nodes"))
+                .count(),
+            3
+        );
+        assert_eq!(
+            log.iter()
+                .filter(|s| s.contains("DELETE FROM monitoring_alert_rules"))
+                .count(),
+            2,
+            "cleanup runs only when the node set changed"
+        );
     }
 
     /// Recover the mock connection's statement log.
@@ -3024,23 +2473,42 @@ mod tests {
     async fn resolve_alarm_context_service_rule_without_project_keeps_service_id() {
         let rule = make_rule(Some(9), None);
 
-        // project_services lookup returns nothing.
+        // project_services lookup returns nothing; the service exists.
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results(vec![Vec::<temps_entities::project_services::Model>::new()])
+            .append_query_results(vec![vec![std::collections::BTreeMap::from([(
+                "id".to_string(),
+                sea_orm::Value::Int(Some(9)),
+            )])]])
             .into_connection();
 
         let evaluator = evaluator_with_db(db);
         let (project_id, environment_id, deployment_id, service_id) =
             evaluator.resolve_alarm_context(&rule).await;
 
-        // Falls through to a system-wide (no project) alarm — no project
-        // mapping found, and there's no project to misattribute it to.
+        // A system-wide (no project) alarm: there's no project to
+        // misattribute it to, but it names the service that breached.
         assert_eq!(project_id, None);
         assert_eq!(environment_id, None);
         assert_eq!(deployment_id, None);
-        // service_id is None here because the fallback path can't attribute it
-        // to a project; the alarm is still stored as system-wide.
-        assert_eq!(service_id, None);
+        assert_eq!(service_id, Some(9));
+    }
+
+    /// A rule whose service row is gone cannot reference it (foreign key):
+    /// the alarm is system-wide with no service.
+    #[tokio::test]
+    async fn resolve_alarm_context_for_a_deleted_service_has_no_service_id() {
+        let rule = make_rule(Some(9), None);
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![Vec::<temps_entities::project_services::Model>::new()])
+            .append_query_results(vec![Vec::<
+                std::collections::BTreeMap<String, sea_orm::Value>,
+            >::new()])
+            .into_connection();
+
+        let evaluator = evaluator_with_db(db);
+        let context = evaluator.resolve_alarm_context(&rule).await;
+        assert_eq!(context, (None, None, None, None));
     }
 
     /// Node-scoped rules (proxy metrics) have no project/service/deployment
@@ -3066,7 +2534,7 @@ mod tests {
 
     // ── volume gates ───────────────────────────────────────────────────────────
 
-    fn latest(pairs: &[(&str, f64)]) -> HashMap<String, f64> {
+    pub(super) fn latest(pairs: &[(&str, f64)]) -> HashMap<String, f64> {
         pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
     }
 
@@ -3124,6 +2592,41 @@ mod tests {
         assert!(!meets_volume_gate("pg.cache_hit_ratio", &values));
     }
 
+    /// The Postgres ratio and its volume cover the same trailing window: a
+    /// low ratio from a window with little traffic is not evaluated.
+    #[test]
+    fn pg_cache_hit_ratio_needs_volume_in_its_window() {
+        let quiet = latest(&[
+            ("pg.cache_hit_ratio", 0.2),
+            ("pg.cache_blocks_accessed_15m", 500.0),
+        ]);
+        assert!(!meets_volume_gate("pg.cache_hit_ratio", &quiet));
+
+        let busy = latest(&[
+            ("pg.cache_hit_ratio", 0.2),
+            (
+                "pg.cache_blocks_accessed_15m",
+                PG_CACHE_HIT_RATIO_MIN_BLOCKS,
+            ),
+        ]);
+        assert!(meets_volume_gate("pg.cache_hit_ratio", &busy));
+
+        // A small application database: 60 block accesses per second over
+        // the 15-minute window is a real workload and must be evaluated.
+        let small_app = latest(&[
+            ("pg.cache_hit_ratio", 0.4),
+            ("pg.cache_blocks_accessed_15m", 60.0 * 15.0 * 60.0),
+        ]);
+        assert!(meets_volume_gate("pg.cache_hit_ratio", &small_app));
+
+        // One access every couple of seconds is an idle database.
+        let idle = latest(&[
+            ("pg.cache_hit_ratio", 0.2),
+            ("pg.cache_blocks_accessed_15m", 450.0),
+        ]);
+        assert!(!meets_volume_gate("pg.cache_hit_ratio", &idle));
+    }
+
     #[test]
     fn proxy_ratio_rules_need_traffic_in_the_current_sample() {
         let idle = latest(&[
@@ -3161,6 +2664,7 @@ mod tests {
         let seeded: Vec<&str> = postgres_default_seeds()
             .iter()
             .chain(redis_default_seeds().iter())
+            .chain(mariadb_default_seeds().iter())
             .chain(proxy_default_seeds().iter())
             .map(|s| s.metric_name)
             .collect();
@@ -3168,6 +2672,7 @@ mod tests {
             "redis.memory_fragmentation_ratio",
             "redis.keyspace_hit_ratio",
             "pg.cache_hit_ratio",
+            "mariadb.buffer_pool_hit_ratio",
             "proxy.error_rate_percent",
             "proxy.request_duration_p99_ms",
         ] {
@@ -3295,6 +2800,264 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(
+            evaluator.firing_alarms.read().await.get(&rule.id),
+            Some(&99)
+        );
+    }
+
+    fn low_cache_hit_ratio_rule() -> monitoring_alert_rules::Model {
+        monitoring_alert_rules::Model {
+            name: "Low cache hit ratio".into(),
+            metric_name: "pg.cache_hit_ratio".into(),
+            threshold: 0.90,
+            comparator: "<".into(),
+            for_duration_secs: 300,
+            ..make_rule(Some(1), None)
+        }
+    }
+
+    /// Evaluate `rule`, whose alarm 99 is firing, against an idle window:
+    /// `pg.cache_blocks_accessed_15m = 0` and no ratio. Whether the alarm resolved.
+    async fn idle_cache_hit_window_resolves(rule: monitoring_alert_rules::Model) -> bool {
+        cache_hit_alarm_resolves(rule, &[("pg.cache_blocks_accessed_15m", 0.0)]).await
+    }
+
+    /// Evaluate `rule`, whose alarm 99 is firing, against `values`. Whether
+    /// the alarm resolved.
+    async fn cache_hit_alarm_resolves(
+        rule: monitoring_alert_rules::Model,
+        values: &[(&str, f64)],
+    ) -> bool {
+        use temps_entities::alarms;
+        let now = Utc::now();
+        let resolved = alarms::Model {
+            id: 99,
+            project_id: Some(1),
+            environment_id: None,
+            deployment_id: None,
+            container_id: None,
+            service_id: Some(1),
+            alarm_type: "database_metric_threshold".into(),
+            severity: "warning".into(),
+            status: "resolved".into(),
+            title: "Low cache hit ratio".into(),
+            message: None,
+            metadata: None,
+            fired_at: now,
+            acknowledged_at: None,
+            acknowledged_by: None,
+            resolved_at: Some(now),
+            silenced_until: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_exec_results(vec![sea_orm::MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 0,
+            }])
+            .append_query_results(vec![vec![resolved]])
+            .into_connection();
+        let evaluator = evaluator_with_db(db);
+        evaluator.firing_alarms.write().await.insert(rule.id, 99);
+
+        evaluator
+            .evaluate_rule(&rule, &latest(values), (Some(1), None, None, Some(1)))
+            .await
+            .expect("evaluation succeeds");
+
+        let still_firing = evaluator.firing_alarms.read().await.contains_key(&rule.id);
+        !still_firing
+    }
+
+    /// An idle window writes no ratio, only `pg.cache_blocks_accessed_15m = 0`.
+    /// Once the last ratio has aged out of the latest values, that zero is
+    /// still proof the database is idle, so a fired alarm resolves.
+    #[tokio::test]
+    async fn idle_cache_hit_window_resolves_a_fired_alarm_without_a_ratio() {
+        assert!(
+            idle_cache_hit_window_resolves(low_cache_hit_ratio_rule()).await,
+            "an idle window must resolve the low cache hit ratio alarm"
+        );
+    }
+
+    /// An edited rule has no volume gate, so a near-idle window can fire it.
+    /// Fully idle, the window has no ratio at all: without resolving on zero
+    /// volume, that alarm would stay open for as long as the database idles.
+    #[tokio::test]
+    async fn idle_cache_hit_window_resolves_an_edited_rule_without_a_ratio() {
+        let rule = monitoring_alert_rules::Model {
+            threshold: 0.95,
+            ..low_cache_hit_ratio_rule()
+        };
+        assert!(default_volume_gate(&rule).is_none(), "the edit opts out");
+        assert!(
+            idle_cache_hit_window_resolves(rule).await,
+            "an idle window must resolve an edited cache hit ratio alarm"
+        );
+    }
+
+    /// Up to 15 minutes after the window went idle, the store's latest values
+    /// still hold the last ratio written while it had traffic, next to the
+    /// zero volume. That ratio must not keep an edited rule's alarm open.
+    #[tokio::test]
+    async fn a_stale_ratio_next_to_zero_volume_resolves_an_edited_rule() {
+        let rule = monitoring_alert_rules::Model {
+            threshold: 0.95,
+            ..low_cache_hit_ratio_rule()
+        };
+        assert!(
+            cache_hit_alarm_resolves(
+                rule,
+                &[
+                    ("pg.cache_hit_ratio", 0.0),
+                    ("pg.cache_blocks_accessed_15m", 0.0)
+                ],
+            )
+            .await,
+            "a ratio over no traffic must not keep the alarm open"
+        );
+    }
+
+    /// The idle resolution above needs the volume in `latest`, which holds
+    /// only the names the cycle asks the store for.
+    #[test]
+    fn an_edited_cache_hit_rule_fetches_its_volume_metric() {
+        let seeded = low_cache_hit_ratio_rule();
+        let edited = monitoring_alert_rules::Model {
+            threshold: 0.95,
+            ..low_cache_hit_ratio_rule()
+        };
+        for rule in [&seeded, &edited] {
+            let mut names = latest_metric_names(&[rule]);
+            names.sort();
+            assert_eq!(
+                names,
+                ["pg.cache_blocks_accessed_15m", "pg.cache_hit_ratio"],
+                "threshold {}",
+                rule.threshold
+            );
+        }
+        let ungated = monitoring_alert_rules::Model {
+            metric_name: "pg.connections_active".into(),
+            ..make_rule(Some(1), None)
+        };
+        assert_eq!(
+            latest_metric_names(&[&ungated, &ungated]),
+            ["pg.connections_active"]
+        );
+    }
+
+    /// The proxy writes `proxy.requests = 0` on every idle sample and no error
+    /// rate, so the latest error rate is the last sample's with traffic. An
+    /// edited rule must keep judging it: resolving on each idle sample would
+    /// keep a sparse-traffic deployment failing every request from alerting.
+    #[tokio::test]
+    async fn an_idle_proxy_sample_does_not_reset_an_edited_error_rate_breach() {
+        let rule = monitoring_alert_rules::Model {
+            name: "High error rate (edited)".into(),
+            metric_name: "proxy.error_rate_percent".into(),
+            threshold: 10.0,
+            comparator: ">".into(),
+            for_duration_secs: 300,
+            ..make_rule(Some(1), None)
+        };
+        assert!(default_volume_gate(&rule).is_none(), "the edit opts out");
+        assert_eq!(latest_metric_names(&[&rule]), ["proxy.error_rate_percent"]);
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let evaluator = evaluator_with_shared_db(db);
+        let started_at = Utc::now();
+        evaluator
+            .breach_start
+            .write()
+            .await
+            .insert(rule.id, started_at);
+
+        evaluator
+            .evaluate_rule(
+                &rule,
+                &latest(&[("proxy.error_rate_percent", 100.0), ("proxy.requests", 0.0)]),
+                (Some(1), None, None, Some(1)),
+            )
+            .await
+            .expect("evaluation succeeds");
+
+        assert_eq!(
+            evaluator.breach_start.read().await.get(&rule.id).copied(),
+            Some(started_at),
+            "the breach window must keep counting"
+        );
+    }
+
+    /// Below the default gate is not idle: an edited rule keeps its alarm
+    /// while the ratio is missing and some traffic remains.
+    #[tokio::test]
+    async fn missing_ratio_with_some_volume_keeps_an_edited_rule_alarm() {
+        let rule = monitoring_alert_rules::Model {
+            threshold: 0.95,
+            ..low_cache_hit_ratio_rule()
+        };
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let evaluator = evaluator_with_shared_db(db);
+        evaluator.firing_alarms.write().await.insert(rule.id, 99);
+
+        evaluator
+            .evaluate_rule(
+                &rule,
+                &latest(&[("pg.cache_blocks_accessed_15m", 500.0)]),
+                (Some(1), None, None, Some(1)),
+            )
+            .await
+            .expect("evaluation succeeds");
+
+        assert_eq!(
+            evaluator.firing_alarms.read().await.get(&rule.id),
+            Some(&99)
+        );
+    }
+
+    /// Right after an upgrade the latest values are the last ones an earlier
+    /// version wrote: a lifetime ratio and, under the old name, the lifetime
+    /// volume. A young database's 50,000 lifetime accesses would pass the
+    /// window's gate, so the stale lifetime ratio must not open a breach.
+    #[tokio::test]
+    async fn a_lifetime_ratio_stored_before_an_upgrade_opens_no_breach() {
+        let rule = low_cache_hit_ratio_rule();
+        assert!(default_volume_gate(&rule).is_some());
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let evaluator = evaluator_with_shared_db(db);
+
+        evaluator
+            .evaluate_rule(
+                &rule,
+                &latest(&[
+                    ("pg.cache_hit_ratio", 0.8),
+                    ("pg.cache_blocks_accessed", 50_000.0),
+                ]),
+                (Some(1), None, None, Some(1)),
+            )
+            .await
+            .expect("evaluation succeeds");
+
+        assert!(!evaluator.breach_start.read().await.contains_key(&rule.id));
+        assert!(!evaluator.firing_alarms.read().await.contains_key(&rule.id));
+    }
+
+    /// Without the volume metric there is no evidence either way: keep the
+    /// alarm until the collector reports again.
+    #[tokio::test]
+    async fn missing_cache_hit_ratio_and_volume_keeps_a_fired_alarm() {
+        let rule = low_cache_hit_ratio_rule();
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let evaluator = evaluator_with_shared_db(db);
+        evaluator.firing_alarms.write().await.insert(rule.id, 99);
+
+        evaluator
+            .evaluate_rule(&rule, &HashMap::new(), (Some(1), None, None, Some(1)))
+            .await
+            .expect("evaluation succeeds");
+
         assert_eq!(
             evaluator.firing_alarms.read().await.get(&rule.id),
             Some(&99)

@@ -1,25 +1,50 @@
 import { SettingsSection } from '@/components/ui/settings-section'
+import {
+  DEFAULT_STOP_TIMEOUT_SECONDS,
+  MAX_STOP_TIMEOUT_SECONDS,
+  MIN_STOP_TIMEOUT_SECONDS,
+  stopTimeoutProblem,
+  stopTimeoutSeconds,
+} from '@/lib/deployment-stop-timeout'
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { EnvironmentResponse, ProjectResponse } from '@/api/client'
+import {
+  EnvironmentResponse,
+  ProjectResponse,
+  type LoadBalancingConfig,
+} from '@/api/client'
 import {
   updateEnvironmentSettingsMutation,
   adminListNodesOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import type { NodeInfoResponse } from '@/api/client/types.gen'
 import { BranchSelector } from '@/components/deployments/BranchSelector'
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
+import { Textarea } from '@/components/ui/textarea'
 import {
   targetLabelsToPayload,
   targetNodesToPayload,
 } from '@/lib/environment-placement'
+import { ComposePlacementPanel } from './ComposePlacementPanel'
 import { projectHasGitRepo } from '@/lib/project-git'
+import {
+  environmentShieldModeToPayload,
+  environmentShieldModeToSelect,
+  exemptPathsToText,
+  parseExemptPathsText,
+  SHIELD_MODES,
+  shieldModeDescription,
+  shieldModeLabel,
+  validateExemptPaths,
+  type EnvironmentShieldModeSelect,
+} from '@/lib/shield'
 import { nodeSchedulingRole, targetNodesHint } from '@/lib/node-role'
 import { NodeRoleBadge } from '@/components/nodes/NodeRoleBadge'
 import {
@@ -37,10 +62,11 @@ import {
 } from '@/components/ui/select'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import {
+  AlertTriangle,
   Clock,
   Cpu,
-  GitBranch,
   Gauge,
+  GitBranch,
   Hammer,
   KeyRound,
   Loader2,
@@ -50,7 +76,10 @@ import {
   Shield,
   X,
 } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
+import { useForm, type UseFormReturn } from 'react-hook-form'
+import { zodResolver } from '@hookform/resolvers/zod'
+import { z } from 'zod'
 import { Link } from 'react-router'
 import { toast } from 'sonner'
 
@@ -75,35 +104,6 @@ interface SecurityConfig {
     whitelistIps?: string[]
     blacklistIps?: string[]
   }
-}
-
-/** Select value for the tri-state environment attack-mode override. */
-type AttackModeSelect = 'inherit' | 'on' | 'off'
-
-/**
- * Map the environment's nullable `attack_mode` to the select value.
- * `null`/`undefined` → "inherit" (use the project setting); `true` → "on";
- * `false` → "off". Keeping these distinct is what lets an environment opt out
- * of (or into) attack mode independently of the project default.
- */
-function attackModeToSelect(
-  value: boolean | null | undefined
-): AttackModeSelect {
-  if (value === true) return 'on'
-  if (value === false) return 'off'
-  return 'inherit'
-}
-
-/**
- * Map the select value back to the API payload. "inherit" sends `null` so the
- * column is cleared and the project setting applies; "on"/"off" send the
- * explicit override. Sending `false` for "off" is intentional — it forces
- * attack mode off even when the project has it on.
- */
-function attackModeToPayload(value: AttackModeSelect): boolean | null {
-  if (value === 'on') return true
-  if (value === 'off') return false
-  return null
 }
 
 /** Select value for the tri-state environment HTTP→HTTPS redirect override. */
@@ -132,11 +132,71 @@ function forceHttpsToPayload(value: ForceHttpsSelect): boolean | null {
   return null
 }
 
+const healthNumberDraft = (max: number) =>
+  z
+    .string()
+    .refine(
+      (value) =>
+        value.trim() !== '' &&
+        Number.isInteger(Number(value)) &&
+        Number(value) >= 1 &&
+        Number(value) <= max,
+      `Enter a whole number from 1 to ${max}`
+    )
+const probePathDraft = z
+  .string()
+  .refine(
+    (path) =>
+      path === '' ||
+      (path.startsWith('/') &&
+        !path.startsWith('//') &&
+        !path.includes('\\') &&
+        !path.includes('#') &&
+        new TextEncoder().encode(path).length <= 2048 &&
+        !Array.from(path).some(
+          (char) =>
+            char.charCodeAt(0) < 32 ||
+            (char.charCodeAt(0) >= 127 && char.charCodeAt(0) <= 159)
+        )),
+    'Use a path starting with /, without fragments or backslashes (maximum 2048 bytes)'
+  )
+const healthDraftSchema = z.object({
+  path: probePathDraft,
+  maxInFlightPerReplica: z.union([
+    z.literal(''),
+    healthNumberDraft(4294967295),
+  ]),
+  intervalSeconds: healthNumberDraft(3600),
+  timeoutSeconds: healthNumberDraft(60),
+  unhealthyThreshold: healthNumberDraft(100),
+  healthyThreshold: healthNumberDraft(100),
+})
+type HealthDrafts = z.infer<typeof healthDraftSchema>
+
+function healthDraftValues(policy?: LoadBalancingConfig | null): HealthDrafts {
+  const health = policy?.healthCheck
+  return {
+    path: health?.path ?? '',
+    maxInFlightPerReplica: policy?.maxInFlightPerReplica?.toString() ?? '',
+    intervalSeconds: String(health?.intervalSeconds ?? 2),
+    timeoutSeconds: String(health?.timeoutSeconds ?? 2),
+    unhealthyThreshold: String(health?.unhealthyThreshold ?? 3),
+    healthyThreshold: String(health?.healthyThreshold ?? 2),
+  }
+}
+
 export function EnvironmentConfigurationCard({
   project,
   environment,
   onUpdate,
 }: EnvironmentConfigurationCardProps) {
+  const healthForm = useForm<HealthDrafts>({
+    resolver: zodResolver(healthDraftSchema),
+    mode: 'onChange',
+    defaultValues: healthDraftValues(
+      environment.deployment_config?.loadBalancing
+    ),
+  })
   const nodesQuery = useQuery({
     ...adminListNodesOptions(),
   })
@@ -149,6 +209,12 @@ export function EnvironmentConfigurationCard({
     u != null ? (u / 1_000_000).toString() : ''
 
   const [formData, setFormData] = useState({
+    loadBalancing: (environment.deployment_config?.loadBalancing ??
+      null) as LoadBalancingConfig | null,
+    preferredNodeIds:
+      environment.deployment_config?.loadBalancing?.preferredNodeIds?.join(
+        ', '
+      ) ?? '',
     branch: environment.branch ?? '',
     cpu_request: microToCores(environment.deployment_config?.cpuRequest),
     cpu_limit: microToCores(environment.deployment_config?.cpuLimit),
@@ -156,10 +222,10 @@ export function EnvironmentConfigurationCard({
       environment.deployment_config?.memoryRequest?.toString() ?? '',
     memory_limit: environment.deployment_config?.memoryLimit?.toString() ?? '',
     replicas: environment.deployment_config?.replicas?.toString() ?? '1',
-    // Tri-state attack mode: 'inherit' (null → use the project setting),
-    // 'on' (true → force on) or 'off' (false → force off). Map the nullable
-    // boolean from the API to the select value.
-    attack_mode: attackModeToSelect(environment.attack_mode),
+    // Shield mode: 'inherit' (null → the project's mode) or a mode of its
+    // own. The API still writes the legacy attack_mode column to match.
+    shield_mode: environmentShieldModeToSelect(environment.shield_mode),
+    shield_exempt_paths: exemptPathsToText(environment.shield_exempt_paths),
     force_https: forceHttpsToSelect(environment.force_https),
     protected: environment.protected ?? false,
     anti_affinity: environment.deployment_config?.antiAffinity ?? true,
@@ -178,6 +244,8 @@ export function EnvironmentConfigurationCard({
       environment.deployment_config?.wakeTimeoutSeconds?.toString() ?? '30',
     request_timeout_seconds:
       environment.deployment_config?.requestTimeoutSeconds?.toString() ?? '',
+    stop_timeout_seconds:
+      environment.deployment_config?.stopTimeoutSeconds?.toString() ?? '',
     sse_idle_timeout_seconds:
       environment.deployment_config?.sseIdleTimeoutSeconds?.toString() ?? '',
     websocket_idle_timeout_seconds:
@@ -216,14 +284,50 @@ export function EnvironmentConfigurationCard({
     } as SecurityConfig,
   })
 
+  const routingDirty = useRef({ policy: false, nodes: false })
+  const routingRevision = useRef({ policy: 0, nodes: 0 })
+  const environmentId = useRef(environment.id)
+  const { loadBalancing, preferredNodeIds } = formData
+  const setLoadBalancing = (value: LoadBalancingConfig | null) => {
+    routingRevision.current.policy += 1
+    routingDirty.current.policy = true
+    setFormData((previous) => ({ ...previous, loadBalancing: value }))
+  }
+  const setPreferredNodeIds = (value: string) => {
+    routingRevision.current.nodes += 1
+    routingDirty.current.nodes = true
+    setFormData((previous) => ({ ...previous, preferredNodeIds: value }))
+  }
+
   // Label editing state
   const [newLabelKey, setNewLabelKey] = useState('')
   const [newLabelValue, setNewLabelValue] = useState('')
 
   // Sync form data when environment changes
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    setFormData({
+    const changedIdentity = environmentId.current !== environment.id
+    if (changedIdentity) {
+      environmentId.current = environment.id
+      routingDirty.current = { policy: false, nodes: false }
+    }
+    healthForm.reset(
+      healthDraftValues(environment.deployment_config?.loadBalancing),
+      {
+        keepDirtyValues: !changedIdentity,
+      }
+    )
+    const dirty = { ...routingDirty.current }
+
+    setFormData((previous) => ({
+      loadBalancing: dirty.policy
+        ? previous.loadBalancing
+        : ((environment.deployment_config?.loadBalancing ??
+            null) as LoadBalancingConfig | null),
+      preferredNodeIds: dirty.nodes
+        ? previous.preferredNodeIds
+        : (environment.deployment_config?.loadBalancing?.preferredNodeIds?.join(
+            ', '
+          ) ?? ''),
       branch: environment.branch ?? '',
       cpu_request: microToCores(environment.deployment_config?.cpuRequest),
       cpu_limit: microToCores(environment.deployment_config?.cpuLimit),
@@ -232,7 +336,8 @@ export function EnvironmentConfigurationCard({
       memory_limit:
         environment.deployment_config?.memoryLimit?.toString() ?? '',
       replicas: environment.deployment_config?.replicas?.toString() ?? '1',
-      attack_mode: attackModeToSelect(environment.attack_mode),
+      shield_mode: environmentShieldModeToSelect(environment.shield_mode),
+      shield_exempt_paths: exemptPathsToText(environment.shield_exempt_paths),
       force_https: forceHttpsToSelect(environment.force_https),
       protected: environment.protected ?? false,
       anti_affinity: environment.deployment_config?.antiAffinity ?? true,
@@ -251,6 +356,8 @@ export function EnvironmentConfigurationCard({
         environment.deployment_config?.wakeTimeoutSeconds?.toString() ?? '30',
       request_timeout_seconds:
         environment.deployment_config?.requestTimeoutSeconds?.toString() ?? '',
+      stop_timeout_seconds:
+        environment.deployment_config?.stopTimeoutSeconds?.toString() ?? '',
       sse_idle_timeout_seconds:
         environment.deployment_config?.sseIdleTimeoutSeconds?.toString() ?? '',
       websocket_idle_timeout_seconds:
@@ -290,22 +397,102 @@ export function EnvironmentConfigurationCard({
               ?.maxRequestsPerHour ?? undefined,
         },
       } as SecurityConfig,
-    })
-  }, [environment])
+    }))
+  }, [environment, healthForm])
 
   const updateEnvironmentSettings = useMutation({
     ...updateEnvironmentSettingsMutation(),
     meta: {
       errorTitle: 'Failed to update environment configuration',
     },
-    onSuccess: () => {
+    onMutate: () => ({
+      environmentId: environmentId.current,
+      revision: { ...routingRevision.current },
+      healthDrafts: healthForm.getValues(),
+    }),
+    onSuccess: (updated, _variables, submitted) => {
+      if (submitted?.environmentId === environmentId.current) {
+        for (const field of ['policy', 'nodes'] as const) {
+          if (routingRevision.current[field] === submitted.revision[field]) {
+            routingDirty.current[field] = false
+          }
+        }
+        const current = healthForm.getValues()
+        for (const field of Object.keys(current) as Array<keyof HealthDrafts>) {
+          // The successful write is the new baseline, even if a pending edit
+          // returned to the previous default (which RHF considered clean).
+          healthForm.resetField(field, {
+            defaultValue: submitted.healthDrafts[field],
+          })
+          if (current[field] !== submitted.healthDrafts[field]) {
+            healthForm.setValue(field, current[field], { shouldDirty: true })
+          }
+        }
+      }
       toast.success('Environment configuration updated successfully')
+      if (updated.placement_warning) {
+        toast.warning(updated.placement_warning)
+      }
       onUpdate()
     },
   })
 
+  const [exemptPathsError, setExemptPathsError] = useState<string | null>(null)
+  const [stopTimeoutError, setStopTimeoutError] = useState<string | null>(null)
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
+
+    let routing = loadBalancing
+    if (routing) {
+      if (!(await healthForm.trigger())) return
+      const drafts = healthForm.getValues()
+      routing = {
+        ...routing,
+        maxInFlightPerReplica:
+          drafts.maxInFlightPerReplica === ''
+            ? null
+            : Number(drafts.maxInFlightPerReplica),
+        healthCheck: {
+          ...defaultLoadBalancing.healthCheck!,
+          ...routing.healthCheck,
+          path: drafts.path || null,
+          intervalSeconds: Number(drafts.intervalSeconds),
+          timeoutSeconds: Number(drafts.timeoutSeconds),
+          unhealthyThreshold: Number(drafts.unhealthyThreshold),
+          healthyThreshold: Number(drafts.healthyThreshold),
+        },
+      }
+    }
+    if (routing?.strategy === 'preferred_nodes') {
+      const ids = preferredNodeIds
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean)
+        .map(Number)
+      if (
+        ids.length > 100 ||
+        new Set(ids).size !== ids.length ||
+        !ids.every((n) => Number.isInteger(n) && n >= 0 && n <= 2147483647)
+      ) {
+        toast.error(
+          'Enter up to 100 distinct nonnegative node IDs separated by commas'
+        )
+        return
+      }
+      routing = { ...routing, preferredNodeIds: ids }
+    }
+
+    const exemptPaths = parseExemptPathsText(formData.shield_exempt_paths)
+    const exemptProblem = validateExemptPaths(exemptPaths)
+    setExemptPathsError(exemptProblem)
+    if (exemptProblem) return
+    const stopTimeoutError = stopTimeoutProblem(formData.stop_timeout_seconds)
+    setStopTimeoutError(stopTimeoutError)
+    if (stopTimeoutError) {
+      toast.error('Check the stop timeout', { description: stopTimeoutError })
+      return
+    }
 
     updateEnvironmentSettings.mutateAsync({
       path: {
@@ -326,14 +513,16 @@ export function EnvironmentConfigurationCard({
         memory_limit: formData.memory_limit
           ? parseInt(formData.memory_limit)
           : null,
+        load_balancing: routing,
         replicas: formData.replicas ? parseInt(formData.replicas) : null,
         // Exposed port is managed by EnvironmentPortOverrideCard under
         // Build & Deploy → Deploy, not this form — omit it so submitting
         // the rest of this form never clobbers that override.
         protected: formData.protected,
         automatic_deploy: formData.automatic_deploy,
-        // Tri-state: null clears the override (inherit project), true/false force it.
-        attack_mode: attackModeToPayload(formData.attack_mode),
+        // null clears the override so the environment follows the project.
+        shield_mode: environmentShieldModeToPayload(formData.shield_mode),
+        shield_exempt_paths: exemptPaths,
         // Tri-state: null clears the override (inherit the proxy's
         // certificate-driven default), true/false force it.
         force_https: forceHttpsToPayload(formData.force_https),
@@ -367,6 +556,9 @@ export function EnvironmentConfigurationCard({
         // the override (inherit service/global default, itself unlimited by
         // default), "0" is a valid, distinct override meaning "explicitly
         // unlimited for this environment."
+        // Blank sends null, which clears the override so the environment
+        // follows the project (or the 10-second default).
+        stop_timeout_seconds: stopTimeoutSeconds(formData.stop_timeout_seconds),
         max_concurrent_connections: formData.max_concurrent_connections
           ? parseInt(formData.max_concurrent_connections)
           : null,
@@ -383,6 +575,17 @@ export function EnvironmentConfigurationCard({
   }
 
   const hasGitRepo = projectHasGitRepo(project)
+  const isComposeProject = project.preset === 'docker-compose'
+  const composePlacementPanel = (
+    <ComposePlacementPanel
+      projectId={project.id}
+      environmentId={environment.id}
+      nodes={activeNodes}
+      nodesLoaded={nodesQuery.isSuccess}
+      nodesError={nodesQuery.error}
+      onRetryNodes={() => void nodesQuery.refetch()}
+    />
+  )
 
   return (
     <form onSubmit={handleSubmit}>
@@ -392,9 +595,13 @@ export function EnvironmentConfigurationCard({
                 no branch to deploy from and no repository to push to, so both
                 controls here are inapplicable rather than unconfigured. */}
         {hasGitRepo && (
-          <SettingsSection title="Git & deployments" icon={GitBranch}>
+          <SettingsSection
+            id="setting-environment-git"
+            title="Git & deployments"
+            icon={GitBranch}
+          >
             <div>
-              <Label>Branch Name</Label>
+              <Label>Branch name</Label>
               <div className="mt-2">
                 <BranchSelector
                   repoOwner={project.repo_owner || ''}
@@ -441,10 +648,14 @@ export function EnvironmentConfigurationCard({
         )}
 
         {/* CPU Resources */}
-        <SettingsSection title="Compute resources" icon={Cpu}>
+        <SettingsSection
+          id="setting-environment-resources"
+          title="Compute resources"
+          icon={Cpu}
+        >
           <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
             <div className="space-y-4">
-              <h3 className="text-sm font-medium">CPU Resources</h3>
+              <h3 className="text-sm font-medium">CPU resources</h3>
               <div className="space-y-4">
                 <div>
                   <Label>CPU Request (cores)</Label>
@@ -504,7 +715,7 @@ export function EnvironmentConfigurationCard({
 
             {/* Memory Resources */}
             <div className="space-y-4">
-              <h3 className="text-sm font-medium">Memory Resources</h3>
+              <h3 className="text-sm font-medium">Memory resources</h3>
               <div className="space-y-4">
                 <div>
                   <Label>Memory Request (MB)</Label>
@@ -583,7 +794,19 @@ export function EnvironmentConfigurationCard({
         </SettingsSection>
 
         {/* Scaling & Network */}
-        <SettingsSection title="Scaling" icon={Network}>
+        <SettingsSection
+          id="setting-environment-scaling"
+          title="Scaling"
+          icon={Network}
+        >
+          <LoadBalancingFields
+            value={loadBalancing}
+            healthForm={healthForm}
+            onChange={setLoadBalancing}
+            preferredNodeIds={preferredNodeIds}
+            onPreferredNodeIdsChange={setPreferredNodeIds}
+            id={String(environment.id)}
+          />
           <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
             <div>
               <Label>Replicas</Label>
@@ -611,7 +834,11 @@ export function EnvironmentConfigurationCard({
         </SettingsSection>
 
         {/* On-Demand (Scale-to-Zero) */}
-        <SettingsSection title="Scale to zero" icon={Moon}>
+        <SettingsSection
+          id="setting-environment-scale-to-zero"
+          title="Scale to zero"
+          icon={Moon}
+        >
           <div className="space-y-4">
             <div className="flex items-start sm:items-center gap-3 p-3 border rounded-lg">
               <div className="flex-1 min-w-0">
@@ -690,7 +917,11 @@ export function EnvironmentConfigurationCard({
         </SettingsSection>
 
         {/* Request Timeouts */}
-        <SettingsSection title="Request timeouts" icon={Clock}>
+        <SettingsSection
+          id="setting-environment-timeouts"
+          title="Request timeouts"
+          icon={Clock}
+        >
           <p className="text-xs text-muted-foreground mb-4">
             Override the global request timeout defaults for this environment.
             Leave blank to inherit the service/global default (no timeout,
@@ -750,8 +981,49 @@ export function EnvironmentConfigurationCard({
           </div>
         </SettingsSection>
 
+        <SettingsSection
+          id="setting-environment-stop-timeout"
+          title="Stop timeout"
+          icon={Clock}
+        >
+          <p className="text-xs text-muted-foreground mb-4">
+            How long this environment&apos;s previous deployment gets to finish
+            in-flight work after SIGTERM, before it is killed, when a new
+            deployment replaces it. Leave blank to follow the project (default{' '}
+            {DEFAULT_STOP_TIMEOUT_SECONDS} seconds).
+          </p>
+          <div className="w-full sm:w-[200px]">
+            <Label htmlFor="environment-stop-timeout">Seconds</Label>
+            <Input
+              id="environment-stop-timeout"
+              type="number"
+              min={MIN_STOP_TIMEOUT_SECONDS}
+              max={MAX_STOP_TIMEOUT_SECONDS}
+              value={formData.stop_timeout_seconds}
+              aria-invalid={stopTimeoutError !== null}
+              onChange={(e) => {
+                setStopTimeoutError(null)
+                setFormData((prev) => ({
+                  ...prev,
+                  stop_timeout_seconds: e.target.value,
+                }))
+              }}
+              placeholder="Inherit"
+            />
+            {stopTimeoutError && (
+              <p className="mt-1 text-xs text-destructive">
+                {stopTimeoutError}
+              </p>
+            )}
+          </div>
+        </SettingsSection>
+
         {/* Concurrent Connection Limit */}
-        <SettingsSection title="Connection limits" icon={Gauge}>
+        <SettingsSection
+          id="setting-environment-connection-limits"
+          title="Connection limits"
+          icon={Gauge}
+        >
           <p className="text-xs text-muted-foreground mb-4">
             Cap on concurrent in-flight requests to this environment&apos;s
             upstream. Protects the proxy&apos;s own connection budget from a
@@ -780,7 +1052,11 @@ export function EnvironmentConfigurationCard({
 
         {/* Build location: always visible so operators learn builds can
             move off the control plane, even before a worker has joined. */}
-        <SettingsSection title="Builds" icon={Hammer}>
+        <SettingsSection
+          id="setting-environment-builds"
+          title="Builds"
+          icon={Hammer}
+        >
           <div className="space-y-2">
             <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
               <div className="flex-1 min-w-0">
@@ -827,11 +1103,14 @@ export function EnvironmentConfigurationCard({
             <p className="text-xs text-muted-foreground">
               A node labelled <code>temps.sh/role=builder</code> is preferred. A{' '}
               <code>temps.sh/role=dedicated</code> node builds only for
-              environments that select it in Target Nodes. When no worker can
+              environments that select it in Target nodes. When no worker can
               take a build, it runs on the control plane when local builds are
               enabled, and the build log says why. CI uses the configured GitHub
               Actions runner and never falls back locally.{' '}
-              <Link to="/settings/build-limits#ci-builder" className="underline">
+              <Link
+                to="/settings/build-limits#ci-builder"
+                className="underline"
+              >
                 Configure CI builder
               </Link>
               .
@@ -856,9 +1135,32 @@ export function EnvironmentConfigurationCard({
           </div>
         </SettingsSection>
 
+        {/* A Compose stack's placement stays visible when no worker is
+            active, or the node list failed to load: the stack still lives
+            somewhere, possibly on a node that just went offline. */}
+        {isComposeProject && activeNodes.length === 0 && (
+          <SettingsSection title="Compose stack placement" icon={Network}>
+            {composePlacementPanel}
+          </SettingsSection>
+        )}
+
+        {/* Outside node scheduling, which is hidden with no active worker: a
+            single-node install, or a failed node list, still needs this. */}
+        {environment.placement_warning && (
+          <Alert>
+            <AlertTriangle className="h-4 w-4" aria-hidden="true" />
+            <AlertTitle>Replicas can&apos;t spread as configured</AlertTitle>
+            <AlertDescription>{environment.placement_warning}</AlertDescription>
+          </Alert>
+        )}
+
         {/* Node Scheduling */}
         {activeNodes.length > 0 && (
-          <SettingsSection title="Node scheduling" icon={Network}>
+          <SettingsSection
+            id="setting-environment-node-scheduling"
+            title="Node scheduling"
+            icon={Network}
+          >
             <div className="space-y-4">
               {/* Protected environment toggle */}
               <div className="flex items-start sm:items-center gap-3 p-3 border rounded-lg">
@@ -912,12 +1214,17 @@ export function EnvironmentConfigurationCard({
                 />
               </div>
 
-              {/* Target Nodes */}
+              {/* Target nodes */}
               <div>
-                <Label className="text-sm font-medium">Target Nodes</Label>
+                <Label className="text-sm font-medium">Target nodes</Label>
                 <p className="text-xs text-muted-foreground mb-2">
-                  {targetNodesHint(activeNodes)}
+                  {isComposeProject
+                    ? 'Choose where this Compose stack first runs. After its first deployment it stays on that node, because its volumes live there.'
+                    : targetNodesHint(activeNodes)}
                 </p>
+                {isComposeProject && (
+                  <div className="mb-2">{composePlacementPanel}</div>
+                )}
                 <div className="space-y-2">
                   {activeNodes.map((node) => {
                     const isSelected = formData.target_nodes.includes(node.id)
@@ -987,11 +1294,11 @@ export function EnvironmentConfigurationCard({
 
               {/* Target Labels */}
               <div>
-                <Label className="text-sm font-medium">Label Selectors</Label>
+                <Label className="text-sm font-medium">Label selectors</Label>
                 <p className="text-xs text-muted-foreground mb-2">
                   Only deploy to nodes matching these labels. All keys must
                   match (AND logic). Labels never select a dedicated node; pick
-                  it in Target Nodes instead.
+                  it in Target nodes instead.
                 </p>
 
                 {/* Existing labels */}
@@ -1069,37 +1376,89 @@ export function EnvironmentConfigurationCard({
         )}
 
         {/* Security Configuration */}
-        <SettingsSection title="Security" icon={Shield}>
+        <SettingsSection
+          id="setting-environment-security"
+          title="Security"
+          icon={Shield}
+        >
           <div className="space-y-4">
-            <div className="flex items-start sm:items-center gap-3 p-3 border rounded-lg">
-              <div className="flex-1 min-w-0">
-                <Label className="text-sm font-medium">Attack Mode</Label>
-                <p className="text-xs text-muted-foreground">
-                  Require a CAPTCHA challenge for visitors. Inherit uses the
-                  service default (currently{' '}
-                  {project.attack_mode ? 'on' : 'off'}).
+            <div className="space-y-3 p-3 border rounded-lg">
+              <div className="flex items-start sm:items-center gap-3">
+                <div className="flex-1 min-w-0">
+                  <Label
+                    htmlFor="env-shield-mode"
+                    className="text-sm font-medium"
+                  >
+                    Shield mode
+                  </Label>
+                  <p className="text-xs text-muted-foreground">
+                    {formData.shield_mode === 'inherit'
+                      ? `Follows the service, currently ${shieldModeLabel(project.shield_mode).toLowerCase()}: ${shieldModeDescription(project.shield_mode)}`
+                      : shieldModeDescription(formData.shield_mode)}
+                  </p>
+                </div>
+                <Select
+                  value={formData.shield_mode}
+                  onValueChange={(value) =>
+                    setFormData((prev) => ({
+                      ...prev,
+                      shield_mode: value as EnvironmentShieldModeSelect,
+                    }))
+                  }
+                >
+                  <SelectTrigger
+                    id="env-shield-mode"
+                    className="w-full sm:w-[180px]"
+                  >
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="inherit">
+                      Inherit ({shieldModeLabel(project.shield_mode)})
+                    </SelectItem>
+                    {SHIELD_MODES.map((mode) => (
+                      <SelectItem key={mode.value} value={mode.value}>
+                        {mode.label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-1.5">
+                <Label
+                  htmlFor="env-shield-exempt-paths"
+                  className="text-sm font-medium"
+                >
+                  Paths never challenged
+                </Label>
+                <Textarea
+                  id="env-shield-exempt-paths"
+                  value={formData.shield_exempt_paths}
+                  onChange={(e) =>
+                    setFormData((prev) => ({
+                      ...prev,
+                      shield_exempt_paths: e.target.value,
+                    }))
+                  }
+                  rows={3}
+                  spellCheck={false}
+                  className="font-mono text-xs"
+                  placeholder={'/api/*\n/webhooks/incoming'}
+                  aria-invalid={exemptPathsError ? 'true' : undefined}
+                  aria-describedby="env-shield-exempt-paths-help"
+                />
+                <p
+                  id="env-shield-exempt-paths-help"
+                  className={
+                    exemptPathsError
+                      ? 'text-xs text-destructive'
+                      : 'text-xs text-muted-foreground'
+                  }
+                >
+                  {exemptPathsError ??
+                    'One path per line; a trailing /* covers everything below it. Requests to these paths are never challenged.'}
                 </p>
               </div>
-              <Select
-                value={formData.attack_mode}
-                onValueChange={(value) =>
-                  setFormData((prev) => ({
-                    ...prev,
-                    attack_mode: value as AttackModeSelect,
-                  }))
-                }
-              >
-                <SelectTrigger className="w-full sm:w-[180px]">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="inherit">
-                    Inherit ({project.attack_mode ? 'on' : 'off'})
-                  </SelectItem>
-                  <SelectItem value="on">On</SelectItem>
-                  <SelectItem value="off">Off</SelectItem>
-                </SelectContent>
-              </Select>
             </div>
 
             <div className="flex items-start sm:items-center gap-3 p-3 border rounded-lg">
@@ -1142,7 +1501,7 @@ export function EnvironmentConfigurationCard({
                   htmlFor="env-security-headers"
                   className="text-sm font-medium"
                 >
-                  Security Headers
+                  Security headers
                 </Label>
                 <p className="text-xs text-muted-foreground">
                   Enable security headers
@@ -1166,7 +1525,7 @@ export function EnvironmentConfigurationCard({
             {formData.security?.enabled && (
               <div className="space-y-4 p-4 border rounded-lg bg-muted/30">
                 <div>
-                  <Label>Header Preset</Label>
+                  <Label>Header preset</Label>
                   <Select
                     value={formData.security?.headers?.preset ?? ''}
                     onValueChange={(value) =>
@@ -1206,7 +1565,7 @@ export function EnvironmentConfigurationCard({
                   className="text-sm font-medium flex items-center gap-1.5"
                 >
                   <KeyRound className="h-4 w-4 shrink-0" />
-                  Password Protection
+                  Password protection
                 </Label>
                 <p className="text-xs text-muted-foreground">
                   Require a password to access this environment.
@@ -1256,10 +1615,10 @@ export function EnvironmentConfigurationCard({
             )}
 
             <div className="space-y-4 p-4 border rounded-lg">
-              <h4 className="text-sm font-medium">Rate Limiting</h4>
+              <h4 className="text-sm font-medium">Rate limiting</h4>
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div>
-                  <Label>Max Requests Per Minute</Label>
+                  <Label>Max requests per minute</Label>
                   <Input
                     type="number"
                     value={
@@ -1284,7 +1643,7 @@ export function EnvironmentConfigurationCard({
                   />
                 </div>
                 <div>
-                  <Label>Max Requests Per Hour</Label>
+                  <Label>Max requests per hour</Label>
                   <Input
                     type="number"
                     value={
@@ -1325,5 +1684,191 @@ export function EnvironmentConfigurationCard({
         </Button>
       </div>
     </form>
+  )
+}
+
+const defaultLoadBalancing: LoadBalancingConfig = {
+  strategy: 'round_robin',
+  preferredNodeIds: [],
+  maxInFlightPerReplica: null,
+  healthCheck: {
+    enabled: false,
+    path: null,
+    intervalSeconds: 2,
+    timeoutSeconds: 2,
+    unhealthyThreshold: 3,
+    healthyThreshold: 2,
+  },
+}
+
+function LoadBalancingFields({
+  healthForm,
+  value,
+  onChange,
+  preferredNodeIds,
+  onPreferredNodeIdsChange,
+  id,
+}: {
+  healthForm: UseFormReturn<HealthDrafts>
+  value: LoadBalancingConfig | null
+  onChange: (value: LoadBalancingConfig | null) => void
+  preferredNodeIds: string
+  onPreferredNodeIdsChange: (value: string) => void
+  id: string
+}) {
+  const policy = value ?? defaultLoadBalancing
+  const health = policy.healthCheck ?? defaultLoadBalancing.healthCheck!
+  const invalidPath = !probePathDraft.safeParse(healthForm.watch('path'))
+    .success
+  const limitDraft = healthForm.watch('maxInFlightPerReplica')
+  const invalidLimit =
+    !healthDraftSchema.shape.maxInFlightPerReplica.safeParse(limitDraft).success
+  return (
+    <div className="space-y-4">
+      <div className="space-y-2">
+        <Label htmlFor={`lb-${id}`}>Request routing</Label>
+        <Select
+          value={value ? policy.strategy : 'inherit'}
+          onValueChange={(v) =>
+            onChange(
+              v === 'inherit'
+                ? null
+                : { ...policy, strategy: v as LoadBalancingConfig['strategy'] }
+            )
+          }
+        >
+          <SelectTrigger id={`lb-${id}`}>
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="inherit">Use project default</SelectItem>
+            <SelectItem value="round_robin">Round robin</SelectItem>
+            <SelectItem value="preferred_nodes">Preferred nodes</SelectItem>
+          </SelectContent>
+        </Select>
+        <p className="text-sm text-muted-foreground">
+          Prefer replicas near your database, with overflow and failover to
+          other nodes. Project defaults use round robin unless configured.
+        </p>
+      </div>
+      {value && (
+        <>
+          {policy.strategy === 'preferred_nodes' && (
+            <>
+              <Label htmlFor={`lb-nodes-${id}`}>
+                Preferred node IDs, in priority order
+              </Label>
+              <Input
+                id={`lb-nodes-${id}`}
+                value={preferredNodeIds}
+                placeholder="3, 5"
+                onChange={(e) => onPreferredNodeIdsChange(e.target.value)}
+              />
+              <p className="text-sm text-muted-foreground">
+                Use 0 for the control plane. Unlisted nodes form the final
+                fallback tier.
+              </p>
+            </>
+          )}
+          {(policy.strategy === 'preferred_nodes' || invalidLimit) && (
+            <>
+              <Label htmlFor={`lb-limit-${id}`}>
+                In-flight requests per replica before overflow
+              </Label>
+              <Input
+                id={`lb-limit-${id}`}
+                type="number"
+                min={1}
+                placeholder="Unlimited"
+                aria-invalid={
+                  !!healthForm.formState.errors.maxInFlightPerReplica
+                }
+                {...healthForm.register('maxInFlightPerReplica')}
+              />
+              {healthForm.formState.errors.maxInFlightPerReplica && (
+                <p role="alert" className="text-sm text-destructive">
+                  {healthForm.formState.errors.maxInFlightPerReplica.message}
+                </p>
+              )}
+              {policy.strategy !== 'preferred_nodes' && (
+                <p className="text-sm text-muted-foreground">
+                  Overflow limits apply only to preferred-node routing. Clear or
+                  correct this invalid saved value to continue.
+                </p>
+              )}
+            </>
+          )}
+          <div className="flex items-center gap-2">
+            <Switch
+              id={`lb-health-${id}`}
+              checked={health.enabled}
+              onCheckedChange={(enabled) =>
+                onChange({ ...policy, healthCheck: { ...health, enabled } })
+              }
+            />
+            <Label htmlFor={`lb-health-${id}`}>Active health checks</Label>
+          </div>
+          <p className="text-sm text-muted-foreground">
+            Stop routing to replicas that fail HTTP probes. If every replica is
+            unhealthy, traffic fails open to all replicas.
+          </p>
+          {(health.enabled ||
+            invalidPath ||
+            Object.keys(healthForm.formState.errors).length > 0) && (
+            <div className="grid gap-4 sm:grid-cols-2">
+              <div className="space-y-2">
+                <Label htmlFor={`lb-path-${id}`}>Probe path</Label>
+                <Input
+                  id={`lb-path-${id}`}
+                  placeholder="Deployment health path"
+                  {...healthForm.register('path')}
+                  aria-invalid={!!healthForm.formState.errors.path}
+                  aria-describedby={`lb-path-${id}-error`}
+                />
+                {healthForm.formState.errors.path && (
+                  <p
+                    id={`lb-path-${id}-error`}
+                    role="alert"
+                    className="text-sm text-destructive"
+                  >
+                    {healthForm.formState.errors.path.message}
+                  </p>
+                )}
+              </div>
+              {(
+                [
+                  ['intervalSeconds', 'Interval (seconds)', 3600],
+                  ['timeoutSeconds', 'Timeout (seconds)', 60],
+                  ['unhealthyThreshold', 'Failures before removal', 100],
+                  ['healthyThreshold', 'Passes before recovery', 100],
+                ] as const
+              ).map(([key, label, max]) => (
+                <div key={key} className="space-y-2">
+                  <Label htmlFor={`lb-${key}-${id}`}>{label}</Label>
+                  <Input
+                    id={`lb-${key}-${id}`}
+                    type="number"
+                    min={1}
+                    max={max}
+                    {...healthForm.register(key)}
+                    aria-invalid={!!healthForm.formState.errors[key]}
+                    aria-describedby={`lb-${key}-${id}-error`}
+                  />
+                  {healthForm.formState.errors[key] && (
+                    <p
+                      id={`lb-${key}-${id}-error`}
+                      role="alert"
+                      className="text-sm text-destructive"
+                    >
+                      {healthForm.formState.errors[key]?.message}
+                    </p>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </>
+      )}
+    </div>
   )
 }

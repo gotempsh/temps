@@ -15,16 +15,14 @@ import {
   deactivateApiKey,
   type ApiKeyResponse,
 } from '@/api/client'
-import {
-  listApiKeysOptions,
-  listApiKeysQueryKey,
-} from '@/api/client/@tanstack/react-query.gen'
+import { listApiKeysOptions } from '@/api/client/@tanstack/react-query.gen'
+import { invalidateApiKeyQueries } from '@/lib/api-key-queries'
 import { ApiKeyTable } from '@/components/api-keys'
 import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { usePageTitle } from '@/hooks/usePageTitle'
 
 export default function ApiKeys() {
-  usePageTitle('API Keys')
+  usePageTitle('API keys')
   const navigate = useNavigate()
   const [keyToDelete, setKeyToDelete] = useState<ApiKeyResponse | null>(null)
   const queryClient = useQueryClient()
@@ -41,12 +39,13 @@ export default function ApiKeys() {
 
   // Delete mutation
   const deleteMutation = useMutation({
-    mutationFn: (id: number) => deleteApiKey({ path: { id } }),
+    mutationFn: (id: number) =>
+      deleteApiKey({ path: { id }, throwOnError: true }),
     meta: {
       errorTitle: 'Failed to delete API key',
     },
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: listApiKeysQueryKey() })
+      invalidateApiKeyQueries(queryClient)
       setKeyToDelete(null)
       toast.success('API key deleted successfully')
     },
@@ -54,24 +53,26 @@ export default function ApiKeys() {
 
   // Activate mutation
   const activateMutation = useMutation({
-    mutationFn: (id: number) => activateApiKey({ path: { id } }),
+    mutationFn: (id: number) =>
+      activateApiKey({ path: { id }, throwOnError: true }),
     meta: {
       errorTitle: 'Failed to activate API key',
     },
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: listApiKeysQueryKey() })
+      invalidateApiKeyQueries(queryClient)
       toast.success('API key activated')
     },
   })
 
   // Deactivate mutation
   const deactivateMutation = useMutation({
-    mutationFn: (id: number) => deactivateApiKey({ path: { id } }),
+    mutationFn: (id: number) =>
+      deactivateApiKey({ path: { id }, throwOnError: true }),
     meta: {
       errorTitle: 'Failed to deactivate API key',
     },
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: listApiKeysQueryKey() })
+      invalidateApiKeyQueries(queryClient)
       toast.success('API key deactivated')
     },
   })
@@ -96,12 +97,12 @@ export default function ApiKeys() {
   return (
     <div className="w-full min-w-0 space-y-6">
       <PageHeader
-        title="API Keys"
+        title="API keys"
         description="Manage your API keys for programmatic access"
         actions={
           <CreateActionButton
             onClick={handleCreateClick}
-            label="Create API Key"
+            label="Create API key"
           />
         }
       />
@@ -111,7 +112,7 @@ export default function ApiKeys() {
         <div className="grid gap-3 grid-cols-1 sm:grid-cols-3 sm:gap-4">
           <Card>
             <CardHeader className="pb-3">
-              <CardTitle className="text-sm font-medium">Total Keys</CardTitle>
+              <CardTitle className="text-sm font-medium">Total keys</CardTitle>
             </CardHeader>
             <CardContent>
               <div className="text-2xl font-bold">{apiKeys.length}</div>
@@ -120,7 +121,7 @@ export default function ApiKeys() {
           </Card>
           <Card>
             <CardHeader className="pb-3">
-              <CardTitle className="text-sm font-medium">Active Keys</CardTitle>
+              <CardTitle className="text-sm font-medium">Active keys</CardTitle>
             </CardHeader>
             <CardContent>
               <div className="text-2xl font-bold">
@@ -132,7 +133,7 @@ export default function ApiKeys() {
           <Card>
             <CardHeader className="pb-3">
               <CardTitle className="text-sm font-medium">
-                Expiring Soon
+                Expiring soon
               </CardTitle>
             </CardHeader>
             <CardContent>

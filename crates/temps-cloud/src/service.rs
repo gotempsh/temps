@@ -202,6 +202,8 @@ pub struct CloudService {
     backup_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     backup_credential_rotation_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     heartbeat_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// ADR-094: the Temps Cloud console session re-check.
+    console_session_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     lifecycle_notify_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// ADR-045 §3: the console-proxy connection task and its own stop
     /// switch. Separate from `cancel` because the worker owns a dedicated
@@ -287,6 +289,7 @@ impl CloudService {
             backup_task: Mutex::new(None),
             backup_credential_rotation_task: Mutex::new(None),
             heartbeat_task: Mutex::new(None),
+            console_session_task: Mutex::new(None),
             lifecycle_notify_task: Mutex::new(None),
             console_proxy_task: Mutex::new(None),
             backup_mirror_wake: Arc::new(Notify::new()),
@@ -324,7 +327,7 @@ impl CloudService {
     /// Publish `settings.cloud.console_access_enabled` to
     /// [`Self::console_access_enabled_rx`]. A no-op send when the value has
     /// not changed, so subscribers only wake on a real transition.
-    fn apply_console_access_from_settings(&self, settings: &temps_core::AppSettings) {
+    fn apply_console_access_from_settings(&self, settings: &temps_config::AppSettings) {
         let enabled = settings.cloud.console_access_enabled;
         self.console_access_tx.send_if_modified(|current| {
             if *current == enabled {
@@ -348,10 +351,52 @@ impl CloudService {
         crate::console_oidc_bootstrap::ConsoleOidcBootstrapOutcome,
         crate::console_oidc_bootstrap::ConsoleOidcBootstrapError,
     > {
-        crate::console_oidc_bootstrap::apply_console_oidc_bootstrap_file_with(path, |config| {
-            self.apply_bootstrap_console_oidc_config(config)
-        })
-        .await
+        let mut outcome =
+            crate::console_oidc_bootstrap::apply_console_oidc_bootstrap_file_with(path, |config| {
+                self.apply_bootstrap_console_oidc_config(config)
+            })
+            .await?;
+        if let crate::console_oidc_bootstrap::ConsoleOidcBootstrapOutcome::Applied {
+            telemetry,
+            ..
+        } = &mut outcome
+        {
+            if *telemetry == crate::console_oidc_bootstrap::TelemetryConsent::Requested {
+                *telemetry = self.apply_bootstrap_telemetry_consent().await;
+            }
+        }
+        Ok(outcome)
+    }
+
+    /// Turn telemetry export on because the bootstrap file asked for it (see
+    /// [`crate::console_oidc_bootstrap::TelemetryConsent`]). Never fails the
+    /// bootstrap: console access has already been applied, and a plane that
+    /// cannot switch export on keeps working locally -- the failure is
+    /// returned for the caller to log and audit.
+    async fn apply_bootstrap_telemetry_consent(
+        &self,
+    ) -> crate::console_oidc_bootstrap::TelemetryConsent {
+        use crate::console_oidc_bootstrap::TelemetryConsent;
+        let _update = self.feature_update_lock.lock().await;
+        let previous = self.link.feature_switches();
+        let updated = match self.config.grant_bootstrap_telemetry_consent().await {
+            Ok(Some(updated)) => updated,
+            Ok(None) => return TelemetryConsent::AlreadyDecided,
+            Err(error) => {
+                return TelemetryConsent::Failed {
+                    reason: error.to_string(),
+                }
+            }
+        };
+        if previous.telemetry {
+            return TelemetryConsent::AlreadyEnabled;
+        }
+        match self.publish_cloud_switches(&updated) {
+            Ok(new) => TelemetryConsent::GrantedByBootstrap { previous, new },
+            Err(error) => TelemetryConsent::Failed {
+                reason: error.to_string(),
+            },
+        }
     }
 
     /// Wire the backup scheduler in once it is registered. Idempotent.
@@ -630,13 +675,7 @@ impl CloudService {
     /// working the moment the instance links and goes quiet (cheaply) the
     /// moment it disconnects, with no separate start/stop wiring needed.
     ///
-    /// This same connection also negotiates `Capability::InstanceStatusReporting`
-    /// (ADR-039), but no `StatusProvider` is wired up here yet: counting
-    /// deployments/services/projects and reading resource usage needs
-    /// database and system access this crate does not have reason to hold
-    /// just for this. Passing `None` is a deliberately silent no-op — the
-    /// capability is still offered, and status reporting activates with no
-    /// further wiring once a provider is registered.
+    /// Reports the worker count from the local database in the background.
     pub fn start_heartbeat_sender(&self) {
         let mut task = self
             .heartbeat_task
@@ -646,12 +685,50 @@ impl CloudService {
             tracing::info!("Cloud service launching heartbeat sender task");
             let link = self.link.clone();
             let cancel = self.cancel.subscribe();
+            let provider = Arc::new(temps_cloud_client::status_provider::WorkerStatusProvider(
+                self.db.clone(),
+            ));
+            // ADR-094: with an auth plugin, this instance applies Cloud's
+            // signed console logouts and says so in its `Hello`.
+            let console_logout = self.oidc_provisioner.get().map(|oidc| {
+                Arc::new(crate::console_sessions::ConsoleLogoutAdapter::new(
+                    oidc.clone(),
+                )) as Arc<dyn temps_cloud_client::ConsoleLogoutSink>
+            });
             *task = Some(tokio::spawn(async move {
-                temps_cloud_client::heartbeat::run(link, cancel, None).await;
+                temps_cloud_client::heartbeat::run_with_console_logout(
+                    link,
+                    cancel,
+                    Some(provider),
+                    console_logout,
+                )
+                .await;
             }));
         } else {
             tracing::debug!("Cloud heartbeat sender task is already registered");
         }
+    }
+
+    /// ADR-094: re-check Temps Cloud console sessions with Cloud every minute
+    /// and end the ones Cloud no longer vouches for. Safe to start
+    /// unconditionally: without the Cloud-managed provider each pass is one
+    /// local query that finds nothing to do.
+    pub fn start_console_session_checker(&self) {
+        let mut task = self
+            .console_session_task
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if task.is_some() {
+            return;
+        }
+        let Some(oidc) = self.oidc_provisioner.get().cloned() else {
+            tracing::debug!("no OidcService registered; no Temps Cloud console sessions to check");
+            return;
+        };
+        let cancel = self.cancel.subscribe();
+        *task = Some(tokio::spawn(crate::console_sessions::run_session_checker(
+            oidc, cancel,
+        )));
     }
 
     /// Launch the backup lifecycle notifier: subscribes to the job queue and
@@ -986,7 +1063,7 @@ impl CloudService {
     /// through [`ConfigService::update_cloud_features`].
     fn publish_cloud_switches(
         &self,
-        updated: &temps_core::AppSettings,
+        updated: &temps_config::AppSettings,
     ) -> Result<CloudFeatureSwitches, CloudServiceError> {
         let switches = CloudFeatureSwitches {
             telemetry: updated.cloud.telemetry_enabled,
@@ -1663,6 +1740,19 @@ impl CloudService {
         if let Some(task) = heartbeat_task {
             await_task_shutdown(task, "Cloud heartbeat sender", SHUTDOWN_TASK_TIMEOUT).await;
         }
+        let console_session_task = self
+            .console_session_task
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(task) = console_session_task {
+            await_task_shutdown(
+                task,
+                "Temps Cloud console session checker",
+                SHUTDOWN_TASK_TIMEOUT,
+            )
+            .await;
+        }
         let console_proxy_task = self
             .console_proxy_task
             .lock()
@@ -2111,6 +2201,7 @@ mod tests {
             managed_by_cloud: true,
             lifecycle_reconcile_failed_at: None,
             lifecycle_reconcile_generation: 0,
+            worker_credentials: "scoped".to_string(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }
@@ -2290,7 +2381,7 @@ mod tests {
     async fn explicit_disable_retries_failed_provider_revocation() {
         let row = temps_entities::settings::Model {
             id: 1,
-            data: temps_core::AppSettings::default().to_json(),
+            data: temps_config::AppSettings::default().to_json(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -2359,7 +2450,7 @@ mod tests {
     fn bootstrap_settings_row() -> temps_entities::settings::Model {
         temps_entities::settings::Model {
             id: 1,
-            data: temps_core::AppSettings::default().to_json(),
+            data: temps_config::AppSettings::default().to_json(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }
@@ -2379,9 +2470,10 @@ mod tests {
             group_claim: "temps_cloud_instance_role".into(),
             role_claim: "temps_cloud_instance_role".into(),
             default_role: "user".into(),
-            trust_idp_email: true,
+            trust_idp_email: false,
             managed_by_cloud: true,
             admin_only_role_required: true,
+            cloud_sessions_confirmed_at: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }
@@ -2517,13 +2609,13 @@ mod tests {
         Arc::new(
             db.append_query_results(vec![vec![managed_provider_row()]])
                 // upsert: delete old mappings; revoke: login states, sessions,
-                // mappings, provider.
+                // ingress grants, mappings, provider.
                 .append_exec_results(vec![
                     sea_orm::MockExecResult {
                         last_insert_id: 0,
                         rows_affected: 1,
                     };
-                    5
+                    6
                 ])
                 .into_connection(),
         )
@@ -2591,6 +2683,71 @@ mod tests {
             vec![true],
             "consent must be saved to the settings row, not only held in memory"
         );
+    }
+
+    /// A hosted plane's file also asks for telemetry export: it is switched on,
+    /// persisted, and reported for auditing -- after console access, never
+    /// instead of it.
+    #[tokio::test]
+    async fn bootstrap_file_asking_for_telemetry_turns_export_on() {
+        let settings_db = settings_db_accepting_consent_writes(2);
+        let service = test_cloud_service(settings_db.clone());
+        attach_oidc(&service, oidc_db_accepting_a_first_upsert());
+        assert!(!service.feature_switches().telemetry, "precondition: off");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(crate::CONSOLE_OIDC_BOOTSTRAP_FILENAME);
+        std::fs::write(
+            &path,
+            r#"{"issuer":"https://cloud.example.com","client_id":"bootstrap-client","client_secret":"shh","telemetry_enabled":true}"#,
+        )
+        .expect("fixture");
+
+        let outcome = service
+            .apply_console_oidc_bootstrap_file(&path)
+            .await
+            .expect("the bootstrap must succeed");
+
+        let crate::console_oidc_bootstrap::ConsoleOidcBootstrapOutcome::Applied {
+            consent,
+            telemetry,
+            ..
+        } = outcome
+        else {
+            panic!("expected Applied");
+        };
+        assert!(consent.was_granted(), "console access is still granted");
+        let crate::TelemetryConsent::GrantedByBootstrap { previous, new } = telemetry else {
+            panic!("expected telemetry to be granted by the bootstrap, got {telemetry:?}");
+        };
+        assert!(!previous.telemetry && new.telemetry);
+        assert!(service.feature_switches().telemetry, "link switch is on");
+        assert!(!path.exists(), "the file is consumed");
+    }
+
+    /// Without the field nothing about telemetry changes -- the shape every
+    /// file had before Cloud started asking.
+    #[tokio::test]
+    async fn bootstrap_file_without_the_telemetry_field_leaves_export_alone() {
+        let settings_db = settings_db_accepting_consent_writes(1);
+        let service = test_cloud_service(settings_db.clone());
+        attach_oidc(&service, oidc_db_accepting_a_first_upsert());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(crate::CONSOLE_OIDC_BOOTSTRAP_FILENAME);
+        std::fs::write(&path, BOOTSTRAP_FILE).expect("fixture");
+
+        let outcome = service
+            .apply_console_oidc_bootstrap_file(&path)
+            .await
+            .expect("the bootstrap must succeed");
+
+        assert!(matches!(
+            outcome,
+            crate::console_oidc_bootstrap::ConsoleOidcBootstrapOutcome::Applied {
+                telemetry: crate::TelemetryConsent::NotRequested,
+                ..
+            }
+        ));
+        assert!(!service.feature_switches().telemetry);
     }
 
     #[tokio::test]
@@ -2850,12 +3007,13 @@ mod tests {
                     // The provider is gone by the second look.
                     vec![],
                 ])
+                // Login states, sessions, ingress grants, mappings, provider.
                 .append_exec_results(vec![
                     sea_orm::MockExecResult {
                         last_insert_id: 0,
                         rows_affected: 1,
                     };
-                    4
+                    5
                 ])
                 .into_connection(),
         );
@@ -2883,13 +3041,11 @@ mod tests {
 
     // ---- Real-Postgres tests (skip when no container runtime is available) ----
 
-    async fn postgres_or_skip(name: &str) -> Option<temps_database::test_utils::TestDatabase> {
-        match temps_database::test_utils::TestDatabase::with_migrations().await {
+    async fn postgres_or_skip(name: &str) -> Option<temps_test_utils::TestDatabase> {
+        match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(database) => Some(database),
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Docker unavailable; skipping {name}: {error}");
                 None
@@ -2913,7 +3069,7 @@ mod tests {
             .expect("settings row query")
         {
             Some(row) => {
-                temps_core::AppSettings::from_json(row.data)
+                temps_config::AppSettings::from_json(row.data)
                     .cloud
                     .console_access_enabled
             }
@@ -2973,7 +3129,10 @@ mod tests {
             provider.admin_only_role_required,
             "only owners/admins may sign in through the managed provider"
         );
-        assert!(provider.trust_idp_email);
+        assert!(
+            !provider.trust_idp_email,
+            "Cloud must supply verified email provenance on every login"
+        );
         assert_eq!(provider.issuer_url, "https://cloud.example.com");
         let mappings = temps_entities::oidc_role_mappings::Entity::find()
             .filter(temps_entities::oidc_role_mappings::Column::ProviderId.eq(provider.id))
@@ -3221,7 +3380,7 @@ mod bootstrap_backend_url_tests {
     use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult};
     use temps_cloud_client::CloudLink;
     use temps_cloud_protocol::EnrollRequest;
-    use temps_core::AppSettings;
+    use temps_config::AppSettings;
 
     use super::*;
 

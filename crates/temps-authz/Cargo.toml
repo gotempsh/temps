@@ -1,0 +1,29 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "temps-authz"
+version.workspace = true
+edition.workspace = true
+description = "Authorization primitives: AuthContext, roles and permissions, the RequireAuth extractor and the permission_guard family of macros"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+temps-core = { path = "../temps-core" }
+temps-entities = { path = "../temps-entities" }
+axum = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+utoipa = { workspace = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }
+chrono = { workspace = true }
+tokio = { workspace = true }
+walkdir = { workspace = true }
+
+[lints]
+workspace = true

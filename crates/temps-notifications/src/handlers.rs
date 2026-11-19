@@ -2,14 +2,14 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use crate::digest::DigestService;
+use crate::error::NotificationError;
 use crate::routing::{
     CreateNotificationRoute, NotificationRoute, NotificationRouteCoverage, NotificationRouteError,
     NotificationRoutePage, NotificationRouteTestResult, NotificationRoutingService,
     RouteTestDelivery, RouteTestDeliveryStatus, UpdateNotificationRoute,
 };
 use crate::services::{
-    NotificationPreferences, NotificationPreferencesService, NotificationProviderConfigError,
-    NotificationProviderConfigMergeError, NotificationProviderCreateError,
+    NotificationPreferences, NotificationPreferencesService, NotificationProviderCreateError,
     NotificationProviderRevealError, NotificationService, TlsMode,
 };
 use crate::telegram::TELEGRAM_PROVIDER_TYPE;
@@ -22,8 +22,8 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use temps_auth::permission_guard;
-use temps_auth::RequireAuth;
+use temps_authz::permission_guard;
+use temps_authz::RequireAuth;
 use temps_core::error_builder::ErrorBuilder;
 use temps_core::problemdetails::Problem;
 use temps_core::secret_string::SecretString;
@@ -100,9 +100,8 @@ impl AuditOperation for NotificationProviderAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -119,9 +118,8 @@ impl AuditOperation for NotificationPreferencesAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -138,9 +136,8 @@ impl AuditOperation for NotificationRouteAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self)
-            .map_err(|error| anyhow::anyhow!("Failed to serialize audit operation {error}"))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -157,13 +154,12 @@ impl AuditOperation for NotificationProviderConfigRevealedAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
-fn make_audit_context(auth: &temps_auth::AuthContext, metadata: &RequestMetadata) -> AuditContext {
+fn make_audit_context(auth: &temps_authz::AuthContext, metadata: &RequestMetadata) -> AuditContext {
     AuditContext {
         user_id: auth.user_id(),
         ip_address: Some(metadata.ip_address.clone()),
@@ -387,7 +383,11 @@ pub struct UpdateNotificationEmailProviderRequest {
 }
 
 /// Configuration for a generic webhook notification provider
-#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
+///
+/// Request-side config. Not `Serialize`: every header value is a
+/// `SecretString` (reads mask them all, because they are where a webhook's
+/// credential goes), so use [`WebhookConfig::into_stored_value`].
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct WebhookConfig {
     /// The URL to send webhook requests to
     #[schema(example = "https://api.example.com/notifications")]
@@ -396,14 +396,34 @@ pub struct WebhookConfig {
     #[serde(default = "default_http_method")]
     #[schema(example = "POST")]
     pub method: String,
-    /// Custom headers to include in the request (e.g., for authentication tokens)
+    /// Custom headers to include in the request (e.g., for authentication
+    /// tokens). Every value is treated as a credential: write-only, masked on
+    /// read, and taken by the AI assistant through a secret slot.
     #[serde(default)]
     #[schema(example = json!({"Authorization": "Bearer your-token", "X-Custom-Header": "custom-value"}))]
-    pub headers: std::collections::HashMap<String, String>,
+    pub headers: std::collections::BTreeMap<String, SecretString>,
     /// Request timeout in seconds. Defaults to 30.
     #[serde(default = "default_timeout_secs")]
     #[schema(example = 30)]
     pub timeout_secs: u64,
+}
+
+impl WebhookConfig {
+    /// The JSON persisted (encrypted) for this provider, with the header
+    /// values exposed.
+    pub fn into_stored_value(self) -> serde_json::Value {
+        let headers: serde_json::Map<String, serde_json::Value> = self
+            .headers
+            .into_iter()
+            .map(|(name, value)| (name, serde_json::Value::String(value.into_exposed())))
+            .collect();
+        serde_json::json!({
+            "url": self.url,
+            "method": self.method,
+            "headers": headers,
+            "timeout_secs": self.timeout_secs,
+        })
+    }
 }
 
 fn default_http_method() -> String {
@@ -414,14 +434,14 @@ fn default_timeout_secs() -> u64 {
     30
 }
 
-#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct CreateWebhookProviderRequest {
     pub name: String,
     pub config: WebhookConfig,
     pub enabled: Option<bool>,
 }
 
-#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct UpdateWebhookProviderRequest {
     pub name: Option<String>,
     pub config: WebhookConfig,
@@ -729,9 +749,7 @@ async fn reveal_notification_provider_config(
     ))
 }
 
-fn require_notification_reveal_audit(
-    result: std::result::Result<(), anyhow::Error>,
-) -> Result<(), Problem> {
+fn require_notification_reveal_audit(result: temps_core::AuditResult<()>) -> Result<(), Problem> {
     result.map_err(|_| {
         ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
             .title("Configuration value could not be revealed")
@@ -821,14 +839,14 @@ impl From<UpdateProviderRequest> for crate::services::UpdateProviderRequest {
     }
 }
 
-fn notification_provider_write_problem(error: &anyhow::Error, title: &'static str) -> Problem {
-    if let Some(validation_error) = error.downcast_ref::<NotificationProviderConfigMergeError>() {
+fn notification_provider_write_problem(error: &NotificationError, title: &'static str) -> Problem {
+    if let NotificationError::ConfigMerge(validation_error) = error {
         return ErrorBuilder::new(StatusCode::BAD_REQUEST)
             .title("Invalid masked provider configuration")
             .detail(validation_error.to_string())
             .build();
     }
-    if let Some(config_error) = error.downcast_ref::<NotificationProviderConfigError>() {
+    if let NotificationError::InvalidProviderConfig(config_error) = error {
         return ErrorBuilder::new(StatusCode::BAD_REQUEST)
             .title("Invalid provider configuration")
             .detail(config_error.to_string())
@@ -1416,7 +1434,7 @@ async fn create_webhook_provider(
     }
 
     let enabled = request.enabled.unwrap_or(true);
-    let config = serde_json::to_value(&request.config).unwrap_or_default();
+    let config = request.config.into_stored_value();
     match app_state
         .notification_service
         .add_provider(request.name, "webhook".to_string(), config, enabled)
@@ -1510,7 +1528,7 @@ async fn update_webhook_provider(
             .build());
     }
 
-    let config = serde_json::to_value(request.config).unwrap_or_default();
+    let config = request.config.into_stored_value();
     let update_request = UpdateProviderRequest {
         name: request.name,
         config: Some(config),
@@ -2171,7 +2189,7 @@ async fn trigger_weekly_digest(
     // the trigger to instance administrators; deployment tokens carry no user
     // identity and are never operators.
     if auth.is_deployment_token()
-        || !(auth.is_admin() || auth.has_role(&temps_auth::Role::PlatformAdmin))
+        || !(auth.is_admin() || auth.has_role(&temps_authz::Role::PlatformAdmin))
     {
         return Err(ErrorBuilder::new(StatusCode::FORBIDDEN)
             .type_("https://temps.sh/probs/insufficient-permissions")
@@ -2699,8 +2717,8 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use sea_orm::MockDatabase;
     use std::sync::{Arc, Mutex};
-    use temps_database::test_utils::TestDatabase;
     use temps_entities::notification_providers;
+    use temps_test_utils::TestDatabase;
     use testcontainers::{core::ContainerPort, runners::AsyncRunner, ContainerAsync, GenericImage};
 
     use tower::ServiceExt;
@@ -2708,9 +2726,105 @@ mod tests {
     #[test]
     fn credential_reveal_fails_closed_when_audit_write_fails() {
         assert!(require_notification_reveal_audit(Ok(())).is_ok());
+        let problem = require_notification_reveal_audit(Err(temps_core::AuditError::write(
+            "NOTIFICATION_PROVIDER_SECRET_REVEALED",
+            "database unavailable",
+        )))
+        .expect_err("reveal must fail when its audit cannot be written");
+        assert_eq!(
+            problem.body["title"],
+            "Configuration value could not be revealed"
+        );
+        assert_eq!(
+            problem.body["detail"],
+            "The audit record for this reveal could not be written"
+        );
+        assert_eq!(
+            problem.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    fn state_over(db: MockDatabase) -> Arc<NotificationState> {
+        let db = Arc::new(db.into_connection());
+        let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password(
+            "notification-handler-test",
+        ));
+        let notification_service =
+            Arc::new(NotificationService::new(db.clone(), encryption_service));
+        Arc::new(NotificationState::new(
+            notification_service.clone(),
+            Arc::new(NotificationRoutingService::new(db.clone())),
+            Arc::new(NotificationPreferencesService::new(db.clone())),
+            Arc::new(DigestService::new(db, notification_service)),
+            Arc::new(RecordingAuditLogger::default()),
+        ))
+    }
+
+    async fn test_endpoint_response(db: MockDatabase) -> (StatusCode, serde_json::Value) {
+        let response = test_notification_provider(
+            State(state_over(db)),
+            Path(9),
+            RequireAuth(test_auth_context()),
+            Extension(test_request_metadata()),
+        )
+        .await
+        .expect("the endpoint reports failures in its body")
+        .into_response();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .expect("the body is buffered");
+        let body = serde_json::from_slice(&body).expect("the body is JSON");
+        (status, body)
+    }
+
+    #[tokio::test]
+    async fn testing_a_missing_provider_answers_404_with_its_id() {
+        let (status, body) = test_endpoint_response(
+            MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results(
+                    [Vec::<temps_entities::notification_providers::Model>::new()],
+                ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["success"], false);
+        assert_eq!(
+            body["message"],
+            "Test failed: Notification provider with ID 9 not found"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_database_failure_testing_a_provider_answers_500() {
+        let (status, body) = test_endpoint_response(
+            MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_errors([sea_orm::DbErr::Custom("connection lost".to_string())]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            body["message"],
+            "Test failed: Failed to load the configuration for notification provider 9: \
+             Custom Error: connection lost"
+        );
+    }
+
+    #[test]
+    fn other_provider_write_failures_stay_opaque_500s() {
+        let error = NotificationError::ConfigEncryption {
+            provider_id: 7,
+            reason: "synthetic internal detail".to_string(),
+        };
+
         let problem =
-            require_notification_reveal_audit(Err(anyhow::anyhow!("database unavailable")))
-                .expect_err("reveal must fail when its audit cannot be written");
+            notification_provider_write_problem(&error, "Failed to update notification provider");
+
+        assert_eq!(
+            problem.body["detail"],
+            "The notification provider could not be updated"
+        );
         assert_eq!(
             problem.into_response().status(),
             StatusCode::INTERNAL_SERVER_ERROR
@@ -2719,10 +2833,11 @@ mod tests {
 
     #[test]
     fn masked_provider_update_validation_maps_to_bad_request() {
-        let error =
-            anyhow::Error::new(NotificationProviderConfigMergeError::UnmatchedMaskedValue {
+        let error = NotificationError::ConfigMerge(
+            crate::services::NotificationProviderConfigMergeError::UnmatchedMaskedValue {
                 path: "headers.X-Authorization".to_string(),
-            });
+            },
+        );
 
         let problem =
             notification_provider_write_problem(&error, "Failed to update notification provider");
@@ -2740,7 +2855,7 @@ mod tests {
         async fn create_audit_log(
             &self,
             operation: &dyn temps_core::AuditOperation,
-        ) -> Result<(), anyhow::Error> {
+        ) -> temps_core::AuditResult<()> {
             self.operations
                 .lock()
                 .expect("recording audit mutex should not be poisoned")
@@ -2749,7 +2864,7 @@ mod tests {
         }
     }
 
-    fn test_auth_context() -> temps_auth::AuthContext {
+    fn test_auth_context() -> temps_authz::AuthContext {
         let now = chrono::Utc::now();
         let user = temps_entities::users::Model {
             id: 42,
@@ -2771,7 +2886,7 @@ mod tests {
             created_at: now,
             updated_at: now,
         };
-        temps_auth::AuthContext::new_session(user, temps_auth::Role::Admin)
+        temps_authz::AuthContext::new_session(user, temps_authz::Role::Admin)
     }
 
     fn test_request_metadata() -> RequestMetadata {
@@ -2927,12 +3042,270 @@ mod tests {
         assert!(stored["message_thread_id"].is_null());
     }
 
+    /// A notification state backed by a real database, with an admin caller.
+    async fn console_flow_state() -> Option<(TestDatabase, Arc<NotificationState>)> {
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(test_db) => test_db,
+            Err(error) => {
+                let message = format!("{error:#}");
+                if temps_test_utils::is_container_runtime_unavailable(&message) {
+                    eprintln!("Skipping Docker-dependent test: {message}");
+                    return None;
+                }
+                panic!("Failed to set up notification handler test: {message}");
+            }
+        };
+        let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password(
+            "notification-handler-console-flow-test",
+        ));
+        let db = test_db.connection_arc();
+        let notification_service =
+            Arc::new(NotificationService::new(db.clone(), encryption_service));
+        let state = Arc::new(NotificationState::new(
+            notification_service.clone(),
+            Arc::new(NotificationRoutingService::new(db.clone())),
+            Arc::new(NotificationPreferencesService::new(db.clone())),
+            Arc::new(DigestService::new(db, notification_service)),
+            Arc::new(RecordingAuditLogger::default()),
+        ));
+        Some((test_db, state))
+    }
+
+    /// The provider as the console reads it back: credentials masked.
+    async fn read_back_provider(state: &Arc<NotificationState>, id: i32) -> serde_json::Value {
+        let response = get_notification_provider(
+            State(state.clone()),
+            Path(id),
+            RequireAuth(test_auth_context()),
+        )
+        .await
+        .expect("provider should be readable")
+        .into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("provider body should be readable");
+        serde_json::from_slice::<serde_json::Value>(&body).expect("provider body should be JSON")
+    }
+
+    /// A stored credential, as an administrator would reveal it.
+    async fn revealed(state: &Arc<NotificationState>, id: i32, field: &str) -> String {
+        state
+            .notification_service
+            .reveal_provider_config_value(id, field)
+            .await
+            .expect("field should be revealable")
+            .1
+    }
+
+    /// Replays what the console's edit page does: read the provider back
+    /// masked, put the same values in the form, and submit them. An edit that
+    /// leaves the destination alone must keep working, and one that moves it
+    /// must be refused while a credential is still masked.
+    #[tokio::test]
+    async fn console_edit_of_an_email_provider_keeps_credentials_until_the_host_moves() {
+        let Some((test_db, state)) = console_flow_state().await else {
+            return;
+        };
+        let created: CreateNotificationEmailProviderRequest =
+            serde_json::from_value(serde_json::json!({
+                "name": "Ops email",
+                "config": {
+                    "smtp_host": "smtp.example.com",
+                    "smtp_port": 587,
+                    "username": "mailer",
+                    "password": "mail-secret",
+                    "from_name": "Temps",
+                    "from_address": "alerts@example.com",
+                    "to_addresses": ["ops@example.com"],
+                    "tls_mode": "Starttls",
+                    "starttls_required": true,
+                    "accept_invalid_certs": false
+                },
+                "enabled": true
+            }))
+            .expect("create request should parse");
+        create_notification_email_provider(
+            State(state.clone()),
+            RequireAuth(test_auth_context()),
+            Extension(test_request_metadata()),
+            Json(created),
+        )
+        .await
+        .map_err(|_| "create should succeed")
+        .expect("create should succeed");
+        let id = state
+            .notification_service
+            .list_providers_paginated(1, 10)
+            .await
+            .expect("providers should list")[0]
+            .id;
+
+        let masked = read_back_provider(&state, id).await["config"].clone();
+        assert_eq!(masked["password"], "***");
+        assert_eq!(masked["smtp_host"], "smtp.example.com");
+
+        let submit = |config: serde_json::Value| {
+            let request: UpdateNotificationEmailProviderRequest =
+                serde_json::from_value(serde_json::json!({
+                    "name": "Ops email",
+                    "config": config,
+                    "enabled": true
+                }))
+                .expect("edit request should parse");
+            let state = state.clone();
+            async move {
+                update_notification_email_provider(
+                    State(state),
+                    Path(id),
+                    RequireAuth(test_auth_context()),
+                    Extension(test_request_metadata()),
+                    Json(request),
+                )
+                .await
+                .map(|response| response.into_response().status())
+                .map_err(|problem| problem.into_response().status())
+            }
+        };
+
+        // The edit page with a recipient added and nothing else touched.
+        let mut recipients_added = masked.clone();
+        recipients_added["to_addresses"] =
+            serde_json::json!(["ops@example.com", "oncall@example.com"]);
+        assert_eq!(submit(recipients_added).await, Ok(StatusCode::OK));
+        assert_eq!(revealed(&state, id, "password").await, "mail-secret");
+        let config = read_back_provider(&state, id).await["config"].clone();
+        assert_eq!(config["to_addresses"][1], "oncall@example.com");
+
+        // The same form with a different mail server and the password untouched.
+        let mut host_moved = masked.clone();
+        host_moved["smtp_host"] = serde_json::json!("smtp.other.example");
+        assert_eq!(
+            submit(host_moved.clone()).await,
+            Err(StatusCode::BAD_REQUEST)
+        );
+        let config = read_back_provider(&state, id).await["config"].clone();
+        assert_eq!(config["smtp_host"], "smtp.example.com");
+        assert_eq!(revealed(&state, id, "password").await, "mail-secret");
+
+        // The password typed again alongside the new server is accepted.
+        host_moved["password"] = serde_json::json!("new-mail-secret");
+        assert_eq!(submit(host_moved).await, Ok(StatusCode::OK));
+        let config = read_back_provider(&state, id).await["config"].clone();
+        assert_eq!(config["smtp_host"], "smtp.other.example");
+        assert_eq!(revealed(&state, id, "password").await, "new-mail-secret");
+
+        test_db.cleanup_all_tables().await.ok();
+    }
+
+    #[tokio::test]
+    async fn console_edit_of_a_webhook_keeps_credentials_until_the_url_moves() {
+        let Some((test_db, state)) = console_flow_state().await else {
+            return;
+        };
+        let created: CreateWebhookProviderRequest = serde_json::from_value(serde_json::json!({
+            "name": "Incident hook",
+            "config": {
+                "url": "https://hooks.example.com/incident",
+                "method": "POST",
+                "headers": {"Authorization": "Bearer hook-secret"},
+                "timeout_secs": 30
+            },
+            "enabled": true
+        }))
+        .expect("create request should parse");
+        create_webhook_provider(
+            State(state.clone()),
+            RequireAuth(test_auth_context()),
+            Extension(test_request_metadata()),
+            Json(created),
+        )
+        .await
+        .map_err(|_| "create should succeed")
+        .expect("create should succeed");
+        let id = state
+            .notification_service
+            .list_providers_paginated(1, 10)
+            .await
+            .expect("providers should list")[0]
+            .id;
+
+        let masked = read_back_provider(&state, id).await["config"].clone();
+        assert_eq!(masked["url"], "***");
+        assert_eq!(masked["headers"]["Authorization"], "***");
+
+        let submit = |name: &'static str, config: serde_json::Value| {
+            let request: UpdateWebhookProviderRequest = serde_json::from_value(serde_json::json!({
+                "name": name,
+                "config": config,
+                "enabled": true
+            }))
+            .expect("edit request should parse");
+            let state = state.clone();
+            async move {
+                update_webhook_provider(
+                    State(state),
+                    Path(id),
+                    RequireAuth(test_auth_context()),
+                    Extension(test_request_metadata()),
+                    Json(request),
+                )
+                .await
+                .map(|response| response.into_response().status())
+                .map_err(|problem| problem.into_response().status())
+            }
+        };
+
+        // The edit page with only the name changed: url and header stay masked.
+        assert_eq!(
+            submit("Renamed hook", masked.clone()).await,
+            Ok(StatusCode::OK)
+        );
+        assert_eq!(
+            revealed(&state, id, "url").await,
+            "https://hooks.example.com/incident"
+        );
+        assert_eq!(
+            revealed(&state, id, "headers.Authorization").await,
+            "Bearer hook-secret"
+        );
+
+        // A new URL with the header still masked.
+        let mut url_moved = masked.clone();
+        url_moved["url"] = serde_json::json!("https://other.example.net/collect");
+        assert_eq!(
+            submit("Renamed hook", url_moved.clone()).await,
+            Err(StatusCode::BAD_REQUEST)
+        );
+        assert_eq!(
+            revealed(&state, id, "url").await,
+            "https://hooks.example.com/incident"
+        );
+        assert_eq!(
+            revealed(&state, id, "headers.Authorization").await,
+            "Bearer hook-secret"
+        );
+
+        // The header typed again alongside the new URL is accepted.
+        url_moved["headers"]["Authorization"] = serde_json::json!("Bearer new-hook-secret");
+        assert_eq!(submit("Renamed hook", url_moved).await, Ok(StatusCode::OK));
+        assert_eq!(
+            revealed(&state, id, "url").await,
+            "https://other.example.net/collect"
+        );
+        assert_eq!(
+            revealed(&state, id, "headers.Authorization").await,
+            "Bearer new-hook-secret"
+        );
+
+        test_db.cleanup_all_tables().await.ok();
+    }
+
     struct TestSetup {
         pub test_db: TestDatabase,
-        #[allow(dead_code)]
+        #[allow(dead_code)] // held so the container is stopped on drop
         pub mailpit_container: ContainerAsync<GenericImage>,
         pub mailpit_smtp_port: u16,
-        #[allow(dead_code)]
+        #[allow(dead_code)] // kept with the container it describes
         pub mailpit_web_port: u16,
         pub notification_state: Arc<NotificationState>,
     }
@@ -2988,7 +3361,7 @@ mod tests {
                 async fn create_audit_log(
                     &self,
                     _operation: &dyn temps_core::AuditOperation,
-                ) -> Result<(), anyhow::Error> {
+                ) -> temps_core::AuditResult<()> {
                     Ok(())
                 }
             }
@@ -3046,7 +3419,7 @@ mod tests {
                 Ok(setup) => setup,
                 Err(error) => {
                     let message = format!("{error:#}");
-                    if temps_database::test_utils::is_container_runtime_unavailable(&message) {
+                    if temps_test_utils::is_container_runtime_unavailable(&message) {
                         eprintln!("Skipping Docker-dependent test: {message}");
                         return Ok(());
                     }
@@ -3613,5 +3986,30 @@ mod tests {
         let stored = cloudflare.into_stored_value();
         assert_eq!(stored["api_token"], "real-cf-token");
         assert_eq!(stored["account_id"], "acct");
+
+        let webhook: WebhookConfig = serde_json::from_value(serde_json::json!({
+            "url": "https://hooks.example.com/incident",
+            "headers": {"Authorization": "Bearer real-hook-token"},
+        }))
+        .unwrap();
+        assert!(!format!("{webhook:?}").contains("real-hook-token"));
+        let stored = webhook.into_stored_value();
+        assert_eq!(stored["headers"]["Authorization"], "Bearer real-hook-token");
+        assert_eq!(stored["url"], "https://hooks.example.com/incident");
+        assert_eq!(stored["method"], "POST");
+        assert_eq!(stored["timeout_secs"], 30);
+    }
+
+    /// Webhook header values are where a webhook's credential goes, so the
+    /// spec flags them `x-temps-secret`: the assistant then has to pass a
+    /// `secret_ref:` handle and can never type a token into the chat.
+    #[test]
+    fn webhook_header_values_are_published_as_secrets() {
+        let spec = serde_json::to_value(NotificationProvidersApiDoc::openapi()).unwrap();
+        let headers = &spec["components"]["schemas"]["WebhookConfig"]["properties"]["headers"];
+        let values = &headers["additionalProperties"];
+        let flagged = values["x-temps-secret"] == true
+            || values["$ref"] == "#/components/schemas/SecretString";
+        assert!(flagged, "header values must be SecretString: {headers}");
     }
 }

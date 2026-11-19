@@ -8,9 +8,16 @@
 //! injecting additional plugins for `temps serve`. This is the seam
 //! described in ADR 0001 §"Extension points exposed by OSS".
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "temps-cli is the bootstrap binary: it parses process arguments and bootstrap environment (database URL, data dir, listen addresses) before any database exists, and may use anyhow::Context (CLAUDE.md)"
+)]
 pub mod commands;
+pub(crate) mod database_url_source;
 mod docker_context;
 pub mod otel_export;
+pub(crate) mod server_secrets;
+pub(crate) mod service_definition;
 
 use clap::{Parser, Subcommand};
 use commands::{
@@ -105,14 +112,52 @@ pub enum Commands {
     Microsandbox(MicrosandboxCommand),
 }
 
+/// The filter used when `RUST_LOG` is unset: `extra` directives first, then
+/// `level` for everything Temps ships, then fixed levels for noisy
+/// dependencies.
+///
+/// `temps` is a target prefix, not a crate: `EnvFilter` matches a directive
+/// against the start of an event's target, so this one directive covers every
+/// `temps_*` crate in the workspace, its SDKs, and plugin crates built outside
+/// this repository, without a list that drifts when a crate is added or
+/// renamed. A more specific directive (`temps_proxy=debug` in `extra`) still
+/// wins for its own target.
+///
+/// `sqlx::postgres::notice` re-emits server NOTICE/WARNING messages:
+/// TimescaleDB's schema advisories on every migration run (e.g. `column "id"
+/// should be used for segmenting`). They're not actionable at runtime, so
+/// they're hidden unless `RUST_LOG` asks for them.
+fn default_log_filter(extra: &str, level: &str) -> String {
+    let extra = if extra.is_empty() {
+        String::new()
+    } else {
+        format!("{extra},")
+    };
+    format!(
+        "{extra}\
+         temps={level},\
+         pingora=warn,\
+         sqlx=warn,\
+         sqlx::postgres::notice=error,\
+         sea_orm=warn,\
+         sea_orm_migration=warn,\
+         h2=warn,\
+         tower=warn,\
+         hyper=warn,\
+         reqwest=warn,\
+         rustls=warn,\
+         tungstenite=warn"
+    )
+}
+
 /// Install the global tracing subscriber. Safe to call once per process.
 pub fn install_tracing(log_level: &str, log_format: &str) {
     install_tracing_extra(log_level, log_format, "");
 }
 
 /// Like [`install_tracing`], with extra filter directives appended — for
-/// embedding binaries whose own crate targets aren't in the default list
-/// (e.g. `vibetemps_api={level}`). `extra` is comma-separated directives,
+/// embedding binaries whose own crate targets don't start with `temps`
+/// (e.g. `example_app={level}`). `extra` is comma-separated directives,
 /// empty for none.
 pub fn install_tracing_extra(log_level: &str, log_format: &str, extra: &str) {
     install_tracing_with_otel(log_level, log_format, extra, None);
@@ -127,102 +172,25 @@ pub fn install_tracing_with_otel(
     extra: &str,
     otel_layer: Option<otel_export::OtelLayer>,
 ) {
-    let filter = if std::env::var("RUST_LOG").is_ok() {
-        tracing_subscriber::EnvFilter::try_from_default_env()
-            .expect("Invalid RUST_LOG environment variable")
+    let rust_log_filter = if std::env::var("RUST_LOG").is_ok() {
+        match tracing_subscriber::EnvFilter::try_from_default_env() {
+            Ok(filter) => Some(filter),
+            Err(e) => {
+                // No subscriber exists yet, so stderr is the only channel.
+                eprintln!(
+                    "Ignoring invalid RUST_LOG environment variable ({e}); \
+                     using --log-level {log_level} instead"
+                );
+                None
+            }
+        }
     } else {
-        let extra = if extra.is_empty() {
-            String::new()
-        } else {
-            format!("{extra},")
-        };
-        // `sqlx::postgres::notice` re-emits server NOTICE/WARNING messages —
-        // TimescaleDB's schema advisories on every migration run (e.g.
-        // `column "id" should be used for segmenting`). They're not actionable
-        // at runtime, so they're hidden unless RUST_LOG asks for them.
-        tracing_subscriber::EnvFilter::new(format!(
-            "{extra}\
-             temps_cli={level},\
-             temps_deployments={level},\
-             temps_deployer={level},\
-             temps_file_store={level},\
-             temps_core={level},\
-             temps_git={level},\
-             temps_projects={level},\
-             temps_environments={level},\
-             temps_domains={level},\
-             temps_proxy={level},\
-             temps_queue={level},\
-             temps_logs={level},\
-             temps_auth={level},\
-             temps_providers={level},\
-             temps_audit={level},\
-             temps_backup={level},\
-             temps_cloud={level},\
-             temps_cloud_client={level},\
-             temps_cloud_protocol={level},\
-             temps_config={level},\
-             temps_analytics={level},\
-             temps_notifications={level},\
-             temps_infra={level},\
-             temps_geo={level},\
-             temps_entities={level},\
-             temps_database={level},\
-             temps_migrations={level},\
-             temps_presets={level},\
-             temps_status_page={level},\
-             temps_monitoring={level},\
-             temps_metrics={level},\
-             temps_routes={level},\
-             temps_error_tracking={level},\
-             temps_sentry_ingester={level},\
-             temps_analytics_performance={level},\
-             temps_analytics_session_replay={level},\
-             temps_analytics_events={level},\
-             temps_analytics_funnels={level},\
-             temps_webhooks={level},\
-             temps_external_plugins={level},\
-             temps_plugin_sdk={level},\
-             temps_blob={level},\
-             temps_dns={level},\
-             temps_email={level},\
-             temps_embeddings={level},\
-             temps_import={level},\
-             temps_import_docker={level},\
-             temps_import_types={level},\
-             temps_kv={level},\
-             temps_log_aggregator={level},\
-             temps_otel={level},\
-             temps_query={level},\
-             temps_query_postgres={level},\
-             temps_query_redis={level},\
-             temps_query_s3={level},\
-             temps_query_mongodb={level},\
-             temps_screenshots={level},\
-             temps_static_files={level},\
-             temps_vulnerability_scanner={level},\
-             temps_agent={level},\
-             temps_edge={level},\
-             temps_wireguard={level},\
-             temps_ai={level},\
-             temps_ai_gateway={level},\
-             temps_ai_chat={level},\
-             temps_ai_api_tools={level},\
-             temps_agents={level},\
-             temps_sandbox={level},\
-             pingora=warn,\
-             sqlx=warn,\
-             sqlx::postgres::notice=error,\
-             sea_orm=warn,\
-             sea_orm_migration=warn,\
-             h2=warn,\
-             tower=warn,\
-             hyper=warn,\
-             reqwest=warn,\
-             rustls=warn,\
-             tungstenite=warn",
-            level = log_level
-        ))
+        None
+    };
+    let filter = if let Some(filter) = rust_log_filter {
+        filter
+    } else {
+        tracing_subscriber::EnvFilter::new(default_log_filter(extra, log_level))
     };
 
     let fmt_layer = match log_format {
@@ -248,8 +216,11 @@ pub fn install_tracing_with_otel(
         .with(filter)
         .with(fmt_layer)
         .with(ErrorMetricsLayer);
-    tracing::subscriber::set_global_default(subscriber)
-        .expect("Failed to set global default subscriber");
+    if let Err(e) = tracing::subscriber::set_global_default(subscriber) {
+        // Only fails when a global subscriber is already installed; that one
+        // keeps receiving events, so logging still works.
+        eprintln!("Tracing subscriber already installed, keeping the existing one: {e}");
+    }
 }
 
 /// Tracing layer that counts ERROR-level events for the anonymous
@@ -556,11 +527,26 @@ unsafe fn scrub_argv_raw(
 /// Convenience entrypoint that parses, installs tracing, and dispatches.
 /// Used by both the OSS `temps` binary (`extra_plugins = vec![]`) and any
 /// EE-bundled binary that wraps the same CLI surface.
+/// Whether `command` logs where its database URL came from and warns when it
+/// was passed with `--database-url`. Only the commands that run as a service
+/// (and so carry the flag in a unit's `ExecStart=`): the warning's advice is
+/// about that definition, and on a one-shot command the log line would land
+/// in stdout ahead of output that scripts parse.
+fn reports_database_url_source(command: &Commands) -> bool {
+    matches!(command, Commands::Serve(_) | Commands::Proxy(_))
+}
+
 pub fn run(extra_plugins: Vec<Box<dyn temps_core::plugin::TempsPlugin>>) -> anyhow::Result<()> {
     // Mutates the environment, so it runs before anything can spawn a thread.
     let docker_context = docker_context::adopt_active_docker_context();
+    // Also mutates the environment: exports TEMPS_DATABASE_URL from
+    // TEMPS_DATABASE_URL_FILE or a systemd credential before clap reads it.
+    let database_url_source = database_url_source::adopt_database_url_file()?;
     install_crypto_provider();
     let cli = Cli::parse();
+    // Checked before the scrub below overwrites the value.
+    let database_url_flag_used =
+        database_url_source::database_url_on_command_line(std::env::args_os());
     // Scrub sensitive flag values from argv *after* clap has parsed them so
     // they no longer appear in `pgrep -af` or /proc/self/cmdline.
     scrub_sensitive_argv(&positional_secrets(&cli));
@@ -574,6 +560,25 @@ pub fn run(extra_plugins: Vec<Box<dyn temps_core::plugin::TempsPlugin>>) -> anyh
     };
     install_tracing_with_otel(&cli.log_level, &cli.log_format, "", otel.layer.take());
     otel.report();
+    // Logs go to stdout, so these notices are kept to the long-running
+    // services they are about: a one-shot command such as
+    // `temps api-key --output-format json` must print only its result.
+    if reports_database_url_source(&cli.command) {
+        match &database_url_source {
+            database_url_source::DatabaseUrlSource::Unchanged => {}
+            database_url_source::DatabaseUrlSource::File(path) => tracing::info!(
+                "Read the database URL from {} (TEMPS_DATABASE_URL_FILE)",
+                path.display()
+            ),
+            database_url_source::DatabaseUrlSource::SystemdCredential(path) => tracing::info!(
+                "Read the database URL from the systemd credential {}",
+                path.display()
+            ),
+        }
+        if database_url_flag_used {
+            tracing::warn!("{}", database_url_source::command_line_warning());
+        }
+    }
     match docker_context {
         Ok(adopted) => tracing::info!(
             "Using Docker context '{}' ({}) because DOCKER_HOST is not set",
@@ -589,13 +594,16 @@ pub fn run(extra_plugins: Vec<Box<dyn temps_core::plugin::TempsPlugin>>) -> anyh
     result
 }
 
-#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+// Split into two attributes so clippy recognises `cfg(test)` and applies
+// `allow-unwrap-in-tests`; it does not look inside `cfg(all(test, ..))`.
+#[cfg(test)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod argv_scrub_tests {
     use std::ffi::CString;
 
     use clap::Parser;
 
-    use super::{positional_secrets, scrub_argv_raw, Cli};
+    use super::{positional_secrets, reports_database_url_source, scrub_argv_raw, Cli};
 
     /// Run [`scrub_argv_raw`] over an owned copy of `args`, as the process
     /// argv would be, and return what is left.
@@ -709,6 +717,43 @@ mod argv_scrub_tests {
         let cli = Cli::try_parse_from(["temps", "join", "--pair", "-"]).unwrap();
         assert!(positional_secrets(&cli).is_empty());
     }
+
+    /// `temps api-key --output-format json` is parsed by scripts (the
+    /// scenario CI pipes it into `jq`), so a database URL notice must not be
+    /// logged ahead of its JSON; `temps serve` is where the notice belongs.
+    #[test]
+    fn only_service_commands_report_the_database_url_source() {
+        let api_key = Cli::try_parse_from([
+            "temps",
+            "api-key",
+            "--database-url",
+            "postgres://localhost/temps",
+            "--name",
+            "scripted",
+            "--output-format",
+            "json",
+        ])
+        .unwrap();
+        assert!(!reports_database_url_source(&api_key.command));
+
+        let serve = Cli::try_parse_from([
+            "temps",
+            "serve",
+            "--database-url",
+            "postgres://localhost/temps",
+        ])
+        .unwrap();
+        assert!(reports_database_url_source(&serve.command));
+
+        let proxy = Cli::try_parse_from([
+            "temps",
+            "proxy",
+            "--database-url",
+            "postgres://localhost/temps",
+        ])
+        .unwrap();
+        assert!(reports_database_url_source(&proxy.command));
+    }
 }
 
 #[cfg(test)]
@@ -782,7 +827,11 @@ mod command_tree_tests {
             "agent ingress delegated",
             "agent ingress fixed",
             "agent ingress off",
+            "agent ingress private",
             "agent ingress status",
+            "agent labels list",
+            "agent labels set",
+            "agent labels unset",
             "agent service install",
             "agent service status",
             "agent service uninstall",
@@ -811,6 +860,7 @@ mod command_tree_tests {
             "domain provision",
             "domain show",
             "edge",
+            "firecracker install-launcher",
             "firecracker setup",
             "join",
             "microsandbox setup",
@@ -899,5 +949,95 @@ mod ip_gate_dispatch_contract_tests {
     #[test]
     fn legacy_dispatch_entrypoint_keeps_infallible_builder() {
         let _: LegacyDispatch = dispatch_with_ip_gate;
+    }
+}
+
+#[cfg(test)]
+mod default_log_filter_tests {
+    use super::default_log_filter;
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::layer::{Context, SubscriberExt};
+    use tracing_subscriber::Layer;
+
+    /// Records the target of every event the filter lets through.
+    #[derive(Clone, Default)]
+    struct Targets(Arc<Mutex<Vec<String>>>);
+
+    impl<S: tracing::Subscriber> Layer<S> for Targets {
+        fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+            self.0
+                .lock()
+                .unwrap()
+                .push(event.metadata().target().to_string());
+        }
+    }
+
+    /// Runs `emit` under the default filter and returns the targets logged.
+    fn logged(extra: &str, level: &str, emit: impl FnOnce()) -> Vec<String> {
+        let targets = Targets::default();
+        let filter = tracing_subscriber::EnvFilter::new(default_log_filter(extra, level));
+        let subscriber = tracing_subscriber::registry()
+            .with(filter)
+            .with(targets.clone());
+        tracing::subscriber::with_default(subscriber, emit);
+        let logged = targets.0.lock().unwrap().clone();
+        logged
+    }
+
+    /// Crates the old hand-kept list missed, a crate built outside this
+    /// repository, and a module path inside a crate all log at the default
+    /// level: a new or renamed crate cannot fall out of the filter.
+    #[test]
+    fn every_temps_target_logs_at_the_default_level() {
+        let logged = logged("", "info", || {
+            tracing::info!(target: "temps_cli", "listed before");
+            tracing::info!(target: "temps_flags", "missing from the old list");
+            tracing::info!(target: "temps_sentry_ingester", "a plugin crate built elsewhere");
+            tracing::info!(target: "temps_proxy::proxy::acme", "a module path");
+            tracing::debug!(target: "temps_cli", "below the level");
+        });
+        assert_eq!(
+            logged,
+            [
+                "temps_cli",
+                "temps_flags",
+                "temps_sentry_ingester",
+                "temps_proxy::proxy::acme",
+            ]
+        );
+    }
+
+    /// Dependencies stay at their fixed levels whatever `--log-level` is.
+    #[test]
+    fn noisy_dependencies_keep_their_fixed_levels() {
+        let logged = logged("", "debug", || {
+            tracing::info!(target: "hyper::proto", "dependency info");
+            tracing::warn!(target: "hyper::proto", "dependency warning");
+            tracing::warn!(target: "sqlx::postgres::notice", "timescale advisory");
+            tracing::error!(target: "sqlx::postgres::notice", "server error");
+            tracing::info!(target: "unrelated_crate", "no directive");
+            tracing::debug!(target: "temps_core", "temps at debug");
+        });
+        assert_eq!(
+            logged,
+            ["hyper::proto", "sqlx::postgres::notice", "temps_core"]
+        );
+    }
+
+    /// A more specific `extra` directive wins for its own target, and an
+    /// embedding binary's own crate is logged only through `extra`.
+    #[test]
+    fn extra_directives_override_the_default_for_their_target() {
+        let logged = logged(
+            "temps_proxy=debug,example_app=info,temps_edge=warn",
+            "info",
+            || {
+                tracing::debug!(target: "temps_proxy", "raised to debug");
+                tracing::debug!(target: "temps_core", "still info");
+                tracing::info!(target: "example_app", "embedding binary");
+                tracing::info!(target: "temps_edge", "lowered to warn");
+            },
+        );
+        assert_eq!(logged, ["temps_proxy", "example_app"]);
     }
 }

@@ -17,7 +17,9 @@ pub struct Model {
     pub region: String,
     pub endpoint: Option<String>,
     pub bucket_path: String,
+    #[serde(skip_serializing)]
     pub access_key_id: String,
+    #[serde(skip_serializing)]
     pub secret_key: String,
     /// STS-style session token for a *temporary* credential, encrypted at rest
     /// with the same [`temps_core::EncryptionService`] as `secret_key`.
@@ -29,6 +31,7 @@ pub struct Model {
     /// this token accompanies it as `X-Amz-Security-Token`, so it has to reach
     /// both the in-process `aws-sdk-s3` clients and the `AWS_SESSION_TOKEN`
     /// environment of every shelled-out engine (`wal-g`, `mc`, `mariabackup`).
+    #[serde(skip_serializing)]
     pub session_token: Option<String>,
     /// When the credential in this row stops working, for a temporary
     /// credential. `None` means it does not expire.
@@ -69,7 +72,20 @@ pub struct Model {
     /// Backup schedules must never target this service because doing so would
     /// recursively write a backup into itself.
     pub backing_service_id: Option<i32>,
+    /// Whether a worker node may receive this source's own credential when
+    /// the source cannot mint a job-scoped one (ADR-102):
+    /// [`WORKER_CREDENTIALS_SCOPED`] (the default, refuse) or
+    /// [`WORKER_CREDENTIALS_ALLOW_FULL`].
+    #[sea_orm(default_value = "scoped")]
+    pub worker_credentials: String,
 }
+
+/// `worker_credentials`: a worker only ever receives a credential scoped to
+/// its job; a job the source cannot scope is refused.
+pub const WORKER_CREDENTIALS_SCOPED: &str = "scoped";
+/// `worker_credentials`: when the source cannot scope, the worker receives
+/// the source's own credential, with a warning on every job.
+pub const WORKER_CREDENTIALS_ALLOW_FULL: &str = "allow_full";
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
 pub enum Relation {
@@ -100,6 +116,48 @@ impl Related<super::backups::Entity> for Entity {
 impl Related<super::external_services::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::BackingService.def()
+    }
+}
+
+impl Model {
+    /// The endpoint with an explicit scheme, as every client receives it.
+    /// `None` for AWS S3 itself.
+    pub fn endpoint_url(&self) -> Option<String> {
+        self.endpoint
+            .as_deref()
+            .filter(|endpoint| !endpoint.trim().is_empty())
+            .map(temps_core::s3_endpoint::endpoint_url)
+    }
+
+    /// Path-style addressing as clients must use it, and why.
+    ///
+    /// `default_when_unset` is what a NULL `force_path_style` means at the
+    /// calling site. An IP-literal endpoint, or a source backed by a
+    /// Temps-managed object store, forces path style whatever the setting.
+    ///
+    /// When the source never set `force_path_style` and the endpoint forces
+    /// it, the forcing reason is reported rather than "as configured": the
+    /// operator configured nothing.
+    pub fn effective_path_style(
+        &self,
+        default_when_unset: bool,
+    ) -> temps_core::s3_endpoint::EffectivePathStyle {
+        use temps_core::s3_endpoint::{effective_path_style, EffectivePathStyle, PathStyleReason};
+        let endpoint = self.endpoint.as_deref();
+        let managed = self.backing_service_id.is_some();
+        match self.force_path_style {
+            Some(configured) => effective_path_style(endpoint, configured, managed),
+            None => match effective_path_style(endpoint, false, managed) {
+                EffectivePathStyle {
+                    reason: PathStyleReason::Configured,
+                    ..
+                } => EffectivePathStyle {
+                    force_path_style: default_when_unset,
+                    reason: PathStyleReason::Configured,
+                },
+                forced => forced,
+            },
+        }
     }
 }
 
@@ -311,6 +369,7 @@ pub async fn insert_encrypted<C: ConnectionTrait>(
         managed_by_cloud: Set(managed_by_cloud),
         lifecycle_reconcile_failed_at: Set(None),
         lifecycle_reconcile_generation: Set(0),
+        worker_credentials: Set(WORKER_CREDENTIALS_SCOPED.to_string()),
         backing_service_id: Set(backing_service_id),
         created_at: Set(now),
         updated_at: Set(now),
@@ -386,6 +445,32 @@ mod tests {
         }
     }
 
+    #[test]
+    fn unset_path_style_on_an_ip_endpoint_reports_why_it_is_forced() {
+        use temps_core::s3_endpoint::PathStyleReason;
+        let mut source = model_with_session_token(None);
+        source.force_path_style = None;
+        source.endpoint = Some("http://10.0.0.5:9000".to_string());
+        let effective = source.effective_path_style(true);
+        assert!(effective.force_path_style);
+        assert_eq!(effective.reason, PathStyleReason::IpAddressEndpoint);
+
+        // A hostname with nothing set keeps the caller's default.
+        source.endpoint = Some("https://s3.example.com".to_string());
+        let effective = source.effective_path_style(false);
+        assert!(!effective.force_path_style);
+        assert_eq!(effective.reason, PathStyleReason::Configured);
+
+        // An explicit choice on an IP endpoint that already matches is the
+        // operator's, not an override.
+        source.endpoint = Some("http://10.0.0.5:9000".to_string());
+        source.force_path_style = Some(true);
+        assert_eq!(
+            source.effective_path_style(true).reason,
+            PathStyleReason::Configured
+        );
+    }
+
     fn model_with_session_token(session_token: Option<String>) -> Model {
         let now = chrono::Utc::now();
         Model {
@@ -404,6 +489,7 @@ mod tests {
             managed_by_cloud: false,
             lifecycle_reconcile_failed_at: None,
             lifecycle_reconcile_generation: 0,
+            worker_credentials: "scoped".to_string(),
             created_at: now,
             updated_at: now,
             backing_service_id: None,
@@ -480,6 +566,22 @@ mod tests {
         )
         .expect("decrypt")
         .is_none());
+    }
+
+    /// The stored columns are ciphertext, but ciphertext plus a leaked key is
+    /// the credential, so none of the three leaves through JSON.
+    #[test]
+    fn serializing_a_source_leaves_out_its_credential_columns() {
+        let mut model = model_with_session_token(Some("stored-session-token".to_string()));
+        model.access_key_id = "stored-access-key".to_string();
+        model.secret_key = "stored-secret-key".to_string();
+
+        let json = serde_json::to_string(&model).expect("serializes");
+
+        assert!(!json.contains("stored-access-key"), "{json}");
+        assert!(!json.contains("stored-secret-key"), "{json}");
+        assert!(!json.contains("stored-session-token"), "{json}");
+        assert!(json.contains("backups"), "{json}");
     }
 
     #[test]

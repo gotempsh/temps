@@ -51,6 +51,11 @@ pub struct Model {
     pub git_provider_connection_id: Option<i32>,
     /// Attack mode - when enabled, requires CAPTCHA verification for all visitors
     pub attack_mode: bool,
+    /// ADR 066 D1: how Shield acts on verdicts for the project's
+    /// environments: `off`, `log`, `selective` or `attack`. Replaces
+    /// `attack_mode`, which the API keeps writing for one release.
+    #[serde(default = "default_shield_mode")]
+    pub shield_mode: String,
     /// ADR-021 Tier 2: opt-in AI summarization of metric alert notifications for
     /// this project. NULL/false = off (the deterministic Tier-1 text is used);
     /// true = enrich with the configured AI provider when one is available.
@@ -178,6 +183,17 @@ pub struct Model {
     /// to FALSE; cross-project links to this project will then be suppressed.
     #[sea_orm(default_value = "true")]
     pub cross_project_trace_sharing: bool,
+    /// Whether this project's own app answers Temps' public paths on its
+    /// domains. The proxy normally sends `/api/_temps*` (browser analytics,
+    /// session replay) and `/api/otel*` (OTLP ingest and queries) to this
+    /// instance's console on every hostname, because deployed apps' SDKs post
+    /// to their own domain. A project that is itself a Temps console or API
+    /// serves those paths, and with this on they reach the project's upstream
+    /// instead — so this instance's own analytics and OTLP ingest stop
+    /// receiving that project's traffic. Off by default.
+    #[sea_orm(default_value = "false")]
+    #[serde(default)]
+    pub serves_own_temps_api: bool,
     /// Opt-in for AI summarization of API traffic analytics for this project.
     /// NULL/false = off; true = generate an AI summary when AI is configured
     /// and the project calls `GET /projects/{id}/api-analytics/summary`.
@@ -243,6 +259,12 @@ pub struct Model {
     /// `project_telemetry_write_intervals` (signal_group = 'analytics').
     #[sea_orm(default_value = "local")]
     pub cloud_analytics_write_mode: CloudAnalyticsWriteMode,
+    /// Container log ingestion budget for this project's containers, in
+    /// lines per second. NULL inherits the platform budget
+    /// (`AppSettings.container_logs.ingest_lines_per_sec`); 0 disables it.
+    pub log_ingest_lines_per_sec: Option<i32>,
+    /// As `log_ingest_lines_per_sec`, in KiB per second.
+    pub log_ingest_kib_per_sec: Option<i32>,
     /// Which template instantiation created this project, and for which of
     /// the template's services, so a resumed instantiation can tell its own
     /// project from one that merely holds the planned slug. The row is
@@ -281,6 +303,12 @@ pub fn pending_instantiation_token(token: &str) -> String {
 /// Whether `token` is a value produced by [`pending_instantiation_token`].
 pub fn is_pending_instantiation_token(token: &str) -> bool {
     token.starts_with("pending:")
+}
+
+/// The mode a project without one runs in (ADR 066 D1), for rows
+/// serialised before the column existed.
+fn default_shield_mode() -> String {
+    "log".to_string()
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

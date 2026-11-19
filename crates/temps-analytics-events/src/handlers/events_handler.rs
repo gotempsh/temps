@@ -35,12 +35,12 @@ use temps_analytics::ingest_keys::{
     stamp_retry_after_on_rate_limited, wildcard_ingest_cors, AnalyticsIngestKeyService,
     AnalyticsIngestRateLimiter, IngestBranch, IngestJson, KeyedIngestCors,
 };
-use temps_auth::{
+use temps_authz::{
     deny_deployment_token, permission_guard, project_access_guard, project_scope_guard, RequireAuth,
 };
 use temps_core::error_builder::ErrorBuilder;
 use temps_core::problemdetails::Problem;
-use temps_proxy::CachedPeerTable;
+use temps_routes::CachedPeerTable;
 use tracing::error;
 
 pub struct AppState {
@@ -955,8 +955,10 @@ pub async fn record_event_metrics(
         })
         .and_then(|raw| primary_accept_language(&raw));
 
-    // Lookup IP geolocation
-    let ip_geolocation_id = if !metadata.ip_address.is_empty() {
+    // Lookup IP geolocation. The network attributes (ASN, country, hosting
+    // verdict) ride along from the same (memory-cached) lookup, so datacenter
+    // detection and the project's traffic filters cost no extra I/O.
+    let (ip_geolocation_id, client_network) = if !metadata.ip_address.is_empty() {
         match state
             .ip_address_service
             .get_or_create_ip(&metadata.ip_address)
@@ -964,21 +966,36 @@ pub async fn record_event_metrics(
         {
             Ok(ip_info) => {
                 info!(
-                    "Resolved IP {} to geolocation: country={:?}, city={:?}",
-                    metadata.ip_address, ip_info.country, ip_info.city
+                    "Resolved IP {} to geolocation: country={:?}, city={:?}, asn={:?}, hosting={:?}",
+                    metadata.ip_address,
+                    ip_info.country,
+                    ip_info.city,
+                    ip_info.asn_number,
+                    ip_info.is_hosting_provider
                 );
-                Some(ip_info.id)
+                let client_network = crate::services::ClientNetwork {
+                    ip: metadata.ip_address.parse().ok(),
+                    asn_number: ip_info.asn_number.and_then(|asn| u32::try_from(asn).ok()),
+                    country_code: ip_info.country_code.clone(),
+                    is_hosting_provider: ip_info.is_hosting_provider,
+                };
+                (Some(ip_info.id), Some(client_network))
             }
             Err(e) => {
                 error!(
                     "Failed to lookup IP geolocation for {}: {}",
                     metadata.ip_address, e
                 );
-                None
+                // IP rules still apply when geolocation is unavailable.
+                let client_network = crate::services::ClientNetwork {
+                    ip: metadata.ip_address.parse().ok(),
+                    ..Default::default()
+                };
+                (None, Some(client_network))
             }
         }
     } else {
-        None
+        (None, None)
     };
 
     let session_id = resolve_client_identity(
@@ -1028,6 +1045,7 @@ pub async fn record_event_metrics(
             language,
             payload.page_title,
             ip_geolocation_id,
+            client_network,
             user_agent,
             referrer,
             // Performance metrics (web vitals)
@@ -1161,6 +1179,7 @@ pub async fn record_console_event(
             None, // language
             None, // page_title
             None, // ip_geolocation_id
+            None, // client_network
             None, // user_agent
             None, // referrer
             None, // ttfb
@@ -1213,7 +1232,7 @@ pub async fn record_console_event(
     ),
     responses(
         (status = 200, description = "Successfully retrieved aggregated buckets", body = AggregatedBucketsResponse),
-        (status = 400, description = "Bad request"),
+        (status = 400, description = "Invalid range, or a bucket size that would return too many points"),
         (status = 401, description = "Unauthorized"),
         (status = 500, description = "Internal server error")
     ),
@@ -1243,6 +1262,19 @@ pub async fn get_aggregated_buckets(
         aggregation_level: query.aggregation_level,
         bucket_size: query.bucket_size,
     };
+    // Both storage backends build one row per bucket in memory, so this is
+    // checked here rather than in each of them.
+    temps_core::time_window::check_series_points(
+        spec.range.start,
+        spec.range.end,
+        &spec.bucket_size,
+    )
+    .map_err(|e| {
+        ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .title("Invalid Time Series Request")
+            .detail(format!("Project {project_id}: {e}"))
+            .build()
+    })?;
     let result = state
         .events_service
         .query_aggregated_buckets(spec)
@@ -1479,8 +1511,8 @@ mod tests {
     use axum::http::Request;
     use axum::middleware;
     use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter};
-    use temps_database::test_utils::TestDatabase;
     use temps_entities::projects;
+    use temps_test_utils::TestDatabase;
     use tower::ServiceExt;
 
     #[test]
@@ -1535,7 +1567,7 @@ mod tests {
         );
     }
 
-    fn create_test_auth_context() -> temps_auth::AuthContext {
+    fn create_test_auth_context() -> temps_authz::AuthContext {
         let user = temps_entities::users::Model {
             id: 1,
             name: "Test User".to_string(),
@@ -1556,7 +1588,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
-        temps_auth::AuthContext::new_session(user, temps_auth::Role::Admin)
+        temps_authz::AuthContext::new_session(user, temps_authz::Role::Admin)
     }
 
     async fn setup_test_app(
@@ -1564,7 +1596,7 @@ mod tests {
     ) -> (axum::Router, Arc<AppState>, Arc<temps_core::CookieCrypto>) {
         let events_writer = Arc::new(crate::services::AnalyticsEventsService::new(db.clone()));
         let events_service: Arc<dyn crate::services::AnalyticsEvents> = events_writer.clone();
-        let route_table = Arc::new(temps_proxy::CachedPeerTable::new(db.clone()));
+        let route_table = Arc::new(temps_routes::CachedPeerTable::new(db.clone()));
         let geoip_service = Arc::new(temps_geo::GeoIpService::Mock(
             temps_geo::MockGeoIpService::new(),
         ));
@@ -1703,7 +1735,7 @@ mod tests {
     fn setup_deployment_token_app(state: Arc<AppState>, token_project_id: i32) -> axum::Router {
         let auth_middleware = middleware::from_fn(
             move |mut req: Request<Body>, next: axum::middleware::Next| async move {
-                let auth_context = temps_auth::AuthContext::new_deployment_token(
+                let auth_context = temps_authz::AuthContext::new_deployment_token(
                     token_project_id,
                     None,
                     None,
@@ -2067,7 +2099,7 @@ mod tests {
 
         let events_writer = Arc::new(crate::services::AnalyticsEventsService::new(db.clone()));
         let events_service: Arc<dyn crate::services::AnalyticsEvents> = events_writer.clone();
-        let route_table = Arc::new(temps_proxy::CachedPeerTable::new(db.clone()));
+        let route_table = Arc::new(temps_routes::CachedPeerTable::new(db.clone()));
         let geoip_service = Arc::new(temps_geo::GeoIpService::Mock(
             temps_geo::MockGeoIpService::new(),
         ));
@@ -2341,7 +2373,7 @@ mod tests {
     /// Register a host in the route table so the no-key branch can resolve it,
     /// without needing a real deployment to exist.
     fn insert_test_route(
-        route_table: &temps_proxy::CachedPeerTable,
+        route_table: &temps_routes::CachedPeerTable,
         host: &str,
         project: Option<projects::Model>,
     ) {

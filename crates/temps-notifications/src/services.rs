@@ -1,13 +1,13 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+use crate::error::{config_parse_reason, webhook_url_display, NotificationError, Result};
 use crate::telegram::{TelegramError, TelegramProvider, TELEGRAM_PROVIDER_TYPE};
 use crate::types::{Notification, NotificationPriority, NotificationSeverity, NotificationType};
 use crate::{
     NotificationRouteError, NotificationRouteTestResult, NotificationRoutingService,
     RouteTestDelivery, RouteTestDeliveryStatus,
 };
-use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use lettre::{
@@ -77,6 +77,10 @@ pub enum NotificationProviderConfigMergeError {
         "Masked notification provider values inside array '{path}' cannot be safely matched after an edit"
     )]
     AmbiguousMaskedArray { path: String },
+    #[error(
+        "'{field}' was changed, so the masked value at '{path}' must be entered again instead of '***'"
+    )]
+    DestinationChangedWithMaskedValue { field: String, path: String },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -424,25 +428,33 @@ pub struct WebhookProvider {
     pub timeout_secs: u64,
 }
 
-async fn validate_webhook_url(url: &str) -> Result<()> {
-    let parsed = validate_external_url(url)
-        .map_err(|error| anyhow::anyhow!("Invalid webhook URL '{}': {}", url, error))?;
+async fn validate_webhook_url(url: &str) -> std::result::Result<(), WebhookDeliveryError> {
+    let invalid = |reason: String| WebhookDeliveryError::InvalidUrl {
+        url: webhook_url_display(url),
+        reason,
+    };
+    let parsed = validate_external_url(url).map_err(|error| invalid(error.to_string()))?;
     if let Some(domain) = parsed
         .host_str()
         .filter(|host| host.parse::<std::net::IpAddr>().is_err())
     {
         let port = parsed.port_or_known_default().ok_or_else(|| {
-            anyhow::anyhow!("Invalid webhook URL '{}': URL has no resolvable port", url)
+            WebhookDeliveryError::NoResolvablePort {
+                url: webhook_url_display(url),
+            }
         })?;
         resolve_and_validate_domain(domain, port)
             .await
-            .map_err(|error| anyhow::anyhow!("Invalid webhook URL '{}': {}", url, error))?;
+            .map_err(|error| invalid(error.to_string()))?;
     }
     Ok(())
 }
 
-async fn webhook_http_client(url: &str, timeout_secs: u64) -> Result<reqwest::Client> {
-    Ok(pinned_webhook_http_client(url, url, timeout_secs).await?)
+async fn webhook_http_client(
+    url: &str,
+    timeout_secs: u64,
+) -> std::result::Result<reqwest::Client, WebhookDeliveryError> {
+    pinned_webhook_http_client(url, &webhook_url_display(url), timeout_secs).await
 }
 
 /// Why an outbound webhook client could not be built or a webhook delivery
@@ -584,10 +596,15 @@ impl CloudflareProvider {
     /// Plain-text fallback body. Cloudflare requires a `text` part alongside the
     /// HTML one, so derive a readable version from the notification.
     fn render_text_body(notification: &Notification) -> String {
-        let mut body = format!("{}\n\n{}", notification.title, notification.message);
-        if !notification.metadata.is_empty() {
+        let mut body = format!("{}\n\n{}", notification.title, notification.text_body());
+        let mut metadata = notification
+            .metadata
+            .iter()
+            .filter(|(key, _)| is_human_visible_metadata_key(key, &notification.metadata))
+            .peekable();
+        if metadata.peek().is_some() {
             body.push_str("\n\n---\n");
-            for (key, value) in &notification.metadata {
+            for (key, value) in metadata {
                 body.push_str(&format!("{}: {}\n", key, value));
             }
         }
@@ -619,26 +636,29 @@ impl CloudflareProvider {
             .json(&payload)
             .send()
             .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "Cloudflare email send to {} failed (request error): {}",
-                    to,
-                    e
-                )
+            .map_err(|e| NotificationError::CloudflareRequest {
+                to: to.to_string(),
+                reason: e.without_url().to_string(),
             })?;
 
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(anyhow::anyhow!(
-                "Cloudflare email send to {} failed with status {}: {}",
-                to,
-                status,
-                body
-            ));
+            return Err(NotificationError::CloudflareRejected {
+                to: to.to_string(),
+                status: status.as_u16(),
+                body,
+            });
         }
 
         Ok(())
+    }
+}
+
+fn cloudflare_client_error(error: reqwest::Error) -> NotificationError {
+    NotificationError::HttpClientBuild {
+        provider: "Cloudflare",
+        reason: error.without_url().to_string(),
     }
 }
 
@@ -646,18 +666,20 @@ impl CloudflareProvider {
 impl NotificationProvider for CloudflareProvider {
     async fn initialize(&mut self, _db: Arc<DatabaseConnection>) -> Result<()> {
         if self.account_id.trim().is_empty() {
-            return Err(anyhow::anyhow!("Cloudflare account_id cannot be empty"));
+            return Err(NotificationError::CloudflareFieldEmpty {
+                field: "account_id",
+            });
         }
         if self.api_token.trim().is_empty() {
-            return Err(anyhow::anyhow!("Cloudflare api_token cannot be empty"));
+            return Err(NotificationError::CloudflareFieldEmpty { field: "api_token" });
         }
         if self.from_address.trim().is_empty() {
-            return Err(anyhow::anyhow!("Cloudflare from_address cannot be empty"));
+            return Err(NotificationError::CloudflareFieldEmpty {
+                field: "from_address",
+            });
         }
         if self.to_addresses.is_empty() {
-            return Err(anyhow::anyhow!(
-                "Cloudflare provider requires at least one recipient in to_addresses"
-            ));
+            return Err(NotificationError::CloudflareNoRecipientsConfigured);
         }
         Ok(())
     }
@@ -665,7 +687,8 @@ impl NotificationProvider for CloudflareProvider {
     async fn send(&self, notification: &Notification) -> Result<()> {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
-            .build()?;
+            .build()
+            .map_err(cloudflare_client_error)?;
 
         let priority_prefix = match notification.priority {
             NotificationPriority::Low => "[LOW] ",
@@ -694,7 +717,7 @@ impl NotificationProvider for CloudflareProvider {
         recipients.sort();
         recipients.dedup();
 
-        let mut last_err: Option<anyhow::Error> = None;
+        let mut last_err: Option<NotificationError> = None;
         let mut delivered = false;
         for addr in &recipients {
             match self.post_email(&client, addr, &subject, &html, &text).await {
@@ -709,9 +732,7 @@ impl NotificationProvider for CloudflareProvider {
         // Surface a failure only if every recipient failed — partial delivery
         // still counts as a successful notification, consistent with SMTP.
         if !delivered {
-            return Err(last_err.unwrap_or_else(|| {
-                anyhow::anyhow!("Cloudflare provider had no recipients to deliver to")
-            }));
+            return Err(last_err.unwrap_or(NotificationError::CloudflareNoRecipients));
         }
 
         Ok(())
@@ -724,7 +745,8 @@ impl NotificationProvider for CloudflareProvider {
         // email. It is account-independent by design.
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(15))
-            .build()?;
+            .build()
+            .map_err(cloudflare_client_error)?;
 
         let url = format!("{}/user/tokens/verify", self.api_base());
 
@@ -752,7 +774,7 @@ fn is_human_visible_metadata_key(
     key: &str,
     metadata: &std::collections::HashMap<String, String>,
 ) -> bool {
-    if key.starts_with('_') {
+    if key.starts_with('_') || key == "text_body" {
         return false;
     }
     if let Some(prefix) = key.strip_suffix("_id") {
@@ -815,8 +837,16 @@ pub(crate) fn html_escape(s: &str) -> String {
 /// destinations (Slack incoming webhooks, Discord-style webhook URLs) that
 /// URL IS the credential, so leaving it in triggers CWE-532 (secrets in
 /// logs) the moment a delivery or health check fails.
-fn webhook_request_error(prefix: &str, error: reqwest::Error) -> anyhow::Error {
-    anyhow::anyhow!("{prefix}: {}", error.without_url())
+fn webhook_request_error(
+    stage: &'static str,
+    url: &str,
+    error: reqwest::Error,
+) -> WebhookDeliveryError {
+    WebhookDeliveryError::Request {
+        stage,
+        url: webhook_url_display(url),
+        reason: error.without_url().to_string(),
+    }
 }
 
 /// Escape Slack mrkdwn special characters so user-controlled text cannot inject
@@ -855,7 +885,7 @@ const CLOUD_METADATA_MAX_ENTRIES: usize = 3;
 const CLOUD_METADATA_ALLOWLIST: &[&str] = &["environment", "event_kind", "resource_type"];
 
 #[derive(Debug, thiserror::Error)]
-enum CloudNotificationError {
+pub enum CloudNotificationError {
     #[error("Could not create a private identifier for the managed notification")]
     Pseudonymization,
     #[error("The managed notification provider could not accept the notification")]
@@ -1085,7 +1115,7 @@ impl NotificationProvider for TempsCloudProvider {
             .send_managed_notification(&ManagedNotificationRequest {
                 source_notification_id,
                 title: bound_cloud_text(&notification.title, CLOUD_TITLE_MAX_CHARS),
-                message: bound_cloud_text(&notification.message, CLOUD_MESSAGE_MAX_CHARS),
+                message: bound_cloud_text(notification.text_body(), CLOUD_MESSAGE_MAX_CHARS),
                 severity,
                 metadata: cloud_metadata(notification),
             })
@@ -1109,9 +1139,9 @@ impl EmailProvider {
             .await
             .map_err(|e| {
                 error!("Failed to get admin role: {}", e);
-                anyhow::anyhow!("Failed to get admin role: {}", e)
+                NotificationError::database("get admin role")(e)
             })?
-            .ok_or_else(|| anyhow::anyhow!("Admin role not found"))?;
+            .ok_or(NotificationError::AdminRoleNotFound)?;
 
         // Then get all users with admin role through user_roles join
         let admin_users = users::Entity::find()
@@ -1121,7 +1151,7 @@ impl EmailProvider {
             .await
             .map_err(|e| {
                 error!("Failed to get admin users: {}", e);
-                anyhow::anyhow!("Failed to get admin users: {}", e)
+                NotificationError::database("get admin users")(e)
             })?;
 
         Ok(admin_users)
@@ -1129,6 +1159,26 @@ impl EmailProvider {
 }
 
 impl EmailProvider {
+    fn smtp_transport_error(&self, error: lettre::transport::smtp::Error) -> NotificationError {
+        NotificationError::SmtpTransport {
+            smtp_host: self.smtp_host.clone(),
+            smtp_port: self.smtp_port,
+            reason: error.to_string(),
+        }
+    }
+
+    fn sender_mailbox(&self, address: &str) -> Result<Mailbox> {
+        let parsed = address
+            .parse()
+            .map_err(
+                |e: lettre::address::AddressError| NotificationError::InvalidSender {
+                    address: address.to_string(),
+                    reason: e.to_string(),
+                },
+            )?;
+        Ok(Mailbox::new(self.from_name.clone(), parsed))
+    }
+
     fn initialize_mailer(&mut self, db: Arc<DatabaseConnection>) -> Result<()> {
         let mut builder = AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(&self.smtp_host)
             .port(self.smtp_port);
@@ -1162,7 +1212,8 @@ impl EmailProvider {
                                 || self.smtp_host == "localhost"
                                 || self.smtp_host == "127.0.0.1",
                         )
-                        .build()?;
+                        .build()
+                        .map_err(|e| self.smtp_transport_error(e))?;
                     builder
                         .tls(lettre::transport::smtp::client::Tls::Required(tls))
                         .build()
@@ -1179,7 +1230,8 @@ impl EmailProvider {
                                 || self.smtp_host == "localhost"
                                 || self.smtp_host == "127.0.0.1",
                         )
-                        .build()?;
+                        .build()
+                        .map_err(|e| self.smtp_transport_error(e))?;
                     builder
                         .tls(lettre::transport::smtp::client::Tls::Opportunistic(tls))
                         .build()
@@ -1198,9 +1250,11 @@ impl EmailProvider {
                             || self.smtp_host == "localhost"
                             || self.smtp_host == "127.0.0.1",
                     )
-                    .build()?;
+                    .build()
+                    .map_err(|e| self.smtp_transport_error(e))?;
                 let mut relay_builder =
-                    AsyncSmtpTransport::<Tokio1Executor>::relay(&self.smtp_host)?
+                    AsyncSmtpTransport::<Tokio1Executor>::relay(&self.smtp_host)
+                        .map_err(|e| self.smtp_transport_error(e))?
                         .port(self.smtp_port)
                         .tls(lettre::transport::smtp::client::Tls::Wrapper(tls));
 
@@ -1228,7 +1282,7 @@ impl EmailProvider {
         let mailer = self
             .mailer
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Email provider not initialized"))?;
+            .ok_or(NotificationError::EmailProviderNotInitialized)?;
 
         let priority_prefix = match notification.priority {
             NotificationPriority::Low => "[LOW] ",
@@ -1237,7 +1291,7 @@ impl EmailProvider {
             NotificationPriority::Critical => "[CRITICAL] ",
         };
 
-        let from = Mailbox::new(self.from_name.clone(), self.from_address.parse()?);
+        let from = self.sender_mailbox(&self.from_address)?;
 
         // If the notification message is already a full HTML document, send it
         // as-is. Otherwise wrap it in the standard notification email template.
@@ -1277,7 +1331,11 @@ impl EmailProvider {
                         .to(to_mailbox)
                         .subject(format!("{}{}", priority_prefix, notification.title))
                         .header(ContentType::TEXT_HTML)
-                        .body(email_body.clone())?;
+                        .body(email_body.clone())
+                        .map_err(|e| NotificationError::EmailBuild {
+                            recipient: addr.clone(),
+                            reason: e.to_string(),
+                        })?;
 
                     match mailer.send(email_msg).await {
                         Ok(_) => report.accepted.push(addr.clone()),
@@ -1395,23 +1453,26 @@ impl EmailProvider {
         let mailer = self
             .mailer
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Email provider not initialized"))?;
+            .ok_or(NotificationError::EmailProviderNotInitialized)?;
 
         let from_address = from_override.unwrap_or(&self.from_address);
-        let from = Mailbox::new(self.from_name.clone(), from_address.parse()?);
+        let from = self.sender_mailbox(from_address)?;
 
         if recipients.is_empty() {
-            return Err(anyhow::anyhow!("No recipient for transactional email"));
+            return Err(NotificationError::NoTransactionalRecipient);
         }
 
-        let mut last_err: Option<anyhow::Error> = None;
+        let mut last_err: Option<NotificationError> = None;
         let mut delivered = false;
         for addr in recipients {
             let to_mailbox = match addr.parse::<Mailbox>() {
                 Ok(m) => m,
                 Err(e) => {
                     error!("Invalid transactional email recipient {}: {}", addr, e);
-                    last_err = Some(anyhow::anyhow!("Invalid recipient {}: {}", addr, e));
+                    last_err = Some(NotificationError::InvalidRecipient {
+                        address: addr.clone(),
+                        reason: e.to_string(),
+                    });
                     continue;
                 }
             };
@@ -1421,13 +1482,20 @@ impl EmailProvider {
                 .to(to_mailbox)
                 .subject(subject)
                 .header(ContentType::TEXT_HTML)
-                .body(html_body.to_string())?;
+                .body(html_body.to_string())
+                .map_err(|e| NotificationError::EmailBuild {
+                    recipient: addr.clone(),
+                    reason: e.to_string(),
+                })?;
 
             match mailer.send(email_msg).await {
                 Ok(_) => delivered = true,
                 Err(e) => {
                     error!("Failed to send transactional email to {}: {}", addr, e);
-                    last_err = Some(anyhow::anyhow!("SMTP send failed for {}: {}", addr, e));
+                    last_err = Some(NotificationError::SmtpSend {
+                        address: addr.clone(),
+                        reason: e.to_string(),
+                    });
                 }
             }
         }
@@ -1435,8 +1503,7 @@ impl EmailProvider {
         if delivered {
             Ok(())
         } else {
-            Err(last_err
-                .unwrap_or_else(|| anyhow::anyhow!("Transactional email could not be delivered")))
+            Err(last_err.unwrap_or(NotificationError::TransactionalUndelivered))
         }
     }
 
@@ -1637,13 +1704,17 @@ impl EmailProvider {
             }
         };
 
-        let from = Mailbox::new(self.from_name.clone(), self.from_address.parse()?);
+        let from = self.sender_mailbox(&self.from_address)?;
         let timestamp = chrono::Utc::now()
             .format("%b %d, %Y at %H:%M UTC")
             .to_string();
         // Best-effort identifier of which Temps instance sent the email.
         // `TEMPS_HOSTNAME` is set by the deploy scripts; falls back to the
         // public address if configured, then a generic label.
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "legacy runtime env config; follow-up: move to a DB-backed setting (P0.7 follow-up). TEMPS_HOSTNAME / TEMPS_PUBLIC_HOSTNAME"
+        )]
         let host = std::env::var("TEMPS_HOSTNAME")
             .or_else(|_| std::env::var("TEMPS_PUBLIC_HOSTNAME"))
             .unwrap_or_else(|_| "temps instance".to_string());
@@ -1692,7 +1763,11 @@ impl EmailProvider {
                             .header(ContentType::TEXT_HTML)
                             .body(html_body),
                     ),
-            )?;
+            )
+            .map_err(|e| NotificationError::EmailBuild {
+                recipient: recipient.clone(),
+                reason: e.to_string(),
+            })?;
 
         match mailer.send(message).await {
             Ok(_) => Ok(true),
@@ -1870,7 +1945,7 @@ impl SlackProvider {
             .collect::<Vec<_>>();
 
         let safe_title = slack_escape(&notification.title);
-        let safe_message = slack_escape(&notification.message);
+        let safe_message = slack_escape(notification.text_body());
         let payload = serde_json::json!({
             "attachments": [{
                 "color": color,
@@ -1898,7 +1973,7 @@ impl NotificationProvider for SlackProvider {
     async fn initialize(&mut self, _db: Arc<DatabaseConnection>) -> Result<()> {
         // Validate webhook URL format
         if !self.webhook_url.starts_with(SLACK_WEBHOOK_PREFIX) {
-            return Err(anyhow::anyhow!("Invalid Slack webhook URL"));
+            return Err(NotificationError::InvalidSlackWebhook);
         }
         Ok(())
     }
@@ -1934,40 +2009,27 @@ impl NotificationProvider for SlackProvider {
     }
 }
 
-#[async_trait]
-impl NotificationProvider for WebhookProvider {
-    async fn initialize(&mut self, _db: Arc<DatabaseConnection>) -> Result<()> {
-        // Validate webhook URL with full SSRF protection (blocks private IPs,
-        // loopback, cloud metadata, link-local, etc.)
-        validate_webhook_url(&self.url).await?;
-
-        // Validate HTTP method
-        let method = self.method.to_uppercase();
-        if !["POST", "PUT", "PATCH"].contains(&method.as_str()) {
-            return Err(anyhow::anyhow!(
-                "Invalid HTTP method: {}. Must be POST, PUT, or PATCH",
-                self.method
-            ));
-        }
-
-        Ok(())
-    }
-
-    async fn send(&self, notification: &Notification) -> Result<()> {
-        let client = webhook_http_client(&self.url, self.timeout_secs).await?;
-
+impl WebhookProvider {
+    /// Production supplies an SSRF-checked client; tests can inspect delivery
+    /// against a local mock server without weakening the production checks.
+    async fn send_with_client(
+        &self,
+        client: &reqwest::Client,
+        notification: &Notification,
+    ) -> Result<()> {
         // Build the payload with all notification data. `_`-prefixed keys are
-        // channel-specific payloads (e.g. the email's `_chart_svg`) — drop them
+        // channel-specific payloads (e.g. the email's `_chart_svg`). Drop them
+        // and the already-selected text alternative
         // so they don't bloat the webhook body.
         let metadata: std::collections::HashMap<&String, &String> = notification
             .metadata
             .iter()
-            .filter(|(k, _)| !k.starts_with('_'))
+            .filter(|(k, _)| !k.starts_with('_') && k.as_str() != "text_body")
             .collect();
         let payload = serde_json::json!({
             "id": notification.id,
             "title": notification.title,
-            "message": notification.message,
+            "message": notification.text_body(),
             "type": notification.notification_type.to_string(),
             "priority": notification.priority.to_string(),
             "severity": notification.effective_severity().to_string(),
@@ -1994,20 +2056,44 @@ impl NotificationProvider for WebhookProvider {
         let response = request
             .send()
             .await
-            .map_err(|e| webhook_request_error("Webhook request failed", e))?;
+            .map_err(|e| webhook_request_error("Webhook request failed", &self.url, e))?;
 
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             error!("Webhook request failed with status {}: {}", status, body);
-            return Err(anyhow::anyhow!(
-                "Webhook request failed with status {}: {}",
-                status,
-                body
-            ));
+            return Err(NotificationError::WebhookRejected {
+                status: status.as_u16(),
+                body,
+            });
         }
 
         Ok(())
+    }
+}
+
+#[async_trait]
+impl NotificationProvider for WebhookProvider {
+    async fn initialize(&mut self, _db: Arc<DatabaseConnection>) -> Result<()> {
+        // Validate webhook URL with full SSRF protection (blocks private IPs,
+        // loopback, cloud metadata, link-local, etc.)
+        validate_webhook_url(&self.url).await?;
+
+        // Validate HTTP method
+        let method = self.method.to_uppercase();
+        if !["POST", "PUT", "PATCH"].contains(&method.as_str()) {
+            return Err(NotificationError::InvalidWebhookMethod {
+                method: self.method.clone(),
+            });
+        }
+
+        Ok(())
+    }
+
+    async fn send(&self, notification: &Notification) -> Result<()> {
+        let client = webhook_http_client(&self.url, self.timeout_secs).await?;
+
+        self.send_with_client(&client, notification).await
     }
 
     async fn health_check(&self) -> Result<bool> {
@@ -2089,7 +2175,7 @@ impl NotificationService {
     async fn get_enabled_providers(
         &self,
         notification: &Notification,
-    ) -> Result<Vec<Box<dyn NotificationProvider>>> {
+    ) -> Result<Vec<Box<dyn NotificationProvider>>, NotificationRouteError> {
         let db_providers = self
             .routing_service
             .resolve_provider_models(notification.effective_severity())
@@ -2125,7 +2211,8 @@ impl NotificationService {
             .filter(notification_providers::Column::Enabled.eq(true))
             .filter(notification_providers::Column::ProviderType.eq("email"))
             .all(self.db.as_ref())
-            .await?;
+            .await
+            .map_err(NotificationError::database("load enabled email providers"))?;
 
         let mut providers = Vec::new();
         for record in records {
@@ -2139,7 +2226,11 @@ impl NotificationService {
             let mut config: EmailProvider = match serde_json::from_str(&decrypted_config) {
                 Ok(c) => c,
                 Err(e) => {
-                    error!("Failed to parse email provider {}: {}", record.name, e);
+                    error!(
+                        "Failed to parse email provider {}: {}",
+                        record.name,
+                        config_parse_reason(&e)
+                    );
                     continue;
                 }
             };
@@ -2206,15 +2297,118 @@ impl NotificationService {
     }
 
     pub async fn send_notification(&self, notification: Notification) -> Result<()> {
+        let batch_key = Self::get_batch_key(&notification);
+        self.send_with_batch_key(notification, batch_key).await
+    }
+
+    /// The marker an episode's row carries once its condition cleared
+    /// (ADR 068 D5).
+    const EPISODE_CLEARED_AT: &'static str = "episode_cleared_at";
+    /// The marker an episode's row carries when no destination accepted it,
+    /// so the next open sends it again instead of staying silent.
+    const EPISODE_UNDELIVERED_AT: &'static str = "episode_undelivered_at";
+
+    /// The newest row under `batch_key`, when its episode is still open.
+    async fn open_episode_row(&self, batch_key: &str) -> Result<Option<notifications::Model>> {
+        let latest = notifications::Entity::find()
+            .filter(notifications::Column::BatchKey.eq(batch_key))
+            .order_by_desc(notifications::Column::CreatedAt)
+            .one(self.db.as_ref())
+            .await
+            .map_err(NotificationError::database(
+                "load the open notification episode",
+            ))?;
+        Ok(latest.filter(|row| episode_open(&row.metadata)))
+    }
+
+    /// Send once per episode under `batch_key`; see
+    /// [`temps_core::notifications::NotificationService::open_episode`].
+    pub async fn open_episode(&self, batch_key: &str, notification: Notification) -> Result<bool> {
+        if self.open_episode_row(batch_key).await?.is_some() {
+            return Ok(false);
+        }
+        let notification = Notification {
+            bypass_throttling: true,
+            ..notification
+        };
+        let delivery = self
+            .deliver_with_batch_key(notification, batch_key.to_string())
+            .await?;
+        if let Delivery::Sent { row, accepted: 0 } = delivery {
+            // Nobody got it: leave the episode closed so the next open
+            // retries, rather than "once per episode" becoming never.
+            Self::mark_episode_row(self.db.as_ref(), *row, Self::EPISODE_UNDELIVERED_AT).await?;
+            warn!(
+                batch_key,
+                "no notification destination accepted the episode; it will be sent again"
+            );
+            return Ok(false);
+        }
+        info!(batch_key, "opened a notification episode");
+        Ok(true)
+    }
+
+    /// Add `marker` (now) to an episode row's metadata.
+    async fn mark_episode_row(
+        db: &DatabaseConnection,
+        row: notifications::Model,
+        marker: &str,
+    ) -> Result<()> {
+        let mut metadata: std::collections::HashMap<String, String> =
+            serde_json::from_str(&row.metadata).unwrap_or_default();
+        metadata.insert(marker.to_string(), Utc::now().to_rfc3339());
+        let batch_key = row.batch_key.clone();
+        let mut update: notifications::ActiveModel = row.into();
+        update.metadata = Set(serde_json::to_string(&metadata).map_err(|source| {
+            NotificationError::MetadataSerialization {
+                what: "episode metadata",
+                batch_key,
+                source,
+            }
+        })?);
+        update
+            .update(db)
+            .await
+            .map_err(NotificationError::database("mark the notification episode"))?;
+        Ok(())
+    }
+
+    /// Mark the open episode under `batch_key` cleared, if there is one.
+    pub async fn close_episode(&self, batch_key: &str) -> Result<()> {
+        let Some(row) = self.open_episode_row(batch_key).await? else {
+            return Ok(());
+        };
+        Self::mark_episode_row(self.db.as_ref(), row, Self::EPISODE_CLEARED_AT).await?;
+        info!(batch_key, "closed a notification episode");
+        Ok(())
+    }
+
+    async fn send_with_batch_key(
+        &self,
+        notification: Notification,
+        batch_key_str: String,
+    ) -> Result<()> {
+        self.deliver_with_batch_key(notification, batch_key_str)
+            .await
+            .map(|_| ())
+    }
+
+    async fn deliver_with_batch_key(
+        &self,
+        notification: Notification,
+        batch_key_str: String,
+    ) -> Result<Delivery> {
         let now = Utc::now();
-        let batch_key_str = Self::get_batch_key(&notification);
 
         // Check for existing similar notifications
         let existing = notifications::Entity::find()
             .filter(notifications::Column::BatchKey.eq(&batch_key_str))
             .order_by_desc(notifications::Column::CreatedAt)
             .one(self.db.as_ref())
-            .await?;
+            .await
+            .map_err(NotificationError::database(
+                "load the previous notification",
+            ))?;
 
         if let Some(existing) = existing.clone() {
             // If we have a similar notification, check if we should send it or batch it.
@@ -2225,7 +2419,10 @@ impl NotificationService {
                 // Update occurrence count and return
                 let mut existing_update: notifications::ActiveModel = existing.clone().into();
                 existing_update.occurrence_count = Set(existing.occurrence_count + 1);
-                existing_update.update(self.db.as_ref()).await?;
+                existing_update
+                    .update(self.db.as_ref())
+                    .await
+                    .map_err(NotificationError::database("batch the notification"))?;
 
                 info!(
                     "Batching notification '{}'. Current count: {}, next send allowed at {}",
@@ -2233,7 +2430,7 @@ impl NotificationService {
                     existing.occurrence_count + 1,
                     existing.next_allowed_at,
                 );
-                return Ok(());
+                return Ok(Delivery::Batched);
             }
         }
 
@@ -2248,7 +2445,13 @@ impl NotificationService {
             .iter()
             .filter(|(k, _)| !k.starts_with('_'))
             .collect();
-        let metadata_json = serde_json::to_string(&persisted_metadata)?;
+        let metadata_json = serde_json::to_string(&persisted_metadata).map_err(|source| {
+            NotificationError::MetadataSerialization {
+                what: "notification metadata",
+                batch_key: batch_key_str.clone(),
+                source,
+            }
+        })?;
         let next_allowed = Self::get_next_allowed_time(&notification.priority, previous_attempts);
 
         // Create new notification record
@@ -2267,7 +2470,10 @@ impl NotificationService {
         };
 
         // Insert the new notification record
-        let _inserted = new_notification.insert(self.db.as_ref()).await?;
+        let inserted = new_notification
+            .insert(self.db.as_ref())
+            .await
+            .map_err(NotificationError::database("record the notification"))?;
 
         // Get the occurrence count for the message modification
         let occurrence_count_val = if let Some(existing) = existing {
@@ -2279,24 +2485,37 @@ impl NotificationService {
         // Modify the notification message if there were batched occurrences
         let mut notification = notification.clone();
         if occurrence_count_val > 1 {
-            notification.message = format!(
-                "{}\n\nThis issue has occurred {} times since the last notification.",
-                notification.message, occurrence_count_val
+            let occurrence_suffix = format!(
+                "\n\nThis issue has occurred {} times since the last notification.",
+                occurrence_count_val
             );
+            notification.message.push_str(&occurrence_suffix);
+            if let Some(text_body) = notification
+                .metadata
+                .get_mut("text_body")
+                .filter(|body| !body.trim().is_empty())
+            {
+                text_body.push_str(&occurrence_suffix);
+            }
         }
 
         // Resolve routes and deliver once to each matching provider.
         let providers = self
             .get_enabled_providers(&notification)
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to get providers {}", e))?;
+            .map_err(|source| NotificationError::ProviderResolution { source })?;
+        let mut accepted = 0;
         for provider in &providers {
-            if let Err(e) = provider.send(&notification).await {
-                error!("Failed to send notification via provider: {}", e);
+            match provider.send(&notification).await {
+                Ok(()) => accepted += 1,
+                Err(e) => error!("Failed to send notification via provider: {}", e),
             }
         }
 
-        Ok(())
+        Ok(Delivery::Sent {
+            row: Box::new(inserted),
+            accepted,
+        })
     }
 
     pub async fn is_configured(&self) -> Result<bool> {
@@ -2307,17 +2526,15 @@ impl NotificationService {
         {
             return Ok(true);
         }
-        self.routing_service
-            .has_routable_provider()
-            .await
-            .map_err(|error| anyhow::anyhow!(error))
+        Ok(self.routing_service.has_routable_provider().await?)
     }
 
     pub async fn list_providers(&self) -> Result<Vec<notification_providers::Model>> {
         let providers = notification_providers::Entity::find()
             .filter(notification_providers::Column::ProviderType.ne("cloud"))
             .all(self.db.as_ref())
-            .await?;
+            .await
+            .map_err(NotificationError::database("list notification providers"))?;
         Ok(providers)
     }
 
@@ -2329,26 +2546,39 @@ impl NotificationService {
         let providers = notification_providers::Entity::find()
             .filter(notification_providers::Column::ProviderType.ne("cloud"))
             .paginate(self.db.as_ref(), page_size)
-            .fetch_page(page - 1)
-            .await?;
+            .fetch_page(temps_core::config::page_index(page))
+            .await
+            .map_err(NotificationError::database("list notification providers"))?;
         Ok(providers)
     }
 
     /// Decrypt and mask the provider config for API responses.
     pub fn decrypt_provider_config(&self, encrypted_config: &str) -> Result<serde_json::Value> {
-        let mut config_value = self.decrypt_provider_config_raw(encrypted_config)?;
+        let mut config_value = self.decrypt_provider_config_raw(None, encrypted_config)?;
         Self::mask_provider_config(&mut config_value);
         Ok(config_value)
     }
 
-    fn decrypt_provider_config_raw(&self, encrypted_config: &str) -> Result<serde_json::Value> {
+    fn decrypt_provider_config_raw(
+        &self,
+        provider_id: Option<i32>,
+        encrypted_config: &str,
+    ) -> Result<serde_json::Value> {
         let decrypted_config = self
             .encryption_service
             .decrypt_string(encrypted_config)
-            .map_err(|e| anyhow::anyhow!("Failed to decrypt config: {}", e))?;
+            .map_err(|e| NotificationError::ConfigDecryption {
+                provider_id,
+                reason: e.to_string(),
+            })?;
 
-        let config_value: serde_json::Value = serde_json::from_str(&decrypted_config)
-            .map_err(|e| anyhow::anyhow!("Failed to parse decrypted config: {}", e))?;
+        let config_value: serde_json::Value =
+            serde_json::from_str(&decrypted_config).map_err(|e| {
+                NotificationError::ConfigParse {
+                    provider_id,
+                    reason: config_parse_reason(&e),
+                }
+            })?;
 
         Ok(config_value)
     }
@@ -2455,6 +2685,78 @@ impl NotificationService {
         Ok(())
     }
 
+    /// Config fields that decide where a provider sends its credentials, or how
+    /// well they are protected on the way.
+    fn destination_fields(provider_type: &str) -> &'static [&'static str] {
+        match provider_type {
+            "webhook" => &["url"],
+            "email" => &[
+                "smtp_host",
+                "smtp_port",
+                "tls_mode",
+                "starttls_required",
+                "accept_invalid_certs",
+            ],
+            _ => &[],
+        }
+    }
+
+    fn first_masked_path(value: &serde_json::Value, path: &str) -> Option<String> {
+        match value {
+            serde_json::Value::String(value) if value == MASKED_CONFIG_VALUE => {
+                Some(path.to_string())
+            }
+            serde_json::Value::Object(object) => object.iter().find_map(|(key, child)| {
+                let child_path = if path.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{path}.{key}")
+                };
+                Self::first_masked_path(child, &child_path)
+            }),
+            serde_json::Value::Array(_) if Self::contains_masked_value(value) => {
+                Some(path.to_string())
+            }
+            _ => None,
+        }
+    }
+
+    /// Refuse an update that moves a provider to a new destination while asking
+    /// to keep its stored credentials.
+    ///
+    /// Reads return credentials as `***` and an update that sends `***` back
+    /// keeps the stored value. Without this check, anyone allowed to edit a
+    /// provider could change its URL or SMTP host to a server they control and
+    /// keep the credentials, which the next delivery or test then sends there.
+    /// A field sent as `***` (a masked URL) or equal to the stored value is
+    /// unchanged. Run before [`Self::merge_masked_values`], which rewrites the
+    /// placeholders.
+    fn reject_masked_values_for_changed_destination(
+        provider_type: &str,
+        existing: &serde_json::Value,
+        replacement: &serde_json::Value,
+    ) -> std::result::Result<(), NotificationProviderConfigMergeError> {
+        for field in Self::destination_fields(provider_type) {
+            let Some(new_value) = replacement.get(*field) else {
+                continue;
+            };
+            let unchanged = new_value.as_str() == Some(MASKED_CONFIG_VALUE)
+                || existing.get(*field) == Some(new_value);
+            if unchanged {
+                continue;
+            }
+            if let Some(path) = Self::first_masked_path(replacement, "") {
+                return Err(
+                    NotificationProviderConfigMergeError::DestinationChangedWithMaskedValue {
+                        field: (*field).to_string(),
+                        path,
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Reveal a single sensitive configuration field after the HTTP layer has
     /// applied authorization. The caller must audit every successful result.
     pub async fn reveal_provider_config_value(
@@ -2480,7 +2782,7 @@ impl NotificationService {
         }
 
         let config = self
-            .decrypt_provider_config_raw(&provider.config)
+            .decrypt_provider_config_raw(Some(provider_id), &provider.config)
             .map_err(|error| NotificationProviderRevealError::Decryption {
                 provider_id,
                 reason: error.to_string(),
@@ -2512,41 +2814,51 @@ impl NotificationService {
         let decrypted_config = self
             .encryption_service
             .decrypt_string(&record.config)
-            .map_err(|e| anyhow::anyhow!("Failed to decrypt config: {}", e))?;
+            .map_err(|e| NotificationError::ConfigDecryption {
+                provider_id: Some(record.id),
+                reason: e.to_string(),
+            })?;
+        let parse_error = |e: serde_json::Error| NotificationError::ConfigParse {
+            provider_id: Some(record.id),
+            reason: config_parse_reason(&e),
+        };
 
         let provider: Box<dyn NotificationProvider> = match record.provider_type.as_str() {
             "email" => {
-                let mut config: EmailProvider = serde_json::from_str(&decrypted_config)?;
+                let mut config: EmailProvider =
+                    serde_json::from_str(&decrypted_config).map_err(parse_error)?;
                 config.initialize(self.db.clone()).await?;
                 Box::new(config)
             }
             "slack" => {
-                let mut config: SlackProvider = serde_json::from_str(&decrypted_config)?;
+                let mut config: SlackProvider =
+                    serde_json::from_str(&decrypted_config).map_err(parse_error)?;
                 config.initialize(self.db.clone()).await?;
                 Box::new(config)
             }
             "webhook" => {
-                let mut config: WebhookProvider = serde_json::from_str(&decrypted_config)?;
+                let mut config: WebhookProvider =
+                    serde_json::from_str(&decrypted_config).map_err(parse_error)?;
                 config.initialize(self.db.clone()).await?;
                 Box::new(config)
             }
             "cloudflare" => {
-                let mut config: CloudflareProvider = serde_json::from_str(&decrypted_config)?;
+                let mut config: CloudflareProvider =
+                    serde_json::from_str(&decrypted_config).map_err(parse_error)?;
                 config.initialize(self.db.clone()).await?;
                 Box::new(config)
             }
             TELEGRAM_PROVIDER_TYPE => {
-                let mut config: TelegramProvider = serde_json::from_str(&decrypted_config)?;
+                let mut config: TelegramProvider =
+                    serde_json::from_str(&decrypted_config).map_err(parse_error)?;
                 config.initialize(self.db.clone()).await?;
                 Box::new(config)
             }
             other => {
-                return Err(anyhow::anyhow!(
-                    "Unsupported notification provider type '{}' for provider {} ('{}')",
-                    other,
-                    record.id,
-                    record.name
-                ))
+                return Err(NotificationError::UnsupportedProviderType {
+                    provider_id: record.id,
+                    provider_type: other.to_string(),
+                })
             }
         };
         Ok(provider)
@@ -2558,7 +2870,11 @@ impl NotificationService {
     ) -> Result<Option<notification_providers::Model>> {
         let provider = notification_providers::Entity::find_by_id(provider_id)
             .one(self.db.as_ref())
-            .await?;
+            .await
+            .map_err(NotificationError::provider_database(
+                provider_id,
+                "load the configuration",
+            ))?;
         Ok(provider)
     }
 
@@ -2660,7 +2976,11 @@ impl NotificationService {
         // First check if the provider exists
         let provider = notification_providers::Entity::find_by_id(provider_id)
             .one(self.db.as_ref())
-            .await?;
+            .await
+            .map_err(NotificationError::provider_database(
+                provider_id,
+                "load the configuration",
+            ))?;
 
         if let Some(provider) = provider {
             let existing_config = provider.config.clone();
@@ -2677,17 +2997,31 @@ impl NotificationService {
                 active_model.name = Set(new_name);
             }
             if let Some(mut new_config) = update.config {
-                let decrypted_existing = self.decrypt_provider_config_raw(&existing_config)?;
+                let decrypted_existing =
+                    self.decrypt_provider_config_raw(Some(provider_id), &existing_config)?;
+                Self::reject_masked_values_for_changed_destination(
+                    &provider_type,
+                    &decrypted_existing,
+                    &new_config,
+                )?;
                 Self::merge_masked_values(&decrypted_existing, &mut new_config, "")?;
                 // Validate after the merge, so an unchanged masked secret is
                 // checked as the stored value it stands for.
                 validate_provider_config(&provider_type, &new_config)?;
-                let config_json = serde_json::to_string(&new_config)?;
+                let config_json = serde_json::to_string(&new_config).map_err(|e| {
+                    NotificationError::ConfigSerialization {
+                        provider_id,
+                        reason: config_parse_reason(&e),
+                    }
+                })?;
                 // Encrypt the config before storing
                 let encrypted_config = self
                     .encryption_service
                     .encrypt_string(&config_json)
-                    .map_err(|e| anyhow::anyhow!("Failed to encrypt config: {}", e))?;
+                    .map_err(|e| NotificationError::ConfigEncryption {
+                        provider_id,
+                        reason: e.to_string(),
+                    })?;
                 active_model.config = Set(encrypted_config);
             }
             if let Some(new_enabled) = update.enabled {
@@ -2695,10 +3029,19 @@ impl NotificationService {
             }
             active_model.updated_at = Set(Utc::now());
 
-            let transaction = self.db.begin().await?;
+            let transaction =
+                self.db
+                    .begin()
+                    .await
+                    .map_err(NotificationError::provider_database(
+                        provider_id,
+                        "start the update",
+                    ))?;
 
             // Update the provider in the database
-            let updated_provider = active_model.update(&transaction).await?;
+            let updated_provider = active_model.update(&transaction).await.map_err(
+                NotificationError::provider_database(provider_id, "save the update"),
+            )?;
 
             // Keep the auto-generated catch-all route's display name (baked
             // in at creation time from the provider's name) in sync with a
@@ -2721,10 +3064,20 @@ impl NotificationService {
                     )
                     .filter(notification_routes::Column::CatchAllProviderId.eq(provider_id))
                     .exec(&transaction)
-                    .await?;
+                    .await
+                    .map_err(NotificationError::provider_database(
+                        provider_id,
+                        "rename the catch-all route",
+                    ))?;
             }
 
-            transaction.commit().await?;
+            transaction
+                .commit()
+                .await
+                .map_err(NotificationError::provider_database(
+                    provider_id,
+                    "commit the update",
+                ))?;
 
             Ok(Some(updated_provider))
         } else {
@@ -2735,14 +3088,20 @@ impl NotificationService {
     pub async fn delete_provider(&self, provider_id: i32) -> Result<bool> {
         let provider = notification_providers::Entity::find_by_id(provider_id)
             .one(self.db.as_ref())
-            .await?;
+            .await
+            .map_err(NotificationError::provider_database(
+                provider_id,
+                "load the configuration",
+            ))?;
 
         if let Some(provider) = provider {
             // The provider's auto-generated catch-all route (if any) is
             // removed automatically via the `catch_all_provider_id` FK's
             // ON DELETE CASCADE — no orphaned "All notifications - <name>
             // (provider <id>)" route is left behind.
-            provider.delete(self.db.as_ref()).await?;
+            provider.delete(self.db.as_ref()).await.map_err(
+                NotificationError::provider_database(provider_id, "delete the configuration"),
+            )?;
             Ok(true)
         } else {
             Ok(false)
@@ -2755,7 +3114,11 @@ impl NotificationService {
     pub async fn test_provider(&self, provider_id: i32) -> Result<ProviderTestOutcome> {
         let provider = notification_providers::Entity::find_by_id(provider_id)
             .one(self.db.as_ref())
-            .await?;
+            .await
+            .map_err(NotificationError::provider_database(
+                provider_id,
+                "load the configuration",
+            ))?;
 
         if let Some(provider) = provider {
             let notification_provider = self.load_provider(&provider).await?;
@@ -2785,10 +3148,7 @@ impl NotificationService {
                 }
             }
         } else {
-            Err(anyhow::anyhow!(
-                "Notification provider with ID {} not found",
-                provider_id
-            ))
+            Err(NotificationError::ProviderNotFound { provider_id })
         }
     }
 
@@ -2897,7 +3257,8 @@ impl NotificationService {
         notifications::Entity::delete_many()
             .filter(notifications::Column::CreatedAt.lt(cutoff))
             .exec(self.db.as_ref())
-            .await?;
+            .await
+            .map_err(NotificationError::database("delete old notifications"))?;
 
         Ok(())
     }
@@ -2962,7 +3323,7 @@ impl CoreNotificationService for NotificationService {
 
         // Try each email provider until one delivers. We don't fan out to
         // all of them — a transactional message should arrive once.
-        let mut last_err: Option<anyhow::Error> = None;
+        let mut last_err: Option<NotificationError> = None;
         for provider in &providers {
             match provider
                 .send_to(
@@ -3002,39 +3363,33 @@ impl CoreNotificationService for NotificationService {
         &self,
         notification_data: NotificationData,
     ) -> Result<(), CoreNotificationError> {
-        // Convert NotificationData to our internal Notification format
-        let notification = Notification {
-            id: notification_data.id,
-            title: notification_data.title,
-            message: notification_data.message,
-            notification_type: match notification_data.notification_type {
-                temps_core::notifications::NotificationType::Info => NotificationType::Info,
-                temps_core::notifications::NotificationType::Warning => NotificationType::Warning,
-                temps_core::notifications::NotificationType::Error => NotificationType::Error,
-                temps_core::notifications::NotificationType::Alert => NotificationType::Alert,
-            },
-            priority: match notification_data.priority {
-                temps_core::notifications::NotificationPriority::Low => NotificationPriority::Low,
-                temps_core::notifications::NotificationPriority::Normal => {
-                    NotificationPriority::Normal
-                }
-                temps_core::notifications::NotificationPriority::High => NotificationPriority::High,
-                temps_core::notifications::NotificationPriority::Critical => {
-                    NotificationPriority::Critical
-                }
-            },
-            severity: notification_data
-                .severity
-                .and_then(|s| NotificationSeverity::from_str(&s)),
-            timestamp: notification_data.timestamp,
-            metadata: notification_data.metadata,
-            bypass_throttling: notification_data.bypass_throttling,
-        };
-
+        let notification = notification_from_core(notification_data);
         match self.send_notification(notification).await {
             Ok(_) => Ok(()),
             Err(e) => Err(CoreNotificationError::SendError(e.to_string())),
         }
+    }
+
+    async fn open_episode(
+        &self,
+        batch_key: &str,
+        notification: NotificationData,
+    ) -> Result<bool, CoreNotificationError> {
+        self.open_episode(batch_key, notification_from_core(notification))
+            .await
+            .map_err(|e| {
+                CoreNotificationError::SendError(format!(
+                    "Could not open notification episode '{batch_key}': {e}"
+                ))
+            })
+    }
+
+    async fn close_episode(&self, batch_key: &str) -> Result<(), CoreNotificationError> {
+        self.close_episode(batch_key).await.map_err(|e| {
+            CoreNotificationError::SendError(format!(
+                "Could not close notification episode '{batch_key}': {e}"
+            ))
+        })
     }
 
     async fn is_configured(&self) -> Result<bool, CoreNotificationError> {
@@ -3054,6 +3409,64 @@ impl CoreNotificationService for NotificationService {
             .await
             .map(Some)
             .map_err(|e| CoreNotificationError::ConfigurationError(e.to_string()))
+    }
+}
+
+/// What became of a notification sent under a batch key.
+enum Delivery {
+    /// Throttled: counted on the previous row, not sent.
+    Batched,
+    /// Recorded as `row`; `accepted` destinations took it.
+    Sent {
+        row: Box<notifications::Model>,
+        accepted: usize,
+    },
+}
+
+/// Whether an episode row's metadata says its condition cleared.
+fn episode_cleared(metadata: &str) -> bool {
+    episode_marked(metadata, NotificationService::EPISODE_CLEARED_AT)
+}
+
+/// Whether an episode row still holds its episode open: its condition has
+/// not cleared, and some destination accepted it.
+fn episode_open(metadata: &str) -> bool {
+    !episode_cleared(metadata)
+        && !episode_marked(metadata, NotificationService::EPISODE_UNDELIVERED_AT)
+}
+
+fn episode_marked(metadata: &str, marker: &str) -> bool {
+    serde_json::from_str::<std::collections::HashMap<String, String>>(metadata)
+        .map(|m| m.contains_key(marker))
+        .unwrap_or(false)
+}
+
+/// The core trait's notification as this crate's.
+fn notification_from_core(notification_data: NotificationData) -> Notification {
+    Notification {
+        id: notification_data.id,
+        title: notification_data.title,
+        message: notification_data.message,
+        notification_type: match notification_data.notification_type {
+            temps_core::notifications::NotificationType::Info => NotificationType::Info,
+            temps_core::notifications::NotificationType::Warning => NotificationType::Warning,
+            temps_core::notifications::NotificationType::Error => NotificationType::Error,
+            temps_core::notifications::NotificationType::Alert => NotificationType::Alert,
+        },
+        priority: match notification_data.priority {
+            temps_core::notifications::NotificationPriority::Low => NotificationPriority::Low,
+            temps_core::notifications::NotificationPriority::Normal => NotificationPriority::Normal,
+            temps_core::notifications::NotificationPriority::High => NotificationPriority::High,
+            temps_core::notifications::NotificationPriority::Critical => {
+                NotificationPriority::Critical
+            }
+        },
+        severity: notification_data
+            .severity
+            .and_then(|s| NotificationSeverity::from_str(&s)),
+        timestamp: notification_data.timestamp,
+        metadata: notification_data.metadata,
+        bypass_throttling: notification_data.bypass_throttling,
     }
 }
 
@@ -3192,8 +3605,24 @@ impl Default for NotificationPreferences {
 
 #[derive(Debug, thiserror::Error)]
 pub enum NotificationPreferencesError {
-    #[error("Database error: {0}")]
-    DatabaseError(String),
+    #[error("Failed to {operation} notification preferences: {source}")]
+    Database {
+        operation: &'static str,
+        #[source]
+        source: sea_orm::DbErr,
+    },
+    #[error("Failed to {operation} notification preferences: {source}")]
+    Serialization {
+        operation: &'static str,
+        #[source]
+        source: serde_json::Error,
+    },
+}
+
+impl NotificationPreferencesError {
+    fn database(operation: &'static str) -> impl FnOnce(sea_orm::DbErr) -> Self {
+        move |source| Self::Database { operation, source }
+    }
 }
 
 pub struct NotificationPreferencesService {
@@ -3211,16 +3640,16 @@ impl NotificationPreferencesService {
         let record = notification_preferences::Entity::find()
             .one(self.db.as_ref())
             .await
-            .map_err(|e| NotificationPreferencesError::DatabaseError(e.to_string()))?;
+            .map_err(NotificationPreferencesError::database("load"))?;
 
         match record {
             Some(record) => {
                 let preferences: NotificationPreferences =
-                    serde_json::from_str(&record.preferences).map_err(|e| {
-                        NotificationPreferencesError::DatabaseError(format!(
-                            "Failed to deserialize preferences: {}",
-                            e
-                        ))
+                    serde_json::from_str(&record.preferences).map_err(|source| {
+                        NotificationPreferencesError::Serialization {
+                            operation: "deserialize",
+                            source,
+                        }
                     })?;
                 Ok(preferences)
             }
@@ -3235,17 +3664,17 @@ impl NotificationPreferencesService {
         &self,
         preferences: NotificationPreferences,
     ) -> Result<NotificationPreferences, NotificationPreferencesError> {
-        let preferences_json = serde_json::to_string(&preferences).map_err(|e| {
-            NotificationPreferencesError::DatabaseError(format!(
-                "Failed to serialize preferences: {}",
-                e
-            ))
+        let preferences_json = serde_json::to_string(&preferences).map_err(|source| {
+            NotificationPreferencesError::Serialization {
+                operation: "serialize",
+                source,
+            }
         })?;
 
         let record = notification_preferences::Entity::find()
             .one(self.db.as_ref())
             .await
-            .map_err(|e| NotificationPreferencesError::DatabaseError(e.to_string()))?;
+            .map_err(NotificationPreferencesError::database("load"))?;
 
         match record {
             Some(record) => {
@@ -3256,7 +3685,7 @@ impl NotificationPreferencesService {
                 active_model
                     .update(self.db.as_ref())
                     .await
-                    .map_err(|e| NotificationPreferencesError::DatabaseError(e.to_string()))?;
+                    .map_err(NotificationPreferencesError::database("update"))?;
             }
             None => {
                 let new_pref = notification_preferences::ActiveModel {
@@ -3269,7 +3698,7 @@ impl NotificationPreferencesService {
                 new_pref
                     .insert(self.db.as_ref())
                     .await
-                    .map_err(|e| NotificationPreferencesError::DatabaseError(e.to_string()))?;
+                    .map_err(NotificationPreferencesError::database("create"))?;
             }
         }
 
@@ -3281,7 +3710,7 @@ impl NotificationPreferencesService {
         notification_preferences::Entity::delete_many()
             .exec(self.db.as_ref())
             .await
-            .map_err(|e| NotificationPreferencesError::DatabaseError(e.to_string()))?;
+            .map_err(NotificationPreferencesError::database("delete"))?;
 
         info!("Deleted notification preferences");
         Ok(())
@@ -3293,7 +3722,7 @@ mod tests {
     use super::*;
     use sea_orm::MockDatabase;
     use std::sync::Mutex;
-    use temps_database::test_utils::TestDatabase;
+    use temps_test_utils::TestDatabase;
 
     macro_rules! test_database_or_skip {
         () => {
@@ -3301,7 +3730,7 @@ mod tests {
                 Ok(test_db) => test_db,
                 Err(error) => {
                     let message = format!("{error:#}");
-                    if temps_database::test_utils::is_container_runtime_unavailable(&message) {
+                    if temps_test_utils::is_container_runtime_unavailable(&message) {
                         eprintln!("Skipping Docker-dependent notification test: {message}");
                         return;
                     }
@@ -3409,6 +3838,245 @@ mod tests {
         }
     }
 
+    fn episode_row(metadata: &str) -> notifications::Model {
+        notifications::Model {
+            id: 7,
+            notification_id: "n-7".to_string(),
+            title: "Nobody can reach production yet".to_string(),
+            message: "m".to_string(),
+            notification_type: "warning".to_string(),
+            priority: "normal".to_string(),
+            metadata: metadata.to_string(),
+            created_at: Utc::now(),
+            sent_at: None,
+            batch_key: "reachability:4".to_string(),
+            occurrence_count: 1,
+            next_allowed_at: Utc::now(),
+            is_read: false,
+            read_at: None,
+        }
+    }
+
+    fn episode_service(db: Arc<DatabaseConnection>) -> NotificationService {
+        NotificationService {
+            routing_service: NotificationRoutingService::new(db.clone()),
+            db,
+            encryption_service: Arc::new(temps_core::EncryptionService::new_from_password(
+                "notification-episode-test",
+            )),
+            cloud: None,
+        }
+    }
+
+    #[test]
+    fn an_episode_is_cleared_only_by_its_marker() {
+        assert!(!episode_cleared("{}"));
+        assert!(!episode_cleared("not json"));
+        assert!(episode_cleared(
+            r#"{"episode_cleared_at":"2026-10-25T10:00:00Z","kind":"reachability"}"#
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_open_episode_is_not_sent_again() {
+        let db = Arc::new(
+            MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results([vec![episode_row(r#"{"kind":"reachability"}"#)]])
+                .into_connection(),
+        );
+        let service = episode_service(db.clone());
+        let sent = service
+            .open_episode("reachability:4", create_test_notification())
+            .await
+            .unwrap();
+        assert!(!sent, "a warning that persists must notify once");
+        drop(service);
+        let log = Arc::try_unwrap(db)
+            .expect("service released the mock database")
+            .into_transaction_log();
+        assert_eq!(log.len(), 1, "only the lookup runs: nothing is inserted");
+    }
+
+    #[tokio::test]
+    async fn closing_an_episode_marks_the_newest_row() {
+        let db = Arc::new(
+            MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results([vec![episode_row(r#"{"kind":"reachability"}"#)]])
+                .append_query_results([vec![episode_row(
+                    r#"{"episode_cleared_at":"2026-10-25T10:00:00Z","kind":"reachability"}"#,
+                )]])
+                .into_connection(),
+        );
+        let service = episode_service(db.clone());
+        service.close_episode("reachability:4").await.unwrap();
+        drop(service);
+        let log = Arc::try_unwrap(db)
+            .expect("service released the mock database")
+            .into_transaction_log();
+        assert_eq!(log.len(), 2);
+        let update = &log[1].statements()[0];
+        assert!(update.sql.starts_with("UPDATE"));
+        assert!(
+            format!("{:?}", update.values).contains("episode_cleared_at"),
+            "the marker is written into the row's metadata"
+        );
+    }
+
+    #[test]
+    fn an_undelivered_episode_is_not_open() {
+        assert!(episode_open(r#"{"kind":"reachability"}"#));
+        assert!(!episode_open(
+            r#"{"episode_undelivered_at":"2026-10-25T10:00:00Z"}"#
+        ));
+        assert!(!episode_open(
+            r#"{"episode_cleared_at":"2026-10-25T10:00:00Z"}"#
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_episode_nobody_received_is_sent_again() {
+        let undelivered = r#"{"episode_undelivered_at":"2026-10-25T10:00:00Z"}"#;
+        let db = Arc::new(
+            MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                // The previous open reached nobody: not an open episode.
+                .append_query_results([vec![episode_row(undelivered)]])
+                // send: the throttle lookup, then the inserted row.
+                .append_query_results([vec![episode_row(undelivered)]])
+                .append_query_results([vec![episode_row("{}")]])
+                // No route is enabled: no destination.
+                .append_query_results([Vec::<temps_entities::notification_routes::Model>::new()])
+                // The row is marked undelivered again.
+                .append_query_results([vec![episode_row(undelivered)]])
+                .into_connection(),
+        );
+        let service = episode_service(db.clone());
+        let sent = service
+            .open_episode("reachability:4", create_test_notification())
+            .await
+            .unwrap();
+        assert!(!sent, "nobody received it, so the episode is not open");
+        drop(service);
+        let log = Arc::try_unwrap(db)
+            .expect("service released the mock database")
+            .into_transaction_log();
+        assert_eq!(log.len(), 5, "{log:?}");
+        assert!(log[2].statements()[0].sql.starts_with("INSERT"));
+        let update = &log[4].statements()[0];
+        assert!(update.sql.starts_with("UPDATE"));
+        assert!(
+            format!("{:?}", update.values).contains("episode_undelivered_at"),
+            "the row is left retryable"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cleared_episode_is_not_closed_twice() {
+        let db = Arc::new(
+            MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results([vec![episode_row(
+                    r#"{"episode_cleared_at":"2026-10-25T10:00:00Z"}"#,
+                )]])
+                .into_connection(),
+        );
+        let service = episode_service(db.clone());
+        service.close_episode("reachability:4").await.unwrap();
+        drop(service);
+        let log = Arc::try_unwrap(db)
+            .expect("service released the mock database")
+            .into_transaction_log();
+        assert_eq!(log.len(), 1, "no update for an episode already closed");
+    }
+
+    #[tokio::test]
+    async fn repeated_notification_keeps_occurrences_in_text_alternative() {
+        for alternative in [Some("Readable body"), None, Some("  \n")] {
+            let mut previous = episode_row("{}");
+            previous.occurrence_count = 3;
+            previous.next_allowed_at = Utc::now() - Duration::seconds(1);
+            let db = Arc::new(
+                MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                    .append_query_results([vec![previous]])
+                    .append_query_results([vec![episode_row("{}")]])
+                    .append_query_results([Vec::<notification_routes::Model>::new()])
+                    .append_query_results([vec![episode_row("{}")]])
+                    .into_connection(),
+            );
+            let cloud = Arc::new(MockManagedNotificationSender::new(true, true));
+            let encryption = Arc::new(temps_core::EncryptionService::new_from_password(
+                "repeated-notification-test",
+            ));
+            let service = service_with_managed_sender(db, encryption, cloud.clone());
+            let mut notification = Notification::new("Repeated alert", "Original body");
+            if let Some(body) = alternative {
+                notification
+                    .metadata
+                    .insert("text_body".into(), body.into());
+            }
+            service.send_notification(notification).await.unwrap();
+            let requests = cloud.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            let expected = if alternative == Some("Readable body") {
+                "Readable body"
+            } else {
+                "Original body"
+            };
+            assert_eq!(
+                requests[0].message,
+                format!(
+                    "{expected}\n\nThis issue has occurred 4 times since the last notification."
+                )
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn webhook_payload_selects_text_and_preserves_ordinary_metadata() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let provider = WebhookProvider {
+            url: server.uri(),
+            method: "POST".into(),
+            headers: Default::default(),
+            timeout_secs: 10,
+        };
+        for alternative in [Some("Readable body"), None, Some(" \n")] {
+            let mut notification = Notification::new("Digest", "Original body")
+                .with_metadata("project_id", "42")
+                .with_metadata("environment", "production")
+                .with_metadata("_chart_svg", "<svg/>");
+            if let Some(body) = alternative {
+                notification
+                    .metadata
+                    .insert("text_body".into(), body.into());
+            }
+            provider
+                .send_with_client(&reqwest::Client::new(), &notification)
+                .await
+                .unwrap();
+        }
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 3);
+        for (request, expected) in
+            requests
+                .iter()
+                .zip(["Readable body", "Original body", "Original body"])
+        {
+            let payload: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(payload["message"], expected);
+            assert_eq!(
+                payload["metadata"],
+                serde_json::json!({
+                    "project_id": "42", "environment": "production"
+                })
+            );
+        }
+    }
+
     #[tokio::test]
     async fn cloud_provider_requires_explicit_opt_in_and_never_duplicates_legacy_rows() {
         for (enabled, available, expected_count) in
@@ -3472,6 +4140,60 @@ mod tests {
             error,
             "Could not create a private identifier for the managed notification"
         );
+    }
+
+    #[tokio::test]
+    async fn cloud_provider_uses_readable_digest_alternative() {
+        let cloud = Arc::new(MockManagedNotificationSender::new(true, true));
+        let provider = TempsCloudProvider {
+            cloud: cloud.clone(),
+        };
+        let mut notification = create_test_notification();
+        notification.message = "<!DOCTYPE html><html><body>Weekly Digest</body></html>".into();
+        notification.metadata.insert(
+            "text_body".into(),
+            "Weekly Digest\n\nDeployments: 3\nhttps://example.test/projects".into(),
+        );
+        provider.send(&notification).await.unwrap();
+        let requests = cloud.requests.lock().unwrap();
+        assert_eq!(requests[0].message, notification.metadata["text_body"]);
+        assert!(!requests[0].metadata.contains_key("text_body"));
+    }
+
+    #[tokio::test]
+    async fn cloud_provider_text_alternative_is_redacted_and_bounded() {
+        let cloud = Arc::new(MockManagedNotificationSender::new(true, true));
+        let provider = TempsCloudProvider {
+            cloud: cloud.clone(),
+        };
+        let mut notification = create_test_notification();
+        notification.metadata.insert(
+            "text_body".into(),
+            format!(
+                "password=private-value {}",
+                "x".repeat(CLOUD_MESSAGE_MAX_CHARS)
+            ),
+        );
+        provider.send(&notification).await.unwrap();
+        let requests = cloud.requests.lock().unwrap();
+        assert!(requests[0].message.contains("[redacted]"));
+        assert!(!requests[0].message.contains("private-value"));
+        assert!(requests[0].message.chars().count() <= CLOUD_MESSAGE_MAX_CHARS);
+    }
+
+    #[tokio::test]
+    async fn cloud_provider_empty_text_alternative_preserves_message() {
+        let cloud = Arc::new(MockManagedNotificationSender::new(true, true));
+        let provider = TempsCloudProvider {
+            cloud: cloud.clone(),
+        };
+        let mut notification = create_test_notification();
+        notification
+            .metadata
+            .insert("text_body".into(), "  \n".into());
+        provider.send(&notification).await.unwrap();
+        let requests = cloud.requests.lock().unwrap();
+        assert_eq!(requests[0].message, notification.message);
     }
 
     #[tokio::test]
@@ -3658,12 +4380,12 @@ mod tests {
         let notification = Notification::new("Alert", "Something broke");
 
         let error = provider.send(&notification).await.unwrap_err();
-        let delivery = error
-            .downcast_ref::<EmailDeliveryError>()
-            .expect("typed delivery error");
         assert!(matches!(
-            delivery,
-            EmailDeliveryError::AllRecipientsFailed { attempted: 1, .. }
+            &error,
+            NotificationError::EmailDelivery(EmailDeliveryError::AllRecipientsFailed {
+                attempted: 1,
+                ..
+            })
         ));
         let message = error.to_string();
         assert!(
@@ -3687,8 +4409,8 @@ mod tests {
         // A provider test must surface the refused recipient.
         let error = provider.send_test(&notification).await.unwrap_err();
         assert!(matches!(
-            error.downcast_ref::<EmailDeliveryError>(),
-            Some(EmailDeliveryError::PartialDelivery {
+            &error,
+            NotificationError::EmailDelivery(EmailDeliveryError::PartialDelivery {
                 accepted: 1,
                 attempted: 2,
                 ..
@@ -3706,8 +4428,8 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(
-            error.downcast_ref::<EmailDeliveryError>(),
-            Some(EmailDeliveryError::NoRecipients { .. })
+            &error,
+            NotificationError::EmailDelivery(EmailDeliveryError::NoRecipients { .. })
         ));
     }
 
@@ -5148,6 +5870,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_slack_digest_uses_text_alternative_without_duplicate_field() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let provider = SlackProvider {
+            webhook_url: server.uri(),
+            channel: None,
+        };
+        let notification = Notification::new(
+            "Weekly Digest",
+            "<!DOCTYPE html><html><body>HTML-only marker</body></html>",
+        )
+        .with_metadata(
+            "text_body",
+            "Deployments: 3\nhttps://example.test/projects\n<!channel>",
+        )
+        .with_metadata("project", "demo");
+        provider
+            .send_with_client(&reqwest::Client::new(), &notification)
+            .await
+            .unwrap();
+        let requests = server.received_requests().await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let attachment = &payload["attachments"][0];
+        assert_eq!(
+            attachment["text"],
+            "Deployments: 3\nhttps://example.test/projects\n&lt;!channel&gt;"
+        );
+        assert_eq!(attachment["fields"].as_array().unwrap().len(), 1);
+        assert!(!payload.to_string().contains("HTML-only marker"));
+        assert!(!payload.to_string().contains("text_body"));
+    }
+
+    #[test]
+    fn test_cloudflare_digest_plain_text_does_not_include_html_or_duplicate_body() {
+        let notification = Notification::new(
+            "Weekly Digest",
+            "<!DOCTYPE html><html>HTML-only marker</html>",
+        )
+        .with_metadata("text_body", "Deployments: 3\nhttps://example.test/projects");
+        let text = CloudflareProvider::render_text_body(&notification);
+        assert!(text.contains("Deployments: 3\nhttps://example.test/projects"));
+        assert!(!text.contains("HTML-only marker"));
+        assert!(!text.contains("text_body:"));
+        assert_eq!(text.matches("Deployments: 3").count(), 1);
+    }
+
+    #[tokio::test]
     async fn test_slack_send_returns_an_error_for_rejected_webhooks() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -5289,6 +6064,230 @@ mod tests {
             .expect_err("array sentinels are structurally ambiguous after edits");
 
         assert!(error.to_string().contains("inside array 'targets'"));
+    }
+
+    #[test]
+    fn a_changed_destination_cannot_keep_masked_credentials() {
+        let existing = serde_json::json!({
+            "url": "https://hooks.example.com/incident",
+            "headers": {"Authorization": "Bearer secret"}
+        });
+        let moved = serde_json::json!({
+            "url": "https://other.example.net/collect",
+            "headers": {"Authorization": "***"}
+        });
+
+        let error = NotificationService::reject_masked_values_for_changed_destination(
+            "webhook", &existing, &moved,
+        )
+        .expect_err("moving a webhook must not carry its masked credentials along");
+
+        assert!(matches!(
+            error,
+            NotificationProviderConfigMergeError::DestinationChangedWithMaskedValue {
+                ref field,
+                ref path
+            } if field == "url" && path == "headers.Authorization"
+        ));
+    }
+
+    #[test]
+    fn an_unchanged_or_masked_destination_keeps_masked_credentials() {
+        let existing = serde_json::json!({
+            "url": "https://hooks.example.com/incident",
+            "headers": {"Authorization": "Bearer secret"}
+        });
+        for url in ["***", "https://hooks.example.com/incident"] {
+            let replacement = serde_json::json!({
+                "url": url,
+                "headers": {"Authorization": "***"}
+            });
+            NotificationService::reject_masked_values_for_changed_destination(
+                "webhook",
+                &existing,
+                &replacement,
+            )
+            .unwrap_or_else(|error| panic!("url {url} is not a new destination: {error}"));
+        }
+    }
+
+    #[test]
+    fn a_changed_destination_with_re_entered_credentials_is_accepted() {
+        let existing = serde_json::json!({
+            "url": "https://hooks.example.com/incident",
+            "headers": {"Authorization": "Bearer secret"}
+        });
+        let moved = serde_json::json!({
+            "url": "https://hooks.example.net/incident",
+            "headers": {"Authorization": "Bearer new-secret"}
+        });
+
+        NotificationService::reject_masked_values_for_changed_destination(
+            "webhook", &existing, &moved,
+        )
+        .expect("nothing is carried over when every credential is sent again");
+    }
+
+    #[test]
+    fn email_transport_changes_cannot_keep_a_masked_password() {
+        let existing = serde_json::json!({
+            "smtp_host": "smtp.example.com",
+            "smtp_port": 587,
+            "tls_mode": "Starttls",
+            "starttls_required": true,
+            "accept_invalid_certs": false,
+            "password": "smtp-secret"
+        });
+        for (field, value) in [
+            ("smtp_host", serde_json::json!("smtp.other.example")),
+            ("smtp_port", serde_json::json!(25)),
+            ("tls_mode", serde_json::json!("None")),
+            ("starttls_required", serde_json::json!(false)),
+            ("accept_invalid_certs", serde_json::json!(true)),
+        ] {
+            let mut replacement = existing.clone();
+            replacement["password"] = serde_json::json!("***");
+            replacement[field] = value;
+
+            let error = NotificationService::reject_masked_values_for_changed_destination(
+                "email",
+                &existing,
+                &replacement,
+            )
+            .expect_err("a changed transport must not keep the masked password");
+            assert!(error.to_string().contains(field), "{error}");
+        }
+    }
+
+    #[test]
+    fn providers_without_a_redirectable_destination_are_not_restricted() {
+        let existing = serde_json::json!({"webhook_url": "https://hooks.slack.com/services/A"});
+        let replacement = serde_json::json!({"webhook_url": "***", "channel": "#other"});
+
+        NotificationService::reject_masked_values_for_changed_destination(
+            "slack",
+            &existing,
+            &replacement,
+        )
+        .expect("slack only accepts its own URL prefix");
+    }
+
+    #[tokio::test]
+    async fn update_provider_refuses_to_move_a_webhook_with_its_stored_credentials() {
+        let test_db = test_database_or_skip!();
+        let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password(
+            "notification-provider-destination-test",
+        ));
+        let service = NotificationService::new(test_db.connection_arc(), encryption_service);
+        let provider = service
+            .add_provider(
+                "Incident webhook".to_string(),
+                "webhook".to_string(),
+                serde_json::json!({
+                    "url": "https://hooks.example.com/incident",
+                    "method": "POST",
+                    "headers": {"Authorization": "Bearer admin-secret"},
+                    "timeout_secs": 30
+                }),
+                true,
+            )
+            .await
+            .expect("webhook provider should be created");
+
+        let error = service
+            .update_provider(
+                provider.id,
+                UpdateProviderRequest {
+                    name: None,
+                    config: Some(serde_json::json!({
+                        "url": "https://other.example.net/collect",
+                        "method": "POST",
+                        "headers": {"Authorization": "***"},
+                        "timeout_secs": 30
+                    })),
+                    enabled: None,
+                },
+            )
+            .await
+            .expect_err("the stored Authorization header must not follow a new URL");
+        assert!(
+            matches!(error, NotificationError::ConfigMerge(_)),
+            "{error:#}"
+        );
+
+        let stored = service
+            .get_provider(provider.id)
+            .await
+            .expect("provider should load")
+            .expect("provider should still exist");
+        let config = service
+            .decrypt_provider_config_raw(Some(stored.id), &stored.config)
+            .expect("stored config should decrypt");
+        assert_eq!(config["url"], "https://hooks.example.com/incident");
+        assert_eq!(config["headers"]["Authorization"], "Bearer admin-secret");
+    }
+
+    #[tokio::test]
+    async fn update_provider_keeps_masked_credentials_when_the_destination_is_unchanged() {
+        let test_db = test_database_or_skip!();
+        let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password(
+            "notification-provider-destination-test",
+        ));
+        let service = NotificationService::new(test_db.connection_arc(), encryption_service);
+        let provider = service
+            .add_provider(
+                "Incident email".to_string(),
+                "email".to_string(),
+                serde_json::json!({
+                    "smtp_host": "smtp.example.com",
+                    "smtp_port": 587,
+                    "username": "mailer",
+                    "password": "smtp-secret",
+                    "from_name": null,
+                    "from_address": "alerts@example.com",
+                    "to_addresses": ["ops@example.com"],
+                    "tls_mode": "Starttls",
+                    "starttls_required": true,
+                    "accept_invalid_certs": false
+                }),
+                true,
+            )
+            .await
+            .expect("email provider should be created");
+
+        service
+            .update_provider(
+                provider.id,
+                UpdateProviderRequest {
+                    name: None,
+                    config: Some(serde_json::json!({
+                        "smtp_host": "smtp.example.com",
+                        "smtp_port": 587,
+                        "username": "mailer",
+                        "password": "***",
+                        "from_name": null,
+                        "from_address": "alerts@example.com",
+                        "to_addresses": ["ops@example.com", "oncall@example.com"],
+                        "tls_mode": "Starttls",
+                        "starttls_required": true,
+                        "accept_invalid_certs": false
+                    })),
+                    enabled: None,
+                },
+            )
+            .await
+            .expect("editing recipients must keep working without re-entering the password");
+
+        let stored = service
+            .get_provider(provider.id)
+            .await
+            .expect("provider should load")
+            .expect("provider should still exist");
+        let config = service
+            .decrypt_provider_config_raw(Some(stored.id), &stored.config)
+            .expect("stored config should decrypt");
+        assert_eq!(config["password"], "smtp-secret");
+        assert_eq!(config["to_addresses"][1], "oncall@example.com");
     }
 
     #[test]
@@ -5723,7 +6722,7 @@ mod tests {
             .expect("an update with the masked token should succeed")
             .expect("provider should exist");
         let stored = service
-            .decrypt_provider_config_raw(&updated.config)
+            .decrypt_provider_config_raw(Some(updated.id), &updated.config)
             .unwrap();
         assert_eq!(stored["bot_token"], "123456789:AAExampleSecretToken");
         assert_eq!(stored["chat_id"], "@ops_channel");
@@ -5744,14 +6743,12 @@ mod tests {
             .await
             .expect_err("an invalid chat id must be refused on update");
         assert!(
-            error
-                .downcast_ref::<NotificationProviderConfigError>()
-                .is_some(),
+            matches!(error, NotificationError::InvalidProviderConfig(_)),
             "{error}"
         );
         let unchanged = service.get_provider(provider.id).await.unwrap().unwrap();
         let stored = service
-            .decrypt_provider_config_raw(&unchanged.config)
+            .decrypt_provider_config_raw(Some(unchanged.id), &unchanged.config)
             .unwrap();
         assert_eq!(stored["chat_id"], "@ops_channel");
     }
@@ -6139,5 +7136,298 @@ FOR EACH ROW EXECUTE FUNCTION reject_notification_route_assignment()
         assert!(visible_keys.contains("project_slug"));
         // No readable twin exists for incident_id, so it must remain visible.
         assert!(visible_keys.contains("incident_id"));
+    }
+}
+
+#[cfg(test)]
+mod typed_error_tests {
+    use super::*;
+    use sea_orm::{DatabaseBackend, DbErr, MockDatabase, MockExecResult};
+    use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
+
+    fn encryption() -> Arc<temps_core::EncryptionService> {
+        Arc::new(temps_core::EncryptionService::new_from_password(
+            "notification-typed-error-test",
+        ))
+    }
+
+    fn service(db: MockDatabase) -> NotificationService {
+        NotificationService::new(Arc::new(db.into_connection()), encryption())
+    }
+
+    fn empty_db() -> Arc<DatabaseConnection> {
+        Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection())
+    }
+
+    fn provider_row(provider_type: &str, config: &str) -> notification_providers::Model {
+        notification_providers::Model {
+            id: 7,
+            name: "Primary".to_string(),
+            provider_type: provider_type.to_string(),
+            config: encryption()
+                .encrypt_string(config)
+                .expect("the test config encrypts"),
+            enabled: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn webhook(url: &str, method: &str) -> WebhookProvider {
+        WebhookProvider {
+            url: url.to_string(),
+            method: method.to_string(),
+            headers: Default::default(),
+            timeout_secs: 5,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_webhook_url_is_reported_by_host_only() {
+        let mut provider = webhook(
+            "https://user:hunter2@127.0.0.1/hooks/SECRETPATH?token=SECRETQUERY",
+            "POST",
+        );
+        let error = provider
+            .initialize(empty_db())
+            .await
+            .expect_err("loopback must be refused");
+
+        assert!(
+            matches!(
+                &error,
+                NotificationError::Webhook(WebhookDeliveryError::InvalidUrl { url, .. })
+                    if url == "https://127.0.0.1"
+            ),
+            "{error:?}"
+        );
+        let message = error.to_string();
+        for secret in ["hunter2", "SECRETPATH", "SECRETQUERY"] {
+            assert!(!message.contains(secret), "{message}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_invalid_webhook_method_is_named() {
+        let mut provider = webhook("https://93.184.216.34/hook", "GET");
+        let error = provider
+            .initialize(empty_db())
+            .await
+            .expect_err("GET is not a delivery method");
+        assert!(matches!(
+            &error,
+            NotificationError::InvalidWebhookMethod { method } if method == "GET"
+        ));
+        assert_eq!(
+            error.to_string(),
+            "Invalid HTTP method: GET. Must be POST, PUT, or PATCH"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_webhook_request_hides_the_url() {
+        // Port 9 on loopback refuses the connection, so reqwest attaches the URL.
+        let source = reqwest::Client::new()
+            .post("http://127.0.0.1:9/hooks/SECRETPATH")
+            .send()
+            .await
+            .expect_err("nothing listens on the discard port");
+        assert!(source.to_string().contains("SECRETPATH"));
+
+        let error = webhook_request_error(
+            "Webhook request failed",
+            "http://127.0.0.1:9/hooks/SECRETPATH",
+            source,
+        );
+        let message = error.to_string();
+        assert!(!message.contains("SECRETPATH"), "{message}");
+        assert!(
+            message.starts_with("Webhook request failed for webhook 'http://127.0.0.1:9'"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn preference_failures_name_the_operation() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_errors([DbErr::Custom("connection lost".to_string())])
+                .into_connection(),
+        );
+        let error = NotificationPreferencesService::new(db)
+            .get_preferences()
+            .await
+            .expect_err("the query fails");
+        assert_eq!(
+            error.to_string(),
+            "Failed to load notification preferences: Custom Error: connection lost"
+        );
+
+        let row = notification_preferences::Model {
+            id: 1,
+            preferences: "not json".to_string(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([[row]])
+                .into_connection(),
+        );
+        let error = NotificationPreferencesService::new(db)
+            .get_preferences()
+            .await
+            .expect_err("the stored value is not JSON");
+        assert!(matches!(
+            error,
+            NotificationPreferencesError::Serialization {
+                operation: "deserialize",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_non_slack_url_keeps_its_message() {
+        assert_eq!(
+            NotificationError::InvalidSlackWebhook.to_string(),
+            "Invalid Slack webhook URL"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rejected_cloudflare_send_carries_recipient_and_status() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("forbidden"))
+            .mount(&server)
+            .await;
+        let provider = CloudflareProvider {
+            account_id: "account".to_string(),
+            api_token: "SECRETTOKEN".to_string(),
+            from_address: "alerts@example.com".to_string(),
+            from_name: None,
+            to_addresses: vec!["ops@example.com".to_string()],
+            api_base: Some(server.uri()),
+        };
+
+        let error = provider
+            .send(&Notification::new("Alert", "Something broke"))
+            .await
+            .expect_err("every recipient failed");
+
+        assert!(
+            matches!(
+                &error,
+                NotificationError::CloudflareRejected { to, status: 403, body }
+                    if to == "ops@example.com" && body == "forbidden"
+            ),
+            "{error:?}"
+        );
+        assert!(!error.to_string().contains("SECRETTOKEN"));
+    }
+
+    #[tokio::test]
+    async fn testing_a_missing_provider_names_its_id() {
+        let service = service(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([Vec::<notification_providers::Model>::new()]),
+        );
+        let error = service
+            .test_provider(9)
+            .await
+            .expect_err("provider 9 does not exist");
+        assert!(matches!(
+            error,
+            NotificationError::ProviderNotFound { provider_id: 9 }
+        ));
+        assert_eq!(
+            error.to_string(),
+            "Notification provider with ID 9 not found"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stored_config_that_does_not_parse_is_not_quoted() {
+        let row = provider_row(
+            "webhook",
+            r#"{"url":12,"secret":"hunter2","method":"hunter2"}"#,
+        );
+        let service = service(MockDatabase::new(DatabaseBackend::Postgres));
+        let error = match service.load_provider(&row).await {
+            Err(error) => error,
+            Ok(_) => panic!("a numeric URL must not load"),
+        };
+        assert!(
+            matches!(
+                &error,
+                NotificationError::ConfigParse {
+                    provider_id: Some(7),
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        assert!(!error.to_string().contains("hunter2"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_provider_type_names_the_type() {
+        let row = provider_row("carrier-pigeon", "{}");
+        let service = service(MockDatabase::new(DatabaseBackend::Postgres));
+        let error = match service.load_provider(&row).await {
+            Err(error) => error,
+            Ok(_) => panic!("the type is not supported"),
+        };
+        assert!(matches!(
+            &error,
+            NotificationError::UnsupportedProviderType { provider_id: 7, provider_type }
+                if provider_type == "carrier-pigeon"
+        ));
+    }
+
+    #[test]
+    fn an_undecryptable_config_is_a_decryption_error() {
+        let service = service(MockDatabase::new(DatabaseBackend::Postgres));
+        let error = service
+            .decrypt_provider_config("not-encrypted")
+            .expect_err("the value is not ciphertext");
+        assert!(matches!(
+            error,
+            NotificationError::ConfigDecryption {
+                provider_id: None,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn database_failures_name_the_operation_and_provider() {
+        let failing = || {
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_errors([DbErr::Custom("connection lost".to_string())])
+                .append_exec_results([MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 0,
+                }])
+        };
+
+        let listed = service(failing())
+            .list_providers()
+            .await
+            .expect_err("the query fails");
+        assert_eq!(
+            listed.to_string(),
+            "Failed to list notification providers: Custom Error: connection lost"
+        );
+
+        let deleted = service(failing())
+            .delete_provider(7)
+            .await
+            .expect_err("the query fails");
+        assert!(matches!(
+            deleted,
+            NotificationError::ProviderDatabase { provider_id: 7, .. }
+        ));
     }
 }

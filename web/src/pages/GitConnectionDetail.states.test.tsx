@@ -17,7 +17,7 @@ const providerKey = getGitProviderOptions({ path: { provider_id: 3 } }).queryKey
 const connectionKey = getConnectionOptions({
   path: { connection_id: 9 },
 }).queryKey
-const NOT_FOUND = 'Git Connection Not Found'
+const NOT_FOUND = 'Git connection not found'
 
 const provider = {
   id: 3,
@@ -149,5 +149,50 @@ test('a verified 404 for the provider shows the connection as not found', () => 
   client.setQueryData(connectionKey, connection)
   fail(client, providerKey, { title: 'Not Found', status: 404 })
   expect(render(client)).toContain(NOT_FOUND)
+  client.clear()
+})
+
+const rejected = { ...connection, is_expired: true }
+
+test('a blocked connection with a stale healthy check is not shown as healthy', () => {
+  const client = createClient()
+  client.setQueryData(providerKey, { ...provider, auth_method: 'oauth' })
+  client.setQueryData(connectionKey, rejected)
+  const html = render(client)
+  expect(html).toContain('Unhealthy')
+  expect(html).not.toContain('Healthy')
+  client.clear()
+})
+
+test('a connection that is not blocked still shows its healthy check', () => {
+  const client = createClient()
+  client.setQueryData(providerKey, { ...provider, auth_method: 'oauth' })
+  client.setQueryData(connectionKey, connection)
+  const html = render(client)
+  expect(html).toContain('Healthy')
+  expect(html).not.toContain('Unhealthy')
+  client.clear()
+})
+
+test('a rejected GitLab OAuth connection points at Reauthorize', () => {
+  const client = createClient()
+  client.setQueryData(providerKey, { ...provider, auth_method: 'oauth' })
+  client.setQueryData(connectionKey, rejected)
+  const html = render(client)
+  expect(html).toContain('no longer accepts this connection')
+  expect(html).toContain('can use Reauthorize on the')
+  expect(html).toContain('href="/git-providers/3"')
+  client.clear()
+})
+
+test('a rejected GitLab App connection is not told to use a missing action', () => {
+  const client = createClient()
+  client.setQueryData(providerKey, { ...provider, auth_method: 'gitlab_app' })
+  client.setQueryData(connectionKey, rejected)
+  const html = render(client)
+  expect(html).toContain('no longer accepts this connection')
+  expect(html).not.toContain('can use Reauthorize')
+  expect(html).toContain('has no Reauthorize')
+  expect(html).toContain('href="/git-providers/add"')
   client.clear()
 })

@@ -39,6 +39,7 @@ import {
 import { useState } from 'react'
 import { useNavigate, useParams } from 'react-router'
 import { DeliveryDetailDialog } from './DeliveryDetailDialog'
+import { openExternal } from '@/lib/open-external'
 import { settingsSectionHref } from '@/lib/project-settings-sections'
 
 interface WebhookDetailProps {
@@ -128,7 +129,7 @@ export function WebhookDetail({ project }: WebhookDetailProps) {
           </Button>
           <div>
             <h2 className="text-2xl font-bold tracking-tight">
-              Webhook Details
+              Webhook details
             </h2>
           </div>
         </div>
@@ -174,7 +175,7 @@ export function WebhookDetail({ project }: WebhookDetailProps) {
           </Button>
           <div>
             <h2 className="text-2xl font-bold tracking-tight">
-              Webhook Details
+              Webhook details
             </h2>
             <p className="text-muted-foreground text-sm font-mono">
               {webhook.url}
@@ -217,7 +218,7 @@ export function WebhookDetail({ project }: WebhookDetailProps) {
 
         <Card>
           <CardHeader className="pb-3">
-            <CardTitle className="text-sm font-medium">Success Rate</CardTitle>
+            <CardTitle className="text-sm font-medium">Success rate</CardTitle>
           </CardHeader>
           <CardContent>
             <div className="text-2xl font-bold">{successRate}%</div>
@@ -230,7 +231,7 @@ export function WebhookDetail({ project }: WebhookDetailProps) {
         <Card>
           <CardHeader className="pb-3">
             <CardTitle className="text-sm font-medium">
-              Total Deliveries
+              Total deliveries
             </CardTitle>
           </CardHeader>
           <CardContent>
@@ -258,7 +259,7 @@ export function WebhookDetail({ project }: WebhookDetailProps) {
                 aria-label="Open webhook URL in a new tab"
                 variant="ghost"
                 size="sm"
-                onClick={() => window.open(webhook.url, '_blank')}
+                onClick={() => openExternal(webhook.url)}
               >
                 <ExternalLink className="h-4 w-4" />
               </Button>
@@ -281,11 +282,11 @@ export function WebhookDetail({ project }: WebhookDetailProps) {
             {webhook.has_secret ? (
               <Badge variant="outline" className="gap-1">
                 <Lock className="h-3 w-3" />
-                HMAC Signing Enabled
+                HMAC signing enabled
               </Badge>
             ) : (
               <Badge variant="outline" className="text-muted-foreground">
-                No Secret Configured
+                No secret configured
               </Badge>
             )}
           </div>
@@ -304,7 +305,7 @@ export function WebhookDetail({ project }: WebhookDetailProps) {
       <Card>
         <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-4">
           <div>
-            <CardTitle>Recent Deliveries</CardTitle>
+            <CardTitle>Recent deliveries</CardTitle>
             <CardDescription>
               Delivery history and event invocations
             </CardDescription>

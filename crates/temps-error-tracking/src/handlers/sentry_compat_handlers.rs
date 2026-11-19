@@ -217,6 +217,13 @@ struct BearerPrincipal {
     credential: SentryCliCredential,
 }
 
+/// The first 12 characters of a release version. Counted in characters because
+/// the version is caller-supplied text, and byte 12 can land inside one, which
+/// panics a byte slice.
+fn short_version(version: &str) -> String {
+    version.chars().take(12).collect()
+}
+
 fn sentry_cli_audit_context(
     principal: BearerPrincipal,
     metadata: &RequestMetadata,
@@ -394,11 +401,7 @@ async fn create_release(
     .await;
 
     let now = Utc::now().to_rfc3339();
-    let short_version = if request.version.len() > 12 {
-        request.version[..12].to_string()
-    } else {
-        request.version.clone()
-    };
+    let short_version = short_version(&request.version);
 
     let project_refs: Vec<SentryReleaseProjectRef> = request
         .projects
@@ -478,11 +481,7 @@ async fn create_project_release(
     .await;
 
     let now = Utc::now().to_rfc3339();
-    let short_version = if request.version.len() > 12 {
-        request.version[..12].to_string()
-    } else {
-        request.version.clone()
-    };
+    let short_version = short_version(&request.version);
 
     let project_refs = vec![SentryReleaseProjectRef {
         name: project_slug.clone(),
@@ -557,11 +556,7 @@ async fn finalize_project_release(
     .await;
 
     let now = Utc::now().to_rfc3339();
-    let short_version = if version.len() > 12 {
-        version[..12].to_string()
-    } else {
-        version.clone()
-    };
+    let short_version = short_version(&version);
 
     let response = SentryReleaseResponse {
         version: version.clone(),
@@ -1113,21 +1108,19 @@ mod tests {
 
     #[test]
     fn test_short_version() {
-        let version = "abc123def456789";
-        let short = if version.len() > 12 {
-            version[..12].to_string()
-        } else {
-            version.to_string()
-        };
-        assert_eq!(short, "abc123def456");
+        assert_eq!(short_version("abc123def456789"), "abc123def456");
+        assert_eq!(short_version("1.0.0"), "1.0.0");
+        assert_eq!(short_version(""), "");
+    }
 
-        let short_version = "1.0.0";
-        let short = if short_version.len() > 12 {
-            short_version[..12].to_string()
-        } else {
-            short_version.to_string()
-        };
-        assert_eq!(short, "1.0.0");
+    #[test]
+    fn short_version_does_not_split_a_multibyte_character() {
+        // Byte 12 falls inside the euro sign, which a byte slice panics on.
+        assert_eq!(short_version("aaaaaaaaaaa€bbb"), "aaaaaaaaaaa€");
+        assert_eq!(
+            short_version("日本語のリリース名前です長い"),
+            "日本語のリリース名前です"
+        );
     }
 
     // === Fix #4 — body-limit constant sanity checks ===

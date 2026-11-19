@@ -23,8 +23,8 @@ use crate::index::timescale::TimescaleLineIndex;
 use crate::index::{LineIndex, NoLineIndex};
 use crate::services::{
     ChunkWriterService, CollectorService, CompactorService, IngestBudget, IngestLimits,
-    LogMetadataService, LogSearchService, RemoteContainerLogSource, RemoteLogCollectorService,
-    RetentionService, TailService,
+    IngestOverrides, LogMetadataService, LogSearchService, RemoteContainerLogSource,
+    RemoteLogCollectorService, RetentionService, TailService,
 };
 use crate::services::{
     ForgetSweeper, ReindexService, DEFAULT_FORGET_BATCH, DEFAULT_REINDEX_BATCH,
@@ -142,6 +142,10 @@ impl TempsPlugin for LogAggregatorPlugin {
             // ── ADR-046 chunk read-through cache ─────────────────────────
             // Built before the chunk writer so the writer can write-through
             // into the same cache a sealing node reads from (ADR-046 §6a).
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "bootstrap: TEMPS_DATA_DIR locates the data directory and is fixed before the database exists"
+            )]
             let data_dir = std::env::var("TEMPS_DATA_DIR")
                 .map(std::path::PathBuf::from)
                 .ok();
@@ -152,7 +156,7 @@ impl TempsPlugin for LogAggregatorPlugin {
             // Opened at the default budget; the persisted setting is applied
             // as soon as the plugin starts (and re-applied every minute).
             let cache_bytes =
-                u64::from(temps_core::ContainerLogSettings::default().cache_mb) * 1024 * 1024;
+                u64::from(temps_config::ContainerLogSettings::default().cache_mb) * 1024 * 1024;
             let cache = ChunkCache::open(cache_dir, cache_bytes)
                 .await
                 .map_err(|e| PluginError::PluginRegistrationFailed {
@@ -268,7 +272,7 @@ impl TempsPlugin for LogAggregatorPlugin {
             // saved settings before any stream starts, and the budget sync
             // keeps them current.
             let ingest_budget = Arc::new(IngestBudget::new(IngestLimits::from_settings(
-                &temps_core::ContainerLogSettings::default(),
+                &temps_config::ContainerLogSettings::default(),
             )));
             context.register_service(ingest_budget.clone());
 
@@ -384,6 +388,10 @@ impl TempsPlugin for LogAggregatorPlugin {
                 let ingest_budget = context.require_service::<IngestBudget>();
                 apply_saved_ingest_limits(&config_service, &ingest_budget).await;
             }
+            {
+                let ingest_budget = context.require_service::<IngestBudget>();
+                apply_ingest_overrides(db.as_ref(), &ingest_budget).await;
+            }
 
             // ── Flush ticker ────────────────────────────────────────────
             // Seals every head buffer whose flush policy (ADR-046 §1) says
@@ -491,6 +499,7 @@ impl TempsPlugin for LogAggregatorPlugin {
                 let cache = context.require_service::<ChunkCache>();
                 let writer = context.require_service::<ChunkWriterService>();
                 let ingest_budget = context.require_service::<IngestBudget>();
+                let override_db = db.clone();
                 let recovery_writer = chunk_writer.clone();
                 tokio::spawn(async move {
                     recovery_writer.wait_for_recovery().await;
@@ -530,6 +539,9 @@ impl TempsPlugin for LogAggregatorPlugin {
                                 tracing::warn!(error = %e, "could not read container log budgets; keeping current")
                             }
                         }
+                        // Per-project / per-service overrides, set on the
+                        // project's and the service's settings pages.
+                        apply_ingest_overrides(override_db.as_ref(), &ingest_budget).await;
                     }
                 });
             }
@@ -761,6 +773,22 @@ async fn apply_saved_ingest_limits(
         Err(_) => tracing::warn!(
             timeout_secs = INGEST_SETTINGS_TIMEOUT.as_secs(),
             "reading the saved log ingestion budget at startup timed out; using the defaults until the next budget sync"
+        ),
+    }
+}
+
+/// Load the per-project / per-service ingestion overrides into `ingest_budget`.
+/// A failed read keeps the overrides already applied.
+async fn apply_ingest_overrides(db: &sea_orm::DatabaseConnection, ingest_budget: &IngestBudget) {
+    match tokio::time::timeout(INGEST_SETTINGS_TIMEOUT, IngestOverrides::load(db)).await {
+        Ok(Ok(overrides)) => ingest_budget.set_overrides(overrides),
+        Ok(Err(e)) => tracing::warn!(
+            error = %e,
+            "could not read per-project/service log ingestion overrides; keeping current"
+        ),
+        Err(_) => tracing::warn!(
+            timeout_secs = INGEST_SETTINGS_TIMEOUT.as_secs(),
+            "reading per-project/service log ingestion overrides timed out; keeping current"
         ),
     }
 }

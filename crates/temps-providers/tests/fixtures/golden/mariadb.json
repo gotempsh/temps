@@ -1,0 +1,87 @@
+[
+  {
+    "body": {
+      "Cmd": [
+        "--skip-name-resolve",
+        "--innodb-buffer-pool-size=128M",
+        "--max-connections=50",
+        "--table-open-cache=256",
+        "--thread-cache-size=16",
+        "--tmp-table-size=32M",
+        "--max-heap-table-size=32M",
+        "--performance-schema=OFF",
+        "--log-bin=mysql-bin",
+        "--binlog-format=ROW",
+        "--server-id=1451900357",
+        "--sync-binlog=1",
+        "--binlog-expire-logs-seconds=3600"
+      ],
+      "Env": [
+        "MARIADB_AUTO_UPGRADE=1",
+        "MARIADB_DATABASE=app",
+        "MARIADB_PASSWORD=testpass123",
+        "MARIADB_ROOT_PASSWORD=rootpass123",
+        "MARIADB_USER=app",
+        "TZ=UTC"
+      ],
+      "ExposedPorts": {
+        "3306/tcp": {}
+      },
+      "Healthcheck": {
+        "Interval": 30000000000,
+        "Retries": 3,
+        "StartInterval": 2000000000,
+        "StartPeriod": 120000000000,
+        "Test": [
+          "CMD-SHELL",
+          "mariadb-admin ping -h 127.0.0.1 -uroot -p\"$MARIADB_ROOT_PASSWORD\" --silent"
+        ],
+        "Timeout": 5000000000
+      },
+      "HostConfig": {
+        "Init": true,
+        "LogConfig": {
+          "Config": {
+            "max-file": "3",
+            "max-size": "20m"
+          },
+          "Type": "json-file"
+        },
+        "Mounts": [
+          {
+            "Source": "mariadb_data_golden",
+            "Target": "/var/lib/mysql",
+            "Type": "volume"
+          }
+        ],
+        "PidsLimit": 512,
+        "PortBindings": {
+          "3306/tcp": [
+            {
+              "HostIp": "127.0.0.1",
+              "HostPort": "13306"
+            }
+          ]
+        },
+        "RestartPolicy": {
+          "Name": "always"
+        },
+        "SecurityOpt": [
+          "no-new-privileges:true"
+        ]
+      },
+      "Image": "ghcr.io/gotempsh/mariadb-walg@sha256:fa4c9247f82c47ace7c1aa9b77010870f4905bbae57c4f0aa24ae6ba3b6cdbf3",
+      "Labels": {
+        "temps.service_name": "golden",
+        "temps.service_type": "mariadb"
+      },
+      "NetworkingConfig": {
+        "EndpointsConfig": {
+          "temps-app-network": {}
+        }
+      }
+    },
+    "name": "mariadb-golden",
+    "platform": null
+  }
+]
