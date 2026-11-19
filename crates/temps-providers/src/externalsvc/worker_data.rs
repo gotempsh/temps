@@ -789,6 +789,7 @@ pub(crate) async fn dump_to_s3(
             script: plan.script,
             env: plan.env,
             volumes_from: None,
+            name: None,
             sensitive,
         },
         destination,
@@ -811,6 +812,9 @@ pub(crate) struct StreamedHelper<'a> {
     pub(crate) env: Vec<String>,
     /// Whether the helper mounts the service container's volumes.
     pub(crate) volumes_from: Option<String>,
+    /// The helper's container name, when the caller needs to know it;
+    /// otherwise one is generated.
+    pub(crate) name: Option<String>,
     /// What to redact out of the helper's stderr.
     pub(crate) sensitive: SensitiveValues<'a>,
 }
@@ -833,6 +837,7 @@ pub(crate) async fn stream_helper_to_s3(
         script,
         env,
         volumes_from,
+        name,
         sensitive,
     } = helper;
     let container = container.as_str();
@@ -846,11 +851,13 @@ pub(crate) async fn stream_helper_to_s3(
             source: Box::new(source),
         }
     };
-    let helper_name = format!(
-        "temps-worker-backup-{}-{:08x}",
-        container.trim_start_matches('/'),
-        rand::random::<u32>()
-    );
+    let helper_name = name.unwrap_or_else(|| {
+        format!(
+            "temps-worker-backup-{}-{:08x}",
+            container.trim_start_matches('/'),
+            rand::random::<u32>()
+        )
+    });
     let created = docker
         .create_container(
             Some(

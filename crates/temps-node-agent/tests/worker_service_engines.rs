@@ -4102,13 +4102,19 @@ async fn start_dragonfly(
 
 /// The `temps-backup-*` files on `container`'s `/data`, one per line.
 async fn backup_snapshots(docker: &Docker, container: &str) -> String {
-    exec(
-        docker,
-        container,
-        &["sh", "-c", "ls -a /data | grep '^temps-backup' || true"],
-    )
-    .await
-    .1
+    backup_snapshots_in(docker, container, "/data").await
+}
+
+/// The `temps-backup-*` files in `dir` of `container`, one per line. A
+/// listing that fails fails the test rather than reading as empty.
+async fn backup_snapshots_in(docker: &Docker, container: &str, dir: &str) -> String {
+    let (code, listing) = exec(docker, container, &["ls", "-a", dir]).await;
+    assert_eq!(code, 0, "listing {dir} in {container}: {listing}");
+    listing
+        .lines()
+        .filter(|file| file.starts_with("temps-backup"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Issue #1953: Dragonfly does not serve `redis-cli --rdb`'s replication
@@ -4265,7 +4271,8 @@ async fn a_dragonfly_replica_and_primary_are_backed_up_by_the_rdb_engine() {
         network,
         password,
         None,
-        &["--dir=/tmp"],
+        // `..` must not let the snapshot out of the volume.
+        &["--dir=/data/../tmp"],
     )
     .await;
     wait_redis(&docker, &outside, password).await;
@@ -4290,18 +4297,18 @@ async fn a_dragonfly_replica_and_primary_are_backed_up_by_the_rdb_engine() {
             .contains("saves snapshots to /tmp, which is not on a volume of its container"),
         "{error}"
     );
-    let (_, saved) = exec(
-        &docker,
-        &outside,
-        &["sh", "-c", "ls -a /tmp | grep '^temps-backup' || true"],
-    )
-    .await;
-    assert_eq!(saved, "", "nothing is saved outside the volumes");
+    assert_eq!(
+        backup_snapshots_in(&docker, &outside, "/tmp").await,
+        "",
+        "nothing is saved outside the volumes"
+    );
 
     // A helper killed while its SAVE runs. Dragonfly is paused as soon as
     // the save's `.tmp` appears, so however fast this host is, the save is
     // still unfinished when its client is killed and when the removal
-    // starts, and the removal can only return by waiting for it.
+    // starts. The removal finds that `.tmp` on the volume without asking
+    // the frozen Dragonfly anything, so it can only return by polling until
+    // the save ends.
     redis_cli(
         &docker,
         &primary,
@@ -4331,7 +4338,7 @@ async fn a_dragonfly_replica_and_primary_are_backed_up_by_the_rdb_engine() {
     .await;
     let snapshot = |name: &str| RdbSnapshot {
         container_name: primary.clone(),
-        workdir: "/data".to_string(),
+        mounts: vec!["/data".to_string()],
         name: name.to_string(),
         password: password.to_string(),
     };
