@@ -130,6 +130,23 @@ impl OnDemandCertProvisioner for DomainServiceProvisioner {
     }
 }
 
+/// Convert a stored backoff deadline to the whole epoch second the proxy's
+/// negative cache compares against, rounding any fraction **up**. The cache
+/// holds a host while `backoff_until_epoch > now_secs`; rounding down would
+/// open it up to a second before the stored deadline, and every attempt in
+/// that window is refused by the stored-deadline check in `temps-domains` and
+/// re-cached at the same already-elapsed second, so connections keep queuing
+/// jobs until the deadline actually passes.
+fn deadline_epoch_secs(deadline: chrono::DateTime<chrono::Utc>) -> u64 {
+    let secs = deadline.timestamp();
+    let secs = if deadline.timestamp_subsec_nanos() > 0 {
+        secs.saturating_add(1)
+    } else {
+        secs
+    };
+    secs.max(0) as u64
+}
+
 /// Map a `DomainServiceError` from the on-demand flow into the proxy-side
 /// [`CertProvisionFailure`]. `temps-domains` already persisted the authoritative
 /// `on_demand_backoff_until` on the `domains` row and returns that deadline with
@@ -145,12 +162,12 @@ fn map_provision_error(err: temps_domains::DomainServiceError) -> CertProvisionF
         E::OnDemandRateLimited { retry_after, .. } => CertProvisionFailure {
             error_chain,
             category: "rate_limited".to_string(),
-            backoff_until_epoch: retry_after.map(|d| d.timestamp().max(0) as u64),
+            backoff_until_epoch: retry_after.map(deadline_epoch_secs),
         },
         E::OnDemandBackoffActive { backoff_until, .. } => CertProvisionFailure {
             error_chain,
             category: "backoff_active".to_string(),
-            backoff_until_epoch: Some(backoff_until.timestamp().max(0) as u64),
+            backoff_until_epoch: Some(deadline_epoch_secs(*backoff_until)),
         },
         E::OnDemandIssuanceFailed {
             category,
@@ -159,7 +176,7 @@ fn map_provision_error(err: temps_domains::DomainServiceError) -> CertProvisionF
         } => CertProvisionFailure {
             error_chain,
             category: category.clone(),
-            backoff_until_epoch: backoff_until.map(|d| d.timestamp().max(0) as u64),
+            backoff_until_epoch: backoff_until.map(deadline_epoch_secs),
         },
         _ => CertProvisionFailure {
             error_chain,
@@ -486,7 +503,7 @@ async fn seed_state_from_db(
                 // "retry allowed" rather than blocking forever.
                 let backoff_until_epoch = row
                     .on_demand_backoff_until
-                    .map(|d| d.timestamp().max(0) as u64)
+                    .map(deadline_epoch_secs)
                     .unwrap_or(0);
                 OnDemandCertState::Failed {
                     backoff_until_epoch,
@@ -758,7 +775,9 @@ mod tests {
 
     #[test]
     fn map_rate_limited_error_carries_retry_after_epoch() {
-        let deadline = Utc::now() + ChronoDuration::hours(2);
+        // A Retry-After with a fraction of a second: the cache must not
+        // reopen before it, so the epoch rounds up.
+        let deadline = chrono::DateTime::from_timestamp(4_102_444_800, 250_000_000).unwrap();
         let err = temps_domains::DomainServiceError::OnDemandRateLimited {
             hostname: "app.1.2.3.4.sslip.io".to_string(),
             detail: "too many certs".to_string(),
@@ -766,17 +785,14 @@ mod tests {
         };
         let failure = map_provision_error(err);
         assert_eq!(failure.category, "rate_limited");
-        assert_eq!(
-            failure.backoff_until_epoch,
-            Some(deadline.timestamp().max(0) as u64)
-        );
+        assert_eq!(failure.backoff_until_epoch, Some(4_102_444_801));
     }
 
     #[test]
     fn map_issuance_failed_error_carries_the_persisted_ladder_deadline() {
         // The ladder deadline must reach the proxy's negative cache: without
         // it the cache retried every 5 minutes whatever the ladder said.
-        let deadline = Utc::now() + ChronoDuration::hours(4);
+        let deadline = chrono::DateTime::from_timestamp(4_102_444_800, 900_000).unwrap();
         let err = temps_domains::DomainServiceError::OnDemandIssuanceFailed {
             hostname: "app.1.2.3.4.sslip.io".to_string(),
             category: "challenge_mismatch".to_string(),
@@ -785,10 +801,7 @@ mod tests {
         };
         let failure = map_provision_error(err);
         assert_eq!(failure.category, "challenge_mismatch");
-        assert_eq!(
-            failure.backoff_until_epoch,
-            Some(deadline.timestamp().max(0) as u64)
-        );
+        assert_eq!(failure.backoff_until_epoch, Some(4_102_444_801));
     }
 
     #[test]
@@ -816,5 +829,40 @@ mod tests {
         let failure = map_provision_error(err);
         assert_eq!(failure.category, "backoff_active");
         assert_eq!(failure.backoff_until_epoch, Some(4_102_444_800));
+    }
+
+    #[test]
+    fn a_fractional_backoff_deadline_never_reopens_the_cache_early() {
+        // Regression: rounding down let the proxy retry up to a second before
+        // the stored deadline; temps-domains refused each of those attempts
+        // and the same elapsed second was cached again, so every connection
+        // in that window queued another job.
+        let stored = chrono::DateTime::from_timestamp(4_102_444_800, 900_000_000).unwrap();
+        let epoch = deadline_epoch_secs(stored);
+        assert_eq!(epoch, 4_102_444_801);
+        // The proxy holds while `epoch > now_secs`; at the stored deadline's
+        // own second the host is still held.
+        assert!(epoch > stored.timestamp() as u64);
+
+        let err = temps_domains::DomainServiceError::OnDemandBackoffActive {
+            hostname: "app.1.2.3.4.sslip.io".to_string(),
+            backoff_until: stored,
+        };
+        assert_eq!(
+            map_provision_error(err).backoff_until_epoch,
+            Some(4_102_444_801)
+        );
+    }
+
+    #[test]
+    fn a_whole_second_deadline_is_not_pushed_back() {
+        let stored = chrono::DateTime::from_timestamp(4_102_444_800, 0).unwrap();
+        assert_eq!(deadline_epoch_secs(stored), 4_102_444_800);
+    }
+
+    #[test]
+    fn a_deadline_before_the_epoch_clamps_to_zero() {
+        let stored = chrono::DateTime::from_timestamp(-10, 500_000_000).unwrap();
+        assert_eq!(deadline_epoch_secs(stored), 0);
     }
 }
