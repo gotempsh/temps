@@ -57,8 +57,12 @@ pub(crate) const ALLOW_UNSIGNED_FLAG: &str = "--allow-unsigned";
 /// embedded root is used; an upgrade is never blocked on Sigstore's CDN.
 const TUF_REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Deadline for downloading a bundle (about 10 KB in practice).
+/// Deadline for each attempt at downloading a bundle (about 10 KB in
+/// practice).
+#[cfg(not(test))]
 const BUNDLE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(60);
+#[cfg(test)]
+const BUNDLE_DOWNLOAD_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// A bundle larger than this is refused rather than buffered.
 const MAX_BUNDLE_BYTES: usize = 1024 * 1024;
@@ -88,10 +92,7 @@ pub(crate) fn bundle_asset_name(asset_name: &str) -> String {
 pub(crate) enum ReleaseSignatureError {
     #[error(
         "Release {tag} publishes no Sigstore signature for {asset} (no '{bundle_asset}' asset), \
-         so its origin cannot be verified. Refusing to install an unsigned release. Releases \
-         published before signing was introduced have none; to install one anyway on the \
-         strength of its SHA-256 checksum alone, run `temps upgrade --version {tag} \
-         {ALLOW_UNSIGNED_FLAG}`"
+         so its origin cannot be verified. Refusing to install an unsigned release"
     )]
     BundleMissing {
         tag: String,
@@ -179,6 +180,33 @@ pub(crate) enum ReleaseSignatureError {
         reason: String,
     },
 }
+
+impl ReleaseSignatureError {
+    /// Into an error for the operator, with `remedy` appended when the
+    /// release simply has no bundle. What gets past that depends on the
+    /// caller, so the error itself does not presume one.
+    pub(crate) fn with_unsigned_remedy(self, remedy: &str) -> anyhow::Error {
+        match self {
+            Self::BundleMissing { .. } => anyhow::anyhow!("{self}. {remedy}"),
+            other => anyhow::Error::new(other),
+        }
+    }
+}
+
+/// How to install the host binary from a release with no bundle.
+pub(crate) fn host_unsigned_remedy(tag: &str) -> String {
+    format!(
+        "Releases published before signing was introduced have none; to install one anyway on \
+         the strength of its SHA-256 checksum alone, run `temps upgrade --version {tag} \
+         {ALLOW_UNSIGNED_FLAG}`"
+    )
+}
+
+/// How to provide a guest agent when the release it would come from has no
+/// bundle. Fetching agents has no unsigned opt-out.
+pub(crate) const GUEST_AGENT_UNSIGNED_REMEDY: &str =
+    "Guest agents are only taken from signed releases; pass the agent's path explicitly with \
+     --vm-agent-bin or --pty-agent-bin instead";
 
 /// Which trusted root a verification ran against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

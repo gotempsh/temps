@@ -312,7 +312,33 @@ async fn missing_bundle_is_refused_without_the_flag() {
         message.contains("temps-linux-amd64.tar.gz.sigstore.json"),
         "{message}"
     );
-    assert!(message.contains(ALLOW_UNSIGNED_FLAG), "{message}");
+    // The error itself names no remedy: what gets past a missing bundle
+    // depends on the caller.
+    assert!(!message.contains(ALLOW_UNSIGNED_FLAG), "{message}");
+    let host = err
+        .with_unsigned_remedy(&host_unsigned_remedy("v0.0.8"))
+        .to_string();
+    assert!(host.starts_with(&message), "{host}");
+    assert!(
+        host.contains("temps upgrade --version v0.0.8 --allow-unsigned"),
+        "{host}"
+    );
+}
+
+#[test]
+fn only_a_missing_bundle_gets_the_unsigned_remedy() {
+    let mismatch = ReleaseSignatureError::IdentityMismatch {
+        tag: "v1.2.3".into(),
+        asset: ASSET.into(),
+        expected: expected_release_identity("v1.2.3"),
+        observed:
+            "https://github.com/someone-else/temps/.github/workflows/release.yml@refs/tags/v1.2.3"
+                .into(),
+    };
+    let message = mismatch.to_string();
+    let error = mismatch.with_unsigned_remedy(GUEST_AGENT_UNSIGNED_REMEDY);
+    assert_eq!(error.to_string(), message);
+    assert!(error.downcast_ref::<ReleaseSignatureError>().is_some());
 }
 
 #[tokio::test]
@@ -415,15 +441,17 @@ async fn allow_unsigned_never_excuses_a_bad_signature() {
 
 #[tokio::test]
 async fn listed_but_unreachable_bundle_fails_closed() {
+    let (url, _requests, server) = serve_flaky_bundle(
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        usize::MAX,
+        String::new(),
+    )
+    .await;
     let release = test_release(
         "v1.2.3",
         &[
             (ASSET, "https://example.invalid/a".into()),
-            (
-                "temps-linux-amd64.tar.gz.sigstore.json",
-                // Nothing listens on port 9 of localhost.
-                "http://127.0.0.1:9/bundle".into(),
-            ),
+            ("temps-linux-amd64.tar.gz.sigstore.json", url),
         ],
     );
     let err = verify_release_asset(
@@ -435,6 +463,7 @@ async fn listed_but_unreachable_bundle_fails_closed() {
     )
     .await
     .unwrap_err();
+    server.abort();
     assert!(
         matches!(err, ReleaseSignatureError::BundleDownload { .. }),
         "{err:?}"

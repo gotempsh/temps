@@ -43,9 +43,10 @@ use crate::commands::upgrade::{
     check_write_permission, create_upgrade_temp_file, current_version_tag, download_asset_to_file,
     ensure_signature_published, extract_binary_from_tarball_file, fetch_expected_checksum,
     fetch_latest_release_in_channel, fetch_specific_release, finalize_staged_binary,
-    is_newer_version, is_older_version, platform_target, seal_staged_binary,
-    stage_vm_agent_from_tarball, verify_computed_checksum, verify_release_asset, GitHubRelease,
-    ReleaseTrustSource, UpgradeChannel,
+    host_unsigned_remedy, is_newer_version, is_older_version, platform_target,
+    preflight_staged_binary, seal_staged_binary, stage_vm_agent_from_tarball,
+    verify_computed_checksum, verify_release_asset, GitHubRelease, ReleaseTrustSource,
+    UpgradeChannel,
 };
 
 /// Grace period between accepting the update and exiting the process. Long
@@ -957,7 +958,8 @@ impl UpdateJob {
             })?;
 
         // An unsigned release is refused before the download, not after.
-        ensure_signature_published(&release, &tarball_name, false)?;
+        ensure_signature_published(&release, &tarball_name, false)
+            .map_err(|e| e.with_unsigned_remedy(&host_unsigned_remedy(&release.tag_name)))?;
 
         info!(
             to = %to_version,
@@ -1002,7 +1004,8 @@ impl UpdateJob {
             &computed,
             false,
         )
-        .await?;
+        .await
+        .map_err(|e| e.with_unsigned_remedy(&host_unsigned_remedy(&release.tag_name)))?;
 
         let mut staged_file = create_upgrade_temp_file(&parent, ".temps-selfupdate-bin.")?;
         let staged_path = staged_file.path().to_path_buf();
@@ -1361,41 +1364,6 @@ fn running_under_systemd_service() -> bool {
         }),
         Err(_) => true,
     }
-}
-
-/// Run the staged binary's `--version` before trusting it.
-///
-/// Catches the failures a checksum cannot: a build for the wrong libc, a
-/// missing shared library, a corrupted extraction. Cheap insurance — without
-/// it, a binary that cannot exec turns a one-click update into an outage that
-/// only a console on the host can fix.
-///
-/// Runs directly against the already-staged extraction file (the same one
-/// `finalize_staged_binary` will persist) instead of writing a second full
-/// copy just to exec it — that second copy is exactly the kind of extra
-/// in-memory/on-disk buffering the streaming rewrite of this flow removed
-/// everywhere else.
-fn preflight_staged_binary(staged_path: &Path) -> anyhow::Result<()> {
-    let output = std::process::Command::new(staged_path)
-        .arg("--version")
-        .output();
-
-    let output = output.map_err(|e| {
-        anyhow::anyhow!(
-            "The downloaded binary could not be executed on this host: {}. \
-             The running version was left untouched.",
-            e
-        )
-    })?;
-    if !output.status.success() {
-        return Err(anyhow::anyhow!(
-            "The downloaded binary exited with {} when asked for its version: {}. \
-             The running version was left untouched.",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    Ok(())
 }
 
 /// Arguments for the `temps migrate` child of an update. With
