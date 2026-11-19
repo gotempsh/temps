@@ -1118,7 +1118,7 @@ impl IngressConnectorService {
         let id = connector.id;
         let name = connector.name.clone();
         let setup = match self.replace_nodes(id, &request.node_ids).await {
-            Ok(()) => self.ensure(connector).await.map(|_| ()),
+            Ok(()) => self.ensure(id, None).await,
             Err(error) => Err(error),
         };
         if setup.is_ok() {
@@ -1458,7 +1458,7 @@ impl IngressConnectorService {
                 connector.name
             )));
         }
-        self.ensure(connector).await?;
+        self.ensure(connector.id, None).await?;
         self.reconcile_all().await;
         self.get(id).await
     }
@@ -1707,9 +1707,34 @@ impl IngressConnectorService {
 
     /// Create or adopt the provider-side tunnel and store the outcome on the
     /// row, so a failure is visible on the connector rather than lost.
-    async fn ensure(&self, connector: ingress_connectors::Model) -> Result<(), IngressError> {
+    /// `edge_port`: the port to configure instead of the stored one
+    /// (`align_control_plane_edge_ports`), kept only when the provider
+    /// accepted it.
+    ///
+    /// One `ensure` per connector runs at a time across every service
+    /// instance and process (a transaction-scoped advisory lock, held from
+    /// reading the row to writing the outcome), and reads the row only once
+    /// it holds it. The last configuration sent to the provider is
+    /// therefore always the one saved: a sync that overlaps a port move
+    /// configures and saves the moved port, never an older one after it.
+    async fn ensure(&self, id: i32, edge_port: Option<i32>) -> Result<(), IngressError> {
+        let txn = self.db.begin().await?;
+        txn.execute(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT pg_advisory_xact_lock(hashtextextended('ingress-connector-ensure:' || $1, 0))",
+            [id.to_string().into()],
+        ))
+        .await?;
+        let mut connector = ingress_connectors::Entity::find_by_id(id)
+            .one(&txn)
+            .await?
+            .filter(|m| !crate::registry::is_credential_kind(&m.provider))
+            .ok_or(IngressError::NotFound(id))?;
         if is_deleting(&connector) {
             return Ok(());
+        }
+        if let Some(port) = edge_port {
+            connector.edge_port = port;
         }
         let outcome = async {
             let provider = self.provider_for(&connector).await?;
@@ -1730,7 +1755,6 @@ impl IngressConnectorService {
         // Settings the service owns may have changed while the provider was
         // called (token holders); keep the stored ones.
         let _guard = self.settings_lock.lock().await;
-        let txn = self.db.begin().await?;
         let current = Self::find_for_update(&txn, connector.id)
             .await
             .unwrap_or_else(|_| connector.clone());
@@ -3515,6 +3539,11 @@ mod tests {
             /// The `edge_port` the last `ensure` configured the tunnel for.
             ensured_port: std::sync::atomic::AtomicU16,
             fail_ensure: AtomicBool,
+            /// Pause the next `ensure` after it configured the tunnel (as a
+            /// real provider then fetches the token), until `release`.
+            hold_next: AtomicBool,
+            held: tokio::sync::Notify,
+            release: tokio::sync::Notify,
         }
 
         struct FakeTunnels(Arc<Calls>);
@@ -3531,6 +3560,10 @@ mod tests {
                     return Err(IngressError::Provider("provider unavailable".into()));
                 }
                 self.0.ensured_port.store(ctx.edge_port, Ordering::SeqCst);
+                if self.0.hold_next.swap(false, Ordering::SeqCst) {
+                    self.0.held.notify_one();
+                    self.0.release.notified().await;
+                }
                 Ok(TunnelHandle {
                     external_id: format!("recreated-{}", ctx.connector_id),
                     settings: serde_json::json!({}),
@@ -4011,6 +4044,58 @@ mod tests {
                 .await
                 .expect("aligned again");
             assert_eq!(calls.ensure.load(Ordering::SeqCst), ensured);
+            drop(test_db);
+        }
+
+        /// A sync that read the old port while a move to the control plane's
+        /// port is at the provider must not leave the provider on one port
+        /// and the row on another: it waits for the move, then configures
+        /// and saves the moved port.
+        #[tokio::test]
+        async fn a_sync_overlapping_a_port_move_never_splits_provider_and_row() {
+            let Some((test_db, service, calls, id)) = setup_with(Some(7481)).await else {
+                return;
+            };
+            service
+                .replace_nodes(id, &[CONTROL_PLANE_NODE_ID])
+                .await
+                .expect("placed on the control plane");
+
+            // The move configures 7481, then stalls before saving.
+            calls.hold_next.store(true, Ordering::SeqCst);
+            let mover = {
+                let service = service.clone();
+                tokio::spawn(async move { service.align_control_plane_edge_ports(7481).await })
+            };
+            tokio::time::timeout(Duration::from_secs(10), calls.held.notified())
+                .await
+                .expect("the move reached the provider");
+
+            // An operator's sync starts from the row, still on 8443.
+            let syncer = {
+                let service = service.clone();
+                tokio::spawn(async move { service.sync(id).await.map(|_| ()) })
+            };
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            calls.release.notify_one();
+            tokio::time::timeout(Duration::from_secs(10), mover)
+                .await
+                .expect("move finished")
+                .expect("join")
+                .expect("moved");
+            tokio::time::timeout(Duration::from_secs(10), syncer)
+                .await
+                .expect("sync finished")
+                .expect("join")
+                .expect("synced");
+
+            let row = service.find(id).await.expect("row");
+            assert_eq!(
+                i32::from(calls.ensured_port.load(Ordering::SeqCst)),
+                row.edge_port,
+                "the provider was last configured for one port and the row saved another"
+            );
+            assert_eq!(row.edge_port, 7481);
             drop(test_db);
         }
 

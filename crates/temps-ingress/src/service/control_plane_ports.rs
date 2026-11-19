@@ -80,10 +80,9 @@ impl IngressConnectorService {
                 .all(self.db.as_ref())
                 .await?,
         );
-        for mut connector in stale {
+        for connector in stale {
             let (id, from) = (connector.id, connector.edge_port);
-            connector.edge_port = i32::from(port);
-            match self.ensure(connector).await {
+            match self.ensure(id, Some(i32::from(port))).await {
                 Ok(()) => info!(
                     connector_id = id,
                     from,
