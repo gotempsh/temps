@@ -28,6 +28,7 @@ import { newline, header, icons, json, colors, success, info, warning, keyValue,
 import { readFile, readdir } from 'node:fs/promises'
 import { existsSync, statSync } from 'node:fs'
 import { resolve, basename, join } from 'node:path'
+import { registerActivityCommands } from './activity.js'
 import { registerInboundFilterCommands } from './filters.js'
 
 interface ListOptions {
@@ -529,6 +530,7 @@ export function registerErrorsCommands(program: Command): void {
     .action(listErrorGroupFingerprintsAction)
 
   registerInboundFilterCommands(errors)
+  registerActivityCommands(errors)
 
   errors
     .command('events')

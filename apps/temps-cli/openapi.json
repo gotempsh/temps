@@ -1022,6 +1022,69 @@
         ],
         "type": "object"
       },
+      "ActivityDetails": {
+        "description": "The specifics of an entry; which fields are set depends on the kind.",
+        "properties": {
+          "assignee": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Assignee",
+                "description": "`assigned`: the new assignee; `None` when unassigned."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "assignee_name": {
+            "description": "`assigned`: the assignee's name when the entry was written.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "bulk": {
+            "description": "`status_changed`: the change came from a bulk request.",
+            "type": "boolean"
+          },
+          "fingerprints": {
+            "description": "`merged`, `unmerged`, `split`: how many fingerprints moved.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "group_ids": {
+            "description": "`merged`: the groups merged in. `unmerged`, `split`: the group on the\nother side (both groups get an entry).",
+            "items": {
+              "format": "int32",
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "in_next_release": {
+            "description": "`status_changed`: resolved in the next release.",
+            "type": "boolean"
+          },
+          "release": {
+            "description": "`regressed`: the release of the event that reopened the group.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "description": "`status_changed`: the new status. `regressed`: the status the group\nhad before the event reopened it (`resolved` or `ignored`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "ActivityEvent": {
         "description": "A single activity event for the real-time activity feed",
         "properties": {
@@ -1315,6 +1378,19 @@
           "end_date"
         ],
         "type": "object"
+      },
+      "ActivityKind": {
+        "description": "What happened to the group.",
+        "enum": [
+          "comment",
+          "status_changed",
+          "regressed",
+          "assigned",
+          "merged",
+          "unmerged",
+          "split"
+        ],
+        "type": "string"
       },
       "ActivityPreview": {
         "properties": {
@@ -6597,6 +6673,49 @@
           "role_type"
         ],
         "type": "object"
+      },
+      "Assignee": {
+        "description": "Who a group is assigned to.",
+        "oneOf": [
+          {
+            "properties": {
+              "id": {
+                "format": "int32",
+                "type": "integer"
+              },
+              "type": {
+                "enum": [
+                  "user"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "id": {
+                "format": "int32",
+                "type": "integer"
+              },
+              "type": {
+                "enum": [
+                  "team"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "type"
+            ],
+            "type": "object"
+          }
+        ]
       },
       "AttachEnvironmentVolumeRequest": {
         "properties": {
@@ -30230,6 +30349,98 @@
         ],
         "type": "object"
       },
+      "ErrorGroupActivityPageResponse": {
+        "properties": {
+          "data": {
+            "description": "Newest first.",
+            "items": {
+              "$ref": "#/components/schemas/ErrorGroupActivityResponse"
+            },
+            "type": "array"
+          },
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total_count": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "data",
+          "page",
+          "page_size",
+          "total_count"
+        ],
+        "type": "object"
+      },
+      "ErrorGroupActivityResponse": {
+        "description": "One entry of a group's activity log.",
+        "properties": {
+          "actor_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "actor_user_id": {
+            "description": "Who did it; `None` for an event that reopened the group, or a user\nwho has since been deleted.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "body": {
+            "description": "The comment text, for `comment` entries.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "details": {
+            "$ref": "#/components/schemas/ActivityDetails"
+          },
+          "edited_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "group_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/ActivityKind"
+          }
+        },
+        "required": [
+          "id",
+          "group_id",
+          "kind",
+          "details",
+          "created_at"
+        ],
+        "type": "object"
+      },
       "ErrorGroupAssigneeOptionsResponse": {
         "properties": {
           "teams": {
@@ -30278,6 +30489,19 @@
         "required": [
           "group_id",
           "changed"
+        ],
+        "type": "object"
+      },
+      "ErrorGroupCommentRequest": {
+        "properties": {
+          "body": {
+            "description": "The comment, at most 10,000 characters; Markdown is shown as text.",
+            "maxLength": 10000,
+            "type": "string"
+          }
+        },
+        "required": [
+          "body"
         ],
         "type": "object"
       },
@@ -160383,6 +160607,89 @@
         "x-maturity": "beta"
       }
     },
+    "/projects/{project_id}/error-groups/{group_id}/activity": {
+      "get": {
+        "operationId": "list_error_group_activity",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Error group ID",
+            "in": "path",
+            "name": "group_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Page number, from 1.",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Entries per page, 1 to 100.",
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorGroupActivityPageResponse"
+                }
+              }
+            },
+            "description": "A page of the activity log"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Missing error_tracking:read or project access"
+          },
+          "404": {
+            "description": "Error group not found in the project"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "List a group's comments and activity, newest first",
+        "tags": [
+          "error-tracking"
+        ],
+        "x-maturity": "beta"
+      }
+    },
     "/projects/{project_id}/error-groups/{group_id}/assignee": {
       "put": {
         "description": "The assignee is independent of the status: an assigned group can be\nresolved or ignored and keeps its assignee. A new assignee is emailed\nwhen an email provider is configured, and `status_change` alert rules\nthat list `assigned` fire.",
@@ -160452,6 +160759,227 @@
           }
         ],
         "summary": "Assign an error group to a user or a team, or unassign it",
+        "tags": [
+          "error-tracking"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/projects/{project_id}/error-groups/{group_id}/comments": {
+      "post": {
+        "operationId": "create_error_group_comment",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Error group ID",
+            "in": "path",
+            "name": "group_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ErrorGroupCommentRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorGroupActivityResponse"
+                }
+              }
+            },
+            "description": "Comment added"
+          },
+          "400": {
+            "description": "Empty or longer than 10,000 characters"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Missing error_tracking:write or project access"
+          },
+          "404": {
+            "description": "Error group not found in the project"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Comment on an error group",
+        "tags": [
+          "error-tracking"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/projects/{project_id}/error-groups/{group_id}/comments/{comment_id}": {
+      "delete": {
+        "description": "Its author may delete it, and so may an administrator.",
+        "operationId": "delete_error_group_comment",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Error group ID",
+            "in": "path",
+            "name": "group_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Comment ID",
+            "in": "path",
+            "name": "comment_id",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Comment deleted"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Neither the author nor an administrator"
+          },
+          "404": {
+            "description": "Comment not found on the group"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Delete a comment on an error group",
+        "tags": [
+          "error-tracking"
+        ],
+        "x-maturity": "beta"
+      },
+      "patch": {
+        "operationId": "update_error_group_comment",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Error group ID",
+            "in": "path",
+            "name": "group_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Comment ID",
+            "in": "path",
+            "name": "comment_id",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ErrorGroupCommentRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorGroupActivityResponse"
+                }
+              }
+            },
+            "description": "Comment changed"
+          },
+          "400": {
+            "description": "Empty or longer than 10,000 characters"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Not the comment's author, or missing error_tracking:write"
+          },
+          "404": {
+            "description": "Comment not found on the group"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Edit your comment on an error group",
         "tags": [
           "error-tracking"
         ],
@@ -186239,6 +186767,10 @@
     },
     {
       "description": "Error group assignment",
+      "name": "error-tracking"
+    },
+    {
+      "description": "Error group comments and activity",
       "name": "error-tracking"
     },
     {

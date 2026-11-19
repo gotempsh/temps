@@ -6,6 +6,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Users, UserRound } from 'lucide-react'
 import {
   getErrorGroupQueryKey,
+  listErrorGroupActivityQueryKey,
   listErrorGroupsQueryKey,
   searchErrorGroupAssigneesOptions,
   setErrorGroupAssigneeMutation,
@@ -79,6 +80,11 @@ export function AssigneeMenu({
       })
       queryClient.invalidateQueries({
         queryKey: getErrorGroupQueryKey({
+          path: { project_id: projectId, group_id: groupId },
+        }),
+      })
+      queryClient.invalidateQueries({
+        queryKey: queryKeyPrefix(listErrorGroupActivityQueryKey, {
           path: { project_id: projectId, group_id: groupId },
         }),
       })

@@ -23,7 +23,7 @@ pub const MAX_ASSIGNEE_OPTIONS: u64 = 20;
 pub const MAX_ASSIGNEE_QUERY_CHARS: usize = 100;
 
 /// Who a group is assigned to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(tag = "type", content = "id", rename_all = "snake_case")]
 pub enum Assignee {
     User(i32),

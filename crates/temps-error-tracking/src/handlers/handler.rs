@@ -63,6 +63,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         .merge(super::feedback_handler::routes())
         .merge(super::group_workflow_handler::routes())
         .merge(super::assignee_handler::routes())
+        .merge(super::activity_handler::routes())
         .merge(super::inbound_filter_handler::routes())
         .merge(super::release_handler::routes())
         .merge(super::client_outcome_handler::routes())
@@ -400,6 +401,17 @@ impl From<ErrorTrackingError> for temps_core::problemdetails::Problem {
                 .value("group_id", group_id)
                 .value("comment_id", comment_id)
                 .build(),
+            ErrorTrackingError::NotCommentAuthor {
+                group_id,
+                comment_id,
+                ..
+            } => temps_core::error_builder::ErrorBuilder::new(StatusCode::FORBIDDEN)
+                .type_("https://temps.sh/probs/not-comment-author")
+                .title("Not The Comment's Author")
+                .detail(err.to_string())
+                .value("group_id", group_id)
+                .value("comment_id", comment_id)
+                .build(),
             ErrorTrackingError::SavedSearchNotFound {
                 project_id,
                 saved_search_id,
@@ -512,6 +524,9 @@ impl axum::response::IntoResponse for ErrorTrackingError {
             ),
             ErrorTrackingError::GroupNotFound => {
                 (StatusCode::NOT_FOUND, "Error group not found".to_string())
+            }
+            ErrorTrackingError::NotCommentAuthor { .. } => {
+                (StatusCode::FORBIDDEN, self.to_string())
             }
             ErrorTrackingError::GroupsNotFound { .. }
             | ErrorTrackingError::GroupNotInProject { .. }
@@ -730,6 +745,21 @@ pub async fn update_error_group(
             request.in_next_release,
         )
         .await?;
+    super::activity_handler::record_activity(
+        &state,
+        project_id,
+        &[group_id],
+        crate::services::group_workflow::ActivityKind::StatusChanged,
+        auth.user_id_opt(),
+        crate::services::group_workflow::ActivityDetails {
+            status: crate::services::error_crud_service::canonical_group_status(&request.status)
+                .ok()
+                .map(str::to_string),
+            in_next_release: request.in_next_release,
+            ..Default::default()
+        },
+    )
+    .await;
 
     let audit = ErrorGroupUpdatedAudit {
         context: AuditContext {

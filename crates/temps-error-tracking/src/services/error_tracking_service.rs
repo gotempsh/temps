@@ -320,6 +320,48 @@ impl ErrorTrackingService {
         self.ingestion.cleanup_source_keys().await
     }
 
+    /// Write the activity entry for an event that reopened a group. Runs
+    /// once per reopening: the reopen is claimed in the ingest transaction
+    /// and a retried event is not stored again. A failed write is logged.
+    async fn record_regression(
+        &self,
+        project_id: i32,
+        group_id: i32,
+        previous_status: &str,
+        release: Option<String>,
+    ) {
+        let release = release
+            .filter(|release| !release.is_empty())
+            .map(|release| {
+                release
+                    .chars()
+                    .take(super::group_workflow::MAX_RELEASE_CHARS)
+                    .collect()
+            });
+        if let Err(error) = self
+            .workflow
+            .record_activity(
+                project_id,
+                &[group_id],
+                super::group_workflow::ActivityKind::Regressed,
+                None,
+                super::group_workflow::ActivityDetails {
+                    status: Some(previous_status.to_string()),
+                    release,
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            tracing::error!(
+                project_id,
+                group_id,
+                "Failed to record the regression of an error group: {}",
+                error
+            );
+        }
+    }
+
     pub async fn process_error_event_with_receipt(
         &self,
         error_data: CreateErrorEventData,
@@ -344,6 +386,7 @@ impl ErrorTrackingService {
             || error_data.visitor_id.is_some();
 
         let project_id = error_data.project_id;
+        let event_release = error_data.release_version.clone();
         let outcome = match submitted_fingerprint {
             Some(fingerprint) => {
                 self.ingestion
@@ -394,6 +437,10 @@ impl ErrorTrackingService {
             // event and count, so concurrent requests cannot each claim one.
             if is_new_group || is_regression {
                 self.announce_group_opened(&group, is_regression).await;
+            }
+            if is_regression {
+                self.record_regression(project_id, group_id, &pre_ingestion_status, event_release)
+                    .await;
             }
 
             let notifications = if is_new_group {

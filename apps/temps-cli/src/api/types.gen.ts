@@ -334,6 +334,43 @@ export type ActivityDay = {
 };
 
 /**
+ * The specifics of an entry; which fields are set depends on the kind.
+ */
+export type ActivityDetails = {
+    assignee?: Assignee | null;
+    /**
+     * `assigned`: the assignee's name when the entry was written.
+     */
+    assignee_name?: string | null;
+    /**
+     * `status_changed`: the change came from a bulk request.
+     */
+    bulk?: boolean;
+    /**
+     * `merged`, `unmerged`, `split`: how many fingerprints moved.
+     */
+    fingerprints?: number | null;
+    /**
+     * `merged`: the groups merged in. `unmerged`, `split`: the group on the
+     * other side (both groups get an entry).
+     */
+    group_ids?: Array<number>;
+    /**
+     * `status_changed`: resolved in the next release.
+     */
+    in_next_release?: boolean;
+    /**
+     * `regressed`: the release of the event that reopened the group.
+     */
+    release?: string | null;
+    /**
+     * `status_changed`: the new status. `regressed`: the status the group
+     * had before the event reopened it (`resolved` or `ignored`).
+     */
+    status?: string | null;
+};
+
+/**
  * A single activity event for the real-time activity feed
  */
 export type ActivityEvent = {
@@ -477,6 +514,11 @@ export type ActivityGraphResponse = {
      */
     total_count: number;
 };
+
+/**
+ * What happened to the group.
+ */
+export type ActivityKind = 'comment' | 'status_changed' | 'regressed' | 'assigned' | 'merged' | 'unmerged' | 'split';
 
 export type ActivityPreview = {
     report: ActivityReport;
@@ -3078,6 +3120,17 @@ export type AssetCachePurgeResponse = {
 export type AssignRoleRequest = {
     role_type: string;
     user_id: number;
+};
+
+/**
+ * Who a group is assigned to.
+ */
+export type Assignee = {
+    id: number;
+    type: 'user';
+} | {
+    id: number;
+    type: 'team';
 };
 
 export type AttachEnvironmentVolumeRequest = {
@@ -14251,6 +14304,38 @@ export type ErrorEventResponse = {
     timestamp: string;
 };
 
+export type ErrorGroupActivityPageResponse = {
+    /**
+     * Newest first.
+     */
+    data: Array<ErrorGroupActivityResponse>;
+    page: number;
+    page_size: number;
+    total_count: number;
+};
+
+/**
+ * One entry of a group's activity log.
+ */
+export type ErrorGroupActivityResponse = {
+    actor_name?: string | null;
+    /**
+     * Who did it; `None` for an event that reopened the group, or a user
+     * who has since been deleted.
+     */
+    actor_user_id?: number | null;
+    /**
+     * The comment text, for `comment` entries.
+     */
+    body?: string | null;
+    created_at: string;
+    details: ActivityDetails;
+    edited_at?: string | null;
+    group_id: number;
+    id: number;
+    kind: ActivityKind;
+};
+
 export type ErrorGroupAssigneeOptionsResponse = {
     /**
      * Teams, at most 20.
@@ -14270,6 +14355,13 @@ export type ErrorGroupAssigneeResponse = {
      */
     changed: boolean;
     group_id: number;
+};
+
+export type ErrorGroupCommentRequest = {
+    /**
+     * The comment, at most 10,000 characters; Markdown is shown as text.
+     */
+    body: string;
 };
 
 export type ErrorGroupDeploymentResponse = {
@@ -84408,6 +84500,59 @@ export type UpdateErrorGroupResponses = {
     200: unknown;
 };
 
+export type ListErrorGroupActivityData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Error group ID
+         */
+        group_id: number;
+    };
+    query?: {
+        /**
+         * Page number, from 1.
+         */
+        page?: number;
+        /**
+         * Entries per page, 1 to 100.
+         */
+        page_size?: number;
+    };
+    url: '/projects/{project_id}/error-groups/{group_id}/activity';
+};
+
+export type ListErrorGroupActivityErrors = {
+    /**
+     * Not authenticated
+     */
+    401: unknown;
+    /**
+     * Missing error_tracking:read or project access
+     */
+    403: unknown;
+    /**
+     * Error group not found in the project
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListErrorGroupActivityResponses = {
+    /**
+     * A page of the activity log
+     */
+    200: ErrorGroupActivityPageResponse;
+};
+
+export type ListErrorGroupActivityResponse = ListErrorGroupActivityResponses[keyof ListErrorGroupActivityResponses];
+
 export type SetErrorGroupAssigneeData = {
     body: SetErrorGroupAssigneeRequest;
     path: {
@@ -84455,6 +84600,154 @@ export type SetErrorGroupAssigneeResponses = {
 };
 
 export type SetErrorGroupAssigneeResponse = SetErrorGroupAssigneeResponses[keyof SetErrorGroupAssigneeResponses];
+
+export type CreateErrorGroupCommentData = {
+    body: ErrorGroupCommentRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Error group ID
+         */
+        group_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/error-groups/{group_id}/comments';
+};
+
+export type CreateErrorGroupCommentErrors = {
+    /**
+     * Empty or longer than 10,000 characters
+     */
+    400: unknown;
+    /**
+     * Not authenticated
+     */
+    401: unknown;
+    /**
+     * Missing error_tracking:write or project access
+     */
+    403: unknown;
+    /**
+     * Error group not found in the project
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type CreateErrorGroupCommentResponses = {
+    /**
+     * Comment added
+     */
+    201: ErrorGroupActivityResponse;
+};
+
+export type CreateErrorGroupCommentResponse = CreateErrorGroupCommentResponses[keyof CreateErrorGroupCommentResponses];
+
+export type DeleteErrorGroupCommentData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Error group ID
+         */
+        group_id: number;
+        /**
+         * Comment ID
+         */
+        comment_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/error-groups/{group_id}/comments/{comment_id}';
+};
+
+export type DeleteErrorGroupCommentErrors = {
+    /**
+     * Not authenticated
+     */
+    401: unknown;
+    /**
+     * Neither the author nor an administrator
+     */
+    403: unknown;
+    /**
+     * Comment not found on the group
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type DeleteErrorGroupCommentResponses = {
+    /**
+     * Comment deleted
+     */
+    204: void;
+};
+
+export type DeleteErrorGroupCommentResponse = DeleteErrorGroupCommentResponses[keyof DeleteErrorGroupCommentResponses];
+
+export type UpdateErrorGroupCommentData = {
+    body: ErrorGroupCommentRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Error group ID
+         */
+        group_id: number;
+        /**
+         * Comment ID
+         */
+        comment_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/error-groups/{group_id}/comments/{comment_id}';
+};
+
+export type UpdateErrorGroupCommentErrors = {
+    /**
+     * Empty or longer than 10,000 characters
+     */
+    400: unknown;
+    /**
+     * Not authenticated
+     */
+    401: unknown;
+    /**
+     * Not the comment's author, or missing error_tracking:write
+     */
+    403: unknown;
+    /**
+     * Comment not found on the group
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UpdateErrorGroupCommentResponses = {
+    /**
+     * Comment changed
+     */
+    200: ErrorGroupActivityResponse;
+};
+
+export type UpdateErrorGroupCommentResponse = UpdateErrorGroupCommentResponses[keyof UpdateErrorGroupCommentResponses];
 
 export type ListErrorEventsData = {
     body?: never;

@@ -230,6 +230,36 @@ impl AuditOperation for ErrorGroupAssignedAudit {
     }
 }
 
+/// Audit event for a comment on an error group (ADR 074, D1.7). Records the
+/// comment's id, never its text.
+#[derive(Debug, Clone, Serialize)]
+pub struct ErrorGroupCommentAudit {
+    pub context: AuditContext,
+    pub project_id: i32,
+    pub group_id: i32,
+    pub comment_id: i64,
+    /// `created`, `edited` or `deleted`.
+    pub action: &'static str,
+}
+
+impl AuditOperation for ErrorGroupCommentAudit {
+    fn operation_type(&self) -> String {
+        format!("ERROR_GROUP_COMMENT_{}", self.action.to_ascii_uppercase())
+    }
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
+    }
+}
+
 /// Audit event for a triage update on an error group (status and/or assignee).
 #[derive(Debug, Clone, Serialize)]
 pub struct ErrorGroupUpdatedAudit {

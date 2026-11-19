@@ -4,8 +4,9 @@
 
 Proposed — 2026-11-19. Being implemented in the order of the Decision
 section. D1.1 (bulk actions), D1.2 (merge and split), D1.3 (ignore
-until), D1.4 (inbound filters), D1.5 (resolve in the next release) and
-D1.6 (assignment) have shipped; the questions they settled
+until), D1.4 (inbound filters), D1.5 (resolve in the next release),
+D1.6 (assignment) and D1.7 (comments and activity) have shipped; the
+questions they settled
 are recorded under "Settled while implementing".
 
 Related: ADR 016 (ClickHouse traces backend), ADR 027 (cross-project trace
@@ -341,3 +342,27 @@ deploys, which is web services. It comes last and may never be worth building.
   caller or to a team the caller is a member of. Bulk assignment is not
   offered.
 
+### D1.7 Comments and activity
+
+- One table, `error_group_activity`, holds comments and history: a `kind`
+  (`comment`, `status_changed`, `regressed`, `assigned`, `merged`,
+  `unmerged`, `split`), the actor, a comment `body`, and typed `details`
+  (JSONB). It is deleted with its group or project. A deleted user's entries
+  stay, with no actor.
+- Entries are written when a group changes, never per event. A bulk change
+  writes all its entries in one statement. An event writes an entry only when
+  it reopens a resolved or ignored group; the reopen is claimed inside the
+  ingest transaction and a retried event is not stored again, so a retry
+  cannot log a second regression.
+- History entries are written after the change commits, outside its
+  transaction, the same way as audit logs: a failed write is logged and the
+  change still succeeds. The conservative alternative, failing the change,
+  would let a log table block triage.
+- Nothing is backfilled: the log starts at the upgrade.
+- Comments are plain text, at most 10,000 characters, trimmed, never empty.
+  Only the author edits a comment; the author or an administrator deletes
+  it. A deployment token cannot comment, because a comment needs an author.
+  Comment writes are audit-logged by id, never with their text. Assignment
+  entries store the assignee's name as it was when assigned.
+- No mentions and no notification on a comment yet: a mention needs the
+  same "who may be told" check as assignment and is left for later.

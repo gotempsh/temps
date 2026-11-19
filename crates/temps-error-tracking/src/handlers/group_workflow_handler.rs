@@ -18,14 +18,15 @@ use temps_core::{DateTime, RequestMetadata};
 use tracing::error;
 use utoipa::{OpenApi, ToSchema};
 
+use super::activity_handler::record_activity;
 use super::audit::{
     AuditContext, ErrorGroupSplitAudit, ErrorGroupUnmergedAudit, ErrorGroupsBulkUpdatedAudit,
     ErrorGroupsMergedAudit,
 };
 use super::types::AppState;
 use crate::services::group_workflow::{
-    BulkGroupAction, BulkGroupFilter, BulkGroupOutcome, BulkGroupSelector, IgnoreConditions,
-    BULK_GROUP_LIMIT,
+    ActivityDetails, ActivityKind, BulkGroupAction, BulkGroupFilter, BulkGroupOutcome,
+    BulkGroupSelector, IgnoreConditions, BULK_GROUP_LIMIT,
 };
 
 #[derive(OpenApi)]
@@ -265,6 +266,24 @@ pub async fn bulk_update_error_groups(
         )
         .await?;
     let response = BulkErrorGroupResponse::new(request.action, outcome);
+    record_activity(
+        &state,
+        project_id,
+        &response.updated_ids,
+        ActivityKind::StatusChanged,
+        auth.user_id_opt(),
+        ActivityDetails {
+            status: Some(
+                BulkGroupAction::from(request.action)
+                    .target_status()
+                    .to_string(),
+            ),
+            in_next_release: request.in_next_release,
+            bulk: true,
+            ..Default::default()
+        },
+    )
+    .await;
 
     // Audited even when nothing changed: the attempt and its selection are
     // part of the record.
@@ -413,6 +432,19 @@ pub async fn merge_error_groups(
         .workflow
         .merge_groups(project_id, group_id, request.source_group_ids.clone())
         .await?;
+    record_activity(
+        &state,
+        project_id,
+        &[outcome.target_group_id],
+        ActivityKind::Merged,
+        auth.user_id_opt(),
+        ActivityDetails {
+            group_ids: outcome.merged_group_ids.clone(),
+            fingerprints: Some(outcome.moved_fingerprints),
+            ..Default::default()
+        },
+    )
+    .await;
 
     let audit = ErrorGroupsMergedAudit {
         context: audit_context(&auth, &metadata),
@@ -473,6 +505,24 @@ pub async fn unmerge_error_group(
         .workflow
         .unmerge_group(project_id, group_id)
         .await?;
+    for (on, other) in [
+        (outcome.group_id, outcome.target_group_id),
+        (outcome.target_group_id, outcome.group_id),
+    ] {
+        record_activity(
+            &state,
+            project_id,
+            &[on],
+            ActivityKind::Unmerged,
+            auth.user_id_opt(),
+            ActivityDetails {
+                group_ids: vec![other],
+                fingerprints: Some(outcome.moved_fingerprints),
+                ..Default::default()
+            },
+        )
+        .await;
+    }
 
     let audit = ErrorGroupUnmergedAudit {
         context: audit_context(&auth, &metadata),
@@ -539,6 +589,24 @@ pub async fn split_error_group(
             request.title.clone(),
         )
         .await?;
+    for (on, other) in [
+        (outcome.group_id, outcome.new_group_id),
+        (outcome.new_group_id, outcome.group_id),
+    ] {
+        record_activity(
+            &state,
+            project_id,
+            &[on],
+            ActivityKind::Split,
+            auth.user_id_opt(),
+            ActivityDetails {
+                group_ids: vec![other],
+                fingerprints: Some(outcome.moved_fingerprints),
+                ..Default::default()
+            },
+        )
+        .await;
+    }
 
     let audit = ErrorGroupSplitAudit {
         context: audit_context(&auth, &metadata),
@@ -749,6 +817,23 @@ pub(crate) mod tests {
         (project.id, ids[0], ids[1])
     }
 
+    /// A user row, so activity entries can name their actor.
+    pub(crate) async fn create_user(db: &sea_orm::DatabaseConnection) -> i32 {
+        use sea_orm::ConnectionTrait;
+        db.query_one(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "INSERT INTO users (name, email, email_verified, must_change_password, mfa_enabled, \
+             created_at, updated_at) VALUES ('Ana', $1, TRUE, FALSE, FALSE, NOW(), NOW()) \
+             RETURNING id",
+            [format!("ana-{}@example.test", uuid::Uuid::new_v4()).into()],
+        ))
+        .await
+        .expect("insert user")
+        .expect("user row")
+        .try_get("", "id")
+        .expect("user id")
+    }
+
     pub(crate) fn app_state(
         db: &Arc<sea_orm::DatabaseConnection>,
         audit: Arc<RecordingAuditLogger>,
@@ -775,10 +860,11 @@ pub(crate) mod tests {
         let (project_id, first, second) = seed(db.as_ref()).await;
         let recorder = Arc::new(RecordingAuditLogger::default());
         let state = app_state(&db, recorder.clone());
+        let actor = create_user(db.as_ref()).await;
 
         let response = bulk_update_error_groups(
             State(state.clone()),
-            RequireAuth(test_user(7, Role::Admin)),
+            RequireAuth(test_user(actor, Role::Admin)),
             Path(project_id),
             Extension(metadata()),
             Json(BulkErrorGroupRequest {
@@ -802,6 +888,20 @@ pub(crate) mod tests {
                 .expect("load group")
                 .expect("group exists");
             assert_eq!(group.status, "resolved");
+        }
+
+        for id in [first, second] {
+            let activity = state
+                .error_tracking_service
+                .workflow
+                .list_activity(project_id, id, 1, 20)
+                .await
+                .expect("activity");
+            assert_eq!(activity.total, 1, "group {id} logs the bulk change");
+            let entry = &activity.entries[0];
+            assert_eq!(entry.kind, ActivityKind::StatusChanged);
+            assert_eq!(entry.details.status.as_deref(), Some("resolved"));
+            assert!(entry.details.bulk);
         }
 
         let entries = recorder.entries.lock().expect("lock");

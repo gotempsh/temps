@@ -15,11 +15,15 @@ import {
 import { AutofixIncidentCard } from '@/components/autofix/AutofixIncidentCard'
 import { SentryEventDetail } from '@/components/error-tracking/SentryEventDetail'
 import { SentryListItem } from '@/components/error-tracking/SentryListItem'
-import { updateErrorGroupMutation } from '@/api/client/@tanstack/react-query.gen'
+import {
+  listErrorGroupActivityQueryKey,
+  updateErrorGroupMutation,
+} from '@/api/client/@tanstack/react-query.gen'
 import { GroupMergeActions } from '@/components/error-tracking/GroupMergeActions'
 import { IgnoreMenu } from '@/components/error-tracking/IgnoreMenu'
 import { ResolveMenu } from '@/components/error-tracking/ResolveMenu'
 import { AssigneeMenu } from '@/components/error-tracking/AssigneeMenu'
+import { GroupActivity } from '@/components/error-tracking/GroupActivity'
 import {
   IGNORE_PRESETS,
   describeIgnoreState,
@@ -64,6 +68,7 @@ import {
   EyeOff,
   Home,
   List,
+  MessageSquare,
   MoreVertical,
   RotateCcw,
 } from 'lucide-react'
@@ -113,6 +118,11 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
         queryKey: getErrorGroupOptions({
           path: { group_id: parseInt(errorGroupId!), project_id: project.id },
         }).queryKey,
+      })
+      queryClient.invalidateQueries({
+        queryKey: queryKeyPrefix(listErrorGroupActivityQueryKey, {
+          path: { group_id: parseInt(errorGroupId!), project_id: project.id },
+        }),
       })
     },
   })
@@ -470,7 +480,7 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
 
       {/* Tabs for different views */}
       <Tabs value={selectedTab} onValueChange={setSelectedTab}>
-        <TabsList className="grid w-full max-w-[400px] grid-cols-2">
+        <TabsList className="grid w-full max-w-[600px] grid-cols-3">
           <TabsTrigger value="overview" icon={Home}>
             Overview
           </TabsTrigger>
@@ -480,6 +490,9 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
             count={errorEvents?.data?.length || 0}
           >
             Events
+          </TabsTrigger>
+          <TabsTrigger value="activity" icon={MessageSquare}>
+            Activity
           </TabsTrigger>
         </TabsList>
 
@@ -578,6 +591,16 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
               })}
             </div>
           </ScrollArea>
+        </TabsContent>
+
+        {/* Activity Tab: comments and history */}
+        <TabsContent value="activity" className="mt-6">
+          <GroupActivity
+            projectId={project.id}
+            groupId={parseInt(errorGroupId!)}
+            currentUserId={currentUser?.id}
+            canModerate={currentUser?.role === 'admin'}
+          />
         </TabsContent>
       </Tabs>
     </div>

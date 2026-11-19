@@ -742,6 +742,38 @@ await fetch('https://your-temps-instance.com/api/projects/42/error-groups/123/as
 
 Earlier versions stored the assignee as free text and used an `assigned` status. Upgrading matches each stored assignee to the user with that email and moves `assigned` groups to `unresolved`, with their assignee. A value that matches no user stays in the read-only `assigned_to` field. The `assigned_to` field of the update request still works, by email, and the status `assigned` is accepted and stored as `unresolved`.
 
+### Comments and Activity {{ anchor: true, id: 'activity' }}
+
+The **Activity** tab of a group shows its history, newest first: who changed its status (and whether it was a bulk action), who assigned it, merges and splits, and each event that reopened a resolved or ignored group, with that event's release. Teammates leave comments there too: what you found, a link to the fix, who is on it. A comment is plain text, up to 10,000 characters, and everyone who can open the project can read it. Its author can edit it; its author or an administrator can delete it. Comment writes are audit-logged, without their text.
+
+<CodeGroup title="Comments and Activity">
+```bash {{ title: 'CLI' }}
+# Comment, edit your comment, delete a comment
+temps errors comment --project-id 42 --group-id 123 --body "Started after the cache change; rolling back"
+temps errors comment --project-id 42 --group-id 123 --edit 9 --body "Rolled back in 2.4.2"
+temps errors comment --project-id 42 --group-id 123 --delete 9
+
+# The history of the group
+temps errors activity --project-id 42 --group-id 123
+```
+
+```typescript {{ title: 'API' }}
+await fetch('https://your-temps-instance.com/api/projects/42/error-groups/123/comments', {
+  method: 'POST',
+  headers: { 'Authorization': `Bearer ${API_KEY}`, 'Content-Type': 'application/json' },
+  body: JSON.stringify({ body: 'Started after the cache change' })
+});
+
+// Newest first; page_size up to 100
+const activity = await fetch(
+  'https://your-temps-instance.com/api/projects/42/error-groups/123/activity?page=1&page_size=20',
+  { headers: { 'Authorization': `Bearer ${API_KEY}` } }
+).then(r => r.json());
+```
+</CodeGroup>
+
+Activity is recorded from this version on; changes made before the upgrade are not in the log. An event that reopens a group is logged once, when it reopens it; ordinary events are never logged here.
+
 ### Triage Many Groups at Once
 
 One request resolves, reopens or ignores up to 1,000 groups. Select them by ID, or by the same filters the list uses — status, environment, event window and a text search over the title, error type and message. A request carries either IDs or filters, never both.

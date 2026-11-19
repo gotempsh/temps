@@ -533,6 +533,8 @@ impl TempsPlugin for ErrorTrackingPlugin {
         );
         schema
             .merge(<crate::handlers::assignee_handler::AssigneeApiDoc as OpenApiTrait>::openapi());
+        schema
+            .merge(<crate::handlers::activity_handler::ActivityApiDoc as OpenApiTrait>::openapi());
         schema.merge(
             <crate::handlers::client_outcome_handler::ClientOutcomeApiDoc as OpenApiTrait>::openapi(
             ),

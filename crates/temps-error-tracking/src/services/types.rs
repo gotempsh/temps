@@ -50,6 +50,18 @@ pub enum ErrorTrackingError {
     #[error("Comment {comment_id} not found on error group {group_id}")]
     CommentNotFound { group_id: i32, comment_id: i64 },
 
+    /// A comment may only be changed by its author (or, for a delete, a
+    /// project administrator). Maps to HTTP 403.
+    #[error(
+        "Comment {comment_id} on error group {group_id} can only be {action} by its author{admins}"
+    )]
+    NotCommentAuthor {
+        group_id: i32,
+        comment_id: i64,
+        action: &'static str,
+        admins: &'static str,
+    },
+
     /// A saved search id that is not one of the project's. Maps to HTTP 404.
     #[error("Saved search {saved_search_id} not found in project {project_id}")]
     SavedSearchNotFound {

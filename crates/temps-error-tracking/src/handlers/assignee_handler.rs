@@ -152,6 +152,21 @@ pub(crate) async fn assign_and_audit(
         )
         .await?;
     let changed = outcome.previous != assignee;
+    if changed {
+        super::activity_handler::record_activity(
+            state,
+            project_id,
+            &[group_id],
+            crate::services::group_workflow::ActivityKind::Assigned,
+            auth.user_id_opt(),
+            crate::services::group_workflow::ActivityDetails {
+                assignee,
+                assignee_name: outcome.current.as_ref().map(|current| current.name.clone()),
+                ..Default::default()
+            },
+        )
+        .await;
+    }
     let audit = ErrorGroupAssignedAudit {
         context: AuditContext {
             user_id: auth.user_id(),
