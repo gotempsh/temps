@@ -64,6 +64,7 @@ import {
   resumeSandboxMutation,
   stopSandboxMutation,
 } from '@/api/client/@tanstack/react-query.gen'
+import { refreshSandboxImageStatus } from '@/components/sandboxes/sandbox-creation'
 import type {
   ApplicationResponse,
   ApplicationWorkspaceResponse,
@@ -75,6 +76,7 @@ import {
   WorkspaceRunningIndicator,
 } from '@/components/ai-first/WorkspaceActivity'
 import {
+  canManageSandboxPlacement,
   canViewNodes,
   toSandboxView,
   isSandboxExpired,
@@ -84,6 +86,7 @@ import {
 import { useAuth } from '@/contexts/AuthContext-shared'
 import { CreateSandboxDocs } from '@/components/sandboxes/CreateSandboxDocs'
 import { CreateSandboxSheet } from '@/components/sandboxes/CreateSandboxSheet'
+import { SandboxImagePreparationCard } from '@/components/sandboxes/SandboxImagePreparationCard'
 import { SandboxNodeBadge } from '@/components/sandboxes/SandboxNode'
 
 function statusVariant(
@@ -172,6 +175,7 @@ type StatusFilter = 'active' | 'expired' | 'all'
 export default function Sandboxes() {
   usePageTitle('Sandboxes')
   const platformFeatures = usePlatformFeatures()
+  const { user } = useAuth()
   const [includeWorkspaceCompute, setIncludeWorkspaceCompute] = useState(false)
   const loadWorkspaces = includeWorkspaceCompute
   const [page, setPage] = useState(1)
@@ -253,6 +257,9 @@ export default function Sandboxes() {
 
   const refreshAll = () => {
     void refetch()
+    // The sandbox image card on this page: Refresh updates its host status
+    // too, not only at the card's own poll.
+    void refreshSandboxImageStatus(queryClient)
     if (loadWorkspaces) {
       void applicationsQuery.refetch()
       void globalWorkspaceQuery.refetch()
@@ -538,6 +545,12 @@ export default function Sandboxes() {
             </div>
           </div>
         )}
+
+        {/* Whether each host already has the sandbox image: the first
+          sandbox on a host without it downloads several GB. */}
+        <SandboxImagePreparationCard
+          canManage={canManageSandboxPlacement(user?.role)}
+        />
 
         <ConfirmDeleteDialog
           open={stopTarget !== null}

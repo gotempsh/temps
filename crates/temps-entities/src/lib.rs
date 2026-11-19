@@ -279,6 +279,7 @@ pub mod sandbox_access_delivery;
 pub mod sandbox_access_runtimes;
 pub mod sandbox_access_services;
 pub mod sandbox_events;
+pub mod sandbox_image_preparations;
 pub mod sandbox_service_assignments;
 pub mod sandbox_service_grants;
 pub mod sandbox_services;

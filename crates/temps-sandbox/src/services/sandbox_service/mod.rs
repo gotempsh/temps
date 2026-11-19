@@ -255,6 +255,11 @@ pub struct CreateSandboxRequest {
     /// handler. Internal callers (application workspaces, agent runs) leave
     /// it `false`: they choose their own limits and are not the abuse case.
     pub enforce_operator_limits: bool,
+    /// Client-chosen id under which this create's steps can be read while
+    /// it runs (`GET /v1/sandboxes/creations/{creation_id}`). `None` = the
+    /// server generates one; the steps are still readable by sandbox id once
+    /// the row exists.
+    pub creation_id: Option<String>,
 }
 
 /// Output DTO — what the service returns to handlers and what handlers
@@ -436,6 +441,8 @@ pub struct SandboxService {
     /// as `starting`, and exec/filesystem calls are refused instead of
     /// trying to wake a container that was never made.
     creates_in_progress: Arc<CreatesInProgress>,
+    /// The steps of every create this process is running or ran recently.
+    creations: Arc<crate::services::creation_progress::CreationTracker>,
     /// This server is a control plane that runs no workloads (ADR 063):
     /// placement never picks it, and anything that needs its own host is
     /// refused with a typed error. `false` on every install that runs
@@ -554,6 +561,7 @@ impl SandboxService {
             node_probe,
             evicting_nodes: Arc::new(EvictingNodes::default()),
             creates_in_progress: Arc::new(CreatesInProgress::default()),
+            creations: Arc::default(),
             control_plane_runs_no_workloads: false,
         }
     }

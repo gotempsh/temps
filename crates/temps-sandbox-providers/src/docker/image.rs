@@ -554,159 +554,123 @@ pub(super) fn ensure_mutable_rebuild_target(image: &str) -> Result<(), AgentErro
     Ok(())
 }
 
+/// Bounds on one sandbox image pull. A registry that accepted the
+/// connection and went quiet must not hold a create (or a prepare) forever;
+/// the ceiling still leaves a multi-gigabyte image room on a slow link.
+const SANDBOX_IMAGE_PULL_TIMEOUTS: temps_docker_util::PullTimeouts =
+    temps_docker_util::PullTimeouts {
+        idle: std::time::Duration::from_secs(10 * 60),
+        total: std::time::Duration::from_secs(3 * 60 * 60),
+    };
+
+/// Ceiling on the local build a preset falls back to when its pull fails.
+/// The build compiles a helper from source, so it gets room on a small
+/// host, but a stuck daemon must not keep the pull "running" (and every
+/// create waiting on it) forever.
+const SANDBOX_IMAGE_FALLBACK_BUILD_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(2 * 60 * 60);
+
+/// Run `build` for at most `limit`, failing with a reason that names the
+/// image and the limit when it runs out.
+async fn build_within(
+    image: &str,
+    limit: std::time::Duration,
+    build: impl std::future::Future<Output = Result<(), String>>,
+) -> Result<(), String> {
+    tokio::time::timeout(limit, build)
+        .await
+        .unwrap_or_else(|_| {
+            Err(format!(
+                "the local build of image {image} did not finish within {limit:?}"
+            ))
+        })
+}
+
 impl DockerSandboxProvider {
     /// Build the sandbox image if it doesn't exist.
     /// For preset runtimes, generates a Dockerfile dynamically.
     /// For custom images, assumes the image is already available (pull or pre-built).
     ///
-    /// This is only ever called on demand — the first time a sandbox is
-    /// created (see `create()`). It is intentionally NOT invoked at startup:
-    /// pulling/building the image at boot would block or bog down the host
-    /// before anyone has actually requested an agent run.
+    /// Called on demand — by the first create that needs the image, or by an
+    /// operator's explicit "prepare sandboxes" — never at startup: pulling
+    /// at boot would bog the host down before anyone asked for a sandbox.
     pub async fn ensure_image(&self) -> Result<(), AgentError> {
         self.ensure_image_for_runtime(&self.config.runtime).await
     }
 
-    /// Build a sandbox image for a specific runtime preset.
+    /// Make a runtime preset's image (or the configured custom image)
+    /// present, joining a pull already running for it.
     pub(super) async fn ensure_image_for_runtime(&self, runtime: &str) -> Result<(), AgentError> {
-        self.ensure_image_for_runtime_with_progress(runtime, None)
-            .await
-    }
-
-    /// Build a sandbox image, optionally streaming progress via a channel.
-    async fn ensure_image_for_runtime_with_progress(
-        &self,
-        runtime: &str,
-        progress: Option<&tokio::sync::mpsc::Sender<String>>,
-    ) -> Result<(), AgentError> {
-        // Helper to send progress if a channel is provided.
-        let send = |msg: String| async {
-            if let Some(tx) = progress {
-                let _ = tx.send(msg).await;
-            }
-        };
-
-        // Custom images: just check if they exist (user must pull/build them)
-        if runtime == "custom" {
-            let img = &self.config.custom_image;
-            if img.is_empty() {
+        let image = if runtime == "custom" {
+            if self.config.custom_image.is_empty() {
                 return Err(AgentError::SandboxProviderUnavailable {
                     provider: "docker".to_string(),
                     reason: "Custom runtime selected but no image specified".to_string(),
                 });
             }
-            // Try to pull if not present locally
-            if self.docker.inspect_image(img).await.is_err() {
-                tracing::info!("Pulling custom sandbox image {}...", img);
-                temps_docker_util::pull_image(&self.docker, temps_docker_util::PullSpec::new(img))
-                    .await
-                    .map_err(|e| AgentError::SandboxProviderUnavailable {
-                        provider: "docker".to_string(),
-                        reason: format!("Failed to pull custom image {}: {}", img, e.cause_text()),
-                    })?;
-            }
-            return Ok(());
+            self.config.custom_image.clone()
+        } else {
+            image_name_for_runtime(runtime)
+        };
+        let status = self.ensure_image_present(&image, |_| {}).await;
+        match status.state {
+            crate::ImagePrepareState::Ready => Ok(()),
+            _ => Err(AgentError::SandboxProviderUnavailable {
+                provider: "docker".to_string(),
+                reason: status
+                    .error
+                    .unwrap_or_else(|| format!("image {image} could not be made available")),
+            }),
         }
+    }
 
-        let image_name = image_name_for_runtime(runtime);
-
-        // Check if image already exists locally. The image name is the
-        // fully-qualified GHCR string (incl. channel suffix), so this
-        // check correctly distinguishes a cached beta image from a
-        // cached stable one — no rename indirection masking which
-        // channel is loaded.
-        if self.docker.inspect_image(&image_name).await.is_ok() {
-            tracing::debug!("Sandbox image {} already exists", image_name);
-            return Ok(());
+    /// Make `image` present on this host: return at once when it is,
+    /// otherwise start (or join) its pull and wait for it, calling
+    /// `on_update` with every status the pull publishes.
+    ///
+    /// The presence check comes first so a call for an image already on the
+    /// host leaves the pull tracker alone: the status an operator reads keeps
+    /// describing the last real pull, not a no-op that found the image.
+    pub(super) async fn ensure_image_present(
+        &self,
+        image: &str,
+        on_update: impl FnMut(&crate::ImagePrepareStatus),
+    ) -> crate::ImagePrepareStatus {
+        if self
+            .image_pulls
+            .current(image)
+            .is_none_or(|s| s.state.is_terminal())
+            && self.docker.inspect_image(image).await.is_ok()
+        {
+            return crate::ImagePrepareStatus {
+                already_present: true,
+                ..crate::ImagePrepareStatus::new(image, crate::ImagePrepareState::Ready)
+            };
         }
+        let (rx, _) = self.start_image_pull(image);
+        image_pulls::wait_for_pull(rx, on_update).await
+    }
 
-        // Try pulling a prebuilt image from GHCR first. This is much
-        // faster than building locally (~seconds vs ~minutes) because the
-        // pushed image is a fully baked layer including Claude CLI, bun,
-        // gh, etc. If the pull fails (rate limit, no internet, image not
-        // published yet) we fall back to a local build — fail-safe, never
-        // blocks startup. The local build tags itself with the same GHCR
-        // name so the next inspect_image short-circuits as expected.
-        send(format!("Pulling {} from GHCR...", image_name)).await;
-        tracing::info!("Trying to pull sandbox image {} from GHCR...", image_name);
-        match self.try_pull(&image_name).await {
-            Ok(()) => {
-                tracing::info!("Pulled {} — skipping local build", image_name);
-                send(format!("Pulled {} — done.", image_name)).await;
-                return Ok(());
-            }
-            Err(reason) => {
-                if image_name.contains("@sha256:") {
-                    return Err(AgentError::SandboxProviderUnavailable {
-                        provider: "docker".to_string(),
-                        reason: format!(
-                            "Failed to pull pinned runtime image {image_name}: {reason}"
-                        ),
-                    });
-                }
-                tracing::info!(
-                    "Pull of {} failed ({}), falling back to local build",
-                    image_name,
-                    reason
-                );
-                send(format!("Pull failed ({}), building locally...", reason)).await;
-            }
-        }
+    /// Start pulling `image` in the background, or join the pull already
+    /// running for it. Returns its status channel and whether this call
+    /// started it.
+    pub(super) fn start_image_pull(
+        &self,
+        image: &str,
+    ) -> (
+        tokio::sync::watch::Receiver<crate::ImagePrepareStatus>,
+        bool,
+    ) {
+        let docker = Arc::clone(&self.docker);
+        let owned = image.to_string();
+        self.image_pulls.start(image, move |reporter| {
+            pull_or_build(docker, owned, reporter)
+        })
+    }
 
-        tracing::info!(
-            "Building sandbox image {} (runtime: {})...",
-            image_name,
-            runtime
-        );
-        send(format!("Building {} (runtime: {})...", image_name, runtime)).await;
-
-        let dockerfile_content = dockerfile_for_runtime(runtime);
-        let tar_buf = build_context_tar(&dockerfile_content)?;
-
-        let options = bollard::query_parameters::BuildImageOptionsBuilder::new()
-            .t(&image_name)
-            .build();
-
-        let body = http_body_util::Full::new(bytes::Bytes::from(tar_buf));
-        let mut stream =
-            self.docker
-                .build_image(options, None, Some(http_body_util::Either::Left(body)));
-
-        while let Some(result) = stream.next().await {
-            match result {
-                Ok(info) => {
-                    if let Some(ref error_detail) = info.error_detail {
-                        let msg = error_detail
-                            .message
-                            .as_deref()
-                            .unwrap_or("unknown build error");
-                        send(format!("ERROR: {}", msg)).await;
-                        return Err(AgentError::SandboxProviderUnavailable {
-                            provider: "docker".to_string(),
-                            reason: format!("Image build error: {}", msg),
-                        });
-                    }
-                    // Forward build log lines
-                    if let Some(ref line) = info.stream {
-                        let trimmed = line.trim();
-                        if !trimmed.is_empty() {
-                            send(trimmed.to_string()).await;
-                        }
-                    }
-                }
-                Err(e) => {
-                    send(format!("ERROR: {}", e)).await;
-                    return Err(AgentError::SandboxProviderUnavailable {
-                        provider: "docker".to_string(),
-                        reason: format!("Image build failed: {}", e),
-                    });
-                }
-            }
-        }
-
-        tracing::info!("Sandbox image {} built successfully", image_name);
-        send(format!("Image {} built successfully.", image_name)).await;
-        Ok(())
+    /// The running or last finished pull of `image` in this process.
+    pub(super) fn image_pull_status(&self, image: &str) -> Option<crate::ImagePrepareStatus> {
+        self.image_pulls.current(image)
     }
 
     /// Build a sandbox image locally from the generated Dockerfile.
@@ -716,81 +680,155 @@ impl DockerSandboxProvider {
         runtime: &str,
         progress: Option<&tokio::sync::mpsc::Sender<String>>,
     ) -> Result<(), AgentError> {
-        let send = |msg: String| async {
-            if let Some(tx) = progress {
-                let _ = tx.send(msg).await;
-            }
-        };
-
         let image_name = image_name_for_runtime(runtime);
+        build_preset_image(&self.docker, runtime, &image_name, progress)
+            .await
+            .map_err(|reason| AgentError::SandboxProviderUnavailable {
+                provider: "docker".to_string(),
+                reason,
+            })
+    }
+}
 
-        tracing::info!(
-            "Building sandbox image {} locally (runtime: {})...",
-            image_name,
-            runtime
-        );
-        send(format!(
-            "Building {} locally (runtime: {})...",
-            image_name, runtime
-        ))
-        .await;
+/// The job behind every sandbox image pull: nothing to do when the image is
+/// present; otherwise pull it by its exact reference (tag or digest, the
+/// one a create uses). A current runtime preset whose pull fails falls back
+/// to a local build under the same name, unless it is pinned by digest: a
+/// digest names published bytes, which a local build cannot reproduce.
+async fn pull_or_build(
+    docker: Arc<Docker>,
+    image: String,
+    mut reporter: image_pulls::PullReporter,
+) -> Result<image_pulls::PullOutcome, String> {
+    if docker.inspect_image(&image).await.is_ok() {
+        return Ok(image_pulls::PullOutcome::AlreadyPresent);
+    }
+    reporter.detail("downloading");
+    tracing::info!(image = %image, "Pulling sandbox image");
+    let pulled = temps_docker_util::pull_image_with_progress(
+        &docker,
+        temps_docker_util::PullSpec::new(&image).timeouts(SANDBOX_IMAGE_PULL_TIMEOUTS),
+        |info| reporter.on_pull_event(info),
+    )
+    .await;
+    let cause = match pulled {
+        Ok(()) => return Ok(image_pulls::PullOutcome::Pulled),
+        Err(error) => error.cause_text(),
+    };
+    let preset = selected_preset_runtime(&image).filter(|_| !image.contains("@sha256:"));
+    let Some(runtime) = preset else {
+        return Err(temps_agent_core::error::image_pull_failure_reason(
+            &image, &cause,
+        ));
+    };
+    tracing::info!(
+        image = %image,
+        reason = %cause,
+        "Pull of the sandbox image failed, falling back to a local build"
+    );
+    reporter.detail("building locally");
+    build_within(
+        &image,
+        SANDBOX_IMAGE_FALLBACK_BUILD_TIMEOUT,
+        build_preset_image(&docker, runtime, &image, None),
+    )
+    .await
+    .map(|()| image_pulls::PullOutcome::Pulled)
+    .map_err(|build| format!("{build} (after the pull failed: {cause})"))
+}
 
-        let dockerfile_content = dockerfile_for_runtime(runtime);
-        let tar_buf = build_context_tar(&dockerfile_content)?;
+/// Build a runtime preset's image from its generated Dockerfile, tagged
+/// `image_name`, forwarding build log lines to `progress`.
+async fn build_preset_image(
+    docker: &Docker,
+    runtime: &str,
+    image_name: &str,
+    progress: Option<&tokio::sync::mpsc::Sender<String>>,
+) -> Result<(), String> {
+    let send = |msg: String| async {
+        if let Some(tx) = progress {
+            let _ = tx.send(msg).await;
+        }
+    };
 
-        let options = bollard::query_parameters::BuildImageOptionsBuilder::new()
-            .t(&image_name)
-            .build();
+    tracing::info!(
+        "Building sandbox image {} locally (runtime: {})...",
+        image_name,
+        runtime
+    );
+    send(format!(
+        "Building {} locally (runtime: {})...",
+        image_name, runtime
+    ))
+    .await;
 
-        let body = http_body_util::Full::new(bytes::Bytes::from(tar_buf));
-        let mut stream =
-            self.docker
-                .build_image(options, None, Some(http_body_util::Either::Left(body)));
+    let dockerfile_content = dockerfile_for_runtime(runtime);
+    let tar_buf = build_context_tar(&dockerfile_content).map_err(|e| e.to_string())?;
 
-        while let Some(result) = stream.next().await {
-            match result {
-                Ok(info) => {
-                    if let Some(ref error_detail) = info.error_detail {
-                        let msg = error_detail
-                            .message
-                            .as_deref()
-                            .unwrap_or("unknown build error");
-                        send(format!("ERROR: {}", msg)).await;
-                        return Err(AgentError::SandboxProviderUnavailable {
-                            provider: "docker".to_string(),
-                            reason: format!("Image build error: {}", msg),
-                        });
-                    }
-                    if let Some(ref line) = info.stream {
-                        let trimmed = line.trim();
-                        if !trimmed.is_empty() {
-                            send(trimmed.to_string()).await;
-                        }
+    let options = bollard::query_parameters::BuildImageOptionsBuilder::new()
+        .t(image_name)
+        .build();
+
+    let body = http_body_util::Full::new(bytes::Bytes::from(tar_buf));
+    let mut stream = docker.build_image(options, None, Some(http_body_util::Either::Left(body)));
+
+    while let Some(result) = stream.next().await {
+        match result {
+            Ok(info) => {
+                if let Some(ref error_detail) = info.error_detail {
+                    let msg = error_detail
+                        .message
+                        .as_deref()
+                        .unwrap_or("unknown build error");
+                    send(format!("ERROR: {}", msg)).await;
+                    return Err(format!("Image build error: {}", msg));
+                }
+                if let Some(ref line) = info.stream {
+                    let trimmed = line.trim();
+                    if !trimmed.is_empty() {
+                        send(trimmed.to_string()).await;
                     }
                 }
-                Err(e) => {
-                    send(format!("ERROR: {}", e)).await;
-                    return Err(AgentError::SandboxProviderUnavailable {
-                        provider: "docker".to_string(),
-                        reason: format!("Image build failed: {}", e),
-                    });
-                }
+            }
+            Err(e) => {
+                send(format!("ERROR: {}", e)).await;
+                return Err(format!("Image build failed: {}", e));
             }
         }
-
-        tracing::info!("Sandbox image {} built successfully", image_name);
-        send(format!("Image {} built successfully.", image_name)).await;
-        Ok(())
     }
 
-    /// Pull `image` from its registry (no rename — the image lives under
-    /// its full GHCR name end-to-end). Returns `Ok(())` on success,
-    /// `Err(reason)` on any failure — callers should treat failure as
-    /// non-fatal and fall back to a local build.
-    async fn try_pull(&self, image: &str) -> Result<(), String> {
-        temps_docker_util::pull_image(&self.docker, temps_docker_util::PullSpec::new(image))
-            .await
-            .map_err(|e| e.cause_text())
+    tracing::info!("Sandbox image {} built successfully", image_name);
+    send(format!("Image {} built successfully.", image_name)).await;
+    Ok(())
+}
+
+#[cfg(test)]
+mod build_deadline_tests {
+    use super::build_within;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn a_build_that_never_ends_fails_with_the_image_and_the_limit() {
+        let result = build_within(
+            "registry.example/sandbox:1",
+            Duration::from_millis(20),
+            std::future::pending(),
+        )
+        .await;
+        let reason = result.expect_err("a stuck build must fail");
+        assert!(reason.contains("registry.example/sandbox:1"), "{reason}");
+        assert!(reason.contains("did not finish within 20ms"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn a_build_that_ends_in_time_keeps_its_result() {
+        let ok = build_within("img", Duration::from_secs(60), async { Ok(()) }).await;
+        assert_eq!(ok, Ok(()));
+        let failed = build_within("img", Duration::from_secs(60), async {
+            Err("Image build error: boom".to_string())
+        })
+        .await;
+        assert_eq!(failed, Err("Image build error: boom".to_string()));
     }
 }
 

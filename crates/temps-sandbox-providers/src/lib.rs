@@ -17,6 +17,7 @@ pub mod firecracker;
 pub mod git_credential_bundle;
 pub mod guest_agent_build;
 pub mod image_archive;
+pub mod image_prepare;
 pub mod image_user;
 pub mod local;
 pub mod managed;
@@ -51,6 +52,11 @@ pub fn home_volume_name_for_label(label: &str) -> String {
 /// A sandbox's outbound policy (which hosts and CIDR blocks it may reach).
 pub use temps_workload::{
     EgressMode, EgressPolicyError, EgressRule, SandboxEgressPolicy, MAX_EGRESS_RULES,
+};
+
+pub use image_prepare::{
+    report_create_phase, with_create_progress, CreatePhase, CreatePhaseEvent, CreateProgressSink,
+    ImagePrepareState, ImagePrepareStatus, ImageRemoval,
 };
 
 pub use temps_agent_core::sandbox_user as user;
@@ -1647,6 +1653,84 @@ done
 
     /// Delete and rebuild the sandbox image. Returns the image name.
     async fn rebuild_image(&self) -> Result<String, AgentError>;
+
+    /// Start pulling `image` (the default a create would use when `None`)
+    /// for `backend` (the host default when `None`) in the background, or
+    /// join the pull already running for it, and return its status. The
+    /// pull outlives the caller. Default: this provider has no image to
+    /// pull, reported as [`ImagePrepareState::Unsupported`].
+    async fn prepare_image(
+        &self,
+        image: Option<&str>,
+        backend: Option<SandboxBackend>,
+    ) -> Result<ImagePrepareStatus, AgentError> {
+        let _ = backend;
+        Ok(ImagePrepareStatus::unsupported(
+            image.unwrap_or_default(),
+            format!(
+                "the '{}' sandbox provider has no image to pull ahead of a create",
+                self.name()
+            ),
+        ))
+    }
+
+    /// Status of `image` (the create default when `None`) on this host,
+    /// without starting anything.
+    async fn image_prepare_status(
+        &self,
+        image: Option<&str>,
+        backend: Option<SandboxBackend>,
+    ) -> Result<ImagePrepareStatus, AgentError> {
+        let _ = backend;
+        Ok(ImagePrepareStatus::unsupported(
+            image.unwrap_or_default(),
+            format!(
+                "the '{}' sandbox provider has no image to pull ahead of a create",
+                self.name()
+            ),
+        ))
+    }
+
+    /// Remove an image this host prepared earlier and no longer needs, never
+    /// forcing it: an image a container still uses is left in place.
+    async fn remove_prepared_image(&self, image: &str) -> Result<ImageRemoval, AgentError> {
+        let _ = image;
+        Ok(ImageRemoval::Unsupported)
+    }
+
+    /// [`prepare_image`](Self::prepare_image) on a specific node (ADR-048).
+    /// `None` = the local host. Single-host providers only know the local
+    /// host; [`node_routing::NodeRoutingSandboxProvider`] asks the worker.
+    async fn prepare_image_on(
+        &self,
+        node_id: Option<i32>,
+        image: Option<&str>,
+        backend: Option<SandboxBackend>,
+    ) -> Result<ImagePrepareStatus, AgentError> {
+        let _ = node_id;
+        self.prepare_image(image, backend).await
+    }
+
+    /// [`image_prepare_status`](Self::image_prepare_status) on a node.
+    async fn image_prepare_status_on(
+        &self,
+        node_id: Option<i32>,
+        image: Option<&str>,
+        backend: Option<SandboxBackend>,
+    ) -> Result<ImagePrepareStatus, AgentError> {
+        let _ = node_id;
+        self.image_prepare_status(image, backend).await
+    }
+
+    /// [`remove_prepared_image`](Self::remove_prepared_image) on a node.
+    async fn remove_prepared_image_on(
+        &self,
+        node_id: Option<i32>,
+        image: &str,
+    ) -> Result<ImageRemoval, AgentError> {
+        let _ = node_id;
+        self.remove_prepared_image(image).await
+    }
 
     /// Report rootfs storage for the management API. Default: empty —
     /// backends without a rootfs cache (Docker, local) have nothing to show.

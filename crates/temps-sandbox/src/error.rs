@@ -170,6 +170,21 @@ pub enum SandboxError {
     #[error("Job {job_id} not found in sandbox {sandbox_id}")]
     JobNotFound { sandbox_id: String, job_id: String },
 
+    /// A create's progress was asked for by a `creation_id` this server is
+    /// not tracking for the caller: unknown, another user's, or finished
+    /// long enough ago to have been dropped.
+    #[error("No sandbox create with creation_id '{creation_id}' is tracked for user {user_id}")]
+    CreationNotFound { creation_id: String, user_id: i32 },
+
+    /// The client-chosen `creation_id` of a create is malformed.
+    #[error("creation_id '{creation_id}' is invalid: use 8 to 64 letters, digits, '-' or '_'")]
+    CreationIdInvalid { creation_id: String },
+
+    /// The client-chosen `creation_id` already names another create of the
+    /// same user.
+    #[error("creation_id '{creation_id}' is already used by another sandbox create of user {user_id}; generate a new one per create")]
+    CreationIdInUse { creation_id: String, user_id: i32 },
+
     /// The underlying provider failed to create the container.
     #[error("Failed to create sandbox for user {user_id}: {reason}")]
     CreateFailed { user_id: i32, reason: String },

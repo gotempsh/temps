@@ -398,6 +398,61 @@ impl SandboxProvider for NodeRoutingSandboxProvider {
             .await
     }
 
+    async fn prepare_image(
+        &self,
+        image: Option<&str>,
+        backend: Option<SandboxBackend>,
+    ) -> Result<crate::ImagePrepareStatus, AgentError> {
+        self.local.prepare_image(image, backend).await
+    }
+
+    async fn image_prepare_status(
+        &self,
+        image: Option<&str>,
+        backend: Option<SandboxBackend>,
+    ) -> Result<crate::ImagePrepareStatus, AgentError> {
+        self.local.image_prepare_status(image, backend).await
+    }
+
+    async fn remove_prepared_image(&self, image: &str) -> Result<crate::ImageRemoval, AgentError> {
+        self.local.remove_prepared_image(image).await
+    }
+
+    async fn prepare_image_on(
+        &self,
+        node_id: Option<i32>,
+        image: Option<&str>,
+        backend: Option<SandboxBackend>,
+    ) -> Result<crate::ImagePrepareStatus, AgentError> {
+        self.for_node(node_id)
+            .await?
+            .prepare_image(image, backend)
+            .await
+    }
+
+    async fn image_prepare_status_on(
+        &self,
+        node_id: Option<i32>,
+        image: Option<&str>,
+        backend: Option<SandboxBackend>,
+    ) -> Result<crate::ImagePrepareStatus, AgentError> {
+        self.for_node(node_id)
+            .await?
+            .image_prepare_status(image, backend)
+            .await
+    }
+
+    async fn remove_prepared_image_on(
+        &self,
+        node_id: Option<i32>,
+        image: &str,
+    ) -> Result<crate::ImageRemoval, AgentError> {
+        self.for_node(node_id)
+            .await?
+            .remove_prepared_image(image)
+            .await
+    }
+
     fn supports_backend(&self, backend: SandboxBackend) -> bool {
         self.local.supports_backend(backend)
     }

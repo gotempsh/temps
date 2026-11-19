@@ -144,6 +144,36 @@ impl SandboxProvider for NoLocalSandboxProvider {
     async fn rebuild_image(&self) -> Result<String, AgentError> {
         Self::refuse("Building the sandbox image")
     }
+
+    async fn prepare_image(
+        &self,
+        image: Option<&str>,
+        _backend: Option<SandboxBackend>,
+    ) -> Result<crate::ImagePrepareStatus, AgentError> {
+        Ok(Self::nothing_to_prepare(image))
+    }
+
+    async fn image_prepare_status(
+        &self,
+        image: Option<&str>,
+        _backend: Option<SandboxBackend>,
+    ) -> Result<crate::ImagePrepareStatus, AgentError> {
+        Ok(Self::nothing_to_prepare(image))
+    }
+}
+
+impl NoLocalSandboxProvider {
+    /// This control plane runs no sandboxes, so it has no image to prepare;
+    /// its workers do.
+    fn nothing_to_prepare(image: Option<&str>) -> crate::ImagePrepareStatus {
+        crate::ImagePrepareStatus::unsupported(
+            image.unwrap_or_default(),
+            AgentError::NoLocalSandboxHost {
+                operation: "Preparing the sandbox image".to_string(),
+            }
+            .to_string(),
+        )
+    }
 }
 
 #[cfg(test)]

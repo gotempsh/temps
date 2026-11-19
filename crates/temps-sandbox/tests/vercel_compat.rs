@@ -112,6 +112,16 @@ fn expected_sdk_paths() -> Vec<&'static str> {
         // Directory listing and preview access checks (temps extensions).
         "/v1/sandboxes/{id}/fs/list",
         "/v1/sandboxes/{id}/preview-access",
+        // A create's ordered steps, read while `POST /v1/sandboxes` runs
+        // (by the client's `creation_id`) or afterwards by sandbox (temps
+        // extension).
+        "/v1/sandboxes/creations/{creation_id}",
+        "/v1/sandboxes/{id}/creation",
+        // Pulling the default sandbox image on each host ahead of the first
+        // create, and the per-host policy that keeps it pulled (temps
+        // extension).
+        "/v1/sandboxes/image-preparation",
+        "/v1/sandboxes/image-preparation/nodes/{node_id}",
     ]
 }
 
