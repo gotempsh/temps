@@ -265,6 +265,23 @@ fn tunnel_service_hostnames(hosts: Option<&Vec<String>>, route_label: &str) -> V
         .collect()
 }
 
+/// Every public Compose service beside each tunnel host of an environment
+/// (ADR 068 D3): the same names the awake path routes, so a sleeping
+/// environment still wakes on them and a control-plane tunnel keeps
+/// publishing them (ADR-107 D4).
+fn compose_tunnel_service_hostnames(
+    preset_config: Option<&temps_entities::preset::PresetConfig>,
+    tunnel_hosts: Option<&Vec<String>>,
+) -> Vec<String> {
+    let Some(temps_entities::preset::PresetConfig::DockerCompose(config)) = preset_config else {
+        return Vec::new();
+    };
+    temps_entities::preset::compose_public_route_labels(&config.public_ports)
+        .iter()
+        .flat_map(|label| tunnel_service_hostnames(tunnel_hosts, label))
+        .collect()
+}
+
 fn compose_public_service_hostnames(
     preset_config: Option<&temps_entities::preset::PresetConfig>,
     preview_domain: &str,
@@ -4830,6 +4847,33 @@ mod tests {
             ]
         );
         assert!(tunnel_service_hostnames(None, "api").is_empty());
+    }
+
+    /// A sleeping Compose environment wakes on (and a control-plane tunnel
+    /// keeps publishing) every tunnel-form service host, as when awake.
+    #[test]
+    fn a_sleeping_compose_environment_keeps_its_tunnel_service_hostnames() {
+        use temps_entities::preset::{DockerComposeConfig, PresetConfig};
+        let route = |service: &str, port: u16| ComposePublicPort {
+            service: service.to_string(),
+            port,
+            ..Default::default()
+        };
+        let config = PresetConfig::DockerCompose(DockerComposeConfig {
+            public_ports: vec![route("web", 3000), route("web", 9222), route("api", 8080)],
+            ..Default::default()
+        });
+        let tunnel_hosts = vec!["shop-staging.tunnel.example.com".to_string()];
+        assert_eq!(
+            compose_tunnel_service_hostnames(Some(&config), Some(&tunnel_hosts)),
+            vec![
+                "shop-staging--web.tunnel.example.com".to_string(),
+                "shop-staging--web-9222.tunnel.example.com".to_string(),
+                "shop-staging--api.tunnel.example.com".to_string(),
+            ]
+        );
+        assert!(compose_tunnel_service_hostnames(Some(&config), None).is_empty());
+        assert!(compose_tunnel_service_hostnames(None, Some(&tunnel_hosts)).is_empty());
     }
 
     #[test]

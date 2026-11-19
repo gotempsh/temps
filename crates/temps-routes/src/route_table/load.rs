@@ -1297,12 +1297,21 @@ impl CachedPeerTable {
                     }
                     if let Some(project) = projects_cache.get(&env.project_id) {
                         let strategy = match_strategy(hostname_strategies, preview_domain);
+                        // ADR 068 D3 / ADR-107 D4: and the same services
+                        // beside each tunnel host, as the awake path routes.
+                        let tunnel_services = compose_tunnel_service_hostnames(
+                            project.preset_config.as_ref(),
+                            tunnel_environment_hosts.get(&env.id),
+                        );
                         for domain in compose_public_service_hostnames(
                             project.preset_config.as_ref(),
                             preview_domain,
                             strategy,
                             main_url,
-                        ) {
+                        )
+                        .into_iter()
+                        .chain(tunnel_services)
+                        {
                             sleeping_environments.push(SleepingEnvironmentEntry {
                                 domain,
                                 environment_id: env.id,
