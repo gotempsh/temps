@@ -55,11 +55,22 @@ pub trait LocalConnectorRuntime: Send + Sync {
 pub struct ControlPlaneHandle {
     origin: Arc<ControlPlaneTunnelOrigin>,
     wake: Arc<Notify>,
+    /// Shared by every service instance holding this handle, so the
+    /// console's and the loop's configurations of one tunnel never overlap.
+    locks: Arc<crate::service::ConnectorLocks>,
 }
 
 impl ControlPlaneHandle {
     pub fn new(origin: Arc<ControlPlaneTunnelOrigin>, wake: Arc<Notify>) -> Self {
-        Self { origin, wake }
+        Self {
+            origin,
+            wake,
+            locks: crate::service::ConnectorLocks::new(),
+        }
+    }
+
+    pub(crate) fn connector_locks(&self) -> &crate::service::ConnectorLocks {
+        &self.locks
     }
 
     /// A handle on `origin` with its own wake-up: one per process, shared

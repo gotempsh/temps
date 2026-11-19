@@ -100,4 +100,17 @@ impl IngressConnectorService {
         }
         Ok(())
     }
+
+    /// Whether connector `id` is placed on the control plane and nowhere
+    /// else: the only placement whose port follows the control plane's.
+    pub(super) async fn runs_only_on_control_plane(&self, id: i32) -> Result<bool, IngressError> {
+        let nodes: Vec<i32> = ingress_connector_nodes::Entity::find()
+            .filter(ingress_connector_nodes::Column::ConnectorId.eq(id))
+            .all(self.db.as_ref())
+            .await?
+            .into_iter()
+            .map(|row| row.node_id)
+            .collect();
+        Ok(!nodes.is_empty() && nodes.iter().all(|node| *node == CONTROL_PLANE_NODE_ID))
+    }
 }

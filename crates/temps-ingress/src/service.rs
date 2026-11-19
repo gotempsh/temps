@@ -37,6 +37,7 @@ use crate::wire::{NodeConnectorSpec, NodeConnectorStatusReport, NodeConnectorsRe
 
 mod control_plane_ports;
 mod ensure;
+pub(crate) use ensure::ConnectorLocks;
 
 /// The DNS controller name stamped on the records this service owns.
 const DNS_CONTROLLER: &str = "ingress-connector";
@@ -51,9 +52,6 @@ const SETUP_SECRETS_KEY: &str = "setup_secrets";
 /// When one of them stops running the tunnel the secret is rotated, so it
 /// cannot keep serving the tunnel's traffic.
 const TOKEN_HOLDERS_KEY: &str = "token_holders";
-/// Settings key: the generation of the newest provider configuration
-/// started for the connector (`service/ensure.rs`).
-const ENSURE_GENERATION_KEY: &str = "ensure_generation";
 /// How `last_error` starts when rotating the secret failed, so a later
 /// success clears only that error.
 const ROTATION_ERROR: &str = "Could not revoke the tunnel secret";
@@ -445,6 +443,9 @@ pub struct IngressConnectorService {
     /// Set when this process runs connectors on the control plane
     /// (ADR-107 D2); see [`Self::attach_control_plane`].
     control_plane: OnceLock<crate::control_plane::ControlPlaneHandle>,
+    /// Orders configurations of one tunnel when no control-plane handle
+    /// shares the process-wide ones (`service/ensure.rs`).
+    own_locks: Arc<ConnectorLocks>,
 }
 
 impl IngressConnectorService {
@@ -473,6 +474,17 @@ impl IngressConnectorService {
             settings_lock: tokio::sync::Mutex::new(()),
             environment_hosts: OnceLock::new(),
             control_plane: OnceLock::new(),
+            own_locks: ConnectorLocks::new(),
+        }
+    }
+
+    /// The per-connector locks every service instance of this process
+    /// shares: the control-plane handle's once attached, otherwise this
+    /// instance's own (it is then the only one configuring tunnels).
+    fn connector_locks(&self) -> &ConnectorLocks {
+        match self.control_plane.get() {
+            Some(handle) => handle.connector_locks(),
+            None => &self.own_locks,
         }
     }
 
@@ -1677,6 +1689,9 @@ impl IngressConnectorService {
     }
 
     async fn replace_nodes(&self, connector_id: i32, node_ids: &[i32]) -> Result<(), IngressError> {
+        // Never while the tunnel is being configured: a port move checks the
+        // placement under this lock (`service/ensure.rs`).
+        let _serialized = self.connector_locks().lock(connector_id).await;
         let wanted: BTreeSet<i32> = node_ids.iter().copied().collect();
         // Recorded before a new node can fetch the secret, so it is rotated
         // once that node leaves even if it leaves right away.
@@ -2972,12 +2987,7 @@ fn keep_setup(old: &serde_json::Value, new: serde_json::Value) -> serde_json::Va
     let serde_json::Value::Object(mut merged) = new else {
         return new;
     };
-    for key in [
-        SETUP_KEY,
-        SETUP_SECRETS_KEY,
-        TOKEN_HOLDERS_KEY,
-        ENSURE_GENERATION_KEY,
-    ] {
+    for key in [SETUP_KEY, SETUP_SECRETS_KEY, TOKEN_HOLDERS_KEY] {
         if let Some(value) = old.get(key) {
             merged.insert(key.into(), value.clone());
         }
@@ -3991,12 +4001,11 @@ mod tests {
             drop(test_db);
         }
 
-        /// The other order: a sync that read the old port is still at the
-        /// provider when a move claims, configures and saves the new port.
-        /// The sync's call may land last, so it is superseded and applies the
-        /// moved port again instead of saving the old one.
+        /// The other order: a sync is at the provider when the move starts.
+        /// The move waits for it, then configures and saves the new port, so
+        /// the sync's call can never land after the move's.
         #[tokio::test]
-        async fn a_sync_overtaken_by_a_port_move_applies_the_moved_port_again() {
+        async fn a_port_move_waits_for_a_sync_at_the_provider() {
             let Some((test_db, service, calls, id)) = setup_with(Some(7481)).await else {
                 return;
             };
@@ -4014,33 +4023,131 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(10), calls.held.notified())
                 .await
                 .expect("the sync reached the provider");
-
-            // The move runs to the end meanwhile: nothing waits on the sync.
-            tokio::time::timeout(
-                Duration::from_secs(10),
-                service.align_control_plane_edge_ports(7481),
-            )
-            .await
-            .expect("the move is not blocked by the sync")
-            .expect("moved");
-            assert_eq!(service.find(id).await.expect("row").edge_port, 7481);
+            let mover = {
+                let service = service.clone();
+                tokio::spawn(async move { service.align_control_plane_edge_ports(7481).await })
+            };
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(!mover.is_finished(), "the move must wait for the sync");
+            assert_eq!(calls.ensure.load(Ordering::SeqCst), 1);
 
             calls.release.notify_one();
-            tokio::time::timeout(Duration::from_secs(10), syncer)
-                .await
-                .expect("sync finished")
-                .expect("join")
-                .expect("synced");
-
+            for task in [syncer, mover] {
+                tokio::time::timeout(Duration::from_secs(10), task)
+                    .await
+                    .expect("finished")
+                    .expect("join")
+                    .expect("ok");
+            }
             let row = service.find(id).await.expect("row");
             assert_eq!(row.edge_port, 7481);
             assert_eq!(
                 i32::from(calls.ensured_port.load(Ordering::SeqCst)),
-                row.edge_port,
-                "the sync's late call left the provider on the old port"
+                row.edge_port
             );
-            // The sync, the move, and the sync once more.
-            assert_eq!(calls.ensure.load(Ordering::SeqCst), 3);
+            drop(test_db);
+        }
+
+        /// A worker added while the move waited for the tunnel's lock wins:
+        /// the move re-checks the placement under that lock and leaves the
+        /// port alone, since every worker binds it itself.
+        #[tokio::test]
+        async fn a_port_move_is_dropped_when_the_tunnel_gains_a_worker_meanwhile() {
+            let Some((test_db, service, calls, id)) = setup_with(Some(7481)).await else {
+                return;
+            };
+            let db = test_db.connection_arc();
+            let worker = insert_node(db.as_ref(), "worker-a", "worker", "active").await;
+            service
+                .replace_nodes(id, &[CONTROL_PLANE_NODE_ID])
+                .await
+                .expect("placed on the control plane");
+
+            // A sync holds the tunnel; the placement change queues first,
+            // then the move, which still sees a control-plane-only tunnel.
+            calls.hold_next.store(true, Ordering::SeqCst);
+            let syncer = {
+                let service = service.clone();
+                tokio::spawn(async move { service.sync(id).await.map(|_| ()) })
+            };
+            tokio::time::timeout(Duration::from_secs(10), calls.held.notified())
+                .await
+                .expect("the sync reached the provider");
+            let placing = {
+                let service = service.clone();
+                tokio::spawn(async move {
+                    service
+                        .replace_nodes(id, &[CONTROL_PLANE_NODE_ID, worker])
+                        .await
+                })
+            };
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let mover = {
+                let service = service.clone();
+                tokio::spawn(async move { service.align_control_plane_edge_ports(7481).await })
+            };
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            calls.release.notify_one();
+            for task in [syncer, placing, mover] {
+                tokio::time::timeout(Duration::from_secs(10), task)
+                    .await
+                    .expect("finished")
+                    .expect("join")
+                    .expect("ok");
+            }
+            assert_eq!(service.find(id).await.expect("row").edge_port, 8443);
+            assert_eq!(calls.ensure.load(Ordering::SeqCst), 1, "only the sync");
+            drop(test_db);
+        }
+
+        /// A placement change waits for a port move at the provider, so a
+        /// worker never joins a tunnel between the move's placement check and
+        /// its saved port.
+        #[tokio::test]
+        async fn a_placement_change_waits_for_a_port_move_at_the_provider() {
+            let Some((test_db, service, calls, id)) = setup_with(Some(7481)).await else {
+                return;
+            };
+            let db = test_db.connection_arc();
+            let worker = insert_node(db.as_ref(), "worker-a", "worker", "active").await;
+            service
+                .replace_nodes(id, &[CONTROL_PLANE_NODE_ID])
+                .await
+                .expect("placed on the control plane");
+
+            calls.hold_next.store(true, Ordering::SeqCst);
+            let mover = {
+                let service = service.clone();
+                tokio::spawn(async move { service.align_control_plane_edge_ports(7481).await })
+            };
+            tokio::time::timeout(Duration::from_secs(10), calls.held.notified())
+                .await
+                .expect("the move reached the provider");
+            let placing = {
+                let service = service.clone();
+                tokio::spawn(async move {
+                    service
+                        .replace_nodes(id, &[CONTROL_PLANE_NODE_ID, worker])
+                        .await
+                })
+            };
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(
+                !placing.is_finished(),
+                "the placement must wait for the move"
+            );
+
+            calls.release.notify_one();
+            for task in [mover, placing] {
+                tokio::time::timeout(Duration::from_secs(10), task)
+                    .await
+                    .expect("finished")
+                    .expect("join")
+                    .expect("ok");
+            }
+            // The move finished first; the worker then binds the moved port.
+            assert_eq!(service.find(id).await.expect("row").edge_port, 7481);
             drop(test_db);
         }
 

@@ -3,84 +3,84 @@
 
 //! Configuring a tunnel at its provider and saving the outcome.
 //!
-//! Two runs for one connector can overlap: the console's sync and the
-//! control-plane loop's port move (ADR-107 D3) run on different service
-//! instances. The provider call is slow, so no lock or pooled connection is
-//! held across it. Instead each run claims a generation on the row before
-//! calling the provider and saves only if it is still the newest; a run a
-//! newer one superseded applies the row's settings again. The port is
-//! settled at the claim, so every run started after a move configures the
-//! moved port, and the last configuration the provider receives is the one
-//! the row holds.
+//! Two service instances configure tunnels in one process: the console's
+//! (create, sync) and the control-plane loop's (moving a tunnel to the port
+//! the proxy listens on, ADR-107 D3). Only one control-plane process owns a
+//! database at a time (`temps serve` takes an owner lock at startup), so a
+//! per-connector lock in that process orders every configuration of a
+//! tunnel: a run reads the row, calls the provider and saves the outcome
+//! before the next one reads anything. The last configuration the provider
+//! receives is therefore always the one saved.
+//!
+//! The lock is a tokio mutex per connector, not a database lock: waiting on
+//! it holds no pooled connection, and it orders only runs for the same
+//! tunnel, which must not overlap anyway.
+
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use chrono::Utc;
 use sea_orm::sea_query::Expr;
 use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set, TransactionTrait};
 use temps_core::DBDateTime;
 use temps_entities::{ingress_connectors, ingress_publications};
-use tracing::{debug, info, warn};
+use tokio::sync::{Mutex, OwnedMutexGuard};
+use tracing::info;
 
-use super::{
-    is_deleting, keep_setup, tunnel_replaced, IngressConnectorService, ENSURE_GENERATION_KEY, STALE,
-};
+use super::{is_deleting, keep_setup, tunnel_replaced, IngressConnectorService, STALE};
 use crate::error::IngressError;
 use crate::provider::TunnelContext;
 
-/// Runs before giving up on a connector whose configuration keeps being
-/// superseded: the newest run then saves the outcome.
-const ENSURE_ATTEMPTS: usize = 3;
-
-/// What one run left the row with.
-enum Finished {
-    Saved,
-    /// A newer run started while this one called the provider.
-    Superseded,
+/// One lock per connector, shared by every service instance of the
+/// process that configures tunnels (through the control-plane handle).
+#[derive(Default)]
+pub struct ConnectorLocks {
+    locks: Mutex<HashMap<i32, Arc<Mutex<()>>>>,
 }
 
-/// The row as a run claimed it.
-struct Claim {
-    connector: ingress_connectors::Model,
-    /// `None` only when the stored settings are not an object, so no
-    /// generation can be kept; such a row is not ordered.
-    generation: Option<u64>,
-    /// The port before the claim: restored if the provider refused a move.
-    previous_port: i32,
+impl ConnectorLocks {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Wait until no other run holds connector `id`, then hold it until the
+    /// guard is dropped. Entries nobody holds or waits for are dropped, so
+    /// the map stays as small as the tunnels in use.
+    pub(crate) async fn lock(&self, id: i32) -> OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self.locks.lock().await;
+            locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+            Arc::clone(locks.entry(id).or_default())
+        };
+        lock.lock_owned().await
+    }
 }
 
 impl IngressConnectorService {
     /// Create or adopt the provider-side tunnel and store the outcome on the
     /// row, so a failure is visible on the connector rather than lost.
-    /// `edge_port`: the port to configure instead of the stored one
-    /// (`align_control_plane_edge_ports`), kept only when the provider
-    /// accepted it.
+    ///
+    /// `edge_port`: move the tunnel to this port
+    /// (`align_control_plane_edge_ports`). Applied only while the tunnel
+    /// still runs on the control plane alone, checked under the lock that
+    /// placement changes take too, and saved only once the provider
+    /// accepted it: an interrupted or refused move leaves the stored port,
+    /// so the next pass moves it again.
     pub(super) async fn ensure(&self, id: i32, edge_port: Option<i32>) -> Result<(), IngressError> {
-        let mut edge_port = edge_port;
-        for attempt in 1..=ENSURE_ATTEMPTS {
-            match self.ensure_once(id, edge_port.take()).await? {
-                Finished::Saved => return Ok(()),
-                Finished::Superseded => debug!(
-                    connector_id = id,
-                    attempt,
-                    "a newer configuration of this tunnel started meanwhile; applying the stored one again"
-                ),
-            }
+        let _serialized = self.connector_locks().lock(id).await;
+        let mut connector = self.find(id).await?;
+        if is_deleting(&connector) {
+            return Ok(());
         }
-        warn!(
-            connector_id = id,
-            attempts = ENSURE_ATTEMPTS,
-            "this tunnel's configuration kept being superseded; the newest run saves the outcome"
-        );
-        Ok(())
-    }
-
-    async fn ensure_once(&self, id: i32, edge_port: Option<i32>) -> Result<Finished, IngressError> {
-        let Some(claim) = self.claim_ensure(id, edge_port).await? else {
-            return Ok(Finished::Saved);
-        };
-        let connector = &claim.connector;
+        if let Some(port) = edge_port {
+            if connector.edge_port == port || !self.runs_only_on_control_plane(id).await? {
+                return Ok(());
+            }
+            connector.edge_port = port;
+        }
         let outcome = async {
-            let provider = self.provider_for(connector).await?;
-            let existing = self.handle_of(connector)?;
+            let provider = self.provider_for(&connector).await?;
+            let existing = self.handle_of(&connector)?;
             let instance_id = self.records.instance_id().await?;
             provider
                 .ensure(&TunnelContext {
@@ -105,17 +105,11 @@ impl IngressConnectorService {
             drop(txn);
             // Removed meanwhile: nothing it made is kept.
             if let Ok(handle) = &outcome {
-                if let Ok(provider) = self.provider_for(connector).await {
+                if let Ok(provider) = self.provider_for(&connector).await {
                     let _ = provider.delete(handle).await;
                 }
             }
-            return Ok(Finished::Saved);
-        }
-        if ensure_generation(&current.settings) != claim.generation {
-            // A newer run claimed the row after this one: its outcome is the
-            // one to keep, and this run's call may have reached the provider
-            // after it, so the stored configuration is applied again.
-            return Ok(Finished::Superseded);
+            return Ok(());
         }
         let mut row: ingress_connectors::ActiveModel = connector.clone().into();
         row.updated_at = Set(Utc::now());
@@ -127,6 +121,8 @@ impl IngressConnectorService {
                     .map_err(|e| IngressError::Encryption(e.to_string()))?;
                 let replaced = tunnel_replaced(current.external_id.as_deref(), &handle.external_id);
                 row.external_id = Set(Some(handle.external_id));
+                // The port the provider now sends visitors to.
+                row.edge_port = Set(connector.edge_port);
                 row.settings = Set(keep_setup(&current.settings, handle.settings));
                 row.secret_encrypted = Set(Some(secret));
                 row.status = Set("ready".into());
@@ -156,12 +152,10 @@ impl IngressConnectorService {
                     );
                 }
                 txn.commit().await?;
-                Ok(Finished::Saved)
+                Ok(())
             }
             Err(error) => {
-                // The provider kept its previous configuration: so does the
-                // row, and the error says why.
-                row.edge_port = Set(claim.previous_port);
+                // The stored port stays: the provider did not take the new one.
                 row.status = Set("error".into());
                 row.last_error = Set(Some(error.to_string()));
                 row.update(&txn).await?;
@@ -170,52 +164,4 @@ impl IngressConnectorService {
             }
         }
     }
-
-    /// Claim the next generation and settle the port, in one short
-    /// transaction. `None` when the connector is being removed.
-    async fn claim_ensure(
-        &self,
-        id: i32,
-        edge_port: Option<i32>,
-    ) -> Result<Option<Claim>, IngressError> {
-        let _guard = self.settings_lock.lock().await;
-        let txn = self.db.begin().await?;
-        let mut connector = Self::find_for_update(&txn, id).await?;
-        if is_deleting(&connector) {
-            return Ok(None);
-        }
-        let previous_port = connector.edge_port;
-        let generation = match &mut connector.settings {
-            serde_json::Value::Object(map) => {
-                let next = map
-                    .get(ENSURE_GENERATION_KEY)
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0)
-                    .saturating_add(1);
-                map.insert(ENSURE_GENERATION_KEY.into(), serde_json::json!(next));
-                Some(next)
-            }
-            _ => None,
-        };
-        if let Some(port) = edge_port {
-            connector.edge_port = port;
-        }
-        let mut row: ingress_connectors::ActiveModel = connector.clone().into();
-        row.settings = Set(connector.settings.clone());
-        row.edge_port = Set(connector.edge_port);
-        row.update(&txn).await?;
-        txn.commit().await?;
-        Ok(Some(Claim {
-            connector,
-            generation,
-            previous_port,
-        }))
-    }
-}
-
-/// The generation of the newest configuration started for a connector.
-fn ensure_generation(settings: &serde_json::Value) -> Option<u64> {
-    settings
-        .get(ENSURE_GENERATION_KEY)
-        .and_then(serde_json::Value::as_u64)
 }
