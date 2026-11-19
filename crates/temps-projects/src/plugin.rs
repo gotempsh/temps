@@ -91,6 +91,11 @@ impl TempsPlugin for ProjectsPlugin {
             let operations_service = Arc::new(OperationsService::new(db.clone()));
             context.register_service(operations_service);
 
+            // Where apps send telemetry, for the framework-agnostic setup
+            let ingest_setup_service =
+                Arc::new(crate::services::IngestSetupService::new(db.clone()));
+            context.register_service(ingest_setup_service);
+
             tracing::debug!("Projects plugin services registered successfully");
             Ok(())
         })
@@ -136,6 +141,11 @@ impl TempsPlugin for ProjectsPlugin {
         // final policy implementation is guaranteed to be registered.
         let sensitive_action_authorizer =
             context.require_service::<dyn temps_core::SensitiveActionAuthorizer>();
+        let ingest_setup_state = Arc::new(crate::handlers::ingest_setup::IngestSetupAppState {
+            ingest_setup_service: context.require_service::<crate::services::IngestSetupService>(),
+            config_service: config_service.clone(),
+            project_access_checker: project_access_checker.clone(),
+        });
         let app_state = Arc::new(crate::handlers::AppState {
             project_service,
             external_service_manager,
@@ -160,6 +170,10 @@ impl TempsPlugin for ProjectsPlugin {
             .merge(
                 crate::handlers::operations::configure_operations_routes()
                     .with_state(operations_state),
+            )
+            .merge(
+                crate::handlers::ingest_setup::configure_ingest_setup_routes()
+                    .with_state(ingest_setup_state),
             );
         Some(PluginRoutes::new(routes))
     }
