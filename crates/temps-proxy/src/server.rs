@@ -904,8 +904,10 @@ pub fn setup_proxy_server(
     // listener once it runs, so it is bound now whether or not a tunnel runs
     // here yet.
     if let Some(origin) = proxy_config.tunnel_origin.as_deref() {
-        let address = temps_core::tunnel_origin::tunnel_origin_address();
-        if tunnel_origin_bindable(address) {
+        if let Some(address) = first_bindable_tunnel_origin(tunnel_origin_candidates_for(
+            &proxy_config,
+            temps_core::tunnel_origin::tunnel_origin_candidates(),
+        )) {
             proxy_service.add_tcp(&address.to_string());
             origin.mark_bound(address.port());
             info!(%address, "Tunnel origin listener configured for the control plane's tunnels");
@@ -997,25 +999,68 @@ fn preflight_check_listen_addresses(proxy_config: &ProxyConfig) -> Result<()> {
     Ok(())
 }
 
-/// Whether the control plane's tunnel origin can be bound. Unlike the main
-/// listeners a conflict is not fatal: the proxy serves without it, and a
-/// tunnel placed on the control plane reports why it cannot start
-/// (ADR-107 D3).
-fn tunnel_origin_bindable(address: std::net::SocketAddr) -> bool {
-    match std::net::TcpListener::bind(address) {
-        Ok(_) => true,
-        Err(error) => {
-            tracing::warn!(
-                %address,
-                %error,
-                "the control plane's tunnel origin could not listen, so tunnels cannot run on \
-                 the control plane until the port is free and Temps restarts \
-                 (`ss -ltnp 'sport = :{}'` shows what holds it)",
-                address.port()
-            );
-            false
+/// `candidates` without the ports this process's own listeners use (HTTP,
+/// TLS, the console's): they are not bound yet when the tunnel origin is
+/// chosen, so probing would find them free. Compared by port alone, so a
+/// wildcard listener (`0.0.0.0:7481`) excludes its loopback form too.
+fn tunnel_origin_candidates_for(
+    proxy_config: &ProxyConfig,
+    candidates: impl IntoIterator<Item = std::net::SocketAddr>,
+) -> Vec<std::net::SocketAddr> {
+    let own: Vec<u16> = [
+        Some(proxy_config.address.as_str()),
+        proxy_config.tls_address.as_deref(),
+        Some(proxy_config.console_address.as_str()),
+        proxy_config.console_ingress_address.as_deref(),
+        proxy_config.internal_dns_sync_address.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|address| address.rsplit_once(':')?.1.parse().ok())
+    .collect();
+    candidates
+        .into_iter()
+        .filter(|candidate| !own.contains(&candidate.port()))
+        .collect()
+}
+
+/// The first of `candidates` the control plane's tunnel origin can listen
+/// on (ADR-107 D3). The first is the default `edge_port`, which a worker
+/// agent on the same machine holds for its own connectors; the control
+/// plane then takes the next free one. Unlike the main listeners, none being
+/// free is not fatal: the proxy serves without it, and a tunnel placed on
+/// the control plane reports why it cannot start.
+fn first_bindable_tunnel_origin(
+    candidates: impl IntoIterator<Item = std::net::SocketAddr>,
+) -> Option<std::net::SocketAddr> {
+    let mut tried = Vec::new();
+    for address in candidates {
+        match std::net::TcpListener::bind(address) {
+            Ok(_) => {
+                if !tried.is_empty() {
+                    tracing::warn!(
+                        %address,
+                        taken = ?tried,
+                        "the control plane's tunnel origin listens on a later port because the \
+                         first is taken (often by a worker agent on this machine); tunnels placed \
+                         only on the control plane follow it"
+                    );
+                }
+                return Some(address);
+            }
+            Err(error) => {
+                debug!(%address, %error, "tunnel origin port taken; trying the next one");
+                tried.push(address);
+            }
         }
     }
+    tracing::warn!(
+        taken = ?tried,
+        "the control plane's tunnel origin could not listen on any of its ports, so tunnels \
+         cannot run on the control plane until one is free and Temps restarts \
+         (`ss -ltnp` shows what holds them)"
+    );
+    None
 }
 
 /// Test-only convenience wrapper around `bind_or_report` for exercising a
@@ -1574,15 +1619,65 @@ mod preflight_bind_tests {
         drop(held);
     }
 
-    /// ADR-107 D3: a taken tunnel origin port does not stop the proxy; the
-    /// listener is skipped and the origin stays unbound.
+    /// ADR-107 D3: a taken tunnel origin port (a worker agent on the same
+    /// machine holds the default) moves the origin to the next free one;
+    /// none free does not stop the proxy, the origin stays unbound.
     #[test]
-    fn a_taken_tunnel_origin_port_is_skipped_not_fatal() {
+    fn a_taken_tunnel_origin_port_moves_to_the_next_free_one() {
         let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = held.local_addr().unwrap();
-        assert!(!tunnel_origin_bindable(address));
+        let taken = held.local_addr().unwrap();
+        let free = {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            probe.local_addr().unwrap()
+        };
+        assert_eq!(first_bindable_tunnel_origin([taken, free]), Some(free));
+        assert_eq!(first_bindable_tunnel_origin([taken]), None);
         drop(held);
-        assert!(tunnel_origin_bindable(address));
+        assert_eq!(first_bindable_tunnel_origin([taken, free]), Some(taken));
+    }
+
+    /// ADR-107 D3: the fallback never takes a port the proxy's own HTTP or
+    /// TLS listener (or the console's) is configured on, wildcard included:
+    /// they are bound after the choice, so the probe would find them free.
+    #[test]
+    fn the_tunnel_origin_never_takes_the_proxys_own_listener_ports() {
+        let candidates: Vec<std::net::SocketAddr> = (7480..=7485)
+            .map(|port| std::net::SocketAddr::from(([127, 0, 0, 1], port)))
+            .collect();
+        let proxy_config = ProxyConfig {
+            address: "0.0.0.0:7481".to_string(),
+            tls_address: Some("127.0.0.1:7482".to_string()),
+            console_address: "[::]:7483".to_string(),
+            ..Default::default()
+        };
+        let ports: Vec<u16> = tunnel_origin_candidates_for(&proxy_config, candidates)
+            .iter()
+            .map(|address| address.port())
+            .collect();
+        assert_eq!(ports, vec![7480, 7484, 7485]);
+
+        // The case reported: a worker agent holds the first port and the TLS
+        // listener is configured on the next, still unbound. The origin skips
+        // both.
+        let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let taken = held.local_addr().unwrap();
+        let (tls, next) = {
+            let first = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let second = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            (first.local_addr().unwrap(), second.local_addr().unwrap())
+        };
+        let proxy_config = ProxyConfig {
+            tls_address: Some(tls.to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            first_bindable_tunnel_origin(tunnel_origin_candidates_for(
+                &proxy_config,
+                [taken, tls, next]
+            )),
+            Some(next)
+        );
+        drop(held);
     }
 
     #[test]

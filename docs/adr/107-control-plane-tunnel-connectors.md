@@ -99,9 +99,32 @@ another machine, and node `0` reports `down` with that reason.
 
 At startup the proxy binds `127.0.0.1:7480` (the default `edge_port`) as a
 second plain-HTTP listener, the **tunnel origin**. Pingora cannot add
-listeners after it starts, so it is bound whether or not a connector exists; a
-port already taken is logged and the listener skipped, and a connector placed
-on node `0` then reports why it cannot start.
+listeners after it starts, so it is bound whether or not a connector exists.
+
+A worker agent on the same machine (a control plane also enrolled as a
+worker) already holds `7480` for its own tunnel origin, so a taken port is
+not the end: the proxy takes the first free port up to `7489` and logs which,
+skipping the ports its own listeners (HTTP, TLS, the console's) are
+configured on, which are not bound yet when it chooses.
+The port is part of the provider's tunnel configuration
+(`http://127.0.0.1:{edge_port}`), so a tunnel placed **only** on the control
+plane follows it: a new one is created on that port, and the connector loop
+moves an existing one, telling the provider first and keeping the new port
+only once the provider accepted it (a failure leaves the old port and the
+error on the tunnel, and is not retried every pass). Only one control-plane process
+owns a database, so a per-connector lock in that process, shared by the
+console's and the connector loop's services, orders every configuration of a
+tunnel: a run reads the row, calls the provider and saves the outcome before
+the next one starts, holding no database connection while it waits. Only
+another configuration of the same tunnel waits on it; placement changes,
+status reports and token-holder updates never wait for the provider. A move
+re-checks right before the provider call that the tunnel still runs only on
+the control plane, and saves the port only once the provider accepted it,
+so the next pass simply makes an interrupted move again; a worker added
+during the call gets the moved port, which it binds like any other. A tunnel also placed on
+workers keeps its port, since every worker binds it itself; its control-plane
+replica reports why it does not run. With every port taken, the listener is
+skipped and a connector placed on node `0` reports why it cannot start.
 
 A request that arrived on the tunnel origin:
 
@@ -143,7 +166,7 @@ replica serves it:
 | Placement | Publishes |
 |---|---|
 | workers only | hostnames workers serve (unchanged) |
-| control plane only | every public hostname in the control plane's route table, and those of sleeping on-demand environments, which have no route until a visit through this proxy wakes them: the control-plane proxy serves them all, including those on workers, and applies every policy that keeps a host off workers (redirects, wake-up, attack mode, path routing) |
+| control plane only | every public hostname in the control plane's route table, published status pages' custom hostnames, and those of sleeping on-demand environments, which have no route until a visit through this proxy wakes them (read from the same route snapshot, so an app waking up or falling asleep is never in neither): the control-plane proxy serves them all, including those on workers, and applies every policy that keeps a host off workers (redirects, wake-up, attack mode, path routing) |
 | control plane and workers | hostnames workers serve: the control plane serves those too, so both replicas answer |
 
 A mixed placement is allowed. It behaves like the workers-only placement for
@@ -172,8 +195,8 @@ tunnel needs a worker.
   addresses on a control-plane tunnel answer `unknown_key`.
 - **Container and library drivers on the control plane.** The supervisor
   offers only the process driver there, as on workers today.
-- **A different tunnel origin port per install.** `edge_port` stays per
-  connector in the schema; the control plane serves only the default.
+- **A chosen tunnel origin port.** The control plane takes the first free
+  port from `7480` to `7489` (D3); an operator cannot pick one.
 
 ## Consequences
 

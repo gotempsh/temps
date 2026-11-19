@@ -25,9 +25,24 @@ use axum::http::{HeaderMap, HeaderName};
 /// the origin on a worker and on the control plane alike.
 pub const TUNNEL_ORIGIN_PORT: u16 = 7480;
 
-/// Where the control plane's proxy listens for its connectors.
+/// The last port the control plane's proxy tries when the ones before it
+/// are taken. A worker agent on the same machine holds
+/// [`TUNNEL_ORIGIN_PORT`] for its own connectors; the control plane then
+/// takes the next free one, and a tunnel placed only on the control plane
+/// follows it (ADR-107 D3).
+pub const TUNNEL_ORIGIN_LAST_PORT: u16 = 7489;
+
+/// Where the control plane's proxy listens for its connectors when the
+/// port is free.
 pub fn tunnel_origin_address() -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), TUNNEL_ORIGIN_PORT)
+}
+
+/// Every loopback address the control plane's proxy may take for its
+/// tunnel origin, in the order it tries them.
+pub fn tunnel_origin_candidates() -> impl Iterator<Item = SocketAddr> {
+    (TUNNEL_ORIGIN_PORT..=TUNNEL_ORIGIN_LAST_PORT)
+        .map(|port| SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port))
 }
 
 /// What the proxy and the control plane's connectors share about the tunnel

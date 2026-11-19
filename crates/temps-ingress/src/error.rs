@@ -59,16 +59,20 @@ pub enum ControlPlaneTunnelsUnavailable {
          traffic. Run the tunnel on a worker."
     )]
     SeparateProxy,
-    /// The proxy could not bind its tunnel origin at startup.
+    /// The proxy could not bind any of its tunnel origin ports at startup.
     #[error(
-        "The control plane's proxy is not listening on {address}, so a tunnel here would have \
-         nowhere to send visitors. Either this server runs its proxy as a separate process \
-         (`temps serve --role console`), or another program held port {port} when Temps \
-         started (`ss -ltnp 'sport = :{port}'` shows which): free it and restart Temps, or \
-         run the tunnel on a worker.",
-        port = address.port()
+        "The control plane's proxy is not listening on any loopback port from {first} to \
+         {last_port}, so a tunnel here would have nowhere to send visitors. Either this server \
+         runs its proxy as a separate process (`temps serve --role console`), or other programs \
+         held every one of those ports when Temps started (a worker agent on this machine \
+         holds {first_port}; `ss -ltnp '( sport >= :{first_port} and sport <= :{last_port} )'` \
+         shows the rest): free one and restart Temps, or run the tunnel on a worker.",
+        first_port = first.port()
     )]
-    OriginUnbound { address: std::net::SocketAddr },
+    OriginUnbound {
+        first: std::net::SocketAddr,
+        last_port: u16,
+    },
 }
 
 impl From<IngressError> for Problem {

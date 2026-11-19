@@ -12,10 +12,13 @@
 //! rows the console reads for workers.
 //!
 //! The connector forwards to the proxy's tunnel origin, which the proxy
-//! binds at startup ([`ControlPlaneTunnelOrigin`]). A spec is only started
-//! once that listener is bound on the spec's `edge_port`; otherwise its
-//! status says why, so a `cloudflared` never reports ready while every
-//! request through it fails.
+//! binds at startup ([`ControlPlaneTunnelOrigin`]) on the first free port
+//! from the default `edge_port` (a worker agent on the same machine holds
+//! that one). A tunnel placed only on the control plane is moved to that
+//! port first ([`IngressConnectorService::align_control_plane_edge_ports`]).
+//! A spec is only started once the listener is bound on the spec's
+//! `edge_port`; otherwise its status says why, so a `cloudflared` never
+//! reports ready while every request through it fails.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -52,11 +55,22 @@ pub trait LocalConnectorRuntime: Send + Sync {
 pub struct ControlPlaneHandle {
     origin: Arc<ControlPlaneTunnelOrigin>,
     wake: Arc<Notify>,
+    /// Shared by every service instance holding this handle, so the
+    /// console's and the loop's configurations of one tunnel never overlap.
+    locks: Arc<crate::service::ConnectorLocks>,
 }
 
 impl ControlPlaneHandle {
     pub fn new(origin: Arc<ControlPlaneTunnelOrigin>, wake: Arc<Notify>) -> Self {
-        Self { origin, wake }
+        Self {
+            origin,
+            wake,
+            locks: crate::service::ConnectorLocks::new(),
+        }
+    }
+
+    pub(crate) fn connector_locks(&self) -> &crate::service::ConnectorLocks {
+        &self.locks
     }
 
     /// A handle on `origin` with its own wake-up: one per process, shared
@@ -69,10 +83,13 @@ impl ControlPlaneHandle {
     pub fn ready(&self) -> Result<(), ControlPlaneTunnelsUnavailable> {
         match self.origin.bound_port() {
             Some(_) => Ok(()),
-            None => Err(origin_unbound(
-                temps_core::tunnel_origin::TUNNEL_ORIGIN_PORT,
-            )),
+            None => Err(origin_unbound()),
         }
+    }
+
+    /// The loopback port the proxy takes tunnel traffic on, once bound.
+    pub fn bound_port(&self) -> Option<u16> {
+        self.origin.bound_port()
     }
 
     /// Look at node 0's specs now rather than at the next poll.
@@ -108,6 +125,9 @@ impl ControlPlaneConnectors {
 
     /// One pass: run what is assigned to node 0 and record how it runs.
     pub async fn sync(&self) -> Result<(), IngressError> {
+        if let Some(port) = self.origin.bound_port() {
+            self.service.align_control_plane_edge_ports(port).await?;
+        }
         let specs = self
             .service
             .node_specs(CONTROL_PLANE_NODE_ID)
@@ -172,11 +192,14 @@ fn split_by_origin(
     let mut held = Vec::new();
     for spec in specs {
         let reason = match bound {
-            None => Some(origin_unbound(spec.edge_port).to_string()),
+            None => Some(origin_unbound().to_string()),
             Some(port) if port != spec.edge_port => Some(format!(
                 "This tunnel sends visitors to port {}, but the control plane's proxy takes \
-                 tunnel traffic on port {port} only. Run this tunnel on a worker instead.",
-                spec.edge_port
+                 tunnel traffic on port {port} (port {} was taken when Temps started, often by \
+                 a worker agent on this machine). A tunnel placed only on the control plane \
+                 moves to that port by itself; one also placed on workers keeps theirs. Place \
+                 it only on the control plane, or only on workers.",
+                spec.edge_port, spec.edge_port
             )),
             Some(_) => None,
         };
@@ -196,9 +219,13 @@ fn split_by_origin(
     (runnable, held)
 }
 
-fn origin_unbound(port: u16) -> ControlPlaneTunnelsUnavailable {
+fn origin_unbound() -> ControlPlaneTunnelsUnavailable {
     ControlPlaneTunnelsUnavailable::OriginUnbound {
-        address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
+        first: SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            temps_core::tunnel_origin::TUNNEL_ORIGIN_PORT,
+        ),
+        last_port: temps_core::tunnel_origin::TUNNEL_ORIGIN_LAST_PORT,
     }
 }
 
@@ -286,11 +313,19 @@ mod tests {
         assert_eq!(
             why,
             ControlPlaneTunnelsUnavailable::OriginUnbound {
-                address: "127.0.0.1:7480".parse().unwrap()
+                first: "127.0.0.1:7480".parse().unwrap(),
+                last_port: 7489,
             }
         );
-        assert!(why.to_string().contains("127.0.0.1:7480"), "{why}");
-        origin.mark_bound(7480);
+        assert!(
+            why.to_string().contains("from 127.0.0.1:7480 to 7489"),
+            "{why}"
+        );
+        assert_eq!(handle.bound_port(), None);
+        // Any port of the range will do: a worker agent on this machine
+        // may hold the first.
+        origin.mark_bound(7481);
         handle.ready().expect("bound");
+        assert_eq!(handle.bound_port(), Some(7481));
     }
 }
