@@ -1619,7 +1619,11 @@ impl LoadBalancer {
         // must name the same hostname: a connection made for one status page
         // cannot be steered to another with a forged Host header. The console
         // re-checks the hostname-to-page binding (`STATUS_HOST_HEADER`) too.
+        // A tunnel's visitor reached the provider's edge over HTTPS and the
+        // connector forwards in plain HTTP on loopback (ADR-107 D3): no SNI
+        // to compare, and nothing to upgrade.
         let is_tls = self.is_tls_connection(session);
+        let is_https = is_tls || self.via_tunnel_origin(session);
         if is_tls {
             let sni = Self::tls_sni(session);
             if sni
@@ -1638,7 +1642,7 @@ impl LoadBalancer {
                 );
                 return self.write_misdirected(session, ctx).await;
             }
-        } else if !self.disable_https_redirect {
+        } else if !is_https && !self.disable_https_redirect {
             // A verified hostname always has its certificate: upgrade.
             let location = format!("https://{host}{}", ctx.path);
             let mut resp = https_redirect_response(
@@ -1679,7 +1683,7 @@ impl LoadBalancer {
         } else {
             header.remove_header("x-forwarded-for");
         }
-        header.insert_header("X-Forwarded-Proto", if is_tls { "https" } else { "http" })?;
+        header.insert_header("X-Forwarded-Proto", if is_https { "https" } else { "http" })?;
         header.insert_header("Host", host.as_str())?;
         header.insert_header(STATUS_HOST_HEADER, host.as_str())?;
 
@@ -1914,9 +1918,9 @@ impl LoadBalancer {
             return Ok(false);
         }
         let now = temps_shield::unix_now();
-        // The clearance cookie is `__Host-` and `Secure`: only a TLS
-        // connection can receive one.
-        let tls = ctx.tls_fingerprint.is_some() || self.is_tls_connection(session);
+        // The clearance cookie is `__Host-` and `Secure`: only an HTTPS
+        // visitor can receive one, which a tunnel's visitor is (ADR-107 D3).
+        let tls = ctx.tls_fingerprint.is_some() || self.is_https_request(session);
         let (decision, netwatch_line) = {
             let header = session.req_header();
             let text = |name: &str| header.headers.get(name).and_then(|v| v.to_str().ok());
@@ -2528,7 +2532,7 @@ impl LoadBalancer {
                 .await;
         }
         if ctx.path == PREVIEW_LOGOUT_PATH && ctx.method == "POST" {
-            let secure = self.is_tls_connection(session);
+            let secure = self.is_https_request(session);
             let set_cookie =
                 build_logout_cookie_sandbox(&preview_host.hex, &settings.preview_domain, secure);
             let mut response = ResponseHeader::build(303, None)?;
@@ -3140,7 +3144,7 @@ impl LoadBalancer {
                 hex,
                 &cookie_value,
                 &settings.preview_domain,
-                self.is_tls_connection(session),
+                self.is_https_request(session),
             ))
         };
 
@@ -3159,7 +3163,7 @@ impl LoadBalancer {
         // an unpartitioned host-only cookie and a parent-domain cookie
         // alongside the fresh CHIPS cookie, sometimes emitting them in
         // separate Cookie header fields.
-        if should_refresh_cookie && self.is_tls_connection(session) {
+        if should_refresh_cookie && self.is_https_request(session) {
             let unpartitioned_cookie = build_logout_cookie_sandbox_unpartitioned(hex);
             response.append_header("Set-Cookie", &unpartitioned_cookie)?;
             let legacy_cookie = build_logout_cookie_sandbox(hex, &settings.preview_domain, false);
@@ -3220,7 +3224,7 @@ impl LoadBalancer {
             return write_preview_redirect(session, ctx, &next, "preview_login_not_required").await;
         }
 
-        let secure = self.is_tls_connection(session);
+        let secure = self.is_https_request(session);
         let snapshot = self
             .route_table
             .as_ref()

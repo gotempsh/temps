@@ -96,7 +96,7 @@ impl LoadBalancer {
         // the rare ephemeral `redirect_to_env` branch rather than for every
         // plain-HTTP request.
         if self.on_demand_cert_manager.is_some()
-            && !self.is_tls_connection(session)
+            && !self.is_https_request(session)
             && self.handle_on_demand_http(session, ctx).await?
         {
             return Ok(Flow::Answered);
@@ -183,7 +183,9 @@ impl LoadBalancer {
         let force_https = env_force_https.or(console_force_https);
         let production_https = if should_apply_production_https_default(
             self.disable_https_redirect,
-            self.is_tls_connection(session),
+            // A tunnel's visitor is already on HTTPS (ADR-107 D3); a plain
+            // TLS check here would redirect it to itself forever.
+            self.is_https_request(session),
             &ctx.path,
             force_https,
             ctx.environment.is_some(),
@@ -203,7 +205,9 @@ impl LoadBalancer {
         };
         let needs_redirect = should_redirect_to_https(
             self.disable_https_redirect,
-            self.is_tls_connection(session),
+            // A tunnel's visitor is already on HTTPS (ADR-107 D3); a plain
+            // TLS check here would redirect it to itself forever.
+            self.is_https_request(session),
             &ctx.path,
             force_https,
             // Lock-free ArcSwap snapshot read, and only reached when the
