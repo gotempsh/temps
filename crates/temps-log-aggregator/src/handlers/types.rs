@@ -47,6 +47,8 @@ pub struct LogAggregatorAppState {
     /// Saved log searches (ADR 073 D1): the named queries the console
     /// offers and log alerts count.
     pub saved_search_service: Arc<LogSavedSearchService>,
+    /// Series of a saved search, for dashboard panels (ADR 073 D1).
+    pub log_series_service: Arc<crate::services::LogSeriesService>,
     /// HTTP log ingest (ADR 073 D1): key authentication, budget, writing.
     pub ingest_service: Arc<crate::ingest::LogIngestService>,
     /// Log ingest key CRUD.
@@ -66,6 +68,7 @@ pub async fn create_log_aggregator_app_state(
     chunk_writer: Arc<ChunkWriterService>,
     ingest_budget: Arc<IngestBudget>,
     saved_search_service: Arc<LogSavedSearchService>,
+    log_series_service: Arc<crate::services::LogSeriesService>,
     ingest_service: Arc<crate::ingest::LogIngestService>,
     ingest_key_service: Arc<crate::ingest::LogIngestKeyService>,
 ) -> Arc<LogAggregatorAppState> {
@@ -84,6 +87,7 @@ pub async fn create_log_aggregator_app_state(
         chunk_writer,
         ingest_budget,
         saved_search_service,
+        log_series_service,
         ingest_service,
         ingest_key_service,
     })

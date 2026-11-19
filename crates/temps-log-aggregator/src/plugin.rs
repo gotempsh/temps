@@ -364,7 +364,7 @@ impl TempsPlugin for LogAggregatorPlugin {
                 db.clone(),
             ));
             context.register_service(
-                log_series_service as Arc<dyn temps_core::log_series::LogSeriesSource>,
+                log_series_service.clone() as Arc<dyn temps_core::log_series::LogSeriesSource>
             );
 
             // ── ADR 073 D1: HTTP log ingest ─────────────────────────────
@@ -392,6 +392,7 @@ impl TempsPlugin for LogAggregatorPlugin {
                 chunk_writer.clone(),
                 ingest_budget,
                 saved_search_service,
+                log_series_service,
                 ingest_service,
                 ingest_key_service,
             )
@@ -792,6 +793,7 @@ impl TempsPlugin for LogAggregatorPlugin {
             chunk_writer: old.chunk_writer.clone(),
             ingest_budget: old.ingest_budget.clone(),
             saved_search_service: old.saved_search_service.clone(),
+            log_series_service: old.log_series_service.clone(),
             ingest_service: old.ingest_service.clone(),
             ingest_key_service: old.ingest_key_service.clone(),
         });

@@ -34,7 +34,10 @@ pub use ingest_budget::{
     IngestOverrides, IngestSource, ThrottledLogSource, BURST_SECONDS, STATS_WINDOW,
     THROTTLED_VISIBLE_FOR,
 };
-pub use log_series::{LogSeriesService, COUNT_PAGE_SIZE};
+pub use log_series::{
+    LogSeries, LogSeriesMethod, LogSeriesPoint, LogSeriesService, SeriesRequest, COUNT_PAGE_SIZE,
+    MAX_NUMERIC_SERIES_BUCKETS, MAX_SERIES_BUCKETS, SERIES_SCAN_CAP,
+};
 pub use metadata::{LogEventsQuery, LogMetadataService};
 pub use reindexer::{ReindexReport, ReindexService, DEFAULT_REINDEX_BATCH};
 pub use remote_collector::{

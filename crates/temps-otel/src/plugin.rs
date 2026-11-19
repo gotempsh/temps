@@ -1012,6 +1012,7 @@ fn pipeline_stat_deltas(
             crate::services::dashboard_service::DashboardLayout,
             crate::services::dashboard_service::DashboardSection,
             crate::services::dashboard_service::DashboardTile,
+            crate::services::dashboard_service::DashboardTileSource,
             metric_alert_handler::CreateMetricAlertRequest,
             metric_alert_handler::UpdateMetricAlertRequest,
             metric_alert_handler::OtelMetricAlertRuleResponse,

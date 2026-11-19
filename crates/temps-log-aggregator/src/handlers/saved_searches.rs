@@ -189,6 +189,10 @@ pub fn configure_routes() -> Router<Arc<LogAggregatorAppState>> {
                 .get(get_saved_search)
                 .delete(delete_saved_search),
         )
+        .route(
+            "/projects/{project_id}/logs/saved-searches/{saved_search_id}/series",
+            get(saved_search_series),
+        )
 }
 
 // ── Handlers ────────────────────────────────────────────────────────────
@@ -464,6 +468,77 @@ pub async fn delete_saved_search(
     Ok(StatusCode::NO_CONTENT)
 }
 
+// ── Series (dashboard panels) ───────────────────────────────────────────
+
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct SavedSearchSeriesParams {
+    /// Window start, RFC 3339.
+    #[param(value_type = String, format = DateTime)]
+    pub start_time: DateTime<Utc>,
+    /// Window end, RFC 3339.
+    #[param(value_type = String, format = DateTime)]
+    pub end_time: DateTime<Utc>,
+    /// Bucket width in seconds. Default 60.
+    pub bucket_secs: Option<u32>,
+    /// `count` (default), or `avg`, `sum`, `max`, `p50`, `p95`, `p99` or
+    /// `count_distinct` followed by `:<attribute>`, e.g. `p95:duration_ms`.
+    pub metric: Option<String>,
+}
+
+/// Chart a saved log search over time: matching lines per bucket, or a
+/// numeric attribute aggregated per bucket.
+#[utoipa::path(
+    tag = "Logs",
+    get,
+    path = "/projects/{project_id}/logs/saved-searches/{saved_search_id}/series",
+    params(
+        ("project_id" = i32, Path, description = "Project ID"),
+        ("saved_search_id" = i32, Path, description = "Saved search ID"),
+        SavedSearchSeriesParams
+    ),
+    responses(
+        (status = 200, description = "The series", body = crate::services::LogSeries),
+        (status = 400, description = "Invalid window, bucket or metric", body = ProblemDetails),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+        (status = 404, description = "Saved search not found", body = ProblemDetails),
+        (status = 503, description = "A numeric series needs the line index, which is unavailable", body = ProblemDetails),
+        (status = 500, description = "Internal server error", body = ProblemDetails)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn saved_search_series(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<LogAggregatorAppState>>,
+    Path((project_id, saved_search_id)): Path<(i32, i32)>,
+    Query(params): Query<SavedSearchSeriesParams>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, LogsRead);
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
+
+    let metric =
+        crate::index::analytics::parse_metric(params.metric.as_deref().unwrap_or("count"))?;
+    let query = state
+        .saved_search_service
+        .query_for(project_id, saved_search_id)
+        .await?;
+    let series = state
+        .log_series_service
+        .series(
+            project_id,
+            &query,
+            crate::services::SeriesRequest {
+                start: params.start_time,
+                end: params.end_time,
+                bucket_secs: params.bucket_secs.unwrap_or(60),
+                metric,
+            },
+        )
+        .await?;
+    Ok(Json(series))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -549,6 +624,13 @@ mod tests {
         let metadata_service = Arc::new(LogMetadataService::new(db.clone()));
         let ingest_keys = Arc::new(crate::ingest::LogIngestKeyService::new(db.clone()));
         let chunk_writer_for_ingest = chunk_writer.clone();
+        let saved_searches = Arc::new(LogSavedSearchService::new(db.clone()));
+        let log_series_service = Arc::new(crate::services::LogSeriesService::new(
+            saved_searches.clone(),
+            store.clone(),
+            Arc::new(NoLineIndex::new("test")),
+            db.clone(),
+        ));
         let state = Arc::new(LogAggregatorAppState {
             search_service: Arc::new(LogSearchService::new(
                 store.clone(),
@@ -568,7 +650,8 @@ mod tests {
             manifests: Arc::new(ManifestRepo::new(db.clone())),
             chunk_writer,
             ingest_budget: Arc::new(IngestBudget::new(IngestLimits::UNLIMITED)),
-            saved_search_service: Arc::new(LogSavedSearchService::new(db.clone())),
+            saved_search_service: saved_searches,
+            log_series_service,
             ingest_service: Arc::new(crate::ingest::LogIngestService::new(
                 ingest_keys.clone(),
                 Arc::new(chunk_writer_for_ingest),
@@ -602,6 +685,12 @@ mod tests {
         assert_eq!(patch.status_code(), StatusCode::UNAUTHORIZED);
         let delete = server.delete("/projects/7/logs/saved-searches/1").await;
         assert_eq!(delete.status_code(), StatusCode::UNAUTHORIZED);
+        let series = server
+            .get("/projects/7/logs/saved-searches/1/series")
+            .add_query_param("start_time", "2026-11-19T11:00:00Z")
+            .add_query_param("end_time", "2026-11-19T12:00:00Z")
+            .await;
+        assert_eq!(series.status_code(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

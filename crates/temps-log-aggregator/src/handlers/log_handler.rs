@@ -490,6 +490,7 @@ pub struct PurgeLogsRequest {
         super::saved_searches::get_saved_search,
         super::saved_searches::update_saved_search,
         super::saved_searches::delete_saved_search,
+        super::saved_searches::saved_search_series,
         super::ingest::ingest_logs,
         super::ingest::list_log_ingest_keys,
         super::ingest::create_log_ingest_key,
@@ -540,6 +541,9 @@ pub struct PurgeLogsRequest {
             super::saved_searches::SavedSearchResponse,
             super::saved_searches::SavedSearchesResponse,
             crate::services::SavedSearchQuery,
+            crate::services::LogSeries,
+            crate::services::LogSeriesPoint,
+            crate::services::LogSeriesMethod,
             super::ingest::LogIngestResponse,
             super::ingest::CreateLogIngestKeyRequest,
             super::ingest::LogIngestKeyResponse,
@@ -1052,6 +1056,15 @@ mod tests {
         let audit_service = Arc::new(MockAuditLogger) as Arc<dyn temps_core::AuditLogger>;
 
         let ingest_keys = Arc::new(crate::ingest::LogIngestKeyService::new(db.connection_arc()));
+        let saved_searches = Arc::new(crate::services::LogSavedSearchService::new(
+            db.connection_arc(),
+        ));
+        let log_series_service = Arc::new(crate::services::LogSeriesService::new(
+            saved_searches.clone(),
+            store.clone(),
+            Arc::new(crate::index::NoLineIndex::new("test")),
+            db.connection_arc(),
+        ));
         let app_state = Arc::new(LogAggregatorAppState {
             search_service,
             metadata_service: metadata_service.clone(),
@@ -1069,9 +1082,8 @@ mod tests {
             ingest_budget: Arc::new(crate::services::IngestBudget::new(
                 crate::services::IngestLimits::UNLIMITED,
             )),
-            saved_search_service: Arc::new(crate::services::LogSavedSearchService::new(
-                db.connection_arc(),
-            )),
+            saved_search_service: saved_searches,
+            log_series_service,
             // One key service for both paths, as the plugin wires it, so a
             // revoke reaches the ingest path's cache.
             ingest_service: Arc::new(crate::ingest::LogIngestService::new(
@@ -2481,6 +2493,7 @@ mod tests {
             chunk_writer: base_state.chunk_writer.clone(),
             ingest_budget: base_state.ingest_budget.clone(),
             saved_search_service: base_state.saved_search_service.clone(),
+            log_series_service: base_state.log_series_service.clone(),
             ingest_service: base_state.ingest_service.clone(),
             ingest_key_service: base_state.ingest_key_service.clone(),
         });
