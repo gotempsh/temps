@@ -861,12 +861,15 @@ mod tests {
         );
         let service =
             Arc::new(crate::services::sandbox_service::tests::preview_test_service_with_db(db));
+        let image_preparation =
+            crate::services::sandbox_service::tests::image_preparation_for(&service);
         let state = Arc::new(SandboxAppState {
             sandbox_service: service,
             snapshot_service: None,
             project_access_checker: None,
             audit_service: None,
             sensitive_action_authorizer: authorizer,
+            image_preparation,
         });
         crate::handlers::configure_routes()
             .with_state(state)

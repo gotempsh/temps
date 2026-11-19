@@ -45,6 +45,7 @@ mod egress;
 mod exec;
 mod files;
 mod image;
+mod image_pulls;
 mod network;
 mod provider;
 mod recover;
@@ -73,7 +74,7 @@ use exec::{
     ROOT_EXEC_PATH,
 };
 use files::{is_turn_secret_path, runtime_user_owns_uploaded_file};
-use image::{ensure_mutable_rebuild_target, selected_preset_runtime};
+use image::ensure_mutable_rebuild_target;
 use network::{
     application_network_connection_order, container_is_parked, docker_network_matches_policy,
     effective_sandbox_network, is_managed_sandbox_network, network_labelled_for_another_gateway,
@@ -94,6 +95,8 @@ use exec::{
     completed_exec_lines, exec_runs_as_root, ownership_fix_command, write_probe_script,
     ExecOutputBuffer, OwnershipScope,
 };
+#[cfg(test)]
+use image::selected_preset_runtime;
 #[cfg(test)]
 use image::{image_name_for_runtime_in_channel, runtime_from_image_name, SandboxChannel};
 #[cfg(test)]
@@ -270,6 +273,9 @@ pub struct DockerSandboxProvider {
     /// reaper must not mistake that gap for an abandoned network, and a
     /// `create` must not start reusing a network the reaper is tearing down.
     creates_in_flight: std::sync::Mutex<SandboxLifecycle>,
+    /// One pull per image at a time, shared by creates and by an operator's
+    /// "prepare sandboxes" (see [`image_pulls`]).
+    image_pulls: Arc<image_pulls::ImagePulls>,
 }
 
 /// Per-sandbox-name bookkeeping behind
@@ -362,6 +368,7 @@ impl DockerSandboxProvider {
             service_access: None,
             network_lock: tokio::sync::Mutex::new(()),
             creates_in_flight: std::sync::Mutex::new(SandboxLifecycle::default()),
+            image_pulls: Arc::default(),
         }
     }
 

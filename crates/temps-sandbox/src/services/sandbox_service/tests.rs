@@ -555,6 +555,33 @@ fn preview_test_service(
     (service, db)
 }
 
+/// Start tracking a create on `service`, as `create_sandbox` does, for
+/// handler tests of the progress routes.
+pub(crate) fn track_creation(
+    service: &SandboxService,
+    user_id: i32,
+    creation_id: &str,
+) -> crate::services::creation_progress::CreationProgress {
+    service
+        .creations
+        .begin(user_id, Some(creation_id))
+        .expect("a valid, unused creation id")
+}
+
+/// The image-preparation service over `service`'s database and provider,
+/// for handler tests that build a `SandboxAppState`.
+pub(crate) fn image_preparation_for(
+    service: &Arc<SandboxService>,
+) -> Arc<crate::services::image_preparation::ImagePreparationService> {
+    Arc::new(
+        crate::services::image_preparation::ImagePreparationService::new(
+            service.db.clone(),
+            service.registry.provider_arc(),
+            service.clone(),
+        ),
+    )
+}
+
 pub(crate) fn preview_test_service_with_db(db: Arc<DatabaseConnection>) -> SandboxService {
     let platform_config = Arc::new(ConfigService::new(
         Arc::new(test_server_config()),

@@ -15,6 +15,17 @@ const USER_SANDBOX_CAP_LOCK_NAMESPACE: i32 = 0x7365_6263;
 /// How long removing the container of a failed worker create may take: the
 /// same per-node deadline as an eviction's container destroy.
 const CREATE_CLEANUP_DEADLINE: std::time::Duration = EVICTION_DESTROY_DEADLINE;
+/// How often a create asks a worker how its image pull is going.
+const WORKER_PULL_POLL: std::time::Duration = std::time::Duration::from_secs(1);
+/// Longest a create waits for a worker's image pull: the pull's own ceiling
+/// plus slack.
+const WORKER_PULL_DEADLINE: std::time::Duration =
+    std::time::Duration::from_secs(3 * 60 * 60 + 10 * 60);
+/// Detail of a create step its provider ran without reporting it separately.
+const UNREPORTED_STEP_DETAIL: &str =
+    "completed as part of the create; this backend does not report the step separately";
+
+use crate::services::creation_progress::{CreationProgress, CreationStepKind};
 
 impl SandboxService {
     /// Create a new standalone sandbox. Inserts the DB row first (to get
@@ -30,6 +41,29 @@ impl SandboxService {
                 summary.status = "starting".to_string();
             }
         }
+    }
+
+    /// The steps of a create `user_id` started with `creation_id`.
+    pub fn creation(
+        &self,
+        user_id: i32,
+        creation_id: &str,
+    ) -> Result<crate::services::creation_progress::SandboxCreation, SandboxError> {
+        self.creations
+            .get(user_id, creation_id)
+            .ok_or_else(|| SandboxError::CreationNotFound {
+                creation_id: creation_id.to_string(),
+                user_id,
+            })
+    }
+
+    /// The steps of the create that made sandbox `public_id`, while this
+    /// process still tracks it. The caller authorizes access to the sandbox.
+    pub fn creation_for_sandbox(
+        &self,
+        public_id: &str,
+    ) -> Option<crate::services::creation_progress::SandboxCreation> {
+        self.creations.for_sandbox(public_id)
     }
 
     /// [`Self::create_sandbox`] in a task of its own, so it always reaches its
@@ -58,8 +92,41 @@ impl SandboxService {
     pub async fn create_sandbox(
         &self,
         user_id: i32,
-        mut req: CreateSandboxRequest,
+        req: CreateSandboxRequest,
     ) -> Result<sandboxes::Model, SandboxError> {
+        use crate::services::creation_progress::CreationIdError;
+        let progress = self
+            .creations
+            .begin(user_id, req.creation_id.as_deref())
+            .map_err(|error| match error {
+                CreationIdError::Invalid { creation_id } => {
+                    SandboxError::CreationIdInvalid { creation_id }
+                }
+                CreationIdError::InUse {
+                    creation_id,
+                    user_id,
+                } => SandboxError::CreationIdInUse {
+                    creation_id,
+                    user_id,
+                },
+            })?;
+        let result = self.create_sandbox_steps(user_id, req, &progress).await;
+        match &result {
+            Ok(_) => progress.succeed(UNREPORTED_STEP_DETAIL),
+            Err(error) => progress.fail(&error.to_string()),
+        }
+        result
+    }
+
+    /// The steps of a sandbox create (see [`Self::create_sandbox`]), each
+    /// recorded in `progress` as it starts and ends.
+    async fn create_sandbox_steps(
+        &self,
+        user_id: i32,
+        mut req: CreateSandboxRequest,
+        progress: &CreationProgress,
+    ) -> Result<sandboxes::Model, SandboxError> {
+        progress.start(CreationStepKind::CheckRequest);
         let lifecycle = match req.lifecycle.as_deref() {
             None => SandboxLifecycle::default(),
             Some(value) => SandboxLifecycle::parse(value)?,
@@ -140,10 +207,16 @@ impl SandboxService {
         let backend = parse_requested_backend(req.backend.as_deref())?;
         validate_allow_docker(req.allow_docker, backend)?;
 
+        progress.done(CreationStepKind::CheckRequest, None);
+
         // ADR-048: decide which node hosts the sandbox before anything is
         // created. Explicit requests are validated against the operator
         // allow-list and never fall back to another node.
+        progress.start(CreationStepKind::SelectNode);
         let node_id = self.place_sandbox(&req).await?;
+        let node_label = self.node_label(node_id).await;
+        progress.done(CreationStepKind::SelectNode, Some(node_label.clone()));
+        progress.start(CreationStepKind::RecordSandbox);
 
         // Operator limits (HTTP create path only). The settings are read once
         // and fail closed: an unreadable section must not turn into "no
@@ -367,6 +440,39 @@ impl SandboxService {
             });
         }
 
+        progress.sandbox_recorded(&public_id_value);
+        progress.done(CreationStepKind::RecordSandbox, None);
+        if req.from_snapshot_artifact.is_some() {
+            progress.skip(
+                CreationStepKind::PullImage,
+                "restored from a snapshot, which carries its own image",
+            );
+        }
+        if source.is_none() {
+            progress.skip(CreationStepKind::SeedSource, "no source was requested");
+        }
+        // A worker cannot report the steps inside its create, so its image
+        // is pulled first, as a step of its own with its progress; the
+        // create then finds it present. A create on this host reports its
+        // own pull through the provider's progress sink.
+        if let (Some(node), None) = (node_id, req.from_snapshot_artifact.as_ref()) {
+            if let Err(error) = self
+                .pull_image_on_worker(
+                    node,
+                    &node_label,
+                    req.image.as_deref(),
+                    backend,
+                    &row,
+                    progress,
+                )
+                .await
+            {
+                self.mark_destroyed(row.id).await.ok();
+                return Err(error);
+            }
+            progress.start(CreationStepKind::CreateContainer);
+        }
+
         let container_label = container_label_for(&public_id_value).to_string();
 
         let config = SandboxCreateConfig {
@@ -389,14 +495,21 @@ impl SandboxService {
             backend,
         };
 
-        // Choose create path: snapshot restore vs normal create.
-        let create_result = if let Some(ref artifact) = req.from_snapshot_artifact {
-            // ADR-037: restore from snapshot. The provider ensures the image
-            // is loaded into the daemon before creating the container.
-            self.registry.create_from_snapshot(artifact, config).await
-        } else {
-            self.registry.create(config).await
-        };
+        // Choose create path: snapshot restore vs normal create. The
+        // provider reports its steps (image, container create and start,
+        // readiness) to `progress` as it runs them.
+        let create_result =
+            temps_sandbox_providers::with_create_progress(progress.phase_sink(), async {
+                if let Some(ref artifact) = req.from_snapshot_artifact {
+                    // ADR-037: restore from snapshot. The provider ensures the
+                    // image is loaded into the daemon before creating the
+                    // container.
+                    self.registry.create_from_snapshot(artifact, config).await
+                } else {
+                    self.registry.create(config).await
+                }
+            })
+            .await;
 
         let handle = match create_result {
             Ok(h) => h,
@@ -444,6 +557,20 @@ impl SandboxService {
         if node_id.is_some() {
             self.confirm_worker_create(&row, user_id).await?;
         }
+        // The container is up. Steps its provider ran without reporting them
+        // (a worker's create, a microVM backend) end here, not after seeding.
+        for step in [
+            CreationStepKind::PullImage,
+            CreationStepKind::CreateContainer,
+            CreationStepKind::StartContainer,
+            CreationStepKind::WaitReady,
+        ] {
+            let detail = match node_id {
+                Some(_) => format!("on {node_label}, reported together with the container create"),
+                None => UNREPORTED_STEP_DETAIL.to_string(),
+            };
+            progress.done_unreported(step, &detail);
+        }
 
         // Persist the *effective* backend + image the provider actually
         // used. When the request omitted them, the host default / backend
@@ -475,6 +602,14 @@ impl SandboxService {
         // isn't left with a half-initialized container that's billing
         // their timeout budget.
         if let Some(source) = source {
+            progress.start(CreationStepKind::SeedSource);
+            progress.detail(
+                CreationStepKind::SeedSource,
+                match &source {
+                    SandboxSource::Git { .. } => "cloning the repository",
+                    SandboxSource::Tarball { .. } => "extracting the archive",
+                },
+            );
             if let Err(e) = self
                 .seed_source(row.id, &public_id_value, user_id, &source)
                 .await
@@ -501,7 +636,9 @@ impl SandboxService {
                 Some(serde_json::json!({ "type": source_kind(&source) })),
             )
             .await;
+            progress.done(CreationStepKind::SeedSource, None);
         }
+        progress.start(CreationStepKind::Ready);
 
         self.record_event(
             row.id,
@@ -524,6 +661,115 @@ impl SandboxService {
             user_id
         );
         Ok(row)
+    }
+
+    /// How a create names the node it placed a sandbox on.
+    async fn node_label(&self, node_id: Option<i32>) -> String {
+        match node_id {
+            None => format!("the {}", placement::CONTROL_PLANE_NAME),
+            Some(id) => placement::node_names(self.db.as_ref(), [id])
+                .await
+                .ok()
+                .and_then(|mut names| names.remove(&id))
+                .map(|name| format!("node '{name}'"))
+                .unwrap_or_else(|| format!("node {id}")),
+        }
+    }
+
+    /// Pull the image a create on worker `node` will use, as its own step
+    /// with its download progress, waiting on a pull already running there
+    /// (an operator's "prepare sandboxes", another create). A node that
+    /// cannot pull ahead (an older agent) pulls during the container create
+    /// instead; a pull that fails ends the create with the node's reason.
+    async fn pull_image_on_worker(
+        &self,
+        node: i32,
+        node_label: &str,
+        image: Option<&str>,
+        backend: Option<temps_sandbox_providers::SandboxBackend>,
+        row: &sandboxes::Model,
+        progress: &CreationProgress,
+    ) -> Result<(), SandboxError> {
+        use temps_sandbox_providers::ImagePrepareState;
+        progress.start(CreationStepKind::PullImage);
+        let provider = self.registry.provider_arc();
+        let mut status = match provider.prepare_image_on(Some(node), image, backend).await {
+            Ok(status) => status,
+            Err(error) => {
+                // The create itself reaches the node and reports a failure
+                // with full context; do not fail it on the preflight.
+                tracing::warn!(
+                    sandbox_id = %row.public_id,
+                    node_id = node,
+                    %error,
+                    "could not ask the node to pull the sandbox image ahead of the create"
+                );
+                progress.detail(
+                    CreationStepKind::PullImage,
+                    format!("{node_label} pulls the image during the container create"),
+                );
+                return Ok(());
+            }
+        };
+        let deadline = tokio::time::Instant::now() + WORKER_PULL_DEADLINE;
+        loop {
+            match status.state {
+                ImagePrepareState::Ready => {
+                    let detail = if status.already_present
+                        || status.bytes_total.is_none() && status.started_at.is_none()
+                    {
+                        format!("already present on {node_label}")
+                    } else {
+                        format!("pulled on {node_label}")
+                    };
+                    progress.done(CreationStepKind::PullImage, Some(detail));
+                    return Ok(());
+                }
+                ImagePrepareState::Failed => {
+                    return Err(SandboxError::ImageUnavailable {
+                        sandbox_id: row.public_id.clone(),
+                        image: status.image.clone(),
+                        reason: format!(
+                            "{node_label}: {}",
+                            status
+                                .error
+                                .unwrap_or_else(|| "the pull failed without a reason".into())
+                        ),
+                    });
+                }
+                ImagePrepareState::NotPulled | ImagePrepareState::Unsupported => {
+                    progress.detail(
+                        CreationStepKind::PullImage,
+                        format!("{node_label} pulls the image during the container create"),
+                    );
+                    return Ok(());
+                }
+                ImagePrepareState::Pulling => progress.image_progress(&status),
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(SandboxError::ImageUnavailable {
+                    sandbox_id: row.public_id.clone(),
+                    image: status.image.clone(),
+                    reason: format!(
+                        "{node_label} was still pulling the image after {} minutes",
+                        WORKER_PULL_DEADLINE.as_secs() / 60
+                    ),
+                });
+            }
+            tokio::time::sleep(WORKER_PULL_POLL).await;
+            status = match provider
+                .image_prepare_status_on(Some(node), Some(&status.image), backend)
+                .await
+            {
+                Ok(next) => next,
+                // A node that cannot answer for a moment is asked again; the
+                // deadline bounds the wait.
+                Err(error) => {
+                    tracing::debug!(node_id = node, %error, "sandbox image status unavailable");
+                    status
+                }
+            };
+        }
     }
 
     /// An eviction can destroy a worker sandbox's row while its container

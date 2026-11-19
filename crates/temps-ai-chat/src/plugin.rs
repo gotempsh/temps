@@ -451,13 +451,17 @@ impl TempsPlugin for AiChatPlugin {
             .application_sandboxes
             .as_ref()
             .zip(context.get_service::<dyn temps_core::SensitiveActionAuthorizer>())
-            .map(|(sandbox_service, sensitive_action_authorizer)| {
+            .zip(context.get_service::<
+                temps_sandbox::services::image_preparation::ImagePreparationService,
+            >())
+            .map(|((sandbox_service, sensitive_action_authorizer), image_preparation)| {
                 Arc::new(temps_sandbox::handlers::SandboxAppState {
                     sandbox_service: sandbox_service.clone(),
                     snapshot_service: None,
                     project_access_checker: project_access_checker.clone(),
                     audit_service: None,
                     sensitive_action_authorizer,
+                    image_preparation,
                 })
             });
         let app_state = Arc::new(AppState {

@@ -198,6 +198,9 @@ impl DockerSandboxProvider {
             None
         };
 
+        crate::report_create_phase(crate::CreatePhaseEvent::Started(
+            crate::CreatePhase::CreateContainer,
+        ));
         let mut container_config = self.sandbox_container_body(
             &config,
             image,
@@ -281,30 +284,38 @@ impl DockerSandboxProvider {
         })
     }
 
-    /// Make sure `image` is present: build a preset image, pull anything
-    /// else. Runs before anything is created, so it never rolls back.
+    /// Make sure `image` is present: pull it (a current runtime preset falls
+    /// back to a local build), joining a pull already running for it, such
+    /// as an operator's "prepare sandboxes". Runs before anything is
+    /// created, so it never rolls back. Reports the image phase and its
+    /// download progress to the create's progress sink.
     async fn ensure_sandbox_image(&self, image: &str, run_id: i32) -> Result<(), AgentError> {
-        // Ensure the image exists (build for presets, pull for custom)
-        if self.docker.inspect_image(image).await.is_ok() {
-            return Ok(());
-        }
-        // If this is a preset image (full GHCR path), build it. The
-        // helper strips the registry prefix + version tag to recover
-        // the runtime name. Anything that doesn't match the preset
-        // prefix is treated as a user-supplied custom image.
-        if let Some(runtime) = selected_preset_runtime(image) {
-            return self.ensure_image_for_runtime(runtime).await;
-        }
-        // A historical pinned image or custom image must be pulled
-        // by its exact reference, never rebuilt under the current tag.
-        tracing::info!("Pulling sandbox image {}...", image);
-        temps_docker_util::pull_image(&self.docker, temps_docker_util::PullSpec::new(image))
-            .await
-            .map_err(|e| AgentError::SandboxCreationFailed {
+        use crate::{report_create_phase, CreatePhase, CreatePhaseEvent, ImagePrepareState};
+        report_create_phase(CreatePhaseEvent::Started(CreatePhase::Image));
+        let status = self
+            .ensure_image_present(image, |status| {
+                report_create_phase(CreatePhaseEvent::ImageProgress(status.clone()));
+            })
+            .await;
+        match status.state {
+            ImagePrepareState::Ready => {
+                if status.already_present {
+                    report_create_phase(CreatePhaseEvent::ImageAlreadyPresent);
+                }
+                report_create_phase(CreatePhaseEvent::Finished(CreatePhase::Image));
+                Ok(())
+            }
+            _ => Err(AgentError::SandboxCreationFailed {
                 run_id,
                 provider: "docker".to_string(),
-                reason: temps_agent_core::error::image_pull_failure_reason(image, &e.cause_text()),
-            })
+                reason: status.error.unwrap_or_else(|| {
+                    temps_agent_core::error::image_pull_failure_reason(
+                        image,
+                        "the pull ended without a result",
+                    )
+                }),
+            }),
+        }
     }
 
     /// Whether `image` runs the in-sandbox runtime daemon, from its
@@ -557,6 +568,12 @@ impl DockerSandboxProvider {
                 provider: "docker".to_string(),
                 reason: format!("Failed to create container: {error}"),
             })?;
+        crate::report_create_phase(crate::CreatePhaseEvent::Finished(
+            crate::CreatePhase::CreateContainer,
+        ));
+        crate::report_create_phase(crate::CreatePhaseEvent::Started(
+            crate::CreatePhase::StartContainer,
+        ));
 
         self.docker
             .start_container(
@@ -569,6 +586,12 @@ impl DockerSandboxProvider {
                 provider: "docker".to_string(),
                 reason: format!("Failed to start container: {error}"),
             })?;
+        crate::report_create_phase(crate::CreatePhaseEvent::Finished(
+            crate::CreatePhase::StartContainer,
+        ));
+        crate::report_create_phase(crate::CreatePhaseEvent::Started(
+            crate::CreatePhase::WaitReady,
+        ));
 
         // Normalize ownership of /home/temps (named volume) and
         // /home/temps/workspace (bind-mount). Both inherit uids from outside
@@ -587,6 +610,9 @@ impl DockerSandboxProvider {
             self.wait_for_runtime_daemon(&container.id, container_name, run_id)
                 .await?;
         }
+        crate::report_create_phase(crate::CreatePhaseEvent::Finished(
+            crate::CreatePhase::WaitReady,
+        ));
         Ok(container.id)
     }
 

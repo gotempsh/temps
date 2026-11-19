@@ -495,6 +495,18 @@ pub(crate) fn sandbox_router(
             post(sandbox_handlers::sandbox_image_identity),
         )
         .route(
+            "/agent/sandboxes/image-prepare",
+            post(sandbox_handlers::prepare_sandbox_image),
+        )
+        .route(
+            "/agent/sandboxes/image-prepare-status",
+            post(sandbox_handlers::sandbox_image_prepare_status),
+        )
+        .route(
+            "/agent/sandboxes/image-remove",
+            post(sandbox_handlers::remove_sandbox_image),
+        )
+        .route(
             "/agent/sandboxes/agent-runtime-check",
             post(sandbox_handlers::check_sandbox_agent_runtime),
         )
@@ -1992,7 +2004,7 @@ pub(crate) mod tests {
     }
 
     /// Every sandbox host route, as the control plane's client calls it.
-    const SANDBOX_ROUTES: [&str; 20] = [
+    const SANDBOX_ROUTES: [&str; 23] = [
         "/agent/sandboxes/service-access",
         "/agent/sandboxes",
         "/agent/sandboxes/exec",
@@ -2011,6 +2023,9 @@ pub(crate) mod tests {
         "/agent/sandboxes/resize-disk",
         "/agent/sandboxes/egress-policy",
         "/agent/sandboxes/image-identity",
+        "/agent/sandboxes/image-prepare",
+        "/agent/sandboxes/image-prepare-status",
+        "/agent/sandboxes/image-remove",
         "/agent/sandboxes/agent-runtime-check",
         "/agent/sandboxes/recover-agent-harness",
     ];

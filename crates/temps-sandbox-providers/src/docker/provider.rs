@@ -1290,6 +1290,85 @@ impl SandboxProvider for DockerSandboxProvider {
         Ok((ready, image_name))
     }
 
+    async fn prepare_image(
+        &self,
+        image: Option<&str>,
+        backend: Option<SandboxBackend>,
+    ) -> Result<crate::ImagePrepareStatus, AgentError> {
+        let image = self.prepare_target(image);
+        if let Some(status) = docker_backend_only(&image, backend) {
+            return Ok(status);
+        }
+        let (rx, started) = self.start_image_pull(&image);
+        if started {
+            tracing::info!(image = %image, "Preparing sandbox image ahead of the first create");
+        }
+        let status = rx.borrow().clone();
+        Ok(status)
+    }
+
+    async fn image_prepare_status(
+        &self,
+        image: Option<&str>,
+        backend: Option<SandboxBackend>,
+    ) -> Result<crate::ImagePrepareStatus, AgentError> {
+        let image = self.prepare_target(image);
+        if let Some(status) = docker_backend_only(&image, backend) {
+            return Ok(status);
+        }
+        let last = self.image_pull_status(&image);
+        if let Some(status) = last
+            .as_ref()
+            .filter(|s| s.state == crate::ImagePrepareState::Pulling)
+        {
+            return Ok(status.clone());
+        }
+        // Presence is the daemon's answer, not this process's memory: the
+        // image may have been pulled before a restart, or removed since.
+        match self.docker.inspect_image(&image).await {
+            Ok(_) => Ok(match last {
+                Some(status) if status.state == crate::ImagePrepareState::Ready => status,
+                _ => crate::ImagePrepareStatus::new(image, crate::ImagePrepareState::Ready),
+            }),
+            Err(error) if docker_error_is_not_found(&error) => Ok(match last {
+                Some(status) if status.state == crate::ImagePrepareState::Failed => status,
+                _ => crate::ImagePrepareStatus::new(image, crate::ImagePrepareState::NotPulled),
+            }),
+            Err(error) => Err(AgentError::SandboxProviderUnavailable {
+                provider: "docker".to_string(),
+                reason: format!("inspect sandbox image {image}: {error}"),
+            }),
+        }
+    }
+
+    async fn remove_prepared_image(&self, image: &str) -> Result<crate::ImageRemoval, AgentError> {
+        if self
+            .image_pull_status(image)
+            .is_some_and(|s| s.state == crate::ImagePrepareState::Pulling)
+        {
+            return Ok(crate::ImageRemoval::InUse);
+        }
+        // Never forced: Docker refuses to remove an image a container (even
+        // a stopped one) still uses, which is exactly the image to keep.
+        let options = bollard::query_parameters::RemoveImageOptionsBuilder::new()
+            .force(false)
+            .build();
+        match self.docker.remove_image(image, Some(options), None).await {
+            Ok(_) => {
+                tracing::info!(image = %image, "Removed a sandbox image no longer used as the default");
+                Ok(crate::ImageRemoval::Removed)
+            }
+            Err(error) if docker_error_is_not_found(&error) => Ok(crate::ImageRemoval::NotPresent),
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 409, ..
+            }) => Ok(crate::ImageRemoval::InUse),
+            Err(error) => Err(AgentError::SandboxProviderUnavailable {
+                provider: "docker".to_string(),
+                reason: format!("remove sandbox image {image}: {error}"),
+            }),
+        }
+    }
+
     async fn rebuild_image(&self) -> Result<String, AgentError> {
         let image_name = self.config.resolved_image();
         ensure_mutable_rebuild_target(&image_name)?;
@@ -1418,5 +1497,35 @@ impl SandboxProvider for DockerSandboxProvider {
                 ),
             }),
         }
+    }
+}
+
+impl DockerSandboxProvider {
+    /// The image a prepare is about: the one named, or exactly what a create
+    /// that names none would use (the release-pinned preset, the channel
+    /// tag, or the operator's custom image).
+    fn prepare_target(&self, image: Option<&str>) -> String {
+        image
+            .filter(|image| !image.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| self.config.resolved_image())
+    }
+}
+
+/// A Docker provider only prepares images for Docker sandboxes; asked about
+/// a microVM backend it says so instead of pulling a Docker image that
+/// backend would never use.
+fn docker_backend_only(
+    image: &str,
+    backend: Option<SandboxBackend>,
+) -> Option<crate::ImagePrepareStatus> {
+    match backend {
+        None | Some(SandboxBackend::Docker) => None,
+        Some(other) => Some(crate::ImagePrepareStatus::unsupported(
+            image,
+            format!(
+                "the '{other}' backend does not run Docker images, so there is nothing to pull"
+            ),
+        )),
     }
 }
