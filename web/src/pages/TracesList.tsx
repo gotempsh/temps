@@ -70,6 +70,7 @@ import {
   Check,
   ChevronLeft,
   ChevronRight,
+  Code2,
   FileCode,
   Gauge,
   Loader2,
@@ -79,8 +80,14 @@ import {
   Terminal,
   Workflow,
 } from 'lucide-react'
+import { PlainHttpSetup } from '@/components/project/setup/PlainHttpSetup'
+import {
+  findSignal,
+  useIngestSetup,
+} from '@/components/project/setup/use-ingest-setup'
+import { externalOtelEnvBlock } from '@/lib/plain-http-setup'
 import { ReactElement, useCallback, useEffect, useMemo, useState } from 'react'
-import { useLocation, useNavigate, useSearchParams } from 'react-router'
+import { Link, useLocation, useNavigate, useSearchParams } from 'react-router'
 
 interface TracesListProps {
   project: ProjectResponse
@@ -409,6 +416,8 @@ function OtelSetupSection({
   const [selectedEnvId, setSelectedEnvId] = useState<string>('')
   const [selectedFrameworkId, setSelectedFrameworkId] =
     useState<string>('nextjs')
+  // The framework-agnostic option: any OpenTelemetry SDK or the Collector.
+  const [plainHttp, setPlainHttp] = useState(false)
 
   const { data: environments } = useQuery({
     ...getEnvironmentsOptions({
@@ -425,10 +434,10 @@ function OtelSetupSection({
     [environments, effectiveSelectedEnvId]
   )
 
-  const baseUrl = window.location.origin
-  const otlpEndpoint = selectedEnv
-    ? `${baseUrl}/api/otel/v1/${project.id}/${selectedEnv.id}/0`
-    : `${baseUrl}/api/otel/v1/${project.id}/0/0`
+  // The public OTLP endpoint for the selected environment, resolved by the
+  // server (ADR-051 public ingress URL), not the console's own origin.
+  const ingestSetup = useIngestSetup(project.id, selectedEnv?.id)
+  const tracesSetup = findSignal(ingestSetup.data, 'traces')
 
   const preset =
     frameworkPresets.find((f) => f.id === selectedFrameworkId) ??
@@ -438,12 +447,7 @@ function OtelSetupSection({
     .split('__SERVICE_NAME__')
     .join(project.name)
 
-  const envVarsCode = `# Auto-injected on Temps deployments.
-# Set these manually when running on Vercel, Fly, AWS, bare metal, etc.
-OTEL_EXPORTER_OTLP_ENDPOINT=${otlpEndpoint}
-OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
-OTEL_EXPORTER_OTLP_HEADERS=Authorization=Bearer <YOUR_API_KEY>
-OTEL_SERVICE_NAME=${project.name}`
+  const envVarsCode = externalOtelEnvBlock(tracesSetup, project.name)
 
   const { data: waitingProbe } = useQuery({
     ...hasTracesOptions({ path: { project_id: project.id } }),
@@ -492,12 +496,15 @@ OTEL_SERVICE_NAME=${project.name}`
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
               {frameworkPresets.map((fw) => {
                 const Icon = fw.icon
-                const isSelected = selectedFrameworkId === fw.id
+                const isSelected = selectedFrameworkId === fw.id && !plainHttp
                 return (
                   <button
                     key={fw.id}
                     type="button"
-                    onClick={() => setSelectedFrameworkId(fw.id)}
+                    onClick={() => {
+                      setSelectedFrameworkId(fw.id)
+                      setPlainHttp(false)
+                    }}
                     className={cn(
                       'flex items-center gap-3 rounded-lg border bg-card p-4 text-left transition-all hover:border-primary/60 hover:bg-accent/40',
                       isSelected &&
@@ -522,6 +529,31 @@ OTEL_SERVICE_NAME=${project.name}`
                   </button>
                 )
               })}
+              <button
+                type="button"
+                onClick={() => setPlainHttp(true)}
+                className={cn(
+                  'flex items-center gap-3 rounded-lg border bg-card p-4 text-left transition-all hover:border-primary/60 hover:bg-accent/40',
+                  plainHttp &&
+                    'border-primary bg-primary/5 ring-2 ring-primary/20'
+                )}
+                aria-pressed={plainHttp}
+              >
+                <div className="rounded-md bg-muted p-2 text-foreground shrink-0">
+                  <Code2 className="size-5" />
+                </div>
+                <div className="flex-1 min-w-0">
+                  <p className="font-medium leading-none truncate">
+                    Plain HTTP / any framework
+                  </p>
+                  <p className="mt-1 text-xs text-muted-foreground truncate">
+                    Any OpenTelemetry SDK or the Collector
+                  </p>
+                </div>
+                {plainHttp && (
+                  <Check className="size-4 shrink-0 text-primary" />
+                )}
+              </button>
             </div>
 
             <div className="flex justify-end">
@@ -533,7 +565,57 @@ OTEL_SERVICE_NAME=${project.name}`
           </div>
         )}
 
-        {wizardStep === 'install' && (
+        {wizardStep === 'install' && plainHttp && (
+          <div className="space-y-6">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="flex items-center gap-3">
+                <span className="text-xs text-muted-foreground shrink-0">
+                  Environment:
+                </span>
+                <Select
+                  value={effectiveSelectedEnvId}
+                  onValueChange={setSelectedEnvId}
+                >
+                  <SelectTrigger className="w-full sm:w-[200px] h-8">
+                    <SelectValue placeholder="Select environment" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {environments?.map((env: EnvironmentResponse) => (
+                      <SelectItem key={env.id} value={String(env.id)}>
+                        {env.name}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+            </div>
+            <PlainHttpSetup
+              project={project}
+              signal="traces"
+              environmentId={selectedEnv?.id}
+            />
+            <PlainHttpSetup
+              project={project}
+              signal="logs"
+              environmentId={selectedEnv?.id}
+            />
+            <div className="flex items-center justify-between gap-3">
+              <Button
+                variant="ghost"
+                onClick={() => setWizardStep('framework')}
+              >
+                <ArrowLeft className="mr-2 size-4" />
+                Back
+              </Button>
+              <Button onClick={() => setWizardStep('waiting')}>
+                Continue
+                <ArrowRight className="ml-2 size-4" />
+              </Button>
+            </div>
+          </div>
+        )}
+
+        {wizardStep === 'install' && !plainHttp && (
           <div className="space-y-6">
             <div className="flex items-center gap-3 rounded-lg border bg-card p-4">
               <div className="rounded-md bg-muted p-2">
@@ -619,9 +701,12 @@ OTEL_SERVICE_NAME=${project.name}`
               </div>
               <CodeBlock code={envVarsCode} language="bash" title=".env" />
               <p className="text-xs text-muted-foreground">
-                Replace <code>&lt;YOUR_API_KEY&gt;</code> with a Temps API key (
+                Set <code>TEMPS_API_KEY</code> to a Temps API key (
                 <code>tk_...</code>) from{' '}
-                <strong>Settings &rarr; API Keys</strong>.
+                <Link className="underline underline-offset-4" to="/keys/new">
+                  API keys
+                </Link>
+                . Keep it server-side.
               </p>
             </div>
 
