@@ -2,7 +2,8 @@
 
 ## Status
 
-Proposed — 2026-11-19
+Proposed — 2026-11-19. D1 is implemented; what it settled is recorded
+under "Settled while implementing D1". D2 to D9 are not started.
 
 Related: ADR 012 (ClickHouse analytics backend), ADR 040 (analytics ingest
 keys), ADR 072 (product analytics gaps against PostHog; D2 here is the goal
@@ -26,7 +27,7 @@ Temps today keeps most of the dashboard.
 | Visitors, sessions, page views, bounce rate, live visitors | `crates/temps-analytics` | Yes |
 | Breakdowns: pages, referrers, channels, UTM, country/region/city, browser, OS, device, language | `web/src/components/analytics/overview/` | Yes |
 | Dashboard filters by dimension, period comparison | `filter_*` fields in `crates/temps-analytics/src/types/requests.rs` | Yes |
-| Custom events with property breakdowns | `/projects/{project_id}/events/*` in `crates/temps-analytics-events` | Yes |
+| Custom events | `/projects/{project_id}/events/*` in `crates/temps-analytics-events`, `/analytics/event-*` in `crates/temps-analytics` | Yes. Breakdowns were over fixed columns only (`PropertyColumn`); a breakdown by a custom property came with D1 (`GET /analytics/event-properties`) |
 | Funnels | `crates/temps-analytics-funnels` | Yes |
 | Engagement time (heartbeat, page leave) | `sdks/node/packages/analytics-core/src/EngagementTracker.ts` | Yes |
 | Bot and AI-crawler filtering | `crates/temps-analytics-backend`, `web/src/pages/ProjectAiCrawlers.tsx` | Yes |
@@ -277,6 +278,43 @@ recipients.
 **Missing.** No search-query data and no way to bring history across. Both are
 integrations with an external account and matter mostly at migration time, so
 they come last.
+
+## Settled while implementing D1
+
+- **Where the code lives.** Link and 404 detection is in
+  `sdks/node/packages/analytics-core/src/AutoTracking.ts`, exported for
+  reuse. The script tag, Vue and Svelte get it through `createAnalytics`;
+  the React provider has its own copy of the tracker and calls the same
+  functions.
+- **Recorded URL.** Origin and path only. Query strings and fragments are
+  dropped: download links are often pre-signed storage URLs whose query
+  string is a credential, and tracking parameters would split one
+  destination into many rows.
+- **Precedence.** A link that is both a download and outbound (a PDF on a
+  CDN) is reported once, as `file_download`. A link with the `download`
+  attribute is a download whatever its extension. Only `http`/`https` links
+  count.
+- **Middle clicks.** The one delegated handler also receives `auxclick`, so
+  a middle click (open in a new tab) counts. Right clicks do not.
+- **The 404 marker.** Checked after each page view and once more one second
+  later, for single-page apps that render their 404 view after the route
+  change; at most one `not_found` per page view.
+- **Server-side 404s.** No new query or endpoint: the report uses the
+  existing API traffic aggregation (`POST /projects/{project_id}/api-analytics/query`,
+  TimescaleDB and ClickHouse) with `status_code = 404` and `is_bot = false`.
+  It gained one allowlisted dimension, `referrer`, for the "top referrer"
+  column. The aggregation serves at most 30 days, so the card narrows a
+  longer selection and says so. A server that predates `referrer` rejects
+  that second query and the card lists paths without referrers.
+- **Property breakdown.** The ADR assumed custom events already had
+  property breakdowns; they had breakdowns over fixed columns only. D1 adds
+  `GET /analytics/event-properties` (event name and one top-level property
+  key, crawlers excluded, at most 100 values). It reads `events.props` on
+  PostgreSQL, like the other `/analytics/event-*` endpoints. D2's property
+  filters can reuse its key validation (`validate_event_property_key`).
+- **Where it shows.** Three cards in the overview's Events tab, each with an
+  explanation and a link to the tracker setup while empty; CLI
+  `temps analytics outbound | downloads | not-found`.
 
 ## Not doing
 
