@@ -4039,7 +4039,7 @@ async fn a_control_plane_redis_is_backed_up_and_restored_by_the_same_node_half()
 const DRAGONFLY_IMAGE: &str = "docker.dragonflydb.io/dragonflydb/dragonfly:v2.1.0@sha256:94891bb22ce2fb0f7a5a3ff1bb3b2fbbc5830e2523293e47723d87fa3e5b1184";
 
 /// Start a Dragonfly container `name` on `network` with its data on volume
-/// `volume`, as a replica of `primary` when given.
+/// `volume`, as a replica of `primary` when given, with `extra` flags.
 async fn start_dragonfly(
     docker: &Docker,
     name: &str,
@@ -4047,6 +4047,7 @@ async fn start_dragonfly(
     network: &str,
     password: &str,
     primary: Option<&str>,
+    extra: &[&str],
 ) {
     let mut cmd = vec![
         "dragonfly".to_string(),
@@ -4064,6 +4065,7 @@ async fn start_dragonfly(
             format!("{primary}:6379"),
         ]);
     }
+    cmd.extend(extra.iter().map(|flag| flag.to_string()));
     docker
         .create_container(
             Some(
@@ -4153,12 +4155,22 @@ async fn a_dragonfly_replica_and_primary_are_backed_up_by_the_rdb_engine() {
     let suffix = std::process::id();
     let primary = format!("redis-dfprimary{suffix}");
     let replica = format!("redis-dfreplica{suffix}");
+    let outside = format!("redis-dfoutside{suffix}");
     let s3_name = format!("dfredis3{suffix}");
     let password = "local-dragonfly-proof";
     let _cleanup = Cleanup {
         docker: docker.clone(),
-        containers: vec![replica.clone(), primary.clone(), s3_name.clone()],
-        volumes: vec![format!("{primary}-data"), format!("{replica}-data")],
+        containers: vec![
+            replica.clone(),
+            primary.clone(),
+            outside.clone(),
+            s3_name.clone(),
+        ],
+        volumes: vec![
+            format!("{primary}-data"),
+            format!("{replica}-data"),
+            format!("{outside}-data"),
+        ],
     };
     start_dragonfly(
         &docker,
@@ -4167,6 +4179,7 @@ async fn a_dragonfly_replica_and_primary_are_backed_up_by_the_rdb_engine() {
         network,
         password,
         None,
+        &[],
     )
     .await;
     wait_redis(&docker, &primary, password).await;
@@ -4177,6 +4190,7 @@ async fn a_dragonfly_replica_and_primary_are_backed_up_by_the_rdb_engine() {
         network,
         password,
         Some(&primary),
+        &[],
     )
     .await;
     wait_redis(&docker, &replica, password).await;
@@ -4240,6 +4254,49 @@ async fn a_dragonfly_replica_and_primary_are_backed_up_by_the_rdb_engine() {
             "{container}: the snapshot file is removed"
         );
     }
+
+    // A `dir` outside every volume: the snapshot would land in the
+    // container's own filesystem, out of the helper's reach, so the backup
+    // is refused before Dragonfly saves anything.
+    start_dragonfly(
+        &docker,
+        &outside,
+        &format!("{outside}-data"),
+        network,
+        password,
+        None,
+        &["--dir=/tmp"],
+    )
+    .await;
+    wait_redis(&docker, &outside, password).await;
+    let error = redis_rdb_backup(
+        Arc::new(docker.clone()),
+        RedisRdbBackup {
+            service_id: 1,
+            service: "dfoutside".to_string(),
+            container_name: outside.clone(),
+            password: password.to_string(),
+            destination: redis_destination(format!("http://127.0.0.1:{s3_port}")),
+            key: format!(
+                "{WALG_BUCKET_PATH}/external_services/redis/dfoutside/2026/11/19/local-{suffix}/dump.rdb.gz"
+            ),
+        },
+    )
+    .await
+    .expect_err("a snapshot dir outside the volumes is refused");
+    assert!(
+        error
+            .to_string()
+            .contains("saves snapshots to /tmp, which is not on a volume of its container"),
+        "{error}"
+    );
+    let (_, saved) = exec(
+        &docker,
+        &outside,
+        &["sh", "-c", "ls -a /tmp | grep '^temps-backup' || true"],
+    )
+    .await;
+    assert_eq!(saved, "", "nothing is saved outside the volumes");
 
     // A helper killed while its SAVE runs: enough data that the save is
     // still writing its `.tmp` when the client is gone.

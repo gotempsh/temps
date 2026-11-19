@@ -158,12 +158,45 @@ pub fn walg_backup_env(
 ///   role; the helper reads the file through the container's volumes
 ///   (`workdir` is the container's, where a relative `dir` points) and
 ///   removes it afterwards.
-pub fn rdb_dump_script(container: &str, workdir: &str, snapshot: &str) -> String {
+/// - A `dir` outside every one of the container's `mounts` is refused
+///   before the `SAVE`: the snapshot would land in the container's own
+///   filesystem, where neither this helper nor the cleanup can read or
+///   remove it, and each attempt would leave another one there.
+pub fn rdb_dump_script(
+    container: &str,
+    workdir: &str,
+    mounts: &[String],
+    snapshot: &str,
+) -> String {
+    let mounts: Vec<&str> = mounts
+        .iter()
+        .map(|mount| mount.trim_end_matches('/'))
+        .filter(|mount| !mount.is_empty())
+        .collect();
+    let in_volume = if mounts.is_empty() {
+        String::new()
+    } else {
+        let patterns: Vec<String> = mounts
+            .iter()
+            .map(|mount| format!("{}/*", shell_escape(mount)))
+            .collect();
+        format!("\n    {}) ;;", patterns.join("|"))
+    };
+    let listed = if mounts.is_empty() {
+        "none".to_string()
+    } else {
+        mounts.join(", ")
+    };
     format!(
         r#"set -e
 host={host}
 if redis-cli -h "$host" -p 6379 INFO server | grep -q '^dragonfly_version:'; then
 {path}
+  case "$dir"/ in{in_volume}
+    *)
+      echo "Dragonfly $host saves snapshots to $dir, which is not on a volume of its container (volumes: "{listed}"), so a backup could neither read nor remove one there; point its dir at a volume to back it up" >&2
+      exit 1 ;;
+  esac
   trap 'rm -f "$f" "$f.tmp"' EXIT
   echo "$host runs Dragonfly, which does not serve redis-cli --rdb: saving a snapshot to $f instead" >&2
   reply=$(redis-cli -h "$host" -p 6379 SAVE RDB {snapshot} 2>&1)
@@ -184,6 +217,7 @@ else
 fi"#,
         host = shell_escape(container),
         path = snapshot_path_lines(workdir, snapshot),
+        listed = shell_escape(&listed),
         snapshot = shell_escape(snapshot),
     )
 }
@@ -658,6 +692,13 @@ pub async fn redis_rdb_backup(
         .state
         .and_then(|state| state.running)
         .unwrap_or(false);
+    // Where Dragonfly may save a snapshot the helper can read and remove.
+    let mounts: Vec<String> = inspect
+        .mounts
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|mount| mount.destination)
+        .collect();
     // Where a relative snapshot `dir` of Dragonfly points; Docker
     // starts a process in `/` when the image sets no working directory.
     let workdir = inspect
@@ -709,7 +750,7 @@ pub async fn redis_rdb_backup(
         name: format!("temps-backup-{:08x}", rand::random::<u32>()),
         password: password.clone(),
     };
-    let script = rdb_dump_script(&container_name, &snapshot.workdir, &snapshot.name);
+    let script = rdb_dump_script(&container_name, &snapshot.workdir, &mounts, &snapshot.name);
     let guard = SnapshotGuard {
         docker: docker.clone(),
         snapshot: Some(snapshot),
@@ -1104,7 +1145,12 @@ mod tests {
 
     #[test]
     fn the_rdb_helper_keeps_the_password_out_of_its_script() {
-        let script = rdb_dump_script("redis-cache", "/data", "temps-backup-0000abcd");
+        let script = rdb_dump_script(
+            "redis-cache",
+            "/data",
+            &["/data".to_string()],
+            "temps-backup-0000abcd",
+        );
         assert!(script.contains("host='redis-cache'\n"));
         assert!(script.contains("redis-cli -h \"$host\" -p 6379 --rdb \"$f\""));
         assert!(script.contains("gzip -c \"$f\""));
@@ -1116,7 +1162,12 @@ mod tests {
     /// volume and removed on every path.
     #[test]
     fn dragonfly_saves_a_snapshot_instead_of_replicating() {
-        let script = rdb_dump_script("redis-cache", "/srv data", "temps-backup-0000abcd");
+        let script = rdb_dump_script(
+            "redis-cache",
+            "/srv data",
+            &["/srv data".to_string()],
+            "temps-backup-0000abcd",
+        );
         assert!(script.contains("grep -q '^dragonfly_version:'"));
         assert!(script.contains("SAVE RDB 'temps-backup-0000abcd'"));
         assert!(script.contains("f=\"$dir\"/'temps-backup-0000abcd'.rdb"));
@@ -1130,6 +1181,31 @@ mod tests {
             snapshot < stream,
             "Dragonfly is recognised before --rdb runs"
         );
+    }
+
+    /// A snapshot outside every volume could be neither read nor removed, so
+    /// such a `dir` is refused before Dragonfly is asked to save.
+    #[test]
+    fn a_snapshot_dir_outside_the_volumes_is_refused_before_saving() {
+        let script = rdb_dump_script(
+            "redis-cache",
+            "/data",
+            &["/data/".to_string(), "/srv/cache".to_string()],
+            "temps-backup-0000abcd",
+        );
+        let guard = script
+            .find("'/data'/*|'/srv/cache'/*) ;;")
+            .expect("the volumes are matched");
+        let refusal = script
+            .find("is not on a volume of its container (volumes: \"'/data, /srv/cache'\")")
+            .expect("the refusal names the volumes");
+        let save = script.find("SAVE RDB").expect("the save");
+        assert!(guard < refusal && refusal < save, "{script}");
+
+        // No volume at all: every dir is refused.
+        let script = rdb_dump_script("redis-cache", "/", &[], "temps-backup-0000abcd");
+        assert!(script.contains("case \"$dir\"/ in\n    *)"), "{script}");
+        assert!(script.contains("(volumes: \"'none'\")"), "{script}");
     }
 
     /// A killed helper's `SAVE` finishes in Dragonfly afterwards, so the
