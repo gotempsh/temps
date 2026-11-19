@@ -115,11 +115,13 @@ error on the tunnel, and is not retried every pass). Only one control-plane proc
 owns a database, so a per-connector lock in that process, shared by the
 console's and the connector loop's services, orders every configuration of a
 tunnel: a run reads the row, calls the provider and saves the outcome before
-the next one starts, holding no database connection while it waits. A move
-re-checks under that lock, which placement changes also take, that the
-tunnel still runs only on the control plane, and saves the port only once
-the provider accepted it, so an interrupted move is simply made again by the
-next pass. A tunnel also placed on
+the next one starts, holding no database connection while it waits. Only
+another configuration of the same tunnel waits on it; placement changes,
+status reports and token-holder updates never wait for the provider. A move
+re-checks right before the provider call that the tunnel still runs only on
+the control plane, and saves the port only once the provider accepted it,
+so the next pass simply makes an interrupted move again; a worker added
+during the call gets the moved port, which it binds like any other. A tunnel also placed on
 workers keeps its port, since every worker binds it itself; its control-plane
 replica reports why it does not run. With every port taken, the listener is
 skipped and a connector placed on node `0` reports why it cannot start.

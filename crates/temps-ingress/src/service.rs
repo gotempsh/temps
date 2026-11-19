@@ -1689,9 +1689,6 @@ impl IngressConnectorService {
     }
 
     async fn replace_nodes(&self, connector_id: i32, node_ids: &[i32]) -> Result<(), IngressError> {
-        // Never while the tunnel is being configured: a port move checks the
-        // placement under this lock (`service/ensure.rs`).
-        let _serialized = self.connector_locks().lock(connector_id).await;
         let wanted: BTreeSet<i32> = node_ids.iter().copied().collect();
         // Recorded before a new node can fetch the secret, so it is rotated
         // once that node leaves even if it leaves right away.
@@ -4048,9 +4045,9 @@ mod tests {
             drop(test_db);
         }
 
-        /// A worker added while the move waited for the tunnel's lock wins:
-        /// the move re-checks the placement under that lock and leaves the
-        /// port alone, since every worker binds it itself.
+        /// A worker added while the move waited for the tunnel wins: the
+        /// move re-checks the placement right before calling the provider
+        /// and leaves the port alone.
         #[tokio::test]
         async fn a_port_move_is_dropped_when_the_tunnel_gains_a_worker_meanwhile() {
             let Some((test_db, service, calls, id)) = setup_with(Some(7481)).await else {
@@ -4063,8 +4060,9 @@ mod tests {
                 .await
                 .expect("placed on the control plane");
 
-            // A sync holds the tunnel; the placement change queues first,
-            // then the move, which still sees a control-plane-only tunnel.
+            // A sync holds the tunnel. The move picks the tunnel while it
+            // still runs only on the control plane, and waits; a worker is
+            // added meanwhile, which the move sees once it runs.
             calls.hold_next.store(true, Ordering::SeqCst);
             let syncer = {
                 let service = service.clone();
@@ -4073,23 +4071,19 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(10), calls.held.notified())
                 .await
                 .expect("the sync reached the provider");
-            let placing = {
-                let service = service.clone();
-                tokio::spawn(async move {
-                    service
-                        .replace_nodes(id, &[CONTROL_PLANE_NODE_ID, worker])
-                        .await
-                })
-            };
-            tokio::time::sleep(Duration::from_millis(200)).await;
             let mover = {
                 let service = service.clone();
                 tokio::spawn(async move { service.align_control_plane_edge_ports(7481).await })
             };
             tokio::time::sleep(Duration::from_millis(200)).await;
+            assert!(!mover.is_finished(), "the move waits for the sync");
+            service
+                .replace_nodes(id, &[CONTROL_PLANE_NODE_ID, worker])
+                .await
+                .expect("placed on a worker too");
 
             calls.release.notify_one();
-            for task in [syncer, placing, mover] {
+            for task in [syncer, mover] {
                 tokio::time::timeout(Duration::from_secs(10), task)
                     .await
                     .expect("finished")
@@ -4101,11 +4095,11 @@ mod tests {
             drop(test_db);
         }
 
-        /// A placement change waits for a port move at the provider, so a
-        /// worker never joins a tunnel between the move's placement check and
-        /// its saved port.
+        /// A placement change never waits for the provider: a worker added
+        /// while a move is at the provider is placed at once, and the moved
+        /// port saved is the one the provider has, which the worker binds.
         #[tokio::test]
-        async fn a_placement_change_waits_for_a_port_move_at_the_provider() {
+        async fn a_placement_change_never_waits_for_a_port_move_at_the_provider() {
             let Some((test_db, service, calls, id)) = setup_with(Some(7481)).await else {
                 return;
             };
@@ -4124,30 +4118,28 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(10), calls.held.notified())
                 .await
                 .expect("the move reached the provider");
-            let placing = {
-                let service = service.clone();
-                tokio::spawn(async move {
-                    service
-                        .replace_nodes(id, &[CONTROL_PLANE_NODE_ID, worker])
-                        .await
-                })
-            };
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            assert!(
-                !placing.is_finished(),
-                "the placement must wait for the move"
-            );
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                service.replace_nodes(id, &[CONTROL_PLANE_NODE_ID, worker]),
+            )
+            .await
+            .expect("the placement change does not wait for the provider")
+            .expect("placed on a worker too");
 
             calls.release.notify_one();
-            for task in [mover, placing] {
-                tokio::time::timeout(Duration::from_secs(10), task)
-                    .await
-                    .expect("finished")
-                    .expect("join")
-                    .expect("ok");
-            }
-            // The move finished first; the worker then binds the moved port.
-            assert_eq!(service.find(id).await.expect("row").edge_port, 7481);
+            tokio::time::timeout(Duration::from_secs(10), mover)
+                .await
+                .expect("finished")
+                .expect("join")
+                .expect("moved");
+            let row = service.find(id).await.expect("row");
+            assert_eq!(row.edge_port, 7481);
+            assert_eq!(
+                i32::from(calls.ensured_port.load(Ordering::SeqCst)),
+                row.edge_port
+            );
+            let specs = service.node_specs(worker).await.expect("worker specs");
+            assert_eq!(specs.connectors[0].edge_port, 7481);
             drop(test_db);
         }
 

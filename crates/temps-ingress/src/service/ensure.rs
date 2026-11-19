@@ -13,8 +13,11 @@
 //! receives is therefore always the one saved.
 //!
 //! The lock is a tokio mutex per connector, not a database lock: waiting on
-//! it holds no pooled connection, and it orders only runs for the same
-//! tunnel, which must not overlap anyway.
+//! it holds no pooled connection, and only another configuration of the
+//! same tunnel ever waits on it. Two configurations of one tunnel cannot
+//! overlap without one overwriting the other at the provider, so that wait
+//! is the ordering itself. Nothing else takes it: placement changes,
+//! status reports and token-holder updates never wait for the provider.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -62,10 +65,12 @@ impl IngressConnectorService {
     ///
     /// `edge_port`: move the tunnel to this port
     /// (`align_control_plane_edge_ports`). Applied only while the tunnel
-    /// still runs on the control plane alone, checked under the lock that
-    /// placement changes take too, and saved only once the provider
-    /// accepted it: an interrupted or refused move leaves the stored port,
-    /// so the next pass moves it again.
+    /// still runs on the control plane alone, checked right before the
+    /// provider call, and saved only once the provider accepted it: an
+    /// interrupted or refused move leaves the stored port, so the next pass
+    /// moves it again. A worker added during the call gets the moved port,
+    /// which it binds like any other: the saved port always matches the
+    /// provider's.
     pub(super) async fn ensure(&self, id: i32, edge_port: Option<i32>) -> Result<(), IngressError> {
         let _serialized = self.connector_locks().lock(id).await;
         let mut connector = self.find(id).await?;
