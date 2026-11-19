@@ -1693,14 +1693,20 @@ impl IngressConnectorService {
         // Recorded before a new node can fetch the secret, so it is rotated
         // once that node leaves even if it leaves right away.
         self.add_token_holders(connector_id, &wanted).await?;
+        // One placement edit of a tunnel at a time: two requests reading the
+        // same rows would otherwise both insert their workers (and leave the
+        // union, or trip the unique constraint). The tunnel's row lock is held
+        // for this read-diff-write only, never across a provider call.
+        let txn = self.db.begin().await?;
+        Self::find_for_update(&txn, connector_id).await?;
         let existing = ingress_connector_nodes::Entity::find()
             .filter(ingress_connector_nodes::Column::ConnectorId.eq(connector_id))
-            .all(self.db.as_ref())
+            .all(&txn)
             .await?;
         for row in &existing {
             if !wanted.contains(&row.node_id) {
                 ingress_connector_nodes::Entity::delete_by_id(row.id)
-                    .exec(self.db.as_ref())
+                    .exec(&txn)
                     .await?;
             }
         }
@@ -1715,9 +1721,10 @@ impl IngressConnectorService {
                 created_at: Set(Utc::now()),
                 ..Default::default()
             }
-            .insert(self.db.as_ref())
+            .insert(&txn)
             .await?;
         }
+        txn.commit().await?;
         Ok(())
     }
 
@@ -4140,6 +4147,57 @@ mod tests {
             );
             let specs = service.node_specs(worker).await.expect("worker specs");
             assert_eq!(specs.connectors[0].edge_port, 7481);
+            drop(test_db);
+        }
+
+        /// Two placement edits of one tunnel never mix: the tunnel ends on
+        /// exactly one of the requested lists, and neither request fails on
+        /// the one-row-per-node constraint.
+        #[tokio::test]
+        async fn concurrent_placement_edits_leave_one_requested_list() {
+            let Some((test_db, service, _calls, id)) = setup_with(Some(7481)).await else {
+                return;
+            };
+            let db = test_db.connection_arc();
+            let a = insert_node(db.as_ref(), "worker-a", "worker", "active").await;
+            let b = insert_node(db.as_ref(), "worker-b", "worker", "active").await;
+            async fn placed(service: &IngressConnectorService, id: i32) -> Vec<i32> {
+                let mut nodes: Vec<i32> = ingress_connector_nodes::Entity::find()
+                    .filter(ingress_connector_nodes::Column::ConnectorId.eq(id))
+                    .all(service.db.as_ref())
+                    .await
+                    .expect("rows")
+                    .into_iter()
+                    .map(|row| row.node_id)
+                    .collect();
+                nodes.sort_unstable();
+                nodes
+            }
+            let with_a = vec![CONTROL_PLANE_NODE_ID, a];
+            let with_b = vec![CONTROL_PLANE_NODE_ID, b];
+            for round in 0..10 {
+                service
+                    .replace_nodes(id, &[CONTROL_PLANE_NODE_ID])
+                    .await
+                    .expect("reset");
+                // Both add a worker; on odd rounds they add the same one.
+                let second = if round % 2 == 0 {
+                    with_b.clone()
+                } else {
+                    with_a.clone()
+                };
+                let (first_done, second_done) = tokio::join!(
+                    service.replace_nodes(id, &with_a),
+                    service.replace_nodes(id, &second),
+                );
+                first_done.expect("first edit");
+                second_done.expect("second edit, never a unique-constraint error");
+                let nodes = placed(&service, id).await;
+                assert!(
+                    nodes == with_a || nodes == second,
+                    "round {round}: placement mixed two requests: {nodes:?}"
+                );
+            }
             drop(test_db);
         }
 
