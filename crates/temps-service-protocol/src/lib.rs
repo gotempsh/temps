@@ -535,6 +535,56 @@ pub struct PostgresWalgBackupRequest {
     pub allow_restart: bool,
 }
 
+/// `POST /agent/services/postgres/cluster-walg-backup`: a WAL-G base backup
+/// of a PostgreSQL HA cluster (pg_auto_failover) from its current primary, a
+/// data member this node runs, by the control plane's own cluster engine.
+///
+/// Names no command, image, host or path: the member's container follows
+/// from the service's name and the member's ordinal, the WAL-G prefix from
+/// the bucket, `bucket_path` and the service's name, the commands are fixed
+/// in the engine. Never turns archiving on and never recreates or restarts
+/// the member: pg_auto_failover owns it. Its outcome is read, like a
+/// standalone backup's, at `/agent/services/postgres/walg-backup/outcome`.
+#[derive(Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PostgresClusterWalgBackupRequest {
+    pub service_id: i32,
+    /// The cluster service's name.
+    pub service: String,
+    /// The ordinal of the data member to back up: the current primary.
+    pub ordinal: i32,
+    /// The port PostgreSQL listens on inside the member's container (each
+    /// member listens on its own, not 5432).
+    pub pg_port: i32,
+    /// The login `wal-g` and `psql` connect with.
+    pub username: String,
+    pub password: String,
+    pub database: String,
+    pub destination: WorkerS3Destination,
+    /// The S3 source's base path inside its bucket; empty for none.
+    #[serde(default)]
+    pub bucket_path: String,
+    /// The backup's id, recorded in WAL-G's sentinel to find it again.
+    pub backup_uuid: String,
+}
+
+impl std::fmt::Debug for PostgresClusterWalgBackupRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PostgresClusterWalgBackupRequest")
+            .field("service_id", &self.service_id)
+            .field("service", &self.service)
+            .field("ordinal", &self.ordinal)
+            .field("pg_port", &self.pg_port)
+            .field("username", &self.username)
+            .field("password", &"[REDACTED]")
+            .field("database", &self.database)
+            .field("destination", &self.destination)
+            .field("bucket_path", &self.bucket_path)
+            .field("backup_uuid", &self.backup_uuid)
+            .finish()
+    }
+}
+
 /// `POST /agent/services/postgres/walg-backup/outcome`: what became of the
 /// WAL-G base backup of service `service` started under `backup_uuid`.
 ///
@@ -1383,6 +1433,15 @@ pub trait NodeServiceRuntime: Send + Sync {
         node: NodeAttachment,
         after_create: RecreateHook,
         published_address: Option<IpAddr>,
+    ) -> Result<PostgresWalgBackupResult, NodeServiceError>;
+
+    /// Run the control plane's WAL-G base backup of an HA cluster's primary,
+    /// a data member this node runs (see
+    /// [`PostgresClusterWalgBackupRequest`]). Never recreates or restarts it.
+    async fn postgres_cluster_walg_backup(
+        &self,
+        request: PostgresClusterWalgBackupRequest,
+        docker: Arc<Docker>,
     ) -> Result<PostgresWalgBackupResult, NodeServiceError>;
 
     /// Point continuous archiving at a destination on this node (see

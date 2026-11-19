@@ -306,6 +306,26 @@ pub fn backup_push_env(
     backup_uuid: &str,
     container_endpoint: Option<String>,
 ) -> Vec<String> {
+    backup_push_env_on_port(
+        walg_prefix,
+        s3,
+        login,
+        5432,
+        backup_uuid,
+        container_endpoint,
+    )
+}
+
+/// [`backup_push_env`] for a server listening on `pg_port` inside its
+/// container: an HA cluster's member listens on its own port.
+pub fn backup_push_env_on_port(
+    walg_prefix: &str,
+    s3: &S3Credentials,
+    login: &PostgresLogin,
+    pg_port: i32,
+    backup_uuid: &str,
+    container_endpoint: Option<String>,
+) -> Vec<String> {
     let mut env = vec![
         format!("WALG_S3_PREFIX={walg_prefix}"),
         format!("AWS_ACCESS_KEY_ID={}", s3.access_key_id),
@@ -315,7 +335,7 @@ pub fn backup_push_env(
     env.extend(login.env());
     env.extend([
         "PGHOST=localhost".to_string(),
-        "PGPORT=5432".to_string(),
+        format!("PGPORT={pg_port}"),
         "WALG_UPLOAD_CONCURRENCY=4".to_string(),
         "WALG_UPLOAD_DISK_CONCURRENCY=1".to_string(),
         "WALG_UPLOAD_QUEUE=2".to_string(),
@@ -449,7 +469,7 @@ pub async fn walg_base_backup(
             output.stderr.trim()
         );
     }
-    let lsn = match current_wal_lsn(&docker, &container_name, &login).await {
+    let lsn = match current_wal_lsn(&docker, &container_name, &login, None).await {
         Ok(lsn) => Some(lsn),
         Err(error) => {
             warn!(service_id, %error, "Could not read the WAL LSN after a WAL-G base backup");
@@ -545,12 +565,16 @@ pub async fn probe_backup_push(
 }
 
 /// `pg_current_wal_lsn()` in the container, credentials in the environment.
-async fn current_wal_lsn(
+/// `pg_port` is the server's port inside the container, when it is not the
+/// default one.
+pub(crate) async fn current_wal_lsn(
     docker: &Docker,
     container_name: &str,
     login: &PostgresLogin,
+    pg_port: Option<i32>,
 ) -> Result<String, WalgBaseBackupError> {
-    let env = login.env();
+    let mut env = login.env().to_vec();
+    env.extend(pg_port.map(|port| format!("PGPORT={port}")));
     let env_refs: Vec<&str> = env.iter().map(|s| s.as_str()).collect();
     let output = exec_capture(
         docker,
@@ -610,7 +634,7 @@ fn node_service_config(
     Ok((service_config, container_name))
 }
 
-fn node_s3(destination: WorkerS3Destination, bucket_path: String) -> S3Credentials {
+pub(crate) fn node_s3(destination: WorkerS3Destination, bucket_path: String) -> S3Credentials {
     S3Credentials {
         access_key_id: destination.access_key_id,
         secret_key: destination.secret_access_key,

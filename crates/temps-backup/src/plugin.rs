@@ -47,9 +47,8 @@ use temps_providers::postgres_upgrade_service::PostgresUpgradeService;
 /// Sourced from each engine's own `ENGINE_KEY` rather than re-spelled here, so
 /// a renamed engine cannot silently drop out of the unavailable set and start
 /// failing backups on a Dockerless control plane again.
-const DOCKER_BACKED_ENGINES: [&str; 3] = [
+const DOCKER_BACKED_ENGINES: [&str; 2] = [
     crate::engines::postgres_pgdump::ENGINE_KEY,
-    crate::engines::postgres_cluster::ENGINE_KEY,
     crate::engines::s3_mirror::ENGINE_KEY,
 ];
 
@@ -389,6 +388,16 @@ impl TempsPlugin for BackupPlugin {
                     docker: docker_handle.cloned().map(|docker| docker.as_ref().clone()),
                     manager: external_service_manager.clone(),
                     worker_credentials: worker_credentials.clone(),
+                })))
+                // PostgreSQL HA clusters: from the current primary, here
+                // with this host's Docker or on the primary's worker through
+                // its agent, wherever the member runs.
+                .register_engine(Arc::new(PostgresClusterEngine::new(PostgresClusterDeps {
+                    db: db.clone(),
+                    external_service_manager: external_service_manager.clone(),
+                    encryption_service: encryption_service.clone(),
+                    docker: docker_handle.cloned().map(|docker| docker.as_ref().clone()),
+                    worker_credentials: worker_credentials.clone(),
                 })));
 
             // Every other engine drives a local Docker container end to end
@@ -409,12 +418,6 @@ impl TempsPlugin for BackupPlugin {
                         encryption_service: encryption_service.clone(),
                         docker: docker.as_ref().clone(),
                     })))
-                    .register_engine(Arc::new(PostgresClusterEngine::new(PostgresClusterDeps {
-                        db: db.clone(),
-                        external_service_manager: external_service_manager.clone(),
-                        encryption_service: encryption_service.clone(),
-                        docker: docker.as_ref().clone(),
-                    })))
                     .register_engine(Arc::new(S3MirrorEngine::new(S3MirrorDeps {
                         db: db.clone(),
                         encryption_service: encryption_service.clone(),
@@ -424,7 +427,7 @@ impl TempsPlugin for BackupPlugin {
                 info!(
                     "BackupExecutor: registered 11 engines: control_plane, \
                      postgres_workload_job, worker_agent, postgres_walg, mongodb, redis, \
-                     mariadb_physical, mariadb_dump, postgres_pgdump, postgres_cluster, \
+                     mariadb_physical, mariadb_dump, postgres_cluster, postgres_pgdump, \
                      s3_mirror",
                 );
             } else {
@@ -440,8 +443,8 @@ impl TempsPlugin for BackupPlugin {
                     engines = %DOCKER_BACKED_ENGINES.join(", "),
                     "BackupExecutor: no local Docker. {control_plane}. The worker engines \
                      postgres_workload_job, worker_agent, postgres_walg, mongodb, redis, \
-                     mariadb_physical and mariadb_dump (for worker services) need no local \
-                     Docker. The other engines are unavailable — {reason}. Backups requesting \
+                     mariadb_physical, mariadb_dump and postgres_cluster (for worker services) \
+                     need no local Docker. The other engines are unavailable — {reason}. Backups requesting \
                      one of them fail immediately with that reason",
                 );
             }
@@ -1121,6 +1124,10 @@ mod tests {
                 "{engine} backs up worker MariaDB services without a local daemon",
             );
         }
+        assert!(
+            !DOCKER_BACKED_ENGINES.contains(&crate::engines::postgres_cluster::ENGINE_KEY),
+            "the cluster engine backs up a primary on a worker without a local daemon",
+        );
         assert_eq!(
             DOCKER_BACKED_ENGINES.len(),
             DOCKER_BACKED_ENGINES

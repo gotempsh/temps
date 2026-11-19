@@ -22,14 +22,14 @@ use std::time::Duration;
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use temps_service_protocol::{
     MongodbBackupRequest, MongodbBackupResult, MongodbRestoreRequest, MongodbRestoreResult,
-    PostgresWalgArchiveRequest, PostgresWalgArchiveResult, PostgresWalgBackupOutcomeRequest,
-    PostgresWalgBackupProgress, PostgresWalgBackupRequest, PostgresWalgBackupResult,
-    PostgresWalgCredentialsRequest, PostgresWalgCredentialsResult, PostgresWalgRestoreRequest,
-    PostgresWalgRestoreResult, RecreateHook, RedisRdbBackupRequest, RedisRdbBackupResult,
-    RedisRestoreRequest, RedisRestoreResult, RedisWalgBackupRequest, RedisWalgBackupResult,
-    RemoteServiceBackupRequest, RemoteServiceBackupResponse, RemoteServiceRestoreRequest,
-    RemoteServiceRestoreResponse, TargetWriteBoundary, WorkerRestoreEngine,
-    WorkerRestoreOutcomeRequest, WorkerRestoreProgress,
+    PostgresClusterWalgBackupRequest, PostgresWalgArchiveRequest, PostgresWalgArchiveResult,
+    PostgresWalgBackupOutcomeRequest, PostgresWalgBackupProgress, PostgresWalgBackupRequest,
+    PostgresWalgBackupResult, PostgresWalgCredentialsRequest, PostgresWalgCredentialsResult,
+    PostgresWalgRestoreRequest, PostgresWalgRestoreResult, RecreateHook, RedisRdbBackupRequest,
+    RedisRdbBackupResult, RedisRestoreRequest, RedisRestoreResult, RedisWalgBackupRequest,
+    RedisWalgBackupResult, RemoteServiceBackupRequest, RemoteServiceBackupResponse,
+    RemoteServiceRestoreRequest, RemoteServiceRestoreResponse, TargetWriteBoundary,
+    WorkerRestoreEngine, WorkerRestoreOutcomeRequest, WorkerRestoreProgress,
 };
 use tokio::sync::Semaphore;
 
@@ -350,6 +350,101 @@ pub async fn postgres_walg_backup(
         }
         PostgresWalgBackupResult::Failed { reason } => {
             tracing::error!(service = %service, %reason, "WAL-G base backup failed");
+        }
+    }
+    AgentResponse::ok(outcome).into_response()
+}
+
+/// `POST /agent/services/postgres/cluster-walg-backup`: a WAL-G base backup
+/// of an HA PostgreSQL cluster from its primary, a data member this node
+/// runs, with the control plane's own cluster engine. The member is named by
+/// its ordinal (its container follows from the service's name), is never
+/// recreated or restarted, and its archiving is left as it is. Recorded and
+/// held against another backup of the service like a standalone WAL-G
+/// backup, so its outcome is read at
+/// `/agent/services/postgres/walg-backup/outcome`. Engine outcomes come back
+/// as 200 with `completed`, `refused` (retrying cannot help) or `failed`.
+#[utoipa::path(
+    tag = "Services",
+    post,
+    path = "/agent/services/postgres/cluster-walg-backup",
+    request_body = PostgresClusterWalgBackupRequest,
+    responses(
+        (status = 200, description = "The engine ran; its outcome", body = AgentResponse<PostgresWalgBackupResult>),
+        (status = 401, description = "Unauthorized"),
+        (status = 429, description = "This node already runs its maximum of backups and restores, or a backup of the service"),
+        (status = 500, description = "The engine could not run"),
+        (status = 503, description = "Docker is not available on this agent"),
+        (status = 504, description = "Backup deadline exceeded")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn postgres_cluster_walg_backup(
+    State(state): State<Arc<AgentState>>,
+    Json(request): Json<PostgresClusterWalgBackupRequest>,
+) -> axum::response::Response {
+    let service = request.service.clone();
+    let Some(permit) = admit(&DATA_OPERATIONS) else {
+        return busy("back up", &service);
+    };
+    let Some(docker) = state.docker.as_ref() else {
+        return docker_missing("back up", &service);
+    };
+    let tracker = match crate::backup_outcomes::WORKER_BACKUPS.begin(&service, &request.backup_uuid)
+    {
+        Ok(tracker) => tracker,
+        Err(running) => return backup_in_flight(&service, &running),
+    };
+    tracing::info!(
+        service = %service,
+        service_id = request.service_id,
+        ordinal = request.ordinal,
+        bucket = %request.destination.bucket,
+        backup_uuid = %request.backup_uuid,
+        "Taking a WAL-G base backup of a PostgreSQL cluster's primary on this node"
+    );
+    let runtime = state.service_runtime.clone();
+    let engine_docker = Arc::new(docker.clone());
+    let outcome = match run_detached(permit, None, async move {
+        let result = runtime
+            .postgres_cluster_walg_backup(request, engine_docker)
+            .await;
+        tracker.finish_walg(&result);
+        result
+    })
+    .await
+    {
+        Detached::Done(Ok(outcome)) => outcome,
+        Detached::Done(Err(error)) => {
+            tracing::error!(service = %service, %error, "Cluster WAL-G base backup could not run");
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("WAL-G base backup of cluster service '{service}' could not run: {error}"),
+            )
+            .into_response();
+        }
+        Detached::Panicked(error) => {
+            tracing::error!(service = %service, %error, "Cluster WAL-G base backup panicked");
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "WAL-G base backup of cluster service '{service}' stopped unexpectedly: \
+                     {error}"
+                ),
+            )
+            .into_response();
+        }
+        Detached::DeadlineExceeded => return deadline_exceeded("WAL-G base backup", &service),
+    };
+    match &outcome {
+        PostgresWalgBackupResult::Completed { .. } => {
+            tracing::info!(service = %service, "Cluster WAL-G base backup completed");
+        }
+        PostgresWalgBackupResult::Refused { reason } => {
+            tracing::warn!(service = %service, %reason, "Cluster WAL-G base backup refused");
+        }
+        PostgresWalgBackupResult::Failed { reason } => {
+            tracing::error!(service = %service, %reason, "Cluster WAL-G base backup failed");
         }
     }
     AgentResponse::ok(outcome).into_response()
@@ -1331,6 +1426,10 @@ mod tests {
                 "/agent/services/postgres/walg-backup/outcome",
                 post(postgres_walg_backup_outcome),
             )
+            .route(
+                "/agent/services/postgres/cluster-walg-backup",
+                post(postgres_cluster_walg_backup),
+            )
             .route("/agent/services/mongodb/backup", post(mongodb_backup))
             .route("/agent/services/mongodb/restore", post(mongodb_restore))
             .route("/agent/services/redis/walg-backup", post(redis_walg_backup))
@@ -1567,6 +1666,108 @@ mod tests {
         assert_eq!(json["data"]["state"], "finished", "{json}");
         assert_eq!(json["data"]["outcome"]["status"], "completed", "{json}");
         assert_eq!(json["data"]["outcome"]["lsn"], "0/4000100", "{json}");
+    }
+
+    fn cluster_walg_body(service: &str, backup_uuid: &str) -> serde_json::Value {
+        serde_json::json!({
+            "service_id": 9,
+            "service": service,
+            "ordinal": 2,
+            "pg_port": 6012,
+            "username": "app",
+            "password": "pw",
+            "database": "appdb",
+            "destination": backup_body(None)["destination"].clone(),
+            "bucket_path": "base",
+            "backup_uuid": backup_uuid
+        })
+    }
+
+    /// An HA cluster's primary on a worker is backed up on that worker: the
+    /// control plane's Docker has no such container (the backup failed with
+    /// "No such container" on every run). The request names the member by
+    /// ordinal, never a container, command or image; the engine runs once on
+    /// this node; its outcome is read like a standalone backup's, and a
+    /// second backup of the cluster waits while one runs.
+    #[tokio::test]
+    async fn a_cluster_walg_backup_runs_on_this_node_and_is_followed_by_its_id() {
+        for field in ["command", "image", "container_name", "walg_prefix"] {
+            let mut body = cluster_walg_body("orders-ha", "u-0");
+            body[field] = serde_json::json!("x");
+            let (status, _) = post_json(
+                app(agent_state(service_runtime(), plugin_builder())),
+                "/agent/services/postgres/cluster-walg-backup",
+                body,
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{field}");
+        }
+
+        // The engine completes as soon as it is asked: no test holds one of
+        // the node's process-wide slots for long.
+        let runtime = Arc::new(crate::test_engines::StubRuntime {
+            walg_backup_hold: Some(Arc::new(tokio::sync::Semaphore::new(1))),
+            ..Default::default()
+        });
+        let state = agent_state(runtime.clone(), plugin_builder());
+        // A name of its own: the node's backup registry is process-wide.
+        let service = "orders-ha-cluster";
+        let (status, json) = post_json(
+            app(state.clone()),
+            "/agent/services/postgres/cluster-walg-backup",
+            cluster_walg_body(service, "u-1"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["data"]["status"], "completed", "{json}");
+        let (status, json) = post_json(
+            app(state.clone()),
+            "/agent/services/postgres/walg-backup/outcome",
+            serde_json::json!({"service": service, "backup_uuid": "u-1"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["data"]["state"], "finished", "{json}");
+        assert_eq!(json["data"]["outcome"]["lsn"], "0/6000100", "{json}");
+        {
+            let asked = runtime
+                .cluster_walg_backups
+                .lock()
+                .expect("cluster_walg_backups");
+            let [request] = asked.as_slice() else {
+                panic!("the engine runs once: {}", asked.len());
+            };
+            assert_eq!(request.service_id, 9);
+            assert_eq!(request.ordinal, 2);
+            assert_eq!(request.pg_port, 6012);
+        }
+
+        // Another backup of the cluster still runs on this node.
+        let running = crate::backup_outcomes::WORKER_BACKUPS
+            .begin(service, "u-2")
+            .expect("no other backup of the cluster runs");
+        let (status, json) = post_json(
+            app(state.clone()),
+            "/agent/services/postgres/cluster-walg-backup",
+            cluster_walg_body(service, "u-3"),
+        )
+        .await;
+        drop(running);
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        let error = json["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("backup u-2 of it is still running"),
+            "{error}"
+        );
+        assert_eq!(
+            runtime
+                .cluster_walg_backups
+                .lock()
+                .expect("cluster_walg_backups")
+                .len(),
+            1,
+            "the overlapping backup never reached the engine"
+        );
     }
 
     /// Re-pointing archiving takes a service and a destination only, and

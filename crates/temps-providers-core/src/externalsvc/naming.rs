@@ -105,6 +105,13 @@ pub fn postgres_container_name(name: &str) -> String {
     format!("postgres-{}", name)
 }
 
+/// Container name of data member `ordinal` of the PostgreSQL HA cluster
+/// named `name`. The single derivation shared by the cluster engine and a
+/// worker's agent, which finds the member to back up from it.
+pub fn postgres_cluster_member_container_name(name: &str, ordinal: i32) -> String {
+    format!("postgres-{name}-{ordinal}")
+}
+
 /// Container name of a service named `name`. The single derivation shared by
 /// the engine and anything that must find its container without an instance.
 pub fn redis_container_name(name: &str) -> String {

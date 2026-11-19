@@ -24,10 +24,6 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use sea_orm::{DatabaseConnection, EntityTrait};
 use serde_json::{json, Value};
-use temps_docker_util::{
-    exec_capture, DockerUtilError, ExecCaptureOptions, ExitCodePolicy, OutputLimit,
-    StreamErrorPolicy,
-};
 use temps_providers::externalsvc::postgres_walg_backup::{
     self as node_half, ArchiveRecreate, WalgBaseBackup, WalgBaseBackupError, WalgBaseBackupOutcome,
 };
@@ -393,7 +389,7 @@ async fn backup_on_worker(
 
 /// How a WAL-G backup whose request went unanswered is followed on its node.
 #[derive(Debug, Clone, Copy)]
-struct BackupOutcomeWait {
+pub(crate) struct BackupOutcomeWait {
     /// Between two asks.
     interval: std::time::Duration,
     /// How long the node may go unanswering before the backup is failed. A
@@ -402,7 +398,7 @@ struct BackupOutcomeWait {
     unreachable_for: std::time::Duration,
 }
 
-const BACKUP_OUTCOME_WAIT: BackupOutcomeWait = BackupOutcomeWait {
+pub(crate) const BACKUP_OUTCOME_WAIT: BackupOutcomeWait = BackupOutcomeWait {
     interval: std::time::Duration::from_secs(10),
     unreachable_for: std::time::Duration::from_secs(10 * 60),
 };
@@ -411,7 +407,7 @@ const BACKUP_OUTCOME_WAIT: BackupOutcomeWait = BackupOutcomeWait {
 /// cannot be stopped there safely (a backup turning archiving on recreates
 /// the container, and the upload runs inside it), and the node refuses
 /// another backup of the service until it ends.
-fn node_backup_runs_on(
+pub(crate) fn node_backup_runs_on(
     service: &temps_entities::external_services::Model,
     node_id: i32,
     backup_uuid: &str,
@@ -435,7 +431,7 @@ fn node_backup_runs_on(
 ///   executor may retry; nothing of it runs on the node.
 /// - Unanswered for `wait.unreachable_for`: failed. A retry then waits for
 ///   the node, which refuses another backup of the service while one runs.
-async fn await_worker_backup<Ask, Fut>(
+pub(crate) async fn await_worker_backup<Ask, Fut>(
     wait: &BackupOutcomeWait,
     cancel: &tokio_util::sync::CancellationToken,
     service: &temps_entities::external_services::Model,
@@ -505,7 +501,7 @@ where
 }
 
 /// A worker's answer, as the outcome or error of the same run here.
-fn worker_outcome(
+pub(crate) fn worker_outcome(
     service: &temps_entities::external_services::Model,
     node_id: i32,
     result: PostgresWalgBackupResult,
@@ -539,7 +535,7 @@ fn worker_outcome(
 
 /// The node half's error as the executor's: a refusal is final, a
 /// cancellation is a cancellation, the rest may succeed on a retry.
-fn backup_error(error: WalgBaseBackupError) -> BackupError {
+pub(crate) fn backup_error(error: WalgBaseBackupError) -> BackupError {
     match error {
         WalgBaseBackupError::Cancelled { .. } => BackupError::Cancelled,
         error if error.is_refusal() => BackupError::PermanentFailure {
@@ -582,43 +578,6 @@ pub(crate) async fn run_walg_exec(
         }),
         Err(error) => Err(backup_error(error)),
     }
-}
-
-/// Run a read-only probe and return its trimmed stdout. Stops at the first
-/// stream error, and the exit code is not read: an empty or partial answer is
-/// for the caller to judge. Shared by both walg engines.
-pub(crate) async fn exec_stdout_probe(
-    docker: &bollard::Docker,
-    container_name: &str,
-    cmd: &[String],
-    env: &[String],
-) -> Result<String, BackupError> {
-    let cmd_refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
-    let env_refs: Vec<&str> = env.iter().map(|s| s.as_str()).collect();
-    let output = exec_capture(
-        docker,
-        container_name,
-        bollard::exec::CreateExecOptions {
-            cmd: Some(cmd_refs),
-            env: Some(env_refs),
-            attach_stdout: Some(true),
-            attach_stderr: Some(false),
-            ..Default::default()
-        },
-        ExecCaptureOptions::separate(OutputLimit::Unbounded, OutputLimit::Head(0))
-            .stream_errors(StreamErrorPolicy::Stop)
-            .exit_code(ExitCodePolicy::NotRead),
-    )
-    .await
-    .map_err(|error| match error {
-        DockerUtilError::ExecCreate { source, .. } => BackupError::Failed {
-            reason: format!("create exec for LSN: {}", source),
-        },
-        other => BackupError::Failed {
-            reason: format!("start exec for LSN: {}", other.cause_text()),
-        },
-    })?;
-    Ok(output.stdout.trim().to_string())
 }
 
 #[cfg(test)]
@@ -745,28 +704,6 @@ mod tests {
             }
             _ => panic!("expected a Failed error for a missing container"),
         }
-    }
-
-    /// The probe answers with trimmed stdout. Stderr is not attached and a
-    /// non-zero exit is not an error: the caller judges the answer.
-    #[tokio::test]
-    async fn exec_stdout_probe_returns_trimmed_stdout_whatever_the_exit_code() {
-        let Some((docker, name)) = exec_container("walg-probe").await else {
-            return;
-        };
-        let cmd = vec![
-            "sh".to_string(),
-            "-c".to_string(),
-            "echo \" $PROBE_VALUE \"; echo noise >&2; exit 2".to_string(),
-        ];
-        let env = vec!["PROBE_VALUE=0/16B6C50".to_string()];
-        let result = exec_stdout_probe(&docker, &name, &cmd, &env).await;
-        remove_exec_container(&docker, &name).await;
-
-        let Ok(answer) = result else {
-            panic!("probe failed");
-        };
-        assert_eq!(answer, "0/16B6C50");
     }
 
     fn worker_service(node_id: i32) -> temps_entities::external_services::Model {

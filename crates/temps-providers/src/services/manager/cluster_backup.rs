@@ -67,6 +67,24 @@ fn build_walg_env(
 // of members; standalone services return a single entry with role="standalone".
 // ---------------------------------------------------------------------------
 
+/// The worker node data member `member` of cluster `service_id` runs on,
+/// refusing one on the control plane: its backup takes this server's Docker.
+fn cluster_member_node(
+    service_id: i32,
+    member: &ServiceMemberInfo,
+) -> Result<i32, ExternalServiceError> {
+    member
+        .node_id
+        .ok_or_else(|| ExternalServiceError::ParameterValidationFailed {
+            service_id,
+            reason: format!(
+                "member '{}' (ordinal {}) of cluster service {service_id} runs on the control \
+                 plane; its backup uses this server's Docker, not a worker's",
+                member.container_name, member.ordinal
+            ),
+        })
+}
+
 impl ExternalServiceManager {
     /// Run a WAL-G basebackup against a Postgres HA cluster.
     ///
@@ -478,6 +496,83 @@ impl ExternalServiceManager {
             self.exec_in_local_container_with_env(&member.container_name, &cmd, user, env_refs)
                 .await
         }
+    }
+
+    /// Take a WAL-G base backup of PostgreSQL HA cluster `service_id` from
+    /// `primary`, a data member on a worker node, with the cluster engine run
+    /// by that node's agent: only that node's Docker reaches the member's
+    /// container. The login is the service's stored one; the destination's
+    /// credentials and the login travel sealed.
+    pub async fn walg_backup_worker_postgres_cluster(
+        &self,
+        service_id: i32,
+        primary: &ServiceMemberInfo,
+        destination: crate::remote_service_client::WorkerS3Destination,
+        bucket_path: String,
+        backup_uuid: String,
+    ) -> Result<crate::remote_service_client::PostgresWalgBackupResult, ExternalServiceError> {
+        let node_id = cluster_member_node(service_id, primary)?;
+        let request = self
+            .cluster_walg_backup_request(service_id, primary, destination, bucket_path, backup_uuid)
+            .await?;
+        self.get_remote_client(node_id)
+            .await?
+            .postgres_cluster_walg_backup(&request)
+            .await
+    }
+
+    /// The request [`Self::walg_backup_worker_postgres_cluster`] sends for
+    /// `primary`.
+    async fn cluster_walg_backup_request(
+        &self,
+        service_id: i32,
+        primary: &ServiceMemberInfo,
+        destination: crate::remote_service_client::WorkerS3Destination,
+        bucket_path: String,
+        backup_uuid: String,
+    ) -> Result<crate::remote_service_client::PostgresClusterWalgBackupRequest, ExternalServiceError>
+    {
+        let service = self.get_service(service_id).await?;
+        let parameters =
+            serde_json::Value::Object(self.parameters_of(&service)?.into_iter().collect());
+        let login =
+            crate::externalsvc::postgres_walg_backup::PostgresLogin::from_parameters(&parameters);
+        Ok(
+            crate::remote_service_client::PostgresClusterWalgBackupRequest {
+                service_id,
+                service: service.name,
+                ordinal: primary.ordinal,
+                pg_port: primary.port.unwrap_or(5432),
+                username: login.username,
+                password: login.password,
+                database: login.database,
+                destination,
+                bucket_path,
+                backup_uuid,
+            },
+        )
+    }
+
+    /// Where the WAL-G base backup of cluster `service_id` started under
+    /// `backup_uuid` on node `node_id` (its primary's) is, for a backup whose
+    /// request went unanswered while the node's backup ran on.
+    pub async fn walg_backup_outcome_worker_postgres_cluster(
+        &self,
+        service_id: i32,
+        node_id: i32,
+        backup_uuid: &str,
+    ) -> Result<crate::remote_service_client::PostgresWalgBackupProgress, ExternalServiceError>
+    {
+        let service = self.get_service(service_id).await?;
+        self.get_remote_client(node_id)
+            .await?
+            .postgres_walg_backup_outcome(
+                &crate::remote_service_client::PostgresWalgBackupOutcomeRequest {
+                    service: service.name,
+                    backup_uuid: backup_uuid.to_string(),
+                },
+            )
+            .await
     }
 
     /// Restore a Postgres HA cluster from a WAL-G backup.
@@ -952,6 +1047,104 @@ echo "[restore] Pre-seed complete"
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn worker_destination() -> crate::remote_service_client::WorkerS3Destination {
+        crate::remote_service_client::WorkerS3Destination {
+            bucket: "backups".to_string(),
+            region: "us-east-1".to_string(),
+            endpoint: Some("s3.example.test".to_string()),
+            force_path_style: true,
+            access_key_id: "scoped-key".to_string(),
+            secret_access_key: "scoped-secret".to_string(),
+            session_token: Some("scoped-session".to_string()),
+        }
+    }
+
+    /// The primary of a cluster runs on a worker: its backup is sent to that
+    /// worker, naming the member by ordinal with its own port, and carrying
+    /// the service's stored login. The control plane's Docker, where the
+    /// reported backups exec'd, has no such container.
+    #[tokio::test]
+    async fn a_worker_primarys_backup_request_names_the_member_and_its_port() {
+        let mut service = crate::services::test_support::encrypted_service_model(
+            9,
+            serde_json::json!({"username": "app", "password": "db-pw", "db_name": "appdb"}),
+        );
+        service.name = "orders-ha".to_string();
+        service.topology = "cluster".to_string();
+        let manager = crate::services::test_support::control_plane_manager_with_db(Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results([vec![service]])
+                .into_connection(),
+        ));
+        let mut primary = crate::services::test_support::service_member_info(
+            3,
+            "postgres-orders-ha-3",
+            "replica",
+            "running",
+        );
+        primary.node_id = Some(10);
+        primary.port = Some(6013);
+
+        let request = manager
+            .cluster_walg_backup_request(
+                9,
+                &primary,
+                worker_destination(),
+                "base".to_string(),
+                "u-1".to_string(),
+            )
+            .await
+            .expect("the request is built from the stored service");
+        assert_eq!(request.service, "orders-ha");
+        assert_eq!(request.ordinal, 3);
+        assert_eq!(request.pg_port, 6013);
+        assert_eq!(request.username, "app");
+        assert_eq!(request.password, "db-pw");
+        assert_eq!(request.database, "appdb");
+        assert_eq!(request.bucket_path, "base");
+        assert_eq!(request.backup_uuid, "u-1");
+        assert_eq!(cluster_member_node(9, &primary).ok(), Some(10));
+    }
+
+    /// A primary on the control plane is never sent to an agent: its backup
+    /// runs on this server's Docker.
+    #[tokio::test]
+    async fn a_control_plane_primary_is_never_sent_to_a_worker() {
+        let primary = crate::services::test_support::service_member_info(
+            1,
+            "postgres-orders-ha-1",
+            "replica",
+            "running",
+        );
+        let Err(ExternalServiceError::ParameterValidationFailed { reason, .. }) =
+            cluster_member_node(9, &primary)
+        else {
+            panic!("a member on the control plane has no worker node");
+        };
+        assert!(reason.contains("runs on the control plane"), "{reason}");
+
+        let manager = crate::services::test_support::control_plane_manager_with_db(Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
+        ));
+        let error = manager
+            .walg_backup_worker_postgres_cluster(
+                9,
+                &primary,
+                worker_destination(),
+                String::new(),
+                "u-1".to_string(),
+            )
+            .await
+            .expect_err("refused before any query or agent call");
+        assert!(
+            matches!(
+                error,
+                ExternalServiceError::ParameterValidationFailed { .. }
+            ),
+            "{error}"
+        );
+    }
 
     /// `exec_in_local_container` and the local path of `exec_in_member_with_env`
     /// are one function: env reaches the command, the streams stay apart and

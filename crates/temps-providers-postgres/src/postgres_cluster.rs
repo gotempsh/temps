@@ -670,7 +670,9 @@ impl PostgresClusterService {
 
     /// Container name for a data node member by ordinal.
     fn node_container_name(&self, ordinal: i32) -> String {
-        format!("postgres-{}-{}", self.name, ordinal)
+        temps_providers_core::externalsvc::naming::postgres_cluster_member_container_name(
+            &self.name, ordinal,
+        )
     }
 
     /// Parse cluster config from ServiceConfig parameters.
