@@ -240,7 +240,8 @@ fn generate_mfa_setup_candidate(email: &str) -> Result<MfaSetupCandidate, UserSe
     );
     let qr = QrCode::new(otp_auth_url)
         .map_err(|error| UserServiceError::Mfa(format!("Failed to generate QR code: {}", error)))?;
-    let qr_image = qr.render::<image::Luma<u8>>().quiet_zone(false).build();
+    // Include the white quiet zone so the QR code scans on dark backgrounds.
+    let qr_image = qr.render::<image::Luma<u8>>().quiet_zone(true).build();
     let mut bytes = Vec::new();
     qr_image
         .write_to(&mut Cursor::new(&mut bytes), image::ImageFormat::Png)
@@ -1619,7 +1620,40 @@ mod tests {
         assert!(setup.recovery_codes.iter().all(
             |code| code.len() == 6 && code.chars().all(|character| character.is_ascii_digit())
         ));
-        assert!(setup.qr_code.starts_with("data:image/png;base64,"));
+        let encoded_png = setup
+            .qr_code
+            .strip_prefix("data:image/png;base64,")
+            .expect("MFA setup should return a PNG data URL");
+        let png = base64::engine::general_purpose::STANDARD
+            .decode(encoded_png)
+            .expect("QR code should be base64-encoded");
+        let image = image::load_from_memory_with_format(&png, image::ImageFormat::Png)
+            .expect("QR code should be a valid PNG")
+            .into_luma8();
+
+        // The top-left finder pattern is seven dark modules wide on its first row.
+        let (left, top, _) = image
+            .enumerate_pixels()
+            .find(|(_, _, pixel)| pixel.0 == [0])
+            .expect("QR code should contain dark modules");
+        let finder_width = (left..image.width())
+            .take_while(|&x| image.get_pixel(x, top).0 == [0])
+            .count() as u32;
+        let quiet_zone = 4 * (finder_width / 7);
+
+        assert!(quiet_zone > 0);
+        assert_eq!(
+            (left, top),
+            (quiet_zone, quiet_zone),
+            "QR code should start four modules from the image edges"
+        );
+        assert!(image.enumerate_pixels().all(|(x, y, pixel)| {
+            let in_quiet_zone = x < quiet_zone
+                || y < quiet_zone
+                || x >= image.width() - quiet_zone
+                || y >= image.height() - quiet_zone;
+            !in_quiet_zone || pixel.0 == [255]
+        }));
 
         drop(service);
         let log = Arc::try_unwrap(db)
