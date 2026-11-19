@@ -10095,3 +10095,123 @@ async fn test_ai_usage_logs_price_known_is_nullable_and_reversible() -> anyhow::
     assert_eq!(kept.try_get::<i32>("", "count")?, 1);
     Ok(())
 }
+
+async fn domain_on_demand_streak_columns(
+    db: &DatabaseConnection,
+) -> Result<Vec<sea_orm::QueryResult>, sea_orm::DbErr> {
+    db.query_all(sea_orm::Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        "SELECT column_name, is_nullable, column_default, data_type \
+         FROM information_schema.columns \
+         WHERE table_schema = 'public' \
+           AND table_name = 'domains' \
+           AND column_name IN ('on_demand_failure_streak', 'on_demand_last_failure_at') \
+         ORDER BY column_name"
+            .to_string(),
+    ))
+    .await
+}
+
+/// The on-demand failure streak is added `NOT NULL DEFAULT 0` with a nullable
+/// failure time, so existing domains start at the bottom of the backoff
+/// ladder, and `down` removes both without touching the rows.
+#[tokio::test]
+async fn test_domains_on_demand_failure_streak_defaults_to_zero_and_is_reversible(
+) -> anyhow::Result<()> {
+    const MIGRATION: &str = "m20261119_000003_add_domain_on_demand_failure_streak";
+    if external_db_configured() {
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            eprintln!(
+                "Skipping domains on-demand streak migration test: Docker unavailable: {error}"
+            );
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    // An existing database with a failing on-demand domain, one migration short.
+    Migrator::up(&db, None).await?;
+    Migrator::down(&db, Some(steps_back_to(MIGRATION))).await?;
+    assert!(
+        domain_on_demand_streak_columns(&db).await?.is_empty(),
+        "columns exist before the migration"
+    );
+    db.execute_unprepared(
+        "INSERT INTO domains (domain, status, is_wildcard, verification_method, last_error, \
+         on_demand_backoff_until, created_at, updated_at) \
+         VALUES ('app.example.com', 'on_demand_failed', false, 'http-01', 'Connection refused', \
+         now() + interval '5 minutes', now(), now())",
+    )
+    .await?;
+
+    Migrator::up(&db, None).await?;
+    let columns = domain_on_demand_streak_columns(&db).await?;
+    assert_eq!(columns.len(), 2, "both columns exist after up");
+    let failure_at = &columns[1];
+    assert_eq!(
+        failure_at.try_get::<String>("", "column_name")?,
+        "on_demand_last_failure_at"
+    );
+    assert_eq!(failure_at.try_get::<String>("", "is_nullable")?, "YES");
+    assert_eq!(
+        failure_at.try_get::<String>("", "data_type")?,
+        "timestamp with time zone"
+    );
+    let streak = &columns[0];
+    assert_eq!(
+        streak.try_get::<String>("", "column_name")?,
+        "on_demand_failure_streak"
+    );
+    assert_eq!(streak.try_get::<String>("", "is_nullable")?, "NO");
+    assert_eq!(
+        streak.try_get::<Option<String>>("", "column_default")?,
+        Some("0".to_string())
+    );
+    assert_eq!(streak.try_get::<String>("", "data_type")?, "integer");
+    let existing = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT count(*)::int AS count FROM domains \
+             WHERE on_demand_failure_streak = 0 AND on_demand_last_failure_at IS NULL"
+                .to_string(),
+        ))
+        .await?
+        .expect("count row");
+    assert_eq!(existing.try_get::<i32>("", "count")?, 1);
+
+    Migrator::down(&db, Some(steps_back_to(MIGRATION))).await?;
+    assert!(
+        domain_on_demand_streak_columns(&db).await?.is_empty(),
+        "down leaves the columns in place"
+    );
+    let kept = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT count(*)::int AS count FROM domains".to_string(),
+        ))
+        .await?
+        .expect("count row");
+    assert_eq!(kept.try_get::<i32>("", "count")?, 1);
+    Ok(())
+}

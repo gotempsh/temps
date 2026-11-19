@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use anyhow::Result;
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, SubsecRound, Utc};
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait,
     PaginatorTrait, QueryFilter, QueryOrder, TransactionTrait,
@@ -244,10 +244,6 @@ pub(crate) const ORDER_STATUS_INVALID: &str = "invalid";
 /// Prefix of the `error_chain` written by the DNS preflight, so the failure
 /// path can tell "never reached the CA" apart from a real ACME failure.
 const DNS_PREFLIGHT_MARKER: &str = "DNS preflight: ";
-
-/// Audit rows read to place a failing on-demand host on the backoff ladder: a
-/// full ladder (5 rungs) with room for skipped rows between failures.
-const ON_DEMAND_HISTORY_LIMIT: u64 = 16;
 
 /// A quiet gap, in hours, after which a host's failure streak starts over.
 /// Twice the 24h cap, so a host retried at the cap keeps its place.
@@ -898,8 +894,7 @@ impl DomainService {
                 domain_active.certificate = Set(Some(cert_data.certificate_pem.clone()));
                 domain_active.private_key = Set(Some(encrypted_private_key));
                 domain_active.expiration_time = Set(Some(cert_data.expiration_time));
-                domain_active.last_error = Set(None);
-                domain_active.last_error_type = Set(None);
+                domain_active.clear_certificate_failure();
                 // As in `complete_challenge`: the certificate came from an ACME
                 // order for this challenge type, so the renewal job can renew
                 // it the same way.
@@ -1157,8 +1152,7 @@ impl DomainService {
                 domain_active.private_key = Set(Some(encrypted_private_key));
                 domain_active.expiration_time = Set(Some(certificate.expiration_time));
                 domain_active.last_renewed = Set(Some(Utc::now()));
-                domain_active.last_error = Set(None);
-                domain_active.last_error_type = Set(None);
+                domain_active.clear_certificate_failure();
                 // Record the challenge that was actually validated. A row
                 // created as `manual` (e.g. by `temps setup`) and issued here
                 // would otherwise stay `manual`, which the renewal job never
@@ -2030,10 +2024,12 @@ impl DomainService {
     /// `on_demand_failed`, the full error chain, an `on_demand` error type, and
     /// an exponential `on_demand_backoff_until` (ADR §4 Layer 2). For a rate
     /// limit, `retry_after` (when present) overrides the exponential delay.
-    /// Returns the deadline it stored.
+    /// Returns the deadline as stored.
     ///
-    /// Must run before this attempt's audit row is written: the rung is the
-    /// number of failures already recorded for the host.
+    /// The rung comes from the failure streak on the same row, and this one
+    /// update writes the deadline and the grown streak together, so nothing
+    /// that can fail separately (the audit row, a history read) can lower the
+    /// next rung or leave the row without its failure state.
     async fn mark_on_demand_failed(
         &self,
         hostname: &str,
@@ -2047,82 +2043,58 @@ impl DomainService {
             .await?
             .ok_or_else(|| DomainServiceError::NotFound(hostname.to_string()))?;
 
-        let now = Utc::now();
-        let backoff_until = match retry_after {
-            Some(ts) => ts,
-            None => {
-                let previous = self.recent_on_demand_outcomes(hostname).await?;
-                now + Self::backoff_delay(Self::consecutive_failures(&previous, now))
-            }
-        };
+        // PostgreSQL keeps timestamps to the microsecond; truncate first so the
+        // deadline handed to the proxy is exactly the one stored.
+        let now = Utc::now().trunc_subsecs(6);
+        let previous = Self::previous_failures(
+            domain.on_demand_failure_streak,
+            domain.on_demand_last_failure_at,
+            now,
+        );
+        let backoff_until = retry_after
+            .unwrap_or_else(|| now + Self::backoff_delay(previous))
+            .trunc_subsecs(6);
 
         let mut active: domains::ActiveModel = domain.into();
         active.status = Set("on_demand_failed".to_string());
         active.last_error = Set(Some(error_chain.to_string()));
         active.last_error_type = Set(Some(category.to_string()));
         active.on_demand_backoff_until = Set(Some(backoff_until));
-        active.update(self.db.as_ref()).await?;
-        Ok(backoff_until)
+        active.on_demand_failure_streak = Set(previous.saturating_add(1));
+        active.on_demand_last_failure_at = Set(Some(now));
+        let updated = active.update(self.db.as_ref()).await?;
+        Ok(updated.on_demand_backoff_until.unwrap_or(backoff_until))
     }
 
-    /// The newest on-demand audit rows for `hostname` (outcome, time), newest
-    /// first: enough for [`Self::consecutive_failures`] to see a full ladder
-    /// plus a few skipped rows. One indexed query
-    /// (`idx_on_demand_cert_attempts_hostname`), bounded by the limit.
-    async fn recent_on_demand_outcomes(
-        &self,
-        hostname: &str,
-    ) -> Result<Vec<(String, DateTime<Utc>)>, DomainServiceError> {
-        use sea_orm::QuerySelect;
-        let rows = on_demand_cert_attempts::Entity::find()
-            .select_only()
-            .column(on_demand_cert_attempts::Column::Outcome)
-            .column(on_demand_cert_attempts::Column::CreatedAt)
-            .filter(on_demand_cert_attempts::Column::Hostname.eq(hostname))
-            .order_by_desc(on_demand_cert_attempts::Column::CreatedAt)
-            .order_by_desc(on_demand_cert_attempts::Column::Id)
-            .limit(ON_DEMAND_HISTORY_LIMIT)
-            .into_tuple::<(String, DateTime<Utc>)>()
-            .all(self.db.as_ref())
-            .await?;
-        Ok(rows)
-    }
-
-    /// How many failures in a row `hostname` has had before this one, from its
-    /// audit rows (newest first).
+    /// How many failures in a row `hostname` had before this one, from the
+    /// streak stored on its row.
     ///
     /// The ladder used to be inferred from `on_demand_backoff_until` and the
     /// row's `updated_at`, but each attempt clears the first and rewrites the
     /// second before it runs, so every failure restarted at 5 minutes. The
-    /// append-only audit log is not touched by an attempt in flight.
+    /// streak is only written by a failure and reset by an issued or imported
+    /// certificate ([`domains::ActiveModel::clear_certificate_failure`]).
     ///
-    /// Counting stops at an issued certificate, and at a quiet gap longer than
-    /// [`ON_DEMAND_STREAK_GAP_HOURS`]: a host nobody requested for two days starts
-    /// over. Rows that are neither issued nor failed (skips) are ignored.
-    fn consecutive_failures(outcomes: &[(String, DateTime<Utc>)], now: DateTime<Utc>) -> usize {
-        let mut count = 0;
-        let mut newer = now;
-        for (outcome, at) in outcomes {
-            if newer - *at > Duration::hours(ON_DEMAND_STREAK_GAP_HOURS) {
-                break;
-            }
-            match outcome.as_str() {
-                "issued" => break,
-                "failed" => {
-                    count += 1;
-                    newer = *at;
-                }
-                _ => {}
-            }
+    /// A streak whose last failure is older than [`ON_DEMAND_STREAK_GAP_HOURS`]
+    /// starts over: a host nobody requested for two days begins at 5 minutes.
+    fn previous_failures(
+        streak: i32,
+        last_failure_at: Option<DateTime<Utc>>,
+        now: DateTime<Utc>,
+    ) -> i32 {
+        match last_failure_at {
+            Some(at) if now - at <= Duration::hours(ON_DEMAND_STREAK_GAP_HOURS) => streak.max(0),
+            _ => 0,
         }
-        count
     }
 
     /// Backoff for an attempt that follows `previous_failures` failures in a
     /// row: 5m → 15m → 1h → 4h → 24h, capped at 24h.
-    fn backoff_delay(previous_failures: usize) -> Duration {
+    fn backoff_delay(previous_failures: i32) -> Duration {
         const LADDER_MINS: [i64; 5] = [5, 15, 60, 240, 1440];
-        let rung = previous_failures.min(LADDER_MINS.len() - 1);
+        let rung = usize::try_from(previous_failures)
+            .unwrap_or(0)
+            .min(LADDER_MINS.len() - 1);
         Duration::minutes(LADDER_MINS[rung])
     }
 
@@ -3041,6 +3013,16 @@ mod tests {
                 return None;
             }
         };
+        let service = on_demand_service_on(test_db.db.clone(), mode);
+        let db = test_db.db.clone();
+        // Return the TestDatabase guard so the caller keeps it alive for the whole
+        // test; its Drop reaps the dedicated schema afterwards.
+        Some((service, db, test_db))
+    }
+
+    /// A service with the given provider behaviour over an existing database,
+    /// so a test can fail and then succeed against the same rows.
+    fn on_demand_service_on(db: Arc<DatabaseConnection>, mode: OnDemandMockMode) -> DomainService {
         let encryption_service = Arc::new(
             EncryptionService::new(
                 "0000000000000000000000000000000000000000000000000000000000000000",
@@ -3048,19 +3030,15 @@ mod tests {
             .unwrap(),
         );
         let repository = Arc::new(crate::tls::repository::DefaultCertificateRepository::new(
-            test_db.db.clone(),
+            db.clone(),
             encryption_service.clone(),
         ));
-        let service = DomainService::new(
-            test_db.db.clone(),
+        DomainService::new(
+            db,
             Arc::new(OnDemandMockProvider { mode }),
             repository,
             encryption_service,
-        );
-        let db = test_db.db.clone();
-        // Return the TestDatabase guard so the caller keeps it alive for the whole
-        // test; its Drop reaps the dedicated schema afterwards.
-        Some((service, db, test_db))
+        )
     }
 
     #[tokio::test]
@@ -3208,10 +3186,30 @@ mod tests {
                 returned, stored,
                 "the proxy must wait as long as the row says"
             );
+            assert_eq!(
+                returned.timestamp_subsec_nanos() % 1_000,
+                0,
+                "the deadline carries no precision the database drops"
+            );
             // Round to the nearest minute: the deadline was set a moment ago.
             rungs.push((stored - Utc::now() + Duration::seconds(30)).num_minutes());
+            // The audit log is observability only: losing its rows (a failed
+            // insert) must not lower the next rung.
+            on_demand_cert_attempts::Entity::delete_many()
+                .filter(on_demand_cert_attempts::Column::Hostname.eq(hostname))
+                .exec(db.as_ref())
+                .await
+                .unwrap();
         }
         assert_eq!(rungs, vec![5, 15, 60, 240, 1440, 1440]);
+        let row = domains::Entity::find()
+            .filter(domains::Column::Domain.eq(hostname))
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("domains row exists");
+        assert_eq!(row.on_demand_failure_streak, 6);
+        assert!(row.on_demand_last_failure_at.is_some());
     }
 
     #[tokio::test]
@@ -3229,17 +3227,37 @@ mod tests {
                 .provision_on_demand(hostname, "ops@example.com")
                 .await;
         }
-        // An issued attempt ends the streak.
-        on_demand_cert_attempts::ActiveModel {
-            hostname: Set(hostname.to_string()),
-            trigger: Set("tls_callback".to_string()),
-            outcome: Set("issued".to_string()),
-            ..Default::default()
-        }
-        .insert(db.as_ref())
-        .await
-        .unwrap();
+        let failing = domains::Entity::find()
+            .filter(domains::Column::Domain.eq(hostname))
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("domains row exists");
+        assert_eq!(failing.on_demand_failure_streak, 3);
 
+        // A certificate is issued: the streak ends with it.
+        on_demand_service_on(db.clone(), OnDemandMockMode::ImmediateCert)
+            .provision_on_demand(hostname, "ops@example.com")
+            .await
+            .expect("issuance succeeds");
+        let issued = domains::Entity::find()
+            .filter(domains::Column::Domain.eq(hostname))
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("domains row exists");
+        assert_eq!(issued.status, "active");
+        assert_eq!(issued.on_demand_failure_streak, 0);
+        assert!(issued.on_demand_last_failure_at.is_none());
+        assert!(issued.on_demand_backoff_until.is_none());
+
+        // The certificate goes away (removed by an operator); the next failure
+        // starts the ladder from the bottom.
+        let mut cleared: domains::ActiveModel = issued.into();
+        cleared.status = Set("pending".to_string());
+        cleared.certificate = Set(None);
+        cleared.private_key = Set(None);
+        cleared.update(db.as_ref()).await.unwrap();
         let _ = service
             .provision_on_demand(hostname, "ops@example.com")
             .await;
@@ -3255,6 +3273,7 @@ mod tests {
             mins, 5,
             "the first failure after a success starts at 5 minutes"
         );
+        assert_eq!(row.on_demand_failure_streak, 1);
     }
 
     #[tokio::test]
@@ -4195,66 +4214,40 @@ mod tests {
         assert_eq!(mins, vec![5, 15, 60, 240, 1440, 1440, 1440]);
     }
 
-    fn outcomes(now: DateTime<Utc>, rows: &[(&str, i64)]) -> Vec<(String, DateTime<Utc>)> {
-        // (outcome, minutes ago), newest first as the query returns them.
-        rows.iter()
-            .map(|(o, ago)| (o.to_string(), now - Duration::minutes(*ago)))
-            .collect()
-    }
-
     #[test]
-    fn test_consecutive_failures_counts_the_streak_newest_first() {
+    fn test_previous_failures_keeps_a_recent_streak() {
         let now = Utc::now();
-        assert_eq!(DomainService::consecutive_failures(&[], now), 0);
+        assert_eq!(DomainService::previous_failures(0, None, now), 0);
         assert_eq!(
-            DomainService::consecutive_failures(
-                &outcomes(now, &[("failed", 6), ("failed", 22), ("failed", 83)]),
-                now
-            ),
+            DomainService::previous_failures(3, Some(now - Duration::minutes(20)), now),
             3
         );
     }
 
     #[test]
-    fn test_consecutive_failures_stops_at_an_issued_certificate() {
+    fn test_previous_failures_keeps_a_streak_retried_at_the_cap() {
+        // The 24h rung retries a day later: still one streak.
         let now = Utc::now();
-        let rows = outcomes(now, &[("failed", 6), ("issued", 30), ("failed", 60)]);
-        assert_eq!(DomainService::consecutive_failures(&rows, now), 1);
+        let last = Some(now - Duration::hours(24) - Duration::minutes(5));
+        assert_eq!(DomainService::previous_failures(5, last, now), 5);
     }
 
     #[test]
-    fn test_consecutive_failures_ignores_skipped_rows() {
+    fn test_previous_failures_restarts_after_a_long_quiet_gap() {
         let now = Utc::now();
-        let rows = outcomes(now, &[("failed", 6), ("skipped_gate", 10), ("failed", 22)]);
-        assert_eq!(DomainService::consecutive_failures(&rows, now), 2);
+        let stale = Some(now - Duration::hours(ON_DEMAND_STREAK_GAP_HOURS) - Duration::minutes(1));
+        assert_eq!(DomainService::previous_failures(4, stale, now), 0);
     }
 
     #[test]
-    fn test_consecutive_failures_keeps_a_streak_retried_at_the_cap() {
-        // Failures a day apart (the 24h rung) stay one streak.
-        let now = Utc::now();
-        let day = 24 * 60;
-        let rows = outcomes(
-            now,
-            &[
-                ("failed", 60),
-                ("failed", day + 60),
-                ("failed", 2 * day + 60),
-                ("failed", 3 * day + 60),
-            ],
+    fn test_previous_failures_without_a_failure_time_is_zero() {
+        // A streak with no time (a row written before the column existed, or
+        // edited by hand) starts over rather than guessing.
+        assert_eq!(DomainService::previous_failures(4, None, Utc::now()), 0);
+        assert_eq!(
+            DomainService::previous_failures(-1, Some(Utc::now()), Utc::now()),
+            0
         );
-        assert_eq!(DomainService::consecutive_failures(&rows, now), 4);
-    }
-
-    #[test]
-    fn test_consecutive_failures_restarts_after_a_long_quiet_gap() {
-        let now = Utc::now();
-        // Nothing for three days: the old streak no longer counts.
-        let stale = outcomes(now, &[("failed", 3 * 24 * 60), ("failed", 3 * 24 * 60 + 5)]);
-        assert_eq!(DomainService::consecutive_failures(&stale, now), 0);
-        // A recent failure after a three-day gap counts alone.
-        let resumed = outcomes(now, &[("failed", 5), ("failed", 3 * 24 * 60)]);
-        assert_eq!(DomainService::consecutive_failures(&resumed, now), 1);
     }
 
     #[test]
@@ -4385,6 +4378,8 @@ mod tests {
             is_wildcard: false,
             verification_method: "http-01".to_string(),
             on_demand_backoff_until: None,
+            on_demand_failure_streak: 0,
+            on_demand_last_failure_at: None,
             created_at: now,
             updated_at: now,
         }
