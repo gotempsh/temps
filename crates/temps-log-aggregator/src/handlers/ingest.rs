@@ -34,7 +34,7 @@ use temps_entities::log_ingest_keys::Model as KeyModel;
 use crate::error::LogAggregatorError;
 use crate::handlers::types::LogAggregatorAppState;
 use crate::ingest::ndjson::MAX_BODY_BYTES;
-use crate::ingest::NewLogIngestKey;
+use crate::ingest::{LogIngestService, NewLogIngestKey};
 
 /// Header a collector may use instead of `Authorization: Bearer`.
 pub const LOG_KEY_HEADER: &str = "x-temps-log-key";
@@ -172,14 +172,25 @@ fn audit_context(
 
 // ── Routes ──────────────────────────────────────────────────────────────
 
+/// The ingest receiver, mounted on the public router (ADR 051 D3).
+///
+/// A collector outside Temps posts here with its key, so the route must be
+/// reachable where the admin console is not: behind the admin gate, or with
+/// a separate public ingress listener. It authenticates the request by its
+/// key and never reads a session. Key management stays on the admin router
+/// ([`configure_routes`]).
+pub fn configure_public_routes() -> Router<Arc<LogIngestService>> {
+    Router::new().route(
+        "/logs/ingest",
+        // The body limit is the batch limit plus room for the framing;
+        // the parser enforces the exact limit with a typed error.
+        post(ingest_logs).layer(DefaultBodyLimit::max(MAX_BODY_BYTES + 1024)),
+    )
+}
+
+/// Key management, on the admin router.
 pub fn configure_routes() -> Router<Arc<LogAggregatorAppState>> {
     Router::new()
-        .route(
-            "/logs/ingest",
-            // The body limit is the batch limit plus room for the framing;
-            // the parser enforces the exact limit with a typed error.
-            post(ingest_logs).layer(DefaultBodyLimit::max(MAX_BODY_BYTES + 1024)),
-        )
         .route(
             "/projects/{project_id}/logs/ingest-keys",
             get(list_log_ingest_keys).post(create_log_ingest_key),
@@ -215,7 +226,8 @@ fn presented_key(headers: &HeaderMap) -> Option<&str> {
 /// Ingest newline-delimited JSON log lines with a log ingest key.
 ///
 /// One JSON object per line; see the logs documentation for the keys read.
-/// A batch is stored whole or refused whole.
+/// A batch is parsed and charged to the budget whole before anything is
+/// stored, so a malformed or over-budget batch stores nothing.
 #[utoipa::path(
     tag = "Logs",
     post,
@@ -233,7 +245,7 @@ fn presented_key(headers: &HeaderMap) -> Option<&str> {
     security(("bearer_auth" = []))
 )]
 pub async fn ingest_logs(
-    State(state): State<Arc<LogAggregatorAppState>>,
+    State(ingest_service): State<Arc<LogIngestService>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -254,7 +266,7 @@ pub async fn ingest_logs(
                 .into_response();
         }
     }
-    match state.ingest_service.ingest(key, &body).await {
+    match ingest_service.ingest(key, &body).await {
         Ok(outcome) => (
             StatusCode::ACCEPTED,
             Json(LogIngestResponse {
@@ -411,7 +423,20 @@ pub async fn revoke_log_ingest_key(
     project_access_guard!(auth, project_id, state.project_access_checker);
 
     let model = state.ingest_key_service.revoke(project_id, key_id).await?;
-    state.ingest_service.forget_key(key_id);
+    // The key is already refused; closing its streams frees the head
+    // buffers and WAL files it held. A failure here leaves them to be
+    // sealed by age and does not undo the revocation.
+    match state.ingest_service.close_key(key_id).await {
+        Ok(streams) => tracing::debug!(
+            project_id,
+            key_id,
+            streams,
+            "Closed a revoked log ingest key's streams"
+        ),
+        Err(e) => {
+            tracing::warn!(project_id, key_id, error = %e, "Failed to close a revoked log ingest key's streams")
+        }
+    }
 
     let audit = LogIngestKeyRevokedAudit {
         context: audit_context(&auth, &metadata),

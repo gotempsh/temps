@@ -298,7 +298,8 @@ A log alert is a metric alert rule whose series is a line count. It uses the sam
 
 - The window is at most one hour.
 - The detector is a fixed threshold. Anomaly detection and per-series splits do not apply to line counts.
-- A text needle is matched by scanning lines, and the scan stops at 1,000 matches. The count is then a lower bound: it can show that more lines than the threshold matched, but not that fewer did, so a "fewer than" rule keeps its current state while the count is capped. A capped count never raises a false alarm and never resolves a real one.
+- A text needle is matched by scanning lines, and the scan stops at 1,000 matches or when its time budget runs out. The count is then a lower bound: it can show that more lines than the threshold matched, but not that fewer did, so a "fewer than" rule, or a "more than" rule still under its threshold, keeps its current state while the count is incomplete. An incomplete count never raises a false alarm and never resolves a real one.
+- A log alert's filters are its saved search's; it takes no label filters of its own. Pointing an alert at another saved search starts it fresh and resolves the alarm the old search left open.
 
 ## Charting Logs on a Dashboard
 
@@ -325,6 +326,8 @@ A host, database, CDN or application that Temps did not deploy can send logs ove
 2. Copy the key. It is shown once; Temps keeps only its hash.
 3. Send lines with the key as a bearer token (`Authorization: Bearer tlk_…`) or in the `X-Temps-Log-Key` header.
 
+The endpoint is a public receiver, like the webhook and OTLP receivers: it answers on the public ingress URL (**Settings → Public ingress**, which falls back to the console URL), and on a separate ingress listener when the console sits behind an IP allowlist. The **Send logs** dialog builds its snippets from that URL. Only the receiver is public; creating and revoking keys stays on the console.
+
 ```bash
 curl -X POST https://temps.example.com/api/logs/ingest \
   -H "Authorization: Bearer $TEMPS_LOG_KEY" \
@@ -344,6 +347,9 @@ encoding.codec = "json"
 framing.method = "newline_delimited"
 auth.strategy = "bearer"
 auth.token = "${TEMPS_LOG_KEY}"
+# Vector's default batch is larger than the endpoint accepts.
+batch.max_bytes = 4000000
+batch.max_events = 5000
 ```
 
 Each line is read like a container's JSON line: `level` and `message` (or `msg`) as usual, other keys as attributes. The timestamp is read from `timestamp`, `@timestamp`, `time`, `ts` or `date` (RFC 3339 or an epoch number); a missing timestamp, or one more than 7 days old or 5 minutes ahead, becomes the arrival time. `service` (or `service.name`, `app`) names the service; without one, the key's default service applies. A key accepts at most 16 service names; further names fold into its default service.
@@ -354,7 +360,7 @@ Each line is read like a container's JSON line: `level` and `message` (or `msg`)
 | Lines per request | 10,000 |
 | Bytes per line | 256 KiB |
 
-A batch is accepted or refused whole: one malformed line refuses the batch with its line number, and a batch over the project's log ingestion budget is refused with `429` and `Retry-After`, so a retrying collector never stores half a batch twice. Refused lines are counted per key on the log pipeline status. Revoking a key refuses its collectors from the next batch; lines already stored are kept.
+A batch is parsed and charged to the budget whole before anything is stored: one malformed line refuses the batch with its line number, and a batch over the key's log ingestion budget is refused with `429` and `Retry-After` (each key is budgeted like one container: the per-container budget, or the project's override of it), so neither stores part of a batch. Refused lines are counted per key on the log pipeline status. A storage failure part-way through a batch (a full disk) stores the lines before it and fails the request; collectors deliver at least once and resend the batch, so those lines can appear twice. Revoking a key waits for its batches in flight, refuses its collectors from the next batch and closes its streams; lines already stored are kept.
 
 ## Structured Logging Best Practices
 

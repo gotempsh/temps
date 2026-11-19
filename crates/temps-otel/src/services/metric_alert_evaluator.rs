@@ -517,22 +517,52 @@ fn humanize_static(
     )
 }
 
+/// How long rule `rule_id` has been breaching, updating its timer.
+///
+/// A confirmed non-breach clears the timer, so a later breach starts its
+/// `for_duration` from zero instead of inheriting the time since an earlier,
+/// interrupted one. Undecided samples never reach here (the caller keeps the
+/// state without deciding), so they leave the timer alone.
+fn track_breach(
+    starts: &mut HashMap<i32, Instant>,
+    rule_id: i32,
+    breaching: bool,
+    now: Instant,
+) -> u64 {
+    if breaching {
+        let start = starts.entry(rule_id).or_insert(now);
+        now.saturating_duration_since(*start).as_secs()
+    } else {
+        starts.remove(&rule_id);
+        0
+    }
+}
+
 /// Whether a line count breaches its threshold.
 ///
 /// A saturated sample is a lower bound: the real count is at least
 /// `sample.count`. That is enough to say a count is above a threshold, but
-/// never that it is below one. `None` means undecided: a "fewer than" rule
-/// on a saturated count keeps its state instead of raising a false alarm (or
-/// resolving a real one) while the search is busier than the counter's cap.
+/// never that it is below one. `None` means undecided: a rule whose answer
+/// the lower bound cannot prove (any "fewer than", or a "more than" still
+/// under its threshold) keeps its state instead of raising a false alarm or
+/// resolving a real one while the count is incomplete.
 fn log_count_breaches(
     comparator: Comparator,
     sample: &LogSeriesSample,
     threshold: f64,
 ) -> Option<bool> {
-    if sample.saturated && matches!(comparator, Comparator::Lt | Comparator::Lte) {
-        return None;
+    let breaches = comparator.breaches(sample.count as f64, threshold);
+    if !sample.saturated {
+        return Some(breaches);
     }
-    Some(comparator.breaches(sample.count as f64, threshold))
+    // A saturated count is a lower bound: the scan stopped at its cap or at
+    // the store's time/byte budget, and unscanned lines may add to it. It
+    // proves "more than" once it is past the threshold; it never proves
+    // "not more than", and it never proves "fewer than".
+    match comparator {
+        Comparator::Gt | Comparator::Gte if breaches => Some(true),
+        Comparator::Gt | Comparator::Gte | Comparator::Lt | Comparator::Lte => None,
+    }
 }
 
 /// One sentence for a log alert: how many lines matched, over what window,
@@ -1277,9 +1307,11 @@ impl MetricAlertEvaluator {
     /// timer are preserved, so a transient gap never resolves a real alert
     /// and never fires a new one.
     async fn persist_unchanged(&self, rule: &AlertRule, now: DateTime<Utc>) {
+        // Conditional like every tick's write: a snapshot read before the
+        // rule changed must not put its old state back.
         if let Err(e) = self
             .alert_service
-            .persist_evaluation(rule.id, &rule.last_state, rule.last_value, now)
+            .persist_evaluation_if_current(rule, &rule.last_state, rule.last_value, now)
             .await
         {
             warn!(rule_id = rule.id, error = %e, "Failed to persist unchanged evaluation");
@@ -1401,7 +1433,7 @@ impl MetricAlertEvaluator {
         let Some(latest) = buckets.last() else {
             if let Err(e) = self
                 .alert_service
-                .persist_evaluation(rule.id, &rule.last_state, rule.last_value, now)
+                .persist_evaluation_if_current(&rule, &rule.last_state, rule.last_value, now)
                 .await
             {
                 warn!(rule_id = rule.id, error = %e, "Failed to persist no-data evaluation");
@@ -1453,7 +1485,12 @@ impl MetricAlertEvaluator {
                     None => {
                         if let Err(e) = self
                             .alert_service
-                            .persist_evaluation(rule.id, &rule.last_state, rule.last_value, now)
+                            .persist_evaluation_if_current(
+                                rule,
+                                &rule.last_state,
+                                rule.last_value,
+                                now,
+                            )
                             .await
                         {
                             warn!(rule_id = rule.id, error = %e, "Failed to persist insufficient-baseline evaluation");
@@ -1473,7 +1510,7 @@ impl MetricAlertEvaluator {
                 );
                 if let Err(e) = self
                     .alert_service
-                    .persist_evaluation(rule.id, &rule.last_state, rule.last_value, now)
+                    .persist_evaluation_if_current(rule, &rule.last_state, rule.last_value, now)
                     .await
                 {
                     warn!(rule_id = rule.id, error = %e, "Failed to persist skipped evaluation");
@@ -1501,12 +1538,9 @@ impl MetricAlertEvaluator {
         now: DateTime<Utc>,
     ) {
         // Track breach duration (in-memory, approximated like temps-monitoring).
-        let breach_elapsed_secs = if breaching {
+        let breach_elapsed_secs = {
             let mut starts = self.breach_start.write().await;
-            let start = starts.entry(rule.id).or_insert_with(Instant::now);
-            start.elapsed().as_secs()
-        } else {
-            0
+            track_breach(&mut starts, rule.id, breaching, Instant::now())
         };
 
         let transition = evaluate_transition(
@@ -1516,6 +1550,7 @@ impl MetricAlertEvaluator {
             rule.for_duration_secs.max(0) as u64,
         );
 
+        let fired = matches!(transition, AlertTransition::FireNow);
         let next_state = match transition {
             AlertTransition::StayOk | AlertTransition::StartBreach => "ok",
             AlertTransition::StayFiring => "firing",
@@ -1530,12 +1565,28 @@ impl MetricAlertEvaluator {
             }
         };
 
-        if let Err(e) = self
+        match self
             .alert_service
-            .persist_evaluation(rule.id, next_state, Some(value), now)
+            .persist_evaluation_if_current(rule, next_state, Some(value), now)
             .await
         {
-            warn!(rule_id = rule.id, error = %e, "Failed to persist rule evaluation");
+            Ok(true) => {}
+            Ok(false) => {
+                // The rule was pointed at another series while this tick
+                // read the old one: its verdict is stale. An alarm it just
+                // opened describes a series the rule no longer watches.
+                debug!(
+                    rule_id = rule.id,
+                    "Alert rule changed during evaluation; discarding this tick's decision"
+                );
+                if fired {
+                    self.resolve(rule.id, rule.project_id).await;
+                }
+                self.clear_breach(rule.id).await;
+            }
+            Err(e) => {
+                warn!(rule_id = rule.id, error = %e, "Failed to persist rule evaluation");
+            }
         }
     }
 
@@ -1575,7 +1626,7 @@ impl MetricAlertEvaluator {
         let Some(latest_ts) = buckets.iter().map(|b| b.bucket).max() else {
             if let Err(e) = self
                 .alert_service
-                .persist_evaluation(rule.id, &rule.last_state, rule.last_value, now)
+                .persist_evaluation_if_current(&rule, &rule.last_state, rule.last_value, now)
                 .await
             {
                 warn!(rule_id = rule.id, error = %e, "Failed to persist no-data grouped evaluation");
@@ -3361,6 +3412,46 @@ mod tests {
         assert_eq!(
             log_count_breaches(Comparator::Gt, &sample(10, false), 20.0),
             Some(false)
+        );
+    }
+
+    #[test]
+    fn a_non_breach_resets_the_breach_timer() {
+        // `> 20` for 60s: 42, then 3, then 42 thirty seconds apart. The second
+        // breach starts its own timer; it does not inherit the first one's.
+        let mut starts = HashMap::new();
+        let t0 = Instant::now();
+        assert_eq!(track_breach(&mut starts, 1, true, t0), 0);
+        assert_eq!(
+            track_breach(&mut starts, 1, false, t0 + Duration::from_secs(30)),
+            0
+        );
+        assert!(starts.is_empty());
+        assert_eq!(
+            track_breach(&mut starts, 1, true, t0 + Duration::from_secs(60)),
+            0
+        );
+        assert_eq!(
+            track_breach(&mut starts, 1, true, t0 + Duration::from_secs(90)),
+            30
+        );
+    }
+
+    #[test]
+    fn a_saturated_count_below_an_above_threshold_keeps_the_state() {
+        // The scan stopped on its time or byte budget after 10 lines: the
+        // real count may still be over 20, so a firing alarm must not resolve.
+        assert_eq!(
+            log_count_breaches(Comparator::Gt, &sample(10, true), 20.0),
+            None
+        );
+        assert_eq!(
+            log_count_breaches(Comparator::Gte, &sample(19, true), 20.0),
+            None
+        );
+        assert_eq!(
+            log_count_breaches(Comparator::Gte, &sample(20, true), 20.0),
+            Some(true)
         );
     }
 

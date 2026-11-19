@@ -96,22 +96,35 @@ The gaps, most important first.
   needle, or an install without a line index, is counted by one bounded,
   newest-first scan of the chunk store that stops at 1,000 matching lines.
   The window is capped at one hour either way, so on a small host a rule
-  can never ask for more than an hour of history per evaluation.
+  can never ask for more than an hour of history per evaluation. While a
+  live chunk in the window is not in the line index yet (its index write
+  failed, or the index was down), the count is scanned instead, so the
+  index lagging never reads as fewer lines. A search that names databases
+  counts only those, not the project's application lines as well.
 - **A capped count is a lower bound.** The evaluator reports it as
   "at least N". It can establish "more than the threshold" but never
   "fewer than": a below-threshold rule on a capped count is undecided and
-  keeps its state (and any open alarm) rather than firing or resolving. A
-  rule "more than the cap" could never fire and is refused when saved.
+  keeps its state (and any open alarm) rather than firing or resolving,
+  and so is a "more than" rule whose lower bound is still under its
+  threshold. A rule "more than the cap" could never fire and is refused
+  when saved.
 - **Log alerts are static thresholds on a count.** No anomaly or forecast
   detector (the metric history holds no log counts to learn from), no
-  `group_by`, no per-series alerting, aggregation fixed to `count`. An
-  alert on a numeric log field is not built; the dashboard can chart one.
+  `group_by`, no label filters (the saved search filters), no per-series
+  alerting, aggregation fixed to `count`. An alert on a numeric log field
+  is not built; the dashboard can chart one. Pointing a rule at another
+  source or saved search resets its state and resolves the alarms the old
+  series left open; switching a log rule to a metric must name the metric.
+  Updates to a rule are serialized on its row, and an evaluation writes its
+  result only while the rule still watches the series it read, so a tick
+  that overlapped an edit never puts the old series' verdict back.
 - **Saved searches.** Per project, at most 100, `logs:read` to see and the
   new `logs:write` to change. The time range is one of `15m`, `1h`, `6h`,
   `24h`, `7d`, `30d`; a custom window from the logs page is saved as the
   nearest of those, since a saved search is a question to ask again, not a
   fixed slice of the past. Deleting a search an alert counts is refused
-  with `409`; a dashboard tile charting a deleted search says so.
+  with `409`, checked under a lock on the search so an alert created at
+  the same moment is never cascaded away; a dashboard tile charting a deleted search says so.
   "Shared" means visible to everyone who can read the project's logs;
   there are no private searches.
 - **Ingest keys are their own table**, modelled on the analytics ingest
@@ -120,20 +133,36 @@ The gaps, most important first.
   default service), and an analytics key must not be able to write logs.
   Only the SHA-256 of a key is stored; the plaintext is returned once.
   Lookups are cached for 30 seconds; revoking through the API evicts the
-  cached entry at once.
-- **A batch is all or nothing.** One malformed line refuses the batch with
+  cached entry at once, and a lookup that overlapped the revoke is not
+  cached. A revoke waits for the key's batches in flight, then seals and
+  closes its streams.
+- **The receiver is on the public router** (ADR 051 D3): `POST
+  /logs/ingest` authenticates by its key, never a session, and is reachable
+  on the ingress listener when the console is gated. It is not added to the
+  proxy's any-host paths, which would take `/api/logs/ingest` from every
+  deployed application's own domain. Key management stays on the admin
+  router, and the console builds the collector URL from the public ingress
+  URL, not the browser's origin.
+- **A batch is admitted whole.** One malformed line refuses the batch with
   its line number, and the ingest budget is charged and enforced per
-  batch, so a retrying collector never stores half a batch twice. Limits:
+  batch, so neither stores part of one. Storage is at least once, like the
+  collectors that send to it: a storage error part-way stores the lines
+  before it, they are counted against the key, and a resend can store them
+  twice. Making a resend idempotent needs a batch identity that Vector and
+  Fluent Bit do not send. Limits:
   5 MiB per request, 10,000 lines, 256 KiB per line, 16 service names per
   key (further names fold into the key's default service). A timestamp
   more than 7 days old or 5 minutes ahead becomes arrival time and is kept
   as an attribute.
 - **Dashboard tiles.** A tile's `source` is `metric` (the default, so
   existing layouts are unchanged) or `logs` with a saved search and
-  `count` or `<fn>:<attribute>`. A count series is at most 240 buckets, a
-  numeric one at most 60 and needs the line index and no text needle. A
-  scanned count stops at 5,000 lines and reports from when it counted, so
-  a chart never draws zero for a period nobody counted.
+  `count` or `<fn>:<attribute>`, the attribute in the line index's key
+  grammar. A count series is at most 240 buckets, a numeric one at most 60
+  and needs the line index and no text needle. Buckets sit on the index's
+  epoch-aligned boundaries whatever the requested start, and a numeric
+  bucket counts only lines that carry the field, so no field is a gap, not
+  zero. A scanned count stops at 5,000 lines and reports from when it
+  counted, so a chart never draws zero for a period nobody counted.
 - **Console.** Saved searches and ingest keys are reached from the logs
   page header, scoped to the service the page is filtered to. A log alert
   is a choice in the existing alert form. There is no CLI for alert rules

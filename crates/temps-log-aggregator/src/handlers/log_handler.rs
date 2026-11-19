@@ -1063,6 +1063,7 @@ mod tests {
             saved_searches.clone(),
             store.clone(),
             Arc::new(crate::index::NoLineIndex::new("test")),
+            Arc::new(crate::store::ManifestRepo::new(db.connection_arc())),
             db.connection_arc(),
         ));
         let app_state = Arc::new(LogAggregatorAppState {
@@ -1324,7 +1325,20 @@ mod tests {
         );
 
         // No key, a wrong key, a compressed body.
-        let collector = TestServer::new(configure_routes().with_state(ctx.app_state.clone()));
+        // The receiver is on the public router, not the admin one.
+        let on_admin = admin.post("/logs/ingest").text("{\"msg\":\"x\"}").await;
+        assert!(
+            matches!(
+                on_admin.status_code(),
+                StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
+            ),
+            "ingest must not be mounted behind the admin gate: {}",
+            on_admin.status_code()
+        );
+        let collector = TestServer::new(
+            super::super::configure_public_routes()
+                .with_state(ctx.app_state.ingest_service.clone()),
+        );
         let missing = collector.post("/logs/ingest").text("{\"msg\":\"x\"}").await;
         assert_eq!(missing.status_code(), StatusCode::UNAUTHORIZED);
         let wrong = collector

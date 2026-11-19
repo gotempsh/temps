@@ -206,9 +206,18 @@ fn validate_log_rule(
     aggregation: &str,
     window_secs: i32,
     detection_config: &DetectionConfig,
+    label_filters: &[(String, String)],
     group_by: &[String],
     dynamic_alerts: bool,
 ) -> Result<(), OtelError> {
+    // Stored and returned but never applied, a label filter would make the
+    // rule look narrower than what it counts.
+    if !label_filters.is_empty() {
+        return Err(OtelError::Validation {
+            message: "A log alert counts what its saved search matches, so it takes no                       label_filters; put the filter in the saved search instead"
+                .to_string(),
+        });
+    }
     if aggregation.trim().to_ascii_lowercase() != LOG_ALERT_AGGREGATION {
         return Err(OtelError::Validation {
             message: format!(
@@ -267,6 +276,16 @@ fn validate_log_rule(
             ),
         }),
     }
+}
+
+/// The result of [`MetricAlertService::update`].
+#[derive(Debug, Clone)]
+pub struct RuleUpdate {
+    pub model: Model,
+    /// The rule now watches a different series (source or saved search):
+    /// its stored state was reset, and the caller must resolve the alarms
+    /// the previous series left open.
+    pub series_changed: bool,
 }
 
 /// The series name and aggregation a rule is stored with.
@@ -331,6 +350,7 @@ fn validate_rule(
             aggregation,
             window_secs,
             detection_config,
+            label_filters,
             group_by,
             dynamic_alerts,
         )?;
@@ -622,9 +642,20 @@ impl MetricAlertService {
         max_series: Option<i32>,
         grouped_notification_threshold: Option<i32>,
         series_source: Option<AlertSeriesSource>,
-    ) -> Result<Model, OtelError> {
-        // Ensure the row exists AND belongs to the project (typed 404 otherwise).
-        let existing = self.get(project_id, id).await?;
+    ) -> Result<RuleUpdate, OtelError> {
+        // Read, validate and write under a lock on the row, so a concurrent
+        // update reads this one's result instead of writing back the values
+        // it read before (a severity-only edit must not undo a source change).
+        let txn = self.db.begin().await?;
+        let Some(existing) = Entity::find_by_id(id)
+            .filter(Column::ProjectId.eq(project_id))
+            .lock_exclusive()
+            .one(&txn)
+            .await?
+        else {
+            txn.rollback().await?;
+            return Err(OtelError::MetricAlertNotFound { rule_id: id });
+        };
 
         // Validate the merged effective field set so partial updates can't leave
         // the row in an un-evaluable state. A detector is replaced wholesale: the
@@ -672,6 +703,25 @@ impl MetricAlertService {
                     ),
                 })?,
         };
+        // A log rule's stored metric name is the placeholder this service
+        // gives it. Becoming a metric rule must name the metric to watch, or
+        // the rule would quietly query that placeholder.
+        let was_log_rule = existing.saved_search_id.is_some() || existing.source == "logs";
+        if was_log_rule
+            && matches!(eff_source, AlertSeriesSource::Metric)
+            && metric_name
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .is_empty()
+        {
+            txn.rollback().await?;
+            return Err(OtelError::Validation {
+                message: format!(
+                    "Alert rule {id} counts a saved log search; switching it to a metric needs                      metric_name (and aggregation) for the metric to watch"
+                ),
+            });
+        }
         let (eff_metric, eff_agg) = normalize_series(eff_source, eff_metric, eff_agg);
         validate_rule(
             &eff_name,
@@ -693,7 +743,19 @@ impl MetricAlertService {
                 .await?;
         }
 
+        // A rule that now watches a different series (another source or
+        // saved search) starts from a clean state: the previous series' verdict
+        // and per-series snapshot say nothing about the new one. The caller
+        // resolves the alarms the old series left open.
+        let series_changed = existing.source != eff_source.as_str()
+            || existing.saved_search_id != eff_source.saved_search_id();
         let mut active: ActiveModel = existing.into();
+        if series_changed {
+            active.last_state = Set("ok".to_string());
+            active.last_value = Set(None);
+            active.series_states = Set(serde_json::json!({}));
+            active.last_dropped_series_count = Set(0);
+        }
         // The source is set from the merged value either way: a rule that
         // becomes a log rule must get its saved search, and one that becomes
         // a metric rule must lose it, or the two columns disagree.
@@ -737,8 +799,55 @@ impl MetricAlertService {
         if let Some(gt) = grouped_notification_threshold {
             active.grouped_notification_threshold = Set(gt);
         }
-        let model = active.update(self.db.as_ref()).await?;
-        Ok(model)
+        let model = active.update(&txn).await?;
+        txn.commit().await?;
+        Ok(RuleUpdate {
+            model,
+            series_changed,
+        })
+    }
+
+    /// Persist an evaluation only while the rule still watches the series
+    /// the evaluation read (same source, saved search, metric and
+    /// aggregation). Returns `false` when the rule changed underneath the
+    /// tick, so its result is stale and must not be written over the newer
+    /// configuration's state.
+    pub async fn persist_evaluation_if_current(
+        &self,
+        evaluated: &Model,
+        last_state: &str,
+        last_value: Option<f64>,
+        last_evaluated_at: DateTime<Utc>,
+    ) -> Result<bool, OtelError> {
+        let saved_search = match evaluated.saved_search_id {
+            Some(id) => Column::SavedSearchId.eq(id),
+            None => Column::SavedSearchId.is_null(),
+        };
+        let result = Entity::update_many()
+            .col_expr(
+                Column::LastState,
+                sea_orm::sea_query::Expr::value(last_state),
+            )
+            .col_expr(
+                Column::LastValue,
+                sea_orm::sea_query::Expr::value(last_value),
+            )
+            .col_expr(
+                Column::LastEvaluatedAt,
+                sea_orm::sea_query::Expr::value(last_evaluated_at),
+            )
+            .col_expr(
+                Column::UpdatedAt,
+                sea_orm::sea_query::Expr::value(Utc::now()),
+            )
+            .filter(Column::Id.eq(evaluated.id))
+            .filter(Column::Source.eq(evaluated.source.clone()))
+            .filter(saved_search)
+            .filter(Column::MetricName.eq(evaluated.metric_name.clone()))
+            .filter(Column::Aggregation.eq(evaluated.aggregation.clone()))
+            .exec(self.db.as_ref())
+            .await?;
+        Ok(result.rows_affected > 0)
     }
 
     /// Delete a rule (scoped to `project_id`). Returns
@@ -1867,6 +1976,170 @@ mod tests {
             false,
         )
         .is_err());
+    }
+
+    #[test]
+    fn a_log_rule_refuses_label_filters_it_would_never_apply() {
+        let error = validate_rule(
+            "Payment failures",
+            "",
+            LOG_ALERT_AGGREGATION,
+            "warning",
+            300,
+            60,
+            &log_threshold(Comparator::Gt, 20.0),
+            &[("region".to_string(), "eu-west".to_string())],
+            &[],
+            false,
+            20,
+            5,
+            AlertSeriesSource::Logs { saved_search_id: 3 },
+        )
+        .expect_err("a label filter on a log rule is refused");
+        assert!(error.to_string().contains("saved search"), "{error}");
+    }
+
+    fn log_model(id: i32) -> Model {
+        let mut model = sample_model(id);
+        model.source = "logs".to_string();
+        model.saved_search_id = Some(3);
+        model.metric_name = LOG_ALERT_METRIC_NAME.to_string();
+        model.aggregation = LOG_ALERT_AGGREGATION.to_string();
+        model.last_state = "firing".to_string();
+        model
+    }
+
+    /// `update` with only the fields a test sets.
+    async fn update_with(
+        service: &MetricAlertService,
+        metric_name: Option<String>,
+        severity: Option<String>,
+        source: Option<AlertSeriesSource>,
+    ) -> Result<RuleUpdate, OtelError> {
+        service
+            .update(
+                7,
+                1,
+                None,
+                metric_name,
+                None,
+                None,
+                None,
+                None,
+                severity,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                source,
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn switching_a_log_rule_to_a_metric_needs_the_metric() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![log_model(1)]])
+            .into_connection();
+        let service = MetricAlertService::new(Arc::new(db));
+        let error = update_with(&service, None, None, Some(AlertSeriesSource::Metric))
+            .await
+            .expect_err("no metric named");
+        assert!(error.to_string().contains("metric_name"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_new_source_resets_the_rule_state_and_says_so() {
+        let mut after = log_model(1);
+        after.last_state = "ok".to_string();
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                // The rule, locked: a metric rule that is firing.
+                .append_query_results([vec![{
+                    let mut m = sample_model(1);
+                    m.last_state = "firing".to_string();
+                    m
+                }]])
+                // The saved search exists in the project.
+                .append_query_results([vec![std::collections::BTreeMap::from([(
+                    "num_items".to_string(),
+                    sea_orm::Value::BigInt(Some(1)),
+                )])]])
+                .append_query_results([vec![after]])
+                .into_connection(),
+        );
+        let service = MetricAlertService::new(db.clone());
+        let update = update_with(
+            &service,
+            None,
+            None,
+            Some(AlertSeriesSource::Logs { saved_search_id: 3 }),
+        )
+        .await
+        .expect("updated");
+        assert!(update.series_changed);
+        drop(service);
+        let log = format!(
+            "{:?}",
+            Arc::try_unwrap(db)
+                .expect("sole owner")
+                .into_transaction_log()
+        );
+        // Debug output escapes quotes; compare without them.
+        let log = log.replace(['\\', '"'], "");
+        assert!(log.contains("FOR UPDATE"), "the row is locked: {log}");
+        assert!(
+            log.contains("SET metric_name = $1, aggregation = $2, last_state = $3"),
+            "{log}"
+        );
+        assert!(log.contains("String(Some(ok))"), "state reset: {log}");
+    }
+
+    #[tokio::test]
+    async fn a_severity_edit_keeps_the_rule_state() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![log_model(1)]])
+            .append_query_results([vec![log_model(1)]])
+            .into_connection();
+        let service = MetricAlertService::new(Arc::new(db));
+        let update = update_with(&service, None, Some("critical".to_string()), None)
+            .await
+            .expect("updated");
+        assert!(!update.series_changed);
+    }
+
+    #[tokio::test]
+    async fn a_stale_evaluation_is_not_written_over_a_changed_rule() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_exec_results([sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 0,
+                }])
+                .into_connection(),
+        );
+        let service = MetricAlertService::new(db.clone());
+        let written = service
+            .persist_evaluation_if_current(&log_model(1), "firing", Some(42.0), chrono::Utc::now())
+            .await
+            .expect("query ran");
+        assert!(!written, "zero rows means the rule changed");
+        drop(service);
+        let log = format!(
+            "{:?}",
+            Arc::try_unwrap(db)
+                .expect("sole owner")
+                .into_transaction_log()
+        );
+        let log = log.replace(['\\', '"'], "");
+        for column in ["source", "saved_search_id", "metric_name", "aggregation"] {
+            assert!(
+                log.contains(&format!("metric_alert_rules.{column} = $")),
+                "guarded on {column}: {log}"
+            );
+        }
     }
 
     #[test]

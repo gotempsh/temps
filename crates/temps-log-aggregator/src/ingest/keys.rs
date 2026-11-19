@@ -26,7 +26,7 @@ use rand::RngExt;
 use sea_orm::ActiveValue::Set;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait,
-    PaginatorTrait, QueryFilter, QueryOrder, Statement,
+    PaginatorTrait, QueryFilter, QueryOrder, Statement, TransactionTrait,
 };
 use sha2::{Digest, Sha256};
 use tracing::{error, warn};
@@ -90,9 +90,47 @@ struct Usage {
     last_used_at: Option<DateTime<Utc>>,
 }
 
+/// Resolved keys, and how many revocations this service has seen.
+///
+/// A lookup notes `revocations` before it reads the database and publishes
+/// its result only if the number is unchanged. A revoke that lands while the
+/// lookup awaits its queries bumps the number under this same lock, so a
+/// key read just before it was revoked is never put back after the revoke
+/// evicted it.
+#[derive(Default)]
+struct KeyCache {
+    entries: HashMap<String, (AuthenticatedKey, Instant)>,
+    revocations: u64,
+}
+
+impl KeyCache {
+    /// Cache `resolved` unless a revocation happened since `seen`. Returns
+    /// whether it was cached.
+    fn publish(&mut self, hash: String, resolved: AuthenticatedKey, seen: u64) -> bool {
+        if self.revocations != seen {
+            return false;
+        }
+        if self.entries.len() >= KEY_CACHE_CAPACITY {
+            let now = Instant::now();
+            self.entries
+                .retain(|_, (_, at)| now.duration_since(*at) < KEY_CACHE_TTL);
+            if self.entries.len() >= KEY_CACHE_CAPACITY {
+                self.entries.clear();
+            }
+        }
+        self.entries.insert(hash, (resolved, Instant::now()));
+        true
+    }
+
+    fn revoke(&mut self, hash: &str) {
+        self.revocations = self.revocations.wrapping_add(1);
+        self.entries.remove(hash);
+    }
+}
+
 pub struct LogIngestKeyService {
     db: Arc<DatabaseConnection>,
-    cache: Mutex<HashMap<String, (AuthenticatedKey, Instant)>>,
+    cache: Mutex<KeyCache>,
     usage: Mutex<HashMap<i32, Usage>>,
 }
 
@@ -100,7 +138,7 @@ impl LogIngestKeyService {
     pub fn new(db: Arc<DatabaseConnection>) -> Self {
         Self {
             db,
-            cache: Mutex::new(HashMap::new()),
+            cache: Mutex::new(KeyCache::default()),
             usage: Mutex::new(HashMap::new()),
         }
     }
@@ -160,12 +198,20 @@ impl LogIngestKeyService {
         if let Some(environment_id) = new.environment_id {
             self.ensure_environment(project_id, environment_id).await?;
         }
+        // Counted and inserted under a lock on the project row, so two
+        // concurrent creations cannot both pass the active-key limit.
+        let txn = self.db.begin().await?;
+        if let Err(e) = crate::services::saved_search::lock_project(&txn, project_id).await {
+            txn.rollback().await?;
+            return Err(e);
+        }
         let active = Entity::find()
             .filter(Column::ProjectId.eq(project_id))
             .filter(Column::IsActive.eq(true))
-            .count(self.db.as_ref())
+            .count(&txn)
             .await?;
         if active >= MAX_ACTIVE_KEYS_PER_PROJECT {
+            txn.rollback().await?;
             return Err(LogAggregatorError::Validation {
                 message: format!(
                     "Project {project_id} already has {active} active log ingest keys; the limit \
@@ -186,8 +232,9 @@ impl LogIngestKeyService {
             created_by_user_id: Set(new.created_by),
             ..Default::default()
         }
-        .insert(self.db.as_ref())
+        .insert(&txn)
         .await?;
+        txn.commit().await?;
         Ok(CreatedLogIngestKey { key, plaintext })
     }
 
@@ -204,7 +251,7 @@ impl LogIngestKeyService {
             existing
         };
         if let Ok(mut cache) = self.cache.lock() {
-            cache.remove(&hash);
+            cache.revoke(&hash);
         }
         Ok(model)
     }
@@ -221,7 +268,10 @@ impl LogIngestKeyService {
             return Err(LogAggregatorError::IngestKeyRejected);
         }
         let hash = hash_key(presented);
-        if let Some(found) = self.cached(&hash) {
+        // A poisoned lock reads as a miss; publishing then fails on the same
+        // lock, so every lookup goes to the database and nothing is cached.
+        let (cached, revocations_seen) = self.cached(&hash).unwrap_or((None, 0));
+        if let Some(found) = cached {
             return Ok(found);
         }
 
@@ -254,22 +304,21 @@ impl LogIngestKeyService {
             default_service: key.default_service,
         };
         if let Ok(mut cache) = self.cache.lock() {
-            if cache.len() >= KEY_CACHE_CAPACITY {
-                let now = Instant::now();
-                cache.retain(|_, (_, at)| now.duration_since(*at) < KEY_CACHE_TTL);
-                if cache.len() >= KEY_CACHE_CAPACITY {
-                    cache.clear();
-                }
-            }
-            cache.insert(hash, (resolved.clone(), Instant::now()));
+            cache.publish(hash, resolved.clone(), revocations_seen);
         }
         Ok(resolved)
     }
 
-    fn cached(&self, hash: &str) -> Option<AuthenticatedKey> {
+    /// The cached resolution of `hash`, if fresh, and the revocation count
+    /// at the time of asking. `None` only when the lock is poisoned.
+    fn cached(&self, hash: &str) -> Option<(Option<AuthenticatedKey>, u64)> {
         let cache = self.cache.lock().ok()?;
-        let (key, at) = cache.get(hash)?;
-        (at.elapsed() < KEY_CACHE_TTL).then(|| key.clone())
+        let found = cache
+            .entries
+            .get(hash)
+            .filter(|(_, at)| at.elapsed() < KEY_CACHE_TTL)
+            .map(|(key, _)| key.clone());
+        Some((found, cache.revocations))
     }
 
     /// Count lines a key delivered. In memory; see [`Self::flush_usage`].
@@ -441,6 +490,35 @@ mod tests {
         ] {
             assert!(!is_well_formed(&bad), "accepted {bad:?}");
         }
+    }
+
+    fn resolved(key_id: i32) -> AuthenticatedKey {
+        AuthenticatedKey {
+            key_id,
+            project_id: 1,
+            environment_id: None,
+            default_service: DEFAULT_INGEST_SERVICE.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_lookup_that_overlapped_a_revoke_is_not_cached() {
+        let mut cache = KeyCache::default();
+        // The lookup notes the count, then awaits its queries ...
+        let seen = cache.revocations;
+        // ... while the key is revoked and evicted.
+        cache.revoke("h");
+        assert!(!cache.publish("h".into(), resolved(1), seen));
+        assert!(cache.entries.is_empty(), "the revoked key came back");
+    }
+
+    #[test]
+    fn a_lookup_with_no_revoke_in_between_is_cached() {
+        let mut cache = KeyCache::default();
+        cache.revoke("other");
+        let seen = cache.revocations;
+        assert!(cache.publish("h".into(), resolved(1), seen));
+        assert!(cache.entries.contains_key("h"));
     }
 
     #[tokio::test]

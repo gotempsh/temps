@@ -1,9 +1,16 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-/** The NDJSON ingest endpoint on the server the console is served from. */
-export function logIngestUrl(origin: string): string {
-  return `${origin.replace(/\/+$/, '')}/api/logs/ingest`
+/** Path of the NDJSON ingest endpoint, on the public router. */
+export const LOG_INGEST_PATH = '/api/logs/ingest'
+
+/**
+ * The NDJSON ingest endpoint under the public ingress URL (ADR-051), never
+ * the browser's origin: a collector outside Temps cannot reach a console
+ * behind the admin gate.
+ */
+export function logIngestUrl(publicIngressBase: string): string {
+  return `${publicIngressBase.replace(/\/+$/, '')}${LOG_INGEST_PATH}`
 }
 
 /** A one-line test a person can paste into a shell. */
@@ -28,6 +35,10 @@ export function vectorSnippet(url: string, key: string): string {
     'framing.method = "newline_delimited"',
     'auth.strategy = "bearer"',
     `auth.token = "${key}"`,
+    // Vector's defaults (10 MB per batch, no event cap) exceed the
+    // endpoint's 5 MiB / 10,000-line limits; leave room for JSON framing.
+    'batch.max_bytes = 4000000',
+    'batch.max_events = 5000',
   ].join('\n')
 }
 

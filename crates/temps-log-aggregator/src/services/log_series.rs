@@ -38,7 +38,7 @@ use temps_core::log_series::{
 };
 
 use crate::error::LogAggregatorError;
-use crate::index::analytics::Metric;
+use crate::index::analytics::{AttrOp, AttrPredicate, Metric};
 use crate::index::LineIndex;
 use crate::services::saved_search::{LogSavedSearchService, SavedSearchQuery};
 use crate::store::{
@@ -99,6 +99,42 @@ pub struct LogSeries {
     pub method: LogSeriesMethod,
 }
 
+/// The bucket boundary at or before `start`.
+///
+/// The line index and the head buffers bucket on multiples of `bucket_secs`
+/// since the Unix epoch, so every series lays its grid on those boundaries
+/// too; a grid starting at the request's own start would drop the first
+/// partial bucket and label the rest one bucket early.
+fn grid_origin(start: DateTime<Utc>, bucket_secs: u32) -> DateTime<Utc> {
+    let width = i64::from(bucket_secs.max(1));
+    start - chrono::Duration::seconds(start.timestamp().rem_euclid(width))
+}
+
+/// The predicate selecting the lines that contribute to `metric`: a numeric
+/// value of its field for a numeric aggregate (`> f64::MIN` holds for every
+/// finite number, zero included, and for no text), the field's presence for a
+/// distinct count. `None` for a line count, which every line contributes to.
+fn contributes_to(metric: &Metric) -> Option<AttrPredicate> {
+    match metric {
+        Metric::Count => None,
+        Metric::CountDistinct(key) => Some(AttrPredicate {
+            key: key.clone(),
+            op: AttrOp::Exists,
+            value: None,
+        }),
+        Metric::Avg(key)
+        | Metric::P50(key)
+        | Metric::P95(key)
+        | Metric::P99(key)
+        | Metric::Max(key)
+        | Metric::Sum(key) => Some(AttrPredicate {
+            key: key.clone(),
+            op: AttrOp::Gt,
+            value: Some(format!("{:e}", f64::MIN)),
+        }),
+    }
+}
+
 fn bucket_count(start: DateTime<Utc>, end: DateTime<Utc>, bucket_secs: u32) -> usize {
     let span = (end - start).num_seconds().max(1);
     let width = i64::from(bucket_secs.max(1));
@@ -134,11 +170,27 @@ fn points(
         .collect()
 }
 
+/// Whether the line index covers every chunk a query would read.
+#[async_trait::async_trait]
+pub trait IndexCoverage: Send + Sync {
+    /// `true` when a live chunk in `query`'s window and scope is not in the
+    /// line index yet.
+    async fn has_unindexed(&self, query: &LogQuery) -> Result<bool, LogAggregatorError>;
+}
+
+#[async_trait::async_trait]
+impl IndexCoverage for crate::store::ManifestRepo {
+    async fn has_unindexed(&self, query: &LogQuery) -> Result<bool, LogAggregatorError> {
+        crate::store::ManifestRepo::has_unindexed(self, query).await
+    }
+}
+
 /// Counts the lines a saved search matches over a window.
 pub struct LogSeriesService {
     saved_searches: Arc<LogSavedSearchService>,
     store: Arc<dyn LogLineStore>,
     line_index: Arc<dyn LineIndex>,
+    coverage: Arc<dyn IndexCoverage>,
     db: Arc<DatabaseConnection>,
 }
 
@@ -147,13 +199,27 @@ impl LogSeriesService {
         saved_searches: Arc<LogSavedSearchService>,
         store: Arc<dyn LogLineStore>,
         line_index: Arc<dyn LineIndex>,
+        coverage: Arc<dyn IndexCoverage>,
         db: Arc<DatabaseConnection>,
     ) -> Self {
         Self {
             saved_searches,
             store,
             line_index,
+            coverage,
             db,
+        }
+    }
+
+    /// Whether the index alone would miss committed lines of `query`. A
+    /// failed check answers `true`: scanning is slower, never wrong.
+    async fn index_incomplete(&self, query: &LogQuery) -> bool {
+        match self.coverage.has_unindexed(query).await {
+            Ok(pending) => pending,
+            Err(e) => {
+                warn!(error = %e, "checking line index coverage failed; counting by scan");
+                true
+            }
         }
     }
 
@@ -200,9 +266,20 @@ impl LogSeriesService {
             start_time: start,
             end_time: end,
             source: query.source,
-            selection: Some(LogSelection {
-                project_ids: vec![project_id],
-                external_service_ids: selected_services,
+            // Projects and services in a selection are OR'd, so a search
+            // that names services must not also name the project: that
+            // would count every application line too. A search whose named
+            // services are all gone selects nothing rather than the project.
+            selection: Some(if query.external_service_ids.is_empty() {
+                LogSelection {
+                    project_ids: vec![project_id],
+                    external_service_ids: selected_services,
+                }
+            } else {
+                LogSelection {
+                    project_ids: vec![],
+                    external_service_ids: selected_services,
+                }
             }),
             levels: query.levels.clone(),
             envs: query.envs.clone(),
@@ -230,7 +307,10 @@ impl LogSeriesService {
         end: DateTime<Utc>,
     ) -> Result<LogSeriesSample, LogAggregatorError> {
         let log_query = self.build_query(project_id, query, start, end).await?;
-        if query.needs_message_scan() || self.line_index.unavailable_reason().is_some() {
+        if query.needs_message_scan()
+            || self.line_index.unavailable_reason().is_some()
+            || self.index_incomplete(&log_query).await
+        {
             return self.count_by_scan(log_query).await;
         }
         self.count_by_index(log_query).await
@@ -281,6 +361,9 @@ impl LogSeriesService {
             });
         }
         let log_query = self.build_query(project_id, query, start, end).await?;
+        // Lines are still read from `[start, end)`; only the grid moves, so
+        // the first bucket may cover part of its width.
+        let origin = grid_origin(start, bucket_secs);
         let index_unavailable = self.line_index.unavailable_reason();
 
         if numeric {
@@ -296,15 +379,20 @@ impl LogSeriesService {
                 return Err(LogAggregatorError::LineIndex { reason });
             }
             return self
-                .numeric_series(log_query, start, end, bucket_secs, &metric)
+                .numeric_series(log_query, origin, end, bucket_secs, &metric)
                 .await;
         }
-        if query.needs_message_scan() || index_unavailable.is_some() {
+        // A chunk the index has not caught up with yet would read as zero
+        // lines: scan instead, which reads chunks and says when it stopped.
+        if query.needs_message_scan()
+            || index_unavailable.is_some()
+            || self.index_incomplete(&log_query).await
+        {
             return self
-                .count_series_by_scan(log_query, start, end, bucket_secs)
+                .count_series_by_scan(log_query, origin, end, bucket_secs)
                 .await;
         }
-        self.count_series_by_index(log_query, start, end, bucket_secs)
+        self.count_series_by_index(log_query, origin, end, bucket_secs)
             .await
     }
 
@@ -407,15 +495,30 @@ impl LogSeriesService {
         bucket_secs: u32,
         metric: &Metric,
     ) -> Result<LogSeries, LogAggregatorError> {
-        let attrs = query.attrs.clone();
-        let mut values = Vec::with_capacity(bucket_count(start, end, bucket_secs));
-        for slot in 0..bucket_count(start, end, bucket_secs) {
+        let mut attrs = query.attrs.clone();
+        // Only lines that carry the field contribute: without this, `lines`
+        // counts every matching line, and a bucket whose lines all lack the
+        // field would plot the aggregate's empty value (0) instead of a gap.
+        if let Some(presence) = contributes_to(metric) {
+            attrs.push(presence);
+        }
+        let buckets = bucket_count(start, end, bucket_secs);
+        let mut values = Vec::with_capacity(buckets);
+        for slot in 0..buckets {
             let bucket_start =
                 start + chrono::Duration::seconds(i64::from(bucket_secs) * slot as i64);
-            let bucket_end =
-                (bucket_start + chrono::Duration::seconds(i64::from(bucket_secs))).min(end);
+            let next_start = bucket_start + chrono::Duration::seconds(i64::from(bucket_secs));
+            // The index bounds are inclusive at both ends. A bucket ends just
+            // before the next one starts, so a line exactly on a boundary is
+            // counted once, in the later bucket; the last bucket ends where
+            // the series does.
+            let bucket_end = if slot + 1 == buckets {
+                end
+            } else {
+                next_start - chrono::Duration::microseconds(1)
+            };
             let mut bucket_query = query.clone();
-            bucket_query.start_time = bucket_start;
+            bucket_query.start_time = bucket_start.max(query.start_time);
             bucket_query.end_time = bucket_end;
             let rows = self
                 .line_index
@@ -715,8 +818,20 @@ mod tests {
             Arc::new(crate::services::LogSavedSearchService::new(db.clone())),
             store,
             Arc::new(NoLineIndex::new("no line index in this test")),
+            Arc::new(Coverage(false)),
             db,
         )
+    }
+
+    /// Index coverage with a fixed answer: `true` means a chunk in the
+    /// window is not indexed yet.
+    struct Coverage(bool);
+
+    #[async_trait]
+    impl IndexCoverage for Coverage {
+        async fn has_unindexed(&self, _query: &LogQuery) -> Result<bool, LogAggregatorError> {
+            Ok(self.0)
+        }
     }
 
     fn query(text: Option<&str>) -> LogQuery {
@@ -872,7 +987,7 @@ mod tests {
 
     // ── Dashboard series ────────────────────────────────────────────────
 
-    use crate::index::analytics::{AggregateRow, AttrPredicate, GroupKey};
+    use crate::index::analytics::{AggregateRow, GroupKey};
     use crate::index::{IndexOutcome, LineIndexSink};
     use crate::store::FacetValue;
     use chrono::TimeZone;
@@ -882,7 +997,11 @@ mod tests {
         histogram: Vec<HistogramBucket>,
         /// `(lines, value)` returned for each aggregate call, in order.
         aggregates: std::sync::Mutex<Vec<(i64, f64)>>,
+        /// `(start, end, predicates)` of each aggregate call.
+        seen: Arc<std::sync::Mutex<Vec<AggregateCall>>>,
     }
+
+    type AggregateCall = (DateTime<Utc>, DateTime<Utc>, Vec<AttrPredicate>);
 
     #[async_trait]
     impl LineIndexSink for FakeIndex {
@@ -927,12 +1046,17 @@ mod tests {
         }
         async fn aggregate(
             &self,
-            _query: &LogQuery,
-            _attrs: &[AttrPredicate],
+            query: &LogQuery,
+            attrs: &[AttrPredicate],
             _group_by: &[GroupKey],
             _metric: &Metric,
             _limit: u32,
         ) -> Result<Vec<AggregateRow>, LogAggregatorError> {
+            self.seen.lock().expect("seen lock").push((
+                query.start_time,
+                query.end_time,
+                attrs.to_vec(),
+            ));
             let (lines, value) = self.aggregates.lock().expect("aggregates lock").remove(0);
             Ok(vec![AggregateRow {
                 keys: vec![],
@@ -964,6 +1088,14 @@ mod tests {
     }
 
     fn series_service(store: Arc<ScriptedStore>, index: Option<FakeIndex>) -> LogSeriesService {
+        series_service_with(store, index, false)
+    }
+
+    fn series_service_with(
+        store: Arc<ScriptedStore>,
+        index: Option<FakeIndex>,
+        unindexed: bool,
+    ) -> LogSeriesService {
         let db = Arc::new(
             sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
                 .append_query_results([Vec::<temps_entities::project_services::Model>::new()])
@@ -977,8 +1109,64 @@ mod tests {
             Arc::new(crate::services::LogSavedSearchService::new(db.clone())),
             store,
             index,
+            Arc::new(Coverage(unindexed)),
             db,
         )
+    }
+
+    #[tokio::test]
+    async fn an_alert_count_scans_while_a_chunk_in_the_window_is_not_indexed() {
+        let index = FakeIndex {
+            histogram: vec![HistogramBucket {
+                ts: t0(),
+                group: None,
+                count: 1,
+            }],
+            aggregates: std::sync::Mutex::new(vec![]),
+            seen: Default::default(),
+        };
+        let store = Arc::new(ScriptedStore::new(vec![LogPage {
+            lines: vec![at_minute(2), at_minute(1), at_minute(0)],
+            next_cursor: None,
+            scanned_back_to: None,
+        }]));
+        let sample = series_service_with(store, Some(index), true)
+            .count(
+                7,
+                &SavedSearchQuery::default(),
+                t0(),
+                t0() + Duration::minutes(3),
+            )
+            .await
+            .expect("count");
+        assert_eq!(sample.count, 3, "the index alone would have said 1");
+        assert!(!sample.saturated);
+    }
+
+    #[tokio::test]
+    async fn a_count_series_scans_while_a_chunk_in_the_window_is_not_indexed() {
+        let index = FakeIndex {
+            histogram: vec![HistogramBucket {
+                ts: t0(),
+                group: None,
+                count: 1,
+            }],
+            aggregates: std::sync::Mutex::new(vec![]),
+            seen: Default::default(),
+        };
+        let store = Arc::new(ScriptedStore::new(vec![LogPage {
+            lines: vec![at_minute(2), at_minute(1), at_minute(0)],
+            next_cursor: None,
+            scanned_back_to: None,
+        }]));
+        let series = series_service_with(store.clone(), Some(index), true)
+            .series(7, &SavedSearchQuery::default(), request(3, Metric::Count))
+            .await
+            .expect("series");
+        assert_eq!(series.method, LogSeriesMethod::Scan);
+        let values: Vec<Option<f64>> = series.points.iter().map(|p| p.value).collect();
+        assert_eq!(values, vec![Some(1.0), Some(1.0), Some(1.0)]);
+        assert_eq!(store.calls(), 1, "the chunks were read");
     }
 
     fn at_minute(minute: i64) -> LogLineRecord {
@@ -1073,6 +1261,7 @@ mod tests {
                 },
             ],
             aggregates: std::sync::Mutex::new(vec![]),
+            seen: Default::default(),
         };
         let store = Arc::new(
             ScriptedStore::new(vec![]).with_unsealed(vec![HistogramBucket {
@@ -1091,11 +1280,156 @@ mod tests {
         assert_eq!(store.calls(), 0, "no message was read");
     }
 
+    fn service_with_links(links: &[i32]) -> LogSeriesService {
+        // `services_linked_to_projects` reads one column, the service id.
+        let rows: Vec<std::collections::BTreeMap<String, sea_orm::Value>> = links
+            .iter()
+            .map(|service_id| {
+                std::collections::BTreeMap::from([(
+                    "service_id".to_string(),
+                    sea_orm::Value::Int(Some(*service_id)),
+                )])
+            })
+            .collect();
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results([rows])
+                .into_connection(),
+        );
+        LogSeriesService::new(
+            Arc::new(crate::services::LogSavedSearchService::new(db.clone())),
+            Arc::new(ScriptedStore::new(vec![])),
+            Arc::new(NoLineIndex::new("no line index in this test")),
+            Arc::new(Coverage(false)),
+            db,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_search_naming_services_selects_only_those_services() {
+        let query = SavedSearchQuery {
+            external_service_ids: vec![3, 99],
+            ..Default::default()
+        };
+        let built = service_with_links(&[3, 4])
+            .build_query(7, &query, t0(), t0() + Duration::minutes(5))
+            .await
+            .expect("query");
+        assert_eq!(
+            built.selection,
+            Some(LogSelection {
+                project_ids: vec![],
+                external_service_ids: vec![3],
+            }),
+            "the project's application lines are not counted, and a stale id is dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_search_naming_only_stale_services_selects_nothing() {
+        let query = SavedSearchQuery {
+            external_service_ids: vec![99],
+            ..Default::default()
+        };
+        let built = service_with_links(&[3])
+            .build_query(7, &query, t0(), t0() + Duration::minutes(5))
+            .await
+            .expect("query");
+        assert_eq!(built.selection, Some(LogSelection::default()));
+    }
+
+    #[tokio::test]
+    async fn a_search_naming_no_services_selects_the_project_and_its_services() {
+        let built = service_with_links(&[3])
+            .build_query(
+                7,
+                &SavedSearchQuery::default(),
+                t0(),
+                t0() + Duration::minutes(5),
+            )
+            .await
+            .expect("query");
+        assert_eq!(
+            built.selection,
+            Some(LogSelection {
+                project_ids: vec![7],
+                external_service_ids: vec![3],
+            })
+        );
+    }
+
+    fn unaligned_request() -> SeriesRequest {
+        // 12:02 to 12:17 in five-minute buckets: the start falls inside the
+        // 12:00 bucket the index reports.
+        SeriesRequest {
+            start: t0() + Duration::minutes(2),
+            end: t0() + Duration::minutes(17),
+            bucket_secs: 300,
+            metric: Metric::Count,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_index_series_keeps_the_first_partial_bucket_when_start_is_unaligned() {
+        let bucket = |minute: i64, count: i64| HistogramBucket {
+            ts: t0() + Duration::minutes(minute),
+            group: None,
+            count,
+        };
+        let index = FakeIndex {
+            histogram: vec![bucket(0, 2), bucket(5, 3), bucket(15, 1)],
+            aggregates: std::sync::Mutex::new(vec![]),
+            seen: Default::default(),
+        };
+        let series = series_service(Arc::new(ScriptedStore::new(vec![])), Some(index))
+            .series(7, &SavedSearchQuery::default(), unaligned_request())
+            .await
+            .expect("series");
+        let got: Vec<(DateTime<Utc>, Option<f64>)> =
+            series.points.iter().map(|p| (p.ts, p.value)).collect();
+        assert_eq!(
+            got,
+            vec![
+                (t0(), Some(2.0)),
+                (t0() + Duration::minutes(5), Some(3.0)),
+                (t0() + Duration::minutes(10), Some(0.0)),
+                (t0() + Duration::minutes(15), Some(1.0)),
+            ],
+            "buckets sit on the boundaries the index uses, none dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_scan_series_uses_the_same_boundaries_as_the_index() {
+        let store = Arc::new(ScriptedStore::new(vec![LogPage {
+            // 12:16:10, 12:06:10 and 12:03:10, newest first.
+            lines: vec![at_minute(16), at_minute(6), at_minute(3)],
+            next_cursor: None,
+            scanned_back_to: None,
+        }]));
+        let series = series_service(store, None)
+            .series(7, &text_query(), unaligned_request())
+            .await
+            .expect("series");
+        let got: Vec<(DateTime<Utc>, Option<f64>)> =
+            series.points.iter().map(|p| (p.ts, p.value)).collect();
+        assert_eq!(
+            got,
+            vec![
+                (t0(), Some(1.0)),
+                (t0() + Duration::minutes(5), Some(1.0)),
+                (t0() + Duration::minutes(10), Some(0.0)),
+                (t0() + Duration::minutes(15), Some(1.0)),
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn a_numeric_series_aggregates_each_bucket_and_leaves_empty_ones_blank() {
         let index = FakeIndex {
             histogram: vec![],
             aggregates: std::sync::Mutex::new(vec![(4, 120.0), (0, 0.0), (1, 80.0)]),
+            seen: Default::default(),
         };
         let series = series_service(Arc::new(ScriptedStore::new(vec![])), Some(index))
             .series(
@@ -1107,6 +1441,49 @@ mod tests {
             .expect("series");
         let values: Vec<Option<f64>> = series.points.iter().map(|p| p.value).collect();
         assert_eq!(values, vec![Some(120.0), None, Some(80.0)]);
+    }
+
+    #[tokio::test]
+    async fn numeric_buckets_do_not_overlap_and_count_only_lines_with_the_field() {
+        let seen: Arc<std::sync::Mutex<Vec<AggregateCall>>> = Default::default();
+        let index = FakeIndex {
+            histogram: vec![],
+            aggregates: std::sync::Mutex::new(vec![(1, 5.0), (1, 6.0), (1, 7.0)]),
+            seen: seen.clone(),
+        };
+        series_service(Arc::new(ScriptedStore::new(vec![])), Some(index))
+            .series(
+                7,
+                &SavedSearchQuery::default(),
+                request(3, Metric::Sum("retry_delay".to_string())),
+            )
+            .await
+            .expect("series");
+        let calls = seen.lock().expect("seen lock").clone();
+        assert_eq!(calls.len(), 3);
+        for pair in calls.windows(2) {
+            assert!(
+                pair[0].1 < pair[1].0,
+                "a boundary line would be counted twice: {:?} then {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+        assert_eq!(
+            calls[2].1,
+            t0() + Duration::minutes(3),
+            "the last bucket ends with the series"
+        );
+        let presence = calls[0].2.last().expect("a presence predicate");
+        assert_eq!(presence.key, "retry_delay");
+        assert_eq!(presence.op, AttrOp::Gt);
+        let floor: f64 = presence
+            .value
+            .as_deref()
+            .expect("value")
+            .parse()
+            .expect("number");
+        assert!(0.0 > floor, "a recorded zero still contributes");
     }
 
     #[tokio::test]

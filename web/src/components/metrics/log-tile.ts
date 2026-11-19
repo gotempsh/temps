@@ -25,6 +25,34 @@ const STEPS = [
   60, 120, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400,
 ]
 
+/**
+ * The line index's attribute key grammar (`[A-Za-z_][A-Za-z0-9_.]{0,63}`);
+ * the dashboard API refuses anything else.
+ */
+export function isLogAttributeKey(key: string): boolean {
+  return /^[A-Za-z_][A-Za-z0-9_.]{0,63}$/.test(key.trim())
+}
+
+/**
+ * Why a log tile cannot be charted, or `null` when it can. A numeric field
+ * is aggregated by the line index, which holds no message text, so a saved
+ * search with a text filter can only be charted as a line count.
+ */
+export function logTileProblem(
+  fn: LogTileFunction,
+  searchFiltersText: boolean
+): string | null {
+  if (fn === 'count' || !searchFiltersText) return null
+  return 'This saved search filters message text, which only a line count can chart. Choose Matching lines, or a search without a text filter.'
+}
+
+/** Whether a saved search's query filters message text. */
+export function searchFiltersText(
+  query: { text?: string | null } | null | undefined
+): boolean {
+  return !!query?.text
+}
+
 /** `count`, or `<fn>:<attribute>`, the way a tile stores it. */
 export function formatLogTileMetric(
   fn: LogTileFunction,

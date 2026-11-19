@@ -20,7 +20,7 @@ use std::sync::Arc;
 use sea_orm::ActiveValue::Set;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
-    QueryOrder, TransactionTrait,
+    QueryOrder, QuerySelect, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -260,9 +260,14 @@ impl LogSavedSearchService {
         let time_range = validate_time_range(&time_range)?;
         query.validate()?;
 
+        // Counted and inserted under a lock on the project row: a transaction
+        // alone does not stop two concurrent creations from both reading 99
+        // and both inserting, so they queue on the project instead.
         let txn = self.db.begin().await?;
-        // Counted and inserted under one transaction so two concurrent
-        // creations cannot both pass the limit check.
+        if let Err(e) = lock_project(&txn, project_id).await {
+            txn.rollback().await?;
+            return Err(e);
+        }
         let existing = Entity::find()
             .filter(Column::ProjectId.eq(project_id))
             .count(&txn)
@@ -344,30 +349,49 @@ impl LogSavedSearchService {
     /// The foreign key cascades (so a project delete takes its log rules with
     /// it); deleting a search directly must not silently delete the alerts
     /// built on it, so this refuses and says how many to detach first.
+    ///
+    /// The search row is locked `FOR UPDATE` before the alerts are counted
+    /// and held through the delete. An alert being created at the same time
+    /// takes a key-share lock on the search for its foreign key, which this
+    /// lock excludes: either the alert committed first and is counted, or it
+    /// waits and then fails its foreign key. It is never created and then
+    /// silently cascaded away.
     pub async fn delete(
         &self,
         project_id: i32,
         saved_search_id: i32,
     ) -> Result<(), LogAggregatorError> {
-        self.get(project_id, saved_search_id).await?;
-        let alert_count = self.alert_count(saved_search_id).await?;
-        if alert_count > 0 {
-            return Err(LogAggregatorError::SavedSearchInUse {
-                saved_search_id,
-                alert_count,
-            });
-        }
-        let deleted = Entity::delete_many()
-            .filter(Column::Id.eq(saved_search_id))
+        use temps_entities::metric_alert_rules;
+        let txn = self.db.begin().await?;
+        let locked = Entity::find_by_id(saved_search_id)
             .filter(Column::ProjectId.eq(project_id))
-            .exec(self.db.as_ref())
+            .lock_exclusive()
+            .one(&txn)
             .await?;
-        if deleted.rows_affected == 0 {
+        if locked.is_none() {
+            txn.rollback().await?;
             return Err(LogAggregatorError::SavedSearchNotFound {
                 project_id,
                 saved_search_id,
             });
         }
+        let alert_count = metric_alert_rules::Entity::find()
+            .filter(metric_alert_rules::Column::SavedSearchId.eq(saved_search_id))
+            .count(&txn)
+            .await?;
+        if alert_count > 0 {
+            txn.rollback().await?;
+            return Err(LogAggregatorError::SavedSearchInUse {
+                saved_search_id,
+                alert_count,
+            });
+        }
+        Entity::delete_many()
+            .filter(Column::Id.eq(saved_search_id))
+            .filter(Column::ProjectId.eq(project_id))
+            .exec(&txn)
+            .await?;
+        txn.commit().await?;
         Ok(())
     }
 
@@ -377,7 +401,6 @@ impl LogSavedSearchService {
         &self,
         saved_search_ids: &[i32],
     ) -> Result<std::collections::HashMap<i32, u64>, LogAggregatorError> {
-        use sea_orm::QuerySelect;
         use temps_entities::metric_alert_rules;
         if saved_search_ids.is_empty() {
             return Ok(std::collections::HashMap::new());
@@ -404,6 +427,26 @@ impl LogSavedSearchService {
             .filter(metric_alert_rules::Column::SavedSearchId.eq(saved_search_id))
             .count(self.db.as_ref())
             .await?)
+    }
+}
+
+/// Lock a project's row for the rest of `txn`, so per-project count-then-
+/// insert limits serialize. Only the id is read.
+pub(crate) async fn lock_project<C: sea_orm::ConnectionTrait>(
+    txn: &C,
+    project_id: i32,
+) -> Result<(), LogAggregatorError> {
+    use temps_entities::projects;
+    let found: Option<i32> = projects::Entity::find_by_id(project_id)
+        .select_only()
+        .column(projects::Column::Id)
+        .lock_exclusive()
+        .into_tuple()
+        .one(txn)
+        .await?;
+    match found {
+        Some(_) => Ok(()),
+        None => Err(LogAggregatorError::ProjectNotFound { project_id }),
     }
 }
 
@@ -683,6 +726,11 @@ mod tests {
     #[tokio::test]
     async fn create_refuses_once_the_per_project_limit_is_reached() {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
+            // The project row lock comes first.
+            .append_query_results([vec![std::collections::BTreeMap::from([(
+                "id".to_string(),
+                sea_orm::Value::Int(Some(7)),
+            )])]])
             .append_query_results([vec![count_row(
                 i64::try_from(MAX_SAVED_SEARCHES_PER_PROJECT).expect("limit fits in i64"),
             )]])
@@ -736,12 +784,77 @@ mod tests {
             .is_err());
     }
 
+    /// Every statement the service sent, as one string.
+    fn sql_log(db: Arc<sea_orm::DatabaseConnection>) -> String {
+        let db = Arc::try_unwrap(db).expect("the service was dropped");
+        db.into_transaction_log()
+            .iter()
+            .map(|t| format!("{t:?}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[tokio::test]
+    async fn delete_locks_the_search_before_counting_its_alerts() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![model(1, 7, &query())]])
+                .append_query_results([vec![count_row(0)]])
+                .append_exec_results([MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        LogSavedSearchService::new(db.clone())
+            .delete(7, 1)
+            .await
+            .expect("an unused search is deleted");
+        let log = sql_log(db);
+        let lock = log.find("FOR UPDATE").expect("the search row is locked");
+        let count = log.find("metric_alert_rules").expect("alerts are counted");
+        assert!(lock < count, "locked before counting: {log}");
+        assert!(log.contains("BEGIN") && log.contains("COMMIT"), "{log}");
+    }
+
+    #[tokio::test]
+    async fn create_locks_the_project_before_counting_its_searches() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![std::collections::BTreeMap::from([(
+                    "id".to_string(),
+                    sea_orm::Value::Int(Some(7)),
+                )])]])
+                .append_query_results([vec![count_row(0)]])
+                .append_query_results([vec![model(1, 7, &query())]])
+                .into_connection(),
+        );
+        LogSavedSearchService::new(db.clone())
+            .create(
+                7,
+                NewSavedSearch {
+                    name: "errors".to_string(),
+                    description: None,
+                    query: SavedSearchQuery::default(),
+                    time_range: "1h".to_string(),
+                    pinned: false,
+                    created_by: None,
+                },
+            )
+            .await
+            .expect("created");
+        let log = sql_log(db);
+        let lock = log.find("FOR UPDATE").expect("the project row is locked");
+        let count = log.find("COUNT").expect("searches are counted");
+        assert!(lock < count, "locked before counting: {log}");
+    }
+
     #[tokio::test]
     async fn delete_refuses_while_a_log_alert_counts_the_search() {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
-            // get()
+            // The search, locked.
             .append_query_results([vec![model(1, 7, &query())]])
-            // alert_count()
+            // Its alerts, counted under the lock.
             .append_query_results([vec![count_row(2)]])
             .append_exec_results([MockExecResult {
                 last_insert_id: 0,

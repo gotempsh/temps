@@ -40,7 +40,12 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { Switch } from '@/components/ui/switch'
 import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { cn } from '@/lib/utils'
-import { alertOnSearchHref, orderSavedSearches } from '@/lib/saved-log-search'
+import {
+  alertOnSearchHref,
+  orderSavedSearches,
+  saveSearchRequest,
+  type SaveSearchContext,
+} from '@/lib/saved-log-search'
 
 const saveSchema = z.object({
   name: z
@@ -77,7 +82,20 @@ export function SavedLogSearches({
 }: SavedLogSearchesProps) {
   const queryClient = useQueryClient()
   const [open, setOpen] = useState(false)
-  const [saveOpen, setSaveOpen] = useState(false)
+  // What "Save" stores is fixed when the dialog opens: if the page's
+  // filters or project change underneath it (browser history, another
+  // tab's link), the dialog still saves what the user chose to save.
+  const [saveContext, setSaveContext] = useState<SaveSearchContext | null>(null)
+  const saveOpen = saveContext !== null
+  const setSaveOpen = (next: boolean) => {
+    if (!next) setSaveContext(null)
+    else if (projectId)
+      setSaveContext({
+        projectId,
+        query: currentQuery,
+        range: currentRange,
+      })
+  }
   const [deleteTarget, setDeleteTarget] = useState<SavedSearchResponse | null>(
     null
   )
@@ -132,17 +150,7 @@ export function SavedLogSearches({
   })
 
   const submit = form.handleSubmit((values) => {
-    if (!projectId) return
-    create.mutate({
-      path: { project_id: projectId },
-      body: {
-        name: values.name,
-        description: values.description.trim() || null,
-        query: currentQuery,
-        time_range: currentRange,
-        pinned: values.pinned,
-      },
-    })
+    if (saveContext) create.mutate(saveSearchRequest(saveContext, values))
   })
 
   const list = orderSavedSearches(searches.data?.data ?? [])

@@ -38,7 +38,10 @@ import { AGGREGATIONS } from '@/components/metrics/metric-format'
 import {
   LOG_TILE_FUNCTIONS,
   formatLogTileMetric,
+  isLogAttributeKey,
+  logTileProblem,
   parseLogTileMetric,
+  searchFiltersText,
   type LogTileFunction,
 } from '@/components/metrics/log-tile'
 import {
@@ -103,12 +106,13 @@ const tileSchema = z
     if (
       tile.kind === 'logs' &&
       tile.log_function !== 'count' &&
-      !/^[A-Za-z0-9_.:-]{1,200}$/.test(tile.log_attribute.trim())
+      !isLogAttributeKey(tile.log_attribute)
     )
       ctx.addIssue({
         code: 'custom',
         path: ['log_attribute'],
-        message: 'Name the attribute to chart, e.g. duration_ms',
+        message:
+          'Name the attribute to chart, e.g. duration_ms: letters, digits, _ and ., starting with a letter or _',
       })
   })
 
@@ -128,6 +132,8 @@ type DashboardFormData = z.infer<typeof dashboardSchema>
 /** The project's saved log searches, for a tile that charts one. */
 interface SavedSearchChoices {
   options: { value: string; label: string }[]
+  /** Ids of the searches that filter message text. */
+  textFiltered: Set<number>
   loading: boolean
   /** Where to save a first search when there is none. */
   logsHref: string
@@ -200,6 +206,11 @@ export default function DashboardBuilder({ project }: DashboardBuilderProps) {
         value: String(search.id),
         label: search.name,
       })),
+      textFiltered: new Set(
+        (savedSearchesQuery.data?.data ?? [])
+          .filter((search) => searchFiltersText(search.query))
+          .map((search) => search.id)
+      ),
       loading: savedSearchesQuery.isPending,
       logsHref: `/logs?project_id=${project.id}`,
     }),
@@ -298,6 +309,25 @@ export default function DashboardBuilder({ project }: DashboardBuilderProps) {
   const isMutating = createMutation.isPending || updateMutation.isPending
 
   const onSubmit = async (data: DashboardFormData) => {
+    // A numeric field over a text-filtered search would fail every time the
+    // tile loads; refuse it here, on the field that has to change.
+    let refused = false
+    data.sections.forEach((section, sectionIndex) =>
+      section.tiles.forEach((tile, tileIndex) => {
+        if (tile.kind !== 'logs' || tile.saved_search_id == null) return
+        const problem = logTileProblem(
+          tile.log_function,
+          savedSearches.textFiltered.has(tile.saved_search_id)
+        )
+        if (problem === null) return
+        refused = true
+        form.setError(
+          `sections.${sectionIndex}.tiles.${tileIndex}.log_function`,
+          { type: 'custom', message: problem }
+        )
+      })
+    )
+    if (refused) return
     const layout = {
       sections: data.sections.map((s) => ({
         id: s.id,
@@ -604,6 +634,10 @@ function TileEditor({
     control,
     name: `sections.${sectionIndex}.tiles.${tileIndex}.log_function`,
   })
+  const savedSearchId = useWatch({
+    control,
+    name: `sections.${sectionIndex}.tiles.${tileIndex}.saved_search_id`,
+  })
   const tilePath = `sections.${sectionIndex}.tiles.${tileIndex}` as const
 
   return (
@@ -633,6 +667,14 @@ function TileEditor({
           control={control}
           tilePath={tilePath}
           logFunction={logFunction}
+          problem={
+            savedSearchId == null
+              ? null
+              : logTileProblem(
+                  logFunction,
+                  savedSearches.textFiltered.has(savedSearchId)
+                )
+          }
           savedSearches={savedSearches}
           onRemove={onRemove}
         />
@@ -774,12 +816,15 @@ function LogTileFields({
   control,
   tilePath,
   logFunction,
+  problem,
   savedSearches,
   onRemove,
 }: {
   control: Control<DashboardFormData>
   tilePath: `sections.${number}.tiles.${number}`
   logFunction: LogTileFunction
+  /** Why this combination cannot be charted, shown under the Value field. */
+  problem: string | null
   savedSearches: SavedSearchChoices
   onRemove: () => void
 }) {
@@ -845,6 +890,11 @@ function LogTileFields({
                 ))}
               </SelectContent>
             </Select>
+            {problem ? (
+              <p className="text-xs text-destructive">{problem}</p>
+            ) : (
+              <FormMessage />
+            )}
           </FormItem>
         )}
       />

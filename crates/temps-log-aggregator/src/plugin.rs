@@ -361,6 +361,7 @@ impl TempsPlugin for LogAggregatorPlugin {
                 saved_search_service.clone(),
                 store.clone(),
                 line_index.clone(),
+                Arc::new(ManifestRepo::new(db.clone())),
                 db.clone(),
             ));
             context.register_service(
@@ -799,6 +800,12 @@ impl TempsPlugin for LogAggregatorPlugin {
         });
         let routes = handlers::configure_routes().with_state(app_state);
 
+        Some(PluginRoutes::new(routes))
+    }
+
+    fn configure_public_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
+        let state = context.require_service::<LogAggregatorAppState>();
+        let routes = handlers::configure_public_routes().with_state(state.ingest_service.clone());
         Some(PluginRoutes::new(routes))
     }
 

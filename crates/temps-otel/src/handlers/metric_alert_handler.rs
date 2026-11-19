@@ -527,7 +527,7 @@ pub async fn update_alert(
     project_scope_guard!(auth, scope.project_id);
     project_access_guard!(auth, scope.project_id, state.project_access_checker);
 
-    let model = state
+    let update = state
         .metric_alert_service
         .update(
             scope.project_id,
@@ -548,6 +548,15 @@ pub async fn update_alert(
             request.source,
         )
         .await?;
+    let model = update.model;
+    if update.series_changed {
+        // The old series' alarms describe something the rule no longer
+        // watches, and nothing would ever evaluate them again.
+        state
+            .metric_alert_evaluator
+            .resolve_all_for_rule(model.id, model.project_id)
+            .await;
+    }
 
     let audit = OtelMetricAlertUpdatedAudit {
         context: AuditContext {

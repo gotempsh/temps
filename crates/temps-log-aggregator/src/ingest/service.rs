@@ -20,8 +20,9 @@
 //!
 //! ## Budget
 //!
-//! One limiter per key, against the same per-project budget and overrides a
-//! container gets ([`IngestBudget`]). A batch is admitted whole or refused
+//! One limiter per key, with the per-container budget and the project's
+//! override a container gets ([`IngestBudget`]): a key is budgeted like one
+//! container, as each container of a project is. A batch is admitted whole or refused
 //! whole with `429` (see [`IngestLimiter::admit_batch`]); a refused batch is
 //! counted and lists the key on the pipeline status page.
 //!
@@ -32,6 +33,14 @@
 //! limiter and a set of at most [`MAX_SERVICES_PER_KEY`] names; keys are
 //! capped per project. Both maps are touched once per request, never per
 //! line.
+//!
+//! ## Failures and revocation
+//!
+//! Parsing and the budget are decided for the whole batch before anything is
+//! stored. A storage error part-way (a full disk) stores the lines before it
+//! and fails the request; collectors deliver at least once and resend the
+//! batch, so those lines can be stored twice. Revoking a key waits for its
+//! in-flight batches, then seals and closes its streams.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -62,12 +71,18 @@ pub struct IngestOutcome {
 #[async_trait::async_trait]
 pub trait IngestLineWriter: Send + Sync {
     async fn write(&self, line: crate::types::LogLine) -> Result<(), LogAggregatorError>;
+    /// Seal and close every stream whose id starts with `prefix`; returns
+    /// how many were closed.
+    async fn close_streams(&self, prefix: &str) -> Result<usize, LogAggregatorError>;
 }
 
 #[async_trait::async_trait]
 impl IngestLineWriter for Arc<ChunkWriterService> {
     async fn write(&self, line: crate::types::LogLine) -> Result<(), LogAggregatorError> {
         self.write_line(line).await
+    }
+    async fn close_streams(&self, prefix: &str) -> Result<usize, LogAggregatorError> {
+        self.remove_streams_with_prefix(prefix).await
     }
 }
 
@@ -95,6 +110,14 @@ pub struct LogIngestService {
     budget: Arc<IngestBudget>,
     limiters: Mutex<HashMap<i32, IngestLimiter>>,
     services: Mutex<HashMap<i32, HashSet<String>>>,
+    /// One gate per key seen by this process. A batch holds it for reading
+    /// while it writes; revoking takes it for writing, so it waits for the
+    /// key's in-flight batches, marks it closed (`true`) and only then
+    /// closes its streams. A batch that authenticated just before the revoke
+    /// and reaches the gate after it is refused instead of reopening a
+    /// stream. Entries are one per key ever used here, which the per-project
+    /// key limit and the rate of revocations keep small.
+    gates: Mutex<HashMap<i32, Arc<tokio::sync::RwLock<bool>>>>,
 }
 
 impl LogIngestService {
@@ -109,17 +132,34 @@ impl LogIngestService {
             budget,
             limiters: Mutex::new(HashMap::new()),
             services: Mutex::new(HashMap::new()),
+            gates: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Forget a key's limiter and services, after it is revoked.
-    pub fn forget_key(&self, key_id: i32) {
+    fn gate(&self, key_id: i32) -> Arc<tokio::sync::RwLock<bool>> {
+        match self.gates.lock() {
+            Ok(mut gates) => gates.entry(key_id).or_default().clone(),
+            // The map holds no invariant a panic could have broken, so a
+            // poisoned lock is still used: a revoke must reach the same gate
+            // the key's batches hold.
+            Err(e) => e.into_inner().entry(key_id).or_default().clone(),
+        }
+    }
+
+    /// After a key is revoked: wait for its in-flight batches, refuse any
+    /// later one, close its streams and forget its limiter and services.
+    /// Returns how many streams were closed.
+    pub async fn close_key(&self, key_id: i32) -> Result<usize, LogAggregatorError> {
+        let gate = self.gate(key_id);
+        let mut closed = gate.write().await;
+        *closed = true;
         if let Ok(mut limiters) = self.limiters.lock() {
             limiters.remove(&key_id);
         }
         if let Ok(mut services) = self.services.lock() {
             services.remove(&key_id);
         }
+        self.writer.close_streams(&stream_prefix(key_id)).await
     }
 
     /// Ingest one request body sent with `presented` as its key.
@@ -129,6 +169,11 @@ impl LogIngestService {
         body: &[u8],
     ) -> Result<IngestOutcome, LogAggregatorError> {
         let key = self.keys.resolve(presented).await?;
+        let gate = self.gate(key.key_id);
+        let closed = gate.read().await;
+        if *closed {
+            return Err(LogAggregatorError::IngestKeyRejected);
+        }
         let now = Utc::now();
         let records = ndjson::parse_batch(body, now)?;
         if records.is_empty() {
@@ -153,9 +198,26 @@ impl LogIngestService {
 
         let total = records.len();
         let lines = self.label(&key, records);
-        for line in lines {
-            self.writer.write(line).await?;
+        for (written, line) in (0_u64..).zip(lines) {
+            if let Err(e) = self.writer.write(line).await {
+                // The lines before this one are stored; count them, so a
+                // key's usage matches what it delivered. The collector will
+                // retry the whole batch, which may store that prefix again.
+                if written > 0 {
+                    self.keys.record_usage(key.key_id, written, now);
+                }
+                error!(
+                    key_id = key.key_id,
+                    project_id = key.project_id,
+                    written,
+                    total,
+                    error = %e,
+                    "Storing a log ingest batch failed part-way"
+                );
+                return Err(e);
+            }
         }
+        drop(closed);
         self.keys.record_usage(key.key_id, total as u64, now);
         debug!(
             key_id = key.key_id,
@@ -230,7 +292,13 @@ impl LogIngestService {
 /// Stream id of a key's service. Safe as a WAL file name: the service is
 /// already reduced to `[a-z0-9._-]`.
 pub fn stream_id(key_id: i32, service: &str) -> String {
-    format!("ingest-{key_id}-{service}")
+    format!("{}{service}", stream_prefix(key_id))
+}
+
+/// The prefix every stream of `key_id` starts with. Ends in `-`, so key 1
+/// never matches key 12's streams.
+pub fn stream_prefix(key_id: i32) -> String {
+    format!("ingest-{key_id}-")
 }
 
 fn context_for(key: &AuthenticatedKey, service: &str) -> ContainerContext {
@@ -263,7 +331,7 @@ mod tests {
     use crate::services::IngestLimits;
     use crate::types::LogLine;
 
-    struct FixedKey(AuthenticatedKey);
+    struct FixedKey(AuthenticatedKey, Mutex<Vec<u64>>);
 
     #[async_trait::async_trait]
     impl IngestKeyResolver for FixedKey {
@@ -274,17 +342,31 @@ mod tests {
                 Err(LogAggregatorError::IngestKeyRejected)
             }
         }
-        fn record_usage(&self, _key_id: i32, _lines: u64, _at: DateTime<Utc>) {}
+        fn record_usage(&self, _key_id: i32, lines: u64, _at: DateTime<Utc>) {
+            self.1.lock().expect("usage lock").push(lines);
+        }
     }
 
+    /// Stored lines, closed stream prefixes, and the number of writes that
+    /// succeed before every later one fails (`None`: never fails).
     #[derive(Default)]
-    struct Recorded(Mutex<Vec<LogLine>>);
+    struct Recorded(Mutex<Vec<LogLine>>, Mutex<Vec<String>>, Option<usize>);
 
     #[async_trait::async_trait]
     impl IngestLineWriter for Recorded {
         async fn write(&self, line: LogLine) -> Result<(), LogAggregatorError> {
-            self.0.lock().expect("lines lock").push(line);
+            let mut lines = self.0.lock().expect("lines lock");
+            if self.2.is_some_and(|limit| lines.len() >= limit) {
+                return Err(LogAggregatorError::Validation {
+                    message: "disk full in this test".to_string(),
+                });
+            }
+            lines.push(line);
             Ok(())
+        }
+        async fn close_streams(&self, prefix: &str) -> Result<usize, LogAggregatorError> {
+            self.1.lock().expect("closed lock").push(prefix.to_string());
+            Ok(1)
         }
     }
 
@@ -300,11 +382,71 @@ mod tests {
     fn service(limits: IngestLimits) -> (LogIngestService, Arc<Recorded>) {
         let writer = Arc::new(Recorded::default());
         let service = LogIngestService::new(
-            Arc::new(FixedKey(key())),
+            Arc::new(FixedKey(key(), Mutex::default())),
             writer.clone(),
             Arc::new(IngestBudget::new(limits)),
         );
         (service, writer)
+    }
+
+    #[tokio::test]
+    async fn a_revoked_key_is_refused_and_its_streams_are_closed() {
+        let (service, writer) = service(IngestLimits::UNLIMITED);
+        service
+            .ingest("good", b"{\"msg\":\"a\"}")
+            .await
+            .expect("accepted");
+        let closed = service.close_key(5).await.expect("closed");
+        assert_eq!(closed, 1);
+        assert_eq!(
+            *writer.1.lock().expect("closed lock"),
+            vec!["ingest-5-".to_string()]
+        );
+        // A batch that authenticated before the revoke (the resolver here
+        // still accepts the key) is refused at the gate, not written into a
+        // reopened stream.
+        assert!(matches!(
+            service.ingest("good", b"{\"msg\":\"b\"}").await,
+            Err(LogAggregatorError::IngestKeyRejected)
+        ));
+        assert_eq!(writer.0.lock().expect("lines lock").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_revoke_waits_for_a_batch_in_flight() {
+        let (service, _writer) = service(IngestLimits::UNLIMITED);
+        let gate = service.gate(5);
+        let in_flight = gate.read().await;
+        let service = Arc::new(service);
+        let closing = tokio::spawn({
+            let service = service.clone();
+            async move { service.close_key(5).await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!closing.is_finished(), "the revoke did not wait");
+        drop(in_flight);
+        closing.await.expect("join").expect("closed");
+    }
+
+    #[test]
+    fn one_keys_prefix_never_matches_another_keys_streams() {
+        assert!(stream_id(12, "web").starts_with(&stream_prefix(12)));
+        assert!(!stream_id(12, "web").starts_with(&stream_prefix(1)));
+    }
+
+    #[tokio::test]
+    async fn a_batch_that_fails_part_way_counts_the_lines_it_stored() {
+        let writer = Arc::new(Recorded(Mutex::default(), Mutex::default(), Some(2)));
+        let keys = Arc::new(FixedKey(key(), Mutex::default()));
+        let service = LogIngestService::new(
+            keys.clone(),
+            writer.clone(),
+            Arc::new(IngestBudget::new(IngestLimits::UNLIMITED)),
+        );
+        let body = b"{\"msg\":\"a\"}\n{\"msg\":\"b\"}\n{\"msg\":\"c\"}\n";
+        assert!(service.ingest("good", body).await.is_err());
+        assert_eq!(writer.0.lock().expect("lines lock").len(), 2);
+        assert_eq!(*keys.1.lock().expect("usage lock"), vec![2]);
     }
 
     #[tokio::test]

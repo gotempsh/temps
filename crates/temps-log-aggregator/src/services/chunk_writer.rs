@@ -1070,6 +1070,29 @@ impl ChunkWriterService {
         Ok(())
     }
 
+    /// Seal and drop every stream whose id starts with `prefix`, the way
+    /// [`Self::remove_container`] does for one. Returns how many were
+    /// removed. Used when a log ingest key is revoked: its
+    /// `ingest-<key id>-<service>` streams would otherwise keep a head
+    /// buffer and a WAL file open for the life of the process.
+    pub async fn remove_streams_with_prefix(
+        self: &Arc<Self>,
+        prefix: &str,
+    ) -> Result<usize, LogAggregatorError> {
+        let ids: Vec<String> = {
+            let buffers = self.buffers.lock().await;
+            buffers
+                .keys()
+                .filter(|id| id.starts_with(prefix))
+                .cloned()
+                .collect()
+        };
+        for id in &ids {
+            self.remove_container(id).await?;
+        }
+        Ok(ids.len())
+    }
+
     /// Seal then drop a container's buffer and WAL file (call when a
     /// container stops).
     ///

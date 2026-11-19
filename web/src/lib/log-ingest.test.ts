@@ -5,6 +5,7 @@ import { describe, expect, test } from 'bun:test'
 import {
   curlSnippet,
   fluentBitSnippet,
+  LOG_INGEST_PATH,
   logIngestUrl,
   vectorSnippet,
 } from './log-ingest'
@@ -12,9 +13,12 @@ import {
 const key = 'tlk_example'
 
 describe('log ingest snippets', () => {
-  test('the endpoint sits under the console origin', () => {
-    expect(logIngestUrl('https://temps.example.com/')).toBe(
-      'https://temps.example.com/api/logs/ingest'
+  test('the endpoint sits under the public ingress URL', () => {
+    expect(logIngestUrl('https://ingest.example.com/')).toBe(
+      'https://ingest.example.com/api/logs/ingest'
+    )
+    expect(logIngestUrl('https://ingest.example.com')).toBe(
+      `https://ingest.example.com${LOG_INGEST_PATH}`
     )
   })
 
@@ -34,6 +38,13 @@ describe('log ingest snippets', () => {
     )
     expect(snippet).toContain('framing.method = "newline_delimited"')
     expect(snippet).toContain(`auth.token = "${key}"`)
+    // Under the endpoint's 5 MiB and 10,000-line limits.
+    const bytes = Number(/batch\.max_bytes = (\d+)/.exec(snippet)?.[1])
+    const events = Number(/batch\.max_events = (\d+)/.exec(snippet)?.[1])
+    expect(bytes).toBeGreaterThan(0)
+    expect(bytes).toBeLessThan(5 * 1024 * 1024)
+    expect(events).toBeGreaterThan(0)
+    expect(events).toBeLessThanOrEqual(10_000)
   })
 
   test('Fluent Bit takes host, port and TLS from the URL', () => {

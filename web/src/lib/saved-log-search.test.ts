@@ -6,6 +6,7 @@ import type { SavedSearchQuery } from '@/api/client/types.gen'
 import {
   savedQueryFromParams,
   savedRangeFromWindow,
+  saveSearchRequest,
   viewFromSavedSearch,
   windowFromSavedRange,
 } from './saved-log-search'
@@ -124,5 +125,33 @@ describe('viewFromSavedSearch', () => {
     )
     expect(view.patch.level).toBe('WARN')
     expect(view.notShown).toEqual(['more than one level', 'containers'])
+  })
+
+  test('a database search says the page is wider than the project', () => {
+    const view = viewFromSavedSearch(
+      { project_id: 17, query: { source: 'service' }, time_range: '1h' },
+      Date.parse('2026-01-01T00:00:00Z')
+    )
+    expect(view.patch.source).toBe('service')
+    expect(view.notShown).toContain("this project's databases")
+  })
+})
+
+describe('saveSearchRequest', () => {
+  test('saves what the dialog captured, not what the page shows now', () => {
+    const captured = {
+      projectId: 7,
+      query: { levels: ['ERROR' as const], text: 'payment failed' },
+      range: '1h',
+    }
+    const request = saveSearchRequest(captured, {
+      name: 'Payment errors',
+      description: '  ',
+      pinned: true,
+    })
+    expect(request.path.project_id).toBe(7)
+    expect(request.body.query).toBe(captured.query)
+    expect(request.body.time_range).toBe('1h')
+    expect(request.body.description).toBeNull()
   })
 })

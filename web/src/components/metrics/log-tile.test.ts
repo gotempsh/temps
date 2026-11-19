@@ -4,7 +4,10 @@
 import { describe, expect, test } from 'bun:test'
 import {
   formatLogTileMetric,
+  isLogAttributeKey,
   logTileBucketSecs,
+  logTileProblem,
+  searchFiltersText,
   logTileMetricLabel,
   parseLogTileMetric,
 } from './log-tile'
@@ -57,5 +60,47 @@ describe('logTileBucketSecs', () => {
     const secs = logTileBucketSecs(from, at(24 * 365), 'avg:x')
     expect(secs % 86400).toBe(0)
     expect((365 * 86400) / secs).toBeLessThanOrEqual(60)
+  })
+})
+
+describe('isLogAttributeKey', () => {
+  test('accepts what the line index accepts', () => {
+    for (const key of [
+      'duration_ms',
+      'http.status',
+      '_x',
+      `a${'b'.repeat(63)}`,
+    ])
+      expect(isLogAttributeKey(key)).toBe(true)
+  })
+
+  test('refuses metric-name syntax the index refuses', () => {
+    for (const key of [
+      '',
+      'request-time',
+      '9lives',
+      'a/b',
+      'a:b',
+      `a${'b'.repeat(64)}`,
+    ])
+      expect(isLogAttributeKey(key)).toBe(false)
+  })
+})
+
+describe('logTileProblem', () => {
+  test('a count charts any search', () => {
+    expect(logTileProblem('count', true)).toBeNull()
+  })
+
+  test('a numeric field cannot chart a text-filtered search', () => {
+    expect(logTileProblem('p95', true)).toContain('Matching lines')
+    expect(logTileProblem('p95', false)).toBeNull()
+  })
+
+  test('only a non-empty text counts as a text filter', () => {
+    expect(searchFiltersText({ text: 'payment failed' })).toBe(true)
+    expect(searchFiltersText({ text: '' })).toBe(false)
+    expect(searchFiltersText({ text: null })).toBe(false)
+    expect(searchFiltersText(undefined)).toBe(false)
   })
 })

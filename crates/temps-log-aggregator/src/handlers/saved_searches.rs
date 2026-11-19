@@ -629,6 +629,7 @@ mod tests {
             saved_searches.clone(),
             store.clone(),
             Arc::new(NoLineIndex::new("test")),
+            Arc::new(crate::store::ManifestRepo::new(db.clone())),
             db.clone(),
         ));
         let state = Arc::new(LogAggregatorAppState {

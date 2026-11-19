@@ -145,6 +145,9 @@ export function viewFromSavedSearch(
   if (query.services?.length) notShown.push('services')
   if (query.container_ids?.length) notShown.push('containers')
   if (query.external_service_ids?.length) notShown.push('databases')
+  // The logs page lists databases of every project for the `service`
+  // source; the search counts only this project's.
+  if (query.source === 'service') notShown.push("this project's databases")
   return {
     patch: {
       project_id: String(saved.project_id),
@@ -178,4 +181,32 @@ export function orderSavedSearches(
     (a, b) =>
       Number(b.pinned) - Number(a.pinned) || a.name.localeCompare(b.name)
   )
+}
+
+/** What the save dialog captured when it opened. */
+export interface SaveSearchContext {
+  projectId: number
+  query: SavedSearchQuery
+  range: string
+}
+
+/**
+ * The create request for a saved search: the project, filters and range
+ * captured when the dialog opened, never the page's current ones, so a page
+ * that changed underneath the dialog does not change what is saved.
+ */
+export function saveSearchRequest(
+  context: SaveSearchContext,
+  values: { name: string; description: string; pinned: boolean }
+) {
+  return {
+    path: { project_id: context.projectId },
+    body: {
+      name: values.name,
+      description: values.description.trim() || null,
+      query: context.query,
+      time_range: context.range,
+      pinned: values.pinned,
+    },
+  }
 }

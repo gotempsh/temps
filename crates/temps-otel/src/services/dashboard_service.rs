@@ -101,16 +101,29 @@ fn default_log_tile_metric() -> String {
 
 const LOG_TILE_FUNCTIONS: &[&str] = &["count_distinct", "avg", "sum", "max", "p50", "p95", "p99"];
 
+/// Longest attribute key the line index accepts.
+const MAX_LOG_ATTRIBUTE_KEY_BYTES: usize = 64;
+
+/// The line index's attribute key grammar, `[A-Za-z_][A-Za-z0-9_.]{0,63}`.
+/// A key the index would refuse must be refused when the tile is saved, not
+/// every time it loads.
+fn is_log_attribute_key(key: &str) -> bool {
+    let bytes = key.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= MAX_LOG_ATTRIBUTE_KEY_BYTES
+        && (bytes[0].is_ascii_alphabetic() || bytes[0] == b'_')
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'.')
+}
+
 /// `count`, or `<fn>:<attribute>` with an attribute name an index can hold.
 fn validate_log_tile_metric(tile_id: &str, metric: &str) -> Result<(), OtelError> {
     if metric == "count" {
         return Ok(());
     }
     let valid = metric.split_once(':').is_some_and(|(function, attr)| {
-        LOG_TILE_FUNCTIONS.contains(&function)
-            && !attr.is_empty()
-            && attr.len() <= MAX_METRIC_NAME_LEN
-            && temps_metrics::validate_metric_name(attr).is_ok()
+        LOG_TILE_FUNCTIONS.contains(&function) && is_log_attribute_key(attr)
     });
     if valid {
         Ok(())
@@ -741,9 +754,17 @@ mod tests {
             "avg:",
             "avg:has space",
             "sum:a\nb",
+            // Metric-name syntax the line index refuses.
+            "avg:request-time",
+            "avg:9lives",
+            "max:a/b",
         ] {
             assert!(log_layout(4, bad).validate().is_err(), "{bad}");
         }
+        let longest = format!("sum:_{}", "a".repeat(63));
+        assert!(log_layout(4, &longest).validate().is_ok());
+        let too_long = format!("sum:_{}", "a".repeat(64));
+        assert!(log_layout(4, &too_long).validate().is_err());
         assert!(log_layout(0, "count").validate().is_err());
     }
 

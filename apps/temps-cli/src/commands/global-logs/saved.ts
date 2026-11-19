@@ -388,7 +388,7 @@ export function registerLogIngestKeyCommands(logs: Command): void {
         warning('Copy the key now. It is not shown again.')
         newline()
         info(
-          "Send lines with: curl -X POST <temps-url>/api/logs/ingest -H 'Authorization: Bearer <key>' --data-binary @lines.ndjson",
+          "Send lines with: curl -X POST <public-ingress-url>/api/logs/ingest -H 'Authorization: Bearer <key>' --data-binary @lines.ndjson",
         )
       },
     )

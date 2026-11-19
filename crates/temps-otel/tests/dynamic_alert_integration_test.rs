@@ -142,15 +142,18 @@ struct EvaluatorTestCtx {
 /// service, so the DB cooldown key can't tell series apart — the evaluator's
 /// per-series state machine guarantees exactly-once firing instead.
 async fn setup_evaluator() -> Option<EvaluatorTestCtx> {
+    // Skip only when there is no container runtime. A database that starts
+    // but fails to migrate is a real failure, not a reason to skip.
     let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
         Ok(db) => db,
-        Err(e) => {
+        Err(e) if temps_test_utils::is_container_runtime_unavailable(&e.to_string()) => {
             println!(
                 "Docker/TestDatabase not available, skipping dynamic alert test: {}",
                 e
             );
             return None;
         }
+        Err(e) => panic!("the test database started but could not be set up: {e}"),
     };
 
     let db = test_db.db.clone();

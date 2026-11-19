@@ -96,7 +96,8 @@ import {
   ChevronDown,
   SlidersHorizontal,
 } from 'lucide-react'
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { switchSignal, type SignalFields } from '@/lib/alert-signal'
 import { useForm, useWatch } from 'react-hook-form'
 import { Link, useLocation, useNavigate, useParams } from 'react-router'
 import { useGoBack } from '@/hooks/useGoBack'
@@ -395,13 +396,34 @@ function AlertFormBody({
   // no learned baseline, no per-series split. Keep hidden fields consistent
   // so a switch back and forth never submits a combination the server
   // refuses.
+  // The metric settings are kept aside while the log signal is shown and
+  // restored when the user returns to a metric.
+  const stashedMetricFields = useRef<SignalFields<
+    AlertFormData['aggregation']
+  > | null>(null)
   useEffect(() => {
-    if (!isLogs) return
-    form.setValue('aggregation', 'count')
-    form.setValue('detection_kind', 'static')
-    form.setValue('group_by', [])
-    form.setValue('label_filters', [])
-    form.setValue('dynamic_alerts', false)
+    const values = form.getValues()
+    const { apply, stashed } = switchSignal(
+      isLogs,
+      {
+        aggregation: values.aggregation,
+        detection_kind: values.detection_kind,
+        group_by: values.group_by,
+        label_filters: values.label_filters,
+        dynamic_alerts: values.dynamic_alerts,
+      },
+      stashedMetricFields.current
+    )
+    stashedMetricFields.current = stashed
+    if (!apply) return
+    form.setValue(
+      'aggregation',
+      apply.aggregation as AlertFormData['aggregation']
+    )
+    form.setValue('detection_kind', apply.detection_kind)
+    form.setValue('group_by', apply.group_by)
+    form.setValue('label_filters', apply.label_filters)
+    form.setValue('dynamic_alerts', apply.dynamic_alerts)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isLogs])
   const isAnomaly = detectionKind === 'anomaly'

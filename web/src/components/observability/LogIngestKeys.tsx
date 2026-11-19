@@ -34,9 +34,12 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import {
   curlSnippet,
   fluentBitSnippet,
+  LOG_INGEST_PATH,
   logIngestUrl,
   vectorSnippet,
 } from '@/lib/log-ingest'
+import { PublicCallbackUrl } from '@/components/settings/PublicCallbackUrl'
+import { usePublicIngress } from '@/hooks/usePublicIngress'
 
 const createSchema = z.object({
   name: z
@@ -148,7 +151,8 @@ function LogIngestKeysBody({
       },
     })
   )
-  const url = logIngestUrl(window.location.origin)
+  const ingress = usePublicIngress()
+  const url = ingress.baseUrl === null ? null : logIngestUrl(ingress.baseUrl)
   const active = (keys.data?.data ?? []).filter((key) => key.is_active)
 
   return (
@@ -166,7 +170,15 @@ function LogIngestKeysBody({
               <CopyButton value={created.key} label="Copy the ingest key" />
             </div>
           </div>
-          <Snippets url={url} secret={created.key} />
+          {url === null ? (
+            <PublicCallbackUrl
+              path={LOG_INGEST_PATH}
+              prefix="POST"
+              label="Copy the ingest URL"
+            />
+          ) : (
+            <Snippets url={url} secret={created.key} />
+          )}
           <Button size="sm" variant="outline" onClick={() => setCreated(null)}>
             Done
           </Button>
