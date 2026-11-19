@@ -48,7 +48,9 @@ pub struct Model {
     pub on_demand_backoff_until: Option<DBDateTime>,
     /// On-demand issuance failures in a row, which picks the next rung of the
     /// backoff ladder. Written in the same update as `on_demand_backoff_until`
-    /// and reset to 0 when a certificate is issued or imported.
+    /// and reset to 0 when a certificate is issued or imported. A serialized
+    /// row written before the column existed reads as 0 (no streak).
+    #[serde(default)]
     pub on_demand_failure_streak: i32,
     /// When the last on-demand failure in the streak happened; a streak older
     /// than the quiet gap starts over. `None` when there is no streak.
@@ -158,6 +160,26 @@ mod tests {
 
         assert!(!json.contains("stored-private-key"), "{json}");
         assert!(json.contains("app.example.com"), "{json}");
+    }
+
+    #[test]
+    fn a_serialized_domain_without_the_on_demand_streak_reads_as_no_streak() {
+        // Rows serialized by a build before the streak existed (fixtures,
+        // payloads from an older node) still deserialize.
+        let domain: Model = serde_json::from_value(serde_json::json!({
+            "id": 1,
+            "domain": "app.example.com",
+            "status": "active",
+            "is_wildcard": false,
+            "verification_method": "http-01",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z"
+        }))
+        .expect("a domain without the streak fields deserializes");
+
+        assert_eq!(domain.on_demand_failure_streak, 0);
+        assert_eq!(domain.on_demand_last_failure_at, None);
+        assert_eq!(domain.failure_cause, None);
     }
 
     #[test]

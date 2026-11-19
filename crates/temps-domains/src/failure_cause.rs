@@ -26,6 +26,16 @@ const ACME_ERROR_URN: &str = "urn:ietf:params:acme:error:";
 /// (`DomainService::preflight_dns`).
 const DNS_PREFLIGHT_PREFIX: &str = "DNS preflight: ";
 
+/// How CAs word an `unauthorized` problem about the ACME account itself
+/// (RFC 8555 §7.3.6: a deactivated account is refused as `unauthorized`),
+/// lowercase. Full phrases, not the word "account", which a hostname or URL
+/// can contain.
+const ACCOUNT_REFUSALS: [&str; 3] = [
+    "account is not valid",
+    "account has been deactivated",
+    "account is deactivated",
+];
+
 /// Why the last certificate attempt for a domain failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -213,11 +223,19 @@ pub fn classify_for(text: &str, challenge: &ChallengeType) -> CertFailureCause {
 /// found no DNS, the contact email is missing, the order poll gave up, or the
 /// CA could not be reached at all.
 pub fn classify(text: &str) -> CertFailureCause {
+    let lower = text.to_ascii_lowercase();
     if let Some(cause) = classify_problem(text) {
+        // `unauthorized` is also how the CA refuses a deactivated or invalid
+        // account; nothing answered a challenge then, the account must be
+        // fixed.
+        if cause == CertFailureCause::UpstreamAnswered
+            && ACCOUNT_REFUSALS.iter().any(|phrase| lower.contains(phrase))
+        {
+            return CertFailureCause::Config;
+        }
         return cause;
     }
 
-    let lower = text.to_ascii_lowercase();
     if text.contains(DNS_PREFLIGHT_PREFIX) {
         return CertFailureCause::DnsLookup;
     }
@@ -375,6 +393,29 @@ mod tests {
                 &ChallengeType::Dns01
             ),
             CertFailureCause::DnsRecordMismatch
+        );
+    }
+
+    #[test]
+    fn an_account_the_ca_refuses_is_config_for_either_challenge() {
+        let refused = "urn:ietf:params:acme:error:unauthorized: \
+                       Account is not valid, has status \"deactivated\"";
+        assert_eq!(classify(refused), CertFailureCause::Config);
+        assert_eq!(
+            classify_for(refused, &ChallengeType::Http01),
+            CertFailureCause::Config
+        );
+        assert_eq!(
+            classify_for(refused, &ChallengeType::Dns01),
+            CertFailureCause::Config
+        );
+        // The word alone, in a hostname, does not make it an account problem.
+        assert_eq!(
+            classify(
+                "urn:ietf:params:acme:error:unauthorized: Invalid response from \
+                 http://account.example.com/.well-known/acme-challenge/abc: 404"
+            ),
+            CertFailureCause::UpstreamAnswered
         );
     }
 

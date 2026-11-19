@@ -2090,7 +2090,10 @@ impl DomainService {
     /// The rung comes from the failure streak on the same row, and this one
     /// update writes the deadline and the grown streak together, so nothing
     /// that can fail separately (the audit row, a history read) can lower the
-    /// next rung or leave the row without its failure state.
+    /// next rung or leave the row without its failure state. The row is read
+    /// `FOR UPDATE` in the same transaction: two processes sharing the
+    /// database (a standalone proxy beside the server) that fail the same host
+    /// at once take turns, so neither increment is lost.
     async fn mark_on_demand_failed(
         &self,
         hostname: &str,
@@ -2098,9 +2101,12 @@ impl DomainService {
         category: &str,
         retry_after: Option<DateTime<Utc>>,
     ) -> Result<DateTime<Utc>, DomainServiceError> {
+        use sea_orm::QuerySelect;
+        let txn = self.db.begin().await?;
         let domain = domains::Entity::find()
             .filter(domains::Column::Domain.eq(hostname))
-            .one(self.db.as_ref())
+            .lock_exclusive()
+            .one(&txn)
             .await?
             .ok_or_else(|| DomainServiceError::NotFound(hostname.to_string()))?;
 
@@ -2128,7 +2134,8 @@ impl DomainService {
         active.on_demand_backoff_until = Set(Some(backoff_until));
         active.on_demand_failure_streak = Set(previous.saturating_add(1));
         active.on_demand_last_failure_at = Set(Some(now));
-        let updated = active.update(self.db.as_ref()).await?;
+        let updated = active.update(&txn).await?;
+        txn.commit().await?;
         Ok(updated.on_demand_backoff_until.unwrap_or(backoff_until))
     }
 
@@ -3286,6 +3293,45 @@ mod tests {
             .expect("domains row exists");
         assert_eq!(row.on_demand_failure_streak, 6);
         assert!(row.on_demand_last_failure_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_on_demand_failures_each_count_once() {
+        // Two processes sharing the database (a standalone proxy beside the
+        // server) can fail the same host at once. Each failure must grow the
+        // streak; a read-then-write without a row lock loses increments.
+        let Some((service, db, _guard)) = on_demand_service(OnDemandMockMode::Fail(
+            "challenge failed: incorrect key authorization".to_string(),
+        ))
+        .await
+        else {
+            return;
+        };
+        let hostname = "raced.1-2-3-4.sslip.io";
+        service.begin_on_demand_issuing(hostname).await.unwrap();
+        let service = Arc::new(service);
+
+        let failures: Vec<_> = (0..8)
+            .map(|_| {
+                let service = service.clone();
+                tokio::spawn(async move {
+                    service
+                        .mark_on_demand_failed(hostname, "connection refused", "timeout", None)
+                        .await
+                })
+            })
+            .collect();
+        for failure in failures {
+            failure.await.unwrap().unwrap();
+        }
+
+        let row = domains::Entity::find()
+            .filter(domains::Column::Domain.eq(hostname))
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("domains row exists");
+        assert_eq!(row.on_demand_failure_streak, 8);
     }
 
     #[tokio::test]
