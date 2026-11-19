@@ -1461,6 +1461,63 @@ async fn plain_http_off_the_tunnel_origin_is_still_redirected_to_https() {
         .assert_answered("http_to_https_redirect", "301");
 }
 
+fn get_forwarded_as(proto: &str) -> String {
+    format!(
+        "GET / HTTP/1.1\r\nHost: {HOST}\r\nAccept: text/html\r\nX-Forwarded-Proto: {proto}\r\n\r\n"
+    )
+}
+
+/// A hostname whose edge policy lets plain HTTP through forwards the
+/// visitor's `http` scheme through the tunnel: that visitor still gets the
+/// app's HTTPS redirect (ADR-107 D3). The header can only downgrade.
+#[tokio::test]
+async fn a_plain_http_visitor_through_the_control_planes_tunnel_is_redirected_to_https() {
+    for proto in ["http", "HTTP", "http, https"] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let f = fixture();
+        f.route_host(|_, env| env.force_https = Some(true));
+        let lb = with_tunnel_origin(f.lb, port);
+        send_on_socket(&lb, &listener, &get_forwarded_as(proto), CLEAN_IP)
+            .await
+            .assert_answered("http_to_https_redirect", "301");
+    }
+}
+
+/// The edge's `https`, or any value that is not `http`, keeps the tunnel's
+/// request secure: no redirect back to the URL the visitor already used.
+#[tokio::test]
+async fn an_https_visitor_through_the_control_planes_tunnel_is_forwarded_as_https() {
+    for proto in ["https", "wss", ""] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let f = fixture();
+        f.route_host(|_, env| env.force_https = Some(true));
+        let lb = with_tunnel_origin(f.lb, port);
+        let reply = send_on_socket(&lb, &listener, &get_forwarded_as(proto), CLEAN_IP).await;
+        reply.assert_forwarded("routed");
+        assert_eq!(
+            reply.upstream_header("x-forwarded-proto"),
+            Some("https"),
+            "{proto}"
+        );
+    }
+}
+
+/// A forged `X-Forwarded-Proto: https` on a public plain-HTTP listener is
+/// still ignored (SEC-12): only the tunnel origin reads the header.
+#[tokio::test]
+async fn a_forged_https_scheme_off_the_tunnel_origin_is_still_redirected() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let f = fixture();
+    f.route_host(|_, env| env.force_https = Some(true));
+    let lb = with_tunnel_origin(f.lb, port.wrapping_add(1).max(1));
+    send_on_socket(&lb, &listener, &get_forwarded_as("https"), CLEAN_IP)
+        .await
+        .assert_answered("http_to_https_redirect", "301");
+}
+
 /// Shield's clearance cookie is `Secure`: a tunnel's HTTPS visitor gets the
 /// challenge, where plain HTTP is told to use HTTPS first (ADR-107 D3).
 #[tokio::test]

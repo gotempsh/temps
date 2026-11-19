@@ -108,8 +108,13 @@ A request that arrived on the tunnel origin:
 - is **secure**: the visitor reached Cloudflare over HTTPS (ADR-070), so no
   HTTPS redirect (an app's, the production default's, a status page's or an
   on-demand certificate's), `Secure` cookies, Shield challenges instead of
-  "use HTTPS", `X-Forwarded-Proto: https` upstream. Every such check reads
-  the listener, never a header; only SNI validation stays TLS-only;
+  "use HTTPS", `X-Forwarded-Proto: https` upstream. The listener decides
+  this; the edge's `X-Forwarded-Proto` can only *downgrade* it: a hostname
+  whose edge policy lets plain HTTP through forwards `http`, and that
+  visitor gets the app's HTTPS redirect and no `Secure` cookie. A missing
+  header or any other value stays secure, so a forged header can cause a
+  redirect but never skip one, and no other listener reads it (SEC-12).
+  Only SNI validation stays TLS-only;
 - is **via a tunnel**: Cloudflare Access addresses (ADR-065 D9) are verified
   on it like on a worker's tunnel origin, and still refused on every other
   listener;

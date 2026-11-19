@@ -1542,7 +1542,22 @@ impl LoadBalancer {
         // the control plane's tunnel origin on loopback, which only the
         // tunnel's connector reaches, after the provider's edge terminated
         // the visitor's HTTPS (ADR-107 D3, ADR-070).
-        self.is_tls_connection(session) || self.via_tunnel_origin(session)
+        self.is_tls_connection(session) || self.tunnel_visitor_on_https(session)
+    }
+
+    /// Whether a request on the control plane's tunnel origin came from a
+    /// visitor who reached the provider's edge over HTTPS (ADR-107 D3).
+    ///
+    /// The listener decides that the request is a tunnel's; the provider's
+    /// `X-Forwarded-Proto` can only *downgrade* it: a hostname whose edge
+    /// policy lets plain HTTP through (`AllowHttp`, `AllowAll`) forwards
+    /// `http`, and that visitor must still get the app's HTTPS redirect and
+    /// no `Secure` cookies. A missing or other value keeps HTTPS, so a
+    /// connector that does not send it never loops on our own redirect, and a
+    /// forged value can only cause a redirect, never skip one. Off the tunnel
+    /// origin the header is never read (SEC-12).
+    pub(crate) fn tunnel_visitor_on_https(&self, session: &PingoraSession) -> bool {
+        self.via_tunnel_origin(session) && !edge_forwarded_plain_http(session.req_header())
     }
 
     /// Whether this request came in on the control plane's tunnel origin
@@ -1623,7 +1638,7 @@ impl LoadBalancer {
         // connector forwards in plain HTTP on loopback (ADR-107 D3): no SNI
         // to compare, and nothing to upgrade.
         let is_tls = self.is_tls_connection(session);
-        let is_https = is_tls || self.via_tunnel_origin(session);
+        let is_https = is_tls || self.tunnel_visitor_on_https(session);
         if is_tls {
             let sni = Self::tls_sni(session);
             if sni
@@ -3360,6 +3375,19 @@ fn parse_public_authority(raw_authority: &str) -> Option<PublicAuthority> {
         forwarded_host,
         port,
     })
+}
+
+/// Whether the tunnel provider's edge says the visitor used plain HTTP: the
+/// first `X-Forwarded-Proto` value is `http` (any case). Read only for a
+/// request on the control plane's tunnel origin (see
+/// `LoadBalancer::tunnel_visitor_on_https`).
+fn edge_forwarded_plain_http(request: &RequestHeader) -> bool {
+    request
+        .headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .is_some_and(|scheme| scheme.trim().eq_ignore_ascii_case("http"))
 }
 
 /// Strip every client-controlled IP/forwarding header from the request that
