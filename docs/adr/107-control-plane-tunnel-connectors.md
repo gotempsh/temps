@@ -111,11 +111,12 @@ The port is part of the provider's tunnel configuration
 plane follows it: a new one is created on that port, and the connector loop
 moves an existing one, telling the provider first and keeping the new port
 only once the provider accepted it (a failure leaves the old port and the
-error on the tunnel, and is not retried every pass). Configuring a tunnel at
-the provider and saving the result run as one step per connector across
-every service instance (a transaction-scoped advisory lock taken before the
-row is read), so a sync overlapping a move configures and saves the moved
-port, never an older one after it. A tunnel also placed on
+error on the tunnel, and is not retried every pass). A run that
+configures a tunnel at the provider first claims a generation on the row
+and settles the port there, holds no lock or connection during the provider
+call, and saves only while its generation is the newest; a superseded run
+applies the row's port again. A sync overlapping a move therefore leaves
+the provider on the port the row holds, whichever call lands last. A tunnel also placed on
 workers keeps its port, since every worker binds it itself; its control-plane
 replica reports why it does not run. With every port taken, the listener is
 skipped and a connector placed on node `0` reports why it cannot start.
