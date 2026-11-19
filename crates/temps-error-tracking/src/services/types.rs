@@ -402,13 +402,13 @@ pub struct ErrorGroupDomain {
     pub status: String,
     pub assigned_to: Option<String>,
     /// Set when this group was merged into another one: its fingerprints and
-    /// future events belong to that group now (ADR 074, D1.2).
+    /// future events belong to that group now (ADR 111, D1.2).
     pub merged_into_group_id: Option<i32>,
     /// While the group is ignored with conditions: when it comes back
-    /// (ADR 074, D1.3). `None` for any other group.
+    /// (ADR 111, D1.3). `None` for any other group.
     pub ignore: Option<GroupIgnoreState>,
     pub resolution: Option<GroupResolutionState>,
-    /// The user or team the group is assigned to (ADR 074, D1.6).
+    /// The user or team the group is assigned to (ADR 111, D1.6).
     pub assignee: Option<super::group_workflow::GroupAssignee>,
     pub project_id: i32,
     pub environment_id: Option<i32>,
@@ -642,7 +642,7 @@ mod without_nul_tests {
 }
 
 /// Refinements of the error group list beyond its original filters
-/// (ADR 074, D1.6 and D1.8).
+/// (ADR 111, D1.6 and D1.8).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GroupListRefinement {
     /// Only groups with this assignee.
@@ -651,7 +651,7 @@ pub struct GroupListRefinement {
     pub search: Option<String>,
 }
 
-/// A group resolved in the next release (ADR 074, D1.5).
+/// A group resolved in the next release (ADR 111, D1.5).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct GroupResolutionState {
     /// Always true; the field exists so clients can test one value.

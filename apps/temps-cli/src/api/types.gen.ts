@@ -17554,7 +17554,7 @@ export type GroupRepositoryResponse = {
 };
 
 /**
- * A group resolved in the next release (ADR 074, D1.5).
+ * A group resolved in the next release (ADR 111, D1.5).
  */
 export type GroupResolutionState = {
     /**

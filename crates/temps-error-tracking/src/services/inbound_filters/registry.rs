@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! The in-memory set of inbound filter rules ingest reads (ADR 074, D1.4).
+//! The in-memory set of inbound filter rules ingest reads (ADR 111, D1.4).
 //!
 //! Ingest evaluates every Sentry error event against its project's rules.
 //! That path takes no lock and makes no database call: the rules live in an

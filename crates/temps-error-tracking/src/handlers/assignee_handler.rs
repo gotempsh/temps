@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Assigning error groups to users and teams (ADR 074, D1.6).
+//! Assigning error groups to users and teams (ADR 111, D1.6).
 
 use std::sync::Arc;
 

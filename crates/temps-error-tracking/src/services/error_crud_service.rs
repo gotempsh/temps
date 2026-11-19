@@ -256,7 +256,7 @@ impl ErrorCRUDService {
 
         // A group merged into another one is not its own issue any more: it
         // keeps its events and count so an unmerge is exact, but the list
-        // shows the surviving group (ADR 074, D1.2).
+        // shows the surviving group (ADR 111, D1.2).
         let mut query = error_groups::Entity::find()
             .filter(error_groups::Column::ProjectId.eq(project_id))
             .filter(error_groups::Column::MergedIntoGroupId.is_null());
@@ -733,7 +733,7 @@ impl ErrorCRUDService {
 
     /// Update an error group's status, and its ignore conditions with it.
     ///
-    /// Every status write sets the ignore conditions (ADR 074, D1.3): an
+    /// Every status write sets the ignore conditions (ADR 111, D1.3): an
     /// `ignored` write records `ignore`, any other write clears them, and the
     /// users counted for an earlier ignore are forgotten.
     pub async fn update_error_group_status(
@@ -884,7 +884,7 @@ pub(crate) fn validate_group_status(status: &str) -> Result<(), ErrorTrackingErr
 }
 
 /// The known status equal to `status`, as a static string. `assigned` was a
-/// status until ADR 074 D1.6 made the assignee a separate field; a write that
+/// status until ADR 111 D1.6 made the assignee a separate field; a write that
 /// still sends it means "open", and lands as `unresolved`.
 pub(crate) fn canonical_group_status(status: &str) -> Result<&'static str, ErrorTrackingError> {
     if status == "assigned" {

@@ -35,23 +35,23 @@ pub struct Model {
 
     // Status management
     pub status: String, // 'unresolved', 'resolved', 'ignored'
-    /// Legacy free-text assignee, read-only since ADR 074 D1.6: a value the
+    /// Legacy free-text assignee, read-only since ADR 111 D1.6: a value the
     /// migration could not match to a user. New assignments use
     /// `assignee_user_id` or `assignee_team_id`.
     pub assigned_to: Option<String>,
-    /// The user the group is assigned to (ADR 074, D1.6). At most one of
+    /// The user the group is assigned to (ADR 111, D1.6). At most one of
     /// this and `assignee_team_id` is set.
     pub assignee_user_id: Option<i32>,
     /// The team the group is assigned to.
     pub assignee_team_id: Option<i32>,
 
-    /// Set when this group was merged into another one (ADR 074, D1.2): its
+    /// Set when this group was merged into another one (ADR 111, D1.2): its
     /// fingerprints now route to that group and new events land there. The
     /// row keeps its own events and `total_count` so unmerging restores both
     /// exactly, and lists and status counts skip it while this is set.
     pub merged_into_group_id: Option<i32>,
 
-    // Ignore conditions (ADR 074, D1.3), read only while `status` is
+    // Ignore conditions (ADR 111, D1.3), read only while `status` is
     // 'ignored'. With none set, the next event reopens the group; otherwise
     // it stays ignored until any condition is met.
     /// Stay ignored until this time.
@@ -65,7 +65,7 @@ pub struct Model {
     /// Stay ignored whatever happens.
     pub ignore_forever: bool,
 
-    /// Resolved "in the next release" (ADR 074, D1.5), read only while
+    /// Resolved "in the next release" (ADR 111, D1.5), read only while
     /// `status` is 'resolved': events from `resolved_in_release_after_id` or
     /// an older release, and events with no release, keep it resolved; an
     /// event from a newer release reopens it.

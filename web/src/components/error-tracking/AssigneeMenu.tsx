@@ -43,7 +43,7 @@ interface AssigneeMenuProps {
 }
 
 /**
- * Assign an error group to a user or a team (ADR 074, D1.6). Offers
+ * Assign an error group to a user or a team (ADR 111, D1.6). Offers
  * "Assign to me", "Unassign" and a search over the people and teams who can
  * be assigned; the search runs only while the menu is open.
  */

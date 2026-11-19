@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! "Resolve in the next release" (ADR 074, D1.5): ordered releases per
+//! "Resolve in the next release" (ADR 111, D1.5): ordered releases per
 //! project, and the release a group is resolved after.
 //!
 //! A release is ordered by `released_at`: the creation time of the first

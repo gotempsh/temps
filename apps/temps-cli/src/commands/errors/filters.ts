@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 // `temps errors filters`: server-side inbound filters that drop noisy error
-// events before they are stored (ADR 074, D1.4).
+// events before they are stored (ADR 111, D1.4).
 
 import type { Command } from 'commander'
 import { requireAuth } from '../../config/store.js'

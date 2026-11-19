@@ -30,7 +30,7 @@ interface BulkTriageBarProps {
 }
 
 /**
- * Triage the selected error groups in one request (ADR 074, D1). The bar
+ * Triage the selected error groups in one request (ADR 111, D1). The bar
  * stays in place with the page's select-all control when nothing is selected,
  * so selecting many groups is one click away instead of a hidden gesture.
  */

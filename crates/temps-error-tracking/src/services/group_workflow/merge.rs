@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Merging and splitting error groups (ADR 074, D1.2).
+//! Merging and splitting error groups (ADR 111, D1.2).
 //!
 //! A merge repoints the fingerprint aliases ingest already reads, so future
 //! events of a merged-away group land in the surviving group with no change

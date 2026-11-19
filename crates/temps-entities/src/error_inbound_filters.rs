@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Per-project rules that drop Sentry error events at ingest, before storage
-//! (ADR 074, D1.4).
+//! (ADR 111, D1.4).
 
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};

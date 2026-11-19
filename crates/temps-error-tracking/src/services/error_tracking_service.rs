@@ -41,7 +41,7 @@ pub struct ErrorTrackingService {
     pub client_outcomes: super::client_outcome_service::ClientOutcomeService,
     pub releases: super::release_service::ReleaseService,
     pub workflow: GroupWorkflowService,
-    /// Inbound filter rules (ADR 074, D1.4).
+    /// Inbound filter rules (ADR 111, D1.4).
     pub inbound_filters: super::inbound_filters::InboundFilterService,
     inbound_filter_registry: Arc<super::inbound_filters::InboundFilterRegistry>,
     source_map_service: OnceCell<Arc<SourceMapService>>,
@@ -49,7 +49,7 @@ pub struct ErrorTrackingService {
     autopilot_callback: OnceCell<NotificationCallback>,
     job_queue: OnceCell<Arc<dyn temps_core::JobQueue>>,
     /// Sends the email that tells a user a group was assigned to them
-    /// (ADR 074, D1.6). Unset, assignments are not mailed.
+    /// (ADR 111, D1.6). Unset, assignments are not mailed.
     assignment_mailer: OnceCell<Arc<dyn temps_core::notifications::NotificationService>>,
 }
 
@@ -100,7 +100,7 @@ impl ErrorTrackingService {
         let _ = self.autopilot_callback.set(callback);
     }
 
-    /// Mail assignees through this service (ADR 074, D1.6).
+    /// Mail assignees through this service (ADR 111, D1.6).
     pub fn set_assignment_mailer(
         &self,
         mailer: Arc<dyn temps_core::notifications::NotificationService>,
@@ -108,7 +108,7 @@ impl ErrorTrackingService {
         let _ = self.assignment_mailer.set(mailer);
     }
 
-    /// Assign a group to a user or team, or unassign it (ADR 074, D1.6).
+    /// Assign a group to a user or team, or unassign it (ADR 111, D1.6).
     ///
     /// The status is untouched. A new assignee triggers the `status_change`
     /// alert rules that list `assigned` (the status assignment used to be),
@@ -254,7 +254,7 @@ impl ErrorTrackingService {
     }
 
     /// The inbound filter rule that drops this Sentry error event, if any
-    /// (ADR 074, D1.4). Called at ingest before anything is stored: an
+    /// (ADR 111, D1.4). Called at ingest before anything is stored: an
     /// in-memory lookup with no lock and no database call. The drop is
     /// counted against the rule.
     pub fn inbound_filter_drop(&self, error_data: &CreateErrorEventData) -> Option<i32> {
@@ -403,7 +403,7 @@ impl ErrorTrackingService {
             });
         }
         // A group that stays ignored (its ignore conditions are not met yet,
-        // ADR 074 D1.3) or stays resolved is silent: counting the event is
+        // ADR 111 D1.3) or stays resolved is silent: counting the event is
         // all that happens. Alerts and the regression announcement are for
         // groups that are open after this event.
         if outcome.current_status == "ignored" || outcome.current_status == "resolved" {
@@ -561,7 +561,7 @@ impl ErrorTrackingService {
         Ok(())
     }
 
-    /// Change the status of many error groups of one project (ADR 074, D1).
+    /// Change the status of many error groups of one project (ADR 111, D1).
     ///
     /// Delegates the write to the workflow service, then evaluates
     /// `status_change` alert rules for the groups that actually changed. The

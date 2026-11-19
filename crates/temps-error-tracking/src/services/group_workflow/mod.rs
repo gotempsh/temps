@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Issue workflow on error groups (ADR 074, D1): triage of many groups at
+//! Issue workflow on error groups (ADR 111, D1): triage of many groups at
 //! once. Every operation here is scoped to one project and runs as a bounded
 //! number of statements; nothing iterates over groups one query at a time.
 

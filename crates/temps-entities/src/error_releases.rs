@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Releases of a project in the order they shipped (ADR 074, D1.5 and D3).
+//! Releases of a project in the order they shipped (ADR 111, D1.5 and D3).
 
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};

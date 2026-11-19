@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-// `temps errors searches`: saved searches over error groups (ADR 074, D1.8),
+// `temps errors searches`: saved searches over error groups (ADR 111, D1.8),
 // and `errors list --saved-search <id>` to run one.
 
 import type { Command } from 'commander'

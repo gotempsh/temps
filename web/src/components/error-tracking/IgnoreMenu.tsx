@@ -27,7 +27,7 @@ interface IgnoreMenuProps {
 }
 
 /**
- * Ignore with a condition for coming back (ADR 074, D1.3): until the next
+ * Ignore with a condition for coming back (ADR 111, D1.3): until the next
  * event, for a while, for more occurrences, until more users are affected,
  * or forever.
  */

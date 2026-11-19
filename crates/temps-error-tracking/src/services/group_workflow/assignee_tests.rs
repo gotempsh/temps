@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Assignees against a real database (ADR 074, D1.6): the upgrade keeps old
+//! Assignees against a real database (ADR 111, D1.6): the upgrade keeps old
 //! assignees, an assignee survives a status change, and "assigned to me"
 //! includes the teams a user is in.
 

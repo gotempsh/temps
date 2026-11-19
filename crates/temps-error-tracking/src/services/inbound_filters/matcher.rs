@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Precompiled inbound filter rules (ADR 074, D1.4) and how one event is
+//! Precompiled inbound filter rules (ADR 111, D1.4) and how one event is
 //! matched against them.
 //!
 //! Matching runs on the ingest path for every Sentry error event of a project

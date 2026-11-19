@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Counting one ingested event in its group, and deciding whether the event
-//! reopens the group (ADR 074, D1.3).
+//! reopens the group (ADR 111, D1.3).
 //!
 //! This runs inside the ingest transaction, after the group row is locked,
 //! and replaces the single counter update ingest always made. The common

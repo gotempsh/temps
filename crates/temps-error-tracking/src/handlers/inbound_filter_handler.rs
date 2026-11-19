@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Inbound filter routes (ADR 074, D1.4): per-project rules that drop noisy
+//! Inbound filter routes (ADR 111, D1.4): per-project rules that drop noisy
 //! Sentry error events before they are stored, and how many each dropped.
 
 use std::sync::Arc;

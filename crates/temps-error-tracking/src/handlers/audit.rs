@@ -199,7 +199,7 @@ impl AuditOperation for ErrorGroupSplitAudit {
     }
 }
 
-/// Audit event for assigning an error group (ADR 074, D1.6).
+/// Audit event for assigning an error group (ADR 111, D1.6).
 #[derive(Debug, Clone, Serialize)]
 pub struct ErrorGroupAssignedAudit {
     pub context: AuditContext,
@@ -230,7 +230,7 @@ impl AuditOperation for ErrorGroupAssignedAudit {
     }
 }
 
-/// Audit event for a comment on an error group (ADR 074, D1.7). Records the
+/// Audit event for a comment on an error group (ADR 111, D1.7). Records the
 /// comment's id, never its text.
 #[derive(Debug, Clone, Serialize)]
 pub struct ErrorGroupCommentAudit {
@@ -260,7 +260,7 @@ impl AuditOperation for ErrorGroupCommentAudit {
     }
 }
 
-/// Audit event for a saved search over error groups (ADR 074, D1.8).
+/// Audit event for a saved search over error groups (ADR 111, D1.8).
 #[derive(Debug, Clone, Serialize)]
 pub struct ErrorSavedSearchAudit {
     pub context: AuditContext,

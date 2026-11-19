@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! "Ignore until" conditions (ADR 074, D1.3): what keeps an ignored group
+//! "Ignore until" conditions (ADR 111, D1.3): what keeps an ignored group
 //! ignored, and how a status write records it.
 
 use chrono::{DateTime, Duration, Utc};

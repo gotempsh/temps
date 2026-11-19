@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Saved searches against a real database (ADR 074, D1.8): names unique per
+//! Saved searches against a real database (ADR 111, D1.8): names unique per
 //! owner ignoring case, the per-user cap, environments of the project only,
 //! and what happens when an environment or the owner is deleted.
 

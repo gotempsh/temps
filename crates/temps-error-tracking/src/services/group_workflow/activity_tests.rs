@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Comments and the activity log against a real database (ADR 074, D1.7):
+//! Comments and the activity log against a real database (ADR 111, D1.7):
 //! comment lifecycle and authorship, newest-first paging, project isolation,
 //! and one `regressed` entry per reopening.
 

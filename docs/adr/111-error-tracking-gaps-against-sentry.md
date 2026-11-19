@@ -1,4 +1,4 @@
-# ADR 074: What error tracking and performance are missing to match Sentry
+# ADR 111: What error tracking and performance are missing to match Sentry
 
 ## Status
 
@@ -13,8 +13,8 @@ Related: ADR 016 (ClickHouse traces backend), ADR 027 (cross-project trace
 linking), ADR 033 (release identity for symbolication), ADR 054 (autofix
 incidents in workspaces).
 
-One of four gap ADRs (071 Plausible, 072 PostHog, 073 Better Stack,
-074 Sentry). The target is 90% of what a typical user relies on.
+One of four gap ADRs (108 Better Stack, 109 Plausible, 110 PostHog,
+111 Sentry). The target is 90% of what a typical user relies on.
 
 **This is the lowest priority of the four.** Ingestion is already compatible
 with the official Sentry SDKs, and the daily "an error happened, show me the

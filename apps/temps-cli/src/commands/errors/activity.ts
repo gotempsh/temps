@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 // `temps errors comment` and `temps errors activity`: comments on an error
-// group and its history (ADR 074, D1.7).
+// group and its history (ADR 111, D1.7).
 
 import type { Command } from 'commander'
 import { requireAuth } from '../../config/store.js'

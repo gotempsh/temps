@@ -37738,7 +37738,7 @@
         "type": "object"
       },
       "GroupResolutionState": {
-        "description": "A group resolved in the next release (ADR 074, D1.5).",
+        "description": "A group resolved in the next release (ADR 111, D1.5).",
         "properties": {
           "after_release": {
             "description": "That release's version, filled in on the single-group read.",

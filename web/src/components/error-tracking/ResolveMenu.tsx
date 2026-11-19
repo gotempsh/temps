@@ -21,7 +21,7 @@ interface ResolveMenuProps {
 }
 
 /**
- * Resolve now, or resolve in the next release (ADR 074, D1.5) for a fix that
+ * Resolve now, or resolve in the next release (ADR 111, D1.5) for a fix that
  * is merged but not deployed: events from the release running today keep the
  * group resolved, and the first event from a newer release reopens it.
  */

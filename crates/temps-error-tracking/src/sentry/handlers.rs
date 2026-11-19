@@ -220,7 +220,7 @@ async fn ingest_sentry_event(
         }
     };
 
-    // Inbound filters (ADR 074, D1.4) drop the event before anything is
+    // Inbound filters (ADR 111, D1.4) drop the event before anything is
     // stored. It is acknowledged like a stored one, as Sentry does, so the
     // SDK neither retries nor reports an error; the rule counts the drop.
     if state
@@ -1367,7 +1367,7 @@ async fn process_parsed_envelope(
     let mut errors_stored = 0;
     // Store each event using the error tracking service
     for mut event in batch.events {
-        // Inbound filters (ADR 074, D1.4): dropped before storage, counted
+        // Inbound filters (ADR 111, D1.4): dropped before storage, counted
         // per rule, and acknowledged so the SDK does not retry.
         if state
             .error_tracking_service

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Comments and the activity log of an error group (ADR 074, D1.7).
+//! Comments and the activity log of an error group (ADR 111, D1.7).
 //!
 //! Entries are written when a group changes (a person changes its status,
 //! assigns, merges or splits it, comments on it, or an event reopens it),

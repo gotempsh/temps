@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Issue workflow routes (ADR 074, D1): triage that acts on many error
+//! Issue workflow routes (ADR 111, D1): triage that acts on many error
 //! groups at once, instead of one request per group.
 
 use std::sync::Arc;

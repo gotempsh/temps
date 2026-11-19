@@ -41,7 +41,7 @@ interface InboundFiltersProps {
 }
 
 /**
- * Server-side inbound filters (ADR 074, D1.4): drop noisy errors before they
+ * Server-side inbound filters (ADR 111, D1.4): drop noisy errors before they
  * are stored, and show how many each rule dropped so a rule that eats real
  * errors is visible.
  */

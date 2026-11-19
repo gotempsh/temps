@@ -160,7 +160,7 @@ pub(super) struct IngestedError {
     pub previous_status: String,
     /// The group's status after this event was counted. Equal to
     /// `previous_status` unless the event reopened the group; an ignored group
-    /// whose conditions are not met yet stays `ignored` (ADR 074, D1.3).
+    /// whose conditions are not met yet stays `ignored` (ADR 111, D1.3).
     pub current_status: String,
     pub inserted: bool,
 }
@@ -183,7 +183,7 @@ pub struct ErrorIngestionService {
     // One lock-free range per service/database, never a per-project/key cache.
     chunk_range: ArcSwapOption<ErrorChunkRange>,
     /// Releases already registered for "resolve in the next release"
-    /// (ADR 074, D1.5); bounded, so a release costs one statement per process.
+    /// (ADR 111, D1.5); bounded, so a release costs one statement per process.
     releases: super::group_workflow::ReleaseRegistry,
 }
 

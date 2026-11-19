@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Assignment of an error group to a user or a team (ADR 074, D1.6). The
+//! Assignment of an error group to a user or a team (ADR 111, D1.6). The
 //! assignee is independent of the status: an assigned group can be resolved
 //! or ignored and keeps its assignee.
 

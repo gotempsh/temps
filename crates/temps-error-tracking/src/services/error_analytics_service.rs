@@ -64,7 +64,7 @@ impl ErrorAnalyticsService {
         environment_id: Option<i32>,
     ) -> Result<ErrorGroupStats, ErrorTrackingError> {
         // Merged-away groups are counted through the group that survived
-        // them, never twice (ADR 074, D1.2).
+        // them, never twice (ADR 111, D1.2).
         let mut query = error_groups::Entity::find()
             .filter(error_groups::Column::ProjectId.eq(project_id))
             .filter(error_groups::Column::MergedIntoGroupId.is_null());

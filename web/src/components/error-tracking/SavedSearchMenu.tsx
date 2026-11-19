@@ -48,7 +48,7 @@ interface SavedSearchMenuProps {
 }
 
 /**
- * Saved searches over the error list (ADR 074, D1.8): open one, save the
+ * Saved searches over the error list (ADR 111, D1.8): open one, save the
  * current filters under a name, share it with the project, or delete it.
  */
 export function SavedSearchMenu({

@@ -148,7 +148,7 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
   const [environmentFilter, setEnvironmentFilter] = useEnvironmentFilter()
   const [statusFilter, setStatusFilter] =
     useState<GroupStatusView>('unresolved')
-  // "Assigned to me" covers the user's teams too (ADR 074, D1.6). A saved
+  // "Assigned to me" covers the user's teams too (ADR 111, D1.6). A saved
   // search can also hold `user:<id>` or `team:<id>`.
   const [assigneeFilter, setAssigneeFilter] = useState<string>('any')
   const [groupSort, setGroupSort] = useState('last_seen:desc')

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Server-side inbound filters (ADR 074, D1.4): per-project rules that drop
+//! Server-side inbound filters (ADR 111, D1.4): per-project rules that drop
 //! noisy Sentry error events before they are stored.
 //!
 //! - [`matcher`]: the rule kinds and how one event is matched.

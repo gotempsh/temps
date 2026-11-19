@@ -116,7 +116,7 @@ impl SentryIngestionService {
                         deployment_id,
                     )?;
 
-                    // Inbound filters (ADR 074, D1.4) drop it before storage.
+                    // Inbound filters (ADR 111, D1.4) drop it before storage.
                     if self
                         .error_tracking_service
                         .inbound_filter_drop(&error_data)
@@ -197,7 +197,7 @@ impl SentryIngestionService {
             deployment_id,
         )?;
 
-        // 5. Inbound filters (ADR 074, D1.4) drop it before storage; the
+        // 5. Inbound filters (ADR 111, D1.4) drop it before storage; the
         //    event is acknowledged as Sentry acknowledges a filtered one.
         if self
             .error_tracking_service

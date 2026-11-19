@@ -363,7 +363,7 @@ impl ErrorAlertService {
     }
 
     /// Evaluate `status_change` rules for many groups changed by one bulk
-    /// triage request (ADR 074, D1).
+    /// triage request (ADR 111, D1).
     ///
     /// Same rules, filters and cooldown as [`Self::evaluate_status_change`],
     /// but the work is bounded by the number of rules rather than by the

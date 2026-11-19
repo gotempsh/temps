@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Saved searches over error groups (ADR 074, D1.8): a named set of list
+//! Saved searches over error groups (ADR 111, D1.8): a named set of list
 //! filters, owned by one user in one project, private unless shared.
 //!
 //! An `assignee` of `me` is stored as written and resolved for whoever opens

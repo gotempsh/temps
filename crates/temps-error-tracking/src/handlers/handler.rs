@@ -753,7 +753,7 @@ pub async fn update_error_group(
     permission_guard!(auth, ErrorTrackingWrite);
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
-    // Legacy assignee by email (ADR 074, D1.6): resolved to a user and set
+    // Legacy assignee by email (ADR 111, D1.6): resolved to a user and set
     // through the assignee route, so it is checked and audited the same way.
     if let Some(assigned_to) = request.assigned_to.as_deref() {
         let assignee = if assigned_to.trim().is_empty() {

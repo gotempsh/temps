@@ -33,7 +33,7 @@ interface GroupActivityProps {
 }
 
 /**
- * The comments and history of an error group (ADR 074, D1.7): who changed its
+ * The comments and history of an error group (ADR 111, D1.7): who changed its
  * status, assigned, merged or split it, which event reopened it, and what the
  * team wrote about it. Newest first.
  */

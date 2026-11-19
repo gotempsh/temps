@@ -35,7 +35,7 @@ interface GroupMergeActionsProps {
 }
 
 /**
- * Merge state of one error group (ADR 074, D1.2): where it was merged, what
+ * Merge state of one error group (ADR 111, D1.2): where it was merged, what
  * was merged into it, and the two ways back out — unmerge for a merged group,
  * split for a group whose fingerprints turn out to be two different bugs.
  */
