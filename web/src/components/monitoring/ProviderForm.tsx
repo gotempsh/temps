@@ -222,6 +222,7 @@ export function ProviderForm({
                       <SelectItem value="cloudflare">
                         Cloudflare Email
                       </SelectItem>
+                      <SelectItem value="telegram">Telegram</SelectItem>
                     </SelectContent>
                   </Select>
                   <FormMessage />
@@ -875,6 +876,107 @@ export function ProviderForm({
                 </FormItem>
               )}
             />
+          </div>
+        )}
+
+        {providerType === 'telegram' && (
+          <div className="space-y-6">
+            <div className="space-y-2">
+              <h3 className="text-sm font-medium leading-none">Telegram bot</h3>
+              <p className="text-sm text-muted-foreground">
+                Sends each notification as a message from your bot, with its
+                severity, details and a link back to Temps. Create a bot with{' '}
+                <a
+                  href="https://t.me/BotFather"
+                  target="_blank"
+                  rel="noreferrer"
+                  className="underline underline-offset-2"
+                >
+                  @BotFather
+                </a>
+                , then add it to the group or channel (or start a chat with it)
+                so it is allowed to post there.
+              </p>
+            </div>
+
+            <FormField
+              control={form.control}
+              name="config.bot_token"
+              render={({ field }) => (
+                <FormItem>
+                  <FormLabel>Bot token</FormLabel>
+                  <FormControl>
+                    <RevealableInput
+                      key={`${revealScopeKey}:bot_token`}
+                      fieldPath="bot_token"
+                      value={field.value}
+                      onChange={field.onChange}
+                      onRevealCredential={onRevealCredential}
+                      type="password"
+                      placeholder="123456789:AA…"
+                      autoComplete="off"
+                    />
+                  </FormControl>
+                  <FormDescription>
+                    The token @BotFather gives you. It is stored encrypted.
+                  </FormDescription>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <FormField
+                control={form.control}
+                name="config.chat_id"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>Chat ID</FormLabel>
+                    <FormControl>
+                      <Input
+                        {...field}
+                        value={field.value ?? ''}
+                        placeholder="-1001234567890"
+                        autoComplete="off"
+                      />
+                    </FormControl>
+                    <FormDescription>
+                      A user, group or channel ID (groups and channels start
+                      with -100), or a public @channelusername
+                    </FormDescription>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+
+              <FormField
+                control={form.control}
+                name="config.message_thread_id"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>Topic ID (Optional)</FormLabel>
+                    <FormControl>
+                      <NumberInput
+                        name={field.name}
+                        ref={field.ref}
+                        onBlur={field.onBlur}
+                        placeholder="42"
+                        inputMode="numeric"
+                        onValueChange={(value) =>
+                          field.onChange(value ?? Number.NaN)
+                        }
+                        value={field.value}
+                      />
+                    </FormControl>
+                    <FormDescription>
+                      For forum-style groups: the topic to post in. Leave empty
+                      for the General topic or a regular chat.
+                    </FormDescription>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+            </div>
           </div>
         )}
 

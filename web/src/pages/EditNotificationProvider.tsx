@@ -26,6 +26,7 @@ import { ProviderForm } from '@/components/monitoring/ProviderForm'
 import {
   ProviderFormData,
   providerUpdateSchema,
+  telegramConfigFromForm,
 } from '@/components/monitoring/schemas'
 import { Button } from '@/components/ui/button'
 import {
@@ -106,8 +107,8 @@ export function EditNotificationProvider() {
       const config = provider.config as Record<string, unknown>
       form.reset({
         name: provider.name,
-        provider_type: provider.provider_type as
-          'email' | 'slack' | 'webhook' | 'cloudflare',
+        provider_type:
+          provider.provider_type as ProviderFormData['provider_type'],
         config: {
           // Slack config
           webhook_url: config.webhook_url as string,
@@ -116,6 +117,11 @@ export function EditNotificationProvider() {
           // Cloudflare config
           account_id: config.account_id as string,
           api_token: config.api_token as string,
+
+          // Telegram config
+          bot_token: config.bot_token as string,
+          chat_id: config.chat_id as string,
+          message_thread_id: (config.message_thread_id as number) ?? undefined,
 
           // Email config
           smtp_host: config.smtp_host as string,
@@ -192,6 +198,18 @@ export function EditNotificationProvider() {
     },
   })
 
+  const updateTelegramMutation = useMutation({
+    ...updateNotificationProviderMutation(),
+    meta: {
+      errorTitle: 'Failed to update Telegram provider',
+    },
+    onSuccess: () => {
+      toast.success('Telegram provider updated successfully')
+      queryClient.invalidateQueries({ queryKey: ['getNotificationProviders'] })
+      navigate('/settings/notifications')
+    },
+  })
+
   const testMutation = useMutation({
     ...testProvider2Mutation(),
     // handleTest shows the failure with the provider's reason and a Retry
@@ -256,6 +274,15 @@ export function EditNotificationProvider() {
             from_name: data.config.from_name || undefined,
             to_addresses: data.config.to_addresses!,
           },
+        },
+      })
+    } else if (data.provider_type === 'telegram') {
+      await updateTelegramMutation.mutateAsync({
+        path: { id: provider.id },
+        body: {
+          name: data.name,
+          enabled: provider.enabled,
+          config: telegramConfigFromForm(data.config),
         },
       })
     } else {
@@ -357,7 +384,8 @@ export function EditNotificationProvider() {
     updateEmailMutation.isPending ||
     updateSlackMutation.isPending ||
     updateWebhookMutation.isPending ||
-    updateCloudflareMutation.isPending
+    updateCloudflareMutation.isPending ||
+    updateTelegramMutation.isPending
 
   return (
     <div className="w-full min-w-0 space-y-6">

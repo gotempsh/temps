@@ -73,9 +73,14 @@ export const weeklyDigestSchema = z.object({
 
 /**
  * Schema for notification provider configuration
- * Supports Slack, Email, and Webhook providers with comprehensive settings
+ * Supports Slack, Email, Webhook, Cloudflare and Telegram providers
  */
 const MASKED_VALUE = '***'
+
+/** `<bot id>:<secret>`, as issued by @BotFather. Mirrors the server check. */
+export const TELEGRAM_BOT_TOKEN_PATTERN = /^\d+:[A-Za-z0-9_-]+$/
+/** A numeric user/group/channel id (`-100…`) or a public `@channelusername`. */
+export const TELEGRAM_CHAT_ID_PATTERN = /^(-?\d+|@[A-Za-z0-9_]{1,64})$/
 
 export const notificationRouteSeveritySchema = z.enum([
   'debug',
@@ -98,7 +103,13 @@ const buildProviderSchema = (allowMaskedValues: boolean) =>
   z
     .object({
       name: z.string().min(1, 'Name is required'),
-      provider_type: z.enum(['email', 'slack', 'webhook', 'cloudflare']),
+      provider_type: z.enum([
+        'email',
+        'slack',
+        'webhook',
+        'cloudflare',
+        'telegram',
+      ]),
       config: z.object({
         // Slack config
         webhook_url: z.string().optional(),
@@ -108,6 +119,11 @@ const buildProviderSchema = (allowMaskedValues: boolean) =>
         // Cloudflare config
         account_id: z.string().optional(),
         api_token: z.string().optional(),
+
+        // Telegram config
+        bot_token: z.string().optional(),
+        chat_id: z.string().optional(),
+        message_thread_id: optionalNumber(z.number().int().positive()),
 
         // Email config
         smtp_host: z.string().optional(),
@@ -227,6 +243,10 @@ const buildProviderSchema = (allowMaskedValues: boolean) =>
           }
           return true
         }
+        // Telegram reports field-level problems in the superRefine below.
+        if (data.provider_type === 'telegram') {
+          return true
+        }
         return false
       },
       {
@@ -235,8 +255,46 @@ const buildProviderSchema = (allowMaskedValues: boolean) =>
         path: ['config'],
       }
     )
+    .superRefine((data, ctx) => {
+      if (data.provider_type !== 'telegram') return
+      const botToken = data.config.bot_token?.trim() ?? ''
+      const chatId = data.config.chat_id?.trim() ?? ''
+      const keepsStoredToken = allowMaskedValues && botToken === MASKED_VALUE
+      if (!botToken) {
+        ctx.addIssue({
+          code: 'custom',
+          message: 'Bot token is required. Create a bot with @BotFather.',
+          path: ['config', 'bot_token'],
+        })
+      } else if (
+        !keepsStoredToken &&
+        !TELEGRAM_BOT_TOKEN_PATTERN.test(botToken)
+      ) {
+        ctx.addIssue({
+          code: 'custom',
+          message:
+            'Bot token must look like 123456789:AA… as issued by @BotFather.',
+          path: ['config', 'bot_token'],
+        })
+      }
+      if (!chatId) {
+        ctx.addIssue({
+          code: 'custom',
+          message: 'Chat ID is required.',
+          path: ['config', 'chat_id'],
+        })
+      } else if (!TELEGRAM_CHAT_ID_PATTERN.test(chatId)) {
+        ctx.addIssue({
+          code: 'custom',
+          message:
+            'Use a numeric chat ID (e.g. -1001234567890) or a public @channelusername.',
+          path: ['config', 'chat_id'],
+        })
+      }
+    })
 
 export const providerSchema = buildProviderSchema(false)
+
 export const providerUpdateSchema = buildProviderSchema(true)
 
 export type ProjectAlertsFormData = z.infer<typeof projectAlertsSchema>
@@ -249,3 +307,16 @@ export type NotificationSettingsFormData = z.infer<
 export type DigestSectionsFormData = z.infer<typeof digestSectionsSchema>
 export type WeeklyDigestFormData = z.infer<typeof weeklyDigestSchema>
 export type ProviderFormData = z.infer<typeof providerSchema>
+
+/**
+ * The stored Telegram config for a validated form. Sent through the generic
+ * provider endpoints, which validate it server-side as well. A masked `***`
+ * token on edit keeps the stored token.
+ */
+export function telegramConfigFromForm(config: ProviderFormData['config']) {
+  return {
+    bot_token: config.bot_token?.trim() ?? '',
+    chat_id: config.chat_id?.trim() ?? '',
+    message_thread_id: config.message_thread_id ?? null,
+  }
+}

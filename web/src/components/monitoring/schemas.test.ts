@@ -6,6 +6,7 @@ import {
   notificationRouteSeveritySchema,
   providerSchema,
   providerUpdateSchema,
+  telegramConfigFromForm,
 } from './schemas'
 
 const slackProvider = {
@@ -93,5 +94,100 @@ describe('provider numeric fields that were emptied', () => {
       config: { ...webhook.config, timeout_secs: 301 },
     })
     expect(result.success).toBe(false)
+  })
+})
+
+describe('telegram provider form', () => {
+  const telegram = {
+    name: 'Phone alerts',
+    provider_type: 'telegram' as const,
+    config: {
+      bot_token: '123456789:AAExampleSecretToken',
+      chat_id: '-1001234567890',
+    },
+  }
+
+  const issuePaths = (input: unknown, schema = providerSchema) => {
+    const result = schema.safeParse(input)
+    return result.success
+      ? []
+      : result.error.issues.map((issue) => issue.path.join('.'))
+  }
+
+  test('accepts numeric and @username chats with an optional topic', () => {
+    expect(providerSchema.safeParse(telegram).success).toBe(true)
+    expect(
+      providerSchema.safeParse({
+        ...telegram,
+        config: { ...telegram.config, chat_id: '@ops_channel' },
+      }).success
+    ).toBe(true)
+    const withTopic = providerSchema.safeParse({
+      ...telegram,
+      config: { ...telegram.config, message_thread_id: 42 },
+    })
+    expect(withTopic.success).toBe(true)
+  })
+
+  test('an emptied topic (NaN) is treated as unset', () => {
+    const result = providerSchema.safeParse({
+      ...telegram,
+      config: { ...telegram.config, message_thread_id: Number.NaN },
+    })
+    expect(result.success).toBe(true)
+    if (result.success) {
+      expect(
+        telegramConfigFromForm(result.data.config).message_thread_id
+      ).toBeNull()
+    }
+  })
+
+  test('points at the bot token field when it is missing or malformed', () => {
+    expect(
+      issuePaths({ ...telegram, config: { ...telegram.config, bot_token: '' } })
+    ).toEqual(['config.bot_token'])
+    expect(
+      issuePaths({
+        ...telegram,
+        config: { ...telegram.config, bot_token: 'not-a-token' },
+      })
+    ).toEqual(['config.bot_token'])
+  })
+
+  test('points at the chat field when it is not a chat id', () => {
+    expect(
+      issuePaths({
+        ...telegram,
+        config: { ...telegram.config, chat_id: 'my group' },
+      })
+    ).toEqual(['config.chat_id'])
+  })
+
+  test('rejects a zero or negative topic id', () => {
+    expect(
+      issuePaths({
+        ...telegram,
+        config: { ...telegram.config, message_thread_id: 0 },
+      })
+    ).toEqual(['config.message_thread_id'])
+  })
+
+  test('the masked token is only accepted when editing', () => {
+    const masked = {
+      ...telegram,
+      config: { ...telegram.config, bot_token: '***' },
+    }
+    expect(providerUpdateSchema.safeParse(masked).success).toBe(true)
+    expect(providerSchema.safeParse(masked).success).toBe(false)
+  })
+
+  test('builds the stored config with trimmed values', () => {
+    expect(
+      telegramConfigFromForm({
+        bot_token: ' 123:abc ',
+        chat_id: ' -100 ',
+        message_thread_id: 7,
+      })
+    ).toEqual({ bot_token: '123:abc', chat_id: '-100', message_thread_id: 7 })
   })
 })

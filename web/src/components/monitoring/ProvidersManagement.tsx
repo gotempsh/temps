@@ -55,10 +55,14 @@ import {
 } from '@/lib/notification-provider-test'
 import { ProviderForm } from './ProviderForm'
 import { NotificationProviderIcon } from './NotificationProviderIcon'
-import { ProviderFormData, providerUpdateSchema } from './schemas'
+import {
+  ProviderFormData,
+  providerUpdateSchema,
+  telegramConfigFromForm,
+} from './schemas'
 
 interface ExtendedNotificationProvider extends NotificationProviderResponse {
-  provider_type: 'email' | 'slack' | 'webhook' | 'cloudflare'
+  provider_type: 'email' | 'slack' | 'webhook' | 'cloudflare' | 'telegram'
   config: {
     // Slack config
     webhook_url?: string
@@ -83,7 +87,22 @@ interface ExtendedNotificationProvider extends NotificationProviderResponse {
     // Cloudflare config
     account_id?: string
     api_token?: string
+
+    // Telegram config
+    bot_token?: string
+    chat_id?: string
+    message_thread_id?: number | null
   }
+}
+
+/** Where a Telegram provider posts, as shown in the providers list. */
+function telegramDestination(
+  config: ExtendedNotificationProvider['config'] | undefined
+): string {
+  if (!config?.chat_id) return 'No chat configured'
+  return config.message_thread_id
+    ? `Chat ${config.chat_id}, topic ${config.message_thread_id}`
+    : `Chat ${config.chat_id}`
 }
 
 interface ProvidersManagementProps {
@@ -162,6 +181,19 @@ export function ProvidersManagement({
     },
     onSuccess: () => {
       toast.success('Cloudflare provider updated successfully')
+      setIsEditDialogOpen(false)
+      setEditingProvider(null)
+      refetch()
+    },
+  })
+
+  const updateTelegramMutation = useMutation({
+    ...updateNotificationProviderMutation(),
+    meta: {
+      errorTitle: 'Failed to update Telegram provider',
+    },
+    onSuccess: () => {
+      toast.success('Telegram provider updated successfully')
       setIsEditDialogOpen(false)
       setEditingProvider(null)
       refetch()
@@ -249,6 +281,15 @@ export function ProvidersManagement({
               from_name: data.config.from_name || undefined,
               to_addresses: data.config.to_addresses!,
             },
+          },
+        })
+      } else if (data.provider_type === 'telegram') {
+        await updateTelegramMutation.mutateAsync({
+          path: { id: editingProvider.id },
+          body: {
+            name: data.name,
+            enabled: editingProvider.enabled,
+            config: telegramConfigFromForm(data.config),
           },
         })
       } else {
@@ -364,12 +405,15 @@ export function ProvidersManagement({
           ? updateSlackMutation.isPending
           : watchedProviderType === 'cloudflare'
             ? updateCloudflareMutation.isPending
-            : updateWebhookMutation.isPending,
+            : watchedProviderType === 'telegram'
+              ? updateTelegramMutation.isPending
+              : updateWebhookMutation.isPending,
     [
       watchedProviderType,
       updateEmailMutation.isPending,
       updateSlackMutation.isPending,
       updateCloudflareMutation.isPending,
+      updateTelegramMutation.isPending,
       updateWebhookMutation.isPending,
     ]
   )
@@ -444,15 +488,17 @@ export function ProvidersManagement({
                 ? config?.from_address
                   ? `From ${config.from_address}`
                   : 'No sender address configured'
-                : provider.provider_type === 'slack'
-                  ? config?.channel && config.channel !== '***'
-                    ? config.channel
-                    : config?.webhook_url
+                : provider.provider_type === 'telegram'
+                  ? telegramDestination(config)
+                  : provider.provider_type === 'slack'
+                    ? config?.channel && config.channel !== '***'
+                      ? config.channel
+                      : config?.webhook_url
+                        ? 'Webhook configured'
+                        : 'No webhook configured'
+                    : config?.url
                       ? 'Webhook configured'
                       : 'No webhook configured'
-                  : config?.url
-                    ? 'Webhook configured'
-                    : 'No webhook configured'
             return (
               <li
                 key={provider.id}
