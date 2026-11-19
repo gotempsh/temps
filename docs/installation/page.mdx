@@ -41,8 +41,44 @@ gh attestation verify "$archive" --repo gotempsh/temps \
 
 The exact certificate identity binds the signature to the release workflow and
 chosen tag. A checksum detects corrupted downloads; it does not establish the
-publisher's identity. The installer and `temps upgrade` verify checksums, but do
-not perform this cosign verification automatically.
+publisher's identity, because whoever can replace a release's tarball can
+replace its checksum too.
+
+### What the installer and `temps upgrade` verify {{ anchor: true, id: 'release-signature-verification' }}
+
+Both check the SHA-256 checksum and then the signature, before anything is
+unpacked:
+
+| Path | Signature check | Unsigned release (no `.sigstore.json`) | Signature present but invalid |
+| ---- | --------------- | -------------------------------------- | ----------------------------- |
+| `temps upgrade` | Always, in-process. No cosign needed. | Refused; `--allow-unsigned` installs it on the checksum alone | Refused |
+| Console **Update now** | Always, in-process | Refused; run `temps upgrade --version <tag> --allow-unsigned` from a shell | Refused |
+| `temps firecracker setup` / `temps microsandbox setup` fetching guest agents | Always, in-process | Refused; pass the agent path explicitly | Refused |
+| `install.sh` | With `cosign` if it is on `PATH`, else with an authenticated `gh` (`gh attestation verify`), else not at all, with a warning and the commands above | Refused; `--allow-unsigned` installs it on the checksum alone | Install aborted |
+
+The in-process check pins the certificate identity to
+`https://github.com/gotempsh/temps/.github/workflows/release.yml@refs/tags/<tag>`
+for the exact tag being installed, and the issuer to GitHub Actions
+(`https://token.actions.githubusercontent.com`). A valid Sigstore signature
+from any other repository, workflow, branch or tag is rejected. Stable, beta
+and nightly releases all carry this identity. The check also requires the
+certificate to chain to Sigstore's Fulcio CA, and requires its certificate
+transparency timestamp and its Rekor transparency-log entry.
+
+The Sigstore trusted root (CA certificates and log keys) is refreshed from
+Sigstore's TUF repository (`tuf-repo-cdn.sigstore.dev`), with a 30-second
+limit and nothing cached on disk. If that host is unreachable, the trusted root
+built into the `temps` binary is used instead, and a warning is logged.
+Verification never needs extra tools on the server. When it fails, the upgrade
+stops and names the tag, the asset, the expected signer and what was found.
+
+`--allow-unsigned` only covers releases published before signing was
+introduced, which have no bundle. It never accepts a signature that is present
+but does not verify. Pass it to the installer as
+`curl -fsSL https://temps.sh/install.sh | bash -s -- --allow-unsigned <tag>`.
+
+Enterprise Edition binaries (`temps upgrade --tier ee`) come from the
+license-gated download proxy and are checked against its checksum only.
 
 The main container image is signed by digest and carries a GitHub build
 provenance attestation for that digest. Image tags drop the leading `v` (release
