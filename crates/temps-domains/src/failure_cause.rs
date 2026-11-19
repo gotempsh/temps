@@ -17,6 +17,8 @@
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+use crate::tls::models::ChallengeType;
+
 /// Prefix of every ACME problem type (RFC 8555 §6.7).
 const ACME_ERROR_URN: &str = "urn:ietf:params:acme:error:";
 
@@ -34,10 +36,15 @@ pub enum CertFailureCause {
     /// timing out, or an address the internet cannot reach (a private network
     /// or tailnet).
     Unreachable,
-    /// Something answered the CA, but not with the challenge token: a CDN or
-    /// tunnel error page, another web server, or a redirect to an HTTPS
-    /// endpoint that is not this server.
+    /// HTTP-01: something answered the CA, but not with the challenge token:
+    /// a CDN or tunnel error page, another web server, or a redirect to an
+    /// HTTPS endpoint that is not this server.
     UpstreamAnswered,
+    /// DNS-01: the CA looked up the `_acme-challenge` TXT record but found no
+    /// value for this order: the record is missing, still holds an old value,
+    /// lives at a DNS provider other than the one answering for the domain, or
+    /// has not propagated yet.
+    DnsRecordMismatch,
     /// A CAA record on the domain does not allow this CA to issue.
     CaaForbids,
     /// The CA's rate limit for this domain or account was reached.
@@ -54,10 +61,11 @@ pub enum CertFailureCause {
 
 impl CertFailureCause {
     /// Every cause, for tests and schema listings.
-    pub const ALL: [CertFailureCause; 8] = [
+    pub const ALL: [CertFailureCause; 9] = [
         CertFailureCause::DnsLookup,
         CertFailureCause::Unreachable,
         CertFailureCause::UpstreamAnswered,
+        CertFailureCause::DnsRecordMismatch,
         CertFailureCause::CaaForbids,
         CertFailureCause::RateLimited,
         CertFailureCause::CaTransient,
@@ -71,6 +79,7 @@ impl CertFailureCause {
             CertFailureCause::DnsLookup => "dns_lookup",
             CertFailureCause::Unreachable => "unreachable",
             CertFailureCause::UpstreamAnswered => "upstream_answered",
+            CertFailureCause::DnsRecordMismatch => "dns_record_mismatch",
             CertFailureCause::CaaForbids => "caa_forbids",
             CertFailureCause::RateLimited => "rate_limited",
             CertFailureCause::CaTransient => "ca_transient",
@@ -103,7 +112,7 @@ impl CertFailureCause {
     pub fn legacy_category(self) -> &'static str {
         match self {
             CertFailureCause::RateLimited => "rate_limited",
-            CertFailureCause::DnsLookup => "dns_failure",
+            CertFailureCause::DnsLookup | CertFailureCause::DnsRecordMismatch => "dns_failure",
             // The console reads this one as "is port 80 open and reachable?",
             // which is the question for both.
             CertFailureCause::Unreachable | CertFailureCause::UpstreamAnswered => {
@@ -180,6 +189,21 @@ pub fn classify_problem(text: &str) -> Option<CertFailureCause> {
         }
     }
     first
+}
+
+/// Classify a failed attempt for a challenge of type `challenge`.
+///
+/// The CA reports a proof it could not verify as `unauthorized` (or
+/// `incorrectResponse`) for both challenge types, and [`classify`] reads that
+/// as HTTP-01's "something else answered on port 80". For DNS-01 no web
+/// server was involved: the TXT record did not hold this order's value.
+pub fn classify_for(text: &str, challenge: &ChallengeType) -> CertFailureCause {
+    match (challenge, classify(text)) {
+        (ChallengeType::Dns01, CertFailureCause::UpstreamAnswered) => {
+            CertFailureCause::DnsRecordMismatch
+        }
+        (_, cause) => cause,
+    }
 }
 
 /// Classify a failed certificate attempt from its full error text.
@@ -329,12 +353,68 @@ mod tests {
     }
 
     #[test]
+    fn an_unverified_dns_01_proof_is_a_txt_record_mismatch_not_an_upstream_answer() {
+        let dns_proof = "[app.example.com Dns01] urn:ietf:params:acme:error:unauthorized: \
+                         Incorrect TXT record \"stale-value\" found at _acme-challenge.app.example.com";
+        assert_eq!(
+            classify_for(dns_proof, &ChallengeType::Dns01),
+            CertFailureCause::DnsRecordMismatch
+        );
+        // The same problem type on HTTP-01 is still something else answering.
+        assert_eq!(
+            classify_for(
+                "urn:ietf:params:acme:error:unauthorized: Invalid response from \
+                 http://app.example.com/.well-known/acme-challenge/abc: 404",
+                &ChallengeType::Http01
+            ),
+            CertFailureCause::UpstreamAnswered
+        );
+        assert_eq!(
+            classify_for(
+                "urn:ietf:params:acme:error:incorrectResponse: wrong value",
+                &ChallengeType::Dns01
+            ),
+            CertFailureCause::DnsRecordMismatch
+        );
+    }
+
+    #[test]
+    fn dns_01_keeps_every_other_cause() {
+        assert_eq!(
+            classify_for(
+                "urn:ietf:params:acme:error:dns: SERVFAIL looking up TXT for _acme-challenge.app.example.com",
+                &ChallengeType::Dns01
+            ),
+            CertFailureCause::DnsLookup
+        );
+        assert_eq!(
+            classify_for(
+                "urn:ietf:params:acme:error:unauthorized: no TXT record \
+                 (urn:ietf:params:acme:error:rateLimited)",
+                &ChallengeType::Dns01
+            ),
+            CertFailureCause::RateLimited
+        );
+        assert_eq!(
+            classify_for(
+                "urn:ietf:params:acme:error:caa: CAA forbids",
+                &ChallengeType::Dns01
+            ),
+            CertFailureCause::CaaForbids
+        );
+    }
+
+    #[test]
     fn legacy_categories_keep_the_existing_console_labels() {
         assert_eq!(
             CertFailureCause::Unreachable.legacy_category(),
             "challenge_mismatch"
         );
         assert_eq!(CertFailureCause::DnsLookup.legacy_category(), "dns_failure");
+        assert_eq!(
+            CertFailureCause::DnsRecordMismatch.legacy_category(),
+            "dns_failure"
+        );
         assert_eq!(
             CertFailureCause::RateLimited.legacy_category(),
             "rate_limited"

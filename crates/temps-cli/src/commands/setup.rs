@@ -3291,6 +3291,66 @@ mod tests {
     use super::*;
     use clap::Parser;
 
+    /// Importing a certificate over a domain whose ACME or on-demand attempts
+    /// failed leaves no trace of that failure: the console would otherwise
+    /// show a stale cause next to a working certificate, and the next
+    /// on-demand failure would start high on the backoff ladder.
+    #[tokio::test]
+    async fn importing_a_certificate_clears_the_previous_failure() {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error)
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+            {
+                println!("Docker not available, skipping test: {error}");
+                return;
+            }
+            Err(error) => panic!("test database setup failed: {error}"),
+        };
+        let db = test_db.db.as_ref();
+        let now = chrono::Utc::now();
+        domains::ActiveModel {
+            domain: Set("imported.example.com".to_string()),
+            status: Set("on_demand_failed".to_string()),
+            is_wildcard: Set(false),
+            verification_method: Set("http-01".to_string()),
+            last_error: Set(Some("connection refused".to_string())),
+            last_error_type: Set(Some("challenge_mismatch".to_string())),
+            failure_cause: Set(Some("unreachable".to_string())),
+            on_demand_backoff_until: Set(Some(now + chrono::Duration::hours(4))),
+            on_demand_failure_streak: Set(4),
+            on_demand_last_failure_at: Set(Some(now)),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .expect("failed domain inserted");
+        let encryption = EncryptionService::new(
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        )
+        .expect("test key");
+
+        let imported = import_external_certificate(
+            db,
+            &encryption,
+            "imported.example.com",
+            "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n",
+            "-----BEGIN PRIVATE KEY-----\nMIIE\n-----END PRIVATE KEY-----\n",
+            now + chrono::Duration::days(90),
+        )
+        .await
+        .expect("import succeeds");
+
+        assert_eq!(imported.status, "active");
+        assert_eq!(imported.verification_method, "manual");
+        assert_eq!(imported.last_error, None);
+        assert_eq!(imported.last_error_type, None);
+        assert_eq!(imported.failure_cause, None);
+        assert_eq!(imported.on_demand_backoff_until, None);
+        assert_eq!(imported.on_demand_failure_streak, 0);
+        assert_eq!(imported.on_demand_last_failure_at, None);
+    }
+
     fn parse_setup(extra_args: &[&str]) -> Box<SetupCommand> {
         let mut args = vec!["temps", "setup", "--database-url", "postgres://example"];
         args.extend_from_slice(extra_args);

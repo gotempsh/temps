@@ -675,7 +675,7 @@ impl DomainService {
         // Request challenge from Let's Encrypt
         let provisioning_result = match self
             .cert_provider
-            .provision(domain_name, challenge_type, user_email)
+            .provision(domain_name, challenge_type.clone(), user_email)
             .await
         {
             Ok(result) => result,
@@ -697,7 +697,7 @@ impl DomainService {
                 domain_active.last_error = Set(Some(e.to_string()));
                 domain_active.last_error_type = Set(Some("challenge_request".to_string()));
                 domain_active.failure_cause = Set(Some(
-                    crate::failure_cause::classify(&e.to_string())
+                    crate::failure_cause::classify_for(&e.to_string(), &challenge_type)
                         .as_str()
                         .to_string(),
                 ));
@@ -1304,7 +1304,7 @@ impl DomainService {
                 domain_active.last_error = Set(Some(e.to_string()));
                 domain_active.last_error_type = Set(Some(error_type.to_string()));
                 domain_active.failure_cause = Set(Some(
-                    crate::failure_cause::classify(&e.to_string())
+                    crate::failure_cause::classify_for(&e.to_string(), &challenge_type)
                         .as_str()
                         .to_string(),
                 ));
@@ -3987,6 +3987,31 @@ mod tests {
         assert_eq!(kept.order_url, url);
         assert_eq!(kept.status, "valid");
         assert_eq!(cleanup_receipt_of(&kept), Some(receipt));
+    }
+
+    #[tokio::test]
+    async fn test_dns_01_proof_the_ca_cannot_verify_records_a_txt_record_mismatch() {
+        // Regression: the CA reports an unverified DNS-01 proof as
+        // `unauthorized`, the same type as an HTTP-01 response from the wrong
+        // server, and the cause read "upstream answered" for a domain that
+        // never served anything.
+        let provider = ScriptedProvider::new(CompletionMode::Invalidate);
+        let Some((service, _repository, db, _guard)) = scripted_service(provider).await else {
+            return;
+        };
+        let name = "txt.example.com";
+        service.create_domain(name, "dns-01").await.unwrap();
+        service
+            .request_challenge(name, "ops@example.com")
+            .await
+            .unwrap();
+        service
+            .complete_challenge(name, "ops@example.com")
+            .await
+            .expect_err("an invalidated challenge must fail");
+
+        let failed = domain_row(&db, name).await;
+        assert_eq!(failed.failure_cause.as_deref(), Some("dns_record_mismatch"));
     }
 
     #[tokio::test]
