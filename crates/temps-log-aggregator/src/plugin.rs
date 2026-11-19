@@ -42,6 +42,9 @@ use temps_clickhouse::ClickHouseConfig;
 /// this is how often a change is picked up without a restart.
 const BUDGET_SYNC_INTERVAL: Duration = Duration::from_secs(60);
 
+/// How often log ingest key usage counters are written (ADR 073 D1).
+const INGEST_KEY_USAGE_FLUSH_INTERVAL: Duration = Duration::from_secs(30);
+
 /// Interval for the periodic flush ticker (10 seconds)
 const FLUSH_TICKER_INTERVAL: Duration = Duration::from_secs(10);
 
@@ -364,6 +367,18 @@ impl TempsPlugin for LogAggregatorPlugin {
                 log_series_service as Arc<dyn temps_core::log_series::LogSeriesSource>,
             );
 
+            // ── ADR 073 D1: HTTP log ingest ─────────────────────────────
+            // Keys are project configuration; the ingest service writes
+            // through the same chunk writer and per-project budget a
+            // container's lines go through.
+            let ingest_key_service = Arc::new(crate::ingest::LogIngestKeyService::new(db.clone()));
+            context.register_service(ingest_key_service.clone());
+            let ingest_service = Arc::new(crate::ingest::LogIngestService::new(
+                ingest_key_service.clone(),
+                Arc::new(chunk_writer.clone()),
+                ingest_budget.clone(),
+            ));
+
             // App state for handlers
             let app_state = create_log_aggregator_app_state(
                 search_service,
@@ -377,6 +392,8 @@ impl TempsPlugin for LogAggregatorPlugin {
                 chunk_writer.clone(),
                 ingest_budget,
                 saved_search_service,
+                ingest_service,
+                ingest_key_service,
             )
             .await;
             context.register_service(app_state);
@@ -563,6 +580,22 @@ impl TempsPlugin for LogAggregatorPlugin {
                         // Per-project / per-service overrides, set on the
                         // project's and the service's settings pages.
                         apply_ingest_overrides(override_db.as_ref(), &ingest_budget).await;
+                    }
+                });
+            }
+
+            // ── Log ingest key usage (ADR 073 D1) ───────────────────────
+            // Line counts and last-used times are summed in memory per
+            // request and written here, one statement per key used since
+            // the last tick, so ingest costs no database write per request.
+            {
+                let ingest_keys = context.require_service::<crate::ingest::LogIngestKeyService>();
+                tokio::spawn(async move {
+                    let mut interval = tokio::time::interval(INGEST_KEY_USAGE_FLUSH_INTERVAL);
+                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    loop {
+                        interval.tick().await;
+                        ingest_keys.flush_usage().await;
                     }
                 });
             }
@@ -759,6 +792,8 @@ impl TempsPlugin for LogAggregatorPlugin {
             chunk_writer: old.chunk_writer.clone(),
             ingest_budget: old.ingest_budget.clone(),
             saved_search_service: old.saved_search_service.clone(),
+            ingest_service: old.ingest_service.clone(),
+            ingest_key_service: old.ingest_key_service.clone(),
         });
         let routes = handlers::configure_routes().with_state(app_state);
 

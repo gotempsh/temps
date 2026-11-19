@@ -14764,6 +14764,7 @@ dependencies = [
  "futures-util",
  "hex",
  "memchr",
+ "rand 0.10.3",
  "regex",
  "reqwest 0.12.28",
  "sea-orm 1.1.20",

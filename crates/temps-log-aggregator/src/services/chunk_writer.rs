@@ -1632,6 +1632,9 @@ mod tests {
             crate::services::IngestLimits::UNLIMITED,
         ));
         context.register_service(ingest_budget.clone());
+        context.register_service(Arc::new(crate::ingest::LogIngestKeyService::new(
+            db.clone(),
+        )));
         context.register_service(Arc::new(crate::services::CollectorService::new(
             docker,
             writer.clone(),

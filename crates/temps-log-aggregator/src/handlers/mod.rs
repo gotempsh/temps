@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 pub(crate) mod global;
+pub(crate) mod ingest;
 pub(crate) mod log_handler;
 pub(crate) mod saved_searches;
 pub(crate) mod types;

@@ -547,6 +547,8 @@ mod tests {
             chunk_writer.clone(),
         ));
         let metadata_service = Arc::new(LogMetadataService::new(db.clone()));
+        let ingest_keys = Arc::new(crate::ingest::LogIngestKeyService::new(db.clone()));
+        let chunk_writer_for_ingest = chunk_writer.clone();
         let state = Arc::new(LogAggregatorAppState {
             search_service: Arc::new(LogSearchService::new(
                 store.clone(),
@@ -566,7 +568,13 @@ mod tests {
             manifests: Arc::new(ManifestRepo::new(db.clone())),
             chunk_writer,
             ingest_budget: Arc::new(IngestBudget::new(IngestLimits::UNLIMITED)),
-            saved_search_service: Arc::new(LogSavedSearchService::new(db)),
+            saved_search_service: Arc::new(LogSavedSearchService::new(db.clone())),
+            ingest_service: Arc::new(crate::ingest::LogIngestService::new(
+                ingest_keys.clone(),
+                Arc::new(chunk_writer_for_ingest),
+                Arc::new(IngestBudget::new(IngestLimits::UNLIMITED)),
+            )),
+            ingest_key_service: ingest_keys,
         });
         (state, tmp)
     }

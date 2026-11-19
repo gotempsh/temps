@@ -47,6 +47,10 @@ pub struct LogAggregatorAppState {
     /// Saved log searches (ADR 073 D1): the named queries the console
     /// offers and log alerts count.
     pub saved_search_service: Arc<LogSavedSearchService>,
+    /// HTTP log ingest (ADR 073 D1): key authentication, budget, writing.
+    pub ingest_service: Arc<crate::ingest::LogIngestService>,
+    /// Log ingest key CRUD.
+    pub ingest_key_service: Arc<crate::ingest::LogIngestKeyService>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -62,6 +66,8 @@ pub async fn create_log_aggregator_app_state(
     chunk_writer: Arc<ChunkWriterService>,
     ingest_budget: Arc<IngestBudget>,
     saved_search_service: Arc<LogSavedSearchService>,
+    ingest_service: Arc<crate::ingest::LogIngestService>,
+    ingest_key_service: Arc<crate::ingest::LogIngestKeyService>,
 ) -> Arc<LogAggregatorAppState> {
     let manifests = Arc::new(ManifestRepo::new(db.clone()));
     Arc::new(LogAggregatorAppState {
@@ -78,5 +84,7 @@ pub async fn create_log_aggregator_app_state(
         chunk_writer,
         ingest_budget,
         saved_search_service,
+        ingest_service,
+        ingest_key_service,
     })
 }

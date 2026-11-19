@@ -163,7 +163,7 @@ pub enum LogAggregatorError {
     #[error("Project {project_id} not found")]
     ProjectNotFound { project_id: i32 },
 
-    #[error("Log ingest batch rejected: {accepted} of {total} lines were stored, the rest exceeded project {project_id}'s log ingestion budget ({reason})")]
+    #[error("Log ingest batch of {total} lines refused ({accepted} stored): project {project_id}'s log ingestion budget is exhausted ({reason}). Retry the whole batch after a few seconds")]
     IngestBudgetExceeded {
         project_id: i32,
         accepted: usize,

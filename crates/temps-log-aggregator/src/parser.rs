@@ -200,50 +200,8 @@ pub fn parse_log_line(
     let trimmed = raw.trim();
 
     // Try JSON parse first
-    if let Ok(Value::Object(mut map)) = serde_json::from_str(trimmed) {
-        let level = extract_level_from_json(&map).unwrap_or(LogLevel::Info);
-        let msg = extract_message_from_json(&map).unwrap_or_else(|| trimmed.to_string());
-
-        // Remove keys already promoted to level/msg/ts columns
-        for key in EXTRACTED_KEYS {
-            map.remove(*key);
-        }
-
-        // Flatten one level of nesting (`{"http":{"status":500}}` ->
-        // `"http.status": 500`); deeper values are stringified and capped.
-        let mut entries = flatten_one_level(map);
-
-        // Duration keeps its pre-ADR-047 behavior: the matched spelling is
-        // replaced by the computed `duration_ms`.
-        promote_canonical_replace_raw(&mut entries, std::slice::from_ref(&DURATION_FAMILY));
-
-        // The other well-known attributes are *added* alongside the raw key
-        // (not a replacement) so pre-existing `fields` shapes — e.g. a raw
-        // `"method"` / `"path"` key from a JSON log line — keep working
-        // unchanged while also gaining the fixed `http_method`/`http_route`
-        // columns the ClickHouse line index reads (ADR-047 §3).
-        add_canonical_keep_raw(&mut entries);
-
-        let fields = build_fields(entries);
-
-        return LogLine {
-            ts: timestamp,
-            stream,
-            level,
-            msg,
-            fields,
-            container_id: ctx.container_id.clone(),
-            service: ctx.service.clone(),
-            env: ctx.env.clone(),
-            project_id: ctx.project_id,
-            external_service_id: ctx.external_service_id,
-            deploy_id: ctx.deploy_id,
-            // node fields are stamped by the collector after parsing — the
-            // parser only knows Docker-label-derived context, not platform
-            // node placement. Local containers stay None.
-            node_id: None,
-            node_name: None,
-        };
+    if let Ok(Value::Object(map)) = serde_json::from_str(trimmed) {
+        return parse_json_log_object(map, trimmed, timestamp, stream, ctx);
     }
 
     // Not JSON — detect level from text
@@ -309,6 +267,65 @@ fn extract_message_from_json(map: &serde_json::Map<String, Value>) -> Option<Str
         }
     }
     None
+}
+
+/// Turn one structured (JSON object) log record into a `LogLine`: level and
+/// message promoted to their columns, the rest flattened into `fields`.
+///
+/// `raw` is the message when the object has no message key. Shared by the
+/// container collector (through [`parse_log_line`]) and the HTTP ingest
+/// endpoint (ADR 073 D1), which parses each NDJSON line once and strips its
+/// own envelope keys (timestamp, service) before calling this.
+pub fn parse_json_log_object(
+    mut map: serde_json::Map<String, Value>,
+    raw: &str,
+    timestamp: DateTime<Utc>,
+    stream: LogStream,
+    ctx: &ContainerContext,
+) -> LogLine {
+    let level = extract_level_from_json(&map).unwrap_or(LogLevel::Info);
+    let msg = extract_message_from_json(&map).unwrap_or_else(|| raw.to_string());
+
+    // Remove keys already promoted to level/msg/ts columns
+    for key in EXTRACTED_KEYS {
+        map.remove(*key);
+    }
+
+    // Flatten one level of nesting (`{"http":{"status":500}}` ->
+    // `"http.status": 500`); deeper values are stringified and capped.
+    let mut entries = flatten_one_level(map);
+
+    // Duration keeps its pre-ADR-047 behavior: the matched spelling is
+    // replaced by the computed `duration_ms`.
+    promote_canonical_replace_raw(&mut entries, std::slice::from_ref(&DURATION_FAMILY));
+
+    // The other well-known attributes are *added* alongside the raw key
+    // (not a replacement) so pre-existing `fields` shapes — e.g. a raw
+    // `"method"` / `"path"` key from a JSON log line — keep working
+    // unchanged while also gaining the fixed `http_method`/`http_route`
+    // columns the ClickHouse line index reads (ADR-047 §3).
+    add_canonical_keep_raw(&mut entries);
+
+    let fields = build_fields(entries);
+
+    LogLine {
+        ts: timestamp,
+        stream,
+        level,
+        msg,
+        fields,
+        container_id: ctx.container_id.clone(),
+        service: ctx.service.clone(),
+        env: ctx.env.clone(),
+        project_id: ctx.project_id,
+        external_service_id: ctx.external_service_id,
+        deploy_id: ctx.deploy_id,
+        // node fields are stamped by the collector after parsing — the
+        // parser only knows Docker-label-derived context, not platform
+        // node placement. Local containers stay None.
+        node_id: None,
+        node_name: None,
+    }
 }
 
 /// Parse a duration string like "45ms", "1.2s", "200us", "500000ns" into
