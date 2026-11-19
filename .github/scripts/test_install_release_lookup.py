@@ -10,7 +10,9 @@ download URL in the failure message tells us which release it picked. A fake
 
 `CompletedInstallTests` instead hands the fake `curl` a local archive, so the
 installer runs to the end inside a temporary directory and its final output
-can be checked.
+can be checked. `SignatureVerificationTests` adds fake `cosign` and `gh`
+binaries to check which verifier runs, with which pinned identity, and that a
+failed or missing signature aborts the install.
 """
 
 import json
@@ -38,6 +40,14 @@ if "api.github.com" not in url:
         sys.stderr.write("download refused by test\n")
         sys.exit(22)
     output = sys.argv[sys.argv.index("--output") + 1]
+    if url.endswith(".sigstore.json"):
+        bundle = os.environ.get("FAKE_BUNDLE")
+        if bundle is None:
+            sys.stdout.write("404")
+        else:
+            open(output, "w").write(bundle)
+            sys.stdout.write("200")
+        sys.exit(0)
     if url.endswith(".sha256"):
         import hashlib
         digest = hashlib.sha256(open(archive, "rb").read()).hexdigest()
@@ -49,6 +59,38 @@ routes = json.load(open(os.environ["FAKE_ROUTES"]))
 status, body = routes.get(url.split("/repos/gotempsh/temps/", 1)[1], routes["default"])
 sys.stdout.write(body + "\n" + status)
 '''
+
+
+# A verifier stand-in: records its arguments, exits with FAKE_<NAME>_EXIT.
+FAKE_VERIFIER = r'''#!/usr/bin/env python3
+import os, sys
+name = os.path.basename(sys.argv[0])
+with open(os.environ["FAKE_TOOL_CALLS"], "a") as calls:
+    calls.write(name + "\t" + "\t".join(sys.argv[1:]) + "\n")
+if name == "gh" and sys.argv[1:3] == ["auth", "status"]:
+    sys.exit(int(os.environ.get("FAKE_GH_AUTH_EXIT", "0")))
+code = int(os.environ.get("FAKE_" + name.upper() + "_EXIT", "0"))
+if code:
+    sys.stderr.write(name + ": verification refused by test\n")
+sys.exit(code)
+'''
+
+
+def system_tool_dir(root):
+    """Every command in /usr/bin and /bin except the ones a test controls.
+
+    A runner image may ship `gh` (GitHub's does) or `cosign`; the tests decide
+    whether a verifier exists, so those are left out, as is any `temps`.
+    """
+    farm = root / "system-bin"
+    farm.mkdir()
+    for directory in ("/usr/bin", "/bin"):
+        for entry in sorted(Path(directory).iterdir()):
+            if entry.name in ("gh", "cosign", "temps") or (farm / entry.name).exists():
+                continue
+            if os.access(entry, os.X_OK) and not entry.is_dir():
+                (farm / entry.name).symlink_to(entry)
+    return farm
 
 
 def release(tag, platforms=("linux-amd64", "darwin-arm64"), body=""):
@@ -342,61 +384,96 @@ echo stable-install-continues
 CAPABILITIES_URL = "https://temps.sh/docs/capabilities"
 
 
+RELEASE_IDENTITY = "https://github.com/gotempsh/temps/.github/workflows/release.yml@refs/tags/v0.1.0"
+OIDC_ISSUER = "https://token.actions.githubusercontent.com"
+
+
+class InstallResult:
+    def __init__(self, returncode, output, installed, tool_calls):
+        self.returncode = returncode
+        self.output = output
+        self.installed = installed
+        self.tool_calls = tool_calls
+
+    def calls_to(self, tool):
+        return [call[1:] for call in self.tool_calls if call[0] == tool]
+
+
+def run_install(arguments=("v0.1.0",), tools=(), bundle="{}", environment_extra=None,
+                temps_already_on_path=False):
+    """Run the installer to the end against a local archive.
+
+    `tools` names fake verifiers to put on PATH (`cosign`, `gh`); `bundle` is
+    the body served for `<tarball>.sigstore.json`, or None for a 404.
+    """
+    with tempfile.TemporaryDirectory(prefix="temps-install-complete-") as temporary:
+        root = Path(temporary)
+        bin_dir = root / "bin"
+        bin_dir.mkdir()
+        (bin_dir / "curl").write_text(FAKE_CURL)
+        (bin_dir / "uname").write_text('#!/bin/sh\necho "Linux x86_64"\n')
+        names = ["curl", "uname"]
+        if temps_already_on_path:
+            (bin_dir / "temps").write_text("#!/bin/sh\n")
+            names.append("temps")
+        for tool in tools:
+            (bin_dir / tool).write_text(FAKE_VERIFIER)
+            names.append(tool)
+        for name in names:
+            (bin_dir / name).chmod(0o755)
+
+        payload = root / "payload"
+        payload.mkdir()
+        (payload / "temps").write_text("#!/bin/sh\necho fake temps\n")
+        archive = root / "temps-linux-amd64.tar.gz"
+        with tarfile.open(archive, "w:gz") as bundle_archive:
+            bundle_archive.add(payload / "temps", arcname="temps")
+
+        home = root / "home"
+        home.mkdir()
+        calls = root / "calls"
+        calls.touch()
+        tool_calls = root / "tool-calls"
+        tool_calls.touch()
+        environment = dict(
+            os.environ,
+            PATH=os.pathsep.join([str(bin_dir), str(system_tool_dir(root))]),
+            HOME=str(home),
+            SHELL="/bin/bash",
+            TEMPS_INSTALL=str(root / "install"),
+            FAKE_ROUTES=str(root / "routes.json"),
+            FAKE_CALLS=str(calls),
+            FAKE_ARCHIVE=str(archive),
+            FAKE_TOOL_CALLS=str(tool_calls),
+        )
+        for name in ("XDG_CONFIG_HOME", "FAKE_BUNDLE", "GH_TOKEN", "GITHUB_TOKEN"):
+            environment.pop(name, None)
+        if bundle is not None:
+            environment["FAKE_BUNDLE"] = bundle
+        environment.update(environment_extra or {})
+        result = subprocess.run(
+            ["bash", str(INSTALLER), *arguments],
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        return InstallResult(
+            result.returncode,
+            result.stdout + result.stderr,
+            (root / "install" / "bin" / "temps").is_file(),
+            [line.split("\t") for line in tool_calls.read_text().splitlines()],
+        )
+
+
 class CompletedInstallTests(unittest.TestCase):
     """Run a pinned install to the end against a local archive."""
 
     def install(self, temps_already_on_path):
-        with tempfile.TemporaryDirectory(prefix="temps-install-complete-") as temporary:
-            root = Path(temporary)
-            bin_dir = root / "bin"
-            bin_dir.mkdir()
-            (bin_dir / "curl").write_text(FAKE_CURL)
-            (bin_dir / "uname").write_text('#!/bin/sh\necho "Linux x86_64"\n')
-            tools = ["curl", "uname"]
-            if temps_already_on_path:
-                (bin_dir / "temps").write_text("#!/bin/sh\n")
-                tools.append("temps")
-            for tool in tools:
-                (bin_dir / tool).chmod(0o755)
-
-            payload = root / "payload"
-            payload.mkdir()
-            (payload / "temps").write_text("#!/bin/sh\necho fake temps\n")
-            archive = root / "temps-linux-amd64.tar.gz"
-            with tarfile.open(archive, "w:gz") as bundle:
-                bundle.add(payload / "temps", arcname="temps")
-
-            # Only system directories besides the fakes, so a `temps` the
-            # host machine has installed cannot change which branch runs.
-            search_path = os.pathsep.join([str(bin_dir), "/usr/bin", "/bin"])
-            if not temps_already_on_path and shutil.which("temps", path=search_path):
-                self.skipTest("a temps binary in /usr/bin or /bin is already on PATH")
-            home = root / "home"
-            home.mkdir()
-            calls = root / "calls"
-            calls.touch()
-            environment = dict(
-                os.environ,
-                PATH=search_path,
-                HOME=str(home),
-                SHELL="/bin/bash",
-                TEMPS_INSTALL=str(root / "install"),
-                FAKE_ROUTES=str(root / "routes.json"),
-                FAKE_CALLS=str(calls),
-                FAKE_ARCHIVE=str(archive),
-            )
-            environment.pop("XDG_CONFIG_HOME", None)
-            result = subprocess.run(
-                ["bash", str(INSTALLER), "v0.1.0"],
-                env=environment,
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            output = result.stdout + result.stderr
-            self.assertEqual(result.returncode, 0, output)
-            self.assertTrue((root / "install" / "bin" / "temps").is_file(), output)
-            return output
+        result = run_install(temps_already_on_path=temps_already_on_path)
+        self.assertEqual(result.returncode, 0, result.output)
+        self.assertTrue(result.installed, result.output)
+        return result.output
 
     def test_fresh_install_links_to_capabilities_page(self):
         output = self.install(temps_already_on_path=False)
@@ -407,6 +484,94 @@ class CompletedInstallTests(unittest.TestCase):
         output = self.install(temps_already_on_path=True)
         self.assertIn("Run 'temps --help' to get started", output)
         self.assertIn(CAPABILITIES_URL, output)
+
+
+class SignatureVerificationTests(unittest.TestCase):
+    def assert_installed(self, result):
+        self.assertEqual(result.returncode, 0, result.output)
+        self.assertTrue(result.installed, result.output)
+
+    def assert_aborted(self, result):
+        self.assertEqual(result.returncode, 1, result.output)
+        self.assertFalse(result.installed, result.output)
+
+    def test_without_a_verifier_installs_and_says_origin_was_not_verified(self):
+        result = run_install()
+        self.assert_installed(result)
+        self.assertIn("origin of", result.output)
+        self.assertIn("NOT verified", result.output)
+        # The manual command carries the pinned identity for this tag.
+        self.assertIn(f"--certificate-identity {RELEASE_IDENTITY}", result.output)
+        self.assertEqual(result.tool_calls, [])
+
+    def test_cosign_verifies_with_the_pinned_identity_and_issuer(self):
+        result = run_install(tools=("cosign", "gh"))
+        self.assert_installed(result)
+        self.assertIn("Signature verified (cosign)", result.output)
+        (arguments,) = result.calls_to("cosign")
+        self.assertEqual(arguments[0], "verify-blob")
+        self.assertEqual(arguments[arguments.index("--certificate-identity") + 1],
+                         RELEASE_IDENTITY)
+        self.assertEqual(arguments[arguments.index("--certificate-oidc-issuer") + 1],
+                         OIDC_ISSUER)
+        self.assertTrue(arguments[arguments.index("--bundle") + 1]
+                        .endswith("temps-linux-amd64.tar.gz.sigstore.json"))
+        self.assertTrue(arguments[-1].endswith("temps-linux-amd64.tar.gz"))
+        # cosign wins; gh is not consulted.
+        self.assertEqual(result.calls_to("gh"), [])
+
+    def test_cosign_failure_aborts_the_install(self):
+        result = run_install(tools=("cosign",), environment_extra={"FAKE_COSIGN_EXIT": "1"})
+        self.assert_aborted(result)
+        self.assertIn("Signature verification FAILED", result.output)
+        self.assertIn(RELEASE_IDENTITY, result.output)
+        self.assertIn("verification refused by test", result.output)
+
+    def test_authenticated_gh_verifies_the_release_workflow_at_the_tag(self):
+        result = run_install(tools=("gh",))
+        self.assert_installed(result)
+        self.assertIn("Build provenance verified (gh)", result.output)
+        auth, verify = result.calls_to("gh")
+        self.assertEqual(auth[:2], ["auth", "status"])
+        self.assertEqual(verify[:2], ["attestation", "verify"])
+        self.assertEqual(verify[verify.index("--repo") + 1], "gotempsh/temps")
+        self.assertEqual(verify[verify.index("--signer-workflow") + 1],
+                         "gotempsh/temps/.github/workflows/release.yml")
+        self.assertEqual(verify[verify.index("--source-ref") + 1], "refs/tags/v0.1.0")
+
+    def test_gh_failure_aborts_the_install(self):
+        result = run_install(tools=("gh",), environment_extra={"FAKE_GH_EXIT": "1"})
+        self.assert_aborted(result)
+        self.assertIn("Build provenance verification FAILED", result.output)
+
+    def test_unauthenticated_gh_counts_as_no_verifier(self):
+        # gh refuses to run without a login, which must not abort the install.
+        result = run_install(tools=("gh",), environment_extra={"FAKE_GH_AUTH_EXIT": "1"})
+        self.assert_installed(result)
+        self.assertIn("NOT verified", result.output)
+        self.assertEqual([call[0] for call in result.calls_to("gh")], ["auth"])
+
+    def test_release_without_a_signature_is_refused(self):
+        for tools in ((), ("cosign",)):
+            with self.subTest(tools=tools):
+                result = run_install(tools=tools, bundle=None)
+                self.assert_aborted(result)
+                self.assertIn("publishes no Sigstore signature", result.output)
+                self.assertIn("temps-linux-amd64.tar.gz.sigstore.json", result.output)
+                self.assertIn("--allow-unsigned v0.1.0", result.output)
+
+    def test_allow_unsigned_installs_a_release_without_a_signature(self):
+        result = run_install(arguments=("--allow-unsigned", "v0.1.0"), tools=("cosign",),
+                             bundle=None)
+        self.assert_installed(result)
+        self.assertIn("--allow-unsigned was passed", result.output)
+        self.assertEqual(result.calls_to("cosign"), [])
+
+    def test_allow_unsigned_never_excuses_a_failed_signature(self):
+        result = run_install(arguments=("--allow-unsigned", "v0.1.0"), tools=("cosign",),
+                             environment_extra={"FAKE_COSIGN_EXIT": "1"})
+        self.assert_aborted(result)
+        self.assertIn("Signature verification FAILED", result.output)
 
 
 if __name__ == "__main__":
