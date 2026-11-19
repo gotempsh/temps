@@ -20,9 +20,9 @@
 //!   as saturated rather than reading an unbounded number of lines into
 //!   memory.
 //!
-//! A saturated sample is a *lower bound*, never an overstatement, so a rule
-//! can under-report a spike but can never fire on a count that did not
-//! happen.
+//! A saturated sample is a *lower bound*, never an overstatement: it can show
+//! a count is above a threshold but not that it is below one, and the alert
+//! evaluator leaves a below-threshold rule undecided on a saturated sample.
 
 use std::sync::Arc;
 

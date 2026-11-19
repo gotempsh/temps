@@ -517,6 +517,24 @@ fn humanize_static(
     )
 }
 
+/// Whether a line count breaches its threshold.
+///
+/// A saturated sample is a lower bound: the real count is at least
+/// `sample.count`. That is enough to say a count is above a threshold, but
+/// never that it is below one. `None` means undecided: a "fewer than" rule
+/// on a saturated count keeps its state instead of raising a false alarm (or
+/// resolving a real one) while the search is busier than the counter's cap.
+fn log_count_breaches(
+    comparator: Comparator,
+    sample: &LogSeriesSample,
+    threshold: f64,
+) -> Option<bool> {
+    if sample.saturated && matches!(comparator, Comparator::Lt | Comparator::Lte) {
+        return None;
+    }
+    Some(comparator.breaches(sample.count as f64, threshold))
+}
+
 /// One sentence for a log alert: how many lines matched, over what window,
 /// and which side of the threshold that is. Says explicitly when the count
 /// is a lower bound, so nobody reads a capped count as the real number.
@@ -1328,7 +1346,19 @@ impl MetricAlertEvaluator {
             return Ok(());
         };
 
-        let breaching = params.comparator.breaches(value, params.threshold);
+        let Some(breaching) = log_count_breaches(params.comparator, &sample, params.threshold)
+        else {
+            // A capped count cannot show it is below a threshold: keep the
+            // rule's state (and any open alarm) rather than decide either way.
+            debug!(
+                rule_id = rule.id,
+                saved_search_id,
+                count = sample.count,
+                "Log alert undecided: a capped count cannot establish a below-threshold breach"
+            );
+            self.persist_unchanged(&rule, now).await;
+            return Ok(());
+        };
         let details = FireDetails::log_breach(&rule, &sample, params);
         self.apply_decision(&rule, value, breaching, details, now)
             .await;
@@ -3303,6 +3333,34 @@ mod tests {
         assert!(
             !rendered.contains("query") && !rendered.contains("text"),
             "the payload must not carry the search query: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_saturated_count_never_decides_a_below_threshold() {
+        // 1,000 lines counted and the counter stopped: the real count may be
+        // far higher, so "fewer than 1,010" can be neither confirmed nor ruled out.
+        assert_eq!(
+            log_count_breaches(Comparator::Lt, &sample(1000, true), 1010.0),
+            None
+        );
+        assert_eq!(
+            log_count_breaches(Comparator::Lte, &sample(1000, true), 1000.0),
+            None
+        );
+        // An exact count below the threshold still fires.
+        assert_eq!(
+            log_count_breaches(Comparator::Lt, &sample(3, false), 1010.0),
+            Some(true)
+        );
+        // A lower bound above the threshold is enough to fire an "above" rule.
+        assert_eq!(
+            log_count_breaches(Comparator::Gt, &sample(1000, true), 20.0),
+            Some(true)
+        );
+        assert_eq!(
+            log_count_breaches(Comparator::Gt, &sample(10, false), 20.0),
+            Some(false)
         );
     }
 
