@@ -1958,6 +1958,7 @@ fn ch_dimension_expression(dimension: TrafficDimension) -> &'static str {
         TrafficDimension::OperatingSystem => "nullIf(operating_system, '')",
         TrafficDimension::DeviceType => "nullIf(device_type, '')",
         TrafficDimension::CacheStatus => "nullIf(cache_status, '')",
+        TrafficDimension::Referrer => "nullIf(referrer, '')",
     }
 }
 
@@ -3423,6 +3424,39 @@ pub(crate) mod tests {
             .expect("impossible query => empty, no round-trip");
         assert!(rows.is_empty());
         assert_eq!(total, 0);
+    }
+
+    /// ClickHouse stores a missing `Referer` as `''`; it must group as null,
+    /// exactly as on TimescaleDB, for the not-found report (ADR 071 D1).
+    #[test]
+    fn traffic_query_groups_by_referrer_with_empty_values_as_null() {
+        let request = TrafficAggregationRequest {
+            start_time: Utc::now() - chrono::Duration::days(7),
+            end_time: Utc::now(),
+            environment_id: None,
+            dimensions: vec![TrafficDimension::Path, TrafficDimension::Referrer],
+            metrics: vec![TrafficMetric::Requests],
+            filters: vec![
+                TrafficFilter {
+                    dimension: TrafficDimension::StatusCode,
+                    operator: TrafficFilterOperator::Eq,
+                    values: vec!["404".to_string()],
+                },
+                TrafficFilter {
+                    dimension: TrafficDimension::Referrer,
+                    operator: TrafficFilterOperator::NotEq,
+                    values: vec![String::new()],
+                },
+            ],
+            order_by: Vec::new(),
+            include_synthetic: false,
+            page: 1,
+            page_size: 20,
+        };
+        let (sql, binds, _count_sql) = build_traffic_query(7, &request).expect("valid query");
+        assert!(sql.contains("toNullable(toString(nullIf(referrer, ''))) AS d1"));
+        assert!(sql.contains("nullIf(referrer, '') != ?"));
+        assert_eq!(binds.len(), 5);
     }
 
     #[test]

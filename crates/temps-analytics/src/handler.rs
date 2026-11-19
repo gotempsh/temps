@@ -49,6 +49,7 @@ pub struct AppState {
         get_event_detail,
         get_event_visitors,
         get_event_entries,
+        get_event_properties,
         get_visitors,
         get_visitor_facets,
         get_visitor_details,
@@ -192,6 +193,9 @@ pub struct AppState {
         EventEntriesQuery,
         EventEntriesResponse,
         EventEntryInfo,
+        EventPropertiesQuery,
+        EventPropertiesResponse,
+        EventPropertyValue,
     )),
     info(
         title = "Analytics API",
@@ -226,6 +230,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         .route("/analytics/event-detail", get(get_event_detail))
         .route("/analytics/event-visitors", get(get_event_visitors))
         .route("/analytics/event-entries", get(get_event_entries))
+        .route("/analytics/event-properties", get(get_event_properties))
         .route("/analytics/visitors", get(get_visitors))
         .route("/analytics/visitor-facets", get(get_visitor_facets))
         .route("/analytics/visitors/{visitor_id}", get(get_visitor_details))
@@ -1378,6 +1383,10 @@ pub(super) fn handle_analytics_error(error: AnalyticsError) -> Problem {
                 ))
                 .build()
         }
+        AnalyticsError::InvalidQuery { .. } => bad_request()
+            .title("Invalid Analytics Query")
+            .detail(error.to_string())
+            .build(),
     }
 }
 
@@ -2238,6 +2247,73 @@ pub async fn get_event_entries(
             Err(handle_analytics_error(e))
         }
     }
+}
+
+/// Break one event down by one of its custom properties
+///
+/// Ranks the values of one top-level key of an event's custom properties,
+/// e.g. the `url` of `outbound_click` or the `extension` of `file_download`
+/// (ADR 071 D1). Crawler traffic is excluded. A value is null when the event
+/// was sent without that property.
+#[utoipa::path(
+    tag = "Analytics",
+    get,
+    path = "/analytics/event-properties",
+    params(
+        ("event_name" = String, Query, description = "Event to break down, e.g. outbound_click"),
+        ("property" = String, Query, description = "Top-level property key to group by, e.g. url. Letters, digits, '_', '-' and '.'; at most 64 characters"),
+        ("project_id" = i32, Query, description = "Project ID"),
+        ("environment_id" = Option<i32>, Query, description = "Environment ID (optional)"),
+        ("start_date" = String, Query, description = "Start date (ISO 8601)"),
+        ("end_date" = String, Query, description = "End date (ISO 8601)"),
+        ("limit" = Option<u64>, Query, description = "Maximum number of values (default: 20, max: 100)")
+    ),
+    responses(
+        (status = 200, description = "Property values ranked by occurrences", body = EventPropertiesResponse),
+        (status = 400, description = "Invalid property name or parameters"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(
+        ("bearer_auth" = [])
+    )
+)]
+pub async fn get_event_properties(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<AppState>>,
+    Query(query): Query<requests::EventPropertiesQuery>,
+) -> Result<Json<EventPropertiesResponse>, Problem> {
+    permission_guard!(auth, AnalyticsRead);
+    project_scope_guard!(auth, query.project_id);
+    project_access_guard!(auth, query.project_id, app_state.project_access_checker);
+
+    let start_date: UtcDateTime = query.start_date.into();
+    let end_date: UtcDateTime = query.end_date.into();
+
+    app_state
+        .analytics_service
+        .get_event_properties(
+            query.project_id,
+            &query.event_name,
+            &query.property,
+            start_date,
+            end_date,
+            query.environment_id,
+            query.limit.unwrap_or(20),
+        )
+        .await
+        .map(Json)
+        .map_err(|e| {
+            error!(
+                project_id = query.project_id,
+                event_name = %query.event_name,
+                property = %query.property,
+                "Event property breakdown failed: {:?}",
+                e
+            );
+            handle_analytics_error(e)
+        })
 }
 
 #[cfg(test)]

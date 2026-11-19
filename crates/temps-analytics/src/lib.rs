@@ -26,7 +26,7 @@ pub mod visitor_audit;
 pub mod testing;
 
 // Re-export main types, service, and plugin
-pub use analytics::AnalyticsService;
+pub use analytics::{validate_event_property_key, AnalyticsService, MAX_EVENT_PROPERTY_KEY_LEN};
 pub use channel::{extract_referrer_hostname, get_channel, parse_utm_params, Channel, UtmParams};
 pub use ingest_keys::{
     extract_analytics_key, is_origin_allowed, resolve_keyed_ingest_scope, AnalyticsIngestKey,

@@ -508,6 +508,7 @@ fn pg_dimension_expression(dimension: TrafficDimension) -> &'static str {
         TrafficDimension::OperatingSystem => "NULLIF(operating_system, '')",
         TrafficDimension::DeviceType => "NULLIF(device_type, '')",
         TrafficDimension::CacheStatus => "NULLIF(cache_status, '')",
+        TrafficDimension::Referrer => "NULLIF(referrer, '')",
     }
 }
 
@@ -979,6 +980,43 @@ mod tests {
     #[test]
     fn test_store_constructs() {
         let _store = make_store();
+    }
+
+    /// The not-found report (ADR 071 D1) groups 404s by path and by the page
+    /// that linked to them. An empty `Referer` must group as null so that
+    /// "no referrer" can be filtered out rather than ranked as a source.
+    #[test]
+    fn traffic_query_groups_by_referrer_with_empty_values_as_null() {
+        let request = TrafficAggregationRequest {
+            start_time: chrono::Utc::now() - chrono::Duration::days(7),
+            end_time: chrono::Utc::now(),
+            environment_id: None,
+            dimensions: vec![TrafficDimension::Path, TrafficDimension::Referrer],
+            metrics: vec![TrafficMetric::Requests],
+            filters: vec![
+                TrafficFilter {
+                    dimension: TrafficDimension::StatusCode,
+                    operator: TrafficFilterOperator::Eq,
+                    values: vec!["404".to_string()],
+                },
+                TrafficFilter {
+                    dimension: TrafficDimension::Referrer,
+                    operator: TrafficFilterOperator::NotEq,
+                    values: vec![String::new()],
+                },
+            ],
+            order_by: Vec::new(),
+            include_synthetic: false,
+            page: 1,
+            page_size: 20,
+        };
+        let (sql, values, count_sql) = build_traffic_query(7, &request).expect("valid query");
+        assert!(sql.contains("CAST(NULLIF(referrer, '') AS TEXT) AS d1"));
+        assert!(sql.contains("GROUP BY path, NULLIF(referrer, '')"));
+        assert!(sql.contains("status_code = $4"));
+        assert!(sql.contains("NULLIF(referrer, '') <> $5"));
+        assert!(count_sql.contains("GROUP BY path, NULLIF(referrer, '')"));
+        assert_eq!(values.len(), 5);
     }
 
     #[test]
