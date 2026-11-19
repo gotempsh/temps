@@ -149,6 +149,30 @@ class ReleaseTests(unittest.TestCase):
         commands = self.build_python(locked=False)
         self.assertNotIn(('uv', 'lock', '--check'), [args for args, _ in commands])
 
+    def test_api_build_regenerates_its_client_before_testing_and_packing(self):
+        # Packing ignores lifecycle scripts, so the generator its prepublishOnly runs must run here.
+        package = next(p for p in release.catalog_packages() if p['key'] == 'api')
+        self.assertIn('bun run generate', release.manifest(package)['scripts']['prepublishOnly'])
+        def command(*args, **kwargs):
+            if args[:2] == ('git', 'show'):
+                return '1234567890\n'
+            if args[:2] == ('git', 'rev-parse'):
+                return 'abc\n'
+            if args[:3] == ('bun', 'pm', 'pack'):
+                Path(args[args.index('--filename') + 1]).write_bytes(b'package')
+            return ''
+        with patch.object(release, 'run', side_effect=command) as run, patch.object(release, 'check_npm_archive'):
+            release.build([package], self.root / 'artifacts')
+        calls = [call.args for call in run.call_args_list if call.kwargs.get('cwd') == release.ROOT / 'packages/api']
+        self.assertLess(calls.index(('bun', 'run', 'generate')), calls.index(('bun', 'run', 'build')))
+        packed = next(c for c in calls if c[:3] == ('bun', 'pm', 'pack'))
+        self.assertLess(calls.index(('bun', 'run', 'generate')), calls.index(packed))
+        # Packages without a generating prepublishOnly are packed from their committed sources.
+        kv = next(p for p in release.catalog_packages() if p['key'] == 'kv')
+        with patch.object(release, 'run', side_effect=command) as run, patch.object(release, 'check_npm_archive'):
+            release.build([kv], self.root / 'artifacts-kv')
+        self.assertNotIn(('bun', 'run', 'generate'), [call.args for call in run.call_args_list])
+
     def test_rust_build_collects_verified_package_archive(self):
         package = {'kind': 'crate', 'key': 'rust', 'path': 'crates/temps-workflows-sdk',
                    'name': 'temps-workflows-sdk', 'version': '1.2.3'}
@@ -568,7 +592,9 @@ class PrepareTests(unittest.TestCase):
                 ('fix: tidy', 'BREAKING-CHANGE: renamed', 'major'),
                 ('chore(deps): bump serde', '', None), ('docs: explain', '', None), ('test: cover', '', None),
                 ('Merge pull request #1 from someone/branch', '', None), ('feat:missing space', '', None),
-                ('Fix: capitalised type', '', None), ('fix: mentions BREAKING CHANGE in passing', '', 'patch')]:
+                ('Fix: capitalised type', '', 'patch'), ('FEAT(kv): shouting', '', 'minor'),
+                ('docs: lowercase footer', 'breaking change: not a footer', None),
+                ('fix: mentions BREAKING CHANGE in passing', '', 'patch')]:
             with self.subTest(subject=subject):
                 self.assertEqual(sdk_prepare.commit_level(subject, body), level)
 
@@ -732,8 +758,10 @@ class PrepareTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'app: stable package depends on prerelease sibling @temps-sdk/core'):
             self.prepare('v9.0.0')
         self.assertEqual(self.read('.github/releases/prepared.json'), '{}\n')
-        # A beta server tag may ship it: both become betas.
-        self.assertEqual(self.selection('v9.0.0-beta.1'), {'app': '1.0.1-beta.1'})
+        # A beta release of app cannot ship against a core version the registry lacks either.
+        with self.assertRaisesRegex(ValueError, 'app: depends on @temps-sdk/core 1.1.0-beta.1, which is neither published'):
+            self.prepare('v9.0.0-beta.1')
+        self.assertEqual(self.read('.github/releases/prepared.json'), '{}\n')
 
     def test_prepare_is_idempotent(self):
         self.add('analytics-core', 'npm', '0.0.6', published={'0.0.6'})
@@ -764,6 +792,11 @@ class PrepareTests(unittest.TestCase):
         self.write('sdks/py-app/pyproject.toml', '[project]\nname = "temps-app"\nversion = "1.0.0"\n'
                    'dependencies = ["temps-core==1.0.0", "aiohttp>=3"]\n\n'
                    '[tool.uv.sources]\ntemps-core = { path = "../py-core" }\n')
+        # The dependent's lock as uv writes it: the sibling is a `directory` entry.
+        self.write('sdks/py-app/uv.lock', 'version = 1\n\n[[package]]\nname = "temps-app"\nversion = "1.0.0"\n'
+                   'source = { editable = "." }\ndependencies = [\n    { name = "temps-core" },\n]\n\n'
+                   '[package.metadata]\nrequires-dist = [{ name = "temps-core", directory = "../py-core" }]\n\n'
+                   '[[package]]\nname = "temps-core"\nversion = "1.0.0"\nsource = { directory = "../py-core" }\n')
         self.add('go-core', 'go', '1.0.0', published={'1.0.0'})
         self.add('go-app', 'go', '1.0.0', published={'1.0.0'})
         core = self.catalog['go-core']['name']
@@ -775,7 +808,121 @@ class PrepareTests(unittest.TestCase):
         self.change('go-core', 'feat: core')
         self.assertEqual(self.selection(), {'go-app': '1.0.1', 'go-core': '1.1.0', 'py-app': '1.0.1', 'py-core': '1.0.1'})
         self.assertIn('"temps-core==1.0.1"', self.read('sdks/py-app/pyproject.toml'))
+        app_lock = self.read('sdks/py-app/uv.lock')
+        self.assertIn('name = "temps-app"\nversion = "1.0.1"\nsource = { editable = "." }', app_lock)
+        self.assertIn('name = "temps-core"\nversion = "1.0.1"\nsource = { directory = "../py-core" }', app_lock)
         self.assertIn(f'require {core} v1.1.0\n\nreplace {core} => ../go-core\n', self.read('sdks/go/go-app/go.mod'))
+
+    def test_renamed_cargo_dependency_is_repinned_and_unrewritable_pins_fail(self):
+        self.add('temps-plugin-protocol', 'crate', '1.0.0', published={'1.0.0'})
+        self.add('temps-plugin-sdk', 'crate', '1.0.0', published={'1.0.0'})
+        manifest = 'crates/temps-plugin-sdk/Cargo.toml'
+        self.write(manifest, '[package]\nname = "temps-plugin-sdk"\nversion = "1.0.0"\n\n[dependencies]\n'
+                   'wire = { package = "temps-plugin-protocol", path = "../temps-plugin-protocol", version = "=1.0.0" }\n')
+        for key in ('temps-plugin-protocol', 'temps-plugin-sdk'):
+            self.release_tag(key, '1.0.0')
+        self.history.commit('fix(protocol): frame', ['crates/temps-plugin-protocol/src/lib.rs'])
+        self.assertEqual(self.selection(), {'temps-plugin-protocol': '1.0.1', 'temps-plugin-sdk': '1.0.1'})
+        self.assertIn('wire = { package = "temps-plugin-protocol", path = "../temps-plugin-protocol", version = "=1.0.1" }',
+                      self.read(manifest))
+        # A dotted table is not rewritten in place, so preparation refuses rather than shipping a stale pin.
+        self.setUp()
+        self.add('temps-plugin-protocol', 'crate', '1.0.0', published={'1.0.0'})
+        self.add('temps-plugin-sdk', 'crate', '1.0.0', published={'1.0.0'})
+        self.write(manifest, '[package]\nname = "temps-plugin-sdk"\nversion = "1.0.0"\n\n'
+                   '[dependencies.temps-plugin-protocol]\npath = "../temps-plugin-protocol"\nversion = "=1.0.0"\n')
+        for key in ('temps-plugin-protocol', 'temps-plugin-sdk'):
+            self.release_tag(key, '1.0.0')
+        self.history.commit('fix(protocol): frame', ['crates/temps-plugin-protocol/src/lib.rs'])
+        with self.assertRaisesRegex(ValueError, 'could not repin temps-plugin-protocol to 1.0.1'):
+            self.prepare()
+        self.assertEqual(self.read('Cargo.lock').count('version = "1.0.0"'), 3)
+
+    def test_explicit_npm_workspace_versions_are_repinned(self):
+        self.add('analytics-core', 'npm', '0.0.6', published={'0.0.6'})
+        self.add('react-analytics', 'npm', '0.0.9', published={'0.0.9'})
+        self.add('vue-analytics', 'npm', '0.0.6', published={'0.0.6'})
+        for key, requirement in [('react-analytics', 'workspace:^0.0.6'), ('vue-analytics', 'workspace:*')]:
+            path = f'sdks/node/packages/{key}/package.json'
+            data = json.loads(self.read(path))
+            data['dependencies'] = {'@temps-sdk/analytics-core': requirement}
+            self.write(path, json.dumps(data, indent=2) + '\n')
+        for key in ('analytics-core', 'react-analytics', 'vue-analytics'):
+            self.release_tag(key, self.version(key))
+        self.change('analytics-core', 'fix: event')
+        self.assertEqual(self.selection(), {'analytics-core': '0.0.7', 'react-analytics': '0.0.10', 'vue-analytics': '0.0.7'})
+        react = json.loads(self.read('sdks/node/packages/react-analytics/package.json'))
+        vue = json.loads(self.read('sdks/node/packages/vue-analytics/package.json'))
+        self.assertEqual(react['dependencies'], {'@temps-sdk/analytics-core': 'workspace:^0.0.7'})
+        self.assertEqual(vue['dependencies'], {'@temps-sdk/analytics-core': 'workspace:*'})
+
+    def test_go_version_qualified_replace_applies_only_to_its_version(self):
+        self.add('go-core', 'go', '1.0.0', published={'1.0.0'})
+        self.add('go-app', 'go', '1.0.0', published={'1.0.0'})
+        core, app = self.catalog['go-core']['name'], self.catalog['go-app']['name']
+        go_mod = 'sdks/go/go-app/go.mod'
+        for key in ('go-core', 'go-app'):
+            self.release_tag(key, '1.0.0')
+        self.change('go-core', 'fix: core')
+        self.write(go_mod, f'module {app}\n\nrequire {core} v1.0.1\n\nreplace {core} v1.0.0 => ../go-core\n')
+        self.assertEqual(self.selection(), {'go-core': '1.0.1'})
+        self.write(go_mod, f'module {app}\n\nrequire {core} v1.0.0 // local\n\nreplace {core} v1.0.0 => ../go-core\n')
+        self.write('.github/releases/prepared.json', '{}\n')
+        self.write('sdks/go/go-core/VERSION', '1.0.0\n')
+        self.assertEqual(self.selection(), {'go-app': '1.0.1', 'go-core': '1.0.1'})
+        self.assertIn(f'require {core} v1.0.1 // local\n\nreplace {core} v1.0.1 => ../go-core\n', self.read(go_mod))
+
+    def test_pypi_registry_versions_compare_by_pep_440(self):
+        for published, message in [({'1.2'}, 'already published'), ({'1.2.0.post1'}, 'already published'),
+                                   ({'1.2.1.post1'}, 'registry already has 1.2.1')]:
+            with self.subTest(published=published):
+                self.setUp()
+                self.add('py', 'pypi', '1.1.0', name='temps-sample', published={'1.1.0', *published})
+                self.release_tag('py', '1.1.0')
+                self.change('py', 'feat: new')
+                with self.assertRaisesRegex(ValueError, message):
+                    self.prepare()
+        self.setUp()
+        self.add('py', 'pypi', '1.1.0', name='temps-sample', published={'1.1.0', '1.2.0.dev3', '1.2.0b1.dev1'})
+        self.release_tag('py', '1.1.0')
+        self.change('py', 'feat: new')
+        self.assertEqual(self.selection('v9.0.0-beta.1'), {'py': '1.2.0b1'})
+
+    def test_manifest_edit_must_change_the_version_field(self):
+        self.add('py', 'pypi', '1.0.0', name='temps-sample', published={'1.0.0'})
+        self.write('sdks/py/pyproject.toml', "[project]\nname = \"temps-sample\"\ndescription = \"\"\"\n"
+                   "version = \"1.0.0\"\n\"\"\"\nversion = '1.0.0'\n")
+        self.release_tag('py', '1.0.0')
+        self.change('py', 'fix: bug')
+        with self.assertRaisesRegex(ValueError, 'no literal version = "1.0.0" in \\[project\\]'):
+            self.prepare()
+
+    def test_failed_write_or_validation_restores_every_file(self):
+        self.add('analytics-core', 'npm', '0.0.6', published={'0.0.6'})
+        self.add('temps-plugin-protocol', 'crate', '1.0.0', published={'1.0.0'})
+        for key in ('analytics-core', 'temps-plugin-protocol'):
+            self.release_tag(key, self.version(key))
+        self.change('analytics-core', 'fix: event')
+        self.history.commit('fix(protocol): frame', ['crates/temps-plugin-protocol/src/lib.rs'])
+        paths = ['.github/releases/prepared.json', 'Cargo.lock', 'sdks/node/bun.lock',
+                 'sdks/node/packages/analytics-core/package.json', 'crates/temps-plugin-protocol/Cargo.toml']
+        before = {path: self.read(path) for path in paths}
+        real_write = Path.write_text
+        writes = []
+        def flaky(target, text, *args, **kwargs):
+            writes.append(target)
+            if len(writes) == 3:
+                raise PermissionError(f'{target}: read-only')
+            return real_write(target, text, *args, **kwargs)
+        with patch.object(Path, 'write_text', flaky), self.assertRaises(PermissionError):
+            self.prepare()
+        self.assertEqual({path: self.read(path) for path in paths}, before)
+        with patch.object(release, 'validate', side_effect=ValueError('validation failed')), \
+                self.assertRaisesRegex(ValueError, 'validation failed'):
+            self.prepare()
+        self.assertEqual({path: self.read(path) for path in paths}, before)
+        # Once the cause is gone a retry succeeds from the untouched inputs.
+        self.assertEqual(self.selection(), {'analytics-core': '0.0.7', 'temps-plugin-protocol': '1.0.1'})
 
     def test_commit_touching_no_package_selects_nothing(self):
         self.add('kv', 'npm', '1.0.0', published={'1.0.0'})
@@ -911,10 +1058,18 @@ class SdkReleasePrepWorkflowTests(unittest.TestCase):
         self.assertEqual(re.findall(r'secrets\.\w+', self.workflow), [])
         for forbidden in ('NPM_TOKEN', 'NODE_AUTH_TOKEN', 'CARGO_REGISTRY', 'PYPI', 'publish --'):
             self.assertNotIn(forbidden, self.workflow)
-        self.assertIn('permissions: {}', self.workflow)
-        write_jobs = re.findall(r'permissions:\n((?:\s{6}\S.*\n)+)', self.workflow)
-        self.assertIn('      contents: write\n      pull-requests: write\n', write_jobs)
-        self.assertIn('      contents: read\n', write_jobs)
+        self.assertIn('\npermissions: {}\n', self.workflow)
+        jobs = self.workflow.split('\njobs:\n')[1]
+        blocks = dict(re.findall(r'^  ([\w-]+):\n(.*?)(?=^  [\w-]+:\n|\Z)', jobs, re.M | re.S))
+        self.assertEqual(sorted(blocks), ['prepare', 'pull-request'])
+        def permissions(job):
+            return re.search(r'^    permissions:\n((?:      \S.*\n)+)', blocks[job], re.M)[1]
+        self.assertEqual(permissions('prepare'), '      contents: read\n')
+        self.assertEqual(permissions('pull-request'), '      contents: write\n      pull-requests: write\n')
+        # Only the job without write access builds third-party package code.
+        self.assertIn('sdk_release.py build', blocks['prepare'])
+        self.assertNotIn('sdk_release.py build', blocks['pull-request'])
+        self.assertNotIn('bun install', blocks['pull-request'])
 
     def test_actions_are_pinned_by_sha(self):
         uses = re.findall(r'uses:\s*(\S+)', self.workflow)
@@ -935,6 +1090,9 @@ class SdkReleasePrepWorkflowTests(unittest.TestCase):
         script = (release.ROOT / 'scripts/release.sh').read_text()
         self.assertIn('python3 scripts/sdk_release.py prepare --tag "v${VERSION}" --check', script)
         self.assertLess(script.index('prepare --tag "v${VERSION}" --check'), script.index('git tag -a'))
+        # A stale, non-empty selection stops the release instead of offering to continue.
+        stale = script.index('python3 scripts/sdk_release.py plan --tag "v${VERSION}")" != "[]"')
+        self.assertLess(script.index('exit 1', stale), script.index('read -r CONTINUE', stale))
 
 
 if __name__ == '__main__':

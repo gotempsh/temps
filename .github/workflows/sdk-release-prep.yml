@@ -11,10 +11,11 @@ name: SDK Release Prep
 # release.yml run for the server tag then tests, publishes and tags exactly
 # the versions it lists.
 #
-# Hook point: beta and stable tags are cut from a `release/v<version>` PR
-# (scripts/release.sh). Pushing that branch runs this workflow for
-# v<version>, and scripts/release.sh refuses to tag while SDK changes are
-# unprepared. Merge the SDK PR before the release PR so the tag contains it.
+# Hook point: beta and stable tags go on the merge commit of a
+# `release/v<version>` PR carrying the scripts/release.sh bump commit.
+# Pushing that branch runs this workflow for v<version> (or dispatch it with
+# the tag). Merge the SDK PR before the release PR so the tag contains it;
+# release.sh stops on a stale selection and asks before releasing without one.
 # Nightly tags never publish SDKs, so nightly-release.yml does not run this.
 #
 # Least privilege: `prepare` installs and builds the SDKs (third-party code)

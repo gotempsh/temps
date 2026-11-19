@@ -23,7 +23,8 @@ import sdk_release as release
 LEVELS = (None, 'patch', 'minor', 'major')
 # Pre-1.0 packages treat a breaking change as minor and a feature as a patch.
 PRE_1_0 = {'major': 'minor', 'minor': 'patch', 'patch': 'patch'}
-SUBJECT = re.compile(r'(?P<type>[a-z]+)(?:\([^()\r\n]*\))?(?P<breaking>!)?: \S')
+# Types are case-insensitive in Conventional Commits 1.0; the BREAKING CHANGE footer is not.
+SUBJECT = re.compile(r'(?P<type>[A-Za-z]+)(?:\([^()\r\n]*\))?(?P<breaking>!)?: \S')
 BREAKING_FOOTER = re.compile(r'^BREAKING[ -]CHANGE: ', re.M)
 BUMPS = {'feat': 'minor', 'fix': 'patch', 'perf': 'patch'}
 SERVER_TAG = r'v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z][0-9A-Za-z.-]*)?'
@@ -41,7 +42,7 @@ def commit_level(subject, body=''):
         return None
     if match['breaking'] or BREAKING_FOOTER.search(body or ''):
         return 'major'
-    return BUMPS.get(match['type'])
+    return BUMPS.get(match['type'].lower())
 
 
 def highest(levels):
@@ -173,14 +174,38 @@ def published_versions(package, fetch=release.registry_json):
     return {line.strip().removeprefix('v') for line in (listing or '').splitlines() if line.strip()}
 
 
-def parse_all(versions, kind):
-    parsed = set()
-    for text in versions:
+PEP440 = re.compile(r'v?(\d+(?:\.\d+)*)(?:[-_.]?(a|b|rc|alpha|beta|c|pre|preview)[-_.]?(\d*))?'
+                    r'(?:[-_.]?(post|rev|r)[-_.]?(\d*)|-(\d+))?(?:[-_.]?dev[-_.]?(\d*))?', re.I)
+
+
+def registry_version(text, kind):
+    """A registry version as the Version it occupies, or None when it cannot collide.
+
+    PyPI compares versions by PEP 440, so `1.2` is `1.2.0`, and `1.2.0.post1` or
+    `1.2.0.1` sit at or above 1.2.0: both occupy the 1.2.0 release for the
+    already-published and registry-ahead guards. A `.devN` build precedes its
+    release and blocks nothing.
+    """
+    if kind != 'pypi':
         try:
-            parsed.add(Version.parse(text, kind))
+            return Version.parse(text, kind)
         except ValueError:
-            continue
-    return parsed
+            return None
+    match = PEP440.fullmatch(text.strip())
+    if not match or match[7] is not None:
+        return None
+    release_parts = [int(part) for part in match[1].split('.')]
+    major, minor, patch = (release_parts + [0, 0, 0])[:3]
+    label = {'a': 'alpha', 'alpha': 'alpha', 'b': 'beta', 'beta': 'beta'}.get((match[2] or '').lower(),
+                                                                          'rc' if match[2] else None)
+    if label:
+        return Version(major, minor, patch, label, int(match[3] or 0))
+    # Final releases, post-releases and longer release segments occupy the core.
+    return Version(major, minor, patch)
+
+
+def parse_all(versions, kind):
+    return {version for text in versions if (version := registry_version(text, kind)) is not None}
 
 
 def manifest_version(kind, text):
@@ -230,6 +255,34 @@ def canonical(name):
     return re.sub(r'[-_.]+', '-', name).lower()
 
 
+def cargo_dependencies(data):
+    """(key, spec) for every table-form dependency a crate ships with (not dev-dependencies)."""
+    tables = [data.get('dependencies', {}), data.get('build-dependencies', {})]
+    tables += [target.get(section, {}) for target in data.get('target', {}).values()
+               for section in ('dependencies', 'build-dependencies')]
+    return [(key, spec) for table in tables for key, spec in table.items() if isinstance(spec, dict)]
+
+
+def go_patterns(module):
+    escaped = re.escape(module)
+    return (re.compile(rf'^(\s*(?:require\s+)?{escaped}\s+)v(\S+)(?=[ \t]*(?://.*)?$)', re.M),
+            re.compile(rf'^(\s*(?:replace\s+)?{escaped}(?:\s+v(\S+))?\s+=>\s+\.)', re.M))
+
+
+def go_local_requirement(text, module):
+    """Version of `module` this go.mod requires through a local replace, or None.
+
+    A version-qualified replace only applies to that exact required version.
+    """
+    require, replace = go_patterns(module)
+    required = require.search(text)
+    if not required:
+        return None
+    if any(match[2] in (None, required[2]) for match in replace.finditer(text)):
+        return required[2]
+    return None
+
+
 def local_dependencies(package, catalog, root):
     """Catalog siblings this package ships a dependency on through the workspace."""
     path = root / package['path']
@@ -244,14 +297,9 @@ def local_dependencies(package, catalog, root):
                 if isinstance(requirement, str) and requirement.startswith('workspace:') and name in siblings:
                     found.add(siblings[name])
     elif kind == 'crate':
-        data = tomllib.loads((path / 'Cargo.toml').read_text())
-        tables = [data.get('dependencies', {}), data.get('build-dependencies', {})]
-        tables += [target.get(section, {}) for target in data.get('target', {}).values()
-                   for section in ('dependencies', 'build-dependencies')]
-        for table in tables:
-            for name, spec in table.items():
-                if isinstance(spec, dict) and 'path' in spec and spec.get('package', name) in siblings:
-                    found.add(siblings[spec.get('package', name)])
+        for key, spec in cargo_dependencies(tomllib.loads((path / 'Cargo.toml').read_text())):
+            if 'path' in spec and spec.get('package', key) in siblings:
+                found.add(siblings[spec.get('package', key)])
     elif kind == 'pypi':
         data = tomllib.loads((path / 'pyproject.toml').read_text())
         sources = {canonical(name): spec for name, spec in
@@ -264,8 +312,7 @@ def local_dependencies(package, catalog, root):
     else:
         text = (path / 'go.mod').read_text()
         for module, key in siblings.items():
-            local = re.search(rf'^\s*(?:replace\s+)?{re.escape(module)}(?:\s+v\S+)?\s+=>\s+\.', text, re.M)
-            if local and re.search(rf'^\s*(?:require\s+)?{re.escape(module)}\s+v\S+[ \t]*$', text, re.M):
+            if go_local_requirement(text, module):
                 found.add(key)
     return found
 
@@ -390,8 +437,19 @@ class Edits:
         return sorted(path for path, text in self.files.items() if (self.root / path).read_text() != text)
 
     def write(self):
-        for path in self.changed():
-            (self.root / path).write_text(self.files[path])
+        """Write every change, or restore the originals when any write fails."""
+        originals = {path: (self.root / path).read_text() for path in self.changed()}
+        self.originals = originals
+        try:
+            for path in originals:
+                (self.root / path).write_text(self.files[path])
+        except BaseException:
+            self.restore()
+            raise
+
+    def restore(self):
+        for path, text in getattr(self, 'originals', {}).items():
+            (self.root / path).write_text(text)
 
 
 def set_manifest_version(edits, package, version):
@@ -416,35 +474,67 @@ def set_manifest_version(edits, package, version):
     stop = start.end() + end.start() if end else len(text)
     body, count = re.subn(rf'^(version\s*=\s*"){re.escape(old)}(")', rf'\g<1>{version}\g<2>',
                           text[start.end():stop] if start else '', count=1, flags=re.M)
-    if not start or count != 1:
-        raise ValueError(f'{path}: no literal version = "{old}" in [{section}]')
-    edits.files[path] = text[:start.end()] + body + text[stop:]
+    new = text[:start.end()] + body + text[stop:] if start else text
+    expected = tomllib.loads(text)
+    expected.setdefault(section, {})['version'] = version
+    if not start or count != 1 or tomllib.loads(new) != expected:
+        raise ValueError(f'{path}: no literal version = "{old}" in [{section}] to rewrite')
+    edits.files[path] = new
 
 
 def set_dependency_pins(edits, package, dependency, version):
-    """Point a dependent's in-catalog requirement at the dependency's new version."""
-    kind = package['kind']
+    """Point a dependent's exact in-catalog requirement at the dependency's new version.
+
+    Floating requirements (`workspace:*`, a Cargo path dependency without a
+    version) follow the dependency by themselves. Every edit is re-parsed and
+    fails closed when a pin still names another version.
+    """
+    kind, name = package['kind'], dependency['name']
     path = f"{package['path']}/{MANIFEST[kind] if kind != 'go' else 'go.mod'}"
-    name = re.escape(dependency['name'])
-    if kind == 'crate':
-        pattern = re.compile(rf'^\s*"?{name}"?\s*=\s*\{{.*\bversion\s*=\s*"[=^~]?([^"]+)"')
-        lines = edits.text(path).split('\n')
+    text = edits.text(path)
+    if kind == 'npm':
+        new = re.sub(rf'("{re.escape(name)}"\s*:\s*"workspace:[\^~]?)\d[^"]*(")', rf'\g<1>{version}\g<2>', text)
+        data = json.loads(new)
+        stale = [requirement for section in ('dependencies', 'peerDependencies', 'optionalDependencies')
+                 for dep, requirement in data.get(section, {}).items()
+                 if dep == name and re.fullmatch(r'workspace:[\^~]?\d.*', requirement)
+                 and re.sub(r'^workspace:[\^~]?', '', requirement) != version]
+    elif kind == 'crate':
+        lines = text.split('\n')
         for index, line in enumerate(lines):
-            match = pattern.match(line)
-            if match and re.search(r'\bpath\s*=', line):
-                lines[index] = line[:match.start(1)] + version + line[match.end(1):]
-        edits.files[path] = '\n'.join(lines)
+            table = re.match(r'\s*("?)([\w-]+)\1\s*=\s*\{(.*)\}', line)
+            if not table or not re.search(r'\bpath\s*=', table[3]):
+                continue
+            renamed = re.search(r'\bpackage\s*=\s*"([^"]+)"', table[3])
+            if (renamed[1] if renamed else table[2]) != name:
+                continue
+            lines[index] = re.sub(r'(\bversion\s*=\s*"\s*[=^~]?\s*)[^"]+(")', rf'\g<1>{version}\g<2>', line)
+        new = '\n'.join(lines)
+        stale = [spec['version'] for key, spec in cargo_dependencies(tomllib.loads(new))
+                 if spec.get('package', key) == name and 'path' in spec and 'version' in spec
+                 and spec['version'].lstrip('=^~ ') != version]
     elif kind == 'pypi':
         # PEP 503: `temps_core`, `temps-core` and `Temps.Core` name the same project.
-        spelled = '[-_.]+'.join(map(re.escape, re.split(r'[-_.]+', dependency['name'])))
-        edits.files[path] = re.sub(rf'(["\']{spelled}\s*==\s*)[^"\';,\s]+', rf'\g<1>{version}', edits.text(path),
-                                   flags=re.I)
-    elif kind == 'go':
-        edits.files[path] = re.sub(rf'^(\s*(?:require\s+)?{name}\s+)v\S+(?=[ \t]*$)', rf'\g<1>v{version}',
-                                   edits.text(path), flags=re.M)
+        spelled = '[-_.]+'.join(map(re.escape, re.split(r'[-_.]+', name)))
+        new = re.sub(rf'(["\']{spelled}\s*==\s*)[^"\';,\s]+', rf'\g<1>{version}', text, flags=re.I)
+        stale = [requirement for requirement in tomllib.loads(new).get('project', {}).get('dependencies', [])
+                 if re.match(rf'{spelled}\s*==', requirement, re.I) and not re.match(
+                     rf'{spelled}\s*==\s*{re.escape(version)}\s*(?:[;,]|$)', requirement, re.I)]
+    else:
+        require, replace = go_patterns(name)
+        required = require.search(text)
+        new = require.sub(rf'\g<1>v{version}', text)
+        if required:
+            # A replace pinned to the old required version must move with it.
+            new = replace.sub(lambda match: match[0].replace(f'v{required[2]}', f'v{version}')
+                              if match[2] == required[2] else match[0], new)
+        stale = [] if go_local_requirement(new, name) in (None, version) else [name]
+    if stale:
+        raise ValueError(f'{path}: could not repin {name} to {version} (still {", ".join(stale)}); edit it by hand')
+    edits.files[path] = new
 
 
-def set_lockfile_versions(edits, package, version, root):
+def set_lockfile_versions(edits, package, version, root, dependents=()):
     kind, old, name = package['kind'], package['version'], package['name']
     if kind == 'npm':
         directory = (root / package['path']).parent
@@ -458,10 +548,11 @@ def set_lockfile_versions(edits, package, version, root):
                       rf'("{re.escape(workspace)}": \{{\s*"name": "{re.escape(name)}",\s*"version": "){re.escape(old)}(")',
                       rf'\g<1>{version}\g<2>', what=f'workspace entry for {name} {old}')
     elif kind == 'pypi':
-        lock = f"{package['path']}/uv.lock"
-        if (root / lock).exists():
-            edits.replace(lock, rf'^(name = "{re.escape(canonical(name))}"\nversion = "){re.escape(old)}("\nsource = \{{ (?:editable|virtual) = )',
-                          rf'\g<1>{version}\g<2>', what=f'editable entry for {name} {old}')
+        for lock in [f"{p['path']}/uv.lock" for p in [package, *dependents]]:
+            if (root / lock).exists():
+                edits.replace(lock, rf'^(name = "{re.escape(canonical(name))}"\nversion = "){re.escape(old)}'
+                              rf'("\nsource = \{{ (?:editable|virtual|directory) = )',
+                              rf'\g<1>{version}\g<2>', what=f'local entry for {name} {old}')
     elif kind == 'crate':
         edits.replace('Cargo.lock', rf'^(name = "{re.escape(name)}"\nversion = "){re.escape(old)}("\n(?!source = ))',
                       rf'\g<1>{version}\g<2>', what=f'path package entry for {name} {old}')
@@ -506,12 +597,20 @@ def prepare(tag, root=release.ROOT, *, history=None, published=None, write=True)
         for dep in sorted(depends[key]):
             if release.channel(final[dep], by_key[dep]['kind']) != 'stable':
                 raise ValueError(f"{key}: stable package depends on prerelease sibling {by_key[dep]['name']} {final[dep]}")
+    # A selected package ships against its siblings' final versions: an unselected
+    # sibling must already be on the registry (sdk_release.check_dependencies).
+    for key in selection:
+        for dep in sorted(depends[key]):
+            if dep not in selection and states[dep].current not in states[dep].published:
+                raise ValueError(f"{key}: depends on {by_key[dep]['name']} {final[dep]}, which is neither "
+                                 f"published nor releasable now; restore its published version or release it")
     edits = Edits(root)
     for key in selection:
         package, version = by_key[key], final[key]
         if version != package['version']:
             set_manifest_version(edits, package, version)
-            set_lockfile_versions(edits, package, version, root)
+            set_lockfile_versions(edits, package, version, root,
+                                  [by_key[k] for k in sorted(by_key) if key in depends[k]])
         for dependent in sorted(k for k in by_key if key in depends[k]):
             set_dependency_pins(edits, by_key[dependent], package, version)
     prepared = {tag: {key: final[key] for key in selection}} if selection else {}
@@ -525,10 +624,14 @@ def prepare(tag, root=release.ROOT, *, history=None, published=None, write=True)
               for key in selection]
     if write:
         edits.write()
-        release.validate(root)
-        planned = [(p['key'], p['version']) for p in release.plan(tag, root)]
-        if planned != [(entry['key'], entry['version']) for entry in report]:
-            raise ValueError(f'{tag}: prepared selection does not round-trip through plan()')
+        try:
+            release.validate(root)
+            planned = [(p['key'], p['version']) for p in release.plan(tag, root)]
+            if planned != [(entry['key'], entry['version']) for entry in report]:
+                raise ValueError(f'{tag}: prepared selection does not round-trip through plan()')
+        except BaseException:
+            edits.restore()
+            raise
     return report, files
 
 

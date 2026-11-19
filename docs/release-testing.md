@@ -1070,7 +1070,9 @@ and registry contents produce the same files, and a second run changes nothing.
   version.
 - **Changes.** Non-merge commits since the baseline that touched the package
   path or a declared `sources` entry in `packages.json` (`@temps-sdk/api` is
-  generated from `apps/temps-cli/openapi.json`). A catalog package nested inside
+  generated from `apps/temps-cli/openapi.json`; `build` runs its `generate`
+  script before testing and packing, as its `prepublishOnly` would, so it ships
+  the client for the tag's spec). A catalog package nested inside
   another's path (`sdks/python/workflows` in `sdks/python`) counts only for the
   inner one. A commit that touches no package selects nothing.
 - **Bump.** From Conventional Commit subjects and bodies: `fix`/`perf` patch,
@@ -1117,12 +1119,18 @@ runs no package code and re-derives the change, refusing to continue if the
 bytes differ from what was dry-built. Neither has registry credentials or
 `id-token`. It only ever force-updates its own commits on its branch.
 
-It fits the existing cut: beta and stable tags come from a `release/v<version>`
-PR made by `scripts/release.sh`. Pushing that branch runs the workflow for
-`v<version>` (or dispatch it with the tag as input). Merge the SDK PR into main
-**before** the release PR, then tag the release merge commit as usual;
-`release.sh` refuses to continue (unless confirmed) while `prepare --check`
-would still change files. Nightlies never publish SDKs, so
+It fits how beta and stable tags are cut today. `scripts/release.sh` makes the
+version-bump commit; it reaches main through a `release/v<version>` PR (the
+branch is pushed by hand, and every recent release PR used that name), and the
+tag goes on that PR's merge commit. Pushing a `release/v*` branch runs the
+workflow for `v<version>`. For any other path, dispatch it:
+`gh workflow run sdk-release-prep.yml -f tag=v<version>`. Merge the SDK PR into
+main **before** the release PR so the tag contains it.
+
+`release.sh` runs `prepare --check` before its bump commit. If the tag already
+has a selection that is now stale, it stops: publishing it would ship newer code
+under the selected versions. If nothing is selected yet, it asks before
+releasing the server without those SDK changes. Nightlies never publish SDKs, so
 `nightly-release.yml` does not run it.
 
 `release.yml` plans in its existing validation job and tests/packages in its

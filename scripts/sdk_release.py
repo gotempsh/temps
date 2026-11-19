@@ -182,6 +182,11 @@ def build(packages, output):
                 run('bun', 'install', '--frozen-lockfile', cwd=install)
                 installed.add(install)
             data = manifest(p)
+            # Packing runs with --ignore-scripts, so honour a prepublishOnly that
+            # regenerates sources first: @temps-sdk/api is selected by changes to
+            # apps/temps-cli/openapi.json and must ship the client for that spec.
+            if re.search(r'\bbun run generate\b', data['scripts'].get('prepublishOnly', '')):
+                run('bun', 'run', 'generate', cwd=path)
             # Workspace consumers require core declarations before their build.
             if '@temps-sdk/analytics-core' in data.get('dependencies', {}):
                 run('bun', 'run', 'build', cwd=ROOT / 'sdks/node/packages/analytics-core')

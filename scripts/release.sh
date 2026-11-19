@@ -51,12 +51,19 @@ fi
 python3 scripts/sdk_release.py plan --tag "v${VERSION}" || exit 1
 
 # SDKs that changed since their last release publish with this tag only once
-# the SDK Release Prep workflow's PR (pushing release/v${VERSION} starts it)
-# is merged. --check changes nothing; it fails while files would change.
+# the SDK Release Prep PR is merged (pushing release/v${VERSION} or
+# `gh workflow run sdk-release-prep.yml -f tag=v${VERSION}` opens it).
+# --check changes nothing; it fails while files would change.
 if ! python3 scripts/sdk_release.py prepare --tag "v${VERSION}" --check > /dev/null; then
+    if [ "$(python3 scripts/sdk_release.py plan --tag "v${VERSION}")" != "[]" ]; then
+        # Publishing a stale selection would ship newer code under the selected versions.
+        echo -e "${RED}Error: the prepared SDK selection for v${VERSION} is stale.${NC}"
+        echo "Re-run: gh workflow run sdk-release-prep.yml -f tag=v${VERSION}, then merge its PR."
+        exit 1
+    fi
     echo -e "${YELLOW}SDK releases for v${VERSION} are not prepared (see above).${NC}"
-    echo -e "${YELLOW}Run the SDK Release Prep workflow for v${VERSION} and merge its PR first, or continue without publishing those SDK changes.${NC}"
-    echo -e "${YELLOW}Continue without them? (y/N)${NC}"
+    echo "Prepare them with: gh workflow run sdk-release-prep.yml -f tag=v${VERSION}, then merge its PR."
+    echo -e "${YELLOW}Release the server without publishing those SDK changes? (y/N)${NC}"
     read -r CONTINUE
     if [ "$CONTINUE" != "y" ] && [ "$CONTINUE" != "Y" ]; then
         echo "Aborted"
