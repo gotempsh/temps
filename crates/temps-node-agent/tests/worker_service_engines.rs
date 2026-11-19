@@ -4348,9 +4348,16 @@ async fn a_dragonfly_replica_and_primary_are_backed_up_by_the_rdb_engine() {
         )
         .await
         .expect("start the saving client");
+    // The save's in-progress file, not a finished snapshot: the client is
+    // killed while Dragonfly is still writing.
+    let in_progress = format!("{abandoned}.rdb.tmp");
     let deadline = Instant::now() + Duration::from_secs(60);
-    while backup_snapshots(&docker, &primary).await.is_empty() {
-        assert!(Instant::now() < deadline, "the SAVE never started");
+    while backup_snapshots(&docker, &primary).await != in_progress {
+        assert!(
+            Instant::now() < deadline,
+            "{in_progress} never appeared: the SAVE did not start, or ended too quickly to \
+             be interrupted"
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     docker
@@ -4363,6 +4370,14 @@ async fn a_dragonfly_replica_and_primary_are_backed_up_by_the_rdb_engine() {
         )
         .await
         .expect("kill the saving client");
+    // The save outlives its client. Were it already over, the removal below
+    // would only delete a finished file and prove nothing about the wait.
+    assert!(
+        redis_cli(&docker, &primary, password, &["INFO", "persistence"])
+            .await
+            .contains("saving:1"),
+        "the SAVE ended before its client was killed; populate more data"
+    );
     remove_rdb_snapshot(
         &docker,
         &RdbSnapshot {
