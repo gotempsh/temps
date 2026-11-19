@@ -27,6 +27,7 @@ import {
   ProviderFormData,
   providerUpdateSchema,
   telegramConfigFromForm,
+  telegramFormFieldsFromConfig,
 } from '@/components/monitoring/schemas'
 import { Button } from '@/components/ui/button'
 import {
@@ -120,9 +121,7 @@ export function EditNotificationProvider() {
           api_token: config.api_token as string,
 
           // Telegram config
-          bot_token: config.bot_token as string,
-          chat_id: config.chat_id as string,
-          message_thread_id: (config.message_thread_id as number) ?? undefined,
+          ...telegramFormFieldsFromConfig(config),
 
           // Email config
           smtp_host: config.smtp_host as string,

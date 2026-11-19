@@ -320,3 +320,25 @@ export function telegramConfigFromForm(config: ProviderFormData['config']) {
     message_thread_id: config.message_thread_id ?? null,
   }
 }
+
+/**
+ * The edit form's Telegram fields for a stored config. The generic provider
+ * endpoints store the config as submitted, and the server accepts `chat_id` as
+ * a JSON integer, so it can come back as a number; the form needs the string
+ * form or an unrelated edit (e.g. a rename) fails validation.
+ */
+export function telegramFormFieldsFromConfig(config: Record<string, unknown>) {
+  const chatId = config.chat_id
+  const threadId = config.message_thread_id
+  return {
+    bot_token: typeof config.bot_token === 'string' ? config.bot_token : '',
+    chat_id:
+      typeof chatId === 'string' || typeof chatId === 'number'
+        ? String(chatId)
+        : '',
+    message_thread_id:
+      typeof threadId === 'number' && Number.isSafeInteger(threadId)
+        ? threadId
+        : undefined,
+  }
+}

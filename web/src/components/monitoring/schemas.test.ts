@@ -7,6 +7,7 @@ import {
   providerSchema,
   providerUpdateSchema,
   telegramConfigFromForm,
+  telegramFormFieldsFromConfig,
 } from './schemas'
 
 const slackProvider = {
@@ -127,6 +128,45 @@ describe('telegram provider form', () => {
       config: { ...telegram.config, message_thread_id: 42 },
     })
     expect(withTopic.success).toBe(true)
+  })
+
+  test('a provider stored with an integer chat id (generic API) can be edited', () => {
+    // POST /notification-providers accepts `chat_id` as a JSON integer and
+    // stores the config as submitted; the API then returns it masked.
+    const stored = {
+      bot_token: '***',
+      chat_id: -1001234567890,
+      message_thread_id: 7,
+    }
+    const fields = telegramFormFieldsFromConfig(stored)
+    expect(fields).toEqual({
+      bot_token: '***',
+      chat_id: '-1001234567890',
+      message_thread_id: 7,
+    })
+    // A rename-only save from the edit page must validate.
+    const result = providerUpdateSchema.safeParse({
+      ...telegram,
+      name: 'Renamed alerts',
+      config: fields,
+    })
+    expect(result.success).toBe(true)
+    if (result.success) {
+      expect(telegramConfigFromForm(result.data.config).chat_id).toBe(
+        '-1001234567890'
+      )
+    }
+  })
+
+  test('missing or malformed stored Telegram fields load as empty, not as casts', () => {
+    expect(telegramFormFieldsFromConfig({})).toEqual({
+      bot_token: '',
+      chat_id: '',
+      message_thread_id: undefined,
+    })
+    expect(
+      telegramFormFieldsFromConfig({ chat_id: null, message_thread_id: '42' })
+    ).toEqual({ bot_token: '', chat_id: '', message_thread_id: undefined })
   })
 
   test('an emptied topic (NaN) is treated as unset', () => {
