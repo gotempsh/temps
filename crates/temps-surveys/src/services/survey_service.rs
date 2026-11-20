@@ -574,42 +574,65 @@ impl SurveyService {
             .map(|q| q.id.as_str())
             .collect::<Vec<_>>()
             .join(",");
-        // The distribution covers the questions that have one. Open-text
-        // answers are mostly distinct, so letting them into the grouped and
-        // limited query could push rare scores and choices past the row cap.
-        let distributed_ids = survey
-            .questions
-            .iter()
-            .filter(|q| q.kind != QuestionKind::OpenText)
-            .map(|q| q.id.as_str())
-            .collect::<Vec<_>>()
-            .join(",");
+        // The distribution covers the questions that have one (open text has
+        // none), and each answer is classified in the database before it is
+        // grouped: a declared choice or an integer score in range keeps its
+        // value, anything else (wrong JSON type, an unknown choice, an array
+        // for a scalar question, a score out of range) becomes one `other`
+        // row per question. The result is bounded by the definition, so junk
+        // values sent by a client can neither fill the row cap nor push out
+        // a rare valid answer.
+        let distributed = distribution_spec(&survey.questions);
         let (filter, values) = event_filter(project_id, survey_id, &window, 3);
         let mut sent_values = vec![SENT_EVENT.into(), question_ids.into()];
         sent_values.extend(values);
         let mut distribution_values = sent_values.clone();
-        distribution_values[1] = distributed_ids.into();
-        // Each answer is one row; a multiple-choice answer is one row per
-        // selection. `#>> '{}'` renders a JSON scalar as text (`"Pro"` ->
-        // `Pro`, `9` -> `9`).
+        distribution_values[1] = distributed.into();
         let responses = format!(
             "jsonb_each(CASE WHEN jsonb_typeof({PROPS}->'responses') = 'object' \
              THEN {PROPS}->'responses' ELSE '{{}}'::jsonb END) AS r(key, value)"
         );
+        // One row per (question, value) per event: a multiple-choice answer
+        // gives one per distinct selection, and NULL is the `other` bucket.
+        // `#>> '{}'` renders a JSON scalar as text (`"Pro"` -> `Pro`).
         let answers = AnswerCountRow::find_by_statement(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
             format!(
-                "SELECT r.key AS question_id, \
-                        (CASE WHEN jsonb_typeof(r.value) = 'array' THEN a.elem ELSE r.value END) #>> '{{}}' AS answer, \
-                        COUNT(*)::bigint AS count \
-                 FROM events e \
-                 CROSS JOIN LATERAL {responses} \
-                 LEFT JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(r.value) = 'array' \
-                     THEN r.value ELSE '[]'::jsonb END) AS a(elem) ON true \
-                 WHERE e.event_type = $1 AND r.key = ANY(string_to_array($2, ',')) \
-                   AND NOT (jsonb_typeof(r.value) = 'array' AND a.elem IS NULL) \
-                   AND {filter} \
-                 GROUP BY 1, 2 ORDER BY 3 DESC LIMIT {MAX_DISTRIBUTION_ROWS}"
+                "WITH q AS ( \
+                   SELECT x->>'id' AS id, x->>'kind' AS kind, x->'choices' AS choices, \
+                          (x->>'min')::numeric AS min, (x->>'max')::numeric AS max \
+                   FROM jsonb_array_elements($2::jsonb) AS x \
+                 ), classified AS ( \
+                   SELECT e.id AS event_id, q.id AS question_id, \
+                     CASE \
+                       WHEN q.kind = 'multiple_choice' THEN \
+                         CASE WHEN jsonb_typeof(r.value) = 'array' AND jsonb_typeof(v.value) = 'string' \
+                                   AND q.choices @> jsonb_build_array(v.value) \
+                              THEN v.value #>> '{{}}' END \
+                       WHEN q.kind = 'single_choice' THEN \
+                         CASE WHEN jsonb_typeof(v.value) = 'string' AND q.choices @> jsonb_build_array(v.value) \
+                              THEN v.value #>> '{{}}' END \
+                       WHEN jsonb_typeof(v.value) = 'number' THEN \
+                         CASE WHEN (v.value #>> '{{}}')::numeric BETWEEN q.min AND q.max \
+                                   AND (v.value #>> '{{}}')::numeric = trunc((v.value #>> '{{}}')::numeric) \
+                              THEN ((v.value #>> '{{}}')::numeric)::int::text END \
+                     END AS answer \
+                   FROM events e \
+                   CROSS JOIN LATERAL {responses} \
+                   JOIN q ON q.id = r.key \
+                   CROSS JOIN LATERAL ( \
+                     SELECT elem AS value FROM jsonb_array_elements( \
+                       CASE WHEN q.kind = 'multiple_choice' AND jsonb_typeof(r.value) = 'array' \
+                            THEN r.value ELSE '[]'::jsonb END) AS elem \
+                     UNION ALL \
+                     SELECT r.value WHERE NOT (q.kind = 'multiple_choice' AND jsonb_typeof(r.value) = 'array') \
+                   ) AS v \
+                   WHERE e.event_type = $1 \
+                     AND r.value NOT IN ('null'::jsonb, '\"\"'::jsonb, '[]'::jsonb) \
+                     AND {filter} \
+                 ) \
+                 SELECT question_id, answer, COUNT(DISTINCT event_id)::bigint AS count \
+                 FROM classified GROUP BY 1, 2 ORDER BY 3 DESC LIMIT {MAX_DISTRIBUTION_ROWS}"
             ),
             distribution_values,
         ))
@@ -632,12 +655,13 @@ impl SurveyService {
 
         let rows: Vec<AnswerRow> = answers
             .into_iter()
-            .filter_map(|row| {
-                row.answer.map(|answer| AnswerRow {
-                    question_id: row.question_id,
-                    answer,
-                    count: row.count,
-                })
+            .map(|row| AnswerRow {
+                question_id: row.question_id,
+                // NULL is the database's `other` bucket; summarizing counts
+                // any undeclared value as other, and a NUL can never be a
+                // declared choice (definitions refuse it).
+                answer: row.answer.unwrap_or_else(|| OTHER_ANSWER.to_string()),
+                count: row.count,
             })
             .collect();
         let answered: HashMap<String, i64> = answered
@@ -712,6 +736,30 @@ impl SurveyService {
     pub(crate) fn delivery(&self) -> &SurveyDeliveryCache {
         &self.delivery
     }
+}
+
+/// The value standing for the database's `other` bucket: never a declared
+/// choice (definitions refuse NUL characters) and never a score.
+const OTHER_ANSWER: &str = "\u{0}other";
+
+/// The distributed questions for the results query, as the JSON array its
+/// `q` table reads: id, kind, declared choices and the score range. Open
+/// text has no distribution and is left out.
+fn distribution_spec(questions: &[SurveyQuestion]) -> String {
+    let spec: Vec<serde_json::Value> = questions
+        .iter()
+        .filter(|q| q.kind != QuestionKind::OpenText)
+        .map(|q| {
+            serde_json::json!({
+                "id": q.id,
+                "kind": q.kind,
+                "choices": q.choices,
+                "min": q.scale_min(),
+                "max": q.scale_max(),
+            })
+        })
+        .collect();
+    serde_json::Value::Array(spec).to_string()
 }
 
 /// `WHERE` clauses shared by every results query, numbered from `first`.
@@ -1147,7 +1195,11 @@ mod tests {
             .map(|statement| format!("{:?}", statement.values))
             .collect();
         assert_eq!(values.len(), 2, "{values:?}");
-        assert!(values[0].contains("\"nps\""), "distribution: {}", values[0]);
+        assert!(
+            values[0].contains("nps") && !values[0].contains("why"),
+            "distribution: {}",
+            values[0]
+        );
         assert!(values[1].contains("\"nps,why\""), "answered: {}", values[1]);
     }
 }

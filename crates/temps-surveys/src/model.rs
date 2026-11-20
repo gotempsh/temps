@@ -247,6 +247,18 @@ pub fn validate(definition: &SurveyDefinition) -> Result<(), String> {
 
     validate_targeting(&definition.targeting, &mut problems);
 
+    // PostgreSQL cannot store U+0000 in text or JSONB; refused here it is a
+    // 400 naming the problem instead of a failed write.
+    let text = serde_json::json!({
+        "name": definition.name,
+        "description": definition.description,
+        "questions": definition.questions,
+        "targeting": definition.targeting,
+    });
+    if contains_nul(&text) {
+        problems.push("text must not contain NUL (U+0000) characters".to_string());
+    }
+
     match definition_size(definition) {
         Ok(bytes) if bytes > MAX_DEFINITION_BYTES => problems.push(format!(
             "questions and targeting take {bytes} bytes, maximum is {MAX_DEFINITION_BYTES}"
@@ -259,6 +271,18 @@ pub fn validate(definition: &SurveyDefinition) -> Result<(), String> {
         Ok(())
     } else {
         Err(problems.join("; "))
+    }
+}
+
+/// Whether any string or key in `value` contains U+0000.
+fn contains_nul(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(text) => text.contains('\0'),
+        serde_json::Value::Array(items) => items.iter().any(contains_nul),
+        serde_json::Value::Object(map) => map
+            .iter()
+            .any(|(key, value)| key.contains('\0') || contains_nul(value)),
+        _ => false,
     }
 }
 
@@ -374,6 +398,11 @@ fn validate_targeting(targeting: &SurveyTargeting, problems: &mut Vec<String>) {
                 "targeting: trigger_event '{event}' must be 1-{MAX_EVENT_NAME_LEN} characters of \
                  letters, digits, '_', '-', '.' and ':'"
             ));
+        } else if event.starts_with("survey_") {
+            problems.push(format!(
+                "targeting: trigger_event '{event}' is reserved: the SDK records survey_ events \
+                 itself and never opens a survey after one"
+            ));
         }
     }
     let rate = targeting.sample_rate;
@@ -418,6 +447,31 @@ mod tests {
             questions,
             targeting: SurveyTargeting::default(),
         }
+    }
+
+    #[test]
+    fn nul_characters_and_survey_trigger_events_are_refused() {
+        let mut nul = definition(vec![question("nps", QuestionKind::Nps)]);
+        nul.questions[0].prompt = "How\0 was it?".into();
+        let error = validate(&nul).unwrap_err();
+        assert!(error.contains("NUL (U+0000)"), "{error}");
+
+        let mut flagged = definition(vec![question("nps", QuestionKind::Nps)]);
+        flagged.targeting.flag = Some(SurveyFlagCondition {
+            key: "beta".into(),
+            value: serde_json::json!({ "a\0": 1 }),
+        });
+        assert!(validate(&flagged).unwrap_err().contains("NUL (U+0000)"));
+
+        let mut reserved = definition(vec![question("nps", QuestionKind::Nps)]);
+        reserved.targeting.trigger_event = Some("survey_sent".into());
+        let error = validate(&reserved).unwrap_err();
+        assert!(
+            error.contains("trigger_event 'survey_sent' is reserved"),
+            "{error}"
+        );
+        reserved.targeting.trigger_event = Some("surveyed".into());
+        assert!(validate(&reserved).is_ok());
     }
 
     #[test]

@@ -40,6 +40,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
+import { useEnvironmentFilter } from '@/components/project-frame/use-environment-filter'
 import { useGoBack } from '@/hooks/useGoBack'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ArrowLeft, Loader2, Pencil, Trash2 } from 'lucide-react'
@@ -71,7 +72,14 @@ export function SurveyDetail({ project }: SurveyDetailProps) {
   const goBack = useGoBack(listPath)
   const navigate = useNavigate()
   const [days, setDays] = useState<(typeof WINDOWS)[number]>(30)
-  const [page, setPage] = useState(1)
+  // Results follow the project bar's environment (`undefined` = all of
+  // them), like every other analytics page.
+  const [environmentId] = useEnvironmentFilter()
+  // The page belongs to the environment it was picked in: another
+  // environment's responses start again at page 1.
+  const [pageState, setPageState] = useState({ page: 1, environmentId })
+  const page = pageState.environmentId === environmentId ? pageState.page : 1
+  const setPage = (next: number) => setPageState({ page: next, environmentId })
   const [editOpen, setEditOpen] = useState(false)
   const [deleteOpen, setDeleteOpen] = useState(false)
   const path = { project_id: project.id, survey_id: surveyId }
@@ -85,11 +93,11 @@ export function SurveyDetail({ project }: SurveyDetailProps) {
   // since the page opened. The generated key stays the prefix, so the
   // invalidation below still matches.
   const resultsQuery = useQuery({
-    queryKey: [...getSurveyResultsQueryKey({ path }), { days }],
+    queryKey: [...getSurveyResultsQueryKey({ path }), { days, environmentId }],
     queryFn: async ({ signal }) => {
       const { data } = await getSurveyResults({
         path,
-        query: windowEndingNow(days),
+        query: { ...windowEndingNow(days), environment_id: environmentId },
         signal,
         throwOnError: true,
       })
@@ -98,11 +106,18 @@ export function SurveyDetail({ project }: SurveyDetailProps) {
     enabled: surveyId > 0,
   })
   const responsesQuery = useQuery({
-    queryKey: [...listSurveyResponsesQueryKey({ path }), { days, page }],
+    queryKey: [
+      ...listSurveyResponsesQueryKey({ path }),
+      { days, environmentId, page },
+    ],
     queryFn: async ({ signal }) => {
       const { data } = await listSurveyResponses({
         path,
-        query: { ...windowEndingNow(days), page },
+        query: {
+          ...windowEndingNow(days),
+          environment_id: environmentId,
+          page,
+        },
         signal,
         throwOnError: true,
       })

@@ -11,7 +11,7 @@
 //! browser state, so the SDK applies them.
 
 use temps_flags::services::EnvironmentFlags;
-use temps_flags::{bucket, evaluate_compiled, EvalContext};
+use temps_flags::{bucket, evaluate_compiled, EvalContext, EvalReason};
 
 use crate::model::{SurveyQuestion, SurveyTargeting};
 
@@ -44,8 +44,11 @@ pub fn in_sample(survey_id: i32, sample_rate: f64, subject: Option<&str>) -> boo
 }
 
 /// Whether the survey's flag condition holds for this context. A survey
-/// without one always passes. A flag that does not exist (or was archived)
-/// fails closed: the survey was meant for the flag's audience only.
+/// without one always passes. A flag that does not exist (or was archived),
+/// or whose evaluation failed, fails closed: the survey was meant for the
+/// flag's audience only, and a failed evaluation serves the default, which
+/// says nothing about that audience. Numbers compare by value, so `1` and
+/// `1.0` are the same condition.
 pub fn flag_condition_holds(
     targeting: &SurveyTargeting,
     flags: Option<&EnvironmentFlags>,
@@ -57,7 +60,30 @@ pub fn flag_condition_holds(
     let Some(flag) = flags.and_then(|flags| flags.get(&condition.key)) else {
         return false;
     };
-    evaluate_compiled(&flag.snapshot, &flag.patterns, ctx).value == condition.value
+    let evaluation = evaluate_compiled(&flag.snapshot, &flag.patterns, ctx);
+    evaluation.reason != EvalReason::Error && same_value(&evaluation.value, &condition.value)
+}
+
+/// JSON equality, except that numbers are equal when their values are:
+/// `serde_json` keeps `1` and `1.0` apart, and a console round trip through
+/// JavaScript turns one into the other.
+fn same_value(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    use serde_json::Value;
+    match (a, b) {
+        (Value::Number(x), Value::Number(y)) => match (x.as_f64(), y.as_f64()) {
+            (Some(x), Some(y)) => x == y,
+            _ => x == y,
+        },
+        (Value::Array(x), Value::Array(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(x, y)| same_value(x, y))
+        }
+        (Value::Object(x), Value::Object(y)) => {
+            x.len() == y.len()
+                && x.iter()
+                    .all(|(key, x)| y.get(key).is_some_and(|y| same_value(x, y)))
+        }
+        _ => a == b,
+    }
 }
 
 /// The surveys this visitor may see, in the order the project created them.
@@ -96,12 +122,28 @@ mod tests {
     }
 
     fn flags(key: &str, enabled: bool) -> EnvironmentFlags {
+        flag_serving(
+            key,
+            enabled,
+            FlagValueType::Bool,
+            serde_json::json!(true),
+            serde_json::json!(false),
+        )
+    }
+
+    fn flag_serving(
+        key: &str,
+        enabled: bool,
+        value_type: FlagValueType,
+        value: serde_json::Value,
+        default_value: serde_json::Value,
+    ) -> EnvironmentFlags {
         let snapshot = FlagSnapshot {
             key: key.into(),
-            value_type: FlagValueType::Bool,
+            value_type,
             enabled,
-            environment_value: Some(serde_json::json!(true)),
-            default_value: serde_json::json!(false),
+            environment_value: Some(value),
+            default_value,
             salt: "salt".into(),
             variants: Vec::new(),
             rules: Vec::new(),
@@ -164,6 +206,60 @@ mod tests {
         // Independent 50% samples overlap on about a quarter of visitors; the
         // same bucket for both would overlap on half.
         assert!((2_200..=2_800).contains(&both), "{both} of 10000");
+    }
+
+    fn on(key: &str, value: serde_json::Value) -> SurveyTargeting {
+        SurveyTargeting {
+            flag: Some(SurveyFlagCondition {
+                key: key.into(),
+                value,
+            }),
+            ..SurveyTargeting::default()
+        }
+    }
+
+    #[test]
+    fn a_failed_evaluation_fails_closed_even_when_the_default_matches() {
+        // The stored value is not a boolean, so the flag serves its default
+        // (false) with reason ERROR; a condition on `false` must not hold.
+        let broken = flag_serving(
+            "beta",
+            true,
+            FlagValueType::Bool,
+            serde_json::json!("yes"),
+            serde_json::json!(false),
+        );
+        assert!(!flag_condition_holds(
+            &on("beta", serde_json::json!(false)),
+            Some(&broken),
+            &ctx(None)
+        ));
+    }
+
+    #[test]
+    fn numeric_conditions_compare_by_value() {
+        let served = flag_serving(
+            "limit",
+            true,
+            FlagValueType::Number,
+            serde_json::json!(1.0),
+            serde_json::json!(0),
+        );
+        assert!(flag_condition_holds(
+            &on("limit", serde_json::json!(1)),
+            Some(&served),
+            &ctx(None)
+        ));
+        assert!(!flag_condition_holds(
+            &on("limit", serde_json::json!(2)),
+            Some(&served),
+            &ctx(None)
+        ));
+        assert!(same_value(
+            &serde_json::json!({"a": [1, 2.0]}),
+            &serde_json::json!({"a": [1.0, 2]})
+        ));
+        assert!(!same_value(&serde_json::json!("1"), &serde_json::json!(1)));
     }
 
     #[test]
