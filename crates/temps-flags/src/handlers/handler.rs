@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Extension, Path, Query, State},
+    extract::{DefaultBodyLimit, Extension, Path, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::IntoResponse,
     routing::{delete, get, patch, post, put},
@@ -31,7 +31,7 @@ use super::audit::{
 use super::public::{
     ofrep_server_bulk, ofrep_server_single, OfrepBulkResponse, OfrepEvaluationFailure,
     OfrepEvaluationRequest, OfrepEvaluationSuccess, OfrepMetadata, PublicFlagEvaluation,
-    PublicFlagsRequest, PublicFlagsResponse,
+    PublicFlagsRequest, PublicFlagsResponse, EVALUATION_BODY_LIMIT,
 };
 use super::types::*;
 use crate::error::FlagError;
@@ -40,7 +40,7 @@ use crate::eval::{
     FlagRule, FlagSnapshot, FlagValueType, FlagVariant, RuleCondition, RuleServe, VariantWeight,
 };
 use crate::services::{
-    normalize_pagination, CreateFlag, SetEnvironmentValue, SetRules, UpdateFlag,
+    normalize_pagination, CreateFlag, SetEnvironmentValue, SetRules, UpdateFlag, UpdatedFlag,
 };
 
 #[derive(OpenApi)]
@@ -134,8 +134,16 @@ pub fn configure_routes() -> Router<Arc<FlagsAppState>> {
         )
         // OpenFeature Remote Evaluation Protocol for server-side SDKs; scope
         // comes from the deployment token.
-        .route("/ofrep/v1/evaluate/flags", post(ofrep_server_bulk))
-        .route("/ofrep/v1/evaluate/flags/{key}", post(ofrep_server_single))
+        // Bounded like the public OFREP routes; axum's default would accept
+        // 2 MB before `parse_ofrep` ever saw it.
+        .route(
+            "/ofrep/v1/evaluate/flags",
+            post(ofrep_server_bulk).layer(DefaultBodyLimit::max(EVALUATION_BODY_LIMIT)),
+        )
+        .route(
+            "/ofrep/v1/evaluate/flags/{key}",
+            post(ofrep_server_single).layer(DefaultBodyLimit::max(EVALUATION_BODY_LIMIT)),
+        )
         // Delivery endpoint for running services. Scope comes from the
         // deployment token, not the URL.
         .route("/flags/snapshot", get(get_flag_snapshot))
@@ -476,6 +484,7 @@ pub async fn get_flag(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Flag not found"),
+        (status = 409, description = "Flag changed since it was read"),
         (status = 500, description = "Internal server error")
     ),
     security(("bearer_auth" = []))
@@ -490,14 +499,15 @@ pub async fn update_flag(
     project_scope_guard!(auth, project_id);
     project_permission_guard!(auth, FlagsWrite, project_id, &state.project_access_checker);
 
-    // One read for the before-image; `update()` reuses it rather than
-    // fetching the flag a second time, and the environments come back with it
-    // instead of costing a third round trip.
+    // The service returns the row it locked as the before-image, so the audit
+    // records the transition this write made even when another writer
+    // committed after this request was sent.
     let expected_updated_at = parse_revision(request.expected_updated_at)?;
-    let before = state.flag_service.get(project_id, &key).await?;
-    let before_flag = before.flag.clone();
-
-    let flag = state
+    let UpdatedFlag {
+        before: before_flag,
+        flag,
+        environments,
+    } = state
         .flag_service
         .update(
             project_id,
@@ -531,7 +541,7 @@ pub async fn update_flag(
         error!("Failed to create audit log for feature flag update: {}", e);
     }
 
-    Ok(Json(FlagResponse::new(flag, before.environments)))
+    Ok(Json(FlagResponse::new(flag, environments)))
 }
 
 #[utoipa::path(
@@ -802,6 +812,10 @@ pub async fn reshuffle_flag(
     project_scope_guard!(auth, project_id);
     project_permission_guard!(auth, FlagsWrite, project_id, &state.project_access_checker);
 
+    // Read the environments first: a reshuffle does not change them, and a
+    // read failing after the new salt is committed would report a reshuffle
+    // that did happen as failed, inviting a retry that reshuffles again.
+    let environments = state.flag_service.get(project_id, &key).await?.environments;
     let flag = state.flag_service.reshuffle(project_id, &key).await?;
 
     let audit = FeatureFlagReshuffledAudit {
@@ -817,7 +831,6 @@ pub async fn reshuffle_flag(
         );
     }
 
-    let environments = state.flag_service.get(project_id, &key).await?.environments;
     Ok(Json(FlagResponse::new(flag, environments)))
 }
 
@@ -834,7 +847,7 @@ pub async fn reshuffle_flag(
     request_body = EvaluateFlagRequest,
     responses(
         (status = 200, description = "Evaluation", body = Evaluation),
-        (status = 400, description = "Environment not in project"),
+        (status = 400, description = "Environment not in project, or the context exceeds the evaluation limits"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Flag or environment not found"),
@@ -859,6 +872,15 @@ pub async fn evaluate_flag(
         key: request.key,
         attributes: request.attributes,
     };
+    // The same bounds as the app-facing endpoints: an attribute longer than
+    // the SDKs accept would otherwise test differently here than in an app.
+    if let Err(reason) = super::public::check_context(&context) {
+        return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid Flag Context")
+            .with_detail(format!(
+                "Cannot evaluate flag '{key}' in project {project_id}: {reason}"
+            )));
+    }
     let evaluation = state
         .flag_service
         .evaluate_for_console(project_id, &key, request.environment_id, &context)

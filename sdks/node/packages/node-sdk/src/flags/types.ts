@@ -100,7 +100,8 @@ export interface FlagSnapshotResponse {
 export interface EvalContext {
   /**
    * Stable bucketing subject (user id, account id, device id). Rules with a
-   * rollout percentage or a variant split are skipped without one.
+   * rollout below 100% or a variant split are skipped without one; a 100%
+   * rollout serving a value or a variant matches without it.
    */
   key?: string;
   /** Targeting attributes, e.g. `{ plan: 'enterprise', country: 'DE' }`. */

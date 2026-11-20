@@ -175,7 +175,7 @@ pub struct OfrepBulkResponse {
 
 /// Reject a context the endpoints will not evaluate. Bounded so a public
 /// caller cannot make one request expensive.
-fn check_context(ctx: &EvalContext) -> Result<(), String> {
+pub(crate) fn check_context(ctx: &EvalContext) -> Result<(), String> {
     if ctx.attributes.len() > MAX_CONTEXT_ATTRIBUTES {
         return Err(format!(
             "{} attributes sent, maximum is {MAX_CONTEXT_ATTRIBUTES}",
@@ -331,20 +331,31 @@ fn parse_body<T: for<'de> Deserialize<'de> + Default>(body: &Bytes) -> Result<T,
 
 /// Bulk OFREP results depend on the context as much as on the definitions,
 /// so the tag covers both: the same tag means the same answer.
+///
+/// Every field is length-prefixed, so no subject key can produce the same
+/// bytes as a shorter key followed by an attribute, and an absent key is
+/// distinct from an empty one.
 fn bulk_etag(definitions: &str, ctx: &EvalContext) -> String {
+    fn field(hasher: &mut Sha256, bytes: &[u8]) {
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+    }
     let mut hasher = Sha256::new();
-    hasher.update(definitions.as_bytes());
-    hasher.update([0u8]);
-    hasher.update(ctx.key.as_deref().unwrap_or("").as_bytes());
+    field(&mut hasher, definitions.as_bytes());
+    match ctx.key.as_deref() {
+        Some(key) => {
+            hasher.update([1u8]);
+            field(&mut hasher, key.as_bytes());
+        }
+        None => hasher.update([0u8]),
+    }
     let mut names: Vec<&String> = ctx.attributes.keys().collect();
     names.sort();
+    hasher.update((names.len() as u64).to_be_bytes());
     for name in names {
-        hasher.update([0u8]);
-        hasher.update(name.as_bytes());
-        hasher.update([1u8]);
-        if let Ok(value) = serde_json::to_vec(&ctx.attributes[name]) {
-            hasher.update(&value);
-        }
+        field(&mut hasher, name.as_bytes());
+        let value = serde_json::to_vec(&ctx.attributes[name]).unwrap_or_default();
+        field(&mut hasher, &value);
     }
     format!("\"{}\"", hex::encode(&hasher.finalize()[..16]))
 }
@@ -1059,6 +1070,33 @@ mod tests {
         assert_eq!(bulk_etag("d", &a), bulk_etag("d", &a));
         assert_ne!(bulk_etag("d", &a), bulk_etag("d", &b));
         assert_ne!(bulk_etag("d", &a), bulk_etag("e", &a));
+    }
+
+    /// A key that embeds what looks like an encoded attribute must not share
+    /// a tag with the shorter key plus that attribute.
+    #[test]
+    fn the_bulk_etag_frames_every_field() {
+        let mut attributes = HashMap::new();
+        attributes.insert("plan".to_string(), AttributeValue::String("pro".into()));
+        let split = EvalContext {
+            key: Some("u".into()),
+            attributes,
+        };
+        let joined = EvalContext {
+            key: Some("u\u{0}plan\u{1}\"pro\"".into()),
+            attributes: HashMap::new(),
+        };
+        assert_ne!(bulk_etag("d", &split), bulk_etag("d", &joined));
+
+        let absent = EvalContext {
+            key: None,
+            attributes: HashMap::new(),
+        };
+        let empty = EvalContext {
+            key: Some(String::new()),
+            attributes: HashMap::new(),
+        };
+        assert_ne!(bulk_etag("d", &absent), bulk_etag("d", &empty));
     }
 
     #[test]

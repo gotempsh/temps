@@ -85498,6 +85498,10 @@ export type UpdateFlagErrors = {
      */
     404: unknown;
     /**
+     * Flag changed since it was read
+     */
+    409: unknown;
+    /**
      * Internal server error
      */
     500: unknown;
@@ -85638,7 +85642,7 @@ export type EvaluateFlagData = {
 
 export type EvaluateFlagErrors = {
     /**
-     * Environment not in project
+     * Environment not in project, or the context exceeds the evaluation limits
      */
     400: unknown;
     /**

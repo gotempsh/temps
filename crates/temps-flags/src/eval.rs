@@ -34,7 +34,7 @@
 //! - A condition on an attribute the context does not carry is false, except
 //!   `not_exists`. Targeting fails closed: a subject we know nothing about
 //!   gets the untargeted value, never the targeted one.
-//! - A rule that needs a bucketing subject (a rollout percentage or a split)
+//! - A rule that needs a bucketing subject (a rollout below 100% or a split)
 //!   is skipped when the context has no `key`. It does not match, it does not
 //!   error: the next rule, then the environment value, apply.
 //! - A rule that cannot be evaluated at all (a pattern that does not compile,
@@ -168,8 +168,8 @@ impl AttributeValue {
 #[derive(Debug, Clone, Default)]
 pub struct EvalContext {
     /// Stable bucketing subject (user id, account id, device id). Required by
-    /// rules with a rollout percentage or a split; without it those rules are
-    /// skipped.
+    /// rules with a rollout below 100% or a split; without it those rules are
+    /// skipped. A 100% rollout serving a value or a variant does not need it.
     pub key: Option<String>,
     /// Targeting attributes.
     pub attributes: HashMap<String, AttributeValue>,
@@ -401,11 +401,19 @@ pub fn compile_pattern(pattern: &str) -> Result<Regex, String> {
             pattern.len()
         ));
     }
-    regex::RegexBuilder::new(&format!("^(?:{pattern})$"))
-        .size_limit(PATTERN_SIZE_LIMIT)
-        .dfa_size_limit(PATTERN_SIZE_LIMIT)
-        .build()
-        .map_err(|e| e.to_string())
+    // Compile the pattern on its own first. Wrapping it in `^(?:…)$` without
+    // that check would let `pro)|(?:team` balance against the wrapper's own
+    // parentheses and compile into `^(?:pro)|(?:team)$`, which is no longer
+    // anchored at both ends and is not the pattern the author wrote.
+    let build = |source: &str| {
+        regex::RegexBuilder::new(source)
+            .size_limit(PATTERN_SIZE_LIMIT)
+            .dfa_size_limit(PATTERN_SIZE_LIMIT)
+            .build()
+            .map_err(|e| e.to_string())
+    };
+    build(pattern)?;
+    build(&format!("^(?:{pattern})$"))
 }
 
 impl CompiledPatterns {
@@ -443,11 +451,13 @@ struct Malformed;
 /// Compiles `matches` patterns on the fly; callers evaluating the same flag
 /// repeatedly should hold a [`CompiledPatterns`] and use [`evaluate_compiled`].
 pub fn evaluate(flag: &FlagSnapshot, ctx: &EvalContext) -> Evaluation {
-    let patterns = if flag
-        .rules
-        .iter()
-        .flat_map(|rule| &rule.conditions)
-        .any(|condition| condition.operator == ConditionOperator::Matches)
+    // A disabled flag runs no rule, so there is nothing to compile.
+    let patterns = if flag.enabled
+        && flag
+            .rules
+            .iter()
+            .flat_map(|rule| &rule.conditions)
+            .any(|condition| condition.operator == ConditionOperator::Matches)
     {
         CompiledPatterns::for_flag(flag)
     } else {
@@ -504,6 +514,14 @@ fn evaluate_rule(
         }
     }
 
+    // Shape first, subject second: a malformed split is an `ERROR` whether or
+    // not this caller sent a key, and whether or not a partial rollout would
+    // have skipped the rule for them, so whether a broken rule is noticed never
+    // depends on who happens to be asking.
+    if let RuleServe::Split { split } = &rule.serve {
+        check_split(flag, split)?;
+    }
+
     let subject = ctx.key.as_deref().filter(|key| !key.is_empty());
     let mut bucketed = false;
 
@@ -542,10 +560,6 @@ fn evaluate_rule(
             )))
         }
         RuleServe::Split { split } => {
-            // Shape first, subject second: a malformed split is an `ERROR`
-            // whether or not this caller sent a key, so whether a broken rule
-            // is noticed never depends on who happens to be asking.
-            check_split(flag, split)?;
             let Some(subject) = subject else {
                 return Ok(None);
             };
@@ -1429,6 +1443,47 @@ mod tests {
             "program size is bounded"
         );
         assert!(compile_pattern(r"[a-z]+").is_ok());
+    }
+
+    /// A pattern whose parentheses only balance against the anchoring wrapper
+    /// would compile into an unanchored alternation, so it is refused.
+    #[test]
+    fn a_pattern_that_escapes_its_anchors_is_rejected() {
+        assert!(compile_pattern("pro)|(?:team").is_err());
+        assert!(compile_pattern("pro|team").is_ok());
+
+        let mut flag = snapshot(true, None);
+        flag.rules = vec![serve_true_when(vec![condition(
+            "plan",
+            ConditionOperator::Matches,
+            Some(ConditionValue::Single(s("pro)|(?:team"))),
+        )])];
+        let result = evaluate(&flag, &ctx(None, &[("plan", s("professional"))]));
+        assert_eq!(result.reason, EvalReason::Error);
+    }
+
+    /// A partial rollout must not hide a broken split from callers who fall
+    /// outside it or send no key.
+    #[test]
+    fn a_malformed_split_behind_a_partial_rollout_degrades_to_error() {
+        let mut flag = string_flag_with_variants();
+        let mut rule = fifty_fifty();
+        if let RuleServe::Split { split } = &mut rule.serve {
+            split[1].weight = 40;
+        }
+        rule.rollout_percentage = Some(10.0);
+        flag.rules = vec![rule];
+
+        assert_eq!(
+            evaluate(&flag, &EvalContext::default()).reason,
+            EvalReason::Error
+        );
+        for key in ["a", "b", "c", "d", "e"] {
+            assert_eq!(
+                evaluate(&flag, &ctx(Some(key), &[])).reason,
+                EvalReason::Error
+            );
+        }
     }
 
     #[test]

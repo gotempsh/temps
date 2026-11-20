@@ -8,5 +8,5 @@ pub mod validation;
 pub use delivery::{DeliveredFlag, EnvironmentFlags};
 pub use flag_service::{
     normalize_pagination, parse_rules, parse_variants, CreateFlag, FlagService,
-    FlagWithEnvironments, SetEnvironmentValue, SetRules, UpdateFlag,
+    FlagWithEnvironments, SetEnvironmentValue, SetRules, UpdateFlag, UpdatedFlag,
 };

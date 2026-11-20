@@ -162215,6 +162215,9 @@
           "404": {
             "description": "Flag not found"
           },
+          "409": {
+            "description": "Flag changed since it was read"
+          },
           "500": {
             "description": "Internal server error"
           }
@@ -162443,7 +162446,7 @@
             "description": "Evaluation"
           },
           "400": {
-            "description": "Environment not in project"
+            "description": "Environment not in project, or the context exceeds the evaluation limits"
           },
           "401": {
             "description": "Unauthorized"

@@ -113,11 +113,18 @@ function sanitized<T>(
 
 class Malformed extends Error {}
 
+/**
+ * The finite decimal numbers the server's evaluator (Rust's `f64` parser)
+ * accepts. `Number()` alone also reads `0x10`, `0b1` and `0o7`, which the
+ * server treats as plain strings, so the two evaluators would disagree.
+ */
+const DECIMAL = /^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/;
+
 function asNumber(value: AttributeValue): number | null {
   if (typeof value === 'number') return Number.isFinite(value) ? value : null;
   if (typeof value === 'string') {
     const trimmed = value.trim();
-    if (trimmed === '') return null;
+    if (!DECIMAL.test(trimmed)) return null;
     const parsed = Number(trimmed);
     return Number.isFinite(parsed) ? parsed : null;
   }
@@ -139,7 +146,10 @@ function compiledPattern(source: string): RegExp {
   let compiled = patternCache.get(source);
   if (compiled === undefined) {
     try {
-      compiled = source.length > 256 ? null : new RegExp(`^(?:${source})$`, 'u');
+      // Compile the pattern alone first, as the server does: `pro)|(?:team`
+      // only balances against the wrapper and would escape its anchors.
+      compiled =
+        source.length > 256 ? null : (new RegExp(source, 'u'), new RegExp(`^(?:${source})$`, 'u'));
     } catch {
       compiled = null;
     }
@@ -255,6 +265,10 @@ function evaluateRule<T>(
     if (!conditionHolds(condition, attributes)) return null;
   }
 
+  // Shape first, subject second, as on the server: a malformed split is an
+  // ERROR even for callers a partial rollout or a missing key would skip.
+  if (rule.serve?.kind === 'split') checkSplit(flag, rule.serve.split ?? []);
+
   const subject = context.key ? context.key : null;
   let bucketed = false;
   const percentage = rule.rollout_percentage;
@@ -278,7 +292,6 @@ function evaluateRule<T>(
       return sanitized<T>(flag, variant.value, reason(bucketed), fallback, variant.key);
     }
     case 'split': {
-      checkSplit(flag, serve.split ?? []);
       if (subject === null) return null;
       const variant = findVariant(flag, pickSplit(flag, serve.split ?? [], subject));
       return sanitized<T>(flag, variant.value, reason(true), fallback, variant.key);

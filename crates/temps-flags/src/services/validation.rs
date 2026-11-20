@@ -40,6 +40,37 @@ fn invalid(key: &str, message: String) -> FlagError {
     }
 }
 
+/// Whether a JSON document contains U+0000 in any string, key or value.
+/// PostgreSQL's `jsonb` cannot store it, so such a write would fail at the
+/// database with an error that names no field.
+fn contains_nul(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(text) => text.contains('\0'),
+        serde_json::Value::Array(items) => items.iter().any(contains_nul),
+        serde_json::Value::Object(map) => map
+            .iter()
+            .any(|(key, value)| key.contains('\0') || contains_nul(value)),
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+            false
+        }
+    }
+}
+
+/// Refuse `item` when its stored JSON would contain U+0000.
+fn reject_nul<T: serde::Serialize>(flag_key: &str, item: &T, what: &str) -> Result<(), FlagError> {
+    match serde_json::to_value(item) {
+        Ok(value) if !contains_nul(&value) => Ok(()),
+        Ok(_) => Err(invalid(
+            flag_key,
+            format!("{what} contains a NUL character (U+0000), which cannot be stored"),
+        )),
+        Err(e) => Err(invalid(
+            flag_key,
+            format!("{what} cannot be serialized for storage: {e}"),
+        )),
+    }
+}
+
 /// Variant keys follow the flag-key alphabet so they are safe as analytics
 /// dimension values and in URLs.
 fn validate_variant_key(flag_key: &str, variant_key: &str) -> Result<(), FlagError> {
@@ -75,6 +106,7 @@ pub fn validate_variants(
     let mut seen = HashSet::new();
     for variant in variants {
         validate_variant_key(flag_key, &variant.key)?;
+        reject_nul(flag_key, variant, &format!("variant '{}'", variant.key))?;
         if !seen.insert(variant.key.as_str()) {
             return Err(invalid(
                 flag_key,
@@ -176,6 +208,7 @@ pub fn validate_rules(
     }
 
     for (index, rule) in rules.iter().enumerate() {
+        reject_nul(flag_key, rule, &format!("rule {index}"))?;
         if let Some(description) = &rule.description {
             if description.len() > MAX_RULE_DESCRIPTION_LEN {
                 return Err(invalid(
@@ -408,6 +441,31 @@ mod tests {
             Err(error) => error.to_string(),
             Ok(()) => panic!("expected a validation error"),
         }
+    }
+
+    #[test]
+    fn nul_characters_are_refused_before_they_reach_jsonb() {
+        let mut declared = variants();
+        declared[0].description = Some("beta\0".into());
+        let error = validate_variants("f", FlagValueType::String, &declared).unwrap_err();
+        assert!(error.to_string().contains("variant 'control'"), "{error}");
+
+        let mut declared = variants();
+        declared[1].value = serde_json::json!("ne\0w");
+        assert!(validate_variants("f", FlagValueType::String, &declared).is_err());
+        assert!(validate_variants("f", FlagValueType::String, &variants()).is_ok());
+
+        let operand = rule(
+            vec![cond(
+                "plan",
+                ConditionOperator::Eq,
+                Some(ConditionValue::Single(AttributeValue::String("p\0".into()))),
+            )],
+            RuleServe::Variant {
+                variant: "test".into(),
+            },
+        );
+        assert!(message(check(vec![operand])).contains("rule 0"));
     }
 
     #[test]
