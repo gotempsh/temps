@@ -141,12 +141,16 @@ pub struct IngestSignalSetup {
     pub signal: IngestSignal,
     pub endpoints: Vec<IngestEndpoint>,
     pub auth: IngestAuth,
-    /// For OTLP signals: the value of `OTEL_EXPORTER_OTLP_ENDPOINT`. SDKs
-    /// append `/v1/traces` or `/v1/logs` to it.
+    /// For OTLP signals without an environment: the value of
+    /// `OTEL_EXPORTER_OTLP_ENDPOINT`. SDKs append `/v1/traces` or `/v1/logs`
+    /// to it. `None` with an environment, whose per-signal URLs in
+    /// `endpoints` go in `OTEL_EXPORTER_OTLP_{TRACES,LOGS}_ENDPOINT`.
     #[schema(example = "https://temps.example.com/api/otel")]
     pub otlp_endpoint: Option<String>,
     /// Whether the project has what this signal needs. `false` means a
-    /// credential still has to be created.
+    /// credential still has to be created. Logs and traces are always `true`:
+    /// they authenticate with the caller's own API key, which is not project
+    /// state; `auth.credential_path` and `auth.cli_command` say how to get one.
     pub configured: bool,
     /// What is missing when `configured` is `false`.
     pub reason: Option<String>,
@@ -203,7 +207,8 @@ impl IngestSetupService {
         let base = normalize_base_url(project_id, public_base_url)?;
 
         // One round trip: the project, the environment check and both
-        // credential checks.
+        // credential checks. A credential bound to a soft-deleted environment
+        // is rejected by the ingest routes, so it does not count here either.
         let row = IngestSetupRow::find_by_statement(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
             r#"
@@ -216,11 +221,19 @@ impl IngestSetupService {
                        SELECT 1 FROM analytics_ingest_keys k
                        WHERE k.project_id = p.id AND k.is_active AND k.revoked_at IS NULL
                          AND ($2::int IS NULL OR k.environment_id IS NULL OR k.environment_id = $2)
+                         AND (k.environment_id IS NULL OR EXISTS (
+                             SELECT 1 FROM environments ke
+                             WHERE ke.id = k.environment_id AND ke.deleted_at IS NULL
+                         ))
                    ) AS has_analytics_key,
                    EXISTS (
                        SELECT 1 FROM project_dsns d
                        WHERE d.project_id = p.id AND d.is_active
                          AND ($2::int IS NULL OR d.environment_id IS NULL OR d.environment_id = $2)
+                         AND (d.environment_id IS NULL OR EXISTS (
+                             SELECT 1 FROM environments de
+                             WHERE de.id = d.environment_id AND de.deleted_at IS NULL
+                         ))
                    ) AS has_dsn
             FROM projects p
             WHERE p.id = $1 AND p.is_deleted = false
@@ -265,6 +278,11 @@ fn normalize_base_url(project_id: i32, url: &str) -> Result<String, IngestSetupE
         .ok_or_else(|| invalid("must start with http:// or https://"))?;
     if rest.is_empty() || rest.starts_with('/') {
         return Err(invalid("has no host"));
+    }
+    // Ingest paths are appended to the base, so a query or fragment would
+    // swallow them (`https://h?x=1/api/_temps/event` posts to `/`).
+    if trimmed.contains('?') || trimmed.contains('#') {
+        return Err(invalid("must not contain a query string or fragment"));
     }
     Ok(trimmed.to_string())
 }
@@ -321,7 +339,8 @@ fn build_setup(
         )
     };
 
-    let api_key_auth = |otlp_project_header: bool| IngestAuth {
+    let api_key_auth = |otlp_project_header: bool| {
+        IngestAuth {
         kind: IngestAuthKind::ApiKey,
         env_var: API_KEY_ENV_VAR.to_string(),
         headers: {
@@ -337,7 +356,15 @@ fn build_setup(
         query_param: None,
         browser_safe: false,
         credential_path: "/keys/new".to_string(),
-        cli_command: format!("temps apikeys create --name {slug}-telemetry --role user"),
+        // OTLP ingest accepts any active `tk_` key whose owner can access the
+        // project, whatever its permissions, so the exporter key gets only
+        // `otel:write`: no reads and no project or deployment management.
+        // `--project-id` is left out because project-confined keys (`tkp_`)
+        // are not accepted by the OTLP routes.
+        cli_command: format!(
+            "temps apikeys create --name {slug}-telemetry --role custom --permissions otel:write --yes"
+        ),
+    }
     };
 
     // With an environment, the path-based routes attribute data to it and
@@ -347,20 +374,30 @@ fn build_setup(
         Some(env) => format!("{base}{OTLP_BASE_PATH}/v1/{project_id}/{env}/0/{signal}"),
         None => format!("{base}{OTLP_BASE_PATH}/v1/{signal}"),
     };
-    let otlp = |signal: IngestSignal, name: &str, path: &str| IngestSignalSetup {
-        signal,
-        endpoints: vec![endpoint(
-            name,
-            "POST",
-            otlp_signal_url(path),
-            "application/x-protobuf",
-        )],
-        auth: api_key_auth(environment_id.is_none()),
-        otlp_endpoint: Some(format!("{base}{OTLP_BASE_PATH}")),
-        configured: true,
-        reason: None,
-        setup_path: format!("{project_path}/traces#traces-setup"),
-    };
+    // `OTEL_EXPORTER_OTLP_ENDPOINT` only works for the header-based routes:
+    // SDKs append `/v1/{signal}` to it, which can't reach the environment's
+    // path-based routes. With an environment, callers use the per-signal URLs.
+    let otlp_base = environment_id
+        .is_none()
+        .then(|| format!("{base}{OTLP_BASE_PATH}"));
+    let otlp =
+        |signal: IngestSignal, name: &str, path: &str, setup_path: String| IngestSignalSetup {
+            signal,
+            endpoints: vec![endpoint(
+                name,
+                "POST",
+                otlp_signal_url(path),
+                "application/x-protobuf",
+            )],
+            auth: api_key_auth(environment_id.is_none()),
+            otlp_endpoint: otlp_base.clone(),
+            // The credential is the caller's own API key, not project state, so
+            // there is nothing project-side to check; `auth` always says how to
+            // create one.
+            configured: true,
+            reason: None,
+            setup_path,
+        };
 
     let signals = vec![
         IngestSignalSetup {
@@ -432,8 +469,18 @@ fn build_setup(
             reason: (!has_dsn).then(|| "No active DSN exists for this project yet".to_string()),
             setup_path: errors_setup,
         },
-        otlp(IngestSignal::Logs, "otlp_logs", "logs"),
-        otlp(IngestSignal::Traces, "otlp_traces", "traces"),
+        otlp(
+            IngestSignal::Logs,
+            "otlp_logs",
+            "logs",
+            format!("{project_path}/telemetry-logs"),
+        ),
+        otlp(
+            IngestSignal::Traces,
+            "otlp_traces",
+            "traces",
+            format!("{project_path}/traces#traces-setup"),
+        ),
     ];
 
     ProjectIngestSetup {
@@ -557,6 +604,70 @@ mod tests {
             .auth
             .cli_command
             .ends_with("--environment-id 7"));
+        // SDKs append /v1/{signal} to OTEL_EXPORTER_OTLP_ENDPOINT, which would
+        // reach the header-based route and lose the environment.
+        for otlp in [IngestSignal::Logs, IngestSignal::Traces] {
+            assert_eq!(signal(&setup, otlp).otlp_endpoint, None, "{otlp:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn logs_and_traces_point_at_their_own_setup_pages() {
+        let setup = service(vec![row(true, true, true)])
+            .get_ingest_setup(42, None, "https://temps.example.com")
+            .await
+            .expect("setup resolves");
+        assert_eq!(
+            signal(&setup, IngestSignal::Logs).setup_path,
+            "/projects/my-app/telemetry-logs"
+        );
+        assert_eq!(
+            signal(&setup, IngestSignal::Traces).setup_path,
+            "/projects/my-app/traces#traces-setup"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_exporter_key_command_grants_only_otel_write_without_prompts() {
+        let setup = service(vec![row(true, true, true)])
+            .get_ingest_setup(42, None, "https://temps.example.com")
+            .await
+            .expect("setup resolves");
+        for otlp in [IngestSignal::Logs, IngestSignal::Traces] {
+            let command = &signal(&setup, otlp).auth.cli_command;
+            assert_eq!(
+                command,
+                "temps apikeys create --name my-app-telemetry --role custom --permissions otel:write --yes"
+            );
+            assert!(!command.contains("--role user"), "{otlp:?}: {command}");
+        }
+    }
+
+    #[tokio::test]
+    async fn credentials_of_deleted_environments_do_not_count() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![row(true, true, true)]])
+                .into_connection(),
+        );
+        IngestSetupService::new(db.clone())
+            .get_ingest_setup(42, None, "https://temps.example.com")
+            .await
+            .expect("setup resolves");
+        let log = Arc::try_unwrap(db)
+            .expect("the service is dropped")
+            .into_transaction_log();
+        let sql = format!("{log:?}");
+        // The event, session-replay and Sentry routes reject a key or DSN
+        // whose environment is soft-deleted; setup must agree.
+        assert!(
+            sql.contains("WHERE ke.id = k.environment_id AND ke.deleted_at IS NULL"),
+            "analytics keys must skip deleted environments: {sql}"
+        );
+        assert!(
+            sql.contains("WHERE de.id = d.environment_id AND de.deleted_at IS NULL"),
+            "DSNs must skip deleted environments: {sql}"
+        );
     }
 
     #[tokio::test]
@@ -650,6 +761,9 @@ mod tests {
             "ftp://temps.example.com",
             "https://",
             "https:///x",
+            // A query or fragment would swallow the appended ingest paths.
+            "https://temps.example.com?mode=console",
+            "https://temps.example.com/#console",
         ] {
             assert!(
                 matches!(

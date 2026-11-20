@@ -19628,13 +19628,17 @@ export type IngestSignalSetup = {
     auth: IngestAuth;
     /**
      * Whether the project has what this signal needs. `false` means a
-     * credential still has to be created.
+     * credential still has to be created. Logs and traces are always `true`:
+     * they authenticate with the caller's own API key, which is not project
+     * state; `auth.credential_path` and `auth.cli_command` say how to get one.
      */
     configured: boolean;
     endpoints: Array<IngestEndpoint>;
     /**
-     * For OTLP signals: the value of `OTEL_EXPORTER_OTLP_ENDPOINT`. SDKs
-     * append `/v1/traces` or `/v1/logs` to it.
+     * For OTLP signals without an environment: the value of
+     * `OTEL_EXPORTER_OTLP_ENDPOINT`. SDKs append `/v1/traces` or `/v1/logs`
+     * to it. `None` with an environment, whose per-signal URLs in
+     * `endpoints` go in `OTEL_EXPORTER_OTLP_{TRACES,LOGS}_ENDPOINT`.
      */
     otlp_endpoint?: string | null;
     /**

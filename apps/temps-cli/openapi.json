@@ -41876,7 +41876,7 @@
             "$ref": "#/components/schemas/IngestAuth"
           },
           "configured": {
-            "description": "Whether the project has what this signal needs. `false` means a\ncredential still has to be created.",
+            "description": "Whether the project has what this signal needs. `false` means a\ncredential still has to be created. Logs and traces are always `true`:\nthey authenticate with the caller's own API key, which is not project\nstate; `auth.credential_path` and `auth.cli_command` say how to get one.",
             "type": "boolean"
           },
           "endpoints": {
@@ -41886,7 +41886,7 @@
             "type": "array"
           },
           "otlp_endpoint": {
-            "description": "For OTLP signals: the value of `OTEL_EXPORTER_OTLP_ENDPOINT`. SDKs\nappend `/v1/traces` or `/v1/logs` to it.",
+            "description": "For OTLP signals without an environment: the value of\n`OTEL_EXPORTER_OTLP_ENDPOINT`. SDKs append `/v1/traces` or `/v1/logs`\nto it. `None` with an environment, whose per-signal URLs in\n`endpoints` go in `OTEL_EXPORTER_OTLP_{TRACES,LOGS}_ENDPOINT`.",
             "example": "https://temps.example.com/api/otel",
             "type": [
               "string",
