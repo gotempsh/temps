@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use super::error::CheckConfigError;
+use crate::error::CheckConfigError;
 
 /// Longest target string accepted.
 pub const MAX_TARGET_CHARS: usize = 2048;

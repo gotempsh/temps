@@ -19,7 +19,7 @@ import { withSpinner } from '../../ui/spinner.js'
 import { printTable, statusBadge, type TableColumn } from '../../ui/table.js'
 import { promptText, promptSelect, promptConfirm } from '../../ui/prompts.js'
 import { newline, header, icons, json, colors, success, info, warning, keyValue } from '../../ui/output.js'
-import { registerTargetMonitorCommands } from './targets.js'
+import { printLocations, registerTargetMonitorCommands } from './targets.js'
 
 const MONITOR_TYPES = ['http', 'tcp', 'ping']
 const CHECK_INTERVALS = [
@@ -341,6 +341,7 @@ async function showMonitor(options: ShowOptions): Promise<void> {
   keyValue('Project ID', monitor.project_id)
   keyValue('Created', new Date(monitor.created_at).toLocaleString())
   keyValue('Updated', new Date(monitor.updated_at).toLocaleString())
+  printLocations(monitor)
   newline()
 }
 

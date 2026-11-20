@@ -304,6 +304,17 @@ Open your project, then **Monitoring → Uptime → Monitor outside Temps**, pic
 
 ICMP ping, domain registration expiry and scripted browser checks are not available.
 
+### Check from more than one place {{ anchor: true, id: 'probe-locations' }}
+
+A check from one place cannot tell a target that is down from a network path that is. In a cluster, switch on **Check from worker nodes too** on a monitor: each check then also runs from up to four online worker nodes at the same time, one per `region` label first, each through its own network and resolver.
+
+- **Down only when most agree.** The monitor is down when more than half of the locations that answered say down, and degraded when more than half say down or degraded. A tie is not a majority: with this server and one worker, both must agree. A location that does not answer (an unreachable node, or an agent too old for the check) is listed and not counted.
+- **What each location saw** is on the monitor's page under **Locations**, and in `temps monitors show`. The check recorded in the uptime history names the failing locations when the verdict is down or degraded.
+- **The same rules everywhere.** A worker validates the check as this server does and refuses targets that are not public from where it stands. Request headers and a body travel only encrypted to that node's key; a node that cannot receive them encrypted is skipped for that monitor.
+- **Without worker nodes** the switch says so and links to **Settings → Nodes**; checks run from this server only. Monitors of Temps environments are checked from this server.
+
+A single-server install cannot learn that it is unreachable from outside. Point an external checker at one of your public URLs for that.
+
 ### From the CLI
 
 ```bash
@@ -318,6 +329,10 @@ temps monitors add-target --project-id 4 --kind tls --name "Shop certificate" --
 temps monitors add-target --project-id 4 --kind dns --name "Docs CNAME" --target docs.example.com \
   --record CNAME --expect edge.example.net
 
+# Check from the cluster's worker nodes too, and see where from
+temps monitors update-target --project-id 4 --monitor-id 31 --from-nodes
+temps monitors locations --project-id 4
+
 # Pause one; change its check (the check flags replace the whole check)
 temps monitors update-target --project-id 4 --monitor-id 31 --pause
 temps monitors update-target --project-id 4 --monitor-id 31 --kind http --expect-status 2xx
@@ -327,7 +342,7 @@ The header file holds one `Name: value` per line, so secrets stay out of your sh
 
 ### From the API
 
-`POST /api/projects/{project_id}/monitors/targets` creates a monitor and `PATCH /api/projects/{project_id}/monitors/{monitor_id}/target` changes one; listing, history and deletion use the existing monitor endpoints. Creating needs `status_page:create` and changing needs `status_page:write` on the project; both are audit-logged with the target host only.
+`POST /api/projects/{project_id}/monitors/targets` creates a monitor and `PATCH /api/projects/{project_id}/monitors/{monitor_id}/target` changes one; listing, history and deletion use the existing monitor endpoints. `GET /api/projects/{project_id}/monitors/probe-locations` lists where checks would run from, with `configured: false` and the reason when no worker node is online. Creating needs `status_page:create` and changing needs `status_page:write` on the project; both are audit-logged with the target host only.
 
 ---
 

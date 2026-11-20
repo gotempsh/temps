@@ -8,7 +8,9 @@ webhooks, maintenance windows and page password (see *Settled while
 implementing D2*). D3 and D4 implemented together — 2026-11-20: HTTP
 assertions, TCP, TLS certificate and DNS checks against any public target;
 ICMP, domain registration expiry and browser checks deferred (see *Settled
-while implementing D3 and D4*). D5 to D8 not started.
+while implementing D3 and D4*). D5 implemented — 2026-11-20 for monitors
+of targets outside Temps, checked from worker nodes with a majority vote
+(see *Settled while implementing D5*). D6 to D8 not started.
 
 Related: ADR 021 (multi-node log aggregation, humanized alert notifications),
 ADR 025 (unified alarm log), ADR 026 (metric alert label filters), ADR 045 to
@@ -407,6 +409,60 @@ from a real one.
 already distributes health probing). A monitor is down when a quorum of
 locations agree, which removes most false alarms. For a single-node install
 the only honest answer is a probe from somewhere else; see *Open questions*.
+
+### Settled while implementing D5
+
+- **Per monitor, off by default.** `status_monitors.probe_from_nodes`, for
+  monitors of targets outside Temps only (a database constraint). Turning it
+  on is the operator's choice: it sends the check, and its decrypted request
+  headers, to the cluster's workers.
+- **Asked on each check, not scheduled on the workers.** The control
+  plane's scheduler keeps the schedule; for each check it asks up to four
+  online workers (active, a heartbeat in the last three minutes, a stored
+  token), one per `region` label first, over the authenticated agent API,
+  and probes itself at the same time. ADR 053's leased assignments fit
+  probes of a node's own containers; an outbound check needs no state on
+  the worker, and asking per check keeps one schedule, one stale-write
+  fence and one place where results are recorded. The load is bounded by
+  the existing sweep concurrency of 10, so at most 40 node requests are in
+  flight; each agent runs at most 16 checks at once and refuses more.
+- **One probe implementation.** The specs, the public-address policy and
+  the probes moved to a database-free crate, `temps-uptime-probe`, which the
+  status page plugin and the node agent share. A worker validates the check
+  exactly as the control plane does on save and resolves the target through
+  its own resolver, so a target that is private from where a worker stands
+  is not dialled from there. A worker applies the default outbound policy:
+  private networks the operator trusts on the control plane are not trusted
+  on workers.
+- **Secrets travel sealed.** A check with headers or a body is sent only
+  sealed to the node's key (`NodeSealing`), never in plain over an
+  `http://` agent address; a node that cannot receive it sealed is listed as
+  not answering. A check without either is sent sealed when it can be and
+  plain otherwise: the target and the check are shown to anyone who can
+  read the monitor.
+- **Majority of those that answered.** Down when more than half of the
+  answering locations say down; degraded when more than half say down or
+  degraded; otherwise operational, so a tie is not a majority and, with the
+  control plane and one worker, both must agree. A location that does not
+  answer is not counted, and the control plane always answers. The recorded
+  response time is the median.
+- **Where each answer is kept.** The latest answers of every location go on
+  the monitor row (`location_results`, replaced on each check and cleared on
+  each edit), not on `status_checks`, a compressed hypertable: one row per
+  monitor stays bounded and nothing changes in history storage. Writing them
+  does not move `updated_at`, which the scheduler compares to discard checks
+  of edited monitors. A down or degraded check's message names up to three
+  failing locations; per-location history is not kept.
+- **Environment monitors** are checked from the control plane only: their
+  address can be internal to the cluster, and a worker's view of it says
+  nothing about what visitors see. A follow-up can extend the switch to them.
+- **Discoverability.** `GET /projects/{id}/monitors/probe-locations`
+  returns the locations a check would use, and `configured: false`, a
+  reason and `/settings/nodes` when no worker is online; the monitor dialog
+  shows the switch in that onboarding state rather than hiding it.
+- **Single-node installs** still cannot report their own outage. An external
+  probe offered by Temps Cloud stays the open question below; the docs point
+  such installs at an external checker.
 
 ### D6. On-call schedules and escalation
 

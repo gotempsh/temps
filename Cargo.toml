@@ -61,6 +61,7 @@ members = [
     "crates/temps-monitoring",
     "crates/temps-alarms",
     "crates/temps-runtime-health",
+    "crates/temps-uptime-probe",
     "crates/temps-credential-checks",
     "crates/temps-network",
     "crates/temps-analytics",

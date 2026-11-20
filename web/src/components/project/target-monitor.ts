@@ -101,6 +101,7 @@ export const targetMonitorSchema = z
     ),
     /** When editing: keep the stored headers and body unless changed. */
     replaceRequest: z.boolean(),
+    probeFromNodes: z.boolean(),
     body: z.string().max(65536, 'At most 64 KiB'),
     warnDays: z.number().int().min(1).max(90),
     recordType: z.enum(
@@ -201,6 +202,7 @@ export function newTargetMonitorValues(
     degradedAfterMs: '',
     headers: [],
     replaceRequest: true,
+    probeFromNodes: false,
     body: '',
     warnDays: 14,
     recordType: 'A',
@@ -216,6 +218,7 @@ export function targetMonitorValues(
   values.name = monitor.name
   values.intervalSeconds = monitor.check_interval_seconds
   values.replaceRequest = false
+  values.probeFromNodes = monitor.probe_from_nodes
   const view = monitor.check
   if (!view) return values
   values.target = view.target
@@ -291,6 +294,7 @@ export function createTargetMonitorRequest(
     check: checkSpec(values),
     request: values.kind === 'http' ? checkRequest(values) : null,
     check_interval_seconds: values.intervalSeconds,
+    probe_from_nodes: values.probeFromNodes,
   }
 }
 
@@ -311,6 +315,7 @@ export function updateTargetMonitorRequest(
         ? checkRequest(values)
         : null,
     check_interval_seconds: values.intervalSeconds,
+    probe_from_nodes: values.probeFromNodes,
   }
 }
 
@@ -329,4 +334,35 @@ export function targetSummary(monitor: MonitorResponse): string | null {
     case 'dns':
       return `${check.record_type} record of ${view.target}`
   }
+}
+
+/** A location's name, with its region when it has one. */
+export function locationLabel(result: {
+  location?: string
+  name?: string
+  region?: string | null
+}): string {
+  const name = result.location ?? result.name ?? ''
+  return result.region ? `${name} (${result.region})` : name
+}
+
+/**
+ * One line on where the latest check ran from and which locations failed,
+ * for a monitor checked from worker nodes; `null` otherwise.
+ */
+export function locationSummary(monitor: MonitorResponse): string | null {
+  const results = monitor.location_results?.results
+  if (!monitor.probe_from_nodes) return null
+  if (!results?.length) return 'Checked from worker nodes; not checked yet'
+  const answered = results.filter((result) => result.status != null)
+  const failing = answered.filter((result) => result.status !== 'operational')
+  const silent = results.length - answered.length
+  const parts = [
+    `${answered.length} of ${results.length} location${results.length === 1 ? '' : 's'} answered`,
+  ]
+  if (failing.length) {
+    parts.push(`failing from ${failing.map(locationLabel).join(', ')}`)
+  }
+  if (silent) parts.push(`${silent} did not answer`)
+  return parts.join('; ')
 }

@@ -84,7 +84,7 @@ import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 
 import { RuntimeHealthPanel } from './RuntimeHealthPanel'
 import { visibleExternalMonitors } from './runtime-health-display'
-import { targetSummary } from './target-monitor'
+import { locationSummary, targetSummary } from './target-monitor'
 import { TargetMonitorDialog } from './TargetMonitorDialog'
 import {
   BUCKET_TONE_CLASS,
@@ -131,6 +131,7 @@ function MonitorCard({
   windowEnd,
 }: MonitorCardProps) {
   const summary = targetSummary(monitor)
+  const locations = locationSummary(monitor)
   const isOnDemand = environment?.deployment_config?.onDemand === true
   const { startDate, endDate } = useMemo(() => {
     const end = new Date(windowEnd)
@@ -213,6 +214,11 @@ function MonitorCard({
                 })}
               </span>
             </div>
+            {locations && (
+              <p className="text-xs text-muted-foreground [overflow-wrap:anywhere]">
+                {locations}
+              </p>
+            )}
           </div>
         </div>
 

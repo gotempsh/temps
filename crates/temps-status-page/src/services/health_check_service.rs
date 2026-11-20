@@ -558,6 +558,7 @@ pub(crate) fn test_target_checks() -> Arc<TargetChecks> {
             "health-check-tests",
         )),
         Arc::new(super::checks::NetworkProber),
+        Arc::new(super::checks::NoNodeLocations),
     ))
 }
 
@@ -935,7 +936,7 @@ impl HealthCheckService {
         job_queue: &Arc<dyn JobQueue>,
         target_checks: &TargetChecks,
     ) -> Result<(), StatusPageError> {
-        let outcome = target_checks.probe(monitor).await?;
+        let super::checks::CheckResult { outcome, locations } = target_checks.run(monitor).await?;
         let status = outcome.status.stored().to_string();
         let check = status_checks::ActiveModel {
             monitor_id: Set(monitor.id),
@@ -958,6 +959,21 @@ impl HealthCheckService {
             return Ok(());
         }
         check.insert(&txn).await?;
+        if let Some(locations) = locations {
+            let json = serde_json::to_value(&locations).map_err(|error| {
+                StatusPageError::InvalidRequest(format!(
+                    "location results of monitor {} could not be encoded: {error}",
+                    monitor.id
+                ))
+            })?;
+            // Not through the active model: that would move `updated_at`,
+            // which tells the scheduler the monitor was edited.
+            status_monitors::Entity::update_many()
+                .col_expr(status_monitors::Column::LocationResults, Expr::value(json))
+                .filter(status_monitors::Column::Id.eq(monitor.id))
+                .exec(&txn)
+                .await?;
+        }
         txn.commit().await?;
         report_check_outcome(
             &MONITOR_DOWN,
@@ -2815,6 +2831,8 @@ mod tests {
             target: None,
             check_spec: None,
             request_encrypted: None,
+            probe_from_nodes: false,
+            location_results: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }

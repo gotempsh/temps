@@ -14,25 +14,31 @@ use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use temps_core::url_validation::{
     resolve_and_validate_domain, validate_outbound_ip, UrlValidationError,
 };
 use tokio::net::TcpStream;
+use utoipa::ToSchema;
 
-use super::spec::{
+use crate::outbound::{pinned_public_client, PublicProbeTarget};
+use crate::spec::{
     normalize_dns_value, parse_status_pattern, CheckRequest, CheckSpec, DnsCheck, HttpCheck,
     Target, TcpCheck, TlsCheck, DEFAULT_TLS_WARN_DAYS, MAX_KEYWORD_BODY_BYTES,
 };
-use crate::services::outbound::{pinned_public_client, PublicProbeTarget};
 
 pub const USER_AGENT: &str = "Temps-Status-Monitor/1.0";
 /// Answers listed in a DNS failure message.
 const MAX_LISTED_ANSWERS: usize = 5;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A check's verdict. Serialized as the value stored in
+/// `status_checks.status`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
 pub enum ProbeStatus {
     Operational,
     Degraded,
+    #[serde(rename = "major_outage")]
     Down,
 }
 
@@ -47,7 +53,7 @@ impl ProbeStatus {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct ProbeOutcome {
     pub status: ProbeStatus,
     pub response_time_ms: Option<i32>,
@@ -56,7 +62,7 @@ pub struct ProbeOutcome {
 }
 
 impl ProbeOutcome {
-    fn up(elapsed: Duration) -> Self {
+    pub fn up(elapsed: Duration) -> Self {
         Self {
             status: ProbeStatus::Operational,
             response_time_ms: Some(millis(elapsed)),
@@ -64,7 +70,7 @@ impl ProbeOutcome {
         }
     }
 
-    fn down(elapsed: Option<Duration>, message: impl Into<String>) -> Self {
+    pub fn down(elapsed: Option<Duration>, message: impl Into<String>) -> Self {
         Self {
             status: ProbeStatus::Down,
             response_time_ms: elapsed.map(millis),
@@ -72,7 +78,7 @@ impl ProbeOutcome {
         }
     }
 
-    fn degraded(elapsed: Duration, message: impl Into<String>) -> Self {
+    pub fn degraded(elapsed: Duration, message: impl Into<String>) -> Self {
         Self {
             status: ProbeStatus::Degraded,
             response_time_ms: Some(millis(elapsed)),
@@ -83,6 +89,16 @@ impl ProbeOutcome {
 
 fn millis(elapsed: Duration) -> i32 {
     i32::try_from(elapsed.as_millis()).unwrap_or(i32::MAX)
+}
+
+/// Seconds since the Unix epoch; 0 for a clock set before it, which makes
+/// every certificate look valid for longer, never expired early.
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            i64::try_from(since.as_secs()).unwrap_or(i64::MAX)
+        })
 }
 
 fn seconds(duration: Duration) -> String {
@@ -435,7 +451,7 @@ async fn probe_tls(check: &TlsCheck, host: &str, port: u16, timeout: Duration) -
         Ok((_, certificate)) => judge_certificate(
             check,
             certificate.validity().not_after.timestamp(),
-            chrono::Utc::now().timestamp(),
+            unix_now(),
             elapsed,
         ),
         Err(error) => ProbeOutcome::down(
@@ -487,7 +503,7 @@ fn shown_address(ip: IpAddr) -> String {
 }
 
 async fn probe_dns(check: &DnsCheck, name: &str, timeout: Duration) -> ProbeOutcome {
-    use super::spec::DnsCheckRecordType;
+    use crate::spec::DnsCheckRecordType;
     use hickory_resolver::config::ResolveHosts;
     use hickory_resolver::proto::rr::{RData, RecordType};
 
@@ -576,7 +592,7 @@ async fn probe_dns(check: &DnsCheck, name: &str, timeout: Duration) -> ProbeOutc
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::checks::spec::{DnsCheckRecordType, KeywordAssertion};
+    use crate::spec::{DnsCheckRecordType, KeywordAssertion};
 
     const FAST: Duration = Duration::from_millis(120);
 

@@ -22,6 +22,10 @@ pub struct CreateTargetMonitorRequest {
     /// How often to check, in seconds (default 60, at least 30).
     #[serde(default)]
     pub check_interval_seconds: Option<i32>,
+    /// Also check from up to four online worker nodes, and count the
+    /// monitor down only when most locations agree (ADR 108 D5).
+    #[serde(default)]
+    pub probe_from_nodes: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
@@ -35,6 +39,8 @@ pub struct UpdateTargetMonitorRequest {
     pub check_interval_seconds: Option<i32>,
     /// `false` pauses the monitor.
     pub is_active: Option<bool>,
+    /// Check from worker nodes too, or from the control plane only.
+    pub probe_from_nodes: Option<bool>,
 }
 
 /// How a monitor outside Temps is checked. Header values are not included.
@@ -67,4 +73,29 @@ impl MonitorCheckView {
             has_body: stored.has_body,
         })
     }
+}
+
+/// One place checks can run from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ProbeLocationView {
+    /// `control plane`, or the worker node's name.
+    pub name: String,
+    /// The worker node; `null` for the control plane.
+    pub node_id: Option<i32>,
+    /// The node's `region` label, when it has one.
+    pub region: Option<String>,
+}
+
+/// Where a monitor checked from worker nodes would be checked from now.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ProbeLocationsResponse {
+    /// The control plane first, then each worker node that would be asked.
+    pub locations: Vec<ProbeLocationView>,
+    /// Whether any worker node is available, so checking from worker
+    /// nodes adds a location.
+    pub configured: bool,
+    /// What is missing when `configured` is false.
+    pub reason: Option<String>,
+    /// Where to fix it in the console.
+    pub setup_path: Option<String>,
 }

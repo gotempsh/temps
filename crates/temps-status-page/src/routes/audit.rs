@@ -496,6 +496,7 @@ pub struct TargetMonitorAudit {
     pub target_host: Option<String>,
     pub header_names: Vec<String>,
     pub is_active: bool,
+    pub probe_from_nodes: bool,
 }
 
 impl AuditOperation for TargetMonitorAudit {

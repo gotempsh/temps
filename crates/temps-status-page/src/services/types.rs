@@ -296,6 +296,13 @@ pub struct MonitorResponse {
     /// How a monitor outside Temps is checked; `null` for an environment
     /// monitor.
     pub check: Option<crate::services::checks::MonitorCheckView>,
+    /// Also checked from worker nodes; down only when most locations agree
+    /// (ADR 108 D5).
+    pub probe_from_nodes: bool,
+    /// What each location reported on the latest check; `null` for a
+    /// monitor checked from the control plane only, or not checked since
+    /// its last change.
+    pub location_results: Option<crate::services::checks::MonitorLocationResults>,
     pub check_interval_seconds: i32,
     pub is_active: bool,
     /// When the scheduler will next probe this monitor. Read-only: it is
@@ -561,6 +568,10 @@ impl From<temps_entities::status_monitors::Model> for MonitorResponse {
                 model.target.as_deref(),
                 model.check_spec.as_ref(),
             ),
+            probe_from_nodes: model.probe_from_nodes,
+            location_results: model
+                .location_results
+                .and_then(|json| serde_json::from_value(json).ok()),
             check_interval_seconds: model.check_interval_seconds,
             is_active: model.is_active,
             next_check_at: model.next_check_at,

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { DateRangePicker } from '@/components/ui/date-range-picker'
+import { MonitorLocations } from './MonitorLocations'
 import { MonitorPathForm } from './MonitorPathForm'
 
 import { ProjectResponse, StatusBucket } from '@/api/client'
@@ -637,6 +638,8 @@ export function MonitorDetail({ project }: MonitorDetailProps) {
           )}
         </CardContent>
       </Card>
+
+      <MonitorLocations monitor={monitor} />
 
       {/* Configuration Details */}
       <Card>

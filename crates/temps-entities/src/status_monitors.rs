@@ -37,6 +37,12 @@ pub struct Model {
     pub check_spec: Option<Json>,
     /// HTTP request headers and body, encrypted with `EncryptionService`.
     pub request_encrypted: Option<String>,
+    /// Also check from the cluster's worker nodes; down only when most
+    /// locations agree (ADR 108 D5). Target monitors only.
+    pub probe_from_nodes: bool,
+    /// What each location reported on the latest check of a monitor checked
+    /// from worker nodes. Written by the scheduler only.
+    pub location_results: Option<Json>,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
 }

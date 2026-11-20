@@ -17,11 +17,15 @@ use temps_entities::{projects, status_monitors};
 use tracing::info;
 
 use super::error::{CheckConfigError, TargetMonitorError};
+use super::locations::CONTROL_PLANE_LOCATION;
 use super::runner::TargetChecks;
 use super::spec::{
     parse_target, validate_spec, CheckRequest, CheckSpec, MonitorCheckKind, StoredCheck, Target,
 };
-use super::types::{CreateTargetMonitorRequest, UpdateTargetMonitorRequest};
+use super::types::{
+    CreateTargetMonitorRequest, ProbeLocationView, ProbeLocationsResponse,
+    UpdateTargetMonitorRequest,
+};
 use crate::services::types::{normalize_check_interval_seconds, DEFAULT_CHECK_INTERVAL_SECS};
 
 /// Target monitors one project may have. Each probes at most every 30 s.
@@ -199,6 +203,8 @@ impl TargetMonitorService {
             target: Set(Some(target.stored())),
             check_spec: Set(Some(Self::stored(spec, &check_request))),
             request_encrypted: Set(request_encrypted),
+            probe_from_nodes: Set(request.probe_from_nodes),
+            location_results: Set(None),
             ..Default::default()
         }
         .insert(&txn)
@@ -211,6 +217,32 @@ impl TargetMonitorService {
             "created a target monitor"
         );
         Ok(model)
+    }
+
+    /// Where a monitor checked from worker nodes would be checked from now.
+    pub async fn probe_locations(&self) -> Result<ProbeLocationsResponse, TargetMonitorError> {
+        let nodes = self.checks.locations().nodes().await?;
+        let mut locations = vec![ProbeLocationView {
+            name: CONTROL_PLANE_LOCATION.to_string(),
+            node_id: None,
+            region: None,
+        }];
+        locations.extend(nodes.into_iter().map(|node| ProbeLocationView {
+            name: node.name,
+            node_id: Some(node.node_id),
+            region: node.region,
+        }));
+        let configured = locations.len() > 1;
+        Ok(ProbeLocationsResponse {
+            locations,
+            configured,
+            reason: (!configured).then(|| {
+                "No worker node is online, so checks run from this server only. Add a worker \
+                 node to check from a second place."
+                    .to_string()
+            }),
+            setup_path: (!configured).then(|| "/settings/nodes".to_string()),
+        })
     }
 
     pub async fn update(
@@ -265,6 +297,11 @@ impl TargetMonitorService {
         active.target = Set(Some(target.stored()));
         active.check_spec = Set(Some(Self::stored(spec, &check_request)));
         active.request_encrypted = Set(request_encrypted);
+        if let Some(probe_from_nodes) = request.probe_from_nodes {
+            active.probe_from_nodes = Set(probe_from_nodes);
+        }
+        // The last answers were for the old settings.
+        active.location_results = Set(None);
         // Probe the new settings on the next sweep. Saving also moves
         // `updated_at`, which discards a probe of the old settings still in
         // flight.

@@ -9625,6 +9625,11 @@ export type CreateTargetMonitorRequest = {
      * Shown in the console and, unless renamed there, on status pages.
      */
     name: string;
+    /**
+     * Also check from up to four online worker nodes, and count the
+     * monitor down only when most locations agree (ADR 108 D5).
+     */
+    probe_from_nodes?: boolean;
     request?: CheckRequest | null;
     /**
      * What to check: a URL (`http`), `host:port` (`tcp`, `tls`; `tls`
@@ -21870,6 +21875,38 @@ export type MonitorConfig = {
     timezone?: string;
 };
 
+/**
+ * What one location reported on a check.
+ */
+export type MonitorLocationResult = {
+    /**
+     * `control plane`, or the worker node's name.
+     */
+    location: string;
+    /**
+     * Why it is not operational, or why the location did not answer.
+     */
+    message?: string | null;
+    /**
+     * The worker node; `null` for the control plane.
+     */
+    node_id?: number | null;
+    /**
+     * The node's `region` label, when it has one.
+     */
+    region?: string | null;
+    response_time_ms?: number | null;
+    status?: ProbeStatus | null;
+};
+
+/**
+ * Every location's answer to the latest check.
+ */
+export type MonitorLocationResults = {
+    checked_at: string;
+    results: Array<MonitorLocationResult>;
+};
+
 export type MonitorResponse = {
     check?: MonitorCheckView | null;
     check_interval_seconds: number;
@@ -21887,6 +21924,7 @@ export type MonitorResponse = {
      * Temps-managed HTTP monitor; independent monitors remain visible for workers.
      */
     is_managed: boolean;
+    location_results?: MonitorLocationResults | null;
     monitor_type: string;
     monitor_url: string;
     name: string;
@@ -21897,6 +21935,11 @@ export type MonitorResponse = {
      * next sweep.
      */
     next_check_at?: string | null;
+    /**
+     * Also checked from worker nodes; down only when most locations agree
+     * (ADR 108 D5).
+     */
+    probe_from_nodes: boolean;
     project_id: number;
     updated_at: string;
 };
@@ -25809,6 +25852,53 @@ export type PrivateIpInfo = {
      */
     primary_ip?: string | null;
 };
+
+/**
+ * One place checks can run from.
+ */
+export type ProbeLocationView = {
+    /**
+     * `control plane`, or the worker node's name.
+     */
+    name: string;
+    /**
+     * The worker node; `null` for the control plane.
+     */
+    node_id?: number | null;
+    /**
+     * The node's `region` label, when it has one.
+     */
+    region?: string | null;
+};
+
+/**
+ * Where a monitor checked from worker nodes would be checked from now.
+ */
+export type ProbeLocationsResponse = {
+    /**
+     * Whether any worker node is available, so checking from worker
+     * nodes adds a location.
+     */
+    configured: boolean;
+    /**
+     * The control plane first, then each worker node that would be asked.
+     */
+    locations: Array<ProbeLocationView>;
+    /**
+     * What is missing when `configured` is false.
+     */
+    reason?: string | null;
+    /**
+     * Where to fix it in the console.
+     */
+    setup_path?: string | null;
+};
+
+/**
+ * A check's verdict. Serialized as the value stored in
+ * `status_checks.status`.
+ */
+export type ProbeStatus = 'operational' | 'degraded' | 'major_outage';
 
 /**
  * Representation of a Problem error to return to the client.
@@ -38427,6 +38517,10 @@ export type UpdateTargetMonitorRequest = {
      */
     is_active?: boolean | null;
     name?: string | null;
+    /**
+     * Check from worker nodes too, or from the control plane only.
+     */
+    probe_from_nodes?: boolean | null;
     request?: CheckRequest | null;
     target?: string | null;
 };
@@ -88392,6 +88486,42 @@ export type CreateMonitorResponses = {
 };
 
 export type CreateMonitorResponse = CreateMonitorResponses[keyof CreateMonitorResponses];
+
+export type GetMonitorProbeLocationsData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/monitors/probe-locations';
+};
+
+export type GetMonitorProbeLocationsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetMonitorProbeLocationsResponses = {
+    /**
+     * Probe locations
+     */
+    200: ProbeLocationsResponse;
+};
+
+export type GetMonitorProbeLocationsResponse = GetMonitorProbeLocationsResponses[keyof GetMonitorProbeLocationsResponses];
 
 export type CreateTargetMonitorData = {
     body: CreateTargetMonitorRequest;

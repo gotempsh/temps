@@ -6,7 +6,8 @@
 //! Creating one needs `status_page:create` on the project, changing one
 //! `status_page:write`, like the environment monitors. Reading, history and
 //! deletion use the existing `/monitors/{monitor_id}` routes. Every write is
-//! audit-logged without the request headers, body or URL path.
+//! audit-logged without the request headers, body or URL path. Where checks
+//! can run from (ADR 108 D5) needs `status_page:read`.
 
 use std::sync::Arc;
 
@@ -14,7 +15,7 @@ use axum::{
     extract::{Extension, Path, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::{patch, post},
+    routing::{get, patch, post},
     Json, Router,
 };
 use temps_authz::{project_permission_guard, RequireAuth};
@@ -27,10 +28,12 @@ use super::audit::{TargetMonitorAction, TargetMonitorAudit};
 use crate::services::checks::{
     CheckRequest, CheckRequestHeader, CheckSpec, CreateTargetMonitorRequest, DnsCheck,
     DnsCheckRecordType, HttpCheck, HttpMethod, KeywordAssertion, MonitorCheckKind,
-    MonitorCheckView, TargetMonitorError, TargetMonitorService, TcpCheck, TlsCheck,
+    MonitorCheckView, MonitorLocationResult, MonitorLocationResults, ProbeLocationView,
+    ProbeLocationsResponse, TargetMonitorError, TargetMonitorService, TcpCheck, TlsCheck,
     UpdateTargetMonitorRequest,
 };
 use crate::services::MonitorResponse;
+use temps_uptime_probe::ProbeStatus;
 
 pub struct TargetMonitorRoutesState {
     pub monitors: Arc<TargetMonitorService>,
@@ -112,6 +115,7 @@ async fn record(
             .map(|check| check.header_names.clone())
             .unwrap_or_default(),
         is_active: monitor.is_active,
+        probe_from_nodes: monitor.probe_from_nodes,
     };
     if let Err(error) = state.audit.create_audit_log(&entry).await {
         tracing::error!(
@@ -226,6 +230,40 @@ pub async fn update_target_monitor(
     Ok(Json(monitor))
 }
 
+/// Where monitors can be checked from
+///
+/// The control plane, plus the online worker nodes a monitor with
+/// `probe_from_nodes` would also be checked from (at most four, one per
+/// `region` label first). `configured` is false when there is no worker
+/// node, with what to do about it.
+#[utoipa::path(
+    get,
+    path = "/projects/{project_id}/monitors/probe-locations",
+    operation_id = "get_monitor_probe_locations",
+    params(("project_id" = i32, Path, description = "Project ID")),
+    responses(
+        (status = 200, description = "Probe locations", body = ProbeLocationsResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "Status Page",
+    security(("bearer_auth" = []))
+)]
+pub async fn get_monitor_probe_locations(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<TargetMonitorRoutesState>>,
+    Path(project_id): Path<i32>,
+) -> Result<impl IntoResponse, Problem> {
+    project_permission_guard!(
+        auth,
+        StatusPageRead,
+        project_id,
+        state.project_access_checker.clone()
+    );
+    Ok(Json(state.monitors.probe_locations().await?))
+}
+
 pub fn create_target_monitor_router(state: Arc<TargetMonitorRoutesState>) -> Router {
     Router::new()
         .route(
@@ -236,12 +274,20 @@ pub fn create_target_monitor_router(state: Arc<TargetMonitorRoutesState>) -> Rou
             "/projects/{project_id}/monitors/{monitor_id}/target",
             patch(update_target_monitor),
         )
+        .route(
+            "/projects/{project_id}/monitors/probe-locations",
+            get(get_monitor_probe_locations),
+        )
         .with_state(state)
 }
 
 #[derive(OpenApi)]
 #[openapi(
-    paths(create_target_monitor, update_target_monitor),
+    paths(
+        create_target_monitor,
+        update_target_monitor,
+        get_monitor_probe_locations
+    ),
     components(schemas(
         CreateTargetMonitorRequest,
         UpdateTargetMonitorRequest,
@@ -257,6 +303,11 @@ pub fn create_target_monitor_router(state: Arc<TargetMonitorRoutesState>) -> Rou
         TlsCheck,
         DnsCheck,
         DnsCheckRecordType,
+        ProbeStatus,
+        MonitorLocationResult,
+        MonitorLocationResults,
+        ProbeLocationView,
+        ProbeLocationsResponse,
     ))
 )]
 pub struct TargetMonitorApiDoc;

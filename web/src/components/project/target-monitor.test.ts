@@ -5,6 +5,7 @@ import { describe, expect, it } from 'bun:test'
 import type { MonitorResponse } from '@/api/client'
 import {
   createTargetMonitorRequest,
+  locationSummary,
   newTargetMonitorValues,
   splitList,
   targetMonitorSchema,
@@ -37,6 +38,8 @@ function monitor(check: MonitorResponse['check']): MonitorResponse {
     monitor_url: check?.target ?? '',
     check_kind: check?.check.kind ?? 'environment',
     check,
+    probe_from_nodes: false,
+    location_results: null,
     check_interval_seconds: 60,
     is_active: true,
     is_managed: false,
@@ -109,6 +112,11 @@ describe('requests', () => {
       headers: [{ name: 'Authorization', value: 'Bearer x' }],
       body: null,
     })
+    expect(body.probe_from_nodes).toBe(false)
+    expect(
+      createTargetMonitorRequest(values({ probeFromNodes: true }))
+        .probe_from_nodes
+    ).toBe(true)
   })
 
   it('sends no request for other kinds', () => {
@@ -138,6 +146,8 @@ describe('requests', () => {
       })
     )
     expect(edited.method).toBe('POST')
+    expect(edited.probeFromNodes).toBe(false)
+    expect(updateTargetMonitorRequest(edited).probe_from_nodes).toBe(false)
     expect(edited.headers).toEqual([{ name: 'Authorization', value: '' }])
     expect(updateTargetMonitorRequest(edited).request).toBeNull()
     expect(
@@ -160,5 +170,61 @@ describe('targetSummary', () => {
     ).toBe('TLS certificate of example.test:443')
     expect(targetSummary(monitor(null))).toBeNull()
     expect(splitList(' a, ,b\nc ')).toEqual(['a', 'b', 'c'])
+  })
+})
+
+describe('locationSummary', () => {
+  const spread = (
+    results: NonNullable<MonitorResponse['location_results']>['results'] | null
+  ) => ({
+    ...monitor({
+      target: 'https://api.example.test/',
+      check: { kind: 'http' },
+      header_names: [],
+      has_body: false,
+    }),
+    probe_from_nodes: true,
+    location_results: results
+      ? { checked_at: '2026-11-21T10:01:00Z', results }
+      : null,
+  })
+
+  it('says which locations failed or did not answer', () => {
+    expect(locationSummary(monitor(null))).toBeNull()
+    expect(locationSummary(spread(null))).toBe(
+      'Checked from worker nodes; not checked yet'
+    )
+    expect(
+      locationSummary(
+        spread([
+          {
+            location: 'control plane',
+            node_id: null,
+            region: null,
+            status: 'operational',
+            response_time_ms: 30,
+            message: null,
+          },
+          {
+            location: 'worker-7',
+            node_id: 7,
+            region: 'eu',
+            status: 'major_outage',
+            response_time_ms: null,
+            message: 'refused',
+          },
+          {
+            location: 'worker-9',
+            node_id: 9,
+            region: null,
+            status: null,
+            response_time_ms: null,
+            message: 'no answer: timeout',
+          },
+        ])
+      )
+    ).toBe(
+      '2 of 3 locations answered; failing from worker-7 (eu); 1 did not answer'
+    )
   })
 })

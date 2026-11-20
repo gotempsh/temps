@@ -21,17 +21,20 @@ use temps_entities::{projects, status_checks, status_monitors, users};
 use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
 use tower::ServiceExt;
 
+use super::locations::NodeLocation;
 use super::probe::{ProbeOutcome, ProbeStatus, TargetProber};
 use super::spec::{CheckRequest, CheckRequestHeader, CheckSpec, HttpCheck, Target, TcpCheck};
 use super::{
-    CreateTargetMonitorRequest, MonitorCheckKind, TargetChecks, TargetMonitorError,
-    TargetMonitorService, UpdateTargetMonitorRequest, MAX_TARGET_MONITORS_PER_PROJECT,
+    CreateTargetMonitorRequest, MonitorCheckKind, MonitorLocationResults, NoNodeLocations,
+    ProbeLocations, ProbeLocationsResponse, TargetChecks, TargetMonitorError, TargetMonitorService,
+    UpdateTargetMonitorRequest, MAX_TARGET_MONITORS_PER_PROJECT,
 };
 use crate::routes::target_monitors::{
-    create_target_monitor, create_target_monitor_router, update_target_monitor,
-    TargetMonitorRoutesState,
+    create_target_monitor, create_target_monitor_router, get_monitor_probe_locations,
+    update_target_monitor, TargetMonitorRoutesState,
 };
 use crate::services::{HealthCheckService, MonitorResponse};
+use temps_uptime_probe::RemoteProbeRequest;
 
 const SECRET: &str = "Bearer tk-secret-value-1234";
 
@@ -149,7 +152,19 @@ async fn fixture() -> Option<Fx> {
 
 impl Fx {
     fn checks(&self, prober: Arc<dyn TargetProber>) -> Arc<TargetChecks> {
-        Arc::new(TargetChecks::new(self.encryption.clone(), prober))
+        self.checks_from(prober, Arc::new(NoNodeLocations))
+    }
+
+    fn checks_from(
+        &self,
+        prober: Arc<dyn TargetProber>,
+        locations: Arc<dyn ProbeLocations>,
+    ) -> Arc<TargetChecks> {
+        Arc::new(TargetChecks::new(
+            self.encryption.clone(),
+            prober,
+            locations,
+        ))
     }
 
     fn service(&self) -> TargetMonitorService {
@@ -189,6 +204,7 @@ fn http_request(target: &str) -> CreateTargetMonitorRequest {
             body: None,
         }),
         check_interval_seconds: Some(10),
+        probe_from_nodes: false,
     }
 }
 
@@ -319,6 +335,7 @@ async fn invalid_and_non_public_targets_are_refused() {
         check: CheckSpec::Tcp(TcpCheck::default()),
         request: None,
         check_interval_seconds: None,
+        probe_from_nodes: false,
     };
     assert!(matches!(
         checked.create(fx.project_id, tcp).await,
@@ -500,6 +517,10 @@ async fn environment_monitors_are_not_changed_here_and_the_shapes_stay_apart() {
 }
 
 async fn health_service(fx: &Fx, prober: Arc<FakeProber>) -> HealthCheckService {
+    health_service_with(fx, fx.checks(prober)).await
+}
+
+async fn health_service_with(fx: &Fx, checks: Arc<TargetChecks>) -> HealthCheckService {
     let config = temps_config::ServerConfig::new(
         "127.0.0.1:3000".to_string(),
         "postgres://test:test@localhost/test".to_string(),
@@ -512,7 +533,7 @@ async fn health_service(fx: &Fx, prober: Arc<FakeProber>) -> HealthCheckService 
         fx.db.clone(),
         config_service,
         Arc::new(RecordingQueue::default()),
-        fx.checks(prober),
+        checks,
     )
     .expect("service")
 }
@@ -701,6 +722,10 @@ async fn routes_require_authentication() {
             "PATCH",
             format!("/projects/{}/monitors/1/target", fx.project_id),
         ),
+        (
+            "GET",
+            format!("/projects/{}/monitors/probe-locations", fx.project_id),
+        ),
     ] {
         let response = router
             .clone()
@@ -720,4 +745,355 @@ async fn routes_require_authentication() {
             "{method} {path}"
         );
     }
+}
+
+/// Worker nodes as probe locations, answering from a script.
+struct FakeLocations {
+    nodes: Vec<NodeLocation>,
+    answers: Vec<(i32, Result<ProbeOutcome, String>)>,
+    asked: Mutex<Vec<(i32, RemoteProbeRequest)>>,
+}
+
+impl FakeLocations {
+    fn new(answers: Vec<(NodeLocation, Result<ProbeOutcome, String>)>) -> Arc<Self> {
+        Arc::new(Self {
+            nodes: answers.iter().map(|(node, _)| node.clone()).collect(),
+            answers: answers
+                .into_iter()
+                .map(|(node, answer)| (node.node_id, answer))
+                .collect(),
+            asked: Mutex::new(Vec::new()),
+        })
+    }
+}
+
+#[async_trait]
+impl ProbeLocations for FakeLocations {
+    async fn nodes(&self) -> Result<Vec<NodeLocation>, sea_orm::DbErr> {
+        Ok(self.nodes.clone())
+    }
+
+    async fn probe(
+        &self,
+        node: &NodeLocation,
+        request: &RemoteProbeRequest,
+    ) -> Result<ProbeOutcome, String> {
+        self.asked
+            .lock()
+            .expect("asked lock")
+            .push((node.node_id, request.clone()));
+        self.answers
+            .iter()
+            .find(|(id, _)| *id == node.node_id)
+            .map(|(_, answer)| answer.clone())
+            .unwrap_or_else(|| Err("not scripted".to_string()))
+    }
+}
+
+fn worker(node_id: i32, region: Option<&str>) -> NodeLocation {
+    NodeLocation {
+        node_id,
+        name: format!("worker-{node_id}"),
+        region: region.map(str::to_string),
+    }
+}
+
+fn down(message: &str) -> Result<ProbeOutcome, String> {
+    Ok(ProbeOutcome {
+        status: ProbeStatus::Down,
+        response_time_ms: None,
+        message: Some(message.to_string()),
+    })
+}
+
+#[tokio::test]
+async fn checked_from_nodes_the_majority_decides_and_every_answer_is_kept() {
+    let Some(fx) = fixture().await else { return };
+    let monitor = fx
+        .service()
+        .create(
+            fx.project_id,
+            CreateTargetMonitorRequest {
+                probe_from_nodes: true,
+                ..http_request("https://api.example.test/")
+            },
+        )
+        .await
+        .expect("create");
+    assert!(monitor.probe_from_nodes);
+    let locations = FakeLocations::new(vec![
+        (
+            worker(7, Some("eu")),
+            down("could not connect: connection refused"),
+        ),
+        (worker(8, None), down("no answer within 10.0 s")),
+        (
+            worker(9, None),
+            Err("could not reach its agent".to_string()),
+        ),
+    ]);
+    let prober = FakeProber::new(ProbeOutcome {
+        status: ProbeStatus::Operational,
+        response_time_ms: Some(40),
+        message: None,
+    });
+    let health = health_service_with(&fx, fx.checks_from(prober.clone(), locations.clone())).await;
+    health.run_all_checks().await.expect("sweep");
+
+    assert_eq!(
+        prober.seen.lock().expect("seen").len(),
+        1,
+        "checked here too"
+    );
+    let asked = locations.asked.lock().expect("asked").clone();
+    assert_eq!(asked.len(), 3, "every node was asked");
+    assert_eq!(asked[0].1.target, "https://api.example.test/");
+    assert_eq!(
+        asked[0].1.request.headers[0].value, SECRET,
+        "nodes get the decrypted request, which the real client only sends sealed"
+    );
+
+    let checks = status_checks::Entity::find()
+        .filter(status_checks::Column::MonitorId.eq(monitor.id))
+        .all(fx.db.as_ref())
+        .await
+        .expect("checks");
+    assert_eq!(checks.len(), 1);
+    assert_eq!(checks[0].status, "major_outage", "2 of the 3 that answered");
+    let message = checks[0].error_message.clone().expect("message");
+    assert!(
+        message.starts_with("down from 2 of 3 locations"),
+        "{message}"
+    );
+    assert!(message.contains("worker-7: could not connect"), "{message}");
+
+    let after = status_monitors::Entity::find_by_id(monitor.id)
+        .one(fx.db.as_ref())
+        .await
+        .expect("load")
+        .expect("monitor");
+    assert_eq!(
+        after.updated_at, monitor.updated_at,
+        "recording answers is not an edit"
+    );
+    let response = MonitorResponse::from(after);
+    let results = response.location_results.expect("answers kept").results;
+    let summary: Vec<(String, Option<&str>)> = results
+        .iter()
+        .map(|result| {
+            (
+                result.location.clone(),
+                result.status.map(|status| status.stored()),
+            )
+        })
+        .collect();
+    assert_eq!(
+        summary,
+        vec![
+            ("control plane".to_string(), Some("operational")),
+            ("worker-7".to_string(), Some("major_outage")),
+            ("worker-8".to_string(), Some("major_outage")),
+            ("worker-9".to_string(), None),
+        ]
+    );
+    assert_eq!(results[1].region.as_deref(), Some("eu"));
+    assert_eq!(
+        results[3].message.as_deref(),
+        Some("no answer: could not reach its agent")
+    );
+}
+
+#[tokio::test]
+async fn one_failing_location_is_not_an_outage_and_others_are_not_asked() {
+    let Some(fx) = fixture().await else { return };
+    let service = fx.service();
+    let spread = service
+        .create(
+            fx.project_id,
+            CreateTargetMonitorRequest {
+                probe_from_nodes: true,
+                ..http_request("https://api.example.test/a")
+            },
+        )
+        .await
+        .expect("create");
+    let here_only = service
+        .create(fx.project_id, http_request("https://api.example.test/b"))
+        .await
+        .expect("create");
+    let locations = FakeLocations::new(vec![
+        (worker(7, None), down("could not connect: no route to host")),
+        (
+            worker(8, None),
+            Ok(ProbeOutcome {
+                status: ProbeStatus::Operational,
+                response_time_ms: Some(80),
+                message: None,
+            }),
+        ),
+    ]);
+    let prober = FakeProber::new(ProbeOutcome {
+        status: ProbeStatus::Operational,
+        response_time_ms: Some(20),
+        message: None,
+    });
+    let health = health_service_with(&fx, fx.checks_from(prober, locations.clone())).await;
+    health.run_all_checks().await.expect("sweep");
+
+    assert_eq!(
+        locations.asked.lock().expect("asked").len(),
+        2,
+        "only the monitor checked from nodes asked them"
+    );
+    for (monitor, kept) in [(&spread, true), (&here_only, false)] {
+        let check = status_checks::Entity::find()
+            .filter(status_checks::Column::MonitorId.eq(monitor.id))
+            .one(fx.db.as_ref())
+            .await
+            .expect("check")
+            .expect("one check");
+        assert_eq!(check.status, "operational");
+        assert_eq!(check.error_message, None);
+        let row = status_monitors::Entity::find_by_id(monitor.id)
+            .one(fx.db.as_ref())
+            .await
+            .expect("load")
+            .expect("monitor");
+        assert_eq!(row.location_results.is_some(), kept);
+    }
+    let check = status_checks::Entity::find()
+        .filter(status_checks::Column::MonitorId.eq(spread.id))
+        .one(fx.db.as_ref())
+        .await
+        .expect("check")
+        .expect("one check");
+    assert_eq!(
+        check.response_time_ms,
+        Some(80),
+        "the median of 20, 80 and none"
+    );
+
+    // Turning it off forgets the answers, which were for other settings.
+    let updated = service
+        .update(
+            fx.project_id,
+            spread.id,
+            UpdateTargetMonitorRequest {
+                probe_from_nodes: Some(false),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("update");
+    assert!(!updated.probe_from_nodes);
+    assert_eq!(updated.location_results, None);
+}
+
+#[tokio::test]
+async fn only_target_monitors_can_be_checked_from_nodes() {
+    let Some(fx) = fixture().await else { return };
+    let environment_monitor = status_monitors::ActiveModel {
+        project_id: Set(fx.project_id),
+        environment_id: Set(None),
+        name: Set("environment".to_string()),
+        monitor_type: Set("web".to_string()),
+        check_interval_seconds: Set(60),
+        is_active: Set(true),
+        is_managed: Set(false),
+        check_kind: Set("environment".to_string()),
+        probe_from_nodes: Set(true),
+        ..Default::default()
+    }
+    .insert(fx.db.as_ref())
+    .await;
+    let error = environment_monitor.expect_err("the constraint refuses it");
+    assert!(
+        error
+            .to_string()
+            .contains("status_monitors_probe_from_nodes_target"),
+        "{error}"
+    );
+}
+
+async fn locations_body(
+    state: Arc<TargetMonitorRoutesState>,
+    project_id: i32,
+) -> ProbeLocationsResponse {
+    let response = get_monitor_probe_locations(auth(Role::Reader), State(state), Path(project_id))
+        .await
+        .unwrap_or_else(|_| panic!("a reader sees the locations"));
+    let response = axum::response::IntoResponse::into_response(response);
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .expect("body");
+    serde_json::from_slice(&body).expect("json")
+}
+
+#[tokio::test]
+async fn probe_locations_say_what_is_missing_without_worker_nodes() {
+    let Some(fx) = fixture().await else { return };
+    let state = fx.routes(Arc::new(RecordingAudit::default()));
+    let denied = get_monitor_probe_locations(
+        auth(Role::MetricsIngest),
+        State(state.clone()),
+        Path(fx.project_id),
+    )
+    .await;
+    let Err(problem) = denied else {
+        panic!("no status page permission")
+    };
+    assert_eq!(problem.status_code, StatusCode::FORBIDDEN);
+
+    let alone = locations_body(state, fx.project_id).await;
+    assert!(!alone.configured);
+    assert_eq!(alone.locations.len(), 1);
+    assert_eq!(alone.locations[0].name, "control plane");
+    assert!(alone
+        .reason
+        .expect("reason")
+        .contains("No worker node is online"));
+    assert_eq!(alone.setup_path.as_deref(), Some("/settings/nodes"));
+
+    let with_nodes = Arc::new(TargetMonitorRoutesState {
+        monitors: Arc::new(
+            TargetMonitorService::new(
+                fx.db.clone(),
+                fx.checks_from(
+                    FakeProber::new(ProbeOutcome {
+                        status: ProbeStatus::Operational,
+                        response_time_ms: Some(1),
+                        message: None,
+                    }),
+                    FakeLocations::new(vec![(worker(7, Some("eu")), down("unused"))]),
+                ),
+            )
+            .without_address_checks(),
+        ),
+        audit: Arc::new(RecordingAudit::default()),
+        project_access_checker: None,
+    });
+    let spread = locations_body(with_nodes, fx.project_id).await;
+    assert!(spread.configured);
+    assert_eq!(spread.reason, None);
+    assert_eq!(spread.locations[1].name, "worker-7");
+    assert_eq!(spread.locations[1].region.as_deref(), Some("eu"));
+}
+
+#[test]
+fn location_results_round_trip_through_the_column() {
+    let results = MonitorLocationResults {
+        checked_at: Utc::now(),
+        results: vec![super::MonitorLocationResult::control_plane(ProbeOutcome {
+            status: ProbeStatus::Degraded,
+            response_time_ms: Some(900),
+            message: Some("HTTP 200 in 900 ms, slower than 500 ms".to_string()),
+        })],
+    };
+    let json = serde_json::to_value(&results).expect("json");
+    assert_eq!(json["results"][0]["status"], "degraded");
+    assert_eq!(
+        serde_json::from_value::<MonitorLocationResults>(json).expect("back"),
+        results
+    );
 }
