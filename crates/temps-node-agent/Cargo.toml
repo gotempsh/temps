@@ -19,6 +19,7 @@ ebpf = ["temps-workload-netpol/ebpf"]
 [dependencies]
 temps-docker-util = { path = "../temps-docker-util" }
 temps-runtime-health = { path = "../temps-runtime-health" }
+temps-uptime-probe = { path = "../temps-uptime-probe" }
 arc-swap = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }

@@ -1612,6 +1612,8 @@ mod tests {
             target: None,
             check_spec: None,
             request_encrypted: None,
+            probe_from_nodes: false,
+            location_results: None,
             created_at: now,
             updated_at: now,
         }

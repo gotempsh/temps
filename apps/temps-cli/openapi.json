@@ -19851,6 +19851,10 @@
             "description": "Shown in the console and, unless renamed there, on status pages.",
             "type": "string"
           },
+          "probe_from_nodes": {
+            "description": "Also check from up to four online worker nodes, and count the\nmonitor down only when most locations agree (ADR 108 D5).",
+            "type": "boolean"
+          },
           "request": {
             "oneOf": [
               {
@@ -47440,6 +47444,79 @@
         ],
         "type": "object"
       },
+      "MonitorLocationResult": {
+        "description": "What one location reported on a check.",
+        "properties": {
+          "location": {
+            "description": "`control plane`, or the worker node's name.",
+            "type": "string"
+          },
+          "message": {
+            "description": "Why it is not operational, or why the location did not answer.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "node_id": {
+            "description": "The worker node; `null` for the control plane.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "region": {
+            "description": "The node's `region` label, when it has one.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "response_time_ms": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "status": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ProbeStatus",
+                "description": "`null` when the location did not answer: it is then not counted."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "location"
+        ],
+        "type": "object"
+      },
+      "MonitorLocationResults": {
+        "description": "Every location's answer to the latest check.",
+        "properties": {
+          "checked_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "results": {
+            "items": {
+              "$ref": "#/components/schemas/MonitorLocationResult"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "checked_at",
+          "results"
+        ],
+        "type": "object"
+      },
       "MonitorResponse": {
         "properties": {
           "check": {
@@ -47489,6 +47566,17 @@
             "description": "Temps-managed HTTP monitor; independent monitors remain visible for workers.",
             "type": "boolean"
           },
+          "location_results": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/MonitorLocationResults",
+                "description": "What each location reported on the latest check; `null` for a\nmonitor checked from the control plane only, or not checked since\nits last change."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "monitor_type": {
             "type": "string"
           },
@@ -47505,6 +47593,10 @@
               "string",
               "null"
             ]
+          },
+          "probe_from_nodes": {
+            "description": "Also checked from worker nodes; down only when most locations agree\n(ADR 108 D5).",
+            "type": "boolean"
           },
           "project_id": {
             "format": "int32",
@@ -47523,6 +47615,7 @@
           "monitor_type",
           "monitor_url",
           "check_kind",
+          "probe_from_nodes",
           "check_interval_seconds",
           "is_active",
           "created_at",
@@ -55642,6 +55735,78 @@
           "ipv6_addresses"
         ],
         "type": "object"
+      },
+      "ProbeLocationView": {
+        "description": "One place checks can run from.",
+        "properties": {
+          "name": {
+            "description": "`control plane`, or the worker node's name.",
+            "type": "string"
+          },
+          "node_id": {
+            "description": "The worker node; `null` for the control plane.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "region": {
+            "description": "The node's `region` label, when it has one.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
+      "ProbeLocationsResponse": {
+        "description": "Where a monitor checked from worker nodes would be checked from now.",
+        "properties": {
+          "configured": {
+            "description": "Whether any worker node is available, so checking from worker\nnodes adds a location.",
+            "type": "boolean"
+          },
+          "locations": {
+            "description": "The control plane first, then each worker node that would be asked.",
+            "items": {
+              "$ref": "#/components/schemas/ProbeLocationView"
+            },
+            "type": "array"
+          },
+          "reason": {
+            "description": "What is missing when `configured` is false.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "setup_path": {
+            "description": "Where to fix it in the console.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "locations",
+          "configured"
+        ],
+        "type": "object"
+      },
+      "ProbeStatus": {
+        "description": "A check's verdict. Serialized as the value stored in\n`status_checks.status`.",
+        "enum": [
+          "operational",
+          "degraded",
+          "major_outage"
+        ],
+        "type": "string"
       },
       "ProblemDetails": {
         "additionalProperties": {
@@ -82926,6 +83091,13 @@
           "name": {
             "type": [
               "string",
+              "null"
+            ]
+          },
+          "probe_from_nodes": {
+            "description": "Check from worker nodes too, or from the control plane only.",
+            "type": [
+              "boolean",
               "null"
             ]
           },
@@ -167472,6 +167644,54 @@
           }
         ],
         "summary": "Create a new monitor",
+        "tags": [
+          "Status Page"
+        ]
+      }
+    },
+    "/projects/{project_id}/monitors/probe-locations": {
+      "get": {
+        "description": "The control plane, plus the online worker nodes a monitor with\n`probe_from_nodes` would also be checked from (at most four, one per\n`region` label first). `configured` is false when there is no worker\nnode, with what to do about it.",
+        "operationId": "get_monitor_probe_locations",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProbeLocationsResponse"
+                }
+              }
+            },
+            "description": "Probe locations"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Where monitors can be checked from",
         "tags": [
           "Status Page"
         ]

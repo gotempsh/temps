@@ -3,9 +3,10 @@
 
 import {
   createTargetMonitorMutation,
+  getMonitorProbeLocationsOptions,
   updateTargetMonitorMutation,
 } from '@/api/client/@tanstack/react-query.gen'
-import type { MonitorResponse } from '@/api/client'
+import type { MonitorResponse, ProbeLocationsResponse } from '@/api/client'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -35,15 +36,17 @@ import {
 import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
 import { zodResolver } from '@hookform/resolvers/zod'
-import { useMutation, useQueryClient } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Plus, Trash2 } from 'lucide-react'
 import { useEffect } from 'react'
 import { useFieldArray, useForm, useWatch } from 'react-hook-form'
+import { Link } from 'react-router'
 import { toast } from 'sonner'
 import {
   createTargetMonitorRequest,
   DNS_RECORD_TYPES,
   HTTP_METHODS,
+  locationLabel,
   newTargetMonitorValues,
   TARGET_KIND_COPY,
   TARGET_KINDS,
@@ -104,6 +107,10 @@ export function TargetMonitorDialog({
     name: 'replaceRequest',
   })
   const copy = TARGET_KIND_COPY[kind]
+  const probeLocations = useQuery({
+    ...getMonitorProbeLocationsOptions({ path: { project_id: projectId } }),
+    enabled: open,
+  })
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -511,6 +518,30 @@ export function TargetMonitorDialog({
                 </FormItem>
               )}
             />
+            <FormField
+              control={form.control}
+              name="probeFromNodes"
+              render={({ field }) => (
+                <FormItem className="flex flex-row items-start justify-between gap-4 rounded-md border p-3">
+                  <div className="space-y-1">
+                    <FormLabel>Check from worker nodes too</FormLabel>
+                    <FormDescription>
+                      <ProbeLocationsHint
+                        isPending={probeLocations.isPending}
+                        isError={probeLocations.isError}
+                        data={probeLocations.data}
+                      />
+                    </FormDescription>
+                  </div>
+                  <FormControl>
+                    <Switch
+                      checked={field.value}
+                      onCheckedChange={field.onChange}
+                    />
+                  </FormControl>
+                </FormItem>
+              )}
+            />
             <DialogFooter>
               <Button
                 type="button"
@@ -527,5 +558,44 @@ export function TargetMonitorDialog({
         </Form>
       </DialogContent>
     </Dialog>
+  )
+}
+
+/** Where the check would run from, or what is missing for a second place. */
+function ProbeLocationsHint({
+  isPending,
+  isError,
+  data,
+}: {
+  isPending: boolean
+  isError: boolean
+  data: ProbeLocationsResponse | undefined
+}) {
+  if (isPending) return <>Looking for worker nodes…</>
+  if (isError || !data) {
+    return (
+      <>
+        Down only when most locations agree. Worker nodes could not be listed
+        right now.
+      </>
+    )
+  }
+  if (!data.configured) {
+    return (
+      <>
+        {data.reason}{' '}
+        {data.setup_path && (
+          <Link className="underline" to={data.setup_path}>
+            Add a worker node
+          </Link>
+        )}
+      </>
+    )
+  }
+  return (
+    <>
+      Also from {data.locations.slice(1).map(locationLabel).join(', ')}. Down
+      only when most locations agree.
+    </>
   )
 }

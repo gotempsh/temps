@@ -1719,6 +1719,8 @@ pub(crate) mod tests {
             target: None,
             check_spec: None,
             request_encrypted: None,
+            probe_from_nodes: false,
+            location_results: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }

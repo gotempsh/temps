@@ -3325,6 +3325,7 @@ Manage uptime monitors for status pages
 - `create` (`add`) - Create a new monitor for a project
 - `add-target` - Monitor a URL, port, TLS certificate or DNS record outside Temps
 - `update-target` - Change a monitor of a target outside Temps; omitted flags keep their value
+- `locations` - List where monitors checked from worker nodes are checked from
 - `show` - Show monitor details and current status
 - `remove` (`rm`) - Delete a monitor
 - `status` - Get current status — all monitors for a project, or a single monitor by ID
@@ -3371,6 +3372,7 @@ Monitor a URL, port, TLS certificate or DNS record outside Temps
 | `-n, --name <name>` | Monitor name | - | Yes |
 | `-i, --interval <seconds>` | Check interval in seconds (default 60, at least 30) | - | No |
 | `--keyword-absent` | Fail when --keyword is present instead of missing | - | No |
+| `--from-nodes` | Also check from online worker nodes; down only when most locations agree | - | No |
 | `--method <method>` | HTTP method (default GET) | - | No |
 | `--expect-status <codes>` | Codes or classes counted as up, e.g. 200,204 or 2xx (default 2xx or 3xx) | - | No |
 | `--keyword <text>` | Text the response body must contain (first 256 KiB; never stored) | - | No |
@@ -3399,6 +3401,8 @@ Change a monitor of a target outside Temps; omitted flags keep their value
 | `--keyword-absent` | Fail when --keyword is present instead of missing | - | No |
 | `--pause` | Stop checking | - | No |
 | `--resume` | Start checking again | - | No |
+| `--from-nodes` | Also check from online worker nodes | - | No |
+| `--no-from-nodes` | Check from this server only | - | No |
 | `--method <method>` | HTTP method (default GET) | - | No |
 | `--expect-status <codes>` | Codes or classes counted as up, e.g. 200,204 or 2xx (default 2xx or 3xx) | - | No |
 | `--keyword <text>` | Text the response body must contain (first 256 KiB; never stored) | - | No |
@@ -3408,6 +3412,17 @@ Change a monitor of a target outside Temps; omitted flags keep their value
 | `--expect <values>` | Comma-separated DNS values; any match is up (default: any answer) | - | No |
 | `--header-file <path>` | File of "Name: value" request headers; stored encrypted, never shown | - | No |
 | `--body-file <path>` | File with the request body; stored encrypted | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `monitors locations`
+
+List where monitors checked from worker nodes are checked from
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
 | `--json` | Output in JSON format | - | No |
 
 ### `monitors show`

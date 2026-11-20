@@ -1,12 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-/// A target or check setting that cannot be used.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum CheckConfigError {
-    #[error("invalid {field}: {reason}")]
-    Invalid { field: &'static str, reason: String },
-}
+pub use temps_uptime_probe::CheckConfigError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum TargetMonitorError {

@@ -6,16 +6,17 @@
 import type { Command } from 'commander'
 import { requireAuth } from '../../config/store.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
-import { createTargetMonitor, updateTargetMonitor } from '../../api/sdk.gen.js'
+import { createTargetMonitor, getMonitorProbeLocations, updateTargetMonitor } from '../../api/sdk.gen.js'
 import type {
   CheckRequest,
   CheckSpec,
   DnsCheckRecordType,
   HttpMethod,
+  MonitorLocationResult,
   MonitorResponse,
 } from '../../api/types.gen.js'
 import { withSpinner } from '../../ui/spinner.js'
-import { json, success, warning, keyValue } from '../../ui/output.js'
+import { json, success, warning, keyValue, newline, header, icons, info } from '../../ui/output.js'
 
 export const TARGET_KINDS = ['http', 'tcp', 'tls', 'dns'] as const
 export type TargetKind = (typeof TARGET_KINDS)[number]
@@ -41,6 +42,7 @@ interface AddOptions extends CheckOptions {
   interval?: string
   headerFile?: string
   bodyFile?: string
+  fromNodes?: boolean
   json?: boolean
 }
 
@@ -55,6 +57,7 @@ interface UpdateOptions extends CheckOptions {
   bodyFile?: string
   pause?: boolean
   resume?: boolean
+  fromNodes?: boolean
   json?: boolean
 }
 
@@ -144,6 +147,38 @@ export async function requestFromFiles(headerFile?: string, bodyFile?: string): 
   return { headers, body: bodyFile ? await read(bodyFile) : null }
 }
 
+const STATES: Record<string, string> = {
+  operational: 'up',
+  degraded: 'degraded',
+  major_outage: 'down',
+}
+
+function locationName(result: { location?: string; name?: string; region?: string | null }): string {
+  const name = result.location ?? result.name ?? ''
+  return result.region ? `${name} (${result.region})` : name
+}
+
+/** One line per location of the latest check of a monitor checked from worker nodes. */
+export function locationLines(monitor: MonitorResponse): string[] {
+  if (!monitor.probe_from_nodes) return []
+  const latest = monitor.location_results
+  if (!latest) return ['not checked since its last change']
+  return latest.results.map((result: MonitorLocationResult) => {
+    const state = result.status ? STATES[result.status] ?? result.status : 'no answer'
+    const time = result.response_time_ms != null ? `, ${result.response_time_ms} ms` : ''
+    const why = result.message ? ` — ${result.message}` : ''
+    return `${locationName(result)}: ${state}${time}${why}`
+  })
+}
+
+/** The latest per-location answers, for `monitors show`. */
+export function printLocations(monitor: MonitorResponse): void {
+  const lines = locationLines(monitor)
+  if (!lines.length) return
+  keyValue('Checked From', 'this server and worker nodes; down when most agree')
+  for (const line of lines) keyValue('  Location', line)
+}
+
 function printMonitor(monitor: MonitorResponse): void {
   keyValue('ID', monitor.id)
   keyValue('Checks', monitor.check?.target ?? monitor.monitor_url)
@@ -152,6 +187,7 @@ function printMonitor(monitor: MonitorResponse): void {
     keyValue('Headers sent', monitor.check.header_names.join(', '))
   }
   keyValue('Every', `${monitor.check_interval_seconds}s`)
+  if (monitor.probe_from_nodes) keyValue('Checked From', 'this server and worker nodes')
 }
 
 function parseId(value: string, flag: string): number {
@@ -182,6 +218,7 @@ export function registerTargetMonitorCommands(monitors: Command): void {
     .requiredOption('-n, --name <name>', 'Monitor name')
     .option('-i, --interval <seconds>', 'Check interval in seconds (default 60, at least 30)')
     .option('--keyword-absent', 'Fail when --keyword is present instead of missing')
+    .option('--from-nodes', 'Also check from online worker nodes; down only when most locations agree')
   for (const [flag, description] of CHECK_FLAGS) add.option(flag, description)
   add.option('--json', 'Output in JSON format').action(async (options: AddOptions) => {
     await requireAuth()
@@ -212,6 +249,7 @@ export function registerTargetMonitorCommands(monitors: Command): void {
           check,
           request,
           check_interval_seconds: interval,
+          probe_from_nodes: options.fromNodes ?? false,
         },
       })
       if (error || !data) throw new Error(getErrorMessage(error))
@@ -237,6 +275,8 @@ export function registerTargetMonitorCommands(monitors: Command): void {
     .option('--keyword-absent', 'Fail when --keyword is present instead of missing')
     .option('--pause', 'Stop checking')
     .option('--resume', 'Start checking again')
+    .option('--from-nodes', 'Also check from online worker nodes')
+    .option('--no-from-nodes', 'Check from this server only')
   for (const [flag, description] of CHECK_FLAGS) update.option(flag, description)
   update.option('--json', 'Output in JSON format').action(async (options: UpdateOptions) => {
     await requireAuth()
@@ -275,6 +315,7 @@ export function registerTargetMonitorCommands(monitors: Command): void {
           request: await requestFromFiles(options.headerFile, options.bodyFile),
           check_interval_seconds: interval,
           is_active: options.pause ? false : options.resume ? true : null,
+          probe_from_nodes: options.fromNodes ?? null,
         },
       })
       if (error || !data) throw new Error(getErrorMessage(error))
@@ -287,4 +328,35 @@ export function registerTargetMonitorCommands(monitors: Command): void {
     success(`Saved monitor ${monitor.id}${monitor.is_active ? '' : ' (paused)'}`)
     printMonitor(monitor)
   })
+
+  monitors
+    .command('locations')
+    .description('List where monitors checked from worker nodes are checked from')
+    .requiredOption('--project-id <id>', 'Project ID')
+    .option('--json', 'Output in JSON format')
+    .action(async (options: { projectId: string; json?: boolean }) => {
+      await requireAuth()
+      await setupClient()
+      const locations = await withSpinner('Listing locations...', async () => {
+        const { data, error } = await getMonitorProbeLocations({
+          client,
+          path: { project_id: parseId(options.projectId, '--project-id') },
+        })
+        if (error || !data) throw new Error(getErrorMessage(error))
+        return data
+      })
+      if (options.json) {
+        json(locations)
+        return
+      }
+      newline()
+      header(`${icons.info} Probe locations (${locations.locations.length})`)
+      for (const location of locations.locations) keyValue('Location', locationName(location))
+      if (!locations.configured) {
+        newline()
+        info(locations.reason ?? 'No worker node is online')
+        if (locations.setup_path) info(`Add one in the console: ${locations.setup_path}`)
+      }
+      newline()
+    })
 }

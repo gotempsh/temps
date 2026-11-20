@@ -1,14 +1,18 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Turning a stored target monitor into a probe.
+//! Turning a stored target monitor into a probe, from the control plane
+//! and, for a monitor checked from worker nodes, from them too.
 
 use std::sync::Arc;
 
 use temps_core::EncryptionService;
 use temps_entities::status_monitors;
+use temps_uptime_probe::RemoteProbeRequest;
+use tracing::warn;
 
 use super::error::TargetMonitorError;
+use super::locations::{combine, MonitorLocationResult, MonitorLocationResults, ProbeLocations};
 use super::probe::{ProbeOutcome, TargetProber};
 use super::spec::{parse_target, CheckRequest, MonitorCheckKind, StoredCheck, Target};
 
@@ -20,14 +24,36 @@ pub struct DecodedCheck {
     pub request: CheckRequest,
 }
 
+/// One check of a target monitor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckResult {
+    /// The verdict recorded in `status_checks`.
+    pub outcome: ProbeOutcome,
+    /// Every location's answer, for a monitor checked from worker nodes.
+    pub locations: Option<MonitorLocationResults>,
+}
+
 pub struct TargetChecks {
     encryption: Arc<EncryptionService>,
     prober: Arc<dyn TargetProber>,
+    locations: Arc<dyn ProbeLocations>,
 }
 
 impl TargetChecks {
-    pub fn new(encryption: Arc<EncryptionService>, prober: Arc<dyn TargetProber>) -> Self {
-        Self { encryption, prober }
+    pub fn new(
+        encryption: Arc<EncryptionService>,
+        prober: Arc<dyn TargetProber>,
+        locations: Arc<dyn ProbeLocations>,
+    ) -> Self {
+        Self {
+            encryption,
+            prober,
+            locations,
+        }
+    }
+
+    pub(crate) fn locations(&self) -> &dyn ProbeLocations {
+        self.locations.as_ref()
     }
 
     pub(crate) fn encryption(&self) -> &EncryptionService {
@@ -83,15 +109,55 @@ impl TargetChecks {
         })
     }
 
-    /// Probe `monitor`'s target once.
-    pub async fn probe(
+    /// Check `monitor`'s target once: from the control plane, and at the
+    /// same time from the worker nodes when the monitor asks for it. A
+    /// failure to list the nodes degrades to the control plane alone.
+    pub async fn run(
         &self,
         monitor: &status_monitors::Model,
-    ) -> Result<ProbeOutcome, TargetMonitorError> {
+    ) -> Result<CheckResult, TargetMonitorError> {
         let check = self.decode(monitor)?;
-        Ok(self
+        let local = self
             .prober
-            .probe(&check.stored.spec, &check.target, &check.request)
-            .await)
+            .probe(&check.stored.spec, &check.target, &check.request);
+        if !monitor.probe_from_nodes {
+            return Ok(CheckResult {
+                outcome: local.await,
+                locations: None,
+            });
+        }
+        let nodes = self.locations.nodes().await.unwrap_or_else(|error| {
+            warn!(
+                monitor_id = monitor.id,
+                %error,
+                "Could not list worker nodes; checking from the control plane only"
+            );
+            Vec::new()
+        });
+        let request = RemoteProbeRequest {
+            check: check.stored.spec.clone(),
+            target: check.target.stored(),
+            request: check.request.clone(),
+        };
+        let remote = futures::future::join_all(
+            nodes
+                .iter()
+                .map(|node| self.locations.probe(node, &request)),
+        );
+        let (local, remote) = tokio::join!(local, remote);
+        let mut results = vec![MonitorLocationResult::control_plane(local)];
+        results.extend(
+            nodes
+                .iter()
+                .zip(remote)
+                .map(|(node, answer)| MonitorLocationResult::node(node, answer)),
+        );
+        Ok(CheckResult {
+            outcome: combine(&results),
+            locations: Some(MonitorLocationResults {
+                checked_at: chrono::Utc::now(),
+                results,
+            }),
+        })
     }
 }

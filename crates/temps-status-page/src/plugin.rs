@@ -30,7 +30,9 @@ use crate::routes::target_monitors::{
     create_target_monitor_router, TargetMonitorApiDoc, TargetMonitorRoutesState,
 };
 use crate::routes::webhooks::{create_webhook_router, WebhookApiDoc, WebhookRoutesState};
-use crate::services::checks::{NetworkProber, TargetChecks, TargetMonitorService};
+use crate::services::checks::{
+    NetworkProber, NodeProbeLocations, TargetChecks, TargetMonitorService,
+};
 use crate::services::maintenance::StatusPageMaintenanceService;
 use crate::services::page_access::PageAccessService;
 use crate::services::public_pages::{DomainServiceCertificates, StatusPageDomainService};
@@ -268,9 +270,16 @@ impl TempsPlugin for StatusPagePlugin {
             // Create health check service with mandatory ConfigService and JobQueue
             // The service will emit StatusCheckCompleted jobs for outage detection
             // Monitors for targets outside Temps (ADR 108 D3, D4).
+            // Worker nodes are probe locations for monitors that ask (D5).
+            let encryption = context.require_service::<temps_core::EncryptionService>();
             let target_checks = Arc::new(TargetChecks::new(
-                context.require_service::<temps_core::EncryptionService>(),
+                encryption.clone(),
                 Arc::new(NetworkProber),
+                Arc::new(NodeProbeLocations::new(
+                    db.clone(),
+                    config_service.clone(),
+                    encryption,
+                )),
             ));
             context.register_service(Arc::new(TargetMonitorService::new(
                 db.clone(),
