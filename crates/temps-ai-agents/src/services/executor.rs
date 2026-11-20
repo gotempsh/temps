@@ -4993,6 +4993,7 @@ pub(crate) mod tests {
             resolved_in_release_after_id: None,
             assignee_user_id: None,
             assignee_team_id: None,
+            issue_type: "error".to_string(),
             project_id: 1,
             environment_id: None,
             deployment_id: None,
