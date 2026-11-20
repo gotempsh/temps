@@ -5,6 +5,7 @@
 // kept in the project's blob storage (ADR 111, D4).
 
 import type { Command } from 'commander'
+import { writeFile } from 'node:fs/promises'
 import { basename } from 'node:path'
 import { requireAuth } from '../../config/store.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
@@ -55,6 +56,27 @@ export function parseOwner(options: { groupId?: string; eventId?: string; feedba
     kind: 'event',
     groupId: wholeId(options.groupId, '--group-id'),
     eventId: wholeId(options.eventId, '--event-id'),
+  }
+}
+
+/**
+ * Write a downloaded attachment to `path`. Without `force` the file is
+ * created only if it does not exist, in one step, so a file that appears
+ * meanwhile (another download of the same name) is never replaced: returns
+ * false then. With `force` an existing file is replaced.
+ */
+export async function saveDownload(path: string, bytes: Uint8Array, force: boolean): Promise<boolean> {
+  if (force) {
+    await Bun.write(path, bytes)
+    return true
+  }
+  try {
+    // Bun.write has no create-only mode; the `wx` flag is O_CREAT | O_EXCL.
+    await writeFile(path, bytes, { flag: 'wx' })
+    return true
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'EEXIST') return false
+    throw error
   }
 }
 
@@ -225,13 +247,10 @@ async function downloadAction(options: {
     }
   })
   const output = options.output ?? name
-  if (!options.force) {
-    if (await Bun.file(output).exists()) {
-      warning(`${output} exists; pass --force to overwrite it or --output to choose another file`)
-      return
-    }
+  if (!(await saveDownload(output, bytes, options.force ?? false))) {
+    warning(`${output} exists; pass --force to overwrite it or --output to choose another file`)
+    return
   }
-  await Bun.write(output, bytes)
   success(`Saved ${formatBytes(bytes.byteLength)} to ${output}`)
 }
 
