@@ -658,10 +658,12 @@ deploys, which is web services. It comes last and may never be worth building.
   writes that never finished (after an hour), attachments of deleted feedback,
   and every attachment of a deleted project (soft-deleted counts). Deleting a
   feedback deletes its attachments. An object that cannot be deleted keeps its
-  row, so the next pass retries; each pass pages past such rows instead of
-  stopping at them, and deleted projects are visited a page per pass from
-  where the last pass stopped. Deleting rows takes the project's usage row
-  lock first, as a reservation does, so the two cannot deadlock. Rolling the
+  row, so a later pass retries; each pass pages past such rows instead of
+  stopping at them, a pass whose step budget runs out continues on the next
+  pass where it stopped (deleted projects too, a page per pass), and a walk
+  that reaches the end starts over. Deleting rows, a deleted project's
+  included, takes the project's usage row lock first, as a reservation does,
+  so the two cannot deadlock. Rolling the
   migration back refuses while any attachment is listed, since dropping the
   rows would strand their objects.
   A write that failed or timed out deletes its object before its row, since a

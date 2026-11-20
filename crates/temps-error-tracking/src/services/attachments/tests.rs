@@ -7,7 +7,9 @@ use std::collections::BTreeMap;
 use std::sync::atomic::AtomicBool;
 
 /// Blob storage in memory. `failing_puts` and `failing_deletes` make
-/// those calls answer as an unreachable store would; `lost_put_answers`
+/// those calls answer as an unreachable store would, and
+/// `failing_delete_prefixes` does so for deletes of those prefixes only;
+/// `lost_put_answers`
 /// keeps the object but answers with an error, as a store whose answer
 /// timed out would.
 #[derive(Default)]
@@ -15,6 +17,7 @@ pub(crate) struct MemoryStore {
     objects: Mutex<BTreeMap<(i32, String), Bytes>>,
     pub(crate) failing_puts: AtomicBool,
     pub(crate) failing_deletes: AtomicBool,
+    pub(crate) failing_delete_prefixes: Mutex<std::collections::BTreeSet<String>>,
     pub(crate) lost_put_answers: AtomicBool,
 }
 
@@ -70,7 +73,13 @@ impl PayloadBlobStore for MemoryStore {
     }
 
     async fn delete_prefix(&self, project_id: i32, prefix: &str) -> Result<u64, PayloadBlobError> {
-        if self.failing_deletes.load(Ordering::SeqCst) {
+        if self.failing_deletes.load(Ordering::SeqCst)
+            || self
+                .failing_delete_prefixes
+                .lock()
+                .expect("store lock")
+                .contains(prefix)
+        {
             return Err(PayloadBlobError::Unavailable {
                 project_id,
                 reason: "synthetic outage".into(),
@@ -963,6 +972,145 @@ mod storage {
         assert!(f.store.keys(f.project_id).is_empty());
         let usage = f.service.usage(f.project_id).await.expect("usage");
         assert_eq!((usage.used_bytes, usage.files), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn a_pass_out_of_budget_continues_after_the_rows_it_could_not_delete() {
+        let Some(f) = fixture("attachment sweep cursor test").await else {
+            return;
+        };
+        // One pass's budget of rows per kind whose objects cannot be
+        // deleted, and one more after them whose object can.
+        let budget = SWEEP_BATCH as i64 * MAX_SWEEP_BATCHES as i64;
+        let kinds = [
+            // An expired event's file: its event is gone.
+            (
+                "'error'",
+                "NOW() - INTERVAL '3 days' + i * INTERVAL '1 microsecond'",
+                "NOW()",
+            ),
+            // A write that never finished, two hours ago.
+            ("'error'", "NULL", "NULL"),
+            // A file of a deleted feedback.
+            ("'feedback'", "NULL", "NOW()"),
+        ];
+        let mut failing = std::collections::BTreeSet::new();
+        for (kind, (owner_kind, event_time, stored_at)) in kinds.iter().enumerate() {
+            let ids =
+                f.db.query_all(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    format!(
+                        "INSERT INTO error_attachments (project_id, owner_kind, owner_id, ordinal, \
+                             event_time, filename, content_type, attachment_type, size_bytes, \
+                             content_sha256, stored_at, created_at) \
+                         SELECT $1, {owner_kind}, $2, i, {event_time}, 'f' || i, 'text/plain', \
+                             'event.attachment', 1, sha256(i::text::bytea), {stored_at}, \
+                             NOW() - INTERVAL '2 hours' \
+                         FROM generate_series(0, $3) AS i ORDER BY i RETURNING id"
+                    ),
+                    [
+                        f.project_id.into(),
+                        (987_000 + kind as i32).into(),
+                        budget.into(),
+                    ],
+                ))
+                .await
+                .expect("insert candidates");
+            let mut ids: Vec<i64> = ids
+                .iter()
+                .map(|row| row.try_get("", "id").expect("id"))
+                .collect();
+            ids.sort_unstable();
+            assert_eq!(ids.len() as i64, budget + 1);
+            failing.extend(ids[..budget as usize].iter().map(|id| object_prefix(*id)));
+        }
+        *f.store.failing_delete_prefixes.lock().expect("store lock") = failing;
+
+        let counts = |o: SweepOutcome| (o.expired, o.stale, o.orphaned_feedback);
+        let first = f
+            .service
+            .sweep(f.store.as_ref(), Utc::now())
+            .await
+            .expect("sweep");
+        assert_eq!(counts(first), (0, 0, 0), "the budget went on failing rows");
+        let second = f
+            .service
+            .sweep(f.store.as_ref(), Utc::now())
+            .await
+            .expect("sweep");
+        assert_eq!(
+            counts(second),
+            (1, 1, 1),
+            "the next pass reaches the row after them"
+        );
+        // Having reached the end, the next pass starts over and retries
+        // the rows that failed.
+        f.store
+            .failing_delete_prefixes
+            .lock()
+            .expect("store lock")
+            .clear();
+        let third = f
+            .service
+            .sweep(f.store.as_ref(), Utc::now())
+            .await
+            .expect("sweep");
+        let budget = budget as u64;
+        assert_eq!(counts(third), (budget, budget, budget));
+    }
+
+    #[tokio::test]
+    async fn deleting_a_deleted_projects_rows_waits_for_the_usage_lock_before_touching_them() {
+        let Some(f) = fixture("attachment deleted project lock test").await else {
+            return;
+        };
+        event(&f, SDK_EVENT, chrono::Duration::minutes(5)).await;
+        f.service
+            .store_batch(
+                f.store.as_ref(),
+                &batch(&f, SDK_EVENT, vec![file("a.txt", b"abc")]),
+            )
+            .await
+            .expect("store");
+        f.db.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "UPDATE projects SET is_deleted = TRUE WHERE id = $1",
+            [f.project_id.into()],
+        ))
+        .await
+        .expect("delete project");
+
+        // A resend holding the usage row lock, as a reservation does.
+        let resend = f.db.begin().await.expect("resend transaction");
+        resend
+            .execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT project_id FROM error_attachment_usage WHERE project_id = $1 FOR UPDATE",
+                [f.project_id.into()],
+            ))
+            .await
+            .expect("usage lock");
+        let (service, store) = (f.service.clone(), f.store.clone());
+        let sweep = tokio::spawn(async move { service.sweep(store.as_ref(), Utc::now()).await });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!sweep.is_finished(), "the sweep waits for the usage lock");
+        // The resend can still renew its row: the sweep has not locked it.
+        resend
+            .execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT id FROM error_attachments WHERE project_id = $1 FOR UPDATE NOWAIT",
+                [f.project_id.into()],
+            ))
+            .await
+            .expect("the attachment rows are not locked by the waiting sweep");
+        resend.commit().await.expect("commit resend");
+
+        let swept = tokio::time::timeout(Duration::from_secs(10), sweep)
+            .await
+            .expect("the sweep finishes once the lock is released")
+            .expect("sweep task")
+            .expect("sweep");
+        assert_eq!(swept.deleted_projects, 1, "{swept:?}");
     }
 
     #[tokio::test]

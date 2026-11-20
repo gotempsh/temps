@@ -219,6 +219,40 @@ pub struct AttachmentService {
     /// The last deleted project a sweep looked at, so a project whose
     /// files cannot be deleted does not hold back the ones after it.
     deleted_project_cursor: std::sync::atomic::AtomicI32,
+    /// Where the other sweep loops stopped, for the same reason.
+    sweep_cursors: SweepCursors,
+}
+
+/// Where each bounded sweep loop stopped when its step budget ran out, so
+/// the next pass continues after every row it looked at, including those
+/// whose object could not be deleted, instead of looking at the same rows
+/// again. A loop that reaches its end starts over on the next pass, which
+/// retries what failed. Only the sweeper reads and writes these.
+#[derive(Debug, Default)]
+struct SweepCursors {
+    /// `(event_time, id)` of the last expired candidate looked at, the time
+    /// in microseconds (what Postgres stores); id 0 means from the start.
+    expired_micros: std::sync::atomic::AtomicI64,
+    expired_id: std::sync::atomic::AtomicI64,
+    stale_id: std::sync::atomic::AtomicI64,
+    orphaned_feedback_id: std::sync::atomic::AtomicI64,
+}
+
+impl SweepCursors {
+    fn expired(&self) -> Option<(DateTime<Utc>, i64)> {
+        let id = self.expired_id.load(Ordering::Relaxed);
+        if id == 0 {
+            return None;
+        }
+        DateTime::from_timestamp_micros(self.expired_micros.load(Ordering::Relaxed))
+            .map(|time| (time, id))
+    }
+
+    fn set_expired(&self, after: Option<(DateTime<Utc>, i64)>) {
+        let (micros, id) = after.map_or((0, 0), |(time, id)| (time.timestamp_micros(), id));
+        self.expired_micros.store(micros, Ordering::Relaxed);
+        self.expired_id.store(id, Ordering::Relaxed);
+    }
 }
 
 /// The uploader and sweeper tasks [`AttachmentService::start`] spawned.
@@ -241,6 +275,7 @@ impl AttachmentService {
             store: OnceLock::new(),
             stop: tokio::sync::watch::channel(()).0,
             deleted_project_cursor: std::sync::atomic::AtomicI32::new(0),
+            sweep_cursors: SweepCursors::default(),
         }
     }
 
@@ -892,9 +927,11 @@ impl AttachmentService {
         // Error events expire by whole time chunks, oldest first, so the
         // attachments of expired events are the oldest ones: walk them in
         // event order and stop at the first page whose events all exist.
-        // Each page starts after the previous one, so a row whose object
-        // cannot be deleted is passed over until the next sweep.
-        let mut after: Option<(DateTime<Utc>, i64)> = None;
+        // Each page starts after the previous one, and a pass whose budget
+        // runs out continues there next time, so a row whose object cannot
+        // be deleted is passed over until the walk starts over.
+        let mut after = self.sweep_cursors.expired();
+        let mut reached_end = false;
         for _ in 0..MAX_SWEEP_BATCHES {
             // Two forms rather than `$1 IS NULL OR ...`, so both walk the
             // `(event_time, id)` index.
@@ -920,7 +957,10 @@ impl AttachmentService {
             let page = SweepCandidate::find_by_statement(statement)
                 .all(self.db.as_ref())
                 .await?;
-            let Some(last) = page.last() else { break };
+            let Some(last) = page.last() else {
+                reached_end = true;
+                break;
+            };
             after = last.event_time.map(|t| (t, last.id));
             let full = page.len() as u64 == SWEEP_BATCH;
             let rows: Vec<RemovalRow> = page
@@ -932,30 +972,46 @@ impl AttachmentService {
                 })
                 .collect();
             if rows.is_empty() {
+                reached_end = true;
                 break;
             }
             outcome.expired += self.remove(store, rows).await?;
             if !full {
+                reached_end = true;
                 break;
             }
         }
+        self.sweep_cursors
+            .set_expired(if reached_end { None } else { after });
 
         let stale_before = now
             - chrono::Duration::from_std(STALE_RESERVATION).unwrap_or(chrono::Duration::hours(1));
-        let mut after_id = 0i64;
+        let mut after_id = self.sweep_cursors.stale_id.load(Ordering::Relaxed);
+        let mut reached_end = false;
         for _ in 0..MAX_SWEEP_BATCHES {
             let (rows, last, full) = self.claim_stale(stale_before, after_id).await?;
-            let Some(last) = last else { break };
+            let Some(last) = last else {
+                reached_end = true;
+                break;
+            };
             after_id = last;
             outcome.stale += self.remove(store, rows).await?;
             if !full {
+                reached_end = true;
                 break;
             }
         }
+        self.sweep_cursors
+            .stale_id
+            .store(if reached_end { 0 } else { after_id }, Ordering::Relaxed);
 
         // Deleting a feedback deletes its attachments; one whose object
         // could not be deleted then is left here.
-        let mut after_id = 0i64;
+        let mut after_id = self
+            .sweep_cursors
+            .orphaned_feedback_id
+            .load(Ordering::Relaxed);
+        let mut reached_end = false;
         for _ in 0..MAX_SWEEP_BATCHES {
             let rows = RemovalRow::find_by_statement(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
@@ -968,14 +1024,21 @@ impl AttachmentService {
             ))
             .all(self.db.as_ref())
             .await?;
-            let Some(last) = rows.last() else { break };
+            let Some(last) = rows.last() else {
+                reached_end = true;
+                break;
+            };
             after_id = last.id;
             let full = rows.len() as u64 == SWEEP_BATCH;
             outcome.orphaned_feedback += self.remove(store, rows).await?;
             if !full {
+                reached_end = true;
                 break;
             }
         }
+        self.sweep_cursors
+            .orphaned_feedback_id
+            .store(if reached_end { 0 } else { after_id }, Ordering::Relaxed);
 
         // Deleted projects, a page per pass, continuing where the last
         // pass stopped and starting over once the end is reached.
@@ -1010,6 +1073,16 @@ impl AttachmentService {
             match deleted {
                 Ok(Ok(_)) | Ok(Err(PayloadBlobError::NotFound { .. })) => {
                     let tx = self.db.begin().await?;
+                    // The usage row lock first, as `remove_rows` and a
+                    // reservation take it, so a resend renewing one of
+                    // these rows and this delete never wait on each other.
+                    tx.execute(Statement::from_sql_and_values(
+                        DatabaseBackend::Postgres,
+                        "SELECT project_id FROM error_attachment_usage WHERE project_id = $1 \
+                         FOR UPDATE",
+                        [project_id.into()],
+                    ))
+                    .await?;
                     tx.execute(Statement::from_sql_and_values(
                         DatabaseBackend::Postgres,
                         "DELETE FROM error_attachments WHERE project_id = $1",
