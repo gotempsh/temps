@@ -70,6 +70,11 @@ pub fn flag_condition_holds(
 fn same_value(a: &serde_json::Value, b: &serde_json::Value) -> bool {
     use serde_json::Value;
     match (a, b) {
+        // Two integers compare exactly (as f64, 2^53 + 1 would equal 2^53);
+        // only a fractional operand compares as a float, so `1 == 1.0`.
+        (Value::Number(x), Value::Number(y)) if !x.is_f64() && !y.is_f64() => {
+            x.as_i64() == y.as_i64() && x.as_u64() == y.as_u64()
+        }
         (Value::Number(x), Value::Number(y)) => match (x.as_f64(), y.as_f64()) {
             (Some(x), Some(y)) => x == y,
             _ => x == y,
@@ -260,6 +265,16 @@ mod tests {
             &serde_json::json!({"a": [1.0, 2]})
         ));
         assert!(!same_value(&serde_json::json!("1"), &serde_json::json!(1)));
+        assert!(!same_value(
+            &serde_json::json!(9_007_199_254_740_992_u64),
+            &serde_json::json!(9_007_199_254_740_993_u64)
+        ));
+        assert!(!same_value(
+            &serde_json::json!(u64::MAX),
+            &serde_json::json!(u64::MAX - 1)
+        ));
+        assert!(!same_value(&serde_json::json!(-1), &serde_json::json!(1)));
+        assert!(same_value(&serde_json::json!(-3), &serde_json::json!(-3.0)));
     }
 
     #[test]

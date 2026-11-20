@@ -2,7 +2,13 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { afterEach, expect, test } from 'bun:test'
-import { cleanup, render, waitFor } from '@testing-library/react'
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter, Route, Routes } from 'react-router'
 import type {
@@ -73,7 +79,23 @@ function body(url: URL): unknown {
       questions: [],
     }
   if (url.pathname.endsWith('/responses'))
-    return { responses: [], page: 1, page_size: 20, total: 0, total_pages: 1 }
+    return {
+      responses: [
+        {
+          event_id: 1,
+          timestamp: '2026-11-20T08:00:00Z',
+          environment_id: 5,
+          visitor_id: null,
+          session_id: null,
+          pathname: '/checkout',
+          answers: { q_score: 9 },
+        },
+      ],
+      page: Number(url.searchParams.get('page') ?? 1),
+      page_size: 20,
+      total: 60,
+      total_pages: 3,
+    }
   return survey
 }
 
@@ -125,5 +147,54 @@ test('results and responses follow the environment picked in the project bar', a
     expect(scoped('/results')).toEqual(['5', null])
     expect(scoped('/responses')).toEqual(['5', null])
   })
+  queryClient.clear()
+})
+
+test('an environment change resets the responses page, also when coming back', async () => {
+  const pages: string[] = []
+  client.setConfig({ baseUrl: 'http://console.example.test/api' })
+  globalThis.fetch = (async (request: Request) => {
+    const url = new URL(request.url)
+    if (url.pathname.endsWith('/responses'))
+      pages.push(
+        `${url.searchParams.get('environment_id') ?? 'all'}:${url.searchParams.get('page')}`
+      )
+    return new Response(JSON.stringify(body(url)), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    })
+  }) as unknown as typeof fetch
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  const tree = (environment: EnvironmentResponse | undefined) => (
+    <QueryClientProvider client={queryClient}>
+      <ProjectEnvironmentContext.Provider value={bar(environment)}>
+        <MemoryRouter
+          initialEntries={['/projects/sample-app/analytics/surveys/3']}
+        >
+          <Routes>
+            <Route
+              path="/projects/:slug/analytics/surveys/:surveyId"
+              element={<SurveyDetail project={project} />}
+            />
+          </Routes>
+        </MemoryRouter>
+      </ProjectEnvironmentContext.Provider>
+    </QueryClientProvider>
+  )
+  const view = render(tree(staging))
+  fireEvent.click(await screen.findByRole('button', { name: 'Next page' }))
+  await waitFor(() => expect(pages).toContain('5:2'))
+  fireEvent.click(await screen.findByRole('button', { name: 'Next page' }))
+  await waitFor(() => expect(pages).toContain('5:3'))
+
+  view.rerender(tree(undefined))
+  await waitFor(() => expect(pages).toContain('all:1'))
+  const before = pages.length
+  view.rerender(tree(staging))
+  await screen.findByLabelText('Page 1 of 3')
+  // Back on staging, page 1 is shown and only page 1 is (re)fetched.
+  expect(pages.slice(before).every((entry) => entry === '5:1')).toBe(true)
   queryClient.clear()
 })

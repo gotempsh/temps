@@ -75,9 +75,13 @@ export function SurveyDetail({ project }: SurveyDetailProps) {
   // Results follow the project bar's environment (`undefined` = all of
   // them), like every other analytics page.
   const [environmentId] = useEnvironmentFilter()
-  // The page belongs to the environment it was picked in: another
-  // environment's responses start again at page 1.
+  // The page belongs to the environment it was picked in: changing the
+  // environment starts again at page 1, and coming back does too (the reset
+  // is stored, not only shown).
   const [pageState, setPageState] = useState({ page: 1, environmentId })
+  if (pageState.environmentId !== environmentId) {
+    setPageState({ page: 1, environmentId })
+  }
   const page = pageState.environmentId === environmentId ? pageState.page : 1
   const setPage = (next: number) => setPageState({ page: next, environmentId })
   const [editOpen, setEditOpen] = useState(false)
