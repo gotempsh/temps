@@ -7,8 +7,13 @@ Apply [the CLI runtime and safety contract](../cli-runtime.md) before executing 
 ## Contents
 
 - [`analytics keys`](#analytics-keys)
+- [`analytics conversions`](#analytics-conversions)
+- [`analytics identity`](#analytics-identity)
 - [`analytics overview`](#analytics-overview)
 - [`analytics top`](#analytics-top)
+- [`analytics outbound`](#analytics-outbound)
+- [`analytics downloads`](#analytics-downloads)
+- [`analytics not-found`](#analytics-not-found)
 - [`analytics funnels`](#analytics-funnels)
 - [`analytics performance`](#analytics-performance)
 - [`analytics ai-agents`](#analytics-ai-agents)
@@ -30,8 +35,13 @@ View project analytics
 **Subcommands:**
 
 - `keys` - Manage analytics ingest keys (pa_...) for apps Temps does not deploy
+- `conversions` (`goals`) - Conversion goals: events or pages that count as success
+- `identity` - Whether visitors are recognised by a stored id or tracked cookieless
 - `overview` (`o`) - Show analytics dashboard overview
 - `top` - Show breakdown by dimension: pages, referrers, browsers, os, devices, countries, regions, cities, channels, events, languages, utm_source, utm_medium, utm_campaign
+- `outbound` - Show the outbound links visitors clicked (outbound_click events)
+- `downloads` - Show the files visitors downloaded (file_download events)
+- `not-found` - Show pages visitors could not find: 404s Temps answered and not_found events
 - `funnels` - Show funnel conversion metrics for all funnels
 - `performance` (`speed`) - Show real-user Web Vitals and optional dimension breakdowns
 - `ai-agents` - Show AI crawler / provider breakdown (web /analytics/ai-agents)
@@ -129,6 +139,126 @@ Revoke (deactivate) an analytics ingest key
 | `-f, --force` | Skip confirmation | - | No |
 | `-y, --yes` | Skip confirmation (alias for --force) | - | No |
 
+### `analytics conversions` (alias: `goals`)
+
+Conversion goals: events or pages that count as success
+
+**Subcommands:**
+
+- `list` - List conversions with visitors, rate and revenue in a period
+- `create` - Define a conversion
+- `update` - Replace a conversion's definition
+- `delete` - Delete a conversion (recorded events are kept)
+- `breakdown` - Where the visitors who converted came from
+
+#### `analytics conversions list`
+
+List conversions with visitors, rate and revenue in a period
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 7d, 30d, 3m) | `30d` | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `analytics conversions create`
+
+Define a conversion
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `-n, --name <name>` | Name shown in reports, e.g. Signup | - | No |
+| `--event <name>` | Count this event, e.g. signup | - | No |
+| `--page <path>` | Count visits to this path; * matches anything, e.g. /docs/* | - | No |
+| `--property <key=value>` | Only events whose property has this value, e.g. plan=pro | - | No |
+| `--revenue-property <key>` | Event property holding the amount, e.g. amount | - | No |
+| `--currency <code>` | ISO 4217 currency of the amount, e.g. EUR | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `analytics conversions update`
+
+Replace a conversion's definition
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--goal-id <id>` | Conversion ID (see list) | - | Yes |
+| `-n, --name <name>` | Name shown in reports, e.g. Signup | - | No |
+| `--event <name>` | Count this event, e.g. signup | - | No |
+| `--page <path>` | Count visits to this path; * matches anything, e.g. /docs/* | - | No |
+| `--property <key=value>` | Only events whose property has this value, e.g. plan=pro | - | No |
+| `--revenue-property <key>` | Event property holding the amount, e.g. amount | - | No |
+| `--currency <code>` | ISO 4217 currency of the amount, e.g. EUR | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `analytics conversions delete`
+
+Delete a conversion (recorded events are kept)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--goal-id <id>` | Conversion ID (see list) | - | Yes |
+| `-f, --force` | Skip confirmation | - | No |
+| `-y, --yes` | Skip confirmation (alias for --force) | - | No |
+
+#### `analytics conversions breakdown`
+
+Where the visitors who converted came from
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--goal-id <id>` | Conversion ID (see list) | - | Yes |
+| `--by <dimension>` | One of channel, referrer, utm_source, utm_medium, utm_campaign, page, country, device_type, browser, operating_system | `channel` | No |
+| `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 7d, 30d, 3m) | `30d` | No |
+| `--limit <n>` | Rows (default: 10, max: 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics identity`
+
+Whether visitors are recognised by a stored id or tracked cookieless
+
+**Subcommands:**
+
+- `show` - Show the identity mode and what it changes
+- `set` - Switch between persistent and cookieless tracking
+
+#### `analytics identity show`
+
+Show the identity mode and what it changes
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `analytics identity set`
+
+Switch between persistent and cookieless tracking
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--mode <mode>` | One of persistent, cookieless | - | Yes |
+| `-y, --yes` | Skip confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
 ### `analytics overview` (alias: `o`)
 
 Show analytics dashboard overview
@@ -151,6 +281,45 @@ Show breakdown by dimension: pages, referrers, browsers, os, devices, countries,
 |------|-------------|---------|----------|
 | `-p, --project <project>` | Project slug or ID | - | No |
 | `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `24h` | No |
+| `--limit <n>` | Number of results (default: 20, max: 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics outbound`
+
+Show the outbound links visitors clicked (outbound_click events)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `7d` | No |
+| `--limit <n>` | Number of results (default: 20, max: 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics downloads`
+
+Show the files visitors downloaded (file_download events)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `7d` | No |
+| `--limit <n>` | Number of results (default: 20, max: 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics not-found`
+
+Show pages visitors could not find: 404s Temps answered and not_found events
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `7d` | No |
 | `--limit <n>` | Number of results (default: 20, max: 100) | - | No |
 | `--json` | Output in JSON format | - | No |
 
