@@ -283,7 +283,7 @@ Without React, `analytics.flags.get('checkout.v2', false)` from `@temps-sdk/anal
 
 - **Nothing is fetched until you read a flag**, so pages that never use flags pay nothing.
 - Requests go to `POST /api/_temps/flags` on **your own domain**, the same path as Temps analytics: no CORS, no key, no ad-blocker list.
-- To target a signed-in user rather than the anonymous visitor, pass `flags={{ key: user.id, attributes: { plan: user.plan } }}` to the provider, or call `flags.reload({ key: user.id })` after sign-in.
+- To target a signed-in user rather than the anonymous visitor, pass `flags={{ key: user.id, attributes: { plan: user.plan } }}` to the provider, or call `flags.reload({ key: user.id })` after sign-in. When the subject or attributes change, values fetched for the previous ones are dropped at once, so after a sign-out nothing targeted at the previous user is served while the new request runs, or if it fails. A refresh with the same context keeps the last values until the new ones arrive.
 - To avoid a flash of the wrong variant, render flags on the server and pass them as `flags={{ bootstrap: { 'checkout.v2': true } }}`.
 
 Temps fills in these attributes from the request, so rules can use them without your app sending anything: `environment`, `host`, `country` (when GeoIP is configured), `browser`, `os`, `device_type`, `visitor_id`, `session_id`. Attributes your app sends override them.
