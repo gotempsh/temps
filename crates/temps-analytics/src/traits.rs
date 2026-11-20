@@ -328,7 +328,10 @@ pub trait Analytics: Send + Sync {
     /// Break one event down by one of its custom properties (a top-level key
     /// of `props`), most frequent value first. Crawler traffic is excluded.
     /// `property` must pass [`crate::validate_event_property_key`].
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "mirrors the query parameters of the event properties endpoint one to one"
+    )]
     async fn get_event_properties(
         &self,
         project_id: i32,

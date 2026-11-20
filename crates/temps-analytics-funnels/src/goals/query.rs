@@ -244,7 +244,10 @@ fn dimension_sql(dimension: AnalyticsGoalBreakdownDimension) -> (&'static str, &
 /// One goal's conversions grouped by `dimension`, with the visitors of each
 /// value as the conversion-rate denominator. `None` when the stored goal is
 /// unusable.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each argument is one independent part of the report scope; a struct would only be unpacked again here"
+)]
 pub(crate) fn breakdown_query(
     goal: &AnalyticsGoal,
     dimension: AnalyticsGoalBreakdownDimension,

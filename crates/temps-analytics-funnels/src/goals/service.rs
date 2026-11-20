@@ -759,7 +759,10 @@ mod tests {
         .id
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "test fixture: one argument per event column the scenarios vary"
+    )]
     async fn create_event(
         db: &DatabaseConnection,
         project_id: i32,
