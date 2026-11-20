@@ -7393,6 +7393,8 @@ Save a log search
 
 Delete a saved search (refused while an alert rule counts it)
 
+**Usage:** `logs saved delete <id> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -7402,6 +7404,8 @@ Delete a saved search (refused while an alert rule counts it)
 #### `logs saved series`
 
 Chart a saved search over time: matching lines per bucket, or a numeric field
+
+**Usage:** `logs saved series <id> [options]`
 
 **Options:**
 
@@ -7451,6 +7455,8 @@ Create an ingest key; the key is printed once
 #### `logs keys revoke`
 
 Revoke an ingest key; collectors using it are refused
+
+**Usage:** `logs keys revoke <id> [options]`
 
 **Options:**
 
