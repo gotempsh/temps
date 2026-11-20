@@ -11,8 +11,9 @@ and regressions after a deployment), D2.3 (Apdex), D2.4 (pages joined to
 backend requests) and D2.5 (breakdown inside an operation) have shipped, so
 D2 is complete. D3.1 (session counters), D3.2 (the release page),
 D3.3 (the crash-free alert) and D3.4 (releases tied to deployments) have
-shipped, so D3 is complete; D4 to D7 are not scheduled. The questions they settled
-are recorded under "Settled while implementing".
+shipped, so D3 is complete. D4 (attachments) has shipped; D5 to D7 are not
+scheduled. The questions they settled are recorded under "Settled while
+implementing".
 
 Related: ADR 016 (ClickHouse traces backend), ADR 027 (cross-project trace
 linking), ADR 033 (release identity for symbolication), ADR 054 (autofix
@@ -608,3 +609,42 @@ deploys, which is web services. It comes last and may never be worth building.
 - The open question whether D3 should wait for mobile or desktop demand was
   settled by building it at this size: counters only, no new store and no
   new alerting system.
+
+### D4 Attachments
+
+- **Plain files only.** An attachment item whose `attachment_type` is
+  `event.attachment` (the default) is kept. Minidumps, Apple crash reports and
+  Unreal files belong to D7 and stay unsupported. An attachment never rejects
+  its envelope: one that is too large, past the count, or has no event or
+  feedback to belong to is reported unsupported, and the events are stored.
+- **Limits.** 2 MiB per file and 4 MiB or 8 files per event or feedback, under
+  the envelope's own 2 MiB body and 10 MiB decompressed limits. Each project
+  has a quota of 256 MiB of attachments until the admin changes it (0 to
+  100 GiB, a column on `error_attachment_usage`, audited). Lowering it deletes
+  nothing: new attachments are dropped until use falls under it.
+- **Off the hot path.** Attachments are queued only when the envelope is
+  answered 200, after their event or feedback is stored, so an SDK retry after
+  a failure stores nothing twice (the row is unique per owner and position).
+  Ingest does one `try_send` into a queue bounded at 256 envelopes and 16 MiB;
+  past either bound the batch is dropped and counted
+  (`x-temps-sentry-attachments-dropped`). One task reserves each file against
+  the quota in a transaction, writes it to the project's blob storage, then
+  marks the row stored. Envelopes without a DSN (tunneled) carry no
+  attachments.
+- **Owner.** The envelope's event id, else its only event, else its only
+  feedback, resolved through `error_event_source_keys` or the feedback's
+  source id. The owner's timestamp is kept so the sweeper can find events that
+  expired.
+- **Lifetime.** An attachment lives as long as what it came with. Every ten
+  minutes a bounded sweeper deletes those whose event expired with its chunk,
+  writes that never finished (after an hour), attachments of deleted feedback,
+  and every attachment of a deleted project (soft-deleted counts). Deleting a
+  feedback deletes its attachments. An object that cannot be deleted keeps its
+  row, so the next pass retries. Without blob storage nothing is stored, and
+  the usage endpoint says so and links `/storage`.
+- **Serving.** PNG, JPEG, GIF and WebP are served inline so the console can
+  show a feedback screenshot. Everything else is served as
+  `application/octet-stream` to save, with `nosniff` and a sandbox CSP, so a
+  stored HTML or SVG file never runs in the console's origin. File names lose
+  directories and control characters.
+

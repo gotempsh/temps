@@ -129,8 +129,8 @@ These checks use synthetic applications, real HTTP endpoints, native storage que
 | Cron monitoring | Native extension: SDK check-ins, interval/crontab schedules, missed-run and timeout detection, native management and run history | Temps observes the existing scheduler; it does not execute jobs. See [Cron monitoring](/docs/monitoring#cron-monitoring). |
 | Release health | Native extension: `session` and `sessions` items become hourly counters; [crash-free sessions and users, adoption and the deploying release](#release-health) per release, published as metrics for alert rules | Counters only, never individual sessions. Distinct users are an estimate. Sessions on tunneled envelopes without a DSN, older than 5 days or with a release over 250 characters are not counted. |
 | Profiles | Outstanding | Profiling payloads, storage, aggregation and flamegraphs need separate product work. |
-| Feedback | Native extension: modern `feedback` and legacy `user_report` text submissions feed a project inbox with error/replay links, native queries, resolve/reopen/ignore and deletion | Verified Node 8/10/11 and browser 11 modern feedback, plus browser 7 legacy reports. Feedback attachments/screenshots and other SDK families are outside this contract. |
-| Attachments | Outstanding | Binary framing is supported; attachment storage and attachment APIs are not. |
+| Feedback | Native extension: modern `feedback` and legacy `user_report` text submissions feed a project inbox with error/replay links, native queries, resolve/reopen/ignore and deletion | Verified Node 8/10/11 and browser 11 modern feedback, plus browser 7 legacy reports. A feedback screenshot is kept as an [attachment](#attachments) when blob storage is enabled; other SDK families are outside this contract. |
+| Attachments | Native extension: plain files (`event.attachment`) sent with an event or feedback are kept in the project's blob storage, listed on the event and the feedback, downloadable and deletable, under a per-project quota | Minidumps, Apple crash reports and other native attachment types are reported unsupported. See [Attachments](#attachments). |
 | Minidumps and native crashes | Outstanding | Native crash parsing, symbols and processing need separate product work. |
 | CSP and NEL reports | Adapted: legacy CSP and Reporting API CSP → native `CSPViolation` issues; NEL → typed native telemetry logs under service `sentry.nel`. Dedicated `/api/{project_id}/security/` and `/nel/` endpoints and envelope items share scoped ingestion services | CSP 64 KiB/report; NEL 16 KiB/report; 100 reports/HTTP batch; existing 2 MiB transport/10 MiB decompression bounds. Report-only disposition and original reports are retained. HPKP/Expect-CT/Expect-Staple/other browser report types remain explicitly unsupported. Automatic NEL delivery depends on HTTPS and browser support. |
 | Client outcomes | Native extension: batched `client_report` entries aggregate into SDK ingestion health, available through native APIs and Errors → SDK ingestion health | Approximate SDK self-reports, separate from server acceptance/rejection counts; received-hour buckets, 31-day retention, 4 KiB/report and 1,000 outcomes/envelope. Bytes, items and profile-duration milliseconds stay separate; unknown reasons/categories collapse to `other`. Exact event-identified report retries are suppressed for 24 hours, atomically with counter updates. Standalone reports without an event ID have no stable identity: their retries can increase totals and lost reports can undercount. Hash-only receipt metadata expires after 24 hours; indexed cleanup deletes at most 2,000 expired receipts per pass. |
@@ -1146,6 +1146,55 @@ const health = await fetch(
 
 const series = await fetch(
   'https://your-temps-instance.com/api/projects/42/release-health/series?release=my-app%401.4.0',
+  { headers: { 'Authorization': `Bearer ${API_KEY}` } }
+).then(r => r.json());
+```
+</CodeGroup>
+
+## Attachments {{ anchor: true, id: 'attachments' }}
+
+Files an SDK sends with an error, such as a log excerpt or the state of a form, and the screenshot the feedback widget takes, are kept with the event or feedback they came with. They appear under **Attachments** on the event page and on the feedback record: images inline, every file as a download. **Errors → Attachments** shows how much of the project's quota they use and sets the quota.
+
+Attachments live in the project's blob storage, so **Blob storage must be enabled** (Storage in the console). Until it is, the event page and the Attachments page say so and link there, and attachments SDKs send are dropped.
+
+- **What is kept.** Plain files (`attachment_type` `event.attachment`, the default): up to 2 MiB each, and 4 MiB or 8 files per event or feedback. Minidumps and other native crash files are reported unsupported. A file that is too large or has no event or feedback to belong to never rejects the envelope; it is counted in `x-temps-sentry-unsupported-items`.
+- **Quota.** Each project may store 256 MiB of attachments until you change it (0 to 100 GiB). Past the quota, new attachments are dropped; lowering it deletes nothing.
+- **When they are written.** After the envelope is answered, by a background task, so an SDK retry stores nothing twice. When the upload queue (256 envelopes, 16 MiB) is full, attachments are dropped and `x-temps-sentry-attachments-dropped` says how many; `x-temps-sentry-attachments-queued` counts the rest.
+- **How long they are kept.** As long as what they came with: attachments of expired events, deleted feedback and deleted projects are deleted within about ten minutes. Deleting an attachment returns its space to the quota.
+- **Downloads are safe to open.** PNG, JPEG, GIF and WebP are shown inline; any other type, HTML and SVG included, is served as a file to save, never rendered in the console.
+
+<CodeGroup title="Attachments">
+```javascript {{ title: 'SDK' }}
+Sentry.getCurrentScope().addAttachment({
+  filename: 'app.log',
+  data: logText,
+  contentType: 'text/plain',
+});
+Sentry.captureException(error); // the log is kept with this event
+```
+
+```bash {{ title: 'CLI' }}
+# Files of an event, or of a feedback
+temps errors attachments list --project-id 42 --group-id 7 --event-id 1093
+temps errors attachments list --project-id 42 --feedback-id 15
+
+# Save one, delete one
+temps errors attachments download --project-id 42 --attachment-id 311
+temps errors attachments delete --project-id 42 --attachment-id 311
+
+# Quota used, and set the quota to 1 GiB
+temps errors attachments usage --project-id 42
+temps errors attachments quota --project-id 42 --mib 1024
+```
+
+```typescript {{ title: 'API' }}
+const usage = await fetch(
+  'https://your-temps-instance.com/api/projects/42/error-attachments/usage',
+  { headers: { 'Authorization': `Bearer ${API_KEY}` } }
+).then(r => r.json()); // { configured, reason, setup_path, used_bytes, quota_bytes, ... }
+
+const { data } = await fetch(
+  'https://your-temps-instance.com/api/projects/42/error-groups/7/events/1093/attachments',
   { headers: { 'Authorization': `Bearer ${API_KEY}` } }
 ).then(r => r.json());
 ```
