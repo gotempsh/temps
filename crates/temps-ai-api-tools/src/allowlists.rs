@@ -142,6 +142,10 @@ pub const AI_READ_ALLOWLIST: &[&str] = &[
     "list_error_event_attachments",
     "list_feedback_attachments",
     "get_error_attachment_usage",
+    "get_error_source_control",
+    "list_error_group_issues",
+    "get_error_group_suspect_commits",
+    "list_error_ownership_rules",
     "list_alert_rules",
     "get_alert_rule",
     // ── Metric alert rules (OTel) — the rules themselves, so the AI can

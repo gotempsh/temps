@@ -935,6 +935,16 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
             "set_error_attachment_quota",
         ],
     ),
+    (
+        "opening, linking and unlinking an error group's issue (ADR 111, D5) writes to the project's GitHub or GitLab repository or to the group's record, and refreshing reads every linked issue from the provider with the project's credentials; replacing the ownership rules decides who new errors are assigned to. A person does these in the console or CLI",
+        &[
+            "create_error_group_issue",
+            "link_error_group_issue",
+            "unlink_error_group_issue",
+            "refresh_error_group_issues",
+            "replace_error_ownership_rules",
+        ],
+    ),
 ];
 
 /// Allowlisted ids that are served by a plugin and so are not in the published
