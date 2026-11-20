@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useEffect } from 'react'
+import { useEffect, useState } from 'react'
 import { Link } from 'react-router'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useForm } from 'react-hook-form'
@@ -13,6 +13,7 @@ import {
   setErrorAttachmentQuotaMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import type { AttachmentUsage } from '@/api/client/types.gen'
+import { Callout, SaveRow } from '@temps-sdk/ds'
 import { PageHeader } from '@/components/layout/PageContainer'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
@@ -96,14 +97,14 @@ export function AttachmentUsageSummary({ usage }: { usage: AttachmentUsage }) {
 export function QuotaForm({
   projectId,
   usage,
+  usageReadAt,
   refreshing = false,
 }: {
   projectId: number
   usage: AttachmentUsage
-  /**
-   * The saved quota is being read again (after a failed save, which may
-   * have been committed): no new save until the server's value is in.
-   */
+  /** When `usage` was last read from the server (React Query `dataUpdatedAt`). */
+  usageReadAt: number
+  /** The saved quota is being read again. */
   refreshing?: boolean
 }) {
   const queryClient = useQueryClient()
@@ -113,6 +114,11 @@ export function QuotaForm({
   })
   const { reset } = form
   const { isDirty } = form.formState
+  // When the last save failed. Its outcome is unknown (the answer may have
+  // been lost after the commit), so no new save until the saved quota has
+  // been read again after it.
+  const [failedAt, setFailedAt] = useState<number | null>(null)
+  const awaitingRead = failedAt !== null && usageReadAt <= failedAt
   // A refresh brings the saved quota in, but never over an unsaved edit.
   useEffect(() => {
     if (!isDirty) reset({ quota_mib: bytesToMib(usage.quota_bytes) })
@@ -120,6 +126,7 @@ export function QuotaForm({
   const save = useMutation({
     ...setErrorAttachmentQuotaMutation(),
     meta: { errorTitle: 'Failed to change the attachment quota' },
+    onMutate: () => setFailedAt(null),
     onSuccess: async (next) => {
       reset({ quota_mib: bytesToMib(next.quota_bytes) })
       toast.success(
@@ -127,10 +134,9 @@ export function QuotaForm({
       )
       await storeSavedUsage(queryClient, projectId, next)
     },
-    // A failed save's outcome is unknown (its answer may have been lost
-    // after the commit), so read the saved quota again. The edit stays in
-    // the form; the summary shows what the server holds.
+    // The edit stays in the form; the summary shows what the server holds.
     onError: () => {
+      setFailedAt(Date.now())
       void queryClient.invalidateQueries({
         queryKey: getErrorAttachmentUsageQueryKey({
           path: { project_id: projectId },
@@ -140,10 +146,22 @@ export function QuotaForm({
   })
   const error = form.formState.errors.quota_mib?.message
   const exact = isWholeMib(usage.quota_bytes)
+  const saveError = save.isError
+    ? (readFailureServerDetail(save.error) ??
+      'The server did not confirm the change.')
+    : null
+  let hint: string | undefined
+  if (awaitingRead) {
+    hint = refreshing
+      ? 'Reading the saved quota again before another save…'
+      : 'Read the saved quota again (Retry above) before saving again.'
+  } else if (!exact && !isDirty) {
+    hint = `The current quota, ${formatBytesBinary(usage.quota_bytes)}, is not a whole number of MiB; enter a new value to replace it.`
+  }
   return (
     <form
       noValidate
-      className="flex flex-col gap-2 sm:flex-row sm:items-end"
+      className="space-y-4"
       onSubmit={form.handleSubmit(({ quota_mib }) =>
         save.mutate({
           path: { project_id: projectId },
@@ -165,27 +183,28 @@ export function QuotaForm({
           disabled={save.isPending}
           {...form.register('quota_mib', { valueAsNumber: true })}
         />
+        {error && (
+          <p id="attachment-quota-error" className="text-xs text-destructive">
+            {error}
+          </p>
+        )}
       </div>
-      <Button
-        type="submit"
-        disabled={save.isPending || refreshing || (exact && !isDirty)}
-      >
-        {save.isPending ? 'Saving…' : 'Save quota'}
-      </Button>
-      {!exact && (
-        <p className="text-xs text-muted-foreground sm:basis-full">
-          The current quota, {formatBytesBinary(usage.quota_bytes)}, is not a
-          whole number of MiB; saving replaces it with the value above.
-        </p>
-      )}
-      {error && (
-        <p
-          id="attachment-quota-error"
-          className="text-xs text-destructive sm:basis-full"
+      {saveError && (
+        <Callout
+          tone="error"
+          title="The attachment quota may not have been saved"
         >
-          {error}
-        </p>
+          {saveError} The summary above shows the quota the server holds; your
+          value is still in the field, so you can save it again.
+        </Callout>
       )}
+      <SaveRow
+        dirty={isDirty}
+        saving={save.isPending}
+        disabled={refreshing || awaitingRead}
+        label={saveError ? 'Save again' : 'Save quota'}
+        hint={hint}
+      />
     </form>
   )
 }
@@ -199,6 +218,7 @@ export function QuotaForm({
 export function AttachmentsSettingsBody({
   projectId,
   usage,
+  usageReadAt,
   isPending,
   error,
   isRetrying,
@@ -206,6 +226,8 @@ export function AttachmentsSettingsBody({
 }: {
   projectId: number
   usage: AttachmentUsage | undefined
+  /** When `usage` was last read from the server. */
+  usageReadAt: number
   isPending: boolean
   error: unknown
   isRetrying: boolean
@@ -246,9 +268,13 @@ export function AttachmentsSettingsBody({
       {failure}
       {usage && <AttachmentUsageSummary usage={usage} />}
       {usage && (
+        // Keyed by project: an unsaved edit never carries over to another
+        // project's quota.
         <QuotaForm
+          key={projectId}
           projectId={projectId}
           usage={usage}
+          usageReadAt={usageReadAt}
           refreshing={isRetrying}
         />
       )}
@@ -272,6 +298,7 @@ export function ErrorAttachmentsSettings({ projectId }: { projectId: number }) {
           <AttachmentsSettingsBody
             projectId={projectId}
             usage={usage.data}
+            usageReadAt={usage.dataUpdatedAt}
             isPending={usage.isPending}
             error={usage.error}
             isRetrying={usage.isFetching}

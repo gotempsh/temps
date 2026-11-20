@@ -167,6 +167,7 @@ describe('QuotaForm', () => {
         <QuotaForm
           projectId={3}
           usage={usage({ quota_bytes })}
+          usageReadAt={1}
           refreshing={refreshing}
         />
       </QueryClientProvider>
@@ -178,16 +179,10 @@ describe('QuotaForm', () => {
     expect(html).not.toContain('not a whole number of MiB')
   })
 
-  test('waits for the saved quota to be read again before another save', () => {
-    // Not a whole MiB, so Save would otherwise be enabled.
-    const html = renderForm(1, true)
-    expect(html).toMatch(/<button[^>]*disabled=""[^>]*>Save quota<\/button>/)
-  })
-
-  test('a quota that is not whole MiB says so and can be saved as shown', () => {
+  test('a quota that is not whole MiB says so and is kept until a new one is entered', () => {
     const html = renderForm(1)
     expect(html).toContain('The current quota, 1 B, is not a whole number')
-    expect(html).not.toMatch(/<button[^>]*disabled=""[^>]*>Save quota/)
+    expect(html).toMatch(/<button[^>]*disabled=""[^>]*>Save quota<\/button>/)
   })
 })
 
@@ -199,6 +194,7 @@ describe('AttachmentsSettingsBody', () => {
           <AttachmentsSettingsBody
             projectId={3}
             usage={props.usage}
+            usageReadAt={1}
             isPending={false}
             error={props.error ?? null}
             isRetrying={false}
