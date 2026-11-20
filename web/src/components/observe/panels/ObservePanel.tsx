@@ -106,6 +106,7 @@ function CorrelationStrip({
           <CopyButton value={event.trace_id} />
           <Link
             to={`/projects/${projectSlug}/traces/${event.trace_id}`}
+            aria-label="Open trace"
             className="inline-flex items-center text-xs text-primary hover:underline"
           >
             <ExternalLink className="h-3 w-3" />
@@ -212,7 +213,10 @@ function KindSpecificDetails({
             />
           </Section>
           <Section title="Attributes">
-            <pre className="overflow-x-auto rounded bg-muted p-3 text-xs">
+            <pre
+              tabIndex={0}
+              className="overflow-x-auto rounded bg-muted p-3 text-xs"
+            >
               <HighlightedCode
                 code={JSON.stringify(event.attributes, null, 2)}
                 language={'json'}
@@ -246,7 +250,10 @@ function KindSpecificDetails({
             </Link>
           </Section>
           <Section title="Stack trace (preview)">
-            <pre className="overflow-x-auto rounded bg-muted p-3 text-xs">
+            <pre
+              tabIndex={0}
+              className="overflow-x-auto rounded bg-muted p-3 text-xs"
+            >
               <HighlightedCode
                 code={JSON.stringify(event.stacktrace_preview, null, 2)}
                 language={'json'}
@@ -304,7 +311,10 @@ function HeadersBlock({
   if (entries.length === 0) return null
   return (
     <Section title={label}>
-      <pre className="overflow-x-auto rounded bg-muted p-3 text-xs">
+      <pre
+        tabIndex={0}
+        className="overflow-x-auto rounded bg-muted p-3 text-xs"
+      >
         {entries.map(([k, v]) => `${k}: ${String(v)}`).join('\n')}
       </pre>
       {truncated && (

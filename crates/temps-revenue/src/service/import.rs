@@ -36,6 +36,7 @@ use temps_entities::{
 use tracing::{debug, info, warn};
 
 use crate::error::RevenueError;
+use crate::providers::{minor_units_from_f64, MAX_MINOR_AMOUNT};
 use crate::service::integration::RevenueIntegrationService;
 
 /// Outcome of a single CSV import run, returned to the user so they can
@@ -367,7 +368,12 @@ async fn upsert_subscription_from_csv(
 
     let status = normalize_status(row.status.as_deref());
     let currency = row.currency.as_ref().map(|c| c.trim().to_lowercase());
-    let mrr_minor = compute_row_mrr(row);
+    let Some(mrr_minor) = compute_row_mrr(row) else {
+        return Ok(UpsertOutcome::SkippedInvalid(format!(
+            "subscription {}: plan amount does not convert to a monthly amount within {} minor units",
+            row.id, MAX_MINOR_AMOUNT
+        )));
+    };
 
     let started_at =
         parse_ts(row.created.as_deref()).or_else(|| parse_ts(row.current_period_start.as_deref()));
@@ -404,7 +410,14 @@ async fn upsert_subscription_from_csv(
                 );
                 return Ok(UpsertOutcome::SkippedStale);
             }
+            // Keep the webhook ordering fence monotonic: a snapshot is as
+            // new as its newest timestamp, so webhook events older than it
+            // must not roll this row back afterwards.
+            let fence = existing_row
+                .last_event_at
+                .map_or(snapshot_at, |fence| fence.max(snapshot_at));
             let mut active: revenue_subscriptions_state::ActiveModel = existing_row.into();
+            active.last_event_at = Set(Some(fence));
             active.status = Set(status);
             active.mrr_minor = Set(mrr_minor);
             active.currency = Set(currency);
@@ -430,6 +443,7 @@ async fn upsert_subscription_from_csv(
                 started_at: Set(started_at.or(Some(snapshot_at))),
                 canceled_at: Set(canceled_at),
                 updated_at: Set(snapshot_at),
+                last_event_at: Set(Some(snapshot_at)),
                 ..Default::default()
             };
             new.insert(txn).await?;
@@ -490,7 +504,12 @@ async fn insert_invoice_event(
         .or_else(|| parse_ts(row.created.as_deref()))
         .unwrap_or_else(Utc::now);
 
-    let amount_minor = row.amount_paid.round() as i64;
+    let Some(amount_minor) = minor_units_from_f64(row.amount_paid) else {
+        return Ok(InvoiceInsertOutcome::SkippedInvalid(format!(
+            "invoice {}: amount_paid is not a finite amount within {} minor units",
+            row.id, MAX_MINOR_AMOUNT
+        )));
+    };
     if amount_minor <= 0 {
         return Ok(InvoiceInsertOutcome::SkippedInvalid(
             "amount_paid is zero or negative".into(),
@@ -553,11 +572,16 @@ fn normalize_status(raw: Option<&str>) -> String {
 }
 
 /// Project a Stripe CSV row's plan into per-month minor units using the
-/// same conversion the webhook path uses.
-fn compute_row_mrr(row: &SubscriptionRow) -> i64 {
+/// same conversion the webhook path uses. `None` when the result is not a
+/// finite amount within [`MAX_MINOR_AMOUNT`]: the row is rejected instead of
+/// storing a value saturated to `i64::MAX`.
+fn compute_row_mrr(row: &SubscriptionRow) -> Option<i64> {
     let amount = row.plan_amount.unwrap_or(0.0);
+    if amount.is_nan() {
+        return None;
+    }
     if amount <= 0.0 {
-        return 0;
+        return Some(0);
     }
     let qty = row.quantity.unwrap_or(1.0).max(1.0);
     let count = row.plan_interval_count.unwrap_or(1.0).max(1.0);
@@ -571,9 +595,9 @@ fn compute_row_mrr(row: &SubscriptionRow) -> i64 {
         "year" => amount / (12.0 * count),
         "week" => amount * (52.0 / 12.0) / count,
         "day" => amount * (365.0 / 12.0) / count,
-        _ => return 0,
+        _ => return Some(0),
     };
-    (monthly * qty).round() as i64
+    minor_units_from_f64(monthly * qty)
 }
 
 /// Accept unix-seconds integers or RFC3339 strings — Stripe's CSV export
@@ -613,7 +637,7 @@ mod tests {
             created: None,
             canceled_at: None,
         };
-        assert_eq!(compute_row_mrr(&row), 2700);
+        assert_eq!(compute_row_mrr(&row), Some(2700));
     }
 
     #[test]
@@ -631,7 +655,7 @@ mod tests {
             created: None,
             canceled_at: None,
         };
-        assert_eq!(compute_row_mrr(&row), 1000);
+        assert_eq!(compute_row_mrr(&row), Some(1000));
     }
 
     #[test]
@@ -649,7 +673,42 @@ mod tests {
             created: None,
             canceled_at: None,
         };
-        assert_eq!(compute_row_mrr(&row), 0);
+        assert_eq!(compute_row_mrr(&row), Some(0));
+    }
+
+    fn monthly_row(plan_amount: f64, quantity: f64) -> SubscriptionRow {
+        SubscriptionRow {
+            id: "sub_big".into(),
+            customer: None,
+            status: None,
+            currency: Some("usd".into()),
+            plan_amount: Some(plan_amount),
+            plan_interval: Some("month".into()),
+            plan_interval_count: None,
+            quantity: Some(quantity),
+            current_period_start: None,
+            created: None,
+            canceled_at: None,
+        }
+    }
+
+    #[test]
+    fn mrr_beyond_the_amount_limit_is_rejected_not_saturated() {
+        // `as i64` used to turn this into i64::MAX, which then overflowed
+        // the org-wide MRR sum.
+        assert_eq!(compute_row_mrr(&monthly_row(1e30, 1.0)), None);
+        // Quantity can push a plausible price past the limit too.
+        assert_eq!(
+            compute_row_mrr(&monthly_row(MAX_MINOR_AMOUNT as f64, 2.0)),
+            None
+        );
+        assert_eq!(compute_row_mrr(&monthly_row(f64::INFINITY, 1.0)), None);
+        assert_eq!(compute_row_mrr(&monthly_row(f64::NAN, 1.0)), None);
+        // The limit itself is still a valid amount.
+        assert_eq!(
+            compute_row_mrr(&monthly_row(MAX_MINOR_AMOUNT as f64, 1.0)),
+            Some(MAX_MINOR_AMOUNT)
+        );
     }
 
     #[test]

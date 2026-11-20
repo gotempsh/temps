@@ -29,13 +29,17 @@ type LoadMetricName = "ttfb" | "fcp" | "lcp" | "fid";
  * the ones current at send time. Web Vitals here are page-lifetime metrics of
  * the hard navigation that loaded the page, so a CLS or INP value reported
  * after a client-side route change still belongs to the landing page — the
- * same attribution CrUX uses.
+ * same attribution CrUX uses. The referrer is that page's too, so the
+ * project's referrer rules and the spam list exclude its samples exactly
+ * when they exclude its page view. It is sent even when empty: a missing
+ * field is how the server recognises SDKs that predate it.
  */
 export class SpeedTracker {
   private readonly basePath: string;
   private readonly ingestKey?: string;
   private readonly pathname: string = "";
   private readonly query: string = "";
+  private readonly referrer: string = "";
   private loadMetrics: Partial<Record<LoadMetricName, number>> = {};
   private loadSent = false;
   /** Load metrics already delivered, so none is ever sent twice. */
@@ -56,6 +60,7 @@ export class SpeedTracker {
     if (typeof window === "undefined") return;
     this.pathname = window.location.pathname;
     this.query = window.location.search;
+    this.referrer = typeof document !== "undefined" ? document.referrer : "";
     this.start();
   }
 
@@ -132,6 +137,7 @@ export class SpeedTracker {
       ...metrics,
       pathname: this.pathname,
       query: this.query,
+      referrer: this.referrer,
     };
     // A page that is going away can cancel a plain fetch; a beacon survives.
     if (typeof document !== "undefined" && document.visibilityState === "hidden") {

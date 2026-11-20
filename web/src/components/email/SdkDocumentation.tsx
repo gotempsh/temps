@@ -514,12 +514,10 @@ export function SdkDocumentation() {
 
         <Tabs defaultValue="react-email" className="w-full">
           <TabsList>
-            <TabsTrigger value="react-email" className="gap-2">
-              <Code2 className="h-4 w-4" />
+            <TabsTrigger value="react-email" icon={Code2}>
               react-email
             </TabsTrigger>
-            <TabsTrigger value="jsx-email" className="gap-2">
-              <Zap className="h-4 w-4" />
+            <TabsTrigger value="jsx-email" icon={Zap}>
               jsx-email
             </TabsTrigger>
           </TabsList>

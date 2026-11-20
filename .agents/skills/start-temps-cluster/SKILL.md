@@ -37,10 +37,11 @@ cannot exercise cross-node scheduling, the overlay, or cluster DNS at all.
 │    each: privileged DinD + `temps agent`, own dockerd            │
 └──────────────────────────────────────────────────────────────────┘
 
-Allocator carves /24s from 172.20.0.0/16, one per worker:
-  worker-1 → 172.20.0.0/24
-  worker-2 → 172.20.1.0/24
-  worker-3 → 172.20.2.0/24
+Allocator carves /24s from 10.202.0.0/16 (default for new clusters, ADR 056),
+one per worker:
+  worker-1 → 10.202.0.0/24
+  worker-2 → 10.202.1.0/24
+  worker-3 → 10.202.2.0/24
 
 Cross-node container traffic flows over a VXLAN tunnel pinned to the
 underlay IPs above. Within-node traffic uses the unchanged
@@ -148,16 +149,16 @@ found".
 
 ```bash
 ./dev-cluster shell worker-1
-docker run -d --rm --name target --network temps0 --ip 172.20.1.50 nginx:alpine
+docker run -d --rm --name target --network temps0 --ip 10.202.1.50 nginx:alpine
 exit
 
 ./dev-cluster shell worker-2
-docker run --rm --network temps0 --ip 172.20.0.50 alpine sh -c \
-  'apk add -q curl && curl -sf --max-time 5 http://172.20.1.50/ | head -c150'
+docker run --rm --network temps0 --ip 10.202.0.50 alpine sh -c \
+  'apk add -q curl && curl -sf --max-time 5 http://10.202.1.50/ | head -c150'
 # "<!DOCTYPE html>..." => bridge + VXLAN + FDB + routes + dual-attach all confirmed working
 ```
 
-(IPs above match worker-1 → `172.20.1.0/24`, worker-2 → `172.20.0.0/24` — the
+(IPs above match worker-1 → `10.202.1.0/24`, worker-2 → `10.202.0.0/24` — the
 allocator assigns CIDRs in registration order, not worker-number order, so
 confirm actual assignments with `./dev-cluster status` rather than assuming
 worker-N always gets the Nth-numbered /24.)
@@ -297,7 +298,10 @@ docker compose -f docker-compose.yml -p temps-dev-cluster exec -T worker-1 \
   key conflict.
 - **`compute_cidr` is NULL on a worker after registering** — allocator ran but
   failed; check the control-plane log for an allocator warning. Pool is
-  `172.20.0.0/16` (room for 256 workers), so exhaustion shouldn't happen here.
+  `10.202.0.0/16` (room for 256 workers), so exhaustion shouldn't happen here.
+- **A worker shows "Cross-node network unavailable"** — the agent's preflight
+  found a host route or Docker network over a subnet it routes; the console
+  (Worker Nodes) shows the range, its owner and the fixes (ADR 056).
 - **Cross-node ping fails** — `./dev-cluster status` shows overlay state per
   worker. Missing bridge/vxlan device on one worker → check that worker's log;
   `network_sync` logs every poll and `NetworkManager::bootstrap` errors are

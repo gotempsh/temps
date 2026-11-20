@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use axum::{
     extract::{rejection::PathRejection, ConnectInfo, Path, Request, State},
-    http::{header, HeaderValue, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::get,
@@ -47,9 +47,7 @@ const SHARDS: usize = 16;
 /// Tracked clients per shard; 16 × 4096 bounds memory to ~65k entries.
 const MAX_CLIENTS_PER_SHARD: usize = 4096;
 
-const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; style-src 'unsafe-inline'; \
-     img-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
-const NOT_FOUND_JSON: &str = r#"{"type":"about:blank","title":"Status Page Not Found","status":404,"detail":"This status page does not exist or is no longer published."}"#;
+use temps_core::public_status_page::{NOT_FOUND_JSON, SECURITY_HEADERS, STATUS_HOST_HEADER};
 
 /// Fixed-window limiter keyed by client (IPv4 address or IPv6 /64), sharded
 /// so concurrent requests rarely contend.
@@ -230,26 +228,24 @@ impl PublicStatusState {
     }
 }
 
+/// The custom hostname the proxy served this request for (#1412), if any.
+/// The proxy strips any client-supplied copy of the header and sets it only
+/// on its custom-hostname path. A value that is not valid UTF-8 matches no
+/// hostname, so it can only ever narrow what is served.
+fn custom_host(headers: &HeaderMap) -> Option<String> {
+    headers.get(STATUS_HOST_HEADER).map(|value| {
+        value
+            .to_str()
+            .map(|host| host.trim().trim_end_matches('.').to_ascii_lowercase())
+            .unwrap_or_default()
+    })
+}
+
 fn harden(response: &mut Response) {
     let headers = response.headers_mut();
-    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    headers.insert(
-        header::X_CONTENT_TYPE_OPTIONS,
-        HeaderValue::from_static("nosniff"),
-    );
-    headers.insert(
-        header::REFERRER_POLICY,
-        HeaderValue::from_static("no-referrer"),
-    );
-    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
-    headers.insert(
-        header::CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static(CONTENT_SECURITY_POLICY),
-    );
-    headers.insert(
-        "x-robots-tag",
-        HeaderValue::from_static("noindex, nofollow"),
-    );
+    for (name, value) in SECURITY_HEADERS {
+        headers.insert(name, HeaderValue::from_static(value));
+    }
 }
 
 async fn rate_limit(
@@ -301,13 +297,15 @@ async fn rate_limit(
 )]
 pub async fn get_public_status_page(
     State(state): State<Arc<PublicStatusState>>,
+    headers: HeaderMap,
     slug: Result<Path<String>, PathRejection>,
 ) -> Response {
     // A slug that does not even decode gets the same 404 as any other miss.
     let slug = slug.map(|Path(slug)| slug).unwrap_or_default();
     let snapshot = is_well_formed_slug(&slug)
         .then(|| state.cache.get(&slug))
-        .flatten();
+        .flatten()
+        .filter(|snapshot| snapshot.serves_host(custom_host(&headers).as_deref()));
     let mut response = match snapshot {
         Some(snapshot) => (
             StatusCode::OK,
@@ -340,12 +338,14 @@ pub async fn get_public_status_page(
 )]
 pub async fn get_public_status_page_json(
     State(state): State<Arc<PublicStatusState>>,
+    headers: HeaderMap,
     slug: Result<Path<String>, PathRejection>,
 ) -> Response {
     let slug = slug.map(|Path(slug)| slug).unwrap_or_default();
     let snapshot = is_well_formed_slug(&slug)
         .then(|| state.cache.get(&slug))
-        .flatten();
+        .flatten()
+        .filter(|snapshot| snapshot.serves_host(custom_host(&headers).as_deref()));
     let mut response = match snapshot {
         Some(snapshot) => (
             StatusCode::OK,

@@ -103,6 +103,63 @@ impl FromStr for ProjectType {
     }
 }
 
+/// Whether Temps runs a project's app.
+///
+/// `External` projects run elsewhere (Vercel, Netlify, a VPS) and only send
+/// Temps their analytics, errors and traces; they are never deployed.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    DeriveActiveEnum,
+    EnumIter,
+    utoipa::ToSchema,
+)]
+#[sea_orm(rs_type = "String", db_type = "Text")]
+#[serde(rename_all = "snake_case")]
+pub enum Hosting {
+    /// Temps builds and runs the app.
+    #[default]
+    #[sea_orm(string_value = "hosted")]
+    Hosted,
+    /// The app runs elsewhere; Temps only observes it.
+    #[sea_orm(string_value = "external")]
+    External,
+}
+
+impl Hosting {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Hosting::Hosted => "hosted",
+            Hosting::External => "external",
+        }
+    }
+}
+
+impl Hosting {
+    /// Why a project with this hosting cannot be deployed, if it cannot.
+    pub fn deploy_refusal(&self, project_name: &str) -> Option<String> {
+        match self {
+            Hosting::Hosted => None,
+            Hosting::External => Some(format!(
+                "{project_name} runs outside Temps (hosting: external), so Temps does not \
+                 deploy it. To deploy it here, switch it to hosted in the project's settings."
+            )),
+        }
+    }
+}
+
+impl Display for Hosting {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Framework enum for supported frameworks.
 /// NOTE: Use db_type = "Text" for SQLite compatibility.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, DeriveActiveEnum, EnumIter)]

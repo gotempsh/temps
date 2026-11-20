@@ -111,6 +111,7 @@ export function RepositoryCatalog({
       </div>
       {catalog.isPending ? (
         <div
+          role="status"
           className="grid gap-3 sm:grid-cols-2"
           aria-label="Loading plugin catalog"
         >

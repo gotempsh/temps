@@ -78,7 +78,7 @@ generated from `tokens.json`, scoped to `.tds` (never `:root`).
 | `useUrlState`                       | `state`, `patch`, `clear`                                                                               | Any filter/tab/page state                                                                                                                                                               | Honour-system                  |
 | `Kbd`                               | `keys`                                                                                                  | Keyboard shortcut hints                                                                                                                                                                 | Honour-system                  |
 | `SettingsGroup`                     | `title`, `description?`, `children`                                                                     | Open aligned settings sections; headings left, controls right, stacked on mobile                                                                                                        | Shared layout                  |
-| `SettingsSection`                   | `title`, `icon`, `id?`, `defaultOpen`, `hasError`                                                       | Collapsible form sections that preserve unsaved values and reveal invalid fields; `id` lets a page deep-link to a section (the console uses `?section=<id>`); promoted from the console | Existing section tests         |
+| `SettingsSection`                   | `title`, `icon`, `id?`, `description?`                                                                  | Always-open titled settings group: an open title-left/settings-right group at the top level, flat inside another section or `SettingsSurface` (never a box in a box); `id` lets a page deep-link to a section (the console uses `?section=<id>`) | Existing section tests         |
 | `HelpPopover` / `Disclosure`        | `label`, `children`                                                                                     | Optional context on click/keyboard; longer details collapsed by default. Keep required instructions and warnings visible.                                                               | Native/Radix semantics         |
 | `LogLevelBadge`                     | `level`                                                                                                 | Shared log severity in explorer, inspector, live and history: neutral routine output, semantic warning/error emphasis                                                                   | Shared primitive               |
 | `LogLine`                           | `content`, `isHighlighted`, `searchTerm`                                                                | One row of a monospace log stream                                                                                                                                                       | Honour-system                  |
@@ -87,7 +87,7 @@ generated from `tokens.json`, scoped to `.tds` (never `:root`).
 | `notify`                            | `notify.ok(message, description?)`, `notify.fail(message, description?)`                                | Background events the user isn't watching (RULES.md § Notifications)                                                                                                                    | Honour-system                  |
 | `Article`                           | `children`                                                                                              | Long-form content read top to bottom (release notes, postmortems, docs) — not for record/scan pages, that's `Detail`                                                                    | Honour-system                  |
 | `GitProviderMark`                   | `provider`, `variant?`, `className?`, `label?`                                                          | Existing GitHub/GitLab/Bitbucket/Gitea brand marks; optional monochrome variant; branch fallback for unknown providers                                                                  | Label and fallback unit tests  |
-| `ProjectAvatar`                     | `name`                                                                                                  | Deterministic project identity where there's no deployment media (pickers, ledger rows, headers) — never a guaranteed-404 favicon fetch                                                 | Honour-system                  |
+| `ProjectAvatar`                     | `name`                                                                                                  | Letter-only identity for a host app with no deployment media. The console itself uses `ServiceIcon` (`web/src/components/project/ServiceIcon.tsx`) for every project icon                                                 | Honour-system                  |
 | `DataTable`                         | `columns`, `rows`, `rowKey`, `renderRow?`, `isLoading?`, `aria-label?`, `pagination?`                   | Any table — embedded (settings sub-panel, `Detail`'s `main`) or as `Ledger`'s body                                                                                                      | Honour-system                  |
 | `CompactRow`                        | `timestamp`, `icon`, `primary`, `secondary?`, `meta?`                                                   | One row of a dense event/log/activity list (promoted from Observe's `ObserveRowShell`)                                                                                                  | Honour-system                  |
 | `Wizard`                            | `title`, `description`, `currentStep`, `steps`, `footer?`, `celebrate?`                                 | Any multi-step flow (setup wizard, onboarding, "connect a resource")                                                                                                                    | Honour-system                  |
@@ -98,8 +98,9 @@ generated from `tokens.json`, scoped to `.tds` (never `:root`).
   Reference screen: `design-system/` "Deployments" list.
 - **`Detail`** (record): **title → verdict → 4-6 facts → main column → aside**.
   Reference screen: `design-system/` deployment detail.
-- **`Settings`** (form): `Field`s, `FormErrors` above a sticky save bar that
-  stays mounted regardless of `dirty`. Reference screen: `design-system/`
+- **`Settings`** (form): `embedded` renders an aligned card with an h2 and contained footer inside a record page, without a second PageContainer. `SettingsGroup headingLevel="h3"` nests its groups. `Field`s, `FormErrors` above a sticky save bar that
+  stays mounted regardless of `dirty`; `saveLabel` names the outcome
+  ("Save repository") instead of the default "Save changes". Reference screen: `design-system/`
   project settings form.
 - **`CardGrid`** (list, card layout): same header shape as `Ledger`
   (title/description/actions/toolbar), a responsive grid body instead of a
@@ -126,8 +127,8 @@ generated from `tokens.json`, scoped to `.tds` (never `:root`).
 ## Responsive & keyboard
 
 `PageHeader` actions wrap under the title below `sm`. `Detail`'s aside stacks
-below `main` below `lg`. `Ledger`'s table is the one thing allowed to scroll
-horizontally. `Picker` is fully keyboard-filterable from focus; shortcuts get
+below `main` below `lg`. Nothing scrolls horizontally, `Ledger`'s
+table included: columns show by priority (see `RULES.md`, Responsive). `Picker` is fully keyboard-filterable from focus; shortcuts get
 a visible `Kbd` badge next to their control — never a keyboard-only entry
 point (repo-wide discoverability rule, `CLAUDE.md`).
 
@@ -144,10 +145,11 @@ the sample request without clearing filters; a selection with no matches
 has a reset action. Fixture dates are relative to when the page opens, so
 presets remain useful; custom ranges preserve absolute timestamps. All records are invented and no API is called.
 
-`DataTable` owns the header, rows, skeleton, border and horizontal scrolling.
+`DataTable` owns the header, rows, skeleton and border; columns carry priority
+classes so the table never scrolls sideways.
 The caller owns request errors, empty/no-match copy, filters, and retries.
-Give the table an accessible name with `aria-label`. Prefer a real link in
-the identity column over row-click-only navigation. Loading cells retain
+Give the table an accessible name with `aria-label`. Rows are `RecordRow`s:
+put a `RecordLink` in the identity column and the whole row opens it. Loading cells retain
 column visibility/alignment classes. Pagination boundary controls guard
 keyboard activation as well as pointer interaction.
 
@@ -194,7 +196,7 @@ justify-between"` instead of `PageHeader` (grep
 6. Extend `audit-records.mjs` to run against `--dir web/src` once production
    migration starts, and decide on an allowlist for legitimate arbitrary
    Tailwind values already in the app (e.g. chart pixel heights).
-7. Cross-repo consumption (vibetemps, temps-fleet) is explicitly out of
+7. Cross-repo consumption is explicitly out of
    scope for this phase (decision #5) — no packaging/versioning work done
    toward that.
 8. `DESIGN.md` (repo root) and `.agents/skills/temps-design-system/SKILL.md`
@@ -514,13 +516,15 @@ The UI retains that existing request; this pass changes its discoverability and
 copy. The live action was intentionally not invoked. Console TypeScript, DS lint,
 and sandbox build passed; browser confirmed the named section and exposed action.
 
-## Resource navigation convention (2026-09-21)
+## Resource navigation convention (2026-09-21, revised 2026-11-06)
 
-`RecordLink` is the single primary-detail affordance for tables: underlined name
-and persistent right arrow, implemented as a router link. `DataTable` and
-`Ledger` no longer accept `onRowClick`; render `RecordLink` in the identity
-column instead. The `/ledger` reference screen demonstrates this. Do not turn
-rows into buttons or add a redundant View action. Full-width details reserve
+`RecordLink` is the single primary-detail affordance for tables, implemented as
+a router link. Since 2026-11-06 it renders as the plain record name (no
+underline, no arrow) and `RecordRow` makes the whole row follow it, with
+modifier-click and middle-click opening a new tab. `DataTable` and `Ledger`
+render `RecordRow`s and accept no `onRowClick`; render `RecordLink` in the
+identity column instead. The `/ledger` reference screen demonstrates this. Do
+not turn rows into buttons or add a redundant View action. Full-width details reserve
 aside space only when there is an aside. See `RULES.md` and root `DESIGN.md`.
 
 ### Canonical tabs: underline navigation
@@ -529,13 +533,20 @@ Use the shared `Tabs`, `TabsList`, `TabsTrigger`, and `TabsContent` exported by
 `@temps-sdk/ds` (and `@temps-sdk/ui`) for peer page views. The default is a
 transparent, full-width strip with a bottom divider and an underline on the
 active tab. No pill container, selected-card background, shadow, or page-local
-styling overrides. Keep labels text-first, with constant font weight.
+styling overrides. Labels keep a constant font weight. Lead each label with a
+Lucide icon through `TabsTrigger icon={Icon}` (`size-4`, hidden from assistive
+technology), so a strip can be scanned by shape as well as by word. The icon
+never replaces the label, on any screen size. Give every tab in a strip an
+icon or none, keep icons distinct within a strip, and let a section's landing
+tab share the icon its section has in the menu. Add icons to a strip when
+touching it.
 
 Use `TabsTrigger count={number}` for optional counts, including zero. Omit a
 count until it is known; never invent totals or show the current page's item
 count as the total. Counts stay visible on inactive tabs. Keep Radix keyboard
-navigation, focus indicators, disabled states, and panel semantics; let long
-strips scroll horizontally. Meaningful detail views keep their selection in
+navigation, focus indicators, disabled states, and panel semantics; long
+strips wrap to a second line rather than scroll (the shared scrolling strip is
+a legacy gap). Meaningful detail views keep their selection in
 the URL. Use a segmented toggle only for a local value choice (such as chart
 interval or list/grid display), not for navigating content sections.
 

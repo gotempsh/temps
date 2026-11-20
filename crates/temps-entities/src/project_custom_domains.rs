@@ -25,6 +25,58 @@ pub struct Model {
     pub certificate_id: Option<i32>,
     /// Docker Compose service name this domain routes to (null = all services)
     pub service_name: Option<String>,
+    /// Who this address is for (ADR 064): `public`, or the reserved
+    /// `private` / `signed_in`. Defaults to `public`.
+    #[serde(default = "crate::audience::default_audience")]
+    pub audience: String,
+    /// For a `private` address (ADR 064 D5): the network range a visitor
+    /// must come from, e.g. `100.64.0.0/10`.
+    #[serde(default)]
+    pub private_range: Option<String>,
+    /// For a `private` address: the worker whose private listener serves it.
+    #[serde(default)]
+    pub private_node_id: Option<i32>,
+    /// For a `private` address: the listener address DNS points at.
+    #[serde(default)]
+    pub private_listener: Option<String>,
+    /// For a `signed_in` address (ADR 065 D7): `temps` or
+    /// `cloudflare_access`. Null on every other address.
+    #[serde(default)]
+    pub gate: Option<String>,
+    /// For a `signed_in` address with the Temps gate: the teams and users
+    /// that may sign in, `{"teams": [..], "users": [..]}`. Null means every
+    /// user with access to the project.
+    #[serde(default)]
+    pub gate_allow: Option<Json>,
+    /// Gate tokens issued before this time are refused (ADR 065 D8).
+    #[serde(default)]
+    pub gate_not_before: Option<DBDateTime>,
+    /// For a `cloudflare_access` gate (ADR 065 D9): the Access token
+    /// provider whose app stands in front of the address.
+    #[serde(default)]
+    pub gate_access_provider_id: Option<i32>,
+    /// That Access app's id at Cloudflare.
+    #[serde(default)]
+    pub gate_access_app_id: Option<String>,
+    /// That Access app's AUD tag: what a listener checks a JWT's `aud`
+    /// against.
+    #[serde(default)]
+    pub gate_access_aud: Option<String>,
+    /// How a `private` address is served (ADR 065 D1): `listener`,
+    /// `tailscale_serve` or `tailscale_service` ([`crate::audience::via`]).
+    /// Set exactly when the audience is private; a check enforces it.
+    #[serde(default)]
+    pub private_via: Option<String>,
+    /// For `tailscale_service`: the Service's `svc:` name.
+    #[serde(default)]
+    pub private_service: Option<String>,
+    /// What the address answers at Cloudflare's edge when it is published
+    /// through a tunnel (ADR 070): `https_only`, `allow_http` (plain HTTP
+    /// on port 80, Cloudflare's other ports refused) or `allow_all`. `None`
+    /// until a *Make it reachable* run records the user's choice; nothing
+    /// changes for an address until then.
+    #[serde(default)]
+    pub http_policy: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

@@ -120,7 +120,7 @@ export function ContainerDetailPage({ project }: ContainerDetailPageProps) {
       <div className="w-full px-4 sm:px-6 lg:px-8 pt-5">
         <Link
           to={backHref}
-          className="inline-flex items-center gap-1.5 text-sm text-neutral-500 hover:text-neutral-900 dark:text-neutral-400 dark:hover:text-white"
+          className="inline-flex items-center gap-1.5 text-sm text-neutral-600 hover:text-neutral-900 dark:text-neutral-400 dark:hover:text-white"
         >
           <ArrowLeft className="size-4" aria-hidden="true" />
           Containers
@@ -142,7 +142,7 @@ export function ContainerDetailPage({ project }: ContainerDetailPageProps) {
       <div className="w-full px-4 sm:px-6 lg:px-8 pt-5">
         <Link
           to={backHref}
-          className="inline-flex items-center gap-1.5 text-sm text-neutral-500 hover:text-neutral-900 dark:text-neutral-400 dark:hover:text-white"
+          className="inline-flex items-center gap-1.5 text-sm text-neutral-600 hover:text-neutral-900 dark:text-neutral-400 dark:hover:text-white"
         >
           <ArrowLeft className="size-4" aria-hidden="true" />
           Containers

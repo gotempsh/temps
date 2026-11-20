@@ -16,6 +16,15 @@
 //! 3. **`down` is real.** A migration that can't be rolled back strands
 //!    an operator who upgrades and needs to go back.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test helpers: panicking is how a test fails"
+)]
+#![allow(
+    clippy::disallowed_methods,
+    reason = "integration test: reads fixture configuration from the environment"
+)]
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement, TransactionTrait};
 use sea_orm_migration::{MigrationTrait, MigratorTrait, SchemaManager};
 use temps_migrations::{Migrator, SandboxWorkspaceLifecycleMigration};

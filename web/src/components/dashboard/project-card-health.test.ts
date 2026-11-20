@@ -67,7 +67,7 @@ describe('projectHealthIndicator', () => {
 
     expect(indicator.tone).toBe('idle')
     expect(indicator.label).toBe('No traffic')
-    expect(indicator.detail).toContain('No user requests reached this project')
+    expect(indicator.detail).toContain('No user requests reached this service')
   })
 
   test('never reports an unreachable health service as idle', () => {
@@ -188,6 +188,15 @@ describe('projectHealthIndicator', () => {
     expect(indicator.detail).not.toContain('failing')
   })
 
+  test('a monitor with nothing to check is grey, never down', () => {
+    const indicator = projectHealthIndicator({
+      health: summary({ status: 'unknown', total_requests: 0 }),
+      monitor: { status: 'no_address' },
+    })
+    expect(indicator).toMatchObject({ tone: 'idle', label: 'Nothing to check' })
+    expect(indicator.detail).toContain('nobody can reach this environment yet')
+  })
+
   test('falls back to traffic when the project has no monitors', () => {
     expect(
       projectHealthIndicator({
@@ -228,5 +237,43 @@ describe('projectHealthIndicator', () => {
     expect(
       projectHealthIndicator({ health: summary(), windowHours: 6 }).detail
     ).toContain('the last 6 hours')
+  })
+})
+
+describe('worker runtime health', () => {
+  test('fresh healthy worker is green without a public address', () => {
+    expect(
+      projectHealthIndicator({
+        monitor: { status: 'no_address', runtime_status: 'healthy' },
+      })
+    ).toMatchObject({ tone: 'healthy', label: 'Healthy' })
+  })
+  test('failed worker is red with its short error', () => {
+    expect(
+      projectHealthIndicator({
+        monitor: {
+          status: 'no_address',
+          runtime_status: 'unhealthy',
+          runtime_reason: 'The worker received an unexpected HTTP status.',
+        },
+      })
+    ).toMatchObject({
+      tone: 'down',
+      detail: 'The worker received an unexpected HTTP status.',
+    })
+  })
+  test('unsupported or expired worker observation stays neutral', () => {
+    expect(
+      projectHealthIndicator({
+        monitor: { status: 'no_address', runtime_status: 'unknown' },
+      })
+    ).toMatchObject({ tone: 'idle', label: 'Health unknown' })
+  })
+  test('a passing worker does not hide a failed public check', () => {
+    expect(
+      projectHealthIndicator({
+        monitor: { status: 'down', runtime_status: 'healthy' },
+      }).tone
+    ).toBe('down')
   })
 })

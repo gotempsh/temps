@@ -60,7 +60,7 @@ function FunnelView({
           <div className="flex items-center justify-center gap-2 text-muted-foreground mb-1">
             <Users className="h-4 w-4" />
             <span className="text-xs uppercase tracking-wider">
-              Total Entries
+              Total entries
             </span>
           </div>
           <div className="text-2xl font-bold">
@@ -85,7 +85,7 @@ function FunnelView({
             <TrendingUp className="h-4 w-4" />
             <span className="text-xs uppercase tracking-wider">Conversion</span>
           </div>
-          <div className="text-2xl font-bold text-green-600">
+          <div className="text-2xl font-bold text-green-700 dark:text-green-600">
             {conversionRate.toFixed(1)}%
           </div>
         </div>
@@ -94,7 +94,7 @@ function FunnelView({
             <div className="flex items-center justify-center gap-2 text-muted-foreground mb-1">
               <DollarSign className="h-4 w-4" />
               <span className="text-xs uppercase tracking-wider">
-                Total Value
+                Total value
               </span>
             </div>
             <div className="text-2xl font-bold">
@@ -137,7 +137,7 @@ function FunnelView({
                   <div className="absolute left-1/2 transform -translate-x-1/2 flex items-center gap-4">
                     <div className="flex items-center gap-2 px-3 py-1 bg-red-50 dark:bg-red-950/30 rounded-full">
                       <TrendingDown className="h-3 w-3 text-red-500" />
-                      <span className="text-xs font-medium text-red-600 dark:text-red-400">
+                      <span className="text-xs font-medium text-red-700 dark:text-red-400">
                         -{step.dropoff.toLocaleString()} (
                         {step.dropoffRate.toFixed(1)}%)
                       </span>
@@ -212,7 +212,7 @@ function FunnelView({
                     <div className="mt-4 pt-4 border-t border-white/20 grid grid-cols-1 sm:grid-cols-2 gap-4 text-sm">
                       <div>
                         <div className="text-xs opacity-75">
-                          From Previous Step
+                          From previous step
                         </div>
                         <div className="font-semibold">
                           {step.conversionFromPrevious.toFixed(1)}%
@@ -240,7 +240,7 @@ function FunnelView({
             <div className="text-sm text-muted-foreground mb-1">
               Total Drop-off
             </div>
-            <div className="text-xl font-bold text-red-600">
+            <div className="text-xl font-bold text-red-700 dark:text-red-600">
               {totalEntries -
                 (cumulativeData[cumulativeData.length - 1]?.completions ||
                   0)}{' '}
@@ -249,7 +249,7 @@ function FunnelView({
           </div>
           <div>
             <div className="text-sm text-muted-foreground mb-1">
-              Average Step Conversion
+              Average step conversion
             </div>
             <div className="text-xl font-bold">
               {(() => {
@@ -287,7 +287,7 @@ function FunnelView({
 // Horizontal Pipeline View (Alternative)
 function HorizontalView({ totalEntries, cumulativeData }: ViewProps) {
   return (
-    <div className="overflow-x-auto pb-4">
+    <div tabIndex={0} className="overflow-x-auto pb-4">
       <div className="min-w-[800px]">
         <div className="flex items-center gap-2">
           {/* Entry */}
@@ -309,7 +309,7 @@ function HorizontalView({ totalEntries, cumulativeData }: ViewProps) {
               {/* Connector */}
               <div className="flex-shrink-0 flex flex-col items-center">
                 <ChevronRight className="h-6 w-6 text-muted-foreground" />
-                <div className="text-xs text-red-500 font-medium">
+                <div className="text-xs text-red-700 dark:text-red-500 font-medium">
                   -{step.dropoff}
                 </div>
               </div>
@@ -416,7 +416,7 @@ export function FunnelVisualization({
               : 'bg-muted hover:bg-muted/80'
           )}
         >
-          Funnel View
+          Funnel view
         </button>
         <button
           onClick={() => setViewMode('horizontal')}
@@ -427,7 +427,7 @@ export function FunnelVisualization({
               : 'bg-muted hover:bg-muted/80'
           )}
         >
-          Pipeline View
+          Pipeline view
         </button>
       </div>
 

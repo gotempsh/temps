@@ -7,6 +7,8 @@ import {
   certificatesEmptyStateCopy,
   effectiveZone,
   isLoopbackHost,
+  contactEmailSchema,
+  needsAcmeContactEmail,
   isValidZoneInput,
   normalizeZoneInput,
   onDemandTlsBlockers,
@@ -152,5 +154,98 @@ describe('zone input', () => {
     ['apps.example.com/path', false],
   ])('%s valid=%p', (zone, expected) => {
     expect(isValidZoneInput(zone)).toBe(expected)
+  })
+})
+
+describe('effectiveZone with a preview domain', () => {
+  test('falls back to a public preview domain', () => {
+    expect(
+      effectiveZone(null, 'https://paas.example.com', 'Apps.Example.com')
+    ).toBe('apps.example.com')
+    expect(effectiveZone(null, null, '*.apps.example.com')).toBe(
+      'apps.example.com'
+    )
+  })
+
+  test('a sslip.io external URL and an explicit zone still win', () => {
+    expect(
+      effectiveZone(null, 'https://1.2.3.4.sslip.io', 'apps.example.com')
+    ).toBe('1.2.3.4.sslip.io')
+    expect(
+      effectiveZone(
+        'zone.example.com',
+        'https://x.sslip.io',
+        'apps.example.com'
+      )
+    ).toBe('zone.example.com')
+  })
+
+  test('loopback and malformed preview domains are never a zone', () => {
+    for (const preview of [
+      'localho.st',
+      'apps.localho.st',
+      'localhost',
+      '127.0.0.1.sslip.io',
+      'no-dot',
+      'https://apps.example.com',
+      '',
+      null,
+      undefined,
+    ]) {
+      expect(effectiveZone(null, null, preview)).toBeNull()
+    }
+  })
+})
+
+describe('needsAcmeContactEmail', () => {
+  const base = {
+    on_demand_tls: { enabled: true, zone: null },
+    external_url: 'https://paas.example.com',
+    preview_domain: 'apps.example.com',
+    letsencrypt: { email: '' },
+  }
+
+  test('true only when the email is the sole blocker', () => {
+    expect(needsAcmeContactEmail(base)).toBe(true)
+    expect(
+      needsAcmeContactEmail({ ...base, letsencrypt: { email: ' ' } })
+    ).toBe(true)
+  })
+
+  test('false once set, when off, or when something else blocks issuance', () => {
+    expect(
+      needsAcmeContactEmail({ ...base, letsencrypt: { email: 'a@b.co' } })
+    ).toBe(false)
+    expect(
+      needsAcmeContactEmail({
+        ...base,
+        on_demand_tls: { enabled: false, zone: null },
+      })
+    ).toBe(false)
+    expect(
+      needsAcmeContactEmail({ ...base, preview_domain: 'localho.st' })
+    ).toBe(false)
+    expect(
+      needsAcmeContactEmail({ ...base, external_url: 'http://localhost:3000' })
+    ).toBe(false)
+    expect(needsAcmeContactEmail(undefined)).toBe(false)
+  })
+})
+
+describe('contactEmailSchema', () => {
+  test('accepts what the settings form accepts and trims it', () => {
+    const parsed = contactEmailSchema.safeParse({ email: ' ops@example.com ' })
+    expect(parsed.success).toBe(true)
+    if (parsed.success) expect(parsed.data.email).toBe('ops@example.com')
+  })
+
+  test('rejects blank and malformed addresses with a message', () => {
+    for (const email of ['', '   ', 'ops@example', 'a b@example.com', 'nope']) {
+      const parsed = contactEmailSchema.safeParse({ email })
+      expect(parsed.success).toBe(false)
+      if (!parsed.success) {
+        expect(parsed.error.issues[0].message.length).toBeGreaterThan(0)
+      }
+    }
   })
 })

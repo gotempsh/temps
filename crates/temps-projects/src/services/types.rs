@@ -92,6 +92,9 @@ pub struct Project {
     pub is_on_demand: bool,
     pub deployment_config: Option<temps_entities::prelude::DeploymentConfig>,
     pub attack_mode: bool,
+    /// The Shield mode the project's environments inherit (ADR 066 D1), as
+    /// stored.
+    pub shield_mode: String,
     pub ai_alert_summaries_enabled: Option<bool>,
     pub ai_api_traffic_summary_enabled: Option<bool>,
     /// Opt-in for native error-tracking source context.
@@ -114,17 +117,30 @@ pub struct Project {
     /// so a Git project can additionally be shipped from an uploaded archive
     /// (`drop`) without losing its repository. NULL/false means off.
     pub allow_alternate_sources: Option<bool>,
+    /// Whether Temps runs the app (`hosted`) or only observes it (`external`).
+    pub hosting: temps_entities::types::Hosting,
     /// GitLab webhook ID installed on the connected repository, if any.
     pub gitlab_webhook_id: Option<i32>,
+    /// GitHub repository webhook ID Temps registered for a non-App GitHub
+    /// connection (PAT/OAuth), if any.
+    pub github_webhook_id: Option<i64>,
     /// ADR-027 Phase 3: whether this project's traces appear in cross-project
     /// discovery results. Default true (consistent with OSS global-observability
     /// model). Operators can set false to suppress cross-project links to this
     /// project.
     pub cross_project_trace_sharing: bool,
+    /// Whether `/api/_temps*` and `/api/otel*` on this project's domains reach
+    /// the project's app rather than this instance's console.
+    pub serves_own_temps_api: bool,
     /// How long (hours) to retain built Docker images before nightly cleanup.
     /// None = use the system default (336 h / 14 days out of the box, from
     /// `AppSettings.image_retention.default_hours`).
     pub image_retention_hours: Option<i32>,
+    /// Container log ingestion budget for this project's containers, in
+    /// lines/s. None = the platform default; 0 = unlimited.
+    pub log_ingest_lines_per_sec: Option<i32>,
+    /// Same as `log_ingest_lines_per_sec`, in KiB of log text per second.
+    pub log_ingest_kib_per_sec: Option<i32>,
 }
 
 /// What the caller is allowed to *claim*, as opposed to what it is allowed to
@@ -265,6 +281,9 @@ pub struct UpdateProjectSettingsParams {
     pub preset: Option<String>,
     pub directory: Option<String>,
     pub attack_mode: Option<bool>,
+    /// ADR 066: the Shield mode; wins over `attack_mode`, which is written
+    /// to match.
+    pub shield_mode: Option<temps_shield::ShieldMode>,
     pub enable_preview_environments: Option<bool>,
     pub preview_envs_on_demand: Option<bool>,
     pub preview_envs_idle_timeout_seconds: Option<i32>,
@@ -272,6 +291,8 @@ pub struct UpdateProjectSettingsParams {
     pub preset_config: Option<serde_json::Value>,
     pub ai_alert_summaries_enabled: Option<bool>,
     pub cross_project_trace_sharing: Option<bool>,
+    /// Send `/api/_temps*` and `/api/otel*` on the project's domains to its app.
+    pub serves_own_temps_api: Option<bool>,
     pub error_source_context_enabled: Option<bool>,
     pub vulnerability_scanning_enabled: Option<bool>,
     pub error_source_root: Option<String>,
@@ -279,6 +300,10 @@ pub struct UpdateProjectSettingsParams {
     /// Outer `None` leaves the retention window unchanged; `Some(None)` clears
     /// the per-project override back to the system default.
     pub image_retention_hours: Option<Option<i32>>,
+    /// Outer `None` leaves the override unchanged; `Some(None)` returns the
+    /// project to the platform log ingestion budget; `Some(Some(0))` lifts it.
+    pub log_ingest_lines_per_sec: Option<Option<i32>>,
+    pub log_ingest_kib_per_sec: Option<Option<i32>>,
 }
 
 /// A display-name change that actually happened.
@@ -414,6 +439,10 @@ pub struct CreateProjectRequest {
     /// persisted here.
     #[serde(default)]
     pub template_slug: Option<String>,
+    /// `external` creates a project Temps never deploys: the app runs
+    /// elsewhere and only sends its telemetry.
+    #[serde(default)]
+    pub hosting: temps_entities::types::Hosting,
 }
 
 /// `app.example.com (binding 3), www.example.com (binding 4)` -- names both
@@ -429,6 +458,20 @@ pub(crate) fn describe_delivery_bindings(hostnames: &[String], binding_ids: &[i3
 
 #[derive(Error, Debug)]
 pub enum ProjectError {
+    #[error("Active environment {environment_id} in project {project_id} was not found")]
+    PipelineEnvironmentNotFound {
+        project_id: i32,
+        environment_id: i32,
+    },
+    #[error(
+        "Failed to load pipeline environment {environment_id} in project {project_id}: {source}"
+    )]
+    PipelineEnvironmentLookup {
+        project_id: i32,
+        environment_id: i32,
+        source: sea_orm::DbErr,
+    },
+
     #[error("Database connection error: {0}")]
     DatabaseConnectionError(String),
 
@@ -522,6 +565,27 @@ pub enum ProjectError {
         binding_ids: Vec<i32>,
     },
 
+    /// Post-migration maintenance has not yet dropped the foreign keys from
+    /// the telemetry tables into the project delete cascade. Deleting now
+    /// would cascade through every chunk of those tables in one transaction,
+    /// which is slow and can run PostgreSQL out of lock slots, so the delete
+    /// is refused before anything is torn down.
+    #[error(
+        "Project {project_id} cannot be deleted yet: post-migration maintenance has not finished \
+         detaching the telemetry tables from projects ({} foreign key(s) left: {}). Deleting now \
+         would cascade through every chunk of those tables in one transaction, which can run \
+         PostgreSQL out of lock slots. Maintenance runs in the background after the server \
+         starts; run `temps migrate` to finish it now, or `temps doctor` to see why it has not \
+         finished, then retry the delete",
+        foreign_keys.len(),
+        foreign_keys.join(", ")
+    )]
+    TelemetryDetachPending {
+        project_id: i32,
+        /// `table.constraint` of each foreign key still in place.
+        foreign_keys: Vec<String>,
+    },
+
     #[error("Other error: {0}")]
     Other(String),
 
@@ -601,6 +665,19 @@ pub enum ProjectError {
         "Additional verification is required before moving a slug that grants host Docker access"
     )]
     SlugClaimStepUpRequired { problem: Box<Problem> },
+
+    /// A one-service project was asked to move onto a template release that
+    /// has several services. Only the first service's runtime could be
+    /// applied, so the release must be deployed as a whole app instead.
+    #[error(
+        "Project {project_id} runs a single service of template '{template_slug}', but release {template_slug}@{target_version} has {service_count} services that must be created together; it cannot be upgraded one service at a time. Deploy the template as a whole app instead"
+    )]
+    SingleServiceUpgradeToMultiService {
+        project_id: i32,
+        template_slug: String,
+        target_version: String,
+        service_count: usize,
+    },
 }
 
 /// Detect a Postgres unique-violation regardless of the variant Sea-ORM

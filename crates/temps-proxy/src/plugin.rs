@@ -14,8 +14,8 @@ use utoipa::OpenApi as OpenApiTrait;
 use crate::{
     handler::handler::LbApiDoc,
     service::{
-        challenge_service::ChallengeService, ip_access_control_service::IpAccessControlService,
-        lb_service::LbService, proxy_log_service::ProxyLogService,
+        ip_access_control_service::IpAccessControlService, lb_service::LbService,
+        project_ip_access_service::ProjectIpAccessService, proxy_log_service::ProxyLogService,
     },
 };
 
@@ -65,9 +65,14 @@ impl TempsPlugin for ProxyPlugin {
             // selection degrades to the default TimescaleDB backend if it is
             // somehow absent — proxy logging must never fail to register. When
             // present and CH is enabled, the handler reads go to ClickHouse.
-            let server_config = context
-                .get_service::<temps_config::ConfigService>()
-                .map(|cs| cs.get_server_config());
+            let config_service = context.get_service::<temps_config::ConfigService>();
+            let server_config = config_service.as_ref().map(|cs| cs.get_server_config());
+            // The ClickHouse wire-compression mode this process runs with,
+            // resolved once from the stored setting by `ConfigPlugin`.
+            let clickhouse_compression = config_service
+                .as_ref()
+                .map(|cs| cs.clickhouse_compression())
+                .unwrap_or_default();
 
             // Pre-registered by the top-level `temps serve` orchestrator
             // (commands/serve/mod.rs) BEFORE any plugin's `register_services`
@@ -87,19 +92,41 @@ impl TempsPlugin for ProxyPlugin {
                 context.require_service::<temps_core::RequestPolicyGateSlot>();
             let _ = self.request_policy_gate_slot.set(request_policy_slot);
 
+            // D9 reads the evidence for promotion where the request logs
+            // live.
+            let shield_evidence = match &server_config {
+                Some(config) => {
+                    crate::shield::EvidenceStore::from_config(config, clickhouse_compression)
+                }
+                None => crate::shield::EvidenceStore::Postgres,
+            };
+
             // Create LB service
             let lb_service = Arc::new(LbService::new(db.clone()));
+
+            // ADR 066, I8: the Shield event sink, for events this process
+            // receives from elsewhere (workers post theirs to the console).
+            // Same backend choice as the request log; the Pingora proxy
+            // keeps its own instance for its decisions.
+            let (shield_events, shield_event_writer) =
+                crate::shield::ShieldEventStore::new(crate::shield::EventBackend::from_config(
+                    server_config.as_deref(),
+                    db.clone(),
+                    clickhouse_compression,
+                ));
+            tokio::spawn(shield_event_writer.run());
 
             // Build the proxy-log storage backend (ClickHouse when enabled, else
             // TimescaleDB) and wire it into the read service the handlers use.
             // When ClickHouse is NOT configured this resolves to the default
             // TimescaleDB path with no behaviour change.
-            let proxy_log_storage = match server_config {
+            let proxy_log_storage = match server_config.as_ref() {
                 Some(config) => crate::storage::build_proxy_log_storage(
-                    &config,
+                    config,
                     db.clone(),
                     ip_service.clone(),
                     retention_slot as Arc<dyn temps_core::RetentionResolver>,
+                    clickhouse_compression,
                 ),
                 None => {
                     tracing::debug!(
@@ -128,15 +155,64 @@ impl TempsPlugin for ProxyPlugin {
             // Create IP Access Control service
             let ip_access_control_service = Arc::new(IpAccessControlService::new(db.clone()));
 
-            // Create Challenge service for CAPTCHA
-            let challenge_service = Arc::new(ChallengeService::new(db.clone()));
+            // Per-project / per-environment IP allow/deny lists (management
+            // side; enforcement is the gate installed in the proxy slot).
+            let project_ip_access_service = Arc::new(ProjectIpAccessService::new(db.clone()));
+
+            // Project edge rules (ADR-089), management side; the proxy's
+            // EdgeRuleGate picks writes up from the change feed.
+            let edge_rule_service = Arc::new(
+                crate::service::edge_rule_service::EdgeRuleService::new(db.clone()),
+            );
+
+            // ADR 066 D2: fetch the Shield reputation lists and compile
+            // them into the snapshots every ingress loads. Every control
+            // plane runs this; claims and an advisory lock keep it to one.
+            // D9: promote what the fleet's events show, and prune.
+            match crate::shield::ShieldSources::new(db.clone()) {
+                Ok(sources) => {
+                    let sources = match &config_service {
+                        Some(config) => sources.with_config(config.clone()),
+                        None => sources,
+                    };
+                    let sources = Arc::new(sources);
+                    sources.clone().spawn();
+                    let learning =
+                        crate::shield::ShieldLearning::new(db.clone(), shield_evidence, sources);
+                    let learning = match &config_service {
+                        Some(config) => learning.with_config(config.clone()),
+                        None => learning,
+                    };
+                    Arc::new(learning).spawn();
+                }
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "Shield lists will not be fetched: no HTTP client"
+                ),
+            }
+
+            // ADR 066 I10: the console's Shield tab reads the same backend
+            // as the request log.
+            let shield_console_service = Arc::new(
+                crate::service::shield_console_service::ShieldConsoleService::new(
+                    db.clone(),
+                    crate::storage::shield_stats::build_shield_stats_storage(
+                        server_config.as_deref(),
+                        db.clone(),
+                        clickhouse_compression,
+                    ),
+                ),
+            );
 
             // Register the services for other plugins to use
+            context.register_service(shield_console_service);
             context.register_service(lb_service);
             context.register_service(proxy_log_service);
             context.register_service(api_traffic_data_source);
             context.register_service(ip_access_control_service);
-            context.register_service(challenge_service);
+            context.register_service(project_ip_access_service);
+            context.register_service(edge_rule_service);
+            context.register_service(shield_events as Arc<dyn temps_shield::EventSink>);
 
             tracing::debug!("Proxy plugin services registered successfully");
             Ok(())
@@ -171,15 +247,36 @@ impl TempsPlugin for ProxyPlugin {
             // Same handoff for ProjectIpGate. Absent a registered plugin,
             // the slot stays on OpenIpGate — every project remains
             // unrestricted, matching a build with no such plugin present.
+            //
+            // When neither the bootstrap nor a plugin supplied a gate, install
+            // the built-in per-project/environment allow/deny list gate. A
+            // plugin gate (e.g. one with its own policy templates) always
+            // wins: the slot is write-once, and we only build ours when it is
+            // still unclaimed after the plugin lookup.
             if let Some(slot) = self.project_ip_gate_slot.get() {
-                if let Some(gate) = context.get_service::<dyn temps_core::ProjectIpGate>() {
+                if slot.is_claimed() {
+                    tracing::debug!(
+                        "proxy: ProjectIpGate slot already contains the authoritative \
+                         gate constructed by the proxy bootstrap"
+                    );
+                } else if let Some(gate) = context.get_service::<dyn temps_core::ProjectIpGate>() {
                     if slot.set(gate) {
                         tracing::debug!("proxy: ProjectIpGate wired in from a registered plugin");
-                    } else {
-                        tracing::debug!(
-                            "proxy: ProjectIpGate slot already contains the authoritative \
-                             gate constructed by the proxy bootstrap"
-                        );
+                    }
+                } else {
+                    let db = context.require_service::<DbConnection>();
+                    let gate = Arc::new(crate::ip_access::ProjectIpAccessGate::new(db));
+                    // A failed initial load must not leave the slot open: the
+                    // error aborts plugin initialisation, and the slot stays
+                    // fail-closed because it is never finished.
+                    gate.hydrate().await.map_err(|e| {
+                        PluginError::InitializationFailed(format!(
+                            "project IP access gate failed to load its rules: {e}"
+                        ))
+                    })?;
+                    gate.spawn_refresh_loop(&tokio::runtime::Handle::current());
+                    if slot.set(gate) {
+                        tracing::debug!("proxy: built-in project IP access gate installed");
                     }
                 }
                 slot.finish_registration();
@@ -205,9 +302,45 @@ impl TempsPlugin for ProxyPlugin {
         let proxy_log_service = context.require_service::<ProxyLogService>();
         let project_access_checker = context.get_service::<dyn temps_core::ProjectAccessChecker>();
         let ip_access_control_service = context.require_service::<IpAccessControlService>();
+        let project_ip_access_service = context.require_service::<ProjectIpAccessService>();
+        // ADR 064 D9: the ingress plugin knows which addresses come through a
+        // tunnel. Every plugin has registered its services by now.
+        if let Some(ways_in) = context.get_service::<dyn temps_core::ways_in::EnvironmentWaysIn>() {
+            project_ip_access_service.attach_ways_in(ways_in);
+        }
+        let project_ip_access_state =
+            Arc::new(crate::handler::project_ip_access::ProjectIpAccessState {
+                service: project_ip_access_service,
+                audit_service: context.require_service::<dyn temps_core::AuditLogger>(),
+                project_access_checker: project_access_checker.clone(),
+            });
+
+        let ip_access_control_state =
+            Arc::new(crate::handler::ip_access_control::IpAccessControlState {
+                service: ip_access_control_service,
+                audit_service: context.require_service::<dyn temps_core::AuditLogger>(),
+            });
+
+        let edge_rules_state = Arc::new(crate::handler::edge_rules::EdgeRulesState {
+            service: context
+                .require_service::<crate::service::edge_rule_service::EdgeRuleService>(),
+            audit_service: context.require_service::<dyn temps_core::AuditLogger>(),
+            project_access_checker: project_access_checker.clone(),
+        });
+
+        let shield_state = Arc::new(crate::handler::shield::ShieldConsoleState {
+            service: context
+                .require_service::<crate::service::shield_console_service::ShieldConsoleService>(),
+            config_service: context.require_service::<temps_config::ConfigService>(),
+            audit_service: context.require_service::<dyn temps_core::AuditLogger>(),
+            project_access_checker: project_access_checker.clone(),
+        });
 
         // Create the app state directly
-        let app_state = Arc::new(crate::handler::types::AppState { lb_service });
+        let app_state = Arc::new(crate::handler::types::AppState {
+            lb_service,
+            audit_service: context.require_service::<dyn temps_core::AuditLogger>(),
+        });
 
         let proxy_logs_state = Arc::new(crate::handler::proxy_logs::ProxyLogsState {
             service: proxy_log_service,
@@ -220,26 +353,16 @@ impl TempsPlugin for ProxyPlugin {
             .merge(crate::handler::proxy_logs::create_routes().with_state(proxy_logs_state))
             .merge(
                 crate::handler::ip_access_control::create_routes()
-                    .with_state(ip_access_control_service),
-            );
+                    .with_state(ip_access_control_state),
+            )
+            .merge(
+                crate::handler::project_ip_access::create_routes()
+                    .with_state(project_ip_access_state),
+            )
+            .merge(crate::handler::edge_rules::create_routes().with_state(edge_rules_state))
+            .merge(crate::handler::shield::create_routes().with_state(shield_state));
 
         Some(PluginRoutes::new(router))
-    }
-
-    /// The proof-of-work CAPTCHA endpoints. A visitor of a protected
-    /// application solves the challenge with no session and from any host, so
-    /// these belong on the public router: `/api/_temps/*` is served by the
-    /// console's public-only surface (ADR-051), and a route under that prefix
-    /// that is only mounted on the admin router is unreachable from there.
-    fn configure_public_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
-        let captcha_state = Arc::new(crate::handler::captcha::CaptchaState {
-            db: context.require_service::<DbConnection>(),
-            challenge_service: context.require_service::<ChallengeService>(),
-        });
-
-        Some(PluginRoutes::new(
-            crate::handler::captcha::create_routes().with_state(captcha_state),
-        ))
     }
 
     fn openapi_schema(&self) -> Option<OpenApi> {
@@ -247,10 +370,19 @@ impl TempsPlugin for ProxyPlugin {
         let lb_spec = LbApiDoc::openapi();
         let proxy_logs_spec = crate::handler::proxy_logs::openapi();
         let ip_access_control_spec = crate::handler::ip_access_control::openapi();
+        let project_ip_access_spec = crate::handler::project_ip_access::openapi();
+        let shield_spec = crate::handler::shield::openapi();
+        let edge_rules_spec = crate::handler::edge_rules::openapi();
 
         let merged = temps_core::openapi::merge_openapi_schemas(
             lb_spec,
-            vec![proxy_logs_spec, ip_access_control_spec],
+            vec![
+                proxy_logs_spec,
+                ip_access_control_spec,
+                project_ip_access_spec,
+                shield_spec,
+                edge_rules_spec,
+            ],
         );
 
         Some(merged)
@@ -277,7 +409,7 @@ impl Default for ProxyPlugin {
 mod tests {
     use super::*;
     use temps_core::plugin::{PluginStateRegistry, ServiceRegistry};
-    use temps_database::test_utils::TestDatabase;
+    use temps_test_utils::TestDatabase;
 
     #[tokio::test]
     async fn test_plugin_registration() {
@@ -318,6 +450,19 @@ mod tests {
         // Verify LB service was registered
         let lb_service = context.get_service::<LbService>();
         assert!(lb_service.is_some(), "LB service should be registered");
+    }
+
+    /// Stand-in for the audit service the console registers in real boot.
+    struct NoopAuditLogger;
+
+    #[async_trait::async_trait]
+    impl temps_core::AuditLogger for NoopAuditLogger {
+        async fn create_audit_log(
+            &self,
+            _operation: &dyn temps_core::AuditOperation,
+        ) -> temps_core::AuditResult<()> {
+            Ok(())
+        }
     }
 
     #[test]
@@ -363,15 +508,37 @@ mod tests {
         let ip_access_control_service =
             Arc::new(IpAccessControlService::new(db_connection.clone()));
 
-        // Create Challenge service
-        let challenge_service = Arc::new(ChallengeService::new(db_connection.clone()));
-
         // Register all services in the service registry
-        service_registry.register(db_connection);
+        service_registry.register(db_connection.clone());
         service_registry.register(lb_service);
         service_registry.register(proxy_log_service);
         service_registry.register(ip_access_control_service);
-        service_registry.register(challenge_service);
+        service_registry.register(Arc::new(ProjectIpAccessService::new(db_connection.clone())));
+        service_registry.register(Arc::new(
+            crate::service::edge_rule_service::EdgeRuleService::new(db_connection.clone()),
+        ));
+        service_registry.register(Arc::new(NoopAuditLogger) as Arc<dyn temps_core::AuditLogger>);
+        // The Shield routes (ADR 066 I10) need their service and the
+        // platform settings, as in the running server.
+        service_registry.register(Arc::new(
+            crate::service::shield_console_service::ShieldConsoleService::new(
+                db_connection.clone(),
+                Arc::new(crate::storage::shield_stats::PostgresShieldStats::new(
+                    db_connection.clone(),
+                )),
+            ),
+        ));
+        let server_config = temps_config::ServerConfig::new(
+            "127.0.0.1:3000".to_string(),
+            "postgresql://test".to_string(),
+            None,
+            Some("127.0.0.1:8000".to_string()),
+        )
+        .expect("ServerConfig::new");
+        service_registry.register(Arc::new(temps_config::ConfigService::new(
+            Arc::new(server_config),
+            db_connection.clone(),
+        )));
 
         let plugin_context = PluginContext::new(service_registry, state_registry);
         let plugin = ProxyPlugin::new();

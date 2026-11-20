@@ -1,0 +1,96 @@
+export const metadata = {
+  title: 'Route a Path to Another Service',
+  description:
+    'Serve /api on your frontend’s domains from your API service, so the browser sees one origin: no CORS, no build-time API URL, no proxy container.',
+  alternates: {
+    canonical: '/docs/route-a-path-to-another-service',
+  },
+}
+
+export const sections = [
+  { title: 'When to use a path route', id: 'when-to-use-a-path-route' },
+  { title: 'Add a route in the console', id: 'add-a-route-in-the-console' },
+  { title: 'Use the CLI', id: 'use-the-cli' },
+  { title: 'Keep or strip the prefix', id: 'keep-or-strip-the-prefix' },
+  { title: 'How routes behave', id: 'how-routes-behave' },
+]
+
+# Route a Path to Another Service
+
+A path route sends requests under a prefix, such as `/api`, on one service's domains to another service of the same Project. The frontend calls `/api` on its own origin, and the API service answers. {{ className: 'lead' }}
+
+---
+
+## When to use a path route {{ anchor: true, id: 'when-to-use-a-path-route' }}
+
+Use one when a frontend expects its API on the same origin: a Vite or Next.js app that calls `fetch('/api/...')`, or an open-source app built as a frontend plus a backend. Without a route, `/api` on the frontend's domain returns the frontend's own page or a 404.
+
+Both services must be in the same project (see [Create a Project and Add Services](/docs/create-a-project-and-add-services)). Each service keeps its own domains; a route only adds a path to the source service's domains.
+
+---
+
+## Add a route in the console {{ anchor: true, id: 'add-a-route-in-the-console' }}
+
+1. Open the project and go to **Settings** > **Path routes**.
+2. Under **On the domains of**, pick the service that receives the requests (the frontend).
+3. Enter the **Path**, for example `/api`.
+4. Under **Is served by**, pick the service that answers them (the API).
+5. Leave **Remove the path before forwarding** off unless the API expects paths without the prefix (see below).
+6. Click **Add route**.
+
+The route applies within a few seconds, without a redeploy. The project's **Overview** tab summarises its routes.
+
+---
+
+## Use the CLI {{ anchor: true, id: 'use-the-cli' }}
+
+```bash
+# /api on the domains of "web" is served by "api"
+bunx @temps-sdk/cli project-groups routes add acme-shop web /api api
+
+# The same, forwarding /api/users as /users
+bunx @temps-sdk/cli project-groups routes add acme-shop web /api api --strip-prefix
+
+# See each route and how it applies per environment
+bunx @temps-sdk/cli project-groups routes list acme-shop
+
+# Remove it; web serves /api itself again
+bunx @temps-sdk/cli project-groups routes remove acme-shop web /api
+```
+
+---
+
+## Keep or strip the prefix {{ anchor: true, id: 'keep-or-strip-the-prefix' }}
+
+- **Keep it (default).** `/api/users?page=2` reaches the API as `/api/users?page=2`. Use this when the API's own routes start with `/api`, which is the most common case.
+- **Strip it.** `/api/users?page=2` reaches the API as `/users?page=2`, and the request carries an `X-Forwarded-Prefix: /api` header so the API can build links and redirects under `/api`. Any `X-Forwarded-Prefix` sent by the client is dropped.
+
+---
+
+## How routes behave {{ anchor: true, id: 'how-routes-behave' }}
+
+<Properties>
+  <Property name="Every domain of the source">
+    A route belongs to the source service, not to one hostname. It applies to the environment's default domain, custom domains and preview domains, including domains you add later.
+  </Property>
+  <Property name="Environments pair by slug">
+    `/api` on `web`'s production goes to `api`'s production, staging to staging. A preview goes to the target's preview of the same branch. There is no fallback: a preview frontend never calls the production API. With no matching environment, or when the target is not deployed there, requests under the path get a 502. `routes list` shows each pairing.
+  </Property>
+  <Property name="Whole segments, longest prefix wins">
+    `/api` matches `/api` and `/api/users`, never `/apiary`. With routes for `/api` and `/api/v2`, `/api/v2/users` goes to the `/api/v2` target.
+  </Property>
+  <Property name="Reserved paths">
+    Paths the platform answers on every domain cannot be routed: `/_temps`, `/api/_temps`, `/api/__temps`, `/api/otel` and `/.well-known`. A route for `/api` still leaves `/api/_temps` (analytics ingestion) to Temps.
+  </Property>
+  <Property name="The target's protections apply">
+    A request routed to the API gets the API service's password, attack mode and limits, not the frontend's. If the frontend is password-protected, protect the API too.
+  </Property>
+  <Property name="Sleeping targets">
+    If the target scales to zero, a routed request wakes it, the same way a request to its own domain does.
+  </Property>
+  <Property name="Cookies are shared">
+    Under one origin, the frontend and the API see the same cookies. That is usually the reason to route, but it means the API receives the frontend's cookies too.
+  </Property>
+</Properties>
+
+A path cannot be `/`, and removing a service from the project removes the routes that involve it.

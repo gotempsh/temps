@@ -76,7 +76,7 @@ export function TraceStatBadges({
       {projectCount != null && (
         <Badge variant="secondary" className={PILL}>
           <Boxes className={ICON} />
-          {projectCount} {projectCount === 1 ? 'project' : 'projects'}
+          {projectCount} {projectCount === 1 ? 'service' : 'services'}
         </Badge>
       )}
 
@@ -109,10 +109,10 @@ export function TraceStatBadges({
         <Badge
           variant="outline"
           className={cn(PILL, 'text-muted-foreground')}
-          title="Some contributing projects have cross-project sharing turned off; their spans are hidden."
+          title="Some contributing services have cross-service sharing turned off; their spans are hidden."
         >
           <EyeOff className={ICON} />
-          Some projects hidden
+          Some services hidden
         </Badge>
       )}
 
@@ -120,7 +120,7 @@ export function TraceStatBadges({
         <Badge
           variant="outline"
           className={cn(PILL, 'text-muted-foreground')}
-          title="This trace exceeded the project/span cap; some spans were dropped."
+          title="This trace exceeded the service/span cap; some spans were dropped."
         >
           <AlertTriangle className={ICON} />
           Truncated

@@ -18,9 +18,10 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use temps_auth::{permission_guard, project_access_guard, RequireAuth};
+use temps_authz::{permission_guard, project_access_guard, RequireAuth};
 use temps_core::error_builder::ErrorBuilder;
 use temps_core::problemdetails::Problem;
+use temps_core::secret_string::SecretString;
 use temps_core::{AuditContext, AuditLogger, RequestMetadata};
 use tracing::error;
 use utoipa::{OpenApi, ToSchema};
@@ -156,14 +157,14 @@ pub struct CreateIntegrationBody {
     /// Registered provider name, e.g. "stripe".
     pub provider: String,
     /// Signing secret from the provider's dashboard.
-    pub signing_secret: String,
+    pub signing_secret: SecretString,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateSecretBody {
     /// New signing secret from the provider's dashboard. Encrypted at
     /// rest; never returned in any API response.
-    pub signing_secret: String,
+    pub signing_secret: SecretString,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -402,6 +403,33 @@ fn analytics_error_to_problem(err: AnalyticsError) -> Problem {
     }
 }
 
+/// Refuse install-wide revenue reads to anyone who does not run the instance.
+///
+/// The global MRR card, global summary and global events feed aggregate
+/// financials across *every* project in the install. They have no project
+/// path parameter a project-scoped guard could narrow, so `ProjectsRead`
+/// (held by every user role) is far too weak a bar: it would hand every
+/// low-privilege user the whole installation's cash, refunds and customers.
+/// Project-scoped revenue endpoints keep their `ProjectsRead` +
+/// `project_access_guard!` gate and are unaffected.
+fn require_instance_admin_for_global_revenue(
+    auth: &temps_authz::AuthContext,
+    operation: &str,
+) -> Result<(), Problem> {
+    if auth.is_instance_admin() {
+        return Ok(());
+    }
+    Err(temps_core::error_builder::forbidden()
+        .title("Insufficient Permissions")
+        .detail(format!(
+            "Only an instance administrator may read install-wide revenue ({}); use the \
+             project-scoped revenue endpoints instead",
+            operation
+        ))
+        .value("user_role", auth.effective_role.to_string())
+        .build())
+}
+
 // ---------------------------------------------------------------- Handlers
 
 /// List registered providers (what the UI needs to render the "Connect"
@@ -494,7 +522,7 @@ async fn revenue_create_integration(
     let input = CreateIntegrationInput {
         project_id,
         provider: body.provider.clone(),
-        signing_secret: body.signing_secret,
+        signing_secret: body.signing_secret.into_exposed(),
     };
     let integration = state
         .integrations
@@ -647,7 +675,7 @@ async fn revenue_update_secret(
     project_access_guard!(auth, project_id, state.project_access_checker);
     let updated = state
         .integrations
-        .update_signing_secret(project_id, integration_id, &body.signing_secret)
+        .update_signing_secret(project_id, integration_id, body.signing_secret.expose())
         .await
         .map_err(revenue_error_to_problem)?;
 
@@ -766,11 +794,16 @@ async fn revenue_metrics_summary(
 
 /// Org-wide MRR total, summed across every project in the install.
 /// Powers the single-number MRR card on the main dashboard.
+///
+/// Instance administrators only: the figure spans every project.
 #[utoipa::path(
     get,
     path = "/revenue/metrics/global-mrr",
     operation_id = "revenue_metrics_global_mrr",
-    responses((status = 200, body = GlobalMrrResponse)),
+    responses(
+        (status = 200, body = GlobalMrrResponse),
+        (status = 403, description = "Caller is not an instance administrator"),
+    ),
     tag = "Revenue",
     security(("bearer_auth" = []))
 )]
@@ -780,6 +813,7 @@ async fn revenue_metrics_global_mrr(
     Query(q): Query<SummaryQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsRead);
+    require_instance_admin_for_global_revenue(&auth, "global MRR")?;
     let currency = q.currency.as_deref().unwrap_or("usd").to_lowercase();
     let current_mrr_minor = state
         .analytics
@@ -811,11 +845,16 @@ async fn revenue_metrics_global_mrr(
 /// Org-wide revenue summary: MRR, paid cash (30d + all-time), refunds,
 /// active subscriptions/customers, and transaction count. Powers the
 /// header on the Revenue transactions page.
+///
+/// Instance administrators only: the figures span every project.
 #[utoipa::path(
     get,
     path = "/revenue/metrics/global-summary",
     operation_id = "revenue_metrics_global_summary",
-    responses((status = 200, body = GlobalRevenueSummaryResponse)),
+    responses(
+        (status = 200, body = GlobalRevenueSummaryResponse),
+        (status = 403, description = "Caller is not an instance administrator"),
+    ),
     params(
         ("currency" = Option<String>, Query, description = "ISO-4217 currency code, default USD"),
     ),
@@ -828,6 +867,7 @@ async fn revenue_metrics_global_summary(
     Query(q): Query<SummaryQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsRead);
+    require_instance_admin_for_global_revenue(&auth, "global revenue summary")?;
     let currency = q.currency.as_deref().unwrap_or("usd").to_lowercase();
     let summary = state
         .analytics
@@ -965,11 +1005,17 @@ async fn revenue_recent_events(
 /// Org-wide revenue events across every project. Powers the revenue
 /// transactions page. Supports filtering by project, date range, and
 /// event type.
+///
+/// Instance administrators only: the feed spans every project (the optional
+/// `project_id` filter narrows the result, not the authorization).
 #[utoipa::path(
     get,
     path = "/revenue/events",
     operation_id = "revenue_global_events",
-    responses((status = 200, body = Vec<GlobalRecentEventResponse>)),
+    responses(
+        (status = 200, body = Vec<GlobalRecentEventResponse>),
+        (status = 403, description = "Caller is not an instance administrator"),
+    ),
     params(
         ("project_id" = Option<i32>, Query, description = "Filter to a single project"),
         ("from" = Option<String>, Query, description = "Lower bound (inclusive), ISO-8601"),
@@ -986,6 +1032,7 @@ async fn revenue_global_events(
     Query(q): Query<GlobalEventsQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsRead);
+    require_instance_admin_for_global_revenue(&auth, "global revenue events")?;
     let event_types = q.event_types.as_deref().map(|s| {
         s.split(',')
             .map(|t| t.trim().to_string())
@@ -1258,4 +1305,52 @@ pub fn configure_management_routes() -> Router<Arc<ManagementState>> {
             "/projects/{project_id}/revenue/integrations/{integration_id}/import/invoices",
             post(revenue_import_invoices_csv).layer(DefaultBodyLimit::max(MAX_CSV_BYTES)),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use temps_authz::{AuthContext, Role};
+    use temps_entities::users;
+
+    fn test_user(id: i32) -> users::Model {
+        let now = Utc::now();
+        users::Model {
+            id,
+            name: "Test User".to_string(),
+            email: format!("user{}@example.com", id),
+            password_hash: None,
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            must_change_password: false,
+            deleted_at: None,
+            mfa_secret: None,
+            mfa_enabled: false,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn global_revenue_gate_allows_instance_admin() {
+        let auth = AuthContext::new_session(test_user(1), Role::Admin);
+        assert!(require_instance_admin_for_global_revenue(&auth, "global MRR").is_ok());
+    }
+
+    #[test]
+    fn global_revenue_gate_rejects_regular_user_with_403() {
+        let auth = AuthContext::new_session(test_user(2), Role::User);
+        // The user role holds ProjectsRead, which is exactly why the old
+        // guard alone let it read install-wide financials.
+        assert!(auth.has_permission(&temps_authz::Permission::ProjectsRead));
+        let problem = require_instance_admin_for_global_revenue(&auth, "global MRR")
+            .expect_err("a regular user must not read install-wide revenue");
+        assert_eq!(problem.status_code, StatusCode::FORBIDDEN);
+    }
 }

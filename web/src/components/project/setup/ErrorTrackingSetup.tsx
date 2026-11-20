@@ -15,6 +15,7 @@ import { Button } from '@/components/ui/button'
 import { CodeBlock } from '@/components/ui/code-block'
 import { CopyButton } from '@/components/ui/copy-button'
 import { cn } from '@/lib/utils'
+import { Callout } from '@temps-sdk/ds'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import {
   ArrowLeft,
@@ -536,6 +537,20 @@ Future<void> main() async {
   },
 ]
 
+function buildBrowserReportExample(dsn: string, projectId: number): string {
+  const url = new URL(dsn)
+  const key = url.username
+  url.username = ''
+  url.password = ''
+  url.search = ''
+  url.hash = ''
+  url.pathname = `/api/${projectId}/security/`
+  url.searchParams.set('sentry_key', key)
+  const security = url.href
+  url.pathname = `/api/${projectId}/nel/`
+  return `Content-Security-Policy-Report-Only: default-src 'self'; report-uri ${security}\nReport-To: ${JSON.stringify({ group: 'temps-nel', max_age: 86400, endpoints: [{ url: url.href }] })}\nNEL: ${JSON.stringify({ report_to: 'temps-nel', max_age: 86400, failure_fraction: 1, success_fraction: 0 })}`
+}
+
 export function ErrorTrackingSetup({ project }: ErrorTrackingSetupProps) {
   const navigate = useNavigate()
   const [wizardStep, setWizardStep] = useState<WizardStepId>('framework')
@@ -660,7 +675,7 @@ ${platform.buildSnippet(platform.dsnExpression)}
               <Sparkles className="mt-0.5 size-4 shrink-0 text-primary" />
               <div className="min-w-0">
                 <p className="font-medium">
-                  Recommended for this project:{' '}
+                  Recommended for this service:{' '}
                   {PLATFORMS.find((p) => p.id === recommendedPlatform)?.name}
                 </p>
                 <p className="mt-0.5 text-xs text-muted-foreground">
@@ -668,7 +683,7 @@ ${platform.buildSnippet(platform.dsnExpression)}
                   <code className="rounded bg-muted px-1 py-0.5 text-[11px]">
                     {project.preset}
                   </code>{' '}
-                  preset we detected in this project.
+                  preset we detected in this service.
                 </p>
               </div>
             </div>
@@ -906,6 +921,52 @@ ${platform.buildSnippet(platform.dsnExpression)}
               showCopy
             />
           </div>
+
+          <Callout tone="info" title="Browser policy and network reports">
+            <div className="space-y-3">
+              <p>
+                Browsers can send CSP violations and network failures directly,
+                including failures that happen before your JavaScript starts.
+                Add report-uri to your existing CSP policy. Use report-only mode
+                while testing. NEL needs HTTPS and browser support.
+              </p>
+              {hasDsn ? (
+                <CodeBlock
+                  language="text"
+                  showCopy
+                  code={buildBrowserReportExample(dsn, project.id)}
+                />
+              ) : (
+                <p>Create a project DSN above to get the report endpoints.</p>
+              )}
+              <div className="flex flex-wrap gap-3">
+                <Button
+                  variant="link"
+                  onClick={() => navigate(`/projects/${project.slug}/errors`)}
+                >
+                  CSP issues
+                </Button>
+                <Button
+                  variant="link"
+                  onClick={() =>
+                    navigate(
+                      `/projects/${project.slug}/telemetry-logs?service=sentry.nel`
+                    )
+                  }
+                >
+                  Network reports in logs
+                </Button>
+                <Button
+                  variant="link"
+                  onClick={() =>
+                    navigate(`/projects/${project.slug}/client-outcomes`)
+                  }
+                >
+                  SDK ingestion health
+                </Button>
+              </div>
+            </div>
+          </Callout>
 
           <div className="flex items-center justify-between gap-3 pt-2">
             <Button variant="ghost" onClick={() => setWizardStep('framework')}>

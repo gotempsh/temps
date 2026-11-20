@@ -1,0 +1,70 @@
+{
+  "description": "Log-only, log, challenge clearance, redirects, environments and disabled rules",
+  "rules": [
+    {
+      "id": 20,
+      "enabled": false,
+      "expression": { "combinator": "all", "children": [] },
+      "action": { "type": "block", "status": 410 }
+    },
+    {
+      "id": 21,
+      "mode": "log_only",
+      "expression": {
+        "combinator": "all",
+        "children": [ { "kind": "condition", "field": "path", "op": "starts_with", "values": ["/beta"] } ]
+      },
+      "action": { "type": "block", "status": 403 }
+    },
+    {
+      "id": 22,
+      "expression": {
+        "combinator": "all",
+        "children": [ { "kind": "condition", "field": "user_agent", "op": "contains", "values": ["curl"], "case_insensitive": true } ]
+      },
+      "action": { "type": "log" }
+    },
+    {
+      "id": 23,
+      "environment_id": 7,
+      "expression": {
+        "combinator": "all",
+        "children": [ { "kind": "condition", "field": "path", "op": "eq", "values": ["/staging-only"] } ]
+      },
+      "action": { "type": "block", "status": 404 }
+    },
+    {
+      "id": 24,
+      "expression": {
+        "combinator": "all",
+        "children": [ { "kind": "condition", "field": "is_hosting_provider", "op": "eq", "values": ["true"] } ]
+      },
+      "action": { "type": "challenge" }
+    },
+    {
+      "id": 25,
+      "expression": {
+        "combinator": "all",
+        "children": [ { "kind": "condition", "field": "path", "op": "starts_with", "values": ["/docs/"] } ]
+      },
+      "action": { "type": "redirect", "target": "https://docs.example.com{path}?{query}", "status": 308 }
+    },
+    {
+      "id": 26,
+      "expression": {
+        "combinator": "all",
+        "children": [ { "kind": "condition", "field": "path", "op": "eq", "values": ["/old"] } ]
+      },
+      "action": { "type": "redirect", "target": "/new", "status": 301 }
+    }
+  ],
+  "cases": [
+    { "name": "log only records and forwards", "request": { "url": "/beta/x", "is_hosting_provider": false }, "decision": { "kind": "forward" }, "trace": ["disabled", "logged", "no_match", "no_match", "no_match", "no_match", "no_match"] },
+    { "name": "log action keeps evaluating", "request": { "url": "/docs/a?x=1", "user_agent": "Curl/8.4", "is_hosting_provider": false }, "decision": { "kind": "redirect", "rule_id": 25, "status": 308, "location": "https://docs.example.com/docs/a?x=1" }, "trace": ["disabled", "no_match", "logged", "no_match", "no_match", "decided", "not_reached"] },
+    { "name": "environment scoped rule applies in its environment", "request": { "url": "/staging-only", "environment_id": 7, "is_hosting_provider": false }, "decision": { "kind": "block", "rule_id": 23, "status": 404 } },
+    { "name": "environment scoped rule is skipped elsewhere", "request": { "url": "/staging-only", "environment_id": 8, "is_hosting_provider": false }, "decision": { "kind": "forward" }, "trace": ["disabled", "no_match", "no_match", "other_environment", "no_match", "no_match", "no_match"] },
+    { "name": "hosting traffic is challenged", "request": { "url": "/", "is_hosting_provider": true }, "decision": { "kind": "challenge", "rule_id": 24 } },
+    { "name": "cleared visitors pass the challenge rule", "request": { "url": "/old", "is_hosting_provider": true, "challenge_cleared": true }, "decision": { "kind": "redirect", "rule_id": 26, "status": 301, "location": "/new" }, "trace": ["disabled", "no_match", "no_match", "no_match", "challenge_passed", "no_match", "decided"] },
+    { "name": "redirect path is normalized", "request": { "url": "//docs//guide", "is_hosting_provider": false }, "decision": { "kind": "redirect", "rule_id": 25, "status": 308, "location": "https://docs.example.com/docs/guide?" } }
+  ]
+}

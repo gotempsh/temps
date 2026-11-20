@@ -46,8 +46,29 @@ impl TempsPlugin for EventsPlugin {
     ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
         Box::pin(async move {
             let db = context.require_service::<sea_orm::DatabaseConnection>();
-            let events_service = Arc::new(crate::services::AnalyticsEventsService::new(db));
+            // One settings service and one filter service, each shared by
+            // ingest and the console API, so a change invalidates the cache
+            // ingest actually reads.
+            let traffic_settings =
+                Arc::new(crate::traffic_settings::ProjectAnalyticsSettingsService::new(db.clone()));
+            let traffic_filters = Arc::new(crate::traffic_settings::TrafficFilterService::new(
+                db.clone(),
+            ));
+            // Shared with Speed ingest, which reads what event ingest notes.
+            let referrer_excluded_page_views =
+                Arc::new(crate::traffic_settings::ReferrerExcludedPageViews::new());
+            let events_service = Arc::new(
+                crate::services::AnalyticsEventsService::with_traffic_controls(
+                    db,
+                    traffic_settings.clone(),
+                    traffic_filters.clone(),
+                    referrer_excluded_page_views.clone(),
+                ),
+            );
             context.register_service(events_service);
+            context.register_service(traffic_settings);
+            context.register_service(traffic_filters);
+            context.register_service(referrer_excluded_page_views);
 
             debug!("Analytics events services registered successfully");
             Ok(())
@@ -56,7 +77,7 @@ impl TempsPlugin for EventsPlugin {
 
     fn configure_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
         let events_service = context.require_service::<crate::services::AnalyticsEventsService>();
-        let route_table = context.require_service::<temps_proxy::CachedPeerTable>();
+        let route_table = context.require_service::<temps_routes::CachedPeerTable>();
         let ip_address_service = context.require_service::<temps_geo::IpAddressService>();
         let cookie_crypto = context.require_service::<temps_core::CookieCrypto>();
         let config_service = context.require_service::<temps_config::ConfigService>();
@@ -69,7 +90,7 @@ impl TempsPlugin for EventsPlugin {
         let events_backend: Arc<dyn crate::services::AnalyticsEvents> =
             if server_config.is_clickhouse_enabled() {
                 let db = context.require_service::<sea_orm::DatabaseConnection>();
-                build_clickhouse_backend(&server_config, db)
+                build_clickhouse_backend(&server_config, db, config_service.clone())
             } else {
                 debug!("ClickHouse analytics backend disabled (TEMPS_CLICKHOUSE_* unset)");
                 events_service.clone()
@@ -92,15 +113,29 @@ impl TempsPlugin for EventsPlugin {
                 .require_service::<temps_analytics::AnalyticsIngestKeyService>(),
             ingest_rate_limiter: context
                 .require_service::<temps_analytics::AnalyticsIngestRateLimiter>(),
+            host_ingest_rate_limiter: Arc::new(crate::handlers::HostIngestRateLimiter::new()),
         });
 
-        let routes = crate::handlers::configure_routes().with_state(state);
+        let traffic_settings_state = Arc::new(crate::traffic_settings::TrafficSettingsAppState {
+            settings_service: context
+                .require_service::<crate::traffic_settings::ProjectAnalyticsSettingsService>(),
+            filter_service: context
+                .require_service::<crate::traffic_settings::TrafficFilterService>(),
+            geo_ip_service: context.require_service::<temps_geo::GeoIpService>(),
+            audit_service: context.require_service::<dyn temps_core::AuditLogger>(),
+            project_access_checker: context.get_service::<dyn temps_core::ProjectAccessChecker>(),
+        });
+
+        let routes = crate::handlers::configure_routes().with_state(state).merge(
+            crate::traffic_settings::configure_traffic_settings_routes()
+                .with_state(traffic_settings_state),
+        );
         Some(PluginRoutes::new(routes))
     }
 
     fn configure_public_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
         let events_service = context.require_service::<crate::services::AnalyticsEventsService>();
-        let route_table = context.require_service::<temps_proxy::CachedPeerTable>();
+        let route_table = context.require_service::<temps_routes::CachedPeerTable>();
         let ip_address_service = context.require_service::<temps_geo::IpAddressService>();
         let cookie_crypto = context.require_service::<temps_core::CookieCrypto>();
 
@@ -127,6 +162,7 @@ impl TempsPlugin for EventsPlugin {
                 .require_service::<temps_analytics::AnalyticsIngestKeyService>(),
             ingest_rate_limiter: context
                 .require_service::<temps_analytics::AnalyticsIngestRateLimiter>(),
+            host_ingest_rate_limiter: Arc::new(crate::handlers::HostIngestRateLimiter::new()),
         });
 
         // The CORS layer resolves keys through the very same service and
@@ -140,17 +176,24 @@ impl TempsPlugin for EventsPlugin {
     }
 
     fn openapi_schema(&self) -> Option<utoipa::openapi::OpenApi> {
-        Some(<crate::handlers::EventsApiDoc as utoipa::OpenApi>::openapi())
+        let mut schema = <crate::handlers::EventsApiDoc as utoipa::OpenApi>::openapi();
+        schema
+            .merge(<crate::traffic_settings::TrafficSettingsApiDoc as utoipa::OpenApi>::openapi());
+        schema.merge(<crate::traffic_settings::TrafficFiltersApiDoc as utoipa::OpenApi>::openapi());
+        Some(schema)
     }
 }
 
 /// Build the ClickHouse-backed read trait object and spawn the fan-out
 /// worker. Migrations are applied on a background task so plugin
-/// `configure_routes` returns promptly; if migrations fail, the backend
-/// will surface the error on the next query rather than blocking startup.
+/// `configure_routes` returns promptly, and are retried until they apply (a
+/// server still starting heals by waiting; a decode failure is re-checked at a
+/// slow cadence and recovers once the operator fixes the server) instead of
+/// being attempted once and left to surface as `Code: 60` per query.
 fn build_clickhouse_backend(
     server_config: &temps_config::ServerConfig,
     db: Arc<sea_orm::DatabaseConnection>,
+    config: Arc<temps_config::ConfigService>,
 ) -> Arc<dyn crate::services::AnalyticsEvents> {
     use temps_analytics_backend::clickhouse::{ClickHouseBackend, ClickHouseConfig};
 
@@ -165,7 +208,8 @@ fn build_clickhouse_backend(
             .clickhouse_password
             .clone()
             .unwrap_or_default(),
-    );
+    )
+    .with_compression(config.clickhouse_compression());
     let backend = ClickHouseBackend::new(cfg);
     let client = Arc::new(backend.client_clone());
 
@@ -179,21 +223,56 @@ fn build_clickhouse_backend(
     // block plugin init on remote calls.
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         let client_for_migrations = Arc::clone(&client);
-        handle.spawn(async move {
-            match temps_analytics_backend::migrations::apply_migrations(&client_for_migrations)
-                .await
-            {
-                Ok(report) => info!(
+        let db_for_migrations = Arc::clone(&db);
+        temps_clickhouse::spawn_retrying(
+            "analytics",
+            temps_clickhouse::MigrationRetryPolicy::default(),
+            move || {
+                let client = Arc::clone(&client_for_migrations);
+                let config = Arc::clone(&config);
+                let db = Arc::clone(&db_for_migrations);
+                async move {
+                    use temps_analytics_backend::AnalyticsBackendError;
+                    let report =
+                        temps_analytics_backend::migrations::apply_migrations(&client).await?;
+                    // Dynamic settings are reconciled after every migration
+                    // pass, even when all migrations were already recorded.
+                    let policy = config.get_retention_policy().await.map_err(|e| {
+                        AnalyticsBackendError::BackendUnavailable {
+                            backend: "clickhouse".into(),
+                            reason: format!("read events retention after migrations: {e}"),
+                        }
+                    })?;
+                    let ttl_changed = temps_analytics_backend::retention::reconcile_events_ttl(
+                        db.as_ref(),
+                        &client,
+                        policy.analytics.events_days,
+                    )
+                    .await
+                    .map_err(|e| {
+                        AnalyticsBackendError::BackendUnavailable {
+                            backend: "clickhouse".into(),
+                            reason: e.to_string(),
+                        }
+                    })?;
+                    if ttl_changed {
+                        info!(
+                            database = %client.database().unwrap_or("default"),
+                            days = policy.analytics.events_days,
+                            "ClickHouse events TTL updated after migrations; expiry follows asynchronous merges"
+                        );
+                    }
+                    Ok::<_, AnalyticsBackendError>(report)
+                }
+            },
+            |report| {
+                info!(
                     applied = ?report.applied,
                     skipped_count = report.skipped.len(),
                     "ClickHouse migrations applied"
-                ),
-                Err(e) => warn!(
-                    error = %e,
-                    "ClickHouse migrations failed; queries will surface the error per-call"
-                ),
-            }
-        });
+                )
+            },
+        );
 
         // Spawn the fan-out worker. It owns one client clone for inserts
         // and a DB clone for the outbox claim/release.

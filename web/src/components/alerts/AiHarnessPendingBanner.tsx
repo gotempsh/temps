@@ -4,29 +4,42 @@
 import { useQuery } from '@tanstack/react-query'
 import { ArrowRight, Terminal } from 'lucide-react'
 import { Link, useLocation } from 'react-router'
-import { listApiKeysOptions } from '@/api/client/@tanstack/react-query.gen'
-import { getAiHarnessStatus } from '@/lib/ai-onboarding'
+import { getAiHarnessStatusOptions } from '@/api/client/@tanstack/react-query.gen'
+import { useManualHarnessCompletion } from '@/hooks/useManualHarnessCompletion'
+import {
+  harnessPollInterval,
+  harnessStatusOf,
+  shouldShowHarnessPendingBanner,
+} from '@/lib/ai-onboarding'
+import { ROUTE_FAILURE_IGNORE } from '@/lib/route-query-failures'
 
 /**
- * Keeps a half-finished external harness connection visible until the
- * dedicated key makes its first authenticated request. There is deliberately
- * no dismiss action: this is a short-lived setup state, not an announcement.
+ * Keeps a half-finished external harness connection visible until it
+ * resolves: the server sees the harness authenticate (with the dedicated key
+ * or a browser-approved CLI login made after it), the user removes the
+ * pending key on /setup/ai, or marks the harness step done in the checklist.
+ * There is deliberately no dismiss action here: this is a short-lived setup
+ * state, and /setup/ai is where it is resolved.
  */
 export function AiHarnessPendingBanner() {
   const { pathname } = useLocation()
+  const { completed: completedManually } = useManualHarnessCompletion()
   const { data } = useQuery({
-    ...listApiKeysOptions({ query: { page: 1, page_size: 100 } }),
+    ...getAiHarnessStatusOptions(),
     retry: false,
-    refetchInterval: (query) =>
-      getAiHarnessStatus(query.state.data?.api_keys) === 'waiting'
-        ? 10_000
-        : false,
+    // An optional setup banner on every page: roles without API-key access
+    // are refused here, and that is not a failure of the page they are on.
+    // `useActivationSignals` observes the same entry and must opt out too.
+    meta: { routeFailure: ROUTE_FAILURE_IGNORE },
+    refetchInterval: (query) => harnessPollInterval(query.state.data),
   })
 
   if (
-    pathname === '/setup/ai' ||
-    pathname.startsWith('/settings/keys') ||
-    getAiHarnessStatus(data?.api_keys) !== 'waiting'
+    !shouldShowHarnessPendingBanner({
+      status: harnessStatusOf(data),
+      pathname,
+      completedManually,
+    })
   ) {
     return null
   }

@@ -8,11 +8,11 @@
 //! but never that Temps Cloud accepts it, authenticates it, forwards it to
 //! ClickHouse and streams a decodable answer back.
 //!
-//! It needs a real deployed backend and a real instance credential, so it is
-//! `#[ignore]`d — the same convention `temps-presets`'
-//! `every_starter_builds_runs_and_serves` uses for the tests that need
-//! infrastructure CI does not have. `cargo test` skips it; nothing here runs
-//! by default.
+//! It needs a real deployed backend and a real instance credential, so it
+//! skips at runtime unless `TEMPS_CLOUD_QUERY_PROXY_TEST_URL` is set
+//! (CLAUDE.md: tests that need infrastructure skip, they are not
+//! `#[ignore]`d). `cargo test` passes without it; nothing here talks to a
+//! backend by default.
 //!
 //! # Running it
 //!
@@ -20,7 +20,7 @@
 //! export TEMPS_CLOUD_QUERY_PROXY_TEST_URL=https://<the-cloud-backend-origin>
 //! export TEMPS_CLOUD_QUERY_PROXY_TEST_TOKEN=<an instance enrollment token>
 //!
-//! cargo test -p temps-cloud-client --test cloud_query_proxy_live_test -- --ignored --nocapture
+//! cargo test -p temps-cloud-client --test cloud_query_proxy_live_test -- --nocapture
 //! ```
 //!
 //! The token is the same credential `CloudClient` already sends as
@@ -29,6 +29,15 @@
 //! state), or whatever the enrollment that linked it returned. No new
 //! credential exists for this path, by design.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test helpers: panicking is how a test fails"
+)]
+#![allow(
+    clippy::disallowed_methods,
+    reason = "integration test: reads fixture configuration from the environment"
+)]
 use temps_cloud_client::{
     query::within_query_budget, CloudFeatureSwitches, CloudLink, EnrollmentState,
 };
@@ -36,21 +45,22 @@ use temps_cloud_client::{
 const URL_VAR: &str = "TEMPS_CLOUD_QUERY_PROXY_TEST_URL";
 const TOKEN_VAR: &str = "TEMPS_CLOUD_QUERY_PROXY_TEST_TOKEN";
 
-/// Read the two variables, naming precisely which one is missing.
+/// Read the two variables. `None` (skip) when no backend is configured;
+/// once the URL is set, a missing token is named precisely.
 ///
 /// A lone operator running this against a freshly deployed proxy needs to know
 /// *which* half of the configuration is absent; "not configured" would send
 /// them looking in both places.
-fn configuration() -> (String, String) {
+fn configuration() -> Option<(String, String)> {
     let url = match std::env::var(URL_VAR) {
         Ok(url) if !url.trim().is_empty() => url,
-        _ => panic!(
-            "{URL_VAR} is not set to a Temps Cloud backend origin.\n\n\
-             This test talks to a really deployed read proxy; there is nothing to \
-             point it at otherwise. Set both variables and re-run with --ignored:\n  \
-             export {URL_VAR}=https://<the-cloud-backend-origin>\n  \
-             export {TOKEN_VAR}=<an instance enrollment token>"
-        ),
+        _ => {
+            println!(
+                "{URL_VAR} is not set; skipping the live Temps Cloud read-proxy test. \
+                 Set {URL_VAR} and {TOKEN_VAR} to run it."
+            );
+            return None;
+        }
     };
     let token = match std::env::var(TOKEN_VAR) {
         Ok(token) if !token.trim().is_empty() => token,
@@ -62,7 +72,7 @@ fn configuration() -> (String, String) {
              credential for the query proxy."
         ),
     };
-    (url, token)
+    Some((url, token))
 }
 
 /// A linked instance pointed at the configured backend.
@@ -97,9 +107,10 @@ fn linked_instance(dir: &tempfile::TempDir, base_url: &str, token: &str) -> Clou
 }
 
 #[tokio::test]
-#[ignore = "needs a deployed Temps Cloud read proxy and an instance token; run explicitly with --ignored"]
 async fn a_trivial_read_round_trips_through_the_cloud_proxy() {
-    let (url, token) = configuration();
+    let Some((url, token)) = configuration() else {
+        return;
+    };
     let dir = tempfile::tempdir().expect("temp dir");
     let link = linked_instance(&dir, &url, &token);
 

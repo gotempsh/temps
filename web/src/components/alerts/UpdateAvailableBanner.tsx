@@ -12,9 +12,9 @@ import { cn } from '@/lib/utils'
 /** localStorage key holding the latest version the user dismissed. */
 const DISMISSED_KEY = 'temps-update-banner-dismissed'
 
-function readDismissedVersion(): string | null {
+function readDismissedVersion(key = DISMISSED_KEY): string | null {
   try {
-    return localStorage.getItem(DISMISSED_KEY)
+    return localStorage.getItem(key)
   } catch {
     // Storage can be unavailable (private mode, disabled) — treat as never
     // dismissed rather than crashing the banner.
@@ -32,7 +32,10 @@ export function UpdateAvailableBanner() {
   const { data } = useUpdateStatus()
   // Seed from storage once; the setter below keeps render state and storage
   // in sync when the user dismisses.
-  const [dismissedVersion, setDismissedVersion] = useState(readDismissedVersion)
+  const [dismissedVersions, setDismissedVersions] = useState(() => ({
+    ordinary: readDismissedVersion(),
+    security: readDismissedVersion('temps-security-update-banner-dismissed'),
+  }))
   const [updateOpen, setUpdateOpen] = useState(false)
   // Only asked for once there is something to update to, so an up-to-date
   // install never pays for the check.
@@ -44,20 +47,30 @@ export function UpdateAvailableBanner() {
   // cannot apply it — the dialog then explains why and gives the command to
   // run instead, which is more use than a button that silently isn't there.
   const canOfferUpdate = Boolean(capability?.allowed)
+  const securityUpdate = data?.security_update === true
 
   if (!data?.update_available || !data.latest_version) {
     return null
   }
 
-  if (dismissedVersion === data.latest_version) {
+  const noticeKind = securityUpdate ? 'security' : 'ordinary'
+  if (dismissedVersions[noticeKind] === data.latest_version) {
     return null
   }
 
   const dismiss = () => {
-    setDismissedVersion(data.latest_version ?? null)
+    setDismissedVersions((previous) => ({
+      ...previous,
+      [noticeKind]: data.latest_version ?? null,
+    }))
     try {
       if (data.latest_version) {
-        localStorage.setItem(DISMISSED_KEY, data.latest_version)
+        localStorage.setItem(
+          securityUpdate
+            ? 'temps-security-update-banner-dismissed'
+            : DISMISSED_KEY,
+          data.latest_version
+        )
       }
     } catch {
       // Best-effort persistence; the in-memory state still hides the banner
@@ -65,21 +78,30 @@ export function UpdateAvailableBanner() {
     }
   }
 
-  // Informational (not a warning): same thin single-line strip as the
-  // disk-space banner, but with a calm blue treatment.
+  // Security fixes get a persistent, prominent alert; ordinary updates use the compact strip.
   return (
     <>
       <div
+        role={securityUpdate ? 'alert' : 'status'}
         className={cn(
           'flex items-center gap-2 border-b px-4 py-1.5 text-sm',
-          'border-blue-200 dark:border-blue-900/50',
-          'bg-blue-50/60 dark:bg-blue-950/20',
-          'text-blue-800 dark:text-blue-200'
+          securityUpdate
+            ? 'border-destructive/50 bg-destructive/10 text-foreground py-3 flex-wrap'
+            : 'border-blue-200 dark:border-blue-900/50 bg-blue-50/60 dark:bg-blue-950/20 text-blue-800 dark:text-blue-200'
         )}
       >
         <ArrowUpCircle className="h-4 w-4 shrink-0 text-blue-600 dark:text-blue-400" />
-        <p className="min-w-0 flex-1 truncate">
-          <span className="font-medium">Update available</span>
+        <p
+          className={cn(
+            'min-w-0 flex-1',
+            securityUpdate ? '[overflow-wrap:anywhere]' : 'truncate'
+          )}
+        >
+          <span className="font-medium">
+            {securityUpdate
+              ? 'Security update available — upgrade recommended'
+              : 'Update available'}
+          </span>
           <span className="sm:hidden">
             {' '}
             — <strong>{data.latest_version}</strong>
@@ -108,7 +130,10 @@ export function UpdateAvailableBanner() {
             href={data.release_url}
             target="_blank"
             rel="noreferrer"
-            className="hidden shrink-0 font-medium underline-offset-2 hover:underline sm:inline text-blue-700 hover:text-blue-900 dark:text-blue-300 dark:hover:text-blue-100"
+            className={cn(
+              'shrink-0 font-medium underline-offset-2 hover:underline text-blue-700 hover:text-blue-900 dark:text-blue-300 dark:hover:text-blue-100',
+              !securityUpdate && 'hidden sm:inline'
+            )}
           >
             Release notes
           </a>
@@ -117,7 +142,12 @@ export function UpdateAvailableBanner() {
           href={data.docs_url}
           target="_blank"
           rel="noreferrer"
-          className="shrink-0 font-medium underline-offset-2 hover:underline text-blue-700 hover:text-blue-900 dark:text-blue-300 dark:hover:text-blue-100"
+          className={cn(
+            'shrink-0 font-medium underline-offset-2 hover:underline text-blue-700 hover:text-blue-900 dark:text-blue-300 dark:hover:text-blue-100',
+            // With "Update now" present the strip is already full on a phone;
+            // the upgrade itself is one tap away in the dialog.
+            canOfferUpdate && 'max-sm:hidden'
+          )}
         >
           How to upgrade
         </a>

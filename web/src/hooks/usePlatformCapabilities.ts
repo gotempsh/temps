@@ -67,14 +67,14 @@ export function usePlatformCapabilities() {
       case 'cloudflare_tunnel':
         return {
           type: 'info',
-          title: 'Cloudflare Tunnel Active',
+          title: 'Cloudflare Tunnel active',
           message:
             'Domains and SSL certificates are automatically managed by Cloudflare. Configure domains through your Cloudflare dashboard.',
         }
       case 'nat':
         return {
           type: 'warning',
-          title: 'NAT Configuration Required',
+          title: 'NAT configuration required',
           message: accessInfo.public_ip
             ? `Point your DNS A records to ${accessInfo.public_ip}. Ensure ports 80 and 443 are properly forwarded from your router to this server.`
             : 'Configure port forwarding for ports 80 and 443 from your router to this server.',
@@ -82,7 +82,7 @@ export function usePlatformCapabilities() {
       case 'direct':
         return {
           type: 'success',
-          title: 'Direct Access Available',
+          title: 'Direct access available',
           message: accessInfo.public_ip
             ? `Point your DNS A records to ${accessInfo.public_ip}.`
             : 'Direct access mode is active.',
@@ -90,7 +90,7 @@ export function usePlatformCapabilities() {
       case 'local':
         return {
           type: 'warning',
-          title: 'Local Development Mode',
+          title: 'Local development mode',
           message:
             'Configure external access (port forwarding or tunnel) to enable domain and certificate management.',
         }

@@ -13,6 +13,7 @@ import {
   parseResourceUpdate,
   parseReplicaCount,
 } from './index.js'
+import { runWithApi } from '../../lib/mock-api.js'
 import { MAX_CPU_MILLICORES } from '../../lib/cpu.js'
 import type { EnvironmentVariableResponse } from '../../api/types.gen.js'
 
@@ -294,5 +295,47 @@ describe('parseReplicaCount', () => {
 
   test('does not warn at or below 10 replicas', () => {
     expect(parseReplicaCount('10')).toEqual({ replicas: 10 })
+  })
+})
+
+
+test('invalid routing JSON fails before authentication or network requests', async () => {
+  const result = await runCommand(registerEnvironmentsCommands, ['environments', 'scale', '-p', 'my-app', '--load-balancing', '[3,5]'])
+  expect(result.exitCode).toBe(1)
+  expect(result.fetched).toBe(false)
+  expect(result.stderr).toContain('Invalid --load-balancing JSON')
+})
+
+
+describe('scale routing JSON', () => {
+  const policy = { strategy: 'preferred_nodes', preferredNodeIds: [3, 0] }
+  const environment = { id: 7, slug: 'production', name: 'Production', deployment_config: { replicas: 2, loadBalancing: policy } }
+  const routes = {
+    'GET /projects/by-slug/app': { id: 4, slug: 'app' },
+    'GET /projects/4/environments': [environment],
+  }
+
+  test('reports the policy returned by the settings API', async () => {
+    const run = await runWithApi(registerEnvironmentsCommands,
+      ['environments', 'scale', '-p', 'app', '--load-balancing', '{"strategy":"preferred_nodes"}', '--json'],
+      { ...routes, 'PUT /projects/4/environments/7/settings': environment })
+    expect(run.error).toBeUndefined()
+    expect(run.exitCode).toBe(0)
+    expect(JSON.parse(run.stdout)).toEqual({ environment: 'production', replicas: 2, load_balancing: policy })
+  })
+
+  test('reports null after clearing the override', async () => {
+    const run = await runWithApi(registerEnvironmentsCommands,
+      ['environments', 'scale', '-p', 'app', '--load-balancing', 'null', '--json'],
+      { ...routes, 'PUT /projects/4/environments/7/settings': { ...environment, deployment_config: { replicas: 2 } } })
+    expect(run.error).toBeUndefined()
+    expect(JSON.parse(run.stdout).load_balancing).toBeNull()
+  })
+
+  test('includes the current policy when inspecting scale', async () => {
+    const run = await runWithApi(registerEnvironmentsCommands,
+      ['environments', 'scale', '-p', 'app', '--json'], routes)
+    expect(run.error).toBeUndefined()
+    expect(JSON.parse(run.stdout).load_balancing).toEqual(policy)
   })
 })

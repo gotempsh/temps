@@ -161,8 +161,18 @@ pub const FEATURE_MATURITY: &[FeatureMaturity] = &[
     ),
     feature(
         "ai-chat",
+        Maturity::Beta,
+        "The Temps assistant runs on configured AI gateway providers; its conversation layout may still change.",
+    ),
+    feature(
+        "ai-gateway",
+        Maturity::Beta,
+        "Provider routing, usage, limits and activity are available; rate limiting and cost attribution are still being hardened.",
+    ),
+    feature(
+        "project-groups",
         Maturity::Experimental,
-        "The AI chat surface and interaction model are still being designed.",
+        "Grouping services into projects is an experiment; naming and inheritance may change or be removed.",
     ),
     feature(
         "ai-agents-workflows",
@@ -170,24 +180,9 @@ pub const FEATURE_MATURITY: &[FeatureMaturity] = &[
         "The agent execution model is in active development and has no end-to-end coverage.",
     ),
     feature(
-        "ai-gateway",
-        Maturity::Experimental,
-        "Rate limiting and cost attribution are not yet complete.",
-    ),
-    feature(
-        "ai-foundation-api-tools",
-        Maturity::Experimental,
-        "The AI foundation and API tool contracts are not yet frozen.",
-    ),
-    feature(
         "embeddings-memory",
         Maturity::Experimental,
         "Embeddings and memory have minimal coverage and an evolving contract.",
-    ),
-    feature(
-        "agent-execution-sandbox",
-        Maturity::Experimental,
-        "The agent execution sandbox has minimal coverage and may change substantially.",
     ),
     feature(
         "sandboxes-preview-environments",
@@ -240,11 +235,23 @@ pub fn feature_key_for_api_path(path: &str) -> Option<&'static str> {
     if path.starts_with("/revenue") || path.contains("/revenue/") {
         return Some("revenue-tracking");
     }
+    if path.starts_with("/project-groups")
+        || path.ends_with("/group")
+        || path.ends_with("/inherited-env-vars")
+        || path.contains("/templates/")
+            && (path.ends_with("/instantiate") || path.contains("/instantiations"))
+        || path.starts_with("/instantiations")
+        || path.ends_with("/hosting")
+        || path.contains("/import") && path.contains("/project-groups")
+    {
+        return Some("project-groups");
+    }
     if path.contains("/service-template") || path.contains("/service-runtime") {
         return Some("service-template-catalog");
     }
+    // AI traces back the gateway's Activity page.
     if path.starts_with("/otel/genai") {
-        return Some("ai-agents-workflows");
+        return Some("ai-gateway");
     }
     if path.contains("session-replay") || path.starts_with("/session-replays") {
         return Some("session-replay");
@@ -392,6 +399,49 @@ mod tests {
         let analytics = feature_maturity("web-analytics").expect("web analytics is registered");
         assert_eq!(analytics.maturity, Maturity::Beta);
         assert!(feature_maturity("mcp-servers").is_none());
+    }
+
+    #[test]
+    fn test_ai_chat_and_gateway_are_beta() {
+        for key in ["ai-chat", "ai-gateway"] {
+            assert_eq!(
+                feature_maturity(key).map(|entry| entry.maturity),
+                Some(Maturity::Beta),
+                "AI feature {key} must carry the Beta label"
+            );
+        }
+        // Harness execution and the skills/tools surface were retired from the
+        // console, so they no longer have a maturity entry to badge.
+        assert!(feature_maturity("agent-execution-sandbox").is_none());
+        assert!(feature_maturity("ai-foundation-api-tools").is_none());
+    }
+
+    #[test]
+    fn test_feature_key_for_api_path_ai_routes_resolve_to_registered_keys() {
+        assert_eq!(
+            feature_key_for_api_path("/chat/conversations"),
+            Some("ai-chat")
+        );
+        assert_eq!(
+            feature_key_for_api_path("/ai-gateway/usage"),
+            Some("ai-gateway")
+        );
+        assert_eq!(
+            feature_key_for_api_path("/otel/genai/traces"),
+            Some("ai-gateway")
+        );
+        for path in [
+            "/chat/conversations",
+            "/ai-gateway/usage",
+            "/otel/genai/traces",
+            "/projects/{id}/agents",
+        ] {
+            let key = feature_key_for_api_path(path).expect("AI path is labeled");
+            assert!(
+                feature_maturity(key).is_some(),
+                "API path {path} resolves to unregistered feature key {key}"
+            );
+        }
     }
 
     #[test]

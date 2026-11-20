@@ -6,6 +6,12 @@
 //! Provides an in-memory storage backend for unit and integration tests,
 //! plus helpers to construct protobuf trace trees and OtelService instances.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test support: an in-memory store whose lock is never poisoned"
+)]
+
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -71,6 +77,8 @@ pub struct MockOtelStorage {
     pub fail_store_logs: Arc<Mutex<Option<String>>>,
     /// [`StorageErrorKind`] stamped onto the injected `fail_store_logs` error.
     pub fail_store_logs_kind: Arc<Mutex<Option<StorageErrorKind>>>,
+    /// Fail only the first N attempts when set, allowing retry recovery tests.
+    pub fail_store_logs_times: Arc<Mutex<Option<u32>>>,
     /// Total number of `store_logs` invocations, including failed ones.
     /// Mirrors `store_spans_calls`.
     pub store_logs_calls: Arc<Mutex<u32>>,
@@ -304,6 +312,14 @@ impl MockOtelStorage {
                         p99_ms: percentile(&durations, 0.99),
                     },
                     last_seen,
+                    query.apdex_threshold_ms.map(|threshold_ms| ApdexCounts {
+                        threshold_ms,
+                        satisfied: durations.iter().filter(|d| **d <= threshold_ms).count() as i64,
+                        tolerating: durations
+                            .iter()
+                            .filter(|d| **d > threshold_ms && **d <= threshold_ms * 4.0)
+                            .count() as i64,
+                    }),
                 )
             })
             .collect();
@@ -435,9 +451,24 @@ impl OtelStorage for MockOtelStorage {
     }
 
     async fn store_logs(&self, records: Vec<LogRecord>) -> StorageResult<u64> {
-        *self.store_logs_calls.lock().unwrap() += 1;
+        let call = {
+            let mut calls = self.store_logs_calls.lock().unwrap();
+            *calls += 1;
+            *calls
+        };
 
-        if let Some(msg) = self.fail_store_logs.lock().unwrap().as_ref() {
+        let should_fail = self
+            .fail_store_logs_times
+            .lock()
+            .unwrap()
+            .is_none_or(|times| call <= times);
+        if let Some(msg) = self
+            .fail_store_logs
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|_| should_fail)
+        {
             return Err(OtelError::Storage {
                 message: msg.clone(),
                 kind: self
@@ -631,6 +662,13 @@ impl OtelStorage for MockOtelStorage {
                     .min_duration_ms
                     .map(|min| s.duration_ms >= min)
                     .unwrap_or(true)
+            })
+            .filter(|s| {
+                query.attribute_path.as_ref().is_none_or(|wanted| {
+                    s.attributes
+                        .get(&wanted.key)
+                        .is_some_and(|value| wanted.matches(value))
+                })
             })
             .take(query.limit.unwrap_or(100) as usize)
             .cloned()
@@ -849,6 +887,14 @@ impl OtelStorage for MockOtelStorage {
                 if span.duration_ms < min_dur {
                     continue;
                 }
+            }
+            // The time window, as the real backends apply it to span starts.
+            if query
+                .start_time
+                .is_some_and(|start| span.start_time < start)
+                || query.end_time.is_some_and(|end| span.start_time > end)
+            {
+                continue;
             }
             trace_map
                 .entry(span.trace_id.clone())
@@ -1172,6 +1218,7 @@ pub fn metric_point(
     attributes: &[(&str, &str)],
 ) -> MetricPoint {
     MetricPoint {
+        ingest_identity: None,
         project_id,
         deployment_id: None,
         resource: ResourceInfo {

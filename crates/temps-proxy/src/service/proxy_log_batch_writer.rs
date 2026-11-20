@@ -8,11 +8,13 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use temps_core::retry::RetryConfig;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-use super::proxy_log_service::CreateProxyLogRequest;
+use super::proxy_log_service::{CreateProxyLogRequest, ProxyLogServiceError};
 use crate::crawler_detector::CrawlerDetector;
+use crate::metrics::ProxyMetrics;
 use crate::redaction;
 use crate::storage::ProxyLogStorage;
 use crate::traits::FirstVisitAttribution;
@@ -21,18 +23,43 @@ use crate::traits::FirstVisitAttribution;
 /// At ~4 KB per entry, 8192 entries = ~32 MB maximum memory usage.
 const CHANNEL_CAPACITY: usize = 8192;
 
-/// Maximum number of rows per batch INSERT statement.
-const MAX_BATCH_SIZE: usize = 200;
+/// Rows that trigger an early flush. Bounds the batch at ~8 MB (4 KB/row).
+const MAX_BATCH_SIZE: usize = 2_000;
 
-/// Maximum tracking events per batch (visitors + sessions are lighter weight).
+/// Maximum tracking events drained per receive (visitors + sessions are
+/// lighter weight).
 const MAX_TRACKING_BATCH_SIZE: usize = 512;
 
+/// Tracking events that trigger an early flush, so a burst of new visitors
+/// cannot grow the tracking batch without bound between timer ticks.
+const MAX_TRACKING_BUFFERED: usize = 8 * MAX_TRACKING_BATCH_SIZE;
+
 /// How long to wait before flushing a partial batch.
-const FLUSH_INTERVAL: Duration = Duration::from_millis(500);
+///
+/// Each flush is one insert per storage backend. At 500 ms a quiet instance
+/// sent ClickHouse ~3 rows per insert, and every tiny insert is a new part
+/// that has to be merged and removed later — the merge and part-removal
+/// churn dominated the table's I/O. Five seconds turns that into tens of
+/// rows per insert at low traffic, while busy instances still flush on
+/// `MAX_BATCH_SIZE` well before the timer. The cost is that a request shows
+/// up in the request log up to five seconds later.
+const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Emit a shed warning once per this many dropped entries (per handle kind),
 /// so overload produces a handful of log lines instead of one per request.
 const DROP_LOG_EVERY: u64 = 10_000;
+
+/// Attempts (first try included) for one batch INSERT that Postgres aborts
+/// with a deadlock or serialization failure.
+const WRITE_MAX_ATTEMPTS: u32 = 5;
+
+/// First backoff before re-running a conflicted batch; doubles per retry up to
+/// [`WRITE_RETRY_MAX_DELAY`]. The worst case adds ~0.75 s (plus jitter) to one
+/// flush, during which the bounded channel keeps absorbing entries.
+const WRITE_RETRY_BASE_DELAY: Duration = Duration::from_millis(50);
+
+/// Ceiling for one backoff step.
+const WRITE_RETRY_MAX_DELAY: Duration = Duration::from_secs(1);
 
 /// TTL for the UUID → i32 id cache. Entries that haven't been accessed for
 /// this duration are evicted; the next flush will re-populate from the DB.
@@ -113,9 +140,18 @@ pub struct TrackingEvent {
 pub struct ProxyLogBatchHandle {
     sender: mpsc::Sender<CreateProxyLogRequest>,
     dropped: Arc<AtomicU64>,
+    metrics: Arc<ProxyMetrics>,
 }
 
 impl ProxyLogBatchHandle {
+    /// Count entries shed because the channel was full into `metrics`, so
+    /// `proxy.log_entries_dropped` covers every way an entry can be lost, not
+    /// only failed writes.
+    pub fn with_metrics(mut self, metrics: Arc<ProxyMetrics>) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
     /// Enqueue a log entry without ever blocking or queueing outside the
     /// bounded channel. When the writer can't keep up the entry is DROPPED
     /// (load-shedding, Cloudflare-style): access logs degrade under overload
@@ -134,6 +170,7 @@ impl ProxyLogBatchHandle {
         redaction::redact_log_entry(&mut request);
 
         if self.sender.try_send(request).is_err() {
+            self.metrics.record_log_entries_shed(1);
             let total = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
             if total == 1 || total.is_multiple_of(DROP_LOG_EVERY) {
                 warn!(
@@ -166,7 +203,6 @@ impl ProxyLogBatchHandle {
 /// dropped; live traffic is never blocked and this task never panics.
 pub struct ProxyLogBatchWriter {
     /// Database connection for raw visitor/session upserts and geo-IP enrichment.
-    #[allow(dead_code)]
     db: Arc<DatabaseConnection>,
     ip_service: Arc<temps_geo::IpAddressService>,
     /// Pluggable persistence backend for proxy_logs.
@@ -179,6 +215,9 @@ pub struct ProxyLogBatchWriter {
     visitor_id_cache: Cache<String, i32>,
     /// session_uuid → session i32 id
     session_id_cache: Cache<String, i32>,
+    /// Counters for batch-write retries and drops, sampled by
+    /// `ProxyMetricsSampler`. Atomics only; updated from this task.
+    metrics: Arc<ProxyMetrics>,
 }
 
 impl ProxyLogBatchWriter {
@@ -196,6 +235,7 @@ impl ProxyLogBatchWriter {
         let log_handle = ProxyLogBatchHandle {
             sender,
             dropped: Arc::new(AtomicU64::new(0)),
+            metrics: Arc::new(ProxyMetrics::default()),
         };
         let tracking_handle = TrackingBatchHandle {
             sender: tracking_sender,
@@ -219,8 +259,17 @@ impl ProxyLogBatchWriter {
             tracking_receiver,
             visitor_id_cache,
             session_id_cache,
+            metrics: Arc::new(ProxyMetrics::default()),
         };
         (log_handle, tracking_handle, writer)
+    }
+
+    /// Report batch-write retries and drops into `metrics` -- the same
+    /// instance the load balancer records request counters into, so the
+    /// existing sampler persists them as `proxy.log_*` series.
+    pub fn with_metrics(mut self, metrics: Arc<ProxyMetrics>) -> Self {
+        self.metrics = metrics;
+        self
     }
 
     /// Run the batch writer loop. This consumes self and runs until both channels
@@ -271,11 +320,15 @@ impl ProxyLogBatchWriter {
                         Some(event) => {
                             tracking_batch.push(event);
                             // Drain additional events without blocking
-                            while tracking_batch.len() < MAX_TRACKING_BATCH_SIZE {
+                            let drain_limit = tracking_batch.len() + MAX_TRACKING_BATCH_SIZE;
+                            while tracking_batch.len() < drain_limit {
                                 match self.tracking_receiver.try_recv() {
                                     Ok(e) => tracking_batch.push(e),
                                     Err(_) => break,
                                 }
+                            }
+                            if tracking_batch.len() >= MAX_TRACKING_BUFFERED {
+                                self.flush_all(&mut tracking_batch, &mut proxy_log_batch).await;
                             }
                         }
                         None => {
@@ -505,19 +558,34 @@ impl ProxyLogBatchWriter {
             self.resolve_tracking_ids(entry).await;
         }
 
-        // Persist via the configured storage backend. FAIL OPEN: on backend
-        // error we log and drop the batch — we never block live traffic and
+        // Persist via the configured storage backend. A deadlock or
+        // serialization failure is retried (bounded, with backoff) because the
+        // statement was rolled back and re-running it is the documented
+        // remedy; anything else, or an exhausted budget, FAILS OPEN: we log,
+        // count the loss and drop the batch -- we never block live traffic and
         // never panic (this task is off the Pingora hot path, but the backend
         // could be down, e.g. ClickHouse unreachable).
-        if let Err(e) = self.storage.write_batch(std::mem::take(batch)).await {
+        let retry = RetryConfig::new(WRITE_MAX_ATTEMPTS)
+            .with_base_delay(WRITE_RETRY_BASE_DELAY)
+            .with_max_delay(WRITE_RETRY_MAX_DELAY);
+        let entries: &[CreateProxyLogRequest] = batch.as_slice();
+        if let Err(e) = write_batch_with_retry(
+            || self.storage.write_batch(entries),
+            &retry,
+            &self.metrics,
+            count,
+        )
+        .await
+        {
+            self.metrics.record_log_batch_dropped(count as u64);
             error!(
-                "Failed to persist {} proxy log entries (dropping batch): {:?}",
-                count, e
+                entries = count,
+                error = ?e,
+                "Failed to persist {} proxy log entries (dropping batch)",
+                count
             );
         }
 
-        // `std::mem::take` already emptied the batch; clear() is a defensive
-        // no-op in case write_batch short-circuits before taking ownership.
         batch.clear();
     }
 
@@ -591,9 +659,172 @@ impl ProxyLogBatchWriter {
     }
 }
 
+/// Run one batch write, re-running it while Postgres reports a deadlock or
+/// serialization failure ([`ProxyLogServiceError::is_transient_write_conflict`]).
+///
+/// At most `retry.max_attempts` attempts are made, separated by
+/// `retry.compute_delay` plus up to 50% jitter so two writers aborted by the
+/// same cycle do not wake in lockstep and collide again. Each re-run is
+/// counted in `metrics`. A non-transient error is returned immediately: it
+/// will not change on a second attempt, and for a non-atomic backend a second
+/// attempt could duplicate rows. Hand-rolled instead of `RetryConfig::retry`
+/// because that retries every error, with no way to stop early on a terminal
+/// one.
+async fn write_batch_with_retry<F, Fut>(
+    mut write: F,
+    retry: &RetryConfig,
+    metrics: &ProxyMetrics,
+    entries: usize,
+) -> Result<(), ProxyLogServiceError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), ProxyLogServiceError>>,
+{
+    let max_attempts = retry.max_attempts.max(1);
+    let mut attempt: u32 = 0;
+    loop {
+        match write().await {
+            Ok(()) => {
+                if attempt > 0 {
+                    info!(
+                        entries,
+                        retries = attempt,
+                        "Proxy log batch persisted after retrying a transient database conflict"
+                    );
+                }
+                return Ok(());
+            }
+            Err(e) if e.is_transient_write_conflict() && attempt + 1 < max_attempts => {
+                let base = retry.compute_delay(attempt);
+                let delay = base + base.mul_f64(rand::random::<f64>() * 0.5);
+                metrics.record_log_write_retry();
+                warn!(
+                    entries,
+                    attempt = attempt + 1,
+                    max_attempts,
+                    delay_ms = delay.as_millis() as u64,
+                    error = %e,
+                    "Proxy log batch hit a transient database conflict, retrying"
+                );
+                tokio::time::sleep(delay).await;
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::super::proxy_log_service::test_support::pg_exec_error;
     use super::*;
+    use std::sync::atomic::AtomicU32;
+
+    fn fast_retry(max_attempts: u32) -> RetryConfig {
+        RetryConfig::new(max_attempts)
+            .with_base_delay(Duration::from_millis(1))
+            .with_max_delay(Duration::from_millis(4))
+    }
+
+    /// Runs `write_batch_with_retry` against a writer that fails with the given
+    /// SQLSTATE `failures` times and then succeeds. Returns the outcome, how
+    /// many times the writer was called, and the metrics it was reported to.
+    async fn run_with_failures(
+        code: &'static str,
+        failures: u32,
+        retry: &RetryConfig,
+    ) -> (Result<(), ProxyLogServiceError>, u32, ProxyMetrics) {
+        let calls = AtomicU32::new(0);
+        let metrics = ProxyMetrics::default();
+        let result = write_batch_with_retry(
+            || {
+                let call = calls.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if call < failures {
+                        Err(pg_exec_error(code, "injected failure"))
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+            retry,
+            &metrics,
+            3,
+        )
+        .await;
+        (result, calls.load(Ordering::SeqCst), metrics)
+    }
+
+    fn retries_and_drops(metrics: &ProxyMetrics) -> (u64, u64, u64) {
+        let delta = metrics
+            .snapshot()
+            .delta_since(&crate::metrics::MetricsSnapshot::default());
+        let value = |name: &str| {
+            delta
+                .samples()
+                .into_iter()
+                .find(|s| s.name == name)
+                .map(|s| s.value as u64)
+                .unwrap_or(0)
+        };
+        (
+            value(crate::metrics::METRIC_LOG_WRITE_RETRIES),
+            value(crate::metrics::METRIC_LOG_BATCHES_DROPPED),
+            value(crate::metrics::METRIC_LOG_ENTRIES_DROPPED),
+        )
+    }
+
+    #[tokio::test]
+    async fn deadlocked_batch_is_retried_until_it_persists() {
+        let (result, calls, metrics) = run_with_failures("40P01", 2, &fast_retry(5)).await;
+        assert!(result.is_ok(), "batch must persist on the third attempt");
+        assert_eq!(calls, 3);
+        assert_eq!(retries_and_drops(&metrics), (2, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn serialization_failure_is_retried_too() {
+        let (result, calls, metrics) = run_with_failures("40001", 1, &fast_retry(5)).await;
+        assert!(result.is_ok());
+        assert_eq!(calls, 2);
+        assert_eq!(retries_and_drops(&metrics), (1, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn retry_budget_is_bounded_and_the_last_error_is_returned() {
+        let (result, calls, metrics) = run_with_failures("40P01", u32::MAX, &fast_retry(4)).await;
+        let error = result.expect_err("a permanently deadlocking batch must give up");
+        assert!(error.is_transient_write_conflict());
+        assert_eq!(calls, 4, "max_attempts counts the first try");
+        // 3 retries between 4 attempts; the drop itself is recorded by
+        // `flush_batch`, not by the retry loop.
+        assert_eq!(retries_and_drops(&metrics), (3, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn non_transient_errors_are_not_retried() {
+        // foreign_key_violation: the parent row is gone, retrying cannot help.
+        let (result, calls, metrics) = run_with_failures("23503", u32::MAX, &fast_retry(5)).await;
+        assert!(result.is_err());
+        assert_eq!(calls, 1);
+        assert_eq!(retries_and_drops(&metrics), (0, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn single_attempt_budget_never_retries() {
+        let (result, calls, metrics) = run_with_failures("40P01", u32::MAX, &fast_retry(1)).await;
+        assert!(result.is_err());
+        assert_eq!(calls, 1);
+        assert_eq!(retries_and_drops(&metrics), (0, 0, 0));
+    }
+
+    #[test]
+    fn dropped_batches_report_batch_and_entry_counts() {
+        let metrics = ProxyMetrics::default();
+        metrics.record_log_batch_dropped(5);
+        metrics.record_log_batch_dropped(2);
+        assert_eq!(retries_and_drops(&metrics), (0, 2, 7));
+    }
 
     fn create_test_ip_service(db: Arc<DatabaseConnection>) -> Arc<temps_geo::IpAddressService> {
         // Use mock GeoIP service for tests (no MaxMind database file needed)
@@ -656,6 +887,10 @@ mod tests {
             response_headers: None,
             trace_id: None,
             error_group_id: None,
+            shield_verdict: None,
+            shield_reasons: Vec::new(),
+            ja4: None,
+            ja4_source: None,
         }
     }
 
@@ -802,6 +1037,8 @@ mod tests {
         let ip_service = create_test_ip_service(db.clone());
         let storage = create_test_storage(db.clone(), ip_service.clone());
         let (handle, _tracking_handle, writer) = ProxyLogBatchWriter::new(db, ip_service, storage);
+        let metrics = Arc::new(ProxyMetrics::default());
+        let handle = handle.with_metrics(metrics.clone());
 
         // Drop the writer (closes the receiver end)
         drop(writer);
@@ -811,6 +1048,12 @@ mod tests {
         // Enqueue counts a shed entry because the writer (receiver) is dropped
         handle.send_or_drop(request);
         assert_eq!(handle.dropped_total(), 1);
+
+        // ...and reports it through `proxy.log_entries_dropped`, so the metric
+        // covers entries shed at the channel, not only failed batch writes.
+        let (_retries, dropped_batches, dropped_entries) = retries_and_drops(&metrics);
+        assert_eq!(dropped_entries, 1);
+        assert_eq!(dropped_batches, 0, "a shed entry is not a failed batch");
     }
 
     #[tokio::test]
@@ -1048,8 +1291,8 @@ mod tests {
     mod attribution_integration {
         use super::*;
         use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter};
-        use temps_database::test_utils::TestDatabase;
         use temps_entities::{environments, projects, visitor};
+        use temps_test_utils::TestDatabase;
 
         async fn setup_project(db: &Arc<DatabaseConnection>) -> (i32, i32) {
             let project = projects::ActiveModel {
@@ -1247,6 +1490,510 @@ mod tests {
                 row.first_channel.as_deref(),
                 Some("Organic Search"),
                 "first_channel must NOT be overwritten"
+            );
+        }
+    }
+
+    /// Issue #1425: a batch INSERT pins its foreign-key parents with
+    /// `FOR KEY SHARE` and can deadlock against a transaction that takes a
+    /// stronger lock on the same parent rows in another order. The issue was
+    /// seen on `environments`; that key has since been dropped, so the tests
+    /// reproduce it on `request_sessions`, a parent the log still references,
+    /// against a real Postgres. They skip (with a message)
+    /// when no container runtime / `TEMPS_TEST_DATABASE_URL` is available.
+    mod deadlock_integration {
+        use super::*;
+        use crate::storage::{ProxyLogStorage, TimescaleDbProxyLogStore};
+        use sea_orm::{
+            ActiveModelTrait, ActiveValue::Set, ConnectOptions, Database, EntityTrait,
+            PaginatorTrait, TransactionTrait,
+        };
+        use std::sync::atomic::AtomicBool;
+        use temps_entities::{environments, projects, proxy_logs, request_sessions};
+        use temps_test_utils::TestDatabase;
+
+        /// How long Postgres waits before checking a stuck lock wait for a
+        /// cycle. Short so the stress test does not spend a second per
+        /// conflict; the deterministic tests pick their own per-pool values to
+        /// decide which side of the cycle Postgres aborts.
+        const FAST_DEADLOCK_TIMEOUT: &str = "30ms";
+
+        struct Fixture {
+            /// Owns the schema; dropping it removes the test schema.
+            database: TestDatabase,
+            /// Connection used by the batch writer.
+            writer_db: Arc<DatabaseConnection>,
+            project_id: i32,
+            environment_id: i32,
+            /// `request_sessions` rows: a parent `proxy_logs` still holds a
+            /// foreign key to, so inserting a row takes `FOR KEY SHARE` on it.
+            /// (The project, environment and deployment keys were dropped.)
+            session_ids: Vec<i32>,
+        }
+
+        impl Fixture {
+            /// A second connection pool onto the same schema with its own
+            /// `deadlock_timeout`, so a test decides which side of a deadlock
+            /// Postgres picks as the victim (the later waiter whose timer
+            /// fires first).
+            async fn pool(&self, deadlock_timeout: &str) -> Arc<DatabaseConnection> {
+                let url = format!(
+                    "{} -c deadlock_timeout={}",
+                    self.database.database_url, deadlock_timeout
+                );
+                let mut options = ConnectOptions::new(url);
+                options.max_connections(16).sqlx_logging(false);
+                Arc::new(
+                    Database::connect(options)
+                        .await
+                        .expect("connect extra pool to the test schema"),
+                )
+            }
+
+            fn storage(&self) -> Arc<TimescaleDbProxyLogStore> {
+                let ip_service = create_test_ip_service(self.writer_db.clone());
+                Arc::new(TimescaleDbProxyLogStore::new(
+                    self.writer_db.clone(),
+                    ip_service,
+                ))
+            }
+
+            /// The handles are returned so the caller keeps both channels open:
+            /// a dropped tracking handle makes the writer's `select!` spin on
+            /// the closed channel.
+            fn writer(
+                &self,
+            ) -> (
+                ProxyLogBatchHandle,
+                TrackingBatchHandle,
+                ProxyLogBatchWriter,
+                Arc<ProxyMetrics>,
+            ) {
+                let ip_service = create_test_ip_service(self.writer_db.clone());
+                let (handle, tracking, writer) =
+                    ProxyLogBatchWriter::new(self.writer_db.clone(), ip_service, self.storage());
+                let metrics = Arc::new(ProxyMetrics::default());
+                (
+                    handle,
+                    tracking,
+                    writer.with_metrics(metrics.clone()),
+                    metrics,
+                )
+            }
+
+            fn entry(&self, request_id: &str, session_id: i32) -> CreateProxyLogRequest {
+                CreateProxyLogRequest {
+                    project_id: Some(self.project_id),
+                    environment_id: Some(self.environment_id),
+                    deployment_id: None,
+                    session_id: Some(session_id),
+                    request_id: request_id.to_string(),
+                    user_agent: None,
+                    ..make_test_log_request("/")
+                }
+            }
+
+            async fn persisted(&self) -> u64 {
+                proxy_logs::Entity::find()
+                    .count(self.writer_db.as_ref())
+                    .await
+                    .expect("count persisted proxy logs")
+            }
+        }
+
+        async fn fixture(sessions_wanted: usize) -> Option<Fixture> {
+            let database = match TestDatabase::with_migrations().await {
+                Ok(database) => database,
+                Err(error)
+                    if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+                {
+                    eprintln!("Skipping proxy log deadlock test: Docker runtime unavailable");
+                    return None;
+                }
+                Err(error) => panic!("Could not create isolated test database: {error}"),
+            };
+            let db = database.connection_arc();
+            let project = projects::ActiveModel {
+                name: Set("Deadlock Test".to_string()),
+                slug: Set("deadlock-test".to_string()),
+                repo_name: Set("repo".to_string()),
+                repo_owner: Set("owner".to_string()),
+                directory: Set(".".to_string()),
+                main_branch: Set("main".to_string()),
+                preset: Set(temps_entities::preset::Preset::Nixpacks),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await
+            .expect("insert project");
+            let environment = environments::ActiveModel {
+                project_id: Set(project.id),
+                name: Set("env".to_string()),
+                slug: Set("env".to_string()),
+                subdomain: Set("deadlock-test".to_string()),
+                host: Set("deadlock-test.example.test".to_string()),
+                upstreams: Set(temps_entities::upstream_config::UpstreamList::default()),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await
+            .expect("insert environment");
+            let now = chrono::Utc::now();
+            let mut session_ids = Vec::new();
+            for index in 0..sessions_wanted {
+                let session = request_sessions::ActiveModel {
+                    session_id: Set(format!("deadlock-session-{index}")),
+                    started_at: Set(now),
+                    last_accessed_at: Set(now),
+                    data: Set("{}".to_string()),
+                    ..Default::default()
+                }
+                .insert(db.as_ref())
+                .await
+                .expect("insert request session");
+                session_ids.push(session.id);
+            }
+
+            // The batch writer's own pool: short deadlock_timeout so the
+            // stress test does not spend a second per conflict.
+            let mut options = ConnectOptions::new(format!(
+                "{} -c deadlock_timeout={FAST_DEADLOCK_TIMEOUT}",
+                database.database_url
+            ));
+            options.max_connections(8).sqlx_logging(false);
+            let writer_db = Arc::new(
+                Database::connect(options)
+                    .await
+                    .expect("connect the writer pool to the test schema"),
+            );
+            Some(Fixture {
+                database,
+                writer_db,
+                project_id: project.id,
+                environment_id: environment.id,
+                session_ids,
+            })
+        }
+
+        /// A transaction that locks session `first`, then `second`,
+        /// `FOR UPDATE` -- the way a session update locks the rows it
+        /// touches. Signals `ready` once it holds `first`, then waits `hold`
+        /// before asking for `second`.
+        async fn lock_two_sessions(
+            db: Arc<DatabaseConnection>,
+            first: i32,
+            second: i32,
+            hold: Duration,
+            ready: Option<tokio::sync::oneshot::Sender<()>>,
+        ) -> Result<(), sea_orm::DbErr> {
+            let txn = db.begin().await?;
+            lock_session(&txn, first).await?;
+            if let Some(ready) = ready {
+                let _ = ready.send(());
+            }
+            tokio::time::sleep(hold).await;
+            lock_session(&txn, second).await?;
+            txn.commit().await
+        }
+
+        async fn lock_session(
+            txn: &sea_orm::DatabaseTransaction,
+            session_id: i32,
+        ) -> Result<(), sea_orm::DbErr> {
+            txn.execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT id FROM request_sessions WHERE id = $1 FOR UPDATE",
+                [session_id.into()],
+            ))
+            .await
+            .map(|_| ())
+        }
+
+        /// Interleaving that deadlocks a batch whose rows arrive in
+        /// descending-session order against a locker that locks ascending:
+        /// the locker holds `lo`, the batch pins `hi` then waits for `lo`, the
+        /// locker then asks for `hi`. Returns the batch's result.
+        ///
+        /// The batch session waits first and Postgres checks for a cycle when
+        /// a waiter's `deadlock_timeout` expires, so the batch pool's timeout
+        /// (400ms) must lapse AFTER the locker has queued for `hi` (100ms) and
+        /// before the locker's own (5s) -- that makes the batch the victim,
+        /// which is what the proxy saw in production.
+        async fn run_against_ascending_locker(
+            f: &Fixture,
+            order_of: impl FnOnce(&[CreateProxyLogRequest]) -> Vec<usize>,
+        ) -> Result<(), ProxyLogServiceError> {
+            let (lo, hi) = (f.session_ids[0], f.session_ids[1]);
+            let locker_db = f.pool("5s").await;
+            let batch_db = f.pool("400ms").await;
+            let store = TimescaleDbProxyLogStore::new(
+                batch_db.clone(),
+                create_test_ip_service(batch_db.clone()),
+            );
+
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            let locker = tokio::spawn(lock_two_sessions(
+                locker_db,
+                lo,
+                hi,
+                Duration::from_millis(100),
+                Some(ready_tx),
+            ));
+            ready_rx.await.expect("locker holds the low session");
+
+            // Arrival order: the high session first.
+            let entries = vec![f.entry("arrives-first", hi), f.entry("arrives-second", lo)];
+            let order = order_of(&entries);
+            let result = store
+                .insert_in_order(&entries, order)
+                .await
+                .map_err(ProxyLogServiceError::from);
+            locker
+                .await
+                .expect("locker task")
+                .expect("the locker always succeeds once the batch is out of its way");
+            result
+        }
+
+        #[tokio::test]
+        async fn arrival_order_batch_deadlocks_against_an_ascending_locker() {
+            let Some(f) = fixture(2).await else {
+                return;
+            };
+            // The pre-fix behaviour: rows inserted in arrival order.
+            let error = run_against_ascending_locker(&f, |entries| (0..entries.len()).collect())
+                .await
+                .expect_err("arrival order [hi, lo] against a lo->hi locker must deadlock");
+            assert!(
+                error.is_transient_write_conflict(),
+                "expected 40P01 from Postgres, got: {error}"
+            );
+            assert_eq!(f.persisted().await, 0, "an aborted batch persists nothing");
+        }
+
+        #[tokio::test]
+        async fn fk_ordered_batch_does_not_deadlock_against_an_ascending_locker() {
+            let Some(f) = fixture(2).await else {
+                return;
+            };
+            run_against_ascending_locker(&f, |entries| {
+                // Exactly what `TimescaleDbProxyLogStore::batch_insert` does.
+                crate::storage::timescaledb::fk_lock_order(entries)
+            })
+            .await
+            .expect("ascending FK order queues behind the locker instead of cycling");
+            assert_eq!(f.persisted().await, 2);
+        }
+
+        /// Sorting cannot help when the other transaction locks in descending
+        /// order; the bounded retry is what recovers the batch there.
+        #[tokio::test]
+        async fn retry_recovers_a_batch_that_lost_a_deadlock() {
+            let Some(f) = fixture(2).await else {
+                return;
+            };
+            let (lo, hi) = (f.session_ids[0], f.session_ids[1]);
+            let locker_db = f.pool("5s").await;
+            let batch_db = f.pool("400ms").await;
+            let store = TimescaleDbProxyLogStore::new(
+                batch_db.clone(),
+                create_test_ip_service(batch_db.clone()),
+            );
+
+            // Descending locker: holds `hi`, then wants `lo`; the sorted batch
+            // pins `lo` first and then waits for `hi` -- a cycle.
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            let locker = tokio::spawn(lock_two_sessions(
+                locker_db,
+                hi,
+                lo,
+                Duration::from_millis(100),
+                Some(ready_tx),
+            ));
+            ready_rx.await.expect("locker holds the high session");
+
+            let entries = vec![f.entry("a", lo), f.entry("b", hi)];
+            let metrics = ProxyMetrics::default();
+            let retry = RetryConfig::new(WRITE_MAX_ATTEMPTS)
+                .with_base_delay(Duration::from_millis(20))
+                .with_max_delay(Duration::from_millis(200));
+            let result = write_batch_with_retry(
+                || {
+                    let store = &store;
+                    let entries = &entries;
+                    async move { store.write_batch(entries).await }
+                },
+                &retry,
+                &metrics,
+                entries.len(),
+            )
+            .await;
+            locker.await.expect("locker task").expect("locker commits");
+
+            result.expect("the batch persists after being retried");
+            assert_eq!(f.persisted().await, 2, "both rows landed exactly once");
+            assert_eq!(
+                retries_and_drops(&metrics),
+                (1, 0, 0),
+                "exactly one deadlock, one retry, nothing dropped"
+            );
+        }
+
+        /// The drop accounting end to end: a batch Postgres rejects for a
+        /// reason retrying cannot fix (a vanished session) is dropped once,
+        /// not retried, and counted with its entry count.
+        #[tokio::test]
+        async fn unrecoverable_batch_is_dropped_once_and_counted() {
+            let Some(f) = fixture(1).await else {
+                return;
+            };
+            let (_handle, _tracking, writer, metrics) = f.writer();
+            let missing_session = f.session_ids[0] + 10_000;
+            let mut batch = vec![
+                f.entry("orphan-1", missing_session),
+                f.entry("orphan-2", missing_session),
+                f.entry("orphan-3", missing_session),
+            ];
+
+            writer.flush_batch(&mut batch).await;
+
+            assert!(batch.is_empty());
+            assert_eq!(f.persisted().await, 0);
+            assert_eq!(
+                retries_and_drops(&metrics),
+                (0, 1, 3),
+                "a foreign-key violation is dropped immediately: no retries, 1 batch, 3 entries"
+            );
+        }
+
+        /// `proxy_logs` holds no foreign key to `environments` (nor to
+        /// `projects` or `deployments`), so an environment row locked by an
+        /// edit or a project delete no longer blocks the log write at all.
+        #[tokio::test]
+        async fn a_locked_environment_does_not_block_a_batch() {
+            let Some(f) = fixture(1).await else {
+                return;
+            };
+            let locker_db = f.pool("5s").await;
+            let editing = locker_db.begin().await.expect("begin environment edit");
+            editing
+                .execute(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    "SELECT id FROM environments WHERE id = $1 FOR UPDATE",
+                    [f.environment_id.into()],
+                ))
+                .await
+                .expect("lock the environment");
+
+            let store = f.storage();
+            let entries = vec![f.entry("while-locked", f.session_ids[0])];
+            tokio::time::timeout(Duration::from_secs(5), store.write_batch(&entries))
+                .await
+                .expect("the batch must not wait for the environment lock")
+                .expect("the batch persists");
+            editing.commit().await.expect("commit environment edit");
+            assert_eq!(f.persisted().await, 1);
+        }
+
+        struct StressOutcome {
+            sent: u64,
+            persisted: u64,
+            retries: u64,
+            dropped_batches: u64,
+            dropped_entries: u64,
+        }
+
+        /// Concurrent proxy traffic (batches over many sessions) while
+        /// lockers repeatedly lock session pairs in RANDOM order, i.e. the
+        /// worst case for a sorted batch.
+        async fn run_stress(f: &Fixture, batches: usize, per_batch: usize) -> StressOutcome {
+            let (handle, _tracking, writer, metrics) = f.writer();
+            let writer_task = tokio::spawn(writer.run());
+
+            let stop = Arc::new(AtomicBool::new(false));
+            let locker_db = f.pool(FAST_DEADLOCK_TIMEOUT).await;
+            let mut lockers = Vec::new();
+            for seed in 0..4usize {
+                let db = locker_db.clone();
+                let sessions = f.session_ids.clone();
+                let stop = stop.clone();
+                lockers.push(tokio::spawn(async move {
+                    let mut round = seed;
+                    while !stop.load(Ordering::Relaxed) {
+                        round += 1;
+                        let first = sessions[round.wrapping_mul(7) % sessions.len()];
+                        let second = sessions[round.wrapping_mul(13) % sessions.len()];
+                        if first != second {
+                            // A locker may itself lose a deadlock; that is
+                            // not what is being measured.
+                            let _ = lock_two_sessions(
+                                db.clone(),
+                                first,
+                                second,
+                                Duration::from_millis(3),
+                                None,
+                            )
+                            .await;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                }));
+            }
+
+            let mut sent = 0u64;
+            for batch in 0..batches {
+                for row in 0..per_batch {
+                    let session = f.session_ids[(batch * 31 + row * 17) % f.session_ids.len()];
+                    handle.send_or_drop(f.entry(&format!("b{batch}-r{row}"), session));
+                    sent += 1;
+                }
+                // Let the writer flush this batch on its own cadence.
+                tokio::time::sleep(Duration::from_millis(40)).await;
+            }
+            drop(handle);
+            writer_task.await.expect("writer task");
+            stop.store(true, Ordering::Relaxed);
+            for locker in lockers {
+                let _ = locker.await;
+            }
+
+            let (retries, dropped_batches, dropped_entries) = retries_and_drops(&metrics);
+            StressOutcome {
+                sent,
+                persisted: f.persisted().await,
+                retries,
+                dropped_batches,
+                dropped_entries,
+            }
+        }
+
+        #[tokio::test]
+        async fn every_entry_is_persisted_under_concurrent_session_locking() {
+            let Some(f) = fixture(6).await else {
+                return;
+            };
+            let outcome = run_stress(&f, 40, 25).await;
+            eprintln!(
+                "stress: sent={} persisted={} retries={} dropped_batches={} dropped_entries={}",
+                outcome.sent,
+                outcome.persisted,
+                outcome.retries,
+                outcome.dropped_batches,
+                outcome.dropped_entries
+            );
+            // The invariant is that nothing vanishes silently: every entry is
+            // either persisted exactly once or counted as dropped. A run that
+            // exhausts the retry budget on a slow host is reported through the
+            // drop counters rather than failing as a flake; the deterministic
+            // tests above pin that the retry itself recovers.
+            assert_eq!(
+                outcome.persisted + outcome.dropped_entries,
+                outcome.sent,
+                "every proxied request is persisted exactly once or counted as dropped"
+            );
+            assert!(
+                outcome.persisted > 0,
+                "the writer must make progress under lock contention"
             );
         }
     }

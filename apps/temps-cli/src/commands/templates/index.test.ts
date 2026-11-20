@@ -21,7 +21,7 @@ describe("filterTemplatesByKind", () => {
   const starter = template({ slug: "node", kind: "starter" });
   const service = template({
     slug: "keycloak",
-    kind: "service",
+    kind: "app",
     version: "1.0.0",
   });
   const templates = [starter, service];
@@ -30,14 +30,20 @@ describe("filterTemplatesByKind", () => {
     expect(filterTemplatesByKind(templates, undefined)).toEqual(templates);
   });
 
-  test("matches case-insensitively so --kind Service finds service templates", () => {
-    expect(filterTemplatesByKind(templates, "Service")).toEqual([service]);
+  test("matches case-insensitively so --kind App finds apps", () => {
+    expect(filterTemplatesByKind(templates, "App")).toEqual([service]);
     expect(filterTemplatesByKind(templates, "STARTER")).toEqual([starter]);
+  });
+
+  test("accepts service, the former name of app, on either side", () => {
+    expect(filterTemplatesByKind(templates, "service")).toEqual([service]);
+    const legacy = template({ slug: "old", kind: "service" as never });
+    expect(filterTemplatesByKind([legacy], "app")).toEqual([legacy]);
   });
 
   test("rejects an unknown kind instead of silently returning no templates", () => {
     expect(() => filterTemplatesByKind(templates, "nonexistent")).toThrow(
-      'Invalid template kind "nonexistent". Expected "starter" or "service".',
+      'Invalid template kind "nonexistent". Expected "starter" or "app".',
     );
   });
 });

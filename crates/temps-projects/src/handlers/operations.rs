@@ -50,8 +50,8 @@ pub struct ListOperationsQuery {
     /// Items per page (default 20, max 100).
     #[param(minimum = 1, maximum = 100, example = 20)]
     pub page_size: Option<u64>,
-    /// `running` (queued, running, waiting), `finished` (succeeded, failed,
-    /// cancelled) or `all` (default).
+    /// `running` (queued, running), `waiting` (needs human review),
+    /// `finished` (succeeded, failed, cancelled) or `all` (default).
     pub status: Option<OperationStatusFilter>,
     /// Only operations of this kind.
     pub kind: Option<OperationKind>,
@@ -67,7 +67,7 @@ pub struct OperationsListResponse {
     pub total: u64,
     pub page: u64,
     pub page_size: u64,
-    /// Queued, running and waiting operations matching the scope, `kind` and
+    /// Queued and running operations matching the scope, `kind` and
     /// `project_id` filters — independent of the `status` filter, so the tray
     /// badge stays correct while browsing finished operations.
     pub running_count: u64,

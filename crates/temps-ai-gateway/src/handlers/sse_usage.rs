@@ -5,8 +5,10 @@
 //! never buffered. Each stream retains at most 128 JSON frames and one 128-byte
 //! token, independently of the size of a terminal Responses event.
 
+use crate::types::PromptTokensDetails;
+
 #[derive(Clone, Copy)]
-pub(super) enum UsageKind {
+pub(crate) enum UsageKind {
     ChatCompletions,
     Responses,
 }
@@ -16,6 +18,8 @@ enum Scope {
     Root,
     Response,
     Usage,
+    /// `usage.prompt_tokens_details` / `usage.input_tokens_details`.
+    Details,
     Other,
 }
 
@@ -26,6 +30,9 @@ enum Key {
     Usage,
     Input,
     Output,
+    Details,
+    Cached,
+    CacheWrite,
     Other,
 }
 
@@ -104,6 +111,7 @@ struct JsonUsage {
     terminal: bool,
     input: i64,
     output: i64,
+    cache: PromptTokensDetails,
 }
 
 impl JsonUsage {
@@ -123,6 +131,7 @@ impl JsonUsage {
             terminal: false,
             input: 0,
             output: 0,
+            cache: PromptTokensDetails::default(),
         }
     }
 
@@ -196,6 +205,16 @@ impl JsonUsage {
                 Some("completion_tokens") if matches!(self.kind, UsageKind::ChatCompletions) => {
                     Key::Output
                 }
+                Some("input_tokens_details") if matches!(self.kind, UsageKind::Responses) => {
+                    Key::Details
+                }
+                Some("prompt_tokens_details")
+                    if matches!(self.kind, UsageKind::ChatCompletions) =>
+                {
+                    Key::Details
+                }
+                Some("cached_tokens") => Key::Cached,
+                Some("cache_write_tokens") => Key::CacheWrite,
                 _ => Key::Other,
             };
             frame.expect = Expect::Colon;
@@ -220,6 +239,12 @@ impl JsonUsage {
             (Scope::Usage, Key::Output) => {
                 self.output = value.and_then(|v| v.as_i64()).unwrap_or(0)
             }
+            (Scope::Details, Key::Cached) => {
+                self.cache.cached_tokens = value.and_then(|v| v.as_i64()).unwrap_or(0)
+            }
+            (Scope::Details, Key::CacheWrite) => {
+                self.cache.cache_write_tokens = value.and_then(|v| v.as_i64()).unwrap_or(0)
+            }
             _ => {}
         }
     }
@@ -241,6 +266,16 @@ impl JsonUsage {
         {
             self.input = 0;
             self.output = 0;
+            self.cache = PromptTokensDetails::default();
+        }
+        if scope == Scope::Usage && key == Key::Details {
+            self.cache = PromptTokensDetails::default();
+        }
+        if scope == Scope::Details && key == Key::Cached {
+            self.cache.cached_tokens = 0;
+        }
+        if scope == Scope::Details && key == Key::CacheWrite {
+            self.cache.cache_write_tokens = 0;
         }
         if scope == Scope::Root && key == Key::Type {
             self.terminal = false;
@@ -271,6 +306,8 @@ impl JsonUsage {
                 Scope::Response
             } else if object && self.usage_parent(parent) && key == Key::Usage {
                 Scope::Usage
+            } else if object && parent == Scope::Usage && key == Key::Details {
+                Scope::Details
             } else {
                 Scope::Other
             }
@@ -400,6 +437,8 @@ pub(super) struct SseUsage {
     json: JsonUsage,
     prefix: usize,
     ignored: bool,
+    /// Cache split of the usage `finish_line` last returned.
+    cache: PromptTokensDetails,
 }
 
 impl SseUsage {
@@ -408,15 +447,25 @@ impl SseUsage {
             json: JsonUsage::new(kind),
             prefix: 0,
             ignored: false,
+            cache: PromptTokensDetails::default(),
         }
     }
 
+    /// The cached share of the usage the last `finish_line` returned.
+    pub(super) fn cache(&self) -> PromptTokensDetails {
+        self.cache
+    }
+
     /// Call `record` for complete data lines without changing forwarded bytes.
-    pub(super) fn push(&mut self, bytes: &[u8], mut record: impl FnMut(i64, i64)) {
+    pub(super) fn push(
+        &mut self,
+        bytes: &[u8],
+        mut record: impl FnMut(i64, i64, PromptTokensDetails),
+    ) {
         for &byte in bytes {
             if byte == b'\n' {
                 if let Some((input, output)) = self.finish_line() {
-                    record(input, output);
+                    record(input, output, self.cache);
                 }
             } else if !self.ignored {
                 if self.prefix < 5 {
@@ -438,6 +487,9 @@ impl SseUsage {
         } else {
             None
         };
+        if usage.is_some() {
+            self.cache = self.json.cache;
+        }
         let kind = self.json.kind;
         // Reuse the bounded stack allocation across data lines.
         let mut frames = std::mem::take(&mut self.json.frames);
@@ -458,7 +510,7 @@ mod tests {
         let mut parser = SseUsage::new(kind);
         let mut usage = None;
         for chunk in line.as_bytes().chunks(chunk_size) {
-            parser.push(chunk, |input, output| usage = Some((input, output)));
+            parser.push(chunk, |input, output, _| usage = Some((input, output)));
         }
         parser.finish_line().or(usage)
     }
@@ -528,25 +580,25 @@ mod tests {
         let mut recorded = Vec::new();
         parser.push(
             b"data: {\"type\":\"response.completed\",\"response\":{\"output\":[\"",
-            |_, _| panic!("unfinished"),
+            |_, _, _| panic!("unfinished"),
         );
         let chunk = [b'x'; 8192];
         for _ in 0..4097 {
-            parser.push(&chunk, |_, _| panic!("unfinished"));
+            parser.push(&chunk, |_, _, _| panic!("unfinished"));
         }
-        parser.push(b"\",0", |_, _| panic!("unfinished"));
+        parser.push(b"\",0", |_, _, _| panic!("unfinished"));
         for _ in 0..100_000 {
-            parser.push(b",{\"usage\":{\"input_tokens\":999}}", |_, _| {
+            parser.push(b",{\"usage\":{\"input_tokens\":999}}", |_, _, _| {
                 panic!("nested usage")
             });
         }
-        parser.push(b"],\"", |_, _| panic!("unfinished"));
+        parser.push(b"],\"", |_, _, _| panic!("unfinished"));
         for _ in 0..32 {
-            parser.push(&chunk, |_, _| panic!("unfinished"));
+            parser.push(&chunk, |_, _, _| panic!("unfinished"));
         }
         parser.push(
             b"\":\"ignored\",\"usage\":{\"input_tokens\":74122,\"output_tokens\":32989}}}\n\n",
-            |input, output| recorded.push((input, output)),
+            |input, output, _| recorded.push((input, output)),
         );
         assert_eq!(recorded, [(74122, 32989)]);
         assert!(parser.json.frames.capacity() <= 128);
@@ -579,5 +631,74 @@ mod tests {
             let json = format!("data: {{\"type\":\"response.completed\",\"response\":{{\"usage\":{{\"input_tokens\":{number},\"output_tokens\":9}}}}}}\n");
             assert_eq!(extract(&json, UsageKind::Responses, 1), Some((0, 9)));
         }
+    }
+
+    fn extract_cache(line: &str, kind: UsageKind, chunk_size: usize) -> PromptTokensDetails {
+        let mut parser = SseUsage::new(kind);
+        let mut cache = PromptTokensDetails::default();
+        for chunk in line.as_bytes().chunks(chunk_size) {
+            parser.push(chunk, |_, _, seen| cache = seen);
+        }
+        if parser.finish_line().is_some() {
+            cache = parser.cache();
+        }
+        cache
+    }
+
+    #[test]
+    fn cached_and_written_tokens_are_read_from_the_usage_details() {
+        let chat = r#"data: {"id":"x","choices":[],"usage":{"prompt_tokens":10000,"completion_tokens":50,"prompt_tokens_details":{"cached_tokens":8000,"cache_write_tokens":500,"audio_tokens":0}}}"#;
+        let responses = r#"data: {"type":"response.completed","response":{"usage":{"input_tokens":10000,"output_tokens":50,"input_tokens_details":{"cached_tokens":8000}}}}"#;
+        for size in [1, 5, 4096] {
+            for ending in ["", "\n\n"] {
+                assert_eq!(
+                    extract_cache(&format!("{chat}{ending}"), UsageKind::ChatCompletions, size),
+                    PromptTokensDetails {
+                        cached_tokens: 8000,
+                        cache_write_tokens: 500
+                    },
+                    "chat, chunk size {size}"
+                );
+                assert_eq!(
+                    extract_cache(&format!("{responses}{ending}"), UsageKind::Responses, size),
+                    PromptTokensDetails {
+                        cached_tokens: 8000,
+                        cache_write_tokens: 0
+                    },
+                    "responses, chunk size {size}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cache_counts_outside_the_usage_details_are_not_accounted() {
+        for line in [
+            // Same key names, wrong place.
+            r#"data: {"cached_tokens":9,"usage":{"prompt_tokens":10,"completion_tokens":1}}"#,
+            r#"data: {"usage":{"cached_tokens":9,"prompt_tokens":10,"completion_tokens":1}}"#,
+            r#"data: {"usage":{"prompt_tokens":10,"completion_tokens":1,"other":{"cached_tokens":9}}}"#,
+            // A later, replaced usage must not inherit the earlier cache split.
+            r#"data: {"usage":{"prompt_tokens":10,"completion_tokens":1,"prompt_tokens_details":{"cached_tokens":9}},"usage":{"prompt_tokens":10,"completion_tokens":1}}"#,
+            // A repeated details object replaces the first.
+            r#"data: {"usage":{"prompt_tokens":10,"completion_tokens":1,"prompt_tokens_details":{"cached_tokens":9},"prompt_tokens_details":null}}"#,
+            // The Responses spelling means nothing to a chat-completions stream.
+            r#"data: {"usage":{"prompt_tokens":10,"completion_tokens":1,"input_tokens_details":{"cached_tokens":9}}}"#,
+        ] {
+            assert_eq!(
+                extract_cache(line, UsageKind::ChatCompletions, 3),
+                PromptTokensDetails::default(),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_repeated_cached_tokens_key_takes_the_last_value_like_serde() {
+        let line = r#"data: {"usage":{"prompt_tokens":10,"completion_tokens":1,"prompt_tokens_details":{"cached_tokens":3,"cached_tokens":9}}}"#;
+        assert_eq!(
+            extract_cache(line, UsageKind::ChatCompletions, 7).cached_tokens,
+            9
+        );
     }
 }

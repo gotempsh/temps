@@ -30,6 +30,11 @@ pub struct Model {
     pub title: Option<String>,
     /// `"active" | "archived"`.
     pub status: String,
+    /// What this thread is: `"ai"` (an AI harness conversation) or
+    /// `"terminal"` (an interactive shell in the workspace sandbox). Fixed at
+    /// creation. Defaults to `"ai"` in the database, so inserts that do not
+    /// set it keep producing AI threads.
+    pub kind: String,
     /// The user who owns this private conversation.
     pub created_by: i32,
     /// Seed refs (log_ids, deployment state) + e.g. autofixer_run_id on hand-off.
@@ -66,6 +71,9 @@ pub struct Model {
     pub last_turn_id: Option<String>,
     /// When the active turn was claimed by the server.
     pub turn_started_at: Option<DBDateTime>,
+    /// `off`, `ask` or `always` for next-step suggestions after each answer;
+    /// `None` follows the user's default.
+    pub next_step_suggestions: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

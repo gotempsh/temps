@@ -55,12 +55,16 @@ export function emitManifest(manifest: PluginManifest): void {
 /**
  * Emit the ready handshake message (phase 2).
  */
-export function emitReady(hasUi: boolean): void {
+export function emitReady(
+  hasUi: boolean,
+  openapi?: Record<string, unknown>,
+): void {
   writeHandshakeMessage({
     type: "ready",
     protocol_version: 2,
     ready: true,
     has_ui: hasUi,
+    ...(openapi ? { openapi } : {}),
   });
 }
 
@@ -75,7 +79,7 @@ export function emitReady(hasUi: boolean): void {
  * @returns Parsed user context, or undefined if no auth headers present.
  */
 export function extractAuthContext(
-  req: IncomingMessage
+  req: IncomingMessage,
 ): TempsUserContext | undefined {
   const role = getHeader(req, HEADER_USER_ROLE);
   const requestId = getHeader(req, HEADER_REQUEST_ID);
@@ -94,10 +98,7 @@ export function extractAuthContext(
   };
 }
 
-function getHeader(
-  req: IncomingMessage,
-  name: string
-): string | undefined {
+function getHeader(req: IncomingMessage, name: string): string | undefined {
   const value = req.headers[name];
   if (Array.isArray(value)) return value[0];
   return value ?? undefined;

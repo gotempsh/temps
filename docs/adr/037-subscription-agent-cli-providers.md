@@ -1,5 +1,11 @@
 # ADR-037: Subscription-Backed Agent CLI Providers for Temps AI Workloads
 
+> **Implementation update (2026-10-13):** Console sign-in for subscription CLIs
+> (Claude Code, Codex) now exists, resolving Q3 and Phase 4 item 5 below. See
+> [Console sign-in](#console-sign-in-2026-10-13) for the mechanism and for the
+> two design questions it had to settle: which OS user status, sign-in and turns
+> run as, and how a rotating refresh token is kept from being copied.
+
 > **Implementation update (2026-08-11):** The original workload matrix and
 > tool-routing restrictions below describe the initial rollout. CLI-backed chat
 > now supports the existing scoped `temps` and confirm-gated `temps_write`
@@ -341,12 +347,17 @@ User-managed runners are out of scope for this ADR.
 **Q3: How should interactive authentication work for a self-hosted or remote
 Temps server?**
 
-Operators authenticate the CLI on the Temps host machine and paste the resulting
-credential into `POST /settings/ai-providers/{provider_id}/credential` (the
-existing UI at `/agent-sandbox/providers`). For Claude Code subscription OAuth,
-`claude setup-token` generates a paste-able token. No interactive auth runs
-inside the Temps server process. Device-code-based auth for operators without
-SSH access is deferred to Phase 4.
+Originally: operators authenticated the CLI on the Temps host and pasted the
+resulting credential into `POST /settings/ai-providers/{provider_id}/credential`
+(`claude setup-token` for Claude Code), with device-code sign-in deferred to
+Phase 4.
+
+Now: the console (and `temps ai provider login <id>`) signs the CLI in through
+the server. The CLI's own flow runs on the Temps host and the operator
+approves access in their own browser; Temps relays the link or device code and
+never sees the provider's tokens during the exchange. Pasting a credential
+remains available as an advanced fallback and for API keys. See
+[Console sign-in](#console-sign-in-2026-10-13).
 
 **Q4: What normalized request/result protocol should adapters implement?**
 
@@ -621,10 +632,156 @@ autofixer provider settings page.
    operator-intervention required (auth failure).
 4. `temps-cli` parity: `bunx @temps-sdk/cli ai provider status` showing
    configured provider, availability, fallback state, and last error.
-5. Evaluate device-code-based auth for operators without SSH access to the Temps
-   host; include only if the threat model is acceptable (device code exchange
-   happens entirely between the operator's browser and the AI vendor — the Temps
-   server only stores the resulting credential token).
+5. ~~Evaluate device-code-based auth for operators without SSH access to the
+   Temps host~~ — done, see [Console sign-in](#console-sign-in-2026-10-13). The
+   threat model was acceptable because the exchange happens between the
+   operator's browser and the vendor; the Temps server relays a link and keeps
+   only an access-token snapshot.
+
+## Console sign-in (2026-10-13)
+
+### Mechanism
+
+| Provider | Process | Operator step | Completion |
+|---|---|---|---|
+| Claude Code | `claude auth login --claudeai` with `BROWSER=echo` | open the link, paste the code Temps writes to the CLI's stdin | CLI exits 0 |
+| Codex | `codex app-server`, JSON-RPC `account/login/start` `{type:"chatgptDeviceCode"}` | open the link, enter the device code | `account/login/completed` |
+
+Endpoints: `POST|GET /settings/ai-providers/{id}/login`, `POST .../login/code`,
+`POST .../login/cancel`. Phases are `starting`, `waiting`, `verifying`,
+`succeeded`, `failed`, `cancelled`, with a human `detail` and elapsed time. A
+sign-in lasts at most 10 minutes, at most 4 run at once, authorization is
+`SettingsWrite` plus the catalog entry's `host_access_requirement` (also for
+`GET`, because the response carries the link and device code), and the CLI's
+whole process group is killed on cancel, timeout or drop. `ProviderCatalogDto`
+gains `login_supported` and `login_unavailable_reason` so the UI always shows
+the button and, when it cannot run yet, says what is missing and how to fix it.
+
+Safeguards: the sign-in link must be `https`, carry no credentials or port and
+sit on an exact allow-listed host (`claude.ai`, `claude.com`,
+`auth.anthropic.com`, `console.anthropic.com`, `platform.claude.com`; OpenAI's
+auth hosts for Codex). The pasted code is restricted to visible ASCII with no
+whitespace so it cannot become a second answer to the CLI. CLI output is
+scanned for the link and discarded; it is never logged or persisted, and the
+pasted code is never logged or audited.
+
+### (a) One user and one HOME for status, sign-in and turns
+
+Before this change `ClaudeCliProvider::get_status` ran `claude auth status` as
+the server's own user (`ai_cli/claude.rs`, `cancellation_safe_command`), while
+`run`, `continue_conversation` and `run_interactive` dropped to the sandbox user
+(or `nobody`) through `runuser -u` when the server was root. The environment
+allow-list copies the server's `HOME` through (`ai_cli/mod.rs`
+`sanitize_command_environment`), so the two paths read different credential
+stores: the Settings card could report "authenticated" while every host turn was
+logged out, or the reverse.
+
+`ai_cli/host_cli.rs` is now the single place a host-side provider CLI command
+is built. It resolves one run user per provider (Claude Code: `temps` if it
+exists, otherwise `nobody`, only when the server is root; Codex keeps the
+server user it always ran as) and, once an operator has signed in through
+Temps, points the process at the Temps-owned directory
+`<data dir>/ai-cli/<provider>/home` through both `HOME` and the provider's own
+variable (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`), so the result does not depend on
+whether `runuser -u` resets `HOME`. Status, discovery, turns and sign-in all use
+it. Hosts authenticated out of band keep working: the managed location is used
+only once a sign-in has produced a credential file there.
+
+Filesystem trust boundary. When the server is root, the CLI runs as an
+unprivileged user that owns `home/` and everything below it, so that user can
+rewrite any path inside it. The server therefore never `chown`s, `chmod`s or
+reads through a path inside `home/` with a symlink-following call:
+
+- `<data dir>/ai-cli` and `<data dir>/ai-cli/<provider>` stay owned by the
+  server and are refused if they are not real directories owned by the server.
+  On a root server `<data dir>/ai-cli` is always `0711` (traversable, not
+  writable, by a run user) because it is shared by every provider: Codex runs
+  as the server user, but signing in to it must not close the directory to
+  Claude's run user. Only a provider directory whose CLI drops privileges is
+  `0711`; the others are `0700`;
+- each sign-in's scratch home and its config directory are created by the
+  server and locked to `0700` *before* anything is handed to the run user, then
+  handed over with `lchown` from the inside out, so the run user never owns a
+  parent in which the server still creates or `chmod`s a child. Promotion
+  renames the whole scratch home over the live one, two renames of entries the
+  run user cannot substitute;
+- credential files are read component by component with `O_NOFOLLOW` and the
+  leaf is opened `O_NONBLOCK`, so a planted `.claude` or `.credentials.json`
+  symlink cannot make the server import another account's token and a planted
+  FIFO cannot hang a blocking read;
+- Codex, which runs as the server user, keeps its directories owned by the
+  server user instead of being handed to an unprivileged user that a root
+  process would then execute configuration from.
+
+### (b) Refresh-token rotation
+
+Pasted `claude setup-token` bearers are static (no refresh token), so the
+original design could safely write one copy per autofixer sandbox
+(`services/executor.rs`). A sign-in credential is different: a short-lived
+access token plus a **rotating** refresh token. Copying it into N sandboxes,
+the relay and the host would let the first copy to refresh invalidate all the
+others. The codebase had already refused the equivalent import for Claude host
+logins (`LocalCredentialError::ClaudeLocalImportDisabled`).
+
+Design: **one holder of the refresh token, access-token-only fan-out.**
+
+1. The CLI-owned directory on the host is the only place the refresh token
+   lives; the CLI refreshes it itself during host turns.
+2. The encrypted `providers[id].credentials_encrypted` row, autofixer sandboxes
+   and the workspace model relay receive a snapshot
+   (`ai_cli/credential_snapshot.rs`) with `accessToken`, `expiresAt`, `scopes`
+   and `subscriptionType` and no refresh token (Codex: `tokens.refresh_token`
+   blanked). The parser never deserializes the refresh token, so no code path
+   can retain it.
+3. Sandboxes get `CLAUDE_CODE_OAUTH_TOKEN` only: no credential file, and the
+   fabricated 365-day / `"max"` envelope is not written for sign-in credentials.
+   Pasted tokens keep the previous behaviour.
+4. `resolve_claude_oauth` / `resolve_codex_auth` are used by the executor, the
+   relay resolver and the smoke test. When a snapshot has less time left than
+   the run needs (run timeout plus margin; 30 minutes for a workspace turn),
+   they take a per-process lock, let the host CLI refresh its own store with one
+   minimal request, re-read it and re-snapshot.
+5. A sign-in is written to a scratch directory. Only after the CLI reports
+   success and `verify_login` confirms it is the scratch home swapped in for
+   the live one, with the previous home kept aside; the access-token snapshot is
+   then saved and, if saving fails, the previous home is restored. A failed or
+   cancelled attempt therefore never changes the live sign-in, and the saved
+   credential and the live CLI home never describe different accounts. Cancel
+   and the deadline are honoured while the CLI runs and while the sign-in is
+   being confirmed; once the home swap starts, the swap and the save run to
+   completion in their own task (a swap that is interrupted regardless restores
+   the previous home when its guard is dropped), and the dialog says that
+   last step can no longer be cancelled.
+
+Known limits: a workspace turn holds its access token for the whole turn (a
+turn that outlives the remaining validity fails and must be retried); the
+refresh lock is per process, so a multi-instance control plane would need a
+shared lock; and credential import needs a file-based credential store, so a
+host that keeps CLI credentials in a system keychain cannot use console
+sign-in and reports that precisely.
+
+Verified against the real binaries (Claude Code and Codex installed on the
+development host, no account approved): the Claude link is printed on stdout
+under `BROWSER=echo` on an allow-listed host and a wrong code makes the CLI exit
+non-zero; `codex app-server` answers `account/login/start` with a
+`verificationUrl` on an OpenAI host and a `userCode`; cancelling leaves no
+process behind.
+
+Not verified, because it needs an approved real account: a successful
+completion and the credential file it writes; that Anthropic and OpenAI refresh
+tokens rotate (assumed, which is the safe direction); that a one-token request
+makes each CLI refresh an expiring token; and that `CLAUDE_CODE_OAUTH_TOKEN`
+accepts a sign-in access token.
+
+### Scope of the CLI update action
+
+The update bar acts on the persistent workspace that model discovery uses,
+because that is the CLI whose version decides which models the picker offers. It
+is shown where that workspace is configured, not above an application's first
+task: an application's turns run in a separate workspace that does not exist yet
+at that point, so updating the discovery workspace there would report an update
+that the application's CLI never receives. Updating an application workspace's
+CLI is not covered and is a follow-up.
 
 ## Alternatives considered
 

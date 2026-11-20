@@ -33,7 +33,7 @@
 use std::sync::Arc;
 
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QuerySelect};
-use temps_auth::AuthContext;
+use temps_authz::AuthContext;
 use temps_core::ProjectAccessChecker;
 use thiserror::Error;
 

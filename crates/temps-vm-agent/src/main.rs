@@ -17,6 +17,7 @@ mod agent;
 
 #[cfg(target_os = "linux")]
 fn main() {
+    std::hint::black_box(&temps_vm_agent::BUILD_MARKER);
     agent::run();
 }
 

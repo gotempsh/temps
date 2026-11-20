@@ -1,8 +1,10 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
+import { PageTitle } from '@temps-sdk/ds'
 import {
   getGenaiTraceOptions,
   queryGenaiTracesOptions,
+  queryGenaiTracesQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
 import type {
   GenAiSpanDetail,
@@ -21,10 +23,19 @@ import { CloudAiMetadataNotice } from '@/components/ai/CloudAiMetadataNotice'
 import { problemDetail } from '@/lib/api-problem'
 import { AiProviderSelect } from '@/components/ai/AiProviderSelect'
 import { AiActivityEmptyState } from '@/components/ai/AiActivityEmptyState'
+import { aiTracesSetupHref } from '@/components/ai/ai-traces-setup'
 import { DateTimeRange } from '@/components/ui/date-time-range'
+import { RefreshButton } from '@/components/ui/refresh-button'
+import { queryKeyPrefix } from '@/lib/refresh'
 import type { DateTimeRangeValue } from '@/lib/date-time-range'
 
-import { Fragment, useMemo, useState } from 'react'
+import {
+  Fragment,
+  useLayoutEffect,
+  useMemo,
+  useState,
+  type ChangeEvent,
+} from 'react'
 import { Link, useSearchParams } from 'react-router'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import {
@@ -45,6 +56,7 @@ import { Input } from '@/components/ui/input'
 import { SearchableSelect } from '@/components/ui/searchable-select'
 import { Label } from '@/components/ui/label'
 import { Badge } from '@/components/ui/badge'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import {
@@ -136,6 +148,7 @@ import {
   Cpu,
   Hash,
   Info,
+  KeyRound,
   RefreshCw,
 } from 'lucide-react'
 import { toast } from 'sonner'
@@ -161,6 +174,7 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import { useSettings } from '@/hooks/useSettings'
 import { ReadFailure } from '@/components/ui/read-failure'
+import { ReplaceProviderKeyDialog } from '@/components/ai/ReplaceProviderKeyDialog'
 import {
   aiProviderRowStatus,
   providerKeysUnknown,
@@ -173,7 +187,10 @@ import {
   aiProviderName,
   aiProviderModels,
   getAiProvider,
+  providerFromAddParam,
   isSelfHostedProvider,
+  providerKeyEndpoint,
+  SELF_HOSTED_PROVIDER_ID,
 } from '@/lib/ai-providers'
 import { SelfHostedProviderFields } from '@/components/ai/SelfHostedProviderFields'
 import { SelfHostedKeySettings } from '@/components/ai/SelfHostedKeySettings'
@@ -182,11 +199,18 @@ import {
   settingsSaveKeyId,
 } from '@/components/ai/self-hosted-provider'
 import {
+  canSubmitProviderKeyForm,
   EMPTY_PROVIDER_KEY_FORM,
+  providerKeyFormForProvider,
   providerKeyFormSchema,
   providerKeyFormToRequest,
+  selectProviderKeyFormProvider,
+  switchToOpenAiCompatible,
+  vendorHasCustomBaseUrl,
   type ProviderKeyFormValues,
 } from '@/components/ai/provider-key-form'
+import { VendorBaseUrlHint } from '@/components/ai/VendorBaseUrlHint'
+import { ProviderKeyProviderPicker } from '@/components/ai/ProviderKeyProviderPicker'
 import { useForm, useWatch } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useIsInstanceAdmin } from '@/hooks/useIsInstanceAdmin'
@@ -194,6 +218,7 @@ import {
   compareAiModelIdsByRelevance,
   sortAiModelIdsByRelevance,
 } from '@/lib/ai-model-ranking'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
 
 // Mutation errors here are thrown ProblemDetails response bodies, not Error
 // instances -- String(error) on an object stringifies to "[object Object]"
@@ -219,6 +244,10 @@ interface UsageSummary {
   error_count: number
   streaming_count: number
   byok_count: number
+  /** Requests that used tokens but whose cost no known price gave. */
+  unpriced_requests: number
+  /** Requests that used tokens and were priced, free models included. */
+  priced_requests: number
 }
 
 interface ProviderUsage {
@@ -246,6 +275,8 @@ interface ModelUsage {
   output_tokens: number
   total_tokens: number
   avg_latency_ms: number
+  /** Recorded cost of the model's requests in the window, in microcents. */
+  estimated_cost_microcents: number
 }
 
 interface UsageLogEntry {
@@ -257,25 +288,19 @@ interface UsageLogEntry {
   output_tokens: number
   latency_ms: number
   estimated_cost_microcents: number
+  /** Used tokens, but no known price gave its cost: unknown, not free. */
+  unpriced: boolean
   status: number
   is_streaming: boolean
   is_byok: boolean
+  /** Set when the call came from a deployment token; absent otherwise. */
+  project_id?: number
+  token_id?: number
 }
 
 interface UsageLogPage {
   entries: UsageLogEntry[]
   total: number
-}
-
-interface ModelPricing {
-  model: string
-  provider: string
-  input_per_million: number
-  output_per_million: number
-}
-
-interface PricingResponse {
-  models: ModelPricing[]
 }
 
 async function fetchJson<T>(url: string): Promise<T> {
@@ -367,7 +392,7 @@ function AiSummaryDefaultsCard({
       </CardHeader>
       <CardContent className="grid gap-4 md:grid-cols-[1fr_1fr_1fr_auto] md:items-end">
         <div className="space-y-2">
-          <Label>Summary provider</Label>
+          <Label htmlFor="ai-summary-provider">Summary provider</Label>
           <Select
             value={providerId}
             onValueChange={(value) => {
@@ -376,7 +401,7 @@ function AiSummaryDefaultsCard({
               setThinking(inherit)
             }}
           >
-            <SelectTrigger>
+            <SelectTrigger id="ai-summary-provider">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
@@ -392,6 +417,7 @@ function AiSummaryDefaultsCard({
         <div className="space-y-2">
           <Label>Summary model</Label>
           <SearchableSelect
+            label="Summary model"
             value={model}
             disabled={!provider}
             options={modelOptions}
@@ -406,13 +432,13 @@ function AiSummaryDefaultsCard({
           />
         </div>
         <div className="space-y-2">
-          <Label>Thinking</Label>
+          <Label htmlFor="ai-summary-thinking">Thinking</Label>
           <Select
             value={thinking}
             disabled={!selectedModel?.thinking_options.length}
             onValueChange={setThinking}
           >
-            <SelectTrigger>
+            <SelectTrigger id="ai-summary-thinking">
               <SelectValue placeholder="Model default" />
             </SelectTrigger>
             <SelectContent>
@@ -455,6 +481,10 @@ function ProviderKeyModelDetail({
   const queryClient = useQueryClient()
   const [modelId, setModelId] = useState('')
   const [modelFilter, setModelFilter] = useState('')
+  const [modelToDelete, setModelToDelete] = useState<{
+    id: number
+    model_id: string
+  } | null>(null)
   const queryKey = ['providerModelInventory', providerKey.id]
   const detailQuery = useQuery({
     queryKey,
@@ -516,6 +546,7 @@ function ProviderKeyModelDetail({
       updateProviderKey({
         path: { id: providerKey.id },
         body: { default_model: modelId },
+        throwOnError: true,
       }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey })
@@ -538,6 +569,7 @@ function ProviderKeyModelDetail({
       toast.error('Could not delete model', {
         description: apiErrorMessage(error),
       }),
+    onSettled: () => setModelToDelete(null),
   })
 
   const models = useMemo(
@@ -691,7 +723,12 @@ function ProviderKeyModelDetail({
                           variant="ghost"
                           size="icon"
                           className="h-8 w-8"
-                          onClick={() => deleteMutation.mutate(model.id)}
+                          onClick={() =>
+                            setModelToDelete({
+                              id: model.id,
+                              model_id: model.model_id,
+                            })
+                          }
                           title="Delete manual model"
                         >
                           <Trash2 className="h-3.5 w-3.5 text-destructive" />
@@ -726,6 +763,19 @@ function ProviderKeyModelDetail({
           Add model
         </Button>
       </form>
+      <ConfirmDeleteDialog
+        open={modelToDelete !== null}
+        onOpenChange={(open) => {
+          if (!open) setModelToDelete(null)
+        }}
+        resourceType="manual model"
+        resourceName={modelToDelete?.model_id ?? ''}
+        consequences={`It is removed from ${providerKey.display_name}; requests for it are no longer routed through this key until it is added again.`}
+        isPending={deleteMutation.isPending}
+        onConfirm={() => {
+          if (modelToDelete) deleteMutation.mutate(modelToDelete.id)
+        }}
+      />
     </div>
   )
 }
@@ -756,48 +806,14 @@ function formatCost(dollars: number): string {
   return `$${dollars.toFixed(6)}`
 }
 
-function findPricing(
-  model: string,
-  pricingMap: Map<string, ModelPricing>
-): ModelPricing | undefined {
-  // Exact match first
-  const exact = pricingMap.get(model)
-  if (exact) return exact
-
-  // Strip common suffixes: -preview, -latest, date stamps like -20250101
-  const stripped = model
-    .replace(/-preview$/, '')
-    .replace(/-latest$/, '')
-    .replace(/-\d{6,8}$/, '')
-  if (stripped !== model) {
-    const match = pricingMap.get(stripped)
-    if (match) return match
-  }
-
-  // Prefix match: find the longest pricing key that the model starts with
-  let best: ModelPricing | undefined
-  let bestLen = 0
-  for (const [key, pricing] of pricingMap) {
-    if (model.startsWith(key) && key.length > bestLen) {
-      best = pricing
-      bestLen = key.length
-    }
-  }
-  return best
-}
-
-function computeCost(
-  model: string,
-  inputTokens: number,
-  outputTokens: number,
-  pricingMap: Map<string, ModelPricing>
-): number {
-  const pricing = findPricing(model, pricingMap)
-  if (!pricing) return 0
-  return (
-    (inputTokens / 1_000_000) * pricing.input_per_million +
-    (outputTokens / 1_000_000) * pricing.output_per_million
-  )
+/**
+ * A recorded cost in dollars. Usage logs store each request's cost in
+ * microcents (1e-6 USD) as the spend caps and budgets count it, cache prices
+ * and long-context rates included, so the console shows that figure instead
+ * of recomputing one from list prices.
+ */
+function microcentsToDollars(microcents: number): number {
+  return microcents / 1_000_000
 }
 
 type TimeRange = { label: string; hours: number }
@@ -805,6 +821,7 @@ type TimeRange = { label: string; hours: number }
 function useTimeRangeSelection(): [
   { range: TimeRange; endMs: number },
   (value: DateTimeRangeValue) => void,
+  () => void,
 ] {
   const [selection, setSelection] = useState(() => ({
     range: { label: '1d', hours: 24 },
@@ -820,6 +837,13 @@ function useTimeRangeSelection(): [
         },
         endMs: Date.parse(value.to),
       }),
+    // Refresh: a preset ("last 24 hours") ends now again; a custom range stays.
+    () =>
+      setSelection((current) =>
+        current.range.label === 'custom'
+          ? current
+          : { ...current, endMs: Date.now() }
+      ),
   ]
 }
 
@@ -850,6 +874,40 @@ function AiTimeRange({
 // pages, and the sandbox UI.
 const SUPPORTED_PROVIDERS = AI_PROVIDERS
 const providerName = aiProviderName
+
+/** A key's custom endpoint host, shown so keys of one provider differ. */
+function KeyEndpoint({ baseUrl }: { baseUrl?: string | null }) {
+  const endpoint = providerKeyEndpoint(baseUrl)
+  if (!endpoint) return null
+  return (
+    <Badge
+      variant="outline"
+      className="h-5 shrink-0 px-1.5 font-mono text-[10px]"
+      title={baseUrl ?? undefined}
+    >
+      {endpoint}
+    </Badge>
+  )
+}
+
+/**
+ * The models column of a provider row. An OpenAI-compatible provider lists
+ * the endpoints its keys point at, since that is what tells them apart.
+ */
+function providerRowModels(
+  provider: { id: string; models: string },
+  providerKeys: { base_url?: string | null }[]
+): string {
+  if (!isSelfHostedProvider(provider.id)) return provider.models
+  const endpoints = [
+    ...new Set(
+      providerKeys
+        .map((key) => providerKeyEndpoint(key.base_url))
+        .filter((endpoint): endpoint is string => endpoint !== null)
+    ),
+  ]
+  return endpoints.length > 0 ? endpoints.join(', ') : provider.models
+}
 const providerModels = aiProviderModels
 
 // ============================================================================
@@ -873,24 +931,73 @@ const providerChartConfig = {
   request_count: { label: 'Requests', color: 'var(--chart-1)' },
 } satisfies ChartConfig
 
-function LogCostCell({
-  log,
-  pricingMap,
+/**
+ * A usage read that failed with nothing loaded. Says so instead of showing
+ * zero or "no data", which would read as a quiet gateway.
+ */
+function UsageReadFailed({
+  label,
+  onRetry,
 }: {
-  log: UsageLogEntry
-  pricingMap: Map<string, ModelPricing>
+  label: string
+  onRetry: () => void
 }) {
-  const cost = computeCost(
-    log.model,
-    log.input_tokens,
-    log.output_tokens,
-    pricingMap
+  return (
+    <div className="flex h-[200px] flex-col items-center justify-center gap-2 text-center text-sm">
+      <p className="text-destructive">Couldn&apos;t load {label}.</p>
+      <Button variant="outline" size="sm" onClick={onRetry}>
+        Retry
+      </Button>
+    </div>
   )
-  return <>{cost > 0 ? formatCost(cost) : '—'}</>
+}
+
+/** A stat card's value when its read failed with nothing loaded. */
+function UsageStatFailed() {
+  return <p className="text-sm text-destructive">Couldn&apos;t load</p>
+}
+
+/**
+ * The window's recorded spend. Requests with no recorded cost (logged before
+ * costs were estimated, or from a model with no published price) are not in
+ * the total, so it says so instead of reading as free.
+ */
+function EstimatedCostStat({ summary }: { summary: UsageSummary | undefined }) {
+  const unpriced = summary?.unpriced_requests ?? 0
+  const priced = summary?.priced_requests ?? 0
+  // Requests that used no tokens (failures) are neither, so they cannot turn
+  // a window with no priced request into a $0.00 total.
+  if (unpriced > 0 && priced === 0) {
+    return (
+      <>
+        <div className="text-2xl font-bold">—</div>
+        <p className="text-xs text-muted-foreground">No recorded cost</p>
+      </>
+    )
+  }
+  return (
+    <>
+      <div className="text-2xl font-bold">
+        {formatCost(microcentsToDollars(summary?.total_cost_microcents ?? 0))}
+      </div>
+      {unpriced > 0 && (
+        <p className="text-xs text-muted-foreground">
+          Excludes {formatTokenCount(unpriced)} unpriced{' '}
+          {unpriced === 1 ? 'request' : 'requests'}
+        </p>
+      )}
+    </>
+  )
+}
+
+function LogCostCell({ log }: { log: UsageLogEntry }) {
+  if (log.unpriced) return <>—</>
+  return <>{formatCost(microcentsToDollars(log.estimated_cost_microcents))}</>
 }
 
 export function UsageAnalytics() {
-  const [{ range: timeRange, endMs }, selectTimeRange] = useTimeRangeSelection()
+  const [{ range: timeRange, endMs }, selectTimeRange, moveToNow] =
+    useTimeRangeSelection()
 
   const timeParams = useMemo(() => {
     const to = new Date(endMs).toISOString()
@@ -899,21 +1006,34 @@ export function UsageAnalytics() {
     return { from, to, bucket }
   }, [endMs, timeRange])
 
-  const { data: summary, isLoading: summaryLoading } = useQuery({
-    queryKey: ['aiUsage', 'summary', timeParams.from, timeParams.to],
+  // The window is named in each key ({ from, to }), so a Refresh that moves
+  // it keeps the numbers on screen and picking another range does not.
+  const {
+    data: summary,
+    isLoading: summaryLoading,
+    isError: summaryError,
+  } = useWindowQuery({
+    queryKey: [
+      'aiUsage',
+      'summary',
+      { from: timeParams.from, to: timeParams.to },
+    ],
     queryFn: () =>
       fetchJson<UsageSummary>(
         buildUsageUrl('summary', { from: timeParams.from, to: timeParams.to })
       ),
   })
 
-  const { data: timeseries, isLoading: timeseriesLoading } = useQuery({
+  const {
+    data: timeseries,
+    isLoading: timeseriesLoading,
+    isError: timeseriesError,
+    refetch: refetchTimeseries,
+  } = useWindowQuery({
     queryKey: [
       'aiUsage',
       'timeseries',
-      timeParams.from,
-      timeParams.to,
-      timeParams.bucket,
+      { from: timeParams.from, to: timeParams.to, bucket: timeParams.bucket },
     ],
     queryFn: () =>
       fetchJson<TimeseriesBucket[]>(
@@ -925,8 +1045,17 @@ export function UsageAnalytics() {
       ),
   })
 
-  const { data: byProvider } = useQuery({
-    queryKey: ['aiUsage', 'by-provider', timeParams.from, timeParams.to],
+  const {
+    data: byProvider,
+    isLoading: byProviderLoading,
+    isError: byProviderError,
+    refetch: refetchByProvider,
+  } = useWindowQuery({
+    queryKey: [
+      'aiUsage',
+      'by-provider',
+      { from: timeParams.from, to: timeParams.to },
+    ],
     queryFn: () =>
       fetchJson<ProviderUsage[]>(
         buildUsageUrl('by-provider', {
@@ -936,8 +1065,17 @@ export function UsageAnalytics() {
       ),
   })
 
-  const { data: topModels } = useQuery({
-    queryKey: ['aiUsage', 'top-models', timeParams.from, timeParams.to],
+  const {
+    data: topModels,
+    isLoading: topModelsLoading,
+    isError: topModelsError,
+    refetch: refetchTopModels,
+  } = useWindowQuery({
+    queryKey: [
+      'aiUsage',
+      'top-models',
+      { from: timeParams.from, to: timeParams.to },
+    ],
     queryFn: () =>
       fetchJson<ModelUsage[]>(
         buildUsageUrl('top-models', {
@@ -965,11 +1103,12 @@ export function UsageAnalytics() {
   // The filter row is collapsed by default and only revealed on demand.
   const [recentFiltersOpen, setRecentFiltersOpen] = useState(false)
 
-  // Cost is entered by the user in dollars; the API expects microcents.
+  // Cost is entered by the user in dollars; the API expects microcents
+  // (1e-6 USD), the unit costs are recorded in.
   const recentCostMicrocents = useMemo(() => {
     const dollars = parseFloat(recentCostInput)
     if (!Number.isFinite(dollars) || dollars < 0) return undefined
-    return Math.round(dollars * 1_000_000 * 100)
+    return Math.round(dollars * 1_000_000)
   }, [recentCostInput])
 
   // Tokens are entered as a plain integer count.
@@ -1035,28 +1174,11 @@ export function UsageAnalytics() {
     setRecentPage(0)
   }
 
-  const { data: pricingData } = useQuery({
-    queryKey: ['aiPricing'],
-    queryFn: () => fetchJson<PricingResponse>('/api/ai/pricing'),
-    staleTime: 60 * 60 * 1000,
-  })
-
-  const pricingMap = useMemo(() => {
-    const map = new Map<string, ModelPricing>()
-    for (const m of pricingData?.models ?? []) {
-      map.set(m.model, m)
-    }
-    return map
-  }, [pricingData])
-
-  const totalEstimatedCost = useMemo(() => {
-    if (!topModels || pricingMap.size === 0) return 0
-    return topModels.reduce(
-      (sum, m) =>
-        sum + computeCost(m.model, m.input_tokens, m.output_tokens, pricingMap),
-      0
-    )
-  }, [topModels, pricingMap])
+  // Failed with nothing to show: never rendered as zero usage.
+  const summaryFailed = summaryError && !summary
+  const timeseriesFailed = timeseriesError && !timeseries
+  const byProviderFailed = byProviderError && !byProvider
+  const topModelsFailed = topModelsError && !topModels
 
   const chartTimeseries = useMemo(
     () =>
@@ -1080,8 +1202,9 @@ export function UsageAnalytics() {
     <div className="space-y-4">
       {/* Time range selector */}
       <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-        <h3 className="text-lg font-semibold">Usage Analytics</h3>
-        <div className="flex gap-1">
+        <h3 className="text-lg font-semibold">Usage analytics</h3>
+        <div className="flex flex-wrap items-center gap-2">
+          <RefreshButton queryKeys={[['aiUsage']]} onRefresh={moveToNow} />
           <AiTimeRange
             range={timeRange}
             endMs={endMs}
@@ -1102,6 +1225,8 @@ export function UsageAnalytics() {
           <CardContent>
             {summaryLoading ? (
               <Skeleton className="h-7 w-16" />
+            ) : summaryFailed ? (
+              <UsageStatFailed />
             ) : (
               <div className="text-2xl font-bold">
                 {formatTokenCount(summary?.total_requests ?? 0)}
@@ -1113,12 +1238,14 @@ export function UsageAnalytics() {
           <CardHeader className="pb-2">
             <CardTitle className="text-sm font-medium flex items-center gap-2">
               <Zap className="h-4 w-4 text-muted-foreground" />
-              Total Tokens
+              Total tokens
             </CardTitle>
           </CardHeader>
           <CardContent>
             {summaryLoading ? (
               <Skeleton className="h-7 w-16" />
+            ) : summaryFailed ? (
+              <UsageStatFailed />
             ) : (
               <div className="text-2xl font-bold">
                 {formatTokenCount(summary?.total_tokens ?? 0)}
@@ -1130,12 +1257,14 @@ export function UsageAnalytics() {
           <CardHeader className="pb-2">
             <CardTitle className="text-sm font-medium flex items-center gap-2">
               <Clock className="h-4 w-4 text-muted-foreground" />
-              Avg Latency
+              Avg latency
             </CardTitle>
           </CardHeader>
           <CardContent>
             {summaryLoading ? (
               <Skeleton className="h-7 w-16" />
+            ) : summaryFailed ? (
+              <UsageStatFailed />
             ) : (
               <div className="text-2xl font-bold">
                 {Math.round(summary?.avg_latency_ms ?? 0)}ms
@@ -1147,12 +1276,14 @@ export function UsageAnalytics() {
           <CardHeader className="pb-2">
             <CardTitle className="text-sm font-medium flex items-center gap-2">
               <TrendingUp className="h-4 w-4 text-muted-foreground" />
-              Error Rate
+              Error rate
             </CardTitle>
           </CardHeader>
           <CardContent>
             {summaryLoading ? (
               <Skeleton className="h-7 w-16" />
+            ) : summaryFailed ? (
+              <UsageStatFailed />
             ) : (
               <div className="text-2xl font-bold">
                 {summary && summary.total_requests > 0
@@ -1172,10 +1303,10 @@ export function UsageAnalytics() {
           <CardContent>
             {summaryLoading ? (
               <Skeleton className="h-7 w-16" />
+            ) : summaryFailed ? (
+              <UsageStatFailed />
             ) : (
-              <div className="text-2xl font-bold">
-                {formatCost(totalEstimatedCost)}
-              </div>
+              <EstimatedCostStat summary={summary} />
             )}
           </CardContent>
         </Card>
@@ -1184,11 +1315,16 @@ export function UsageAnalytics() {
       {/* Requests over time chart */}
       <Card>
         <CardHeader>
-          <CardTitle className="text-base">Requests Over Time</CardTitle>
+          <CardTitle className="text-base">Requests over time</CardTitle>
         </CardHeader>
         <CardContent>
           {timeseriesLoading ? (
             <Skeleton className="h-[200px] w-full" />
+          ) : timeseriesFailed ? (
+            <UsageReadFailed
+              label="requests over time"
+              onRetry={() => void refetchTimeseries()}
+            />
           ) : chartTimeseries.length === 0 ? (
             <EmptyState
               icon={Activity}
@@ -1225,11 +1361,16 @@ export function UsageAnalytics() {
       <div className="grid gap-4 md:grid-cols-2">
         <Card>
           <CardHeader>
-            <CardTitle className="text-base">Token Usage</CardTitle>
+            <CardTitle className="text-base">Token usage</CardTitle>
           </CardHeader>
           <CardContent>
             {timeseriesLoading ? (
               <Skeleton className="h-[200px] w-full" />
+            ) : timeseriesFailed ? (
+              <UsageReadFailed
+                label="usage over time"
+                onRetry={() => void refetchTimeseries()}
+              />
             ) : chartTimeseries.length === 0 ? (
               <div className="h-[200px] flex items-center justify-center text-sm text-muted-foreground">
                 No data
@@ -1276,11 +1417,16 @@ export function UsageAnalytics() {
 
         <Card>
           <CardHeader>
-            <CardTitle className="text-base">Avg Latency</CardTitle>
+            <CardTitle className="text-base">Avg latency</CardTitle>
           </CardHeader>
           <CardContent>
             {timeseriesLoading ? (
               <Skeleton className="h-[200px] w-full" />
+            ) : timeseriesFailed ? (
+              <UsageReadFailed
+                label="usage over time"
+                onRetry={() => void refetchTimeseries()}
+              />
             ) : chartTimeseries.length === 0 ? (
               <div className="h-[200px] flex items-center justify-center text-sm text-muted-foreground">
                 No data
@@ -1323,10 +1469,17 @@ export function UsageAnalytics() {
       <div className="grid gap-4 md:grid-cols-2">
         <Card>
           <CardHeader>
-            <CardTitle className="text-base">By Provider</CardTitle>
+            <CardTitle className="text-base">By provider</CardTitle>
           </CardHeader>
           <CardContent>
-            {!byProvider || byProvider.length === 0 ? (
+            {byProviderLoading ? (
+              <Skeleton className="h-[200px] w-full" />
+            ) : byProviderFailed ? (
+              <UsageReadFailed
+                label="usage by provider"
+                onRetry={() => void refetchByProvider()}
+              />
+            ) : !byProvider || byProvider.length === 0 ? (
               <div className="h-[200px] flex items-center justify-center text-sm text-muted-foreground">
                 No data
               </div>
@@ -1372,22 +1525,28 @@ export function UsageAnalytics() {
 
         <Card>
           <CardHeader>
-            <CardTitle className="text-base">Top Models</CardTitle>
+            <CardTitle className="text-base">Top models</CardTitle>
           </CardHeader>
           <CardContent>
-            {!topModels || topModels.length === 0 ? (
+            {topModelsLoading ? (
+              <div className="space-y-3">
+                {['a', 'b', 'c', 'd'].map((key) => (
+                  <Skeleton key={key} className="h-5 w-full" />
+                ))}
+              </div>
+            ) : topModelsFailed ? (
+              <UsageReadFailed
+                label="top models"
+                onRetry={() => void refetchTopModels()}
+              />
+            ) : !topModels || topModels.length === 0 ? (
               <div className="h-[200px] flex items-center justify-center text-sm text-muted-foreground">
                 No data
               </div>
             ) : (
               <div className="space-y-3">
                 {topModels.map((m) => {
-                  const cost = computeCost(
-                    m.model,
-                    m.input_tokens,
-                    m.output_tokens,
-                    pricingMap
-                  )
+                  const cost = microcentsToDollars(m.estimated_cost_microcents)
                   return (
                     <div
                       key={m.model}
@@ -1406,7 +1565,7 @@ export function UsageAnalytics() {
                         <span>{formatTokenCount(m.request_count)} req</span>
                         <span>{formatTokenCount(m.total_tokens)} tok</span>
                         {cost > 0 && (
-                          <span className="text-orange-500 font-medium">
+                          <span className="text-orange-700 dark:text-orange-500 font-medium">
                             {formatCost(cost)}
                           </span>
                         )}
@@ -1424,7 +1583,7 @@ export function UsageAnalytics() {
       <Card>
         <CardHeader className="gap-3">
           <div className="flex items-center justify-between gap-2">
-            <CardTitle className="text-base">Recent Requests</CardTitle>
+            <CardTitle className="text-base">Recent requests</CardTitle>
             <Button
               type="button"
               variant={recentFiltersOpen ? 'secondary' : 'outline'}
@@ -1432,7 +1591,7 @@ export function UsageAnalytics() {
               onClick={() => setRecentFiltersOpen((open) => !open)}
             >
               <SlidersHorizontal className="h-4 w-4" />
-              <span className="hidden sm:inline">Filters</span>
+              <span className="max-sm:sr-only">Filters</span>
               {recentActiveFilterCount > 0 && (
                 <Badge
                   variant="secondary"
@@ -1452,7 +1611,10 @@ export function UsageAnalytics() {
                 providers={AI_PROVIDERS}
               />
               <Select value={recentStatus} onValueChange={setRecentStatus}>
-                <SelectTrigger className="w-full sm:w-[150px]">
+                <SelectTrigger
+                  aria-label="Status"
+                  className="w-full sm:w-[150px]"
+                >
                   <SelectValue placeholder="Status" />
                 </SelectTrigger>
                 <SelectContent>
@@ -1473,7 +1635,10 @@ export function UsageAnalytics() {
                     setRecentCostOp(v as typeof recentCostOp)
                   }
                 >
-                  <SelectTrigger className="w-[92px]">
+                  <SelectTrigger
+                    aria-label="Cost comparison"
+                    className="w-[92px]"
+                  >
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
@@ -1508,7 +1673,10 @@ export function UsageAnalytics() {
                     setRecentTokensOp(v as typeof recentTokensOp)
                   }
                 >
-                  <SelectTrigger className="w-[104px]">
+                  <SelectTrigger
+                    aria-label="Tokens comparison"
+                    className="w-[104px]"
+                  >
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
@@ -1569,6 +1737,7 @@ export function UsageAnalytics() {
                     <TableHead>Time</TableHead>
                     <TableHead>Provider</TableHead>
                     <TableHead>Model</TableHead>
+                    <TableHead>Caller</TableHead>
                     <TableHead className="hidden md:table-cell">
                       Tokens
                     </TableHead>
@@ -1596,6 +1765,11 @@ export function UsageAnalytics() {
                       <TableCell className="font-mono text-xs">
                         {log.model}
                       </TableCell>
+                      <TableCell className="text-muted-foreground text-xs whitespace-nowrap">
+                        {log.project_id === undefined
+                          ? '—'
+                          : `Project #${log.project_id}${log.token_id === undefined ? '' : ` · token #${log.token_id}`}`}
+                      </TableCell>
                       <TableCell className="hidden md:table-cell text-muted-foreground">
                         {formatTokenCount(log.input_tokens + log.output_tokens)}
                       </TableCell>
@@ -1603,7 +1777,7 @@ export function UsageAnalytics() {
                         {log.latency_ms}ms
                       </TableCell>
                       <TableCell className="hidden md:table-cell text-muted-foreground">
-                        <LogCostCell log={log} pricingMap={pricingMap} />
+                        <LogCostCell log={log} />
                       </TableCell>
                       <TableCell>
                         <div className="flex items-center gap-1.5">
@@ -1613,7 +1787,7 @@ export function UsageAnalytics() {
                             }
                             className={
                               log.status < 400
-                                ? 'bg-green-500/15 text-green-500 hover:bg-green-500/25'
+                                ? 'bg-green-500/15 text-green-700 dark:text-green-500 hover:bg-green-500/25'
                                 : ''
                             }
                           >
@@ -1654,7 +1828,10 @@ export function UsageAnalytics() {
                   value={String(recentPageSize)}
                   onValueChange={(v) => setRecentPageSize(Number(v))}
                 >
-                  <SelectTrigger className="h-8 w-[110px] text-xs">
+                  <SelectTrigger
+                    aria-label="Rows per page"
+                    className="h-8 w-[110px] text-xs"
+                  >
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
@@ -1674,7 +1851,7 @@ export function UsageAnalytics() {
                   onClick={() => setRecentPage((p) => Math.max(0, p - 1))}
                 >
                   <ChevronLeft className="h-4 w-4" />
-                  <span className="hidden sm:inline">Previous</span>
+                  <span className="max-sm:sr-only">Previous</span>
                 </Button>
                 <Button
                   variant="outline"
@@ -1682,7 +1859,7 @@ export function UsageAnalytics() {
                   disabled={recentPage + 1 >= recentTotalPages}
                   onClick={() => setRecentPage((p) => p + 1)}
                 >
-                  <span className="hidden sm:inline">Next</span>
+                  <span className="max-sm:sr-only">Next</span>
                   <ChevronRight className="h-4 w-4" />
                 </Button>
               </div>
@@ -1872,7 +2049,7 @@ function SpanTreeRow({
                 <TooltipTrigger asChild>
                   <Badge
                     variant="outline"
-                    className="text-[9px] px-1 py-0 h-4 text-blue-500 border-blue-500/30 shrink-0"
+                    className="text-[9px] px-1 py-0 h-4 text-blue-600 dark:text-blue-500 border-blue-500/30 shrink-0"
                   >
                     cached
                   </Badge>
@@ -2009,7 +2186,7 @@ function ChatMessageBubble({ msg }: { msg: ChatMessage }) {
         <div key={`thinking-${i}`} className="flex justify-start">
           <div className="max-w-[90%] rounded-lg px-3 py-2 text-xs bg-violet-500/10 border border-violet-500/20">
             <div className="flex items-center gap-1.5 mb-1">
-              <span className="text-[10px] font-semibold uppercase text-violet-500">
+              <span className="text-[10px] font-semibold uppercase text-violet-600 dark:text-violet-500">
                 thinking
               </span>
             </div>
@@ -2076,7 +2253,9 @@ function ChatMessageBubble({ msg }: { msg: ChatMessage }) {
                   key={j}
                   className="bg-background/50 rounded p-1.5 font-mono text-[10px]"
                 >
-                  <span className="text-amber-500">{tc.function?.name}</span>
+                  <span className="text-amber-700 dark:text-amber-500">
+                    {tc.function?.name}
+                  </span>
                   {tc.function?.arguments && (
                     <pre className="text-muted-foreground mt-0.5 whitespace-pre-wrap">
                       <HighlightedCode
@@ -2095,7 +2274,9 @@ function ChatMessageBubble({ msg }: { msg: ChatMessage }) {
               key={`tool-use-${j}`}
               className="bg-background/50 rounded p-1.5 font-mono text-[10px] mt-1"
             >
-              <span className="text-amber-500">{block.name}</span>
+              <span className="text-amber-700 dark:text-amber-500">
+                {block.name}
+              </span>
               {block.id && (
                 <span className="text-muted-foreground ml-1">({block.id})</span>
               )}
@@ -2196,11 +2377,11 @@ function FullConversationView({
             <div key={i} className="flex justify-start">
               <div className="max-w-[90%] rounded-lg px-3 py-2 text-xs bg-emerald-500/10 border border-emerald-500/20">
                 <div className="flex items-center gap-1.5 mb-1">
-                  <span className="text-[10px] font-semibold uppercase text-emerald-600">
+                  <span className="text-[10px] font-semibold uppercase text-emerald-700 dark:text-emerald-600">
                     tool execution
                   </span>
                   {block?.name && (
-                    <span className="font-mono text-[10px] text-emerald-500">
+                    <span className="font-mono text-[10px] text-emerald-700 dark:text-emerald-500">
                       {block.name}
                     </span>
                   )}
@@ -2252,7 +2433,10 @@ function JsonBlock({ label, value }: { label: string; value: string | null }) {
         {label}
       </CollapsibleTrigger>
       <CollapsibleContent>
-        <pre className="mt-1 p-2 bg-muted rounded text-[10px] font-mono overflow-x-auto max-h-[200px] overflow-y-auto">
+        <pre
+          tabIndex={0}
+          className="mt-1 p-2 bg-muted rounded text-[10px] font-mono overflow-x-auto max-h-[200px] overflow-y-auto"
+        >
           <HighlightedCode code={formatted} language="json" />
         </pre>
       </CollapsibleContent>
@@ -2319,7 +2503,11 @@ function SpanDetailSheet({
             )}
             <Badge
               variant={isError ? 'destructive' : 'default'}
-              className={!isError ? 'bg-green-500/15 text-green-500' : ''}
+              className={
+                !isError
+                  ? 'bg-green-500/15 text-green-700 dark:text-green-500'
+                  : ''
+              }
             >
               {span.status_code}
             </Badge>
@@ -2344,13 +2532,13 @@ function SpanDetailSheet({
                 </div>
                 {span.cache_read_input_tokens != null &&
                   span.cache_read_input_tokens > 0 && (
-                    <div className="text-[10px] text-blue-500">
+                    <div className="text-[10px] text-blue-600 dark:text-blue-500">
                       {formatTokenCount(span.cache_read_input_tokens)} cached
                     </div>
                   )}
                 {span.cache_creation_input_tokens != null &&
                   span.cache_creation_input_tokens > 0 && (
-                    <div className="text-[10px] text-amber-500">
+                    <div className="text-[10px] text-amber-700 dark:text-amber-500">
                       {formatTokenCount(span.cache_creation_input_tokens)} cache
                       write
                     </div>
@@ -2403,7 +2591,7 @@ function SpanDetailSheet({
           {/* Identification */}
           <DetailSection title="Identification">
             <DetailRow label="Span ID" value={span.span_id} mono />
-            <DetailRow label="Parent Span" value={span.parent_span_id} mono />
+            <DetailRow label="Parent span" value={span.parent_span_id} mono />
             <DetailRow label="Kind" value={span.kind} />
             <DetailRow
               label="Duration"
@@ -2417,15 +2605,15 @@ function SpanDetailSheet({
 
           {/* Model */}
           <DetailSection title="Model">
-            <DetailRow label="Requested Model" value={span.gen_ai_model} mono />
+            <DetailRow label="Requested model" value={span.gen_ai_model} mono />
             <DetailRow
-              label="Response Model"
+              label="Response model"
               value={span.gen_ai_response_model}
               mono
             />
             <DetailRow label="Response ID" value={span.response_id} mono />
             <DetailRow
-              label="Finish Reasons"
+              label="Finish reasons"
               value={span.response_finish_reasons?.join(', ')}
             />
             <DetailRow
@@ -2436,32 +2624,32 @@ function SpanDetailSheet({
           </DetailSection>
 
           {/* Request Parameters */}
-          <DetailSection title="Request Parameters">
+          <DetailSection title="Request parameters">
             <DetailRow
               label="Temperature"
               value={span.request_temperature?.toString()}
             />
             <DetailRow
-              label="Max Tokens"
+              label="Max tokens"
               value={span.request_max_tokens?.toString()}
             />
             <DetailRow label="Top P" value={span.request_top_p?.toString()} />
             <DetailRow label="Top K" value={span.request_top_k?.toString()} />
             <DetailRow
-              label="Frequency Penalty"
+              label="Frequency penalty"
               value={span.request_frequency_penalty?.toString()}
             />
             <DetailRow
-              label="Presence Penalty"
+              label="Presence penalty"
               value={span.request_presence_penalty?.toString()}
             />
             <DetailRow
-              label="Stop Sequences"
+              label="Stop sequences"
               value={span.request_stop_sequences?.join(', ')}
             />
             <DetailRow label="Seed" value={span.request_seed?.toString()} />
             <DetailRow
-              label="Choice Count"
+              label="Choice count"
               value={span.request_choice_count?.toString()}
             />
           </DetailSection>
@@ -2478,8 +2666,8 @@ function SpanDetailSheet({
 
           {/* Tool */}
           {(span.tool_name || span.tool_call_id) && (
-            <DetailSection title="Tool Execution">
-              <DetailRow label="Tool Name" value={span.tool_name} />
+            <DetailSection title="Tool execution">
+              <DetailRow label="Tool name" value={span.tool_name} />
               <DetailRow label="Call ID" value={span.tool_call_id} mono />
               <DetailRow label="Type" value={span.tool_type} />
               <DetailRow label="Description" value={span.tool_description} />
@@ -2494,7 +2682,7 @@ function SpanDetailSheet({
                 value={span.embeddings_dimension_count.toString()}
               />
               <DetailRow
-                label="Encoding Formats"
+                label="Encoding formats"
                 value={span.request_encoding_formats?.join(', ')}
               />
             </DetailSection>
@@ -2503,7 +2691,7 @@ function SpanDetailSheet({
           {/* Retrieval */}
           {span.data_source_id && (
             <DetailSection title="Retrieval">
-              <DetailRow label="Data Source" value={span.data_source_id} mono />
+              <DetailRow label="Data source" value={span.data_source_id} mono />
             </DetailSection>
           )}
 
@@ -2520,18 +2708,18 @@ function SpanDetailSheet({
             span.openai_system_fingerprint ||
             span.aws_bedrock_guardrail_id ||
             span.azure_resource_provider_namespace) && (
-            <DetailSection title="Provider Specific">
-              <DetailRow label="OpenAI API Type" value={span.openai_api_type} />
+            <DetailSection title="Provider specific">
+              <DetailRow label="OpenAI API type" value={span.openai_api_type} />
               <DetailRow
-                label="Request Service Tier"
+                label="Request service tier"
                 value={span.openai_request_service_tier}
               />
               <DetailRow
-                label="Response Service Tier"
+                label="Response service tier"
                 value={span.openai_response_service_tier}
               />
               <DetailRow
-                label="System Fingerprint"
+                label="System fingerprint"
                 value={span.openai_system_fingerprint}
                 mono
               />
@@ -2546,7 +2734,7 @@ function SpanDetailSheet({
                 mono
               />
               <DetailRow
-                label="Azure Namespace"
+                label="Azure namespace"
                 value={span.azure_resource_provider_namespace}
               />
             </DetailSection>
@@ -2580,7 +2768,7 @@ function SpanDetailSheet({
               <Separator />
               <div>
                 <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-1">
-                  Tool Content
+                  Tool content
                 </h4>
                 <JsonBlock
                   label="Arguments"
@@ -2846,7 +3034,7 @@ function InvocationCard({
                     </span>
                   )}
                   {cacheRead > 0 && (
-                    <span className="text-blue-500">
+                    <span className="text-blue-600 dark:text-blue-500">
                       {formatTokenCount(cacheRead)} cached
                     </span>
                   )}
@@ -2867,7 +3055,7 @@ function InvocationCard({
             onClick={() => onOpenSpan(span)}
           >
             <Info className="h-3.5 w-3.5" />
-            <span className="hidden sm:inline">Details</span>
+            <span className="max-sm:sr-only">Details</span>
           </Button>
         </div>
         <CollapsibleContent>
@@ -3084,7 +3272,7 @@ function TraceDetailView({
             <div className="grid gap-3 grid-cols-2 md:grid-cols-4 lg:grid-cols-6">
               <Card className="p-3">
                 <div className="text-[10px] text-muted-foreground uppercase">
-                  Total Spans
+                  Total spans
                 </div>
                 <div className="text-xl font-bold">
                   {traceDetail.span_count}
@@ -3105,20 +3293,20 @@ function TraceDetailView({
               </Card>
               <Card className="p-3">
                 <div className="text-[10px] text-muted-foreground uppercase">
-                  Input Tokens
+                  Input tokens
                 </div>
                 <div className="text-xl font-bold tabular-nums">
                   {formatTokenCount(stats.totalInput)}
                 </div>
                 {stats.totalCacheRead > 0 && (
-                  <div className="text-[10px] text-blue-500">
+                  <div className="text-[10px] text-blue-600 dark:text-blue-500">
                     {formatTokenCount(stats.totalCacheRead)} cached
                   </div>
                 )}
               </Card>
               <Card className="p-3">
                 <div className="text-[10px] text-muted-foreground uppercase">
-                  Output Tokens
+                  Output tokens
                 </div>
                 <div className="text-xl font-bold tabular-nums">
                   {formatTokenCount(stats.totalOutput)}
@@ -3127,7 +3315,7 @@ function TraceDetailView({
               {stats.tools.length > 0 && (
                 <Card className="p-3">
                   <div className="text-[10px] text-muted-foreground uppercase">
-                    Tool Calls
+                    Tool calls
                   </div>
                   <div className="text-xl font-bold">{stats.tools.length}</div>
                 </Card>
@@ -3140,7 +3328,7 @@ function TraceDetailView({
                   <div className="text-xl font-bold text-destructive">
                     {stats.errors.length}
                   </div>
-                  <div className="text-[10px] text-destructive/70">
+                  <div className="text-[10px] text-destructive">
                     {stats.errors[0].error_type ?? 'Unknown'}
                   </div>
                 </Card>
@@ -3151,8 +3339,7 @@ function TraceDetailView({
           {/* Invocations (default) + raw span tree */}
           <Tabs defaultValue="conversation" className="w-full">
             <TabsList>
-              <TabsTrigger value="conversation" className="gap-1.5">
-                <MessageSquare className="h-3.5 w-3.5" />
+              <TabsTrigger value="conversation" icon={MessageSquare}>
                 Conversation
                 {invocationCount > 0 && (
                   <span className="text-xs text-muted-foreground">
@@ -3160,8 +3347,7 @@ function TraceDetailView({
                   </span>
                 )}
               </TabsTrigger>
-              <TabsTrigger value="tree" className="gap-1.5">
-                <ListTree className="h-3.5 w-3.5" />
+              <TabsTrigger value="tree" icon={ListTree}>
                 Span tree
                 <span className="text-xs text-muted-foreground">
                   {traceDetail.span_count}
@@ -3263,11 +3449,17 @@ function TraceDetailView({
 // ── AgentActivity ───────────────────────────────────────────────────
 
 export function AgentActivity() {
-  const { projects } = useProjects()
+  const {
+    projects,
+    isLoading: projectsLoading,
+    error: projectsError,
+    refetch: refetchProjects,
+  } = useProjects()
   const [selectedProjectId, setSelectedProjectId] = useState<
     number | undefined
   >(projects[0]?.id)
-  const [{ range: timeRange, endMs }, selectTimeRange] = useTimeRangeSelection()
+  const [{ range: timeRange, endMs }, selectTimeRange, moveToNow] =
+    useTimeRangeSelection()
   const [systemFilter, setSystemFilter] = useState<string>('')
   const [selectedTraceId, setSelectedTraceId] = useState<string | null>(null)
   const [selectedTraceBounds, setSelectedTraceBounds] =
@@ -3278,6 +3470,7 @@ export function AgentActivity() {
   }
 
   const projectId = selectedProjectId ?? projects[0]?.id
+  const projectSlug = projects.find((project) => project.id === projectId)?.slug
 
   const timeParams = useMemo(() => {
     const to = new Date(endMs).toISOString()
@@ -3289,7 +3482,7 @@ export function AgentActivity() {
     data: tracesResponse,
     isLoading: tracesLoading,
     error: tracesError,
-  } = useQuery({
+  } = useWindowQuery({
     ...queryGenaiTracesOptions({
       query: {
         project_id: projectId,
@@ -3335,15 +3528,18 @@ export function AgentActivity() {
     <div className="space-y-4">
       {/* Filters */}
       <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-        <h3 className="text-lg font-semibold">Agent Activity</h3>
-        <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+        <h3 className="text-lg font-semibold">Agent activity</h3>
+        <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center">
           {projects.length > 0 && (
             <Select
               value={projectId?.toString() ?? ''}
               onValueChange={(v) => setSelectedProjectId(Number(v))}
             >
-              <SelectTrigger className="w-full sm:w-[180px]">
-                <SelectValue placeholder="Select project" />
+              <SelectTrigger
+                aria-label="Service"
+                className="w-full sm:w-[180px]"
+              >
+                <SelectValue placeholder="Select service" />
               </SelectTrigger>
               <SelectContent>
                 {projects.map((p) => (
@@ -3360,7 +3556,15 @@ export function AgentActivity() {
               setSystemFilter(value === 'all' ? '' : value)
             }
           />
-          <div className="flex gap-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <RefreshButton
+              queryKeys={[
+                queryKeyPrefix(queryGenaiTracesQueryKey, {
+                  query: { project_id: projectId },
+                }),
+              ]}
+              onRefresh={moveToNow}
+            />
             <AiTimeRange
               range={timeRange}
               endMs={endMs}
@@ -3373,18 +3577,38 @@ export function AgentActivity() {
       {projectId && (
         <CloudAiMetadataNotice
           projectId={projectId}
-          projectSlug={
-            projects.find((project) => project.id === projectId)?.slug
-          }
+          projectSlug={projectSlug}
         />
       )}
 
       {/* Traces list */}
-      {!projectId ? (
+      {!projectId && projectsLoading ? (
+        <div className="space-y-2">
+          <Skeleton className="h-16 w-full" />
+          <Skeleton className="h-16 w-full" />
+        </div>
+      ) : !projectId && projectsError ? (
+        <ReadFailure
+          resource="Services"
+          error={projectsError}
+          onRetry={refetchProjects}
+        />
+      ) : !projectId ? (
         <EmptyState
+          size="compact"
           icon={Bot}
-          title="No project selected"
-          description="Select a project to view AI agent activity traces."
+          title="No services yet"
+          description="AI activity is recorded per service. Deploy a service that calls an AI provider and its traces appear here."
+          action={
+            <div className="flex flex-wrap justify-center gap-2">
+              <Button asChild>
+                <Link to="/projects/new">Deploy a service</Link>
+              </Button>
+              <Button asChild variant="outline">
+                <Link to="/ai-gateway">Set up the AI gateway</Link>
+              </Button>
+            </div>
+          }
         />
       ) : tracesLoading ? (
         <div className="space-y-2">
@@ -3402,7 +3626,7 @@ export function AgentActivity() {
           )}
         />
       ) : traces.length === 0 ? (
-        <AiActivityEmptyState setupHref="/ai-gateway/setup" />
+        <AiActivityEmptyState setupHref={aiTracesSetupHref(projectSlug)} />
       ) : (
         <Card>
           <CardContent className="p-0">
@@ -3507,7 +3731,7 @@ export function AgentActivity() {
                                 <TooltipTrigger>
                                   <Badge
                                     variant="outline"
-                                    className="text-[10px] text-blue-500 border-blue-500/30"
+                                    className="text-[10px] text-blue-600 dark:text-blue-500 border-blue-500/30"
                                   >
                                     {cachePct}% hit
                                   </Badge>
@@ -3545,7 +3769,7 @@ export function AgentActivity() {
                           ) : (
                             <Badge
                               variant="default"
-                              className="bg-green-500/15 text-green-500 hover:bg-green-500/25"
+                              className="bg-green-500/15 text-green-700 dark:text-green-500 hover:bg-green-500/25"
                             >
                               OK
                             </Badge>
@@ -3582,7 +3806,8 @@ export function ProjectAgentActivity({
   projectId: number
   projectSlug: string
 }) {
-  const [{ range: timeRange, endMs }, selectTimeRange] = useTimeRangeSelection()
+  const [{ range: timeRange, endMs }, selectTimeRange, moveToNow] =
+    useTimeRangeSelection()
   const [systemFilter, setSystemFilter] = useState<string>('')
   const [searchParams, setSearchParams] = useSearchParams()
   const selectedTraceId = searchParams.get('trace') || null
@@ -3615,7 +3840,7 @@ export function ProjectAgentActivity({
     data: tracesResponse,
     isLoading: tracesLoading,
     error: tracesError,
-  } = useQuery({
+  } = useWindowQuery({
     ...queryGenaiTracesOptions({
       query: {
         project_id: projectId,
@@ -3659,15 +3884,23 @@ export function ProjectAgentActivity({
   return (
     <div className="space-y-4">
       <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-        <h3 className="text-lg font-semibold">AI Activity</h3>
-        <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+        <h3 className="text-lg font-semibold">AI activity</h3>
+        <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center">
           <AiProviderSelect
             value={systemFilter || 'all'}
             onValueChange={(value) =>
               setSystemFilter(value === 'all' ? '' : value)
             }
           />
-          <div className="flex gap-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <RefreshButton
+              queryKeys={[
+                queryKeyPrefix(queryGenaiTracesQueryKey, {
+                  query: { project_id: projectId },
+                }),
+              ]}
+              onRefresh={moveToNow}
+            />
             <AiTimeRange
               range={timeRange}
               endMs={endMs}
@@ -3800,7 +4033,7 @@ export function ProjectAgentActivity({
                                 <TooltipTrigger>
                                   <Badge
                                     variant="outline"
-                                    className="text-[10px] text-blue-500 border-blue-500/30"
+                                    className="text-[10px] text-blue-600 dark:text-blue-500 border-blue-500/30"
                                   >
                                     {cachePct}% hit
                                   </Badge>
@@ -3838,7 +4071,7 @@ export function ProjectAgentActivity({
                           ) : (
                             <Badge
                               variant="default"
-                              className="bg-green-500/15 text-green-500 hover:bg-green-500/25"
+                              className="bg-green-500/15 text-green-700 dark:text-green-500 hover:bg-green-500/25"
                             >
                               OK
                             </Badge>
@@ -3866,47 +4099,6 @@ export function ProjectAgentActivity({
   )
 }
 
-function DeleteConfirmDialog({
-  open,
-  onOpenChange,
-  providerKey,
-  onConfirm,
-  isPending,
-}: {
-  open: boolean
-  onOpenChange: (open: boolean) => void
-  providerKey: ProviderKeyResponse | null
-  onConfirm: (id: number) => void
-  isPending: boolean
-}) {
-  return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent>
-        <DialogHeader>
-          <DialogTitle>Delete Provider Key</DialogTitle>
-          <DialogDescription>
-            Are you sure you want to delete &quot;{providerKey?.display_name}
-            &quot;? This will stop routing requests through this provider key.
-          </DialogDescription>
-        </DialogHeader>
-        <DialogFooter>
-          <Button variant="outline" onClick={() => onOpenChange(false)}>
-            Cancel
-          </Button>
-          <Button
-            variant="destructive"
-            onClick={() => providerKey && onConfirm(providerKey.id)}
-            disabled={isPending}
-          >
-            {isPending && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-            Delete
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  )
-}
-
 export function AiGatewayPage() {
   const queryClient = useQueryClient()
   const { data: settings } = useSettings()
@@ -3914,6 +4106,13 @@ export function AiGatewayPage() {
   usePageTitle('AI Gateway')
 
   const [dialogOpen, setDialogOpen] = useState(false)
+  // True when the add-key dialog was opened from a provider's own row, so the
+  // provider is fixed. Opened from the header or the onboarding prompt, the
+  // dialog shows a provider choice instead.
+  const [providerPreselected, setProviderPreselected] = useState(false)
+  // The base URL as last left or pasted, so an OpenAI-compatible key's
+  // models load on their own without sending the key to a half-typed host.
+  const [committedBaseUrl, setCommittedBaseUrl] = useState('')
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false)
   const [selectedKey, setSelectedKey] = useState<ProviderKeyResponse | null>(
     null
@@ -3945,6 +4144,11 @@ export function AiGatewayPage() {
       shouldValidate: providerKeyForm.formState.isSubmitted,
     })
 
+  // `/ai-gateway?add=openrouter` is where the assistant's onboarding sends
+  // operators. Handled in an effect below, once the existing keys are known.
+  const [addSearchParams, setAddSearchParams] = useSearchParams()
+  const addProvider = addSearchParams.get('add')
+
   // Derive the gateway endpoint from platform settings
   const externalUrl = settings?.external_url || window.location.origin
   const gatewayEndpoint = `${externalUrl}/api/ai/v1`
@@ -3962,6 +4166,42 @@ export function AiGatewayPage() {
   const { data: keysData, isLoading } = keysQuery
 
   const keys = keysData ?? []
+
+  // Open the add-key dialog for the `?add=` provider exactly as its "Add key"
+  // button would (numbering the name after the keys it already has), then
+  // drop the parameter so a reload or a back-navigation does not reopen it.
+  // Waits for the key list so the pre-filled name is the right one. The
+  // dialog state is adjusted during render (the page can already be mounted
+  // when the link is followed); the form store is filled before paint.
+  const keysSettled = keysData !== undefined || keysQuery.isError
+  const [handledAddProvider, setHandledAddProvider] = useState<string | null>(
+    null
+  )
+  if (keysSettled && addProvider !== handledAddProvider) {
+    setHandledAddProvider(addProvider)
+    if (providerFromAddParam(addProvider)) {
+      setProviderPreselected(true)
+      setDialogOpen(true)
+    }
+  }
+  useLayoutEffect(() => {
+    if (addProvider === null || !keysSettled) return
+    const provider = providerFromAddParam(addProvider)
+    if (provider) {
+      const existing = (keysData ?? []).filter(
+        (key) => key.provider === provider.id
+      ).length
+      providerKeyForm.reset(providerKeyFormForProvider(provider, existing))
+    }
+    setAddSearchParams(
+      (params) => {
+        params.delete('add')
+        return params
+      },
+      { replace: true }
+    )
+  }, [addProvider, keysSettled, keysData, providerKeyForm, setAddSearchParams])
+
   const keysRead = { keys: keysData, isError: keysQuery.isError }
   const keysUnknown = providerKeysUnknown(keysRead)
 
@@ -4012,7 +4252,8 @@ export function AiGatewayPage() {
 
   // Delete mutation
   const deleteMutation = useMutation({
-    mutationFn: (id: number) => deleteProviderKey({ path: { id } }),
+    mutationFn: (id: number) =>
+      deleteProviderKey({ path: { id }, throwOnError: true }),
     meta: { errorTitle: 'Failed to delete provider key' },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['providerKeys'] })
@@ -4025,11 +4266,45 @@ export function AiGatewayPage() {
   // Toggle active mutation
   const toggleMutation = useMutation({
     mutationFn: ({ id, is_active }: { id: number; is_active: boolean }) =>
-      updateProviderKey({ path: { id }, body: { is_active } }),
+      updateProviderKey({
+        path: { id },
+        body: { is_active },
+        throwOnError: true,
+      }),
     meta: { errorTitle: 'Failed to update provider key' },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['providerKeys'] })
     },
+  })
+
+  // Replace a key's secret. The dialog keeps the key it was opened for while
+  // it animates closed, so `replaceOpen` is separate from `replacingKey`.
+  const [replacingKey, setReplacingKey] = useState<ProviderKeyResponse | null>(
+    null
+  )
+  const [replaceOpen, setReplaceOpen] = useState(false)
+  const replaceMutation = useMutation({
+    mutationFn: ({ id, apiKey }: { id: number; apiKey: string }) =>
+      updateProviderKey({
+        path: { id },
+        body: { api_key: apiKey },
+        throwOnError: true,
+      }),
+    onSuccess: (_, { id }) => {
+      queryClient.invalidateQueries({ queryKey: ['providerKeys'] })
+      queryClient.invalidateQueries({
+        queryKey: getAiProviderStatusQueryKey(),
+      })
+      setReplaceOpen(false)
+      toast.success('API key replaced', {
+        description: 'The new key was verified with the provider.',
+        action: {
+          label: 'Test key',
+          onClick: () => testKeyMutation.mutate(id),
+        },
+      })
+    },
+    // A refusal is shown in the dialog, which stays open for another try.
   })
 
   // Test existing key by ID
@@ -4069,7 +4344,46 @@ export function AiGatewayPage() {
   // backend now verifies on create (see handlers/providers.rs) — a failed
   // test surfaces as a 400 on the create call itself.
 
-  const resetForm = () => providerKeyForm.reset(EMPTY_PROVIDER_KEY_FORM)
+  const resetForm = () => {
+    providerKeyForm.reset(EMPTY_PROVIDER_KEY_FORM)
+    setProviderPreselected(false)
+  }
+
+  // Header and onboarding entry points: no provider yet, the user picks one
+  // in the dialog.
+  const openAddKeyDialog = () => {
+    providerKeyForm.reset(EMPTY_PROVIDER_KEY_FORM)
+    setProviderPreselected(false)
+    createMutation.reset()
+    setDialogOpen(true)
+  }
+
+  const handleProviderChosen = (providerId: string) => {
+    const provider = SUPPORTED_PROVIDERS.find((p) => p.id === providerId)
+    if (!provider) return
+    const existingKeyCount = keys.filter(
+      (k) => k.provider === provider.id
+    ).length
+    providerKeyForm.reset(
+      selectProviderKeyFormProvider(
+        providerKeyForm.getValues(),
+        provider,
+        existingKeyCount,
+        SUPPORTED_PROVIDERS.map((p) => p.name)
+      )
+    )
+  }
+
+  const handleSwitchToOpenAiCompatible = () => {
+    providerKeyForm.reset(
+      switchToOpenAiCompatible(
+        providerKeyForm.getValues(),
+        providerName(SELF_HOSTED_PROVIDER_ID),
+        keys.filter((k) => k.provider === SELF_HOSTED_PROVIDER_ID).length,
+        SUPPORTED_PROVIDERS.map((p) => p.name)
+      )
+    )
+  }
 
   const handleCreate = providerKeyForm.handleSubmit((values) => {
     if (createMutation.isPending) return
@@ -4196,17 +4510,16 @@ console.log(response.choices[0].message.content);`,
       {/* Page Header */}
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div>
-          <h1 className="text-2xl sm:text-3xl font-bold">AI Gateway</h1>
+          <PageTitle className="text-2xl sm:text-3xl font-bold">
+            AI Gateway
+          </PageTitle>
           <p className="text-muted-foreground mt-1 sm:mt-2 text-sm">
             Unified API for multiple AI providers with a single endpoint
           </p>
         </div>
-        <Button
-          onClick={() => setDialogOpen(true)}
-          className="w-full sm:w-auto"
-        >
+        <Button onClick={openAddKeyDialog} className="w-full sm:w-auto">
           <Plus className="mr-2 h-4 w-4" />
-          Add Provider Key
+          Add provider key
         </Button>
       </div>
 
@@ -4233,9 +4546,6 @@ console.log(response.choices[0].message.content);`,
                 <CopyButton value={gatewayEndpoint} className="shrink-0" />
               </div>
               <div className="flex flex-wrap items-center gap-2">
-                <Button size="sm" asChild>
-                  <Link to="/ai-gateway/setup">View code examples</Link>
-                </Button>
                 {shouldPromptForFirstProviderKey(
                   keysRead,
                   SUPPORTED_PROVIDERS.map((p) => p.id)
@@ -4243,7 +4553,7 @@ console.log(response.choices[0].message.content);`,
                   <Button
                     size="sm"
                     variant="outline"
-                    onClick={() => setDialogOpen(true)}
+                    onClick={openAddKeyDialog}
                   >
                     <Plus className="mr-2 h-4 w-4" />
                     Add a provider key
@@ -4269,7 +4579,10 @@ console.log(response.choices[0].message.content);`,
                   value={effectiveSnippetProvider}
                   onValueChange={setSnippetProvider}
                 >
-                  <SelectTrigger className="h-7 w-[150px] text-xs focus:ring-0 focus:ring-offset-0">
+                  <SelectTrigger
+                    aria-label="Snippet provider"
+                    className="h-7 w-[150px] text-xs focus:ring-0 focus:ring-offset-0"
+                  >
                     <SelectValue placeholder="Provider" />
                   </SelectTrigger>
                   <SelectContent>
@@ -4420,7 +4733,7 @@ console.log(response.choices[0].message.content);`,
                         </TableCell>
                         <TableCell className="hidden lg:table-cell py-2 text-xs text-muted-foreground">
                           <span className="line-clamp-1">
-                            {provider.models}
+                            {providerRowModels(provider, providerKeys)}
                           </span>
                         </TableCell>
                         <TableCell className="hidden sm:table-cell py-2">
@@ -4433,7 +4746,7 @@ console.log(response.choices[0].message.content);`,
                               Unknown
                             </Badge>
                           ) : status === 'active' ? (
-                            <Badge className="justify-center whitespace-nowrap bg-green-500/15 text-green-600 dark:text-green-400 hover:bg-green-500/25">
+                            <Badge className="justify-center whitespace-nowrap bg-green-500/15 text-green-700 dark:text-green-400 hover:bg-green-500/25">
                               Active
                             </Badge>
                           ) : status === 'disabled' ? (
@@ -4464,13 +4777,13 @@ console.log(response.choices[0].message.content);`,
                             }
                             size="sm"
                             onClick={() => {
-                              providerKeyForm.reset({
-                                ...EMPTY_PROVIDER_KEY_FORM,
-                                provider: provider.id,
-                                display_name: hasAnyKey
-                                  ? `${provider.name} (key ${providerKeys.length + 1})`
-                                  : provider.name,
-                              })
+                              providerKeyForm.reset(
+                                providerKeyFormForProvider(
+                                  provider,
+                                  providerKeys.length
+                                )
+                              )
+                              setProviderPreselected(true)
                               setDialogOpen(true)
                             }}
                           >
@@ -4500,6 +4813,7 @@ console.log(response.choices[0].message.content);`,
                                       Disabled
                                     </Badge>
                                   )}
+                                  <KeyEndpoint baseUrl={key.base_url} />
                                   <code className="text-xs text-muted-foreground truncate">
                                     {key.api_key_masked}
                                   </code>
@@ -4522,6 +4836,20 @@ console.log(response.choices[0].message.content);`,
                                     ) : (
                                       <Play className="h-4 w-4" />
                                     )}
+                                  </Button>
+                                  <Button
+                                    variant="ghost"
+                                    size="icon"
+                                    className="h-8 w-8"
+                                    onClick={() => {
+                                      replaceMutation.reset()
+                                      setReplacingKey(key)
+                                      setReplaceOpen(true)
+                                    }}
+                                    title="Replace API key"
+                                    aria-label={`Replace API key for ${key.display_name}`}
+                                  >
+                                    <KeyRound className="h-4 w-4" />
                                   </Button>
                                   <Button
                                     variant="ghost"
@@ -4599,7 +4927,12 @@ console.log(response.choices[0].message.content);`,
           }
         }}
       >
+        {/* Scrolls rather than grows: with the base-URL hint, a save error
+            or the self-hosted fields shown, the form is taller than a short
+            viewport, and a centred dialog would push its title and Close
+            button off the top of the screen. */}
         <DialogContent
+          className="max-h-[90dvh] overflow-y-auto"
           onInteractOutside={(event) => {
             if (createMutation.isPending) event.preventDefault()
           }}
@@ -4612,7 +4945,7 @@ console.log(response.choices[0].message.content);`,
               <DialogTitle>
                 {newProvider
                   ? `Configure ${providerName(newProvider)}`
-                  : 'Add Provider Key'}
+                  : 'Add provider key'}
               </DialogTitle>
               <DialogDescription>
                 Your key is encrypted at rest and used only to route requests
@@ -4620,7 +4953,24 @@ console.log(response.choices[0].message.content);`,
               </DialogDescription>
             </DialogHeader>
             <div className="grid gap-4 py-4">
-              {newProvider && (
+              {providerPreselected ? null : (
+                <div className="grid gap-2">
+                  <Label>Provider</Label>
+                  <ProviderKeyProviderPicker
+                    providers={SUPPORTED_PROVIDERS}
+                    value={newProvider}
+                    onChange={handleProviderChosen}
+                    disabled={createMutation.isPending}
+                    invalid={!!formErrors.provider}
+                  />
+                  {formErrors.provider && (
+                    <p className="text-xs text-destructive">
+                      {formErrors.provider.message}
+                    </p>
+                  )}
+                </div>
+              )}
+              {newProvider && providerPreselected && (
                 <div className="flex items-center gap-3 rounded-md border bg-muted/30 px-3 py-2.5">
                   <AiProviderIcon provider={newProvider} size={36} />
                   <div className="min-w-0 flex-1">
@@ -4643,109 +4993,134 @@ console.log(response.choices[0].message.content);`,
                   )}
                 </div>
               )}
-              <div className="grid gap-2">
-                <Label htmlFor="displayName">Display Name</Label>
-                <Input
-                  id="displayName"
-                  placeholder="Production API Key"
-                  disabled={createMutation.isPending}
-                  aria-invalid={!!formErrors.display_name}
-                  {...providerKeyForm.register('display_name')}
-                />
-                {formErrors.display_name && (
-                  <p className="text-xs text-destructive">
-                    {formErrors.display_name.message}
-                  </p>
-                )}
-              </div>
-              <div className="grid gap-2">
-                <Label htmlFor="apiKey">
-                  API Key
-                  {newProviderIsSelfHosted && (
-                    <>
-                      {' '}
-                      <span className="text-muted-foreground font-normal">
-                        (optional)
-                      </span>
-                    </>
+              {/* Hidden (not unmounted) until a provider is chosen: the fields
+                  depend on the provider, and SelfHostedProviderFields keeps
+                  its discovery state mounted. */}
+              <div className={newProvider ? 'grid gap-4' : 'hidden'}>
+                <div className="grid gap-2">
+                  <Label htmlFor="displayName">Display name</Label>
+                  <Input
+                    id="displayName"
+                    placeholder="Production API Key"
+                    disabled={createMutation.isPending}
+                    aria-invalid={!!formErrors.display_name}
+                    {...providerKeyForm.register('display_name')}
+                  />
+                  {formErrors.display_name && (
+                    <p className="text-xs text-destructive">
+                      {formErrors.display_name.message}
+                    </p>
                   )}
-                </Label>
-                <Input
-                  id="apiKey"
-                  type="password"
-                  placeholder={
-                    newProviderIsSelfHosted
-                      ? 'Leave empty if your server has no authentication'
-                      : 'sk-...'
-                  }
-                  disabled={createMutation.isPending}
-                  aria-invalid={!!formErrors.api_key}
-                  {...providerKeyForm.register('api_key')}
-                />
-                {formErrors.api_key ? (
-                  <p className="text-xs text-destructive">
-                    {formErrors.api_key.message}
-                  </p>
-                ) : (
+                </div>
+                <div className="grid gap-2">
+                  <Label htmlFor="apiKey">
+                    API key
+                    {newProviderIsSelfHosted && (
+                      <>
+                        {' '}
+                        <span className="text-muted-foreground font-normal">
+                          (optional)
+                        </span>
+                      </>
+                    )}
+                  </Label>
+                  <Input
+                    id="apiKey"
+                    type="password"
+                    placeholder={
+                      newProviderIsSelfHosted
+                        ? 'Leave empty if your server has no authentication'
+                        : 'sk-...'
+                    }
+                    disabled={createMutation.isPending}
+                    aria-invalid={!!formErrors.api_key}
+                    {...providerKeyForm.register('api_key')}
+                  />
+                  {formErrors.api_key ? (
+                    <p className="text-xs text-destructive">
+                      {formErrors.api_key.message}
+                    </p>
+                  ) : (
+                    <p className="text-xs text-muted-foreground">
+                      Your key is encrypted at rest and never exposed in the
+                      dashboard.
+                    </p>
+                  )}
+                </div>
+                <div className="grid gap-2">
+                  <Label htmlFor="baseUrl">
+                    {newProviderIsSelfHosted ? 'Base URL' : 'Custom Base URL'}{' '}
+                    <span className="text-muted-foreground font-normal">
+                      {newProviderIsSelfHosted ? '(required)' : '(optional)'}
+                    </span>
+                  </Label>
+                  <Input
+                    id="baseUrl"
+                    placeholder={
+                      newProviderIsSelfHosted
+                        ? 'https://api.deepseek.com/v1 or http://10.0.0.5:8000/v1'
+                        : 'https://api.openai.com/v1'
+                    }
+                    disabled={createMutation.isPending}
+                    aria-invalid={!!formErrors.base_url}
+                    {...providerKeyForm.register('base_url', {
+                      onBlur: (event: ChangeEvent<HTMLInputElement>) =>
+                        setCommittedBaseUrl(event.target.value),
+                      onChange: (event: ChangeEvent<HTMLInputElement>) => {
+                        const { inputType } = event.nativeEvent as InputEvent
+                        // A paste or browser autofill arrives whole.
+                        if (
+                          inputType === 'insertFromPaste' ||
+                          inputType === 'insertReplacementText'
+                        ) {
+                          setCommittedBaseUrl(event.target.value)
+                        }
+                      },
+                    })}
+                  />
+                  {formErrors.base_url && (
+                    <p className="text-xs text-destructive">
+                      {formErrors.base_url.message}
+                    </p>
+                  )}
                   <p className="text-xs text-muted-foreground">
-                    Your key is encrypted at rest and never exposed in the
-                    dashboard.
+                    {newProviderIsSelfHosted
+                      ? 'The OpenAI-compatible API root, including /v1: a hosted API or a server on your network. Private addresses must be trusted first.'
+                      : `Only for a proxy or gateway that serves ${providerName(newProvider)}'s own models.`}
                   </p>
-                )}
-              </div>
-              <div className="grid gap-2">
-                <Label htmlFor="baseUrl">
-                  {newProviderIsSelfHosted ? 'Base URL' : 'Custom Base URL'}{' '}
-                  <span className="text-muted-foreground font-normal">
-                    {newProviderIsSelfHosted ? '(required)' : '(optional)'}
-                  </span>
-                </Label>
-                <Input
-                  id="baseUrl"
-                  placeholder={
-                    newProviderIsSelfHosted
-                      ? 'http://10.0.0.5:8000/v1'
-                      : 'https://api.openai.com/v1'
+                  <VendorBaseUrlHint
+                    open={vendorHasCustomBaseUrl(formValues)}
+                    providerName={providerName(newProvider)}
+                    onSwitch={handleSwitchToOpenAiCompatible}
+                    disabled={createMutation.isPending}
+                  />
+                </div>
+                <SelfHostedProviderFields
+                  open={newProviderIsSelfHosted}
+                  baseUrl={formValues.base_url}
+                  committedBaseUrl={committedBaseUrl}
+                  apiKey={formValues.api_key}
+                  trustPrivateAddress={formValues.trust_private_address}
+                  onTrustPrivateAddressChange={(trusted) =>
+                    setFormValue('trust_private_address', trusted)
                   }
+                  canTrustPrivateAddress={canTrustPrivateAddress}
+                  discovery={formValues.discovery}
+                  onDiscovered={(discovery) =>
+                    setFormValue('discovery', discovery)
+                  }
+                  defaultModel={formValues.default_model}
+                  onDefaultModelChange={(model) =>
+                    setFormValue('default_model', model)
+                  }
+                  capabilities={formValues.capabilities}
+                  onCapabilitiesChange={(capabilities) =>
+                    setFormValue('capabilities', capabilities)
+                  }
+                  error={formErrors.default_model?.message}
                   disabled={createMutation.isPending}
-                  aria-invalid={!!formErrors.base_url}
-                  {...providerKeyForm.register('base_url')}
                 />
-                {formErrors.base_url && (
-                  <p className="text-xs text-destructive">
-                    {formErrors.base_url.message}
-                  </p>
-                )}
-                <p className="text-xs text-muted-foreground">
-                  {newProviderIsSelfHosted
-                    ? 'The OpenAI-compatible API root of your server, including /v1. Private addresses must be trusted first.'
-                    : 'Override the default API endpoint for this provider.'}
-                </p>
               </div>
-              <SelfHostedProviderFields
-                open={newProviderIsSelfHosted}
-                baseUrl={formValues.base_url}
-                apiKey={formValues.api_key}
-                trustPrivateAddress={formValues.trust_private_address}
-                onTrustPrivateAddressChange={(trusted) =>
-                  setFormValue('trust_private_address', trusted)
-                }
-                canTrustPrivateAddress={canTrustPrivateAddress}
-                discovery={formValues.discovery}
-                onDiscovered={(discovery) =>
-                  setFormValue('discovery', discovery)
-                }
-                defaultModel={formValues.default_model}
-                onDefaultModelChange={(model) =>
-                  setFormValue('default_model', model)
-                }
-                capabilities={formValues.capabilities}
-                onCapabilitiesChange={(capabilities) =>
-                  setFormValue('capabilities', capabilities)
-                }
-                error={formErrors.default_model?.message}
-                disabled={createMutation.isPending}
-              />
             </div>
             <p className="text-xs text-muted-foreground">
               {newProviderIsSelfHosted
@@ -4763,7 +5138,10 @@ console.log(response.choices[0].message.content);`,
             <DialogFooter>
               <Button
                 onClick={handleCreate}
-                disabled={createMutation.isPending}
+                disabled={
+                  createMutation.isPending ||
+                  !canSubmitProviderKeyForm({ provider: newProvider })
+                }
                 className="w-full sm:w-auto"
               >
                 {createMutation.isPending ? (
@@ -4780,16 +5158,38 @@ console.log(response.choices[0].message.content);`,
         </DialogContent>
       </Dialog>
 
+      <ReplaceProviderKeyDialog
+        open={replaceOpen}
+        onOpenChange={setReplaceOpen}
+        keyName={replacingKey?.display_name ?? ''}
+        providerName={replacingKey ? providerName(replacingKey.provider) : ''}
+        pending={replaceMutation.isPending}
+        error={
+          replaceMutation.isError
+            ? apiErrorMessage(replaceMutation.error)
+            : null
+        }
+        onReplace={(apiKey) =>
+          replacingKey
+            ? replaceMutation.mutateAsync({ id: replacingKey.id, apiKey })
+            : Promise.reject(new Error('No provider key selected'))
+        }
+      />
+
       {/* Delete Confirmation Dialog */}
-      <DeleteConfirmDialog
+      <ConfirmDeleteDialog
         open={deleteDialogOpen}
         onOpenChange={(open) => {
           setDeleteDialogOpen(open)
           if (!open) setSelectedKey(null)
         }}
-        providerKey={selectedKey}
-        onConfirm={(id) => deleteMutation.mutate(id)}
+        resourceType="provider key"
+        resourceName={selectedKey?.display_name ?? ''}
+        consequences="Requests will no longer be routed through this provider key."
         isPending={deleteMutation.isPending}
+        onConfirm={() => {
+          if (selectedKey) deleteMutation.mutate(selectedKey.id)
+        }}
       />
     </div>
   )

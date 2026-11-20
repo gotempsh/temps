@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { ProjectResponse } from '@/api/client'
+import type { ProjectResponse, ProjectSecretResponse } from '@/api/client'
 import {
   createProjectSecretMutation,
   deleteProjectSecretMutation,
@@ -9,18 +9,9 @@ import {
   listProjectSecretsOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { Button } from '@/components/ui/button'
+import { PageHeader } from '@temps-sdk/ds'
 import { EmptyState } from '@/components/ui/empty-state'
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-  AlertDialogTrigger,
-} from '@/components/ui/alert-dialog'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import {
   Dialog,
   DialogContent,
@@ -36,7 +27,7 @@ import { Label } from '@/components/ui/label'
 import { KbdBadge } from '@/components/ui/kbd-badge'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { FileLock2, Plus, Trash2 } from 'lucide-react'
+import { FileLock2, Pencil, Plus, Trash2 } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import { Link, useLocation, useNavigate } from 'react-router'
 import { detailReturnState } from '@/lib/detail-return-path'
@@ -49,6 +40,8 @@ import {
   type EnvironmentVariableCheck,
 } from './EnvironmentVariableChecks'
 import { indicatorsBySubject, useHttpChecks } from './http-checks'
+import { SecretEditDialog } from './SecretEditDialog'
+import { composeServiceNamesFor } from './secret-form'
 
 interface SecretsSettingsProps {
   project: ProjectResponse
@@ -86,6 +79,9 @@ export function SecretsSettings({ project }: SecretsSettingsProps) {
   })
 
   const [isCreateOpen, setIsCreateOpen] = useState(false)
+  // The id outlives the dialog so its content stays put while it fades out.
+  const [editingSecretId, setEditingSecretId] = useState<number | null>(null)
+  const [isEditOpen, setIsEditOpen] = useState(false)
 
   useKeyboardShortcut({
     key: 'n',
@@ -102,38 +98,44 @@ export function SecretsSettings({ project }: SecretsSettingsProps) {
   }
 
   const secrets = secretsQuery.data ?? []
+  const editingSecret: ProjectSecretResponse | null =
+    secrets.find((s) => s.id === editingSecretId) ?? null
   const environments = environmentsQuery.data ?? []
+  const liveEnvironmentIds = useMemo(
+    () =>
+      environmentsQuery.data
+        ? new Set(environmentsQuery.data.map((environment) => environment.id))
+        : undefined,
+    [environmentsQuery.data]
+  )
   const composeServiceNames = composeServiceNamesFor(project)
   const isComposeProject = project.preset === 'docker-compose'
 
   return (
     <div className="space-y-6">
-      <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
-        <div>
-          <p className="text-sm text-muted-foreground max-w-2xl">
-            Secrets are mounted into your containers as files at{' '}
-            <code className="text-xs bg-muted px-1.5 py-0.5 rounded">
+      <PageHeader
+        title="Secrets"
+        description={
+          <>
+            Mounted read-only at{' '}
+            <code className="rounded bg-muted px-1.5 py-0.5 text-xs">
               /run/secrets/&lt;KEY&gt;
             </code>{' '}
-            as a read-only mount. They are never visible via{' '}
-            <code className="text-xs bg-muted px-1.5 py-0.5 rounded">
+            in every container, never as environment variables or in{' '}
+            <code className="rounded bg-muted px-1.5 py-0.5 text-xs">
               docker inspect
-            </code>{' '}
-            and never injected as environment variables. Read with e.g.{' '}
-            <code className="text-xs bg-muted px-1.5 py-0.5 rounded">
-              fs.readFileSync(&apos;/run/secrets/DB_PASSWORD&apos;,
-              &apos;utf8&apos;)
             </code>
-            . Docker Compose projects get the same mount in every service. A
-            redeploy is required for new or updated secrets to take effect.
-          </p>
-        </div>
-        <Button onClick={() => setIsCreateOpen(true)}>
-          <Plus className="h-4 w-4 mr-1" />
-          New secret
-          <KbdBadge keys={['N']} className="ml-2 hidden sm:inline-flex" />
-        </Button>
-      </div>
+            . Redeploy to apply changes.
+          </>
+        }
+        actions={
+          <Button onClick={() => setIsCreateOpen(true)}>
+            <Plus className="h-4 w-4 mr-1" />
+            New secret
+            <KbdBadge keys={['N']} className="ml-2 hidden sm:inline-flex" />
+          </Button>
+        }
+      />
 
       {secretsQuery.isPending ? (
         <div className="space-y-2">
@@ -142,26 +144,25 @@ export function SecretsSettings({ project }: SecretsSettingsProps) {
         </div>
       ) : secrets.length === 0 ? (
         <EmptyState
+          size="compact"
           icon={FileLock2}
           title="No secrets yet"
-          description="Secrets are mounted into your containers as read-only files. Add one to get started."
-          action={
-            <Button onClick={() => setIsCreateOpen(true)}>
-              <Plus className="h-4 w-4 mr-1" />
-              New secret
-              <KbdBadge keys={['N']} className="ml-2 hidden sm:inline-flex" />
-            </Button>
-          }
+          description="Read one in your app as a file, e.g. /run/secrets/DB_PASSWORD."
         />
       ) : (
-        <div className="border rounded-md divide-y">
+        <div className="divide-y border-y">
           {secrets.map((s) => (
             <SecretRow
               key={s.id}
               secret={s}
               projectId={project.id}
               detailPath={secretPath(s.id)}
+              liveEnvironmentIds={liveEnvironmentIds}
               checks={checksBySecret.get(s.id) ?? []}
+              onEdit={() => {
+                setEditingSecretId(s.id)
+                setIsEditOpen(true)
+              }}
               onManageChecks={() =>
                 navigate(secretPath(s.id), {
                   state: detailReturnState(location),
@@ -178,6 +179,13 @@ export function SecretsSettings({ project }: SecretsSettingsProps) {
           ))}
         </div>
       )}
+
+      <SecretEditDialog
+        open={isEditOpen && editingSecret !== null}
+        onOpenChange={setIsEditOpen}
+        project={project}
+        secret={editingSecret}
+      />
 
       <CreateSecretDialog
         open={isCreateOpen}
@@ -198,32 +206,36 @@ export function SecretsSettings({ project }: SecretsSettingsProps) {
   )
 }
 
+/**
+ * Where a secret is mounted, for its list row. Bindings to deleted
+ * environments are kept by the server (a restored environment gets its secrets
+ * back) but mount nowhere. They still count as a scope: a secret bound only to
+ * deleted environments is not "All environments", which is what an empty
+ * binding list means.
+ */
+function secretScopeLabel(
+  environments: Array<{ id: number; name: string }>,
+  liveIds: ReadonlySet<number> | undefined
+): string {
+  if (environments.length === 0) return 'All environments'
+  const active = liveIds
+    ? environments.filter((environment) => liveIds.has(environment.id))
+    : environments
+  const deletedCount = environments.length - active.length
+  const deleted =
+    deletedCount === 0
+      ? ''
+      : `${deletedCount} deleted ${deletedCount === 1 ? 'environment' : 'environments'}`
+  if (active.length === 0) return `Only ${deleted} (not mounted anywhere)`
+  const names = active.map((environment) => environment.name).join(', ')
+  return deleted ? `${names} • ${deleted}` : names
+}
+
 /** A secret with no environments is mounted in every environment. */
 function secretScope(environments: Array<{ id: number }>): VariableChangeScope {
   return environments.length === 0
     ? 'all'
     : environments.map((environment) => environment.id)
-}
-
-/** Compose service names the project last synced from its compose file.
- *  Empty for non-Compose presets, which deploy a single container. */
-function composeServiceNamesFor(project: {
-  preset?: string | null
-  preset_config?: unknown
-}): string[] {
-  const cfg = (project.preset_config ?? {}) as Record<string, unknown>
-  const services = (cfg.composeServices ??
-    cfg.compose_services ??
-    []) as Array<{
-    name?: string
-  }>
-  return Array.from(
-    new Set(
-      services
-        .map((service) => service?.name)
-        .filter((name): name is string => typeof name === 'string' && !!name)
-    )
-  ).sort()
 }
 
 interface SecretRowProps {
@@ -238,7 +250,10 @@ interface SecretRowProps {
   }
   projectId: number
   detailPath: string
+  /** Ids of the project's current environments; undefined while not loaded. */
+  liveEnvironmentIds: ReadonlySet<number> | undefined
   checks: EnvironmentVariableCheck[]
+  onEdit: () => void
   onManageChecks: () => void
   onDeleted: () => void
 }
@@ -247,17 +262,22 @@ function SecretRow({
   secret,
   projectId,
   detailPath,
+  liveEnvironmentIds,
   checks,
+  onEdit,
   onManageChecks,
   onDeleted,
 }: SecretRowProps) {
   const location = useLocation()
+  const [isDeleteOpen, setIsDeleteOpen] = useState(false)
   const deleteMutation = useMutation({
     ...deleteProjectSecretMutation(),
     onSuccess: () => {
+      setIsDeleteOpen(false)
       onDeleted()
     },
     onError: (err: Error) => {
+      setIsDeleteOpen(false)
       toast.error(
         err instanceof Error ? err.message : 'Failed to delete secret'
       )
@@ -276,9 +296,7 @@ function SecretRow({
           {secret.key}
         </Link>
         <div className="text-xs text-muted-foreground">
-          {secret.environments.length === 0
-            ? 'All environments'
-            : secret.environments.map((e) => e.name).join(', ')}
+          {secretScopeLabel(secret.environments, liveEnvironmentIds)}
           {secret.include_in_preview ? ' • preview enabled' : ''}
           {secret.compose_services && secret.compose_services.length > 0
             ? ` • only ${secret.compose_services.join(', ')}`
@@ -289,40 +307,37 @@ function SecretRow({
         ••••••••
       </span>
       <EnvironmentVariableChecks checks={checks} onManage={onManageChecks} />
-      <AlertDialog>
-        <AlertDialogTrigger asChild>
-          <Button
-            variant="ghost"
-            size="icon"
-            className="text-muted-foreground hover:text-destructive"
-            aria-label={`Delete secret ${secret.key}`}
-          >
-            <Trash2 className="h-4 w-4" />
-          </Button>
-        </AlertDialogTrigger>
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Delete secret {secret.key}?</AlertDialogTitle>
-            <AlertDialogDescription>
-              Running containers keep their mounted secret file until the next
-              deployment. New deployments will not receive this secret.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              onClick={() =>
-                deleteMutation.mutate({
-                  path: { project_id: projectId, secret_id: secret.id },
-                })
-              }
-              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-            >
-              Delete
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+      <Button
+        variant="ghost"
+        size="icon"
+        className="text-muted-foreground"
+        aria-label={`Edit secret ${secret.key}`}
+        onClick={onEdit}
+      >
+        <Pencil className="h-4 w-4" />
+      </Button>
+      <Button
+        variant="ghost"
+        size="icon"
+        className="text-muted-foreground hover:text-destructive"
+        aria-label={`Delete secret ${secret.key}`}
+        onClick={() => setIsDeleteOpen(true)}
+      >
+        <Trash2 className="h-4 w-4" />
+      </Button>
+      <ConfirmDeleteDialog
+        open={isDeleteOpen}
+        onOpenChange={setIsDeleteOpen}
+        resourceType="secret"
+        resourceName={secret.key}
+        consequences="Running containers keep their mounted secret file until the next deployment. New deployments will not receive this secret."
+        isPending={deleteMutation.isPending}
+        onConfirm={() =>
+          deleteMutation.mutate({
+            path: { project_id: projectId, secret_id: secret.id },
+          })
+        }
+      />
     </div>
   )
 }
@@ -513,7 +528,7 @@ function CreateSecretDialog({
               <p className="text-xs text-muted-foreground mt-2">
                 This secret will be mounted in every service. To restrict it to
                 specific containers — so a database or sidecar can&apos;t read
-                an application&apos;s credentials — sync this project&apos;s
+                an application&apos;s credentials — sync this service&apos;s
                 compose services from Git settings, then edit the secret.
               </p>
             </div>

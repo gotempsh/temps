@@ -97,7 +97,7 @@ impl OpenAiCompatProvider {
         let response_body = read_limited_responses_body(response, &request.model).await?;
         let payload =
             serde_json::from_slice::<serde_json::Value>(&response_body).map_err(|error| {
-                AiGatewayError::TranslationError {
+                AiGatewayError::UpstreamMalformedResponse {
                     provider: self.info.id.to_string(),
                     reason: format!("Failed to parse Responses result: {error}"),
                 }
@@ -328,7 +328,7 @@ impl OpenAiCompatProvider {
         Self::new(
             ProviderInfo {
                 id: crate::self_hosted::OPENAI_COMPATIBLE,
-                display_name: "Self-hosted (OpenAI-compatible)",
+                display_name: "OpenAI-compatible",
                 default_base_url: "",
                 capabilities: &[
                     ProviderCapability::ChatCompletion,
@@ -394,6 +394,9 @@ impl AiProvider for OpenAiCompatProvider {
         if self.info.id == "openai" {
             sanitize_openai_request(&mut req);
         }
+        if super::prompt_cache::uses_explicit_prompt_cache(self.info.id, &req.model) {
+            super::prompt_cache::mark_cache_breakpoints(&mut req.messages);
+        }
 
         let response = with_bearer(self.client.post(&url), api_key)
             .json(&req)
@@ -413,14 +416,10 @@ impl AiProvider for OpenAiCompatProvider {
             });
         }
 
-        let completion: ChatCompletionResponse =
-            response
-                .json()
-                .await
-                .map_err(|e| AiGatewayError::TranslationError {
-                    provider: self.info.id.to_string(),
-                    reason: format!("Failed to parse response: {}", e),
-                })?;
+        let completion: ChatCompletionResponse = response
+            .json()
+            .await
+            .map_err(|e| crate::error::response_body_error(self.info.id, "response", e))?;
 
         Ok(completion)
     }
@@ -444,6 +443,9 @@ impl AiProvider for OpenAiCompatProvider {
 
         if self.info.id == "openai" {
             sanitize_openai_request(&mut req);
+        }
+        if super::prompt_cache::uses_explicit_prompt_cache(self.info.id, &req.model) {
+            super::prompt_cache::mark_cache_breakpoints(&mut req.messages);
         }
 
         // Inject stream_options.include_usage so the final chunk includes token counts
@@ -520,14 +522,9 @@ impl AiProvider for OpenAiCompatProvider {
             });
         }
 
-        let embedding: EmbeddingResponse =
-            response
-                .json()
-                .await
-                .map_err(|e| AiGatewayError::TranslationError {
-                    provider: self.info.id.to_string(),
-                    reason: format!("Failed to parse embedding response: {}", e),
-                })?;
+        let embedding: EmbeddingResponse = response.json().await.map_err(|e| {
+            crate::error::response_body_error(self.info.id, "embedding response", e)
+        })?;
 
         Ok(embedding)
     }

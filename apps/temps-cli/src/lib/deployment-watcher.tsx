@@ -6,12 +6,21 @@ import { render, Box, Text, Newline } from 'ink'
 import Spinner from 'ink-spinner'
 import { config, credentials } from '../config/store.js'
 import { normalizeApiUrl, getWebUrl } from './api-client.js'
+import {
+  primaryEnvironmentUrl,
+  reachabilityWarningLines,
+  type ReachabilityWarning,
+} from './reachability-warning.js'
 
 interface DeploymentEnvironment {
   id: number
   name: string
   slug: string
   domains: string[]
+  /** The environment's primary address (ADR 068 D4), as a URL. */
+  primary_url?: string | null
+  /** Why nobody can reach the environment yet, when the server knows. */
+  no_address_reason?: string | null
   /** Public Docker Compose service URLs, one per public port. */
   service_urls?: { service: string; port: number; url: string }[]
 }
@@ -23,6 +32,8 @@ interface DeploymentResponse {
   url?: string
   cancelled_reason?: string
   environment?: DeploymentEnvironment
+  /** Set when the deploy finished and nobody can reach it (ADR 068 D5). */
+  reachability_warning?: ReachabilityWarning | null
 }
 
 interface DeploymentJobResponse {
@@ -447,14 +458,25 @@ export function DeploymentWatcher({
                   <Text color="cyan" bold>{deployment.url}</Text>
                 </Box>
               )}
-              {deployment?.environment?.domains?.[0] && (
-                <Box marginLeft={3}>
-                  <Text>Domain: </Text>
-                  <Text color="cyan" bold>
-                    {deployment.environment.domains[0].startsWith('http')
-                      ? deployment.environment.domains[0]
-                      : `https://${deployment.environment.domains[0]}`}
-                  </Text>
+              {deployment?.environment &&
+                primaryEnvironmentUrl(deployment.environment) && (
+                  <Box marginLeft={3}>
+                    <Text>Domain: </Text>
+                    <Text color="cyan" bold>
+                      {primaryEnvironmentUrl(deployment.environment)}
+                    </Text>
+                  </Box>
+                )}
+              {deployment?.reachability_warning && (
+                // The deploy succeeded; this says who cannot reach it yet.
+                <Box marginLeft={1} marginTop={1} flexDirection="column">
+                  {reachabilityWarningLines(deployment.reachability_warning).map(
+                    (line, index) => (
+                      <Text key={index} color="yellow">
+                        {line}
+                      </Text>
+                    ),
+                  )}
                 </Box>
               )}
               {deployment?.environment?.service_urls?.map((route) => (

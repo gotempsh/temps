@@ -1,11 +1,14 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { RedirectWithQuery } from '@/components/routing/RedirectWithQuery'
+import { RetiredAiWorkspaceRedirect } from '@/components/routing/RetiredAiWorkspaceRedirect'
 import { CommandPalette } from '@/components/command/CommandPalette'
 import {
   CompactErrorFallback,
   ErrorBoundary,
   ErrorFallback,
+  RouteQueryFailureBanner,
 } from '@/components/error'
 import { ThemeProvider } from '@/components/providers/ThemeProvider'
 import { ThemeWrapper } from '@/components/theme/ThemeWrapper'
@@ -18,16 +21,17 @@ import {
   type ConsoleExtensions,
 } from '@temps-sdk/console-kit'
 import {
+  MutationCache,
   QueryCache,
   QueryClient,
   QueryClientProvider,
 } from '@tanstack/react-query'
 import { getCurrentUserOptions } from '@/api/client/@tanstack/react-query.gen'
-import { Loader2 } from 'lucide-react'
 import { lazy, Suspense, useEffect } from 'react'
-import { BrowserRouter, Navigate, Route, Routes } from 'react-router'
+import { BrowserRouter, Route, Routes, useLocation } from 'react-router'
 import { toast, Toaster } from 'sonner'
 import { gitProviderSetupPath, problemSetupPath } from '@/lib/api-problem'
+import { useScrollToLinkedSection } from '@/hooks/useOpenSectionFromHash'
 import {
   nodeCapabilityQueryKey,
   type NodeCapability,
@@ -43,12 +47,24 @@ import {
 import { ProblemDetails } from './api/client'
 import { client } from './api/client/client.gen'
 import { attachHttpStatus } from './lib/http-error-status'
+import {
+  installUnhandledRejectionReporter,
+  markErrorReported,
+} from './lib/unhandled-rejections'
+import { announceMutationFailure } from './lib/mutation-error-toast'
 import { shouldRetryQuery } from './lib/query-retry'
 import { Header } from './components/dashboard/Header'
+import { useVisualViewportFit } from './hooks/useVisualViewportFit'
 import AppSidebar from './components/dashboard/Sidebar'
+import { ComposeVersionAlert } from './components/alerts/ComposeVersionAlert'
 import { DiskSpaceAlert } from './components/alerts/DiskSpaceAlert'
 import { UpdateAvailableBanner } from './components/alerts/UpdateAvailableBanner'
 import { AiHarnessPendingBanner } from './components/alerts/AiHarnessPendingBanner'
+import {
+  AppLoadingScreen,
+  PageSkeleton,
+} from './components/layout/AppLoadingScreen'
+import { AcmeContactEmailBanner } from './components/alerts/AcmeContactEmailBanner'
 import { ProtectedLayout } from './components/layout/ProtectedLayout'
 import SandboxPreviewAccess from './pages/SandboxPreviewAccess'
 import { SettingsLayout } from './components/settings/SettingsLayout'
@@ -87,12 +103,46 @@ const PlatformTools = lazy(() =>
 const Projects = lazy(() =>
   import('./pages/Projects').then((m) => ({ default: m.Projects }))
 )
+const ConnectGroupRepository = lazy(() =>
+  import('./pages/ConnectGroupRepository').then((m) => ({
+    default: m.ConnectGroupRepository,
+  }))
+)
+const ProjectGroupDetail = lazy(() =>
+  import('./pages/ProjectGroupDetail').then((m) => ({
+    default: m.ProjectGroupDetail,
+  }))
+)
 const Revenue = lazy(() =>
   import('./pages/Revenue').then((m) => ({ default: m.Revenue }))
+)
+const StatusPages = lazy(() =>
+  import('./pages/StatusPages').then((m) => ({ default: m.StatusPages }))
+)
+const NewStatusPagePage = lazy(() =>
+  import('./pages/StatusPages').then((m) => ({ default: m.NewStatusPagePage }))
+)
+const StatusPageDetailPage = lazy(() =>
+  import('./pages/StatusPages').then((m) => ({
+    default: m.StatusPageDetailPage,
+  }))
 )
 const Sandboxes = lazy(() => import('./pages/Sandboxes'))
 const WorkspaceDetail = lazy(() => import('./pages/WorkspaceDetail'))
 const SandboxDetail = lazy(() => import('./pages/SandboxDetail'))
+const AccessSessionCreatePage = lazy(
+  () => import('./pages/AccessSessionCreatePage')
+)
+const AccessSessionDetailPage = lazy(
+  () => import('./pages/AccessSessionDetailPage')
+)
+const AccessBundleDetailPage = lazy(
+  () => import('./pages/AccessBundleDetailPage')
+)
+const AccessBundlePage = lazy(() => import('./pages/AccessBundlePage'))
+const VaultDetailPage = lazy(() => import('./pages/VaultDetailPage'))
+const VaultPage = lazy(() => import('./pages/VaultPage'))
+const AccessServicePage = lazy(() => import('./pages/AccessServicePage'))
 const Storage = lazy(() =>
   import('./pages/Storage').then((m) => ({ default: m.Storage }))
 )
@@ -199,8 +249,43 @@ const AddDomain = lazy(() =>
 const DomainDetail = lazy(() =>
   import('./pages/DomainDetail').then((m) => ({ default: m.DomainDetail }))
 )
+const TunnelDomainDetail = lazy(() =>
+  import('./pages/TunnelDomainDetail').then((m) => ({
+    default: m.TunnelDomainDetail,
+  }))
+)
 const Certificates = lazy(() =>
   import('./pages/Certificates').then((m) => ({ default: m.Certificates }))
+)
+const ProjectWorkflowKeys = lazy(() =>
+  import('./pages/workflows/ProjectWorkflowKeys').then((m) => ({
+    default: m.ProjectWorkflowKeys,
+  }))
+)
+const WorkflowSettings = lazy(() =>
+  import('./pages/workflows/WorkflowSettings').then((m) => ({
+    default: m.WorkflowSettings,
+  }))
+)
+const WorkflowGrants = lazy(() =>
+  import('./pages/workflows/WorkflowGrants').then((m) => ({
+    default: m.WorkflowGrants,
+  }))
+)
+const AllWorkflows = lazy(() =>
+  import('./pages/workflows/AllWorkflows').then((m) => ({
+    default: m.AllWorkflows,
+  }))
+)
+const WorkflowDetail = lazy(() =>
+  import('./pages/workflows/WorkflowDetail').then((m) => ({
+    default: m.WorkflowDetail,
+  }))
+)
+const WorkflowRunDetail = lazy(() =>
+  import('./pages/workflows/WorkflowRunDetail').then((m) => ({
+    default: m.WorkflowRunDetail,
+  }))
 )
 const Backups = lazy(() =>
   import('./pages/Backups').then((m) => ({ default: m.Backups }))
@@ -240,7 +325,9 @@ const ImportProject = lazy(() =>
 )
 const Import = lazy(() => import('./pages/Import'))
 const ProjectDetail = lazy(() =>
-  import('./pages/ProjectDetail').then((m) => ({ default: m.ProjectDetail }))
+  import('./pages/ProjectDetail').then((m) => ({
+    default: m.ProjectDetail,
+  }))
 )
 const Settings = lazy(() =>
   import('./pages/Settings').then((m) => ({ default: m.Settings }))
@@ -279,6 +366,9 @@ const AuditLogs = lazy(() =>
 )
 const CliLogin = lazy(() =>
   import('./pages/CliLogin').then((m) => ({ default: m.CliLogin }))
+)
+const IngressLogin = lazy(() =>
+  import('./pages/IngressLogin').then((m) => ({ default: m.IngressLogin }))
 )
 const ProxyLogs = lazy(() => import('./pages/ProxyLogs'))
 const ProxyMetrics = lazy(() => import('./pages/ProxyMetrics'))
@@ -334,6 +424,11 @@ const SecurityPage = lazy(() =>
     default: m.SecurityPage,
   }))
 )
+const ShieldProposalsPage = lazy(() =>
+  import('./pages/settings/ShieldProposalsPage').then((m) => ({
+    default: m.ShieldProposalsPage,
+  }))
+)
 const RateLimitingPage = lazy(() =>
   import('./pages/settings/RateLimitingPage').then((m) => ({
     default: m.RateLimitingPage,
@@ -342,6 +437,11 @@ const RateLimitingPage = lazy(() =>
 const RequestTimeoutsPage = lazy(() =>
   import('./pages/settings/RequestTimeoutsPage').then((m) => ({
     default: m.RequestTimeoutsPage,
+  }))
+)
+const ServiceHealthchecksPage = lazy(() =>
+  import('./pages/settings/ServiceHealthchecksPage').then((m) => ({
+    default: m.ServiceHealthchecksPage,
   }))
 )
 const OnDemandTlsPage = lazy(() =>
@@ -404,6 +504,21 @@ const TelemetrySettingsPage = lazy(() =>
     default: m.TelemetrySettingsPage,
   }))
 )
+const DnsPage = lazy(() =>
+  import('./pages/settings/DnsPage').then((m) => ({
+    default: m.DnsPage,
+  }))
+)
+const NetworkPolicyPage = lazy(() =>
+  import('./pages/settings/NetworkPolicyPage').then((m) => ({
+    default: m.NetworkPolicyPage,
+  }))
+)
+const IngressSetupPage = lazy(() =>
+  import('./pages/settings/IngressSetupPage').then((m) => ({
+    default: m.IngressSetupPage,
+  }))
+)
 const NodeDetailPage = lazy(() =>
   import('./pages/settings/NodesPage').then((m) => ({
     default: m.NodeDetailPage,
@@ -412,6 +527,11 @@ const NodeDetailPage = lazy(() =>
 const AiGateway = lazy(() =>
   import('./pages/AiGateway').then((m) => ({
     default: m.AiGatewayPage,
+  }))
+)
+const AiGatewayLimitsPage = lazy(() =>
+  import('./pages/AiGatewayLimitsPage').then((m) => ({
+    default: m.AiGatewayLimitsPage,
   }))
 )
 const AiGatewayUsagePage = lazy(() =>
@@ -424,75 +544,25 @@ const AiGatewayActivityPage = lazy(() =>
     default: m.AiGatewayActivityPage,
   }))
 )
-const AiGatewaySetupPage = lazy(() =>
-  import('./pages/AiGatewaySetupPage').then((m) => ({
-    default: m.AiGatewaySetupPage,
-  }))
-)
 
 const AiChat = lazy(() =>
   import('./pages/AiChat').then((m) => ({
     default: m.AiChat,
   }))
 )
-const AiFirstPrototype = lazy(() =>
-  import('./pages/AiFirstPrototype').then((m) => ({
-    default: m.AiFirstPrototype,
+const SandboxSettingsPage = lazy(() =>
+  import('./pages/sandbox-settings/SandboxSettingsPage').then((m) => ({
+    default: m.SandboxSettingsPage,
   }))
 )
-const AiWorkflowsOverview = lazy(() =>
-  import('./pages/AiWorkflowsOverview').then((m) => ({
-    default: m.AiWorkflowsOverview,
-  }))
-)
-const AgentSandboxLayout = lazy(() =>
-  import('./pages/agent-sandbox/AgentSandboxLayout').then((m) => ({
-    default: m.AgentSandboxLayout,
-  }))
-)
-const AgentSandboxDashboard = lazy(() =>
-  import('./pages/agent-sandbox/AgentSandboxDashboard').then((m) => ({
-    default: m.AgentSandboxDashboard,
-  }))
-)
-const AgentSandboxProvidersList = lazy(() =>
+const AutofixCredentialsList = lazy(() =>
   import('./pages/agent-sandbox/AgentSandboxProvidersList').then((m) => ({
     default: m.AgentSandboxProvidersList,
   }))
 )
-const AgentSandboxProviderDetail = lazy(() =>
+const AutofixCredentialDetail = lazy(() =>
   import('./pages/agent-sandbox/AgentSandboxProviderDetail').then((m) => ({
     default: m.AgentSandboxProviderDetail,
-  }))
-)
-const AgentSandboxSandboxPage = lazy(() =>
-  import('./pages/agent-sandbox/AgentSandboxSandboxPage').then((m) => ({
-    default: m.AgentSandboxSandboxPage,
-  }))
-)
-const AgentSandboxPreviewPage = lazy(() =>
-  import('./pages/agent-sandbox/AgentSandboxPreviewPage').then((m) => ({
-    default: m.AgentSandboxPreviewPage,
-  }))
-)
-const AgentSandboxSecretsPage = lazy(() =>
-  import('./pages/agent-sandbox/AgentSandboxSecretsPage').then((m) => ({
-    default: m.AgentSandboxSecretsPage,
-  }))
-)
-const GlobalSkillsSettingsPage = lazy(() =>
-  import('./components/settings/GlobalSkillsSettings').then((m) => ({
-    default: m.GlobalSkillsSettings,
-  }))
-)
-const GlobalMcpServersSettingsPage = lazy(() =>
-  import('./components/settings/GlobalMcpServersSettings').then((m) => ({
-    default: m.GlobalMcpServersSettings,
-  }))
-)
-const GlobalSkillDetailPage = lazy(() =>
-  import('./pages/settings/GlobalSkillDetail').then((m) => ({
-    default: m.GlobalSkillDetail,
   }))
 )
 const OtelPipelineStatusPage = lazy(() =>
@@ -505,22 +575,17 @@ const TraefikDiscoveryPage = lazy(() =>
     default: m.TraefikDiscoveryPage,
   }))
 )
-const GlobalMcpServerDetailPage = lazy(() =>
-  import('./pages/settings/GlobalMcpServerDetail').then((m) => ({
-    default: m.GlobalMcpServerDetail,
-  }))
-)
-
-// Loading component
-const PageLoader = () => (
-  <div className="flex items-center justify-center min-h-[400px]">
-    <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
-  </div>
-)
 
 // Full app routes with sidebar
 const FullAppRoutes = () => {
   const { routes: extraRoutes } = useConsoleExtensions()
+  // The assistant is a focus mode: no console sidebar, header or banners, just
+  // the conversation. Its own header carries the way back to the console.
+  const focusMode = useLocation().pathname === '/chat'
+  // On a phone the keyboard must not push the header off screen.
+  useVisualViewportFit(focusMode)
+  // A link to a setting lands on that setting, on every page.
+  useScrollToLinkedSection()
 
   // Lock the document to the viewport while the app shell is mounted. The shell
   // is a fixed-height (`dvh`) layout whose content scrolls in inner containers,
@@ -552,53 +617,74 @@ const FullAppRoutes = () => {
         <AutofixOnboardingProvider>
           <SidebarProvider>
             {/* Wrap sidebar with independent error boundary */}
-            <ErrorBoundary
-              fallback={(error, _errorInfo, resetError) => (
-                <CompactErrorFallback
-                  error={error}
-                  resetError={resetError}
-                  componentName="Sidebar"
-                />
-              )}
-              onError={(error, errorInfo) => {
-                console.error('[App] Sidebar error caught by boundary:', error)
-                console.error(
-                  '[App] Component stack:',
-                  errorInfo.componentStack
-                )
-              }}
-            >
-              <AppSidebar />
-            </ErrorBoundary>
-            <SidebarInset>
-              {/* App-wide disk-space banner — sits above the header inside the
-              content column (to the right of the fixed sidebar, so it's never
-              clipped by it), full content width, on every page. */}
-              <DiskSpaceAlert />
-              {/* App-wide "newer release published" banner — informational, per-
-              version dismissible, links the upgrade docs. */}
-              <UpdateAvailableBanner />
-              <AiHarnessPendingBanner />
-              {/* Wrap header with independent error boundary */}
+            {!focusMode && (
               <ErrorBoundary
                 fallback={(error, _errorInfo, resetError) => (
                   <CompactErrorFallback
                     error={error}
                     resetError={resetError}
-                    componentName="Header"
-                    minimal
+                    componentName="Sidebar"
                   />
                 )}
                 onError={(error, errorInfo) => {
-                  console.error('[App] Header error caught by boundary:', error)
+                  console.error(
+                    '[App] Sidebar error caught by boundary:',
+                    error
+                  )
                   console.error(
                     '[App] Component stack:',
                     errorInfo.componentStack
                   )
                 }}
               >
-                <Header />
+                <AppSidebar />
               </ErrorBoundary>
+            )}
+            <SidebarInset
+              className={
+                focusMode
+                  ? 'max-md:fixed max-md:inset-x-0 max-md:top-[var(--app-top,0px)] max-md:h-[var(--app-height,100dvh)]'
+                  : undefined
+              }
+            >
+              {/* App-wide disk-space banner — sits above the header inside the
+              content column (to the right of the fixed sidebar, so it's never
+              clipped by it), full content width, on every page. */}
+              {!focusMode && <DiskSpaceAlert />}
+              {/* App-wide "newer release published" banner — informational, per-
+              version dismissible, links the upgrade docs. */}
+              {!focusMode && <UpdateAvailableBanner />}
+              {!focusMode && <AiHarnessPendingBanner />}
+              {/* Docker Compose CLI too old/missing for Compose deployments. */}
+              {!focusMode && <ComposeVersionAlert />}
+              {/* HTTPS for environment URLs needs a Let's Encrypt contact; asks
+              for it inline while on-demand TLS is on and nothing else blocks. */}
+              {!focusMode && <AcmeContactEmailBanner />}
+              {/* Wrap header with independent error boundary */}
+              {!focusMode && (
+                <ErrorBoundary
+                  fallback={(error, _errorInfo, resetError) => (
+                    <CompactErrorFallback
+                      error={error}
+                      resetError={resetError}
+                      componentName="Header"
+                      minimal
+                    />
+                  )}
+                  onError={(error, errorInfo) => {
+                    console.error(
+                      '[App] Header error caught by boundary:',
+                      error
+                    )
+                    console.error(
+                      '[App] Component stack:',
+                      errorInfo.componentStack
+                    )
+                  }}
+                >
+                  <Header />
+                </ErrorBoundary>
+              )}
               {/* Wrap page content with error boundary */}
               <ErrorBoundary
                 fallback={(error, errorInfo, resetError) => (
@@ -623,439 +709,669 @@ const FullAppRoutes = () => {
                     with a banner showing this box hung past the bottom of
                     the screen. Anything sized to 100% of it — a plugin
                     iframe, say — lost its last rows off-screen. */}
-                <div className="flex-1 min-h-0 overflow-y-auto py-2 px-0 sm:p-4">
-                  <Routes>
-                    {extraRoutes?.map((r) => (
-                      <Route key={r.path} path={r.path} element={r.element} />
-                    ))}
-                    <Route
-                      path="/"
-                      element={<Navigate to="/projects" replace />}
-                    />
-                    <Route
-                      path="/dashboard"
-                      element={<Navigate to="/projects" replace />}
-                    />
-                    <Route path="/account" element={<Account />} />
-                    <Route path="/setup" element={<Setup />} />
-                    <Route path="/get-started" element={<GetStarted />} />
-                    <Route path="/setup/ai" element={<AiOnboarding />} />
-                    <Route path="/tools" element={<PlatformTools />} />
-                    <Route path="/projects" element={<Projects />} />
-                    <Route
-                      path="/drop"
-                      element={
-                        <Navigate to="/projects/new?source=drop" replace />
-                      }
-                    />
-                    <Route path="/revenue" element={<Revenue />} />
-                    <Route path="/sandboxes" element={<Sandboxes />} />
-                    <Route
-                      path="/workspaces"
-                      element={<Sandboxes key="workspaces" workspacesOnly />}
-                    />
-                    <Route
-                      path="/workspaces/:workspaceId"
-                      element={<WorkspaceDetail />}
-                    />
-                    <Route
-                      path="/sandboxes/:sandboxId"
-                      element={<SandboxDetail />}
-                    />
-                    <Route path="/monitoring/server" element={<Server />} />
-                    <Route path="/monitoring" element={<Monitoring />}>
-                      <Route index element={<Navigate to="alerts" replace />} />
-                      <Route
-                        path="resources"
-                        element={<Navigate to="/proxy" replace />}
-                      />
-                      <Route
-                        path="providers/add"
-                        element={
-                          <Navigate to="/settings/notifications/new" replace />
-                        }
-                      />
-                      <Route
-                        path="providers/edit/:id"
-                        element={<EditNotificationProvider />}
-                      />
-                      <Route path=":section" element={<MonitoringSettings />} />
-                    </Route>
-                    <Route
-                      path="/alarms"
-                      element={<Navigate to="/monitoring/alarms" replace />}
-                    />
-                    {/* Observe section */}
-                    <Route path="/analytics" element={<GlobalAnalytics />} />
-                    <Route path="/traces" element={<GlobalTraces />} />
-                    <Route path="/logs" element={<GlobalLogs />} />
-                    <Route path="/errors" element={<GlobalErrors />} />
+                <div
+                  data-console-scroll
+                  className={
+                    focusMode
+                      ? 'flex-1 min-h-0 overflow-hidden flex flex-col'
+                      : 'flex-1 min-h-0 overflow-y-auto py-2 px-0 sm:p-4'
+                  }
+                >
+                  {/* The full-screen chat fills this box exactly, so a banner
+                      gets its own row and the page the rest: stacked in a
+                      plain block, the banner pushed the chat's input off the
+                      bottom of the screen. Elsewhere the wrapper is
+                      `contents`, leaving the scrolling pages as they were. */}
+                  <RouteQueryFailureBanner
+                    className={
+                      focusMode ? 'shrink-0 px-2 pt-2 pb-0 sm:px-2' : undefined
+                    }
+                  />
+                  <div className={focusMode ? 'min-h-0 flex-1' : 'contents'}>
+                    <Suspense fallback={<PageSkeleton />}>
+                      <Routes>
+                        {extraRoutes?.map((r) => (
+                          <Route
+                            key={r.path}
+                            path={r.path}
+                            element={r.element}
+                          />
+                        ))}
+                        <Route
+                          path="/"
+                          element={<RedirectWithQuery to="/projects" />}
+                        />
+                        <Route
+                          path="/dashboard"
+                          element={<RedirectWithQuery to="/projects" />}
+                        />
+                        <Route path="/account" element={<Account />} />
+                        <Route path="/setup" element={<Setup />} />
+                        <Route path="/get-started" element={<GetStarted />} />
+                        <Route path="/setup/ai" element={<AiOnboarding />} />
+                        <Route path="/tools" element={<PlatformTools />} />
+                        <Route path="/projects" element={<Projects />} />
+                        <Route
+                          path="/p/:slug"
+                          element={<ProjectGroupDetail />}
+                        />
+                        <Route
+                          path="/p/:slug/repository"
+                          element={<ConnectGroupRepository />}
+                        />
+                        <Route
+                          path="/drop"
+                          element={
+                            <RedirectWithQuery to="/projects/new?source=drop" />
+                          }
+                        />
+                        <Route path="/revenue" element={<Revenue />} />
+                        <Route path="/status-pages" element={<StatusPages />} />
+                        <Route
+                          path="/status-pages/new"
+                          element={<NewStatusPagePage />}
+                        />
+                        <Route
+                          path="/status-pages/:statusPageId"
+                          element={<StatusPageDetailPage />}
+                        />
+                        <Route
+                          path="/access-services/new"
+                          element={<AccessServicePage />}
+                        />
+                        <Route
+                          path="/access-services/:serviceId/edit"
+                          element={<AccessServicePage />}
+                        />
+                        <Route
+                          path="/vault/vaults/:vaultId/bundles/new"
+                          element={<AccessBundlePage />}
+                        />
+                        <Route
+                          path="/vault/vaults/:vaultId/bundles/:bundleId/edit"
+                          element={<AccessBundlePage />}
+                        />
+                        <Route
+                          path="/vault/vaults/:vaultId/bundles/:bundleId/sessions/new"
+                          element={<AccessSessionCreatePage />}
+                        />
+                        <Route
+                          path="/vault/vaults/:vaultId/sessions/:sessionId"
+                          element={<AccessSessionDetailPage />}
+                        />
+                        <Route
+                          path="/vault/vaults/:vaultId/bundles/:bundleId"
+                          element={<AccessBundleDetailPage />}
+                        />
+                        <Route
+                          path="/projects/:projectId/access-services/new"
+                          element={<AccessServicePage />}
+                        />
+                        <Route
+                          path="/projects/:projectId/access-services/:serviceId/edit"
+                          element={<AccessServicePage />}
+                        />
+                        <Route
+                          path="/vault/projects/:projectId/vaults/:vaultId/bundles/new"
+                          element={<AccessBundlePage />}
+                        />
+                        <Route
+                          path="/vault/projects/:projectId/vaults/:vaultId/bundles/:bundleId/edit"
+                          element={<AccessBundlePage />}
+                        />
+                        <Route
+                          path="/vault/projects/:projectId/vaults/:vaultId/bundles/:bundleId/sessions/new"
+                          element={<AccessSessionCreatePage />}
+                        />
+                        <Route
+                          path="/vault/projects/:projectId/vaults/:vaultId/sessions/:sessionId"
+                          element={<AccessSessionDetailPage />}
+                        />
+                        <Route
+                          path="/vault/projects/:projectId/vaults/:vaultId/bundles/:bundleId"
+                          element={<AccessBundleDetailPage />}
+                        />
+                        <Route
+                          path="/vault/projects/:projectId/vaults/:vaultId"
+                          element={<VaultDetailPage />}
+                        />
+                        <Route path="/vault" element={<VaultPage />} />
+                        <Route
+                          path="/vault/vaults/:vaultId"
+                          element={<VaultDetailPage />}
+                        />
+                        <Route
+                          path="/vault/projects/:projectId"
+                          element={<VaultPage />}
+                        />
+                        <Route path="/sandboxes" element={<Sandboxes />} />
+                        <Route
+                          path="/workspaces"
+                          element={<RedirectWithQuery to="/sandboxes" />}
+                        />
+                        <Route
+                          path="/workspaces/:workspaceId"
+                          element={<WorkspaceDetail />}
+                        />
+                        {/* One route for every tab, so switching tabs keeps
+                            the page (and each tab's unsaved edits) mounted. */}
+                        <Route
+                          path="/sandboxes/settings/*"
+                          element={<SandboxSettingsPage />}
+                        />
+                        <Route
+                          path="/sandboxes/:sandboxId"
+                          element={<SandboxDetail />}
+                        />
+                        <Route path="/monitoring/server" element={<Server />} />
+                        <Route path="/monitoring" element={<Monitoring />}>
+                          <Route
+                            index
+                            element={<RedirectWithQuery to="alerts" />}
+                          />
+                          <Route
+                            path="resources"
+                            element={<RedirectWithQuery to="/proxy" />}
+                          />
+                          <Route
+                            path="providers/add"
+                            element={
+                              <RedirectWithQuery to="/settings/notifications/new" />
+                            }
+                          />
+                          <Route
+                            path="providers/edit/:id"
+                            element={<EditNotificationProvider />}
+                          />
+                          <Route
+                            path=":section"
+                            element={<MonitoringSettings />}
+                          />
+                        </Route>
+                        <Route
+                          path="/alarms"
+                          element={
+                            <RedirectWithQuery to="/monitoring/alarms" />
+                          }
+                        />
+                        {/* Observe section */}
+                        <Route
+                          path="/analytics"
+                          element={<GlobalAnalytics />}
+                        />
+                        <Route path="/traces" element={<GlobalTraces />} />
+                        <Route path="/logs" element={<GlobalLogs />} />
+                        <Route path="/errors" element={<GlobalErrors />} />
 
-                    {/* ADR-027 Phase 2: global cross-project unified trace waterfall */}
-                    <Route
-                      path="/traces/global/:traceId"
-                      element={<CrossProjectTraceDetail />}
-                    />
-                    <Route path="/proxy" element={<ProxyMetrics />} />
-                    <Route path="/proxy-logs" element={<ProxyLogs />} />
-                    <Route
-                      path="/proxy-logs/:id"
-                      element={<ProxyLogDetail />}
-                    />
-                    <Route path="/audit-logs" element={<AuditLogs />} />
-                    {/* CLI device-authorization approval surface. The route
+                        {/* ADR-027 Phase 2: global cross-project unified trace waterfall */}
+                        <Route
+                          path="/traces/global/:traceId"
+                          element={<CrossProjectTraceDetail />}
+                        />
+                        <Route path="/proxy" element={<ProxyMetrics />} />
+                        <Route path="/proxy-logs" element={<ProxyLogs />} />
+                        <Route
+                          path="/proxy-logs/:id"
+                          element={<ProxyLogDetail />}
+                        />
+                        <Route path="/audit-logs" element={<AuditLogs />} />
+                        {/* CLI device-authorization approval surface. The route
                     sits inside the protected layout so unauthenticated
                     visitors get bounced through /login and the
                     captureReturnTo() infrastructure brings them back. */}
-                    <Route path="/cli-login" element={<CliLogin />} />
-                    <Route path="/cli-login/:userCode" element={<CliLogin />} />
-                    {/* Settings drill-down: only items NOT surfaced at the
+                        <Route path="/cli-login" element={<CliLogin />} />
+                        {/* Temps login hand-off for environments that require
+                    it (ADR-055 §11); protected for the same reason. */}
+                        <Route
+                          path="/ingress/login"
+                          element={<IngressLogin />}
+                        />
+                        <Route
+                          path="/cli-login/:userCode"
+                          element={<CliLogin />}
+                        />
+                        {/* Settings drill-down: only items NOT surfaced at the
                     main sidebar root live here. Top-level resources
                     (domains, storage, email, AI, source providers,
                     backups) moved out so they don't trigger the
                     settings sidebar swap. */}
-                    <Route path="/settings" element={<SettingsLayout />}>
-                      <Route index element={<Settings />} />
-                      <Route path="notifications" element={<Notifications />} />
-                      <Route
-                        path="notifications/new"
-                        element={<AddNotificationProvider />}
-                      />
-                      <Route
-                        path="notifications/routes/new"
-                        element={<NotificationRouteForm />}
-                      />
-                      <Route
-                        path="notifications/routes/:id"
-                        element={<NotificationRouteForm />}
-                      />
-                      <Route
-                        path="notifications/:id"
-                        element={<EditNotificationProvider />}
-                      />
-                      <Route path="users" element={<Users />} />
-                      <Route path="users/new" element={<CreateUser />} />
-                      <Route path="users/:userId" element={<UserDetail />} />
-                      {/* Teams sit under /settings alongside Users and API Keys:
+                        <Route path="/settings" element={<SettingsLayout />}>
+                          <Route index element={<Settings />} />
+                          <Route
+                            path="notifications"
+                            element={<Notifications />}
+                          />
+                          <Route
+                            path="notifications/new"
+                            element={<AddNotificationProvider />}
+                          />
+                          <Route
+                            path="notifications/routes/new"
+                            element={<NotificationRouteForm />}
+                          />
+                          <Route
+                            path="notifications/routes/:id"
+                            element={<NotificationRouteForm />}
+                          />
+                          <Route
+                            path="notifications/:id"
+                            element={<EditNotificationProvider />}
+                          />
+                          <Route path="users" element={<Users />} />
+                          <Route path="users/new" element={<CreateUser />} />
+                          <Route
+                            path="users/:userId"
+                            element={<UserDetail />}
+                          />
+                          {/* Teams sit under /settings alongside Users and API Keys:
                       the sidebar lists them together, and a top-level route
                       would drop out of the settings layout on click. */}
-                      <Route path="teams" element={<Teams />} />
-                      <Route path="teams/:teamId" element={<TeamDetail />} />
-                      <Route path="auth" element={<AuthSettingsPage />} />
-                      <Route
-                        path="auth/new"
-                        element={<CreateOidcProviderPage />}
-                      />
-                      <Route
-                        path="auth/providers/:providerId"
-                        element={<OidcProviderDetailPage />}
-                      />
-                      <Route path="keys" element={<ApiKeys />} />
-                      <Route path="keys/new" element={<ApiKeyCreate />} />
-                      <Route path="keys/:id" element={<ApiKeyDetail />} />
-                      <Route path="keys/:id/edit" element={<ApiKeyEdit />} />
-                      <Route path="load-balancer" element={<CustomRoutes />} />
-                      <Route path="load-balancer/add" element={<AddRoute />} />
-                      <Route
-                        path="docker-registry"
-                        element={<DockerRegistryPage />}
-                      />
-                      {/* Security */}
-                      <Route path="version" element={<VersionPage />} />
-                      <Route path="security" element={<SecurityPage />} />
-                      <Route
-                        path="rate-limiting"
-                        element={<RateLimitingPage />}
-                      />
-                      <Route
-                        path="disk-monitoring"
-                        element={<DiskMonitoringPage />}
-                      />
-                      <Route
-                        path="build-limits"
-                        element={<BuildLimitsPage />}
-                      />
-                      <Route
-                        path="request-timeouts"
-                        element={<RequestTimeoutsPage />}
-                      />
-                      <Route
-                        path="on-demand-tls"
-                        element={<OnDemandTlsPage />}
-                      />
-                      <Route
-                        path="metrics-monitoring"
-                        element={<MetricsMonitoringPage />}
-                      />
-                      <Route path="cloud" element={<CloudSettingsPage />} />
-                      <Route
-                        path="telemetry"
-                        element={<TelemetrySettingsPage />}
-                      />
-                      <Route path="nodes" element={<NodesPage />} />
-                      <Route
-                        path="nodes/:nodeId"
-                        element={<NodeDetailPage />}
-                      />
-                      <Route path="plugins" element={<PluginsPage />} />
-                      <Route
-                        path="plugins/install"
-                        element={<PluginInstallPage />}
-                      />
-                      <Route
-                        path="otel-pipeline"
-                        element={<OtelPipelineStatusPage />}
-                      />
-                      <Route
-                        path="traefik-discovery"
-                        element={<TraefikDiscoveryPage />}
-                      />
-                      <Route path="mcp-server" element={<McpServerPage />} />
-                    </Route>
-                    {/* Top-level resources surfaced in the main sidebar */}
-                    <Route path="/domains" element={<Domains />} />
-                    <Route path="/domains/add" element={<AddDomain />} />
-                    <Route path="/domains/:id" element={<DomainDetail />} />
-                    <Route path="/certificates" element={<Certificates />} />
-                    <Route path="/storage" element={<Storage />} />
-                    <Route path="/storage/create" element={<CreateService />} />
-                    <Route path="/storage/import" element={<ImportService />} />
-                    <Route path="/storage/:id" element={<ServiceDetail />} />
-                    <Route
-                      path="/storage/:id/monitoring"
-                      element={<ServiceMonitoring />}
-                    />
-                    <Route
-                      path="/storage/:id/browse"
-                      element={<ServiceDataBrowser />}
-                    />
-                    <Route path="/storage/:id/logs" element={<ServiceLogs />} />
-                    <Route
-                      path="/storage/:id/query-performance"
-                      element={<ServiceQueryPerformance />}
-                    />
-                    <Route
-                      path="/storage/:id/restore"
-                      element={<ServiceRestore />}
-                    />
-                    <Route
-                      path="/storage/:id/import-data"
-                      element={<ServiceDataImport />}
-                    />
-                    <Route
-                      path="/storage/:id/import-data/:runId"
-                      element={<ServiceDataImportRun />}
-                    />
-                    <Route
-                      path="/storage/:id/upgrades/:upgradeId"
-                      element={<MajorUpgradeDetail />}
-                    />
-                    <Route
-                      path="/storage/:id/members/add"
-                      element={<AddClusterMember />}
-                    />
-                    <Route path="/email" element={<Email />} />
-                    <Route
-                      path="/email/domains/new"
-                      element={<EmailDomainNew />}
-                    />
-                    <Route
-                      path="/email/domains/:id"
-                      element={<EmailDomainDetail />}
-                    />
-                    <Route
-                      path="/email/providers/new"
-                      element={<AddEmailProvider />}
-                    />
-                    <Route
-                      path="/email/providers/:id"
-                      element={<EmailProviderDetail />}
-                    />
-                    <Route path="/email/:id" element={<EmailDetail />} />
-                    <Route path="/ai-gateway" element={<AiGateway />} />
-                    <Route
-                      path="/ai-gateway/usage"
-                      element={<AiGatewayUsagePage />}
-                    />
-                    <Route
-                      path="/ai-gateway/activity"
-                      element={<AiGatewayActivityPage />}
-                    />
-                    <Route
-                      path="/ai-gateway/setup"
-                      element={<AiGatewaySetupPage />}
-                    />
-                    <Route path="/chat" element={<AiChat />} />
-                    <Route path="/ai-first" element={<AiFirstPrototype />} />
-                    <Route
-                      path="/ai-workflows"
-                      element={<AiWorkflowsOverview />}
-                    />
-                    <Route
-                      path="/agent-sandbox"
-                      element={<AgentSandboxLayout />}
-                    >
-                      <Route index element={<AgentSandboxDashboard />} />
-                      <Route
-                        path="providers"
-                        element={<AgentSandboxProvidersList />}
-                      />
-                      <Route
-                        path="providers/:id"
-                        element={<AgentSandboxProviderDetail />}
-                      />
-                      <Route
-                        path="sandbox"
-                        element={<AgentSandboxSandboxPage />}
-                      />
-                      <Route
-                        path="preview"
-                        element={<AgentSandboxPreviewPage />}
-                      />
-                      <Route
-                        path="secrets"
-                        element={<AgentSandboxSecretsPage />}
-                      />
-                    </Route>
-                    <Route
-                      path="/skills"
-                      element={<GlobalSkillsSettingsPage />}
-                    />
-                    <Route
-                      path="/skills/:slug"
-                      element={<GlobalSkillDetailPage />}
-                    />
-                    <Route
-                      path="/mcp-servers"
-                      element={<GlobalMcpServersSettingsPage />}
-                    />
-                    <Route
-                      path="/mcp-servers/:slug"
-                      element={<GlobalMcpServerDetailPage />}
-                    />
-                    <Route path="/git-providers" element={<GitSources />} />
-                    <Route
-                      path="/git-providers/add"
-                      element={<AddGitProvider />}
-                    />
-                    <Route
-                      path="/git-providers/:id"
-                      element={<GitProviderDetail />}
-                    />
-                    <Route
-                      path="/git-providers/:id/connections/:connectionId"
-                      element={<GitConnectionDetail />}
-                    />
-                    <Route path="/dns-providers" element={<DnsProviders />} />
-                    <Route
-                      path="/delivery-profiles"
-                      element={<DeliveryProfiles />}
-                    />
-                    <Route
-                      path="/delivery-profiles/:id"
-                      element={<DeliveryProfileDetail />}
-                    />
-                    <Route
-                      path="/dns-providers/add"
-                      element={<AddDnsProvider />}
-                    />
-                    <Route
-                      path="/dns-providers/:id"
-                      element={<DnsProviderDetail />}
-                    />
-                    <Route path="/backups" element={<Backups />} />
-                    <Route
-                      path="/backups/s3-sources/new"
-                      element={<CreateS3Source />}
-                    />
-                    <Route
-                      path="/backups/s3-sources/:id/schedules/new"
-                      element={<CreateBackupSchedule />}
-                    />
-                    <Route
-                      path="/backups/s3-sources/:id/schedules/:scheduleId/edit"
-                      element={<EditBackupSchedule />}
-                    />
-                    <Route
-                      path="/backups/schedules/:id"
-                      element={<ScheduleDetail />}
-                    />
-                    <Route
-                      path="/backups/schedules/:scheduleId/runs/:runId"
-                      element={<ScheduleRunDetail />}
-                    />
-                    <Route
-                      path="/backups/s3-sources/:id/backups/:backupId"
-                      element={<BackupDetail />}
-                    />
-                    <Route
-                      path="/backups/s3-sources/:id"
-                      element={<S3SourceDetail />}
-                    />
-                    {/* Backward-compat: old /settings/<resource> links → new top-level */}
-                    <Route
-                      path="/settings/domains/*"
-                      element={<Navigate to="/domains" replace />}
-                    />
-                    <Route
-                      path="/settings/email/*"
-                      element={<Navigate to="/email" replace />}
-                    />
-                    <Route
-                      path="/settings/ai-gateway/*"
-                      element={<Navigate to="/ai-gateway" replace />}
-                    />
-                    <Route
-                      path="/settings/ai-providers"
-                      element={<Navigate to="/ai-gateway" replace />}
-                    />
-                    <Route
-                      path="/settings/agent-sandbox/*"
-                      element={<Navigate to="/agent-sandbox" replace />}
-                    />
-                    <Route
-                      path="/settings/skills/*"
-                      element={<Navigate to="/skills" replace />}
-                    />
-                    <Route
-                      path="/settings/mcp-servers/*"
-                      element={<Navigate to="/mcp-servers" replace />}
-                    />
-                    <Route
-                      path="/settings/git-providers/*"
-                      element={<Navigate to="/git-providers" replace />}
-                    />
-                    <Route
-                      path="/settings/dns-providers/*"
-                      element={<Navigate to="/dns-providers" replace />}
-                    />
-                    <Route
-                      path="/settings/backups/*"
-                      element={<Navigate to="/backups" replace />}
-                    />
-                    {/* Projects */}
-                    <Route path="/projects/new" element={<NewProject />} />
-                    <Route
-                      path="/projects/import-wizard"
-                      element={<Import />}
-                    />
-                    <Route
-                      path="/projects/import/:repositoryId"
-                      element={<ImportProject />}
-                    />
-                    <Route
-                      path="/projects/:slug/*"
-                      element={<ProjectDetail />}
-                    />
-                    {/* Utility */}
-                    <Route path="/ip/:ip" element={<IpGeolocationDetail />} />
-                    {/* External plugin routes */}
-                    <Route
-                      path="/plugins/:pluginName/*"
-                      element={<PluginPage />}
-                    />
-                    <Route path="*" element={<NotFound />} />
-                  </Routes>
+                          <Route path="teams" element={<Teams />} />
+                          <Route
+                            path="teams/:teamId"
+                            element={<TeamDetail />}
+                          />
+                          <Route path="auth" element={<AuthSettingsPage />} />
+                          <Route
+                            path="auth/new"
+                            element={<CreateOidcProviderPage />}
+                          />
+                          <Route
+                            path="auth/providers/:providerId"
+                            element={<OidcProviderDetailPage />}
+                          />
+                          <Route path="keys" element={<ApiKeys />} />
+                          <Route path="keys/new" element={<ApiKeyCreate />} />
+                          <Route path="keys/:id" element={<ApiKeyDetail />} />
+                          <Route
+                            path="keys/:id/edit"
+                            element={<ApiKeyEdit />}
+                          />
+                          <Route
+                            path="load-balancer"
+                            element={<CustomRoutes />}
+                          />
+                          <Route
+                            path="load-balancer/add"
+                            element={<AddRoute />}
+                          />
+                          <Route
+                            path="docker-registry"
+                            element={<DockerRegistryPage />}
+                          />
+                          {/* Security */}
+                          <Route path="version" element={<VersionPage />} />
+                          <Route path="security" element={<SecurityPage />} />
+                          <Route
+                            path="shield-proposals"
+                            element={<ShieldProposalsPage />}
+                          />
+                          <Route
+                            path="rate-limiting"
+                            element={<RateLimitingPage />}
+                          />
+                          <Route
+                            path="disk-monitoring"
+                            element={<DiskMonitoringPage />}
+                          />
+                          <Route
+                            path="build-limits"
+                            element={<BuildLimitsPage />}
+                          />
+                          <Route
+                            path="request-timeouts"
+                            element={<RequestTimeoutsPage />}
+                          />
+                          <Route
+                            path="service-healthchecks"
+                            element={<ServiceHealthchecksPage />}
+                          />
+                          <Route
+                            path="on-demand-tls"
+                            element={<OnDemandTlsPage />}
+                          />
+                          <Route
+                            path="metrics-monitoring"
+                            element={<MetricsMonitoringPage />}
+                          />
+                          <Route path="cloud" element={<CloudSettingsPage />} />
+                          <Route
+                            path="telemetry"
+                            element={<TelemetrySettingsPage />}
+                          />
+                          <Route path="nodes" element={<NodesPage />} />
+                          <Route
+                            path="nodes/ingress"
+                            element={<IngressSetupPage />}
+                          />
+                          <Route
+                            path="nodes/:nodeId"
+                            element={<NodeDetailPage />}
+                          />
+                          <Route
+                            path="nodes/:nodeId/:section"
+                            element={<NodeDetailPage />}
+                          />
+                          <Route path="plugins" element={<PluginsPage />} />
+                          <Route
+                            path="plugins/install"
+                            element={<PluginInstallPage />}
+                          />
+                          <Route
+                            path="otel-pipeline"
+                            element={<OtelPipelineStatusPage />}
+                          />
+                          <Route
+                            path="traefik-discovery"
+                            element={<TraefikDiscoveryPage />}
+                          />
+                          <Route path="dns" element={<DnsPage />} />
+                          <Route
+                            path="network-policy"
+                            element={<NetworkPolicyPage />}
+                          />
+                          <Route
+                            path="mcp-server"
+                            element={<McpServerPage />}
+                          />
+                        </Route>
+                        {/* Top-level resources surfaced in the main sidebar */}
+                        <Route path="/domains" element={<Domains />} />
+                        <Route path="/domains/add" element={<AddDomain />} />
+                        <Route
+                          path="/domains/tunnel/:hostname"
+                          element={<TunnelDomainDetail />}
+                        />
+                        <Route path="/domains/:id" element={<DomainDetail />} />
+                        <Route
+                          path="/certificates"
+                          element={<Certificates />}
+                        />
+                        <Route path="/storage" element={<Storage />} />
+                        <Route
+                          path="/storage/create"
+                          element={<CreateService />}
+                        />
+                        <Route
+                          path="/storage/import"
+                          element={<ImportService />}
+                        />
+                        <Route
+                          path="/storage/:id"
+                          element={<ServiceDetail />}
+                        />
+                        <Route
+                          path="/storage/:id/monitoring"
+                          element={<ServiceMonitoring />}
+                        />
+                        <Route
+                          path="/storage/:id/browse"
+                          element={<ServiceDataBrowser />}
+                        />
+                        <Route
+                          path="/storage/:id/logs"
+                          element={<ServiceLogs />}
+                        />
+                        <Route
+                          path="/storage/:id/query-performance"
+                          element={<ServiceQueryPerformance />}
+                        />
+                        <Route
+                          path="/storage/:id/restore"
+                          element={<ServiceRestore />}
+                        />
+                        <Route
+                          path="/storage/:id/import-data"
+                          element={<ServiceDataImport />}
+                        />
+                        <Route
+                          path="/storage/:id/import-data/:runId"
+                          element={<ServiceDataImportRun />}
+                        />
+                        <Route
+                          path="/storage/:id/upgrades/:upgradeId"
+                          element={<MajorUpgradeDetail />}
+                        />
+                        <Route
+                          path="/storage/:id/members/add"
+                          element={<AddClusterMember />}
+                        />
+                        <Route path="/email" element={<Email />} />
+                        <Route
+                          path="/email/domains/new"
+                          element={<EmailDomainNew />}
+                        />
+                        <Route
+                          path="/email/domains/:id"
+                          element={<EmailDomainDetail />}
+                        />
+                        <Route
+                          path="/email/providers/new"
+                          element={<AddEmailProvider />}
+                        />
+                        <Route
+                          path="/email/providers/:id"
+                          element={<EmailProviderDetail />}
+                        />
+                        <Route path="/email/:id" element={<EmailDetail />} />
+                        <Route path="/ai-gateway" element={<AiGateway />} />
+                        <Route
+                          path="/ai-gateway/usage"
+                          element={<AiGatewayUsagePage />}
+                        />
+                        <Route
+                          path="/ai-gateway/limits"
+                          element={<AiGatewayLimitsPage />}
+                        />
+                        <Route
+                          path="/ai-gateway/activity"
+                          element={<AiGatewayActivityPage />}
+                        />
+                        {/* Retired AI surfaces: harnesses, the harness
+                            workspace, workflows, skills, MCP servers and the
+                            gateway setup page. Old links land on the page that
+                            replaced them instead of a 404. */}
+                        <Route
+                          path="/ai-gateway/setup"
+                          element={<RedirectWithQuery to="/ai-gateway" />}
+                        />
+                        <Route path="/chat" element={<AiChat />} />
+                        {/* The AI workspace page was retired; old links
+                            land on the workspace they named. */}
+                        <Route
+                          path="/ai-first"
+                          element={<RetiredAiWorkspaceRedirect />}
+                        />
+                        <Route
+                          path="/ai-workflows"
+                          element={<RedirectWithQuery to="/chat" />}
+                        />
+                        {/* Autofix's agent credentials. Not in navigation;
+                            autofix's setup steps link here. */}
+                        <Route
+                          path="/agent-sandbox/providers"
+                          element={<AutofixCredentialsList />}
+                        />
+                        <Route
+                          path="/agent-sandbox/providers/:id"
+                          element={<AutofixCredentialDetail />}
+                        />
+                        <Route
+                          path="/agent-sandbox/sandbox"
+                          element={
+                            <RedirectWithQuery to="/sandboxes/settings" />
+                          }
+                        />
+                        <Route
+                          path="/agent-sandbox/preview"
+                          element={
+                            <RedirectWithQuery to="/sandboxes/settings/preview" />
+                          }
+                        />
+                        <Route
+                          path="/agent-sandbox/*"
+                          element={<RedirectWithQuery to="/ai-gateway" />}
+                        />
+                        <Route
+                          path="/skills/*"
+                          element={<RedirectWithQuery to="/chat" />}
+                        />
+                        <Route
+                          path="/mcp-servers/*"
+                          element={<RedirectWithQuery to="/chat" />}
+                        />
+                        <Route path="/git-providers" element={<GitSources />} />
+                        <Route
+                          path="/git-providers/add"
+                          element={<AddGitProvider />}
+                        />
+                        <Route
+                          path="/git-providers/:id"
+                          element={<GitProviderDetail />}
+                        />
+                        <Route
+                          path="/git-providers/:id/connections/:connectionId"
+                          element={<GitConnectionDetail />}
+                        />
+                        <Route
+                          path="/dns-providers"
+                          element={<DnsProviders />}
+                        />
+                        <Route
+                          path="/delivery-profiles"
+                          element={<DeliveryProfiles />}
+                        />
+                        <Route
+                          path="/delivery-profiles/:id"
+                          element={<DeliveryProfileDetail />}
+                        />
+                        <Route
+                          path="/dns-providers/add"
+                          element={<AddDnsProvider />}
+                        />
+                        <Route
+                          path="/dns-providers/:id"
+                          element={<DnsProviderDetail />}
+                        />
+                        <Route path="/workflows" element={<AllWorkflows />} />
+                        <Route
+                          path="/workflows/:projectId/:environmentId"
+                          element={<WorkflowDetail />}
+                        />
+                        <Route
+                          path="/workflows/:projectId/keys"
+                          element={<ProjectWorkflowKeys />}
+                        />
+                        <Route
+                          path="/workflows/:projectId/:environmentId/settings"
+                          element={<WorkflowSettings />}
+                        />
+                        <Route
+                          path="/workflows/:projectId/:environmentId/grants"
+                          element={<WorkflowGrants />}
+                        />
+                        <Route
+                          path="/workflows/:projectId/:environmentId/runs/:runId"
+                          element={<WorkflowRunDetail />}
+                        />
+                        <Route path="/backups" element={<Backups />} />
+                        <Route
+                          path="/backups/s3-sources/new"
+                          element={<CreateS3Source />}
+                        />
+                        <Route
+                          path="/backups/s3-sources/:id/schedules/new"
+                          element={<CreateBackupSchedule />}
+                        />
+                        <Route
+                          path="/backups/s3-sources/:id/schedules/:scheduleId/edit"
+                          element={<EditBackupSchedule />}
+                        />
+                        <Route
+                          path="/backups/schedules/:id"
+                          element={<ScheduleDetail />}
+                        />
+                        <Route
+                          path="/backups/schedules/:scheduleId/runs/:runId"
+                          element={<ScheduleRunDetail />}
+                        />
+                        <Route
+                          path="/backups/s3-sources/:id/backups/:backupId"
+                          element={<BackupDetail />}
+                        />
+                        <Route
+                          path="/backups/s3-sources/:id"
+                          element={<S3SourceDetail />}
+                        />
+                        {/* Backward-compat: old /settings/<resource> links → new top-level */}
+                        <Route
+                          path="/settings/domains/*"
+                          element={<RedirectWithQuery to="/domains" />}
+                        />
+                        <Route
+                          path="/settings/email/*"
+                          element={<RedirectWithQuery to="/email" />}
+                        />
+                        <Route
+                          path="/settings/ai-gateway/*"
+                          element={<RedirectWithQuery to="/ai-gateway" />}
+                        />
+                        <Route
+                          path="/settings/ai-providers"
+                          element={<RedirectWithQuery to="/ai-gateway" />}
+                        />
+                        <Route
+                          path="/settings/agent-sandbox/*"
+                          element={<RedirectWithQuery to="/ai-gateway" />}
+                        />
+                        <Route
+                          path="/settings/skills/*"
+                          element={<RedirectWithQuery to="/skills" />}
+                        />
+                        <Route
+                          path="/settings/mcp-servers/*"
+                          element={<RedirectWithQuery to="/mcp-servers" />}
+                        />
+                        <Route
+                          path="/settings/git-providers/*"
+                          element={<RedirectWithQuery to="/git-providers" />}
+                        />
+                        <Route
+                          path="/settings/dns-providers/*"
+                          element={<RedirectWithQuery to="/dns-providers" />}
+                        />
+                        <Route
+                          path="/settings/backups/*"
+                          element={<RedirectWithQuery to="/backups" />}
+                        />
+                        {/* Projects */}
+                        <Route path="/projects/new" element={<NewProject />} />
+                        <Route
+                          path="/projects/import-wizard"
+                          element={<Import />}
+                        />
+                        <Route
+                          path="/projects/import/:repositoryId"
+                          element={<ImportProject />}
+                        />
+                        <Route
+                          path="/projects/:slug/*"
+                          element={<ProjectDetail />}
+                        />
+                        {/* Utility */}
+                        <Route
+                          path="/ip/:ip"
+                          element={<IpGeolocationDetail />}
+                        />
+                        {/* External plugin routes */}
+                        <Route
+                          path="/plugins/:pluginName/*"
+                          element={<PluginPage />}
+                        />
+                        <Route path="*" element={<NotFound />} />
+                      </Routes>
+                    </Suspense>
+                  </div>
                 </div>
               </ErrorBoundary>
             </SidebarInset>
@@ -1090,7 +1406,7 @@ const AppContent = () => {
       <AuthProvider>
         <ProjectsProvider>
           <PresetProvider>
-            <Suspense fallback={<PageLoader />}>
+            <Suspense fallback={<AppLoadingScreen />}>
               <Routes>
                 {/* Public routes that don't require authentication */}
                 <Route path="/mfa-verify" element={<MfaVerify />} />
@@ -1129,25 +1445,14 @@ const AppContent = () => {
   )
 }
 
-// Helper to generate friendly error titles from mutation operations
-const getErrorTitle = (
-  context: any,
-  defaultTitle?: string
-): string | undefined => {
-  // Check for custom error title in mutation meta
-  if (context?.meta?.errorTitle) {
-    return context.meta.errorTitle
-  }
-  const mutationKey = context?.mutationKey?.[0]
-  if (mutationKey) {
-    // e.g., "createProject" -> "Failed to create project"
-    return `Failed to ${mutationKey.replace(/([A-Z])/g, ' $1').toLowerCase()}`
-  }
-
-  return defaultTitle
-}
-
 const queryClient = new QueryClient({
+  // Runs for every failed mutation, including those that define their own
+  // `onError` (which replaces the default one below). Whoever announces the
+  // failure, a handler that also awaits the mutation without a catch must not
+  // have it announced a second time by the unhandled-rejection reporter.
+  mutationCache: new MutationCache({
+    onError: (error) => markErrorReported(error),
+  }),
   queryCache: new QueryCache({
     onError: (error, query) => {
       // ProblemDetails response bodies never carry a "status" field -- the
@@ -1207,8 +1512,12 @@ const queryClient = new QueryClient({
       retry: shouldRetryQuery,
     },
     mutations: {
-      onError: (error: unknown, _variables, context) => {
-        const problemDetails = error as ProblemDetails
+      // `meta` and `mutationKey` arrive in the fourth argument; the third is
+      // the `onMutate` result, which is `undefined` for these mutations.
+      onError: (error: unknown, _variables, _onMutateResult, context) => {
+        const problemDetails = error as ProblemDetails & {
+          extensions?: Record<string, unknown>
+        }
 
         // Sensitive mutations own this response: they open a step-up dialog
         // and retry after verification. A global error toast would be both
@@ -1266,16 +1575,8 @@ const queryClient = new QueryClient({
           return
         }
 
-        // Get custom error title
-        const customTitle = getErrorTitle(context, problemDetails.title)
-
-        if (problemDetails.title) {
-          toast.error(customTitle || problemDetails.title, {
-            description: problemDetails.detail,
-          })
-        } else {
-          toast.error(customTitle || 'An error occurred')
-        }
+        // Authored title (`meta.errorTitle`) plus the server's reason.
+        announceMutationFailure(problemDetails, context)
       },
     },
   },
@@ -1305,6 +1606,16 @@ export const TempsConsole = ({
   useEffect(() => {
     if (!document.documentElement.lang) document.documentElement.lang = 'en'
   }, [])
+
+  // An API failure nobody awaited with a `catch` would otherwise end as an
+  // "uncaught exception: Object" with nothing on screen.
+  useEffect(
+    () =>
+      installUnhandledRejectionReporter((notice) =>
+        toast.error(notice.title, { description: notice.description })
+      ),
+    []
+  )
 
   return (
     <ThemeProvider defaultTheme="system" enableSystem attribute="class">

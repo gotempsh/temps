@@ -20,6 +20,14 @@
 //! (CI typically builds them first; locally `cargo test` does too via
 //! `--bin` deps, but a clean checkout might not).
 
+// Test-only helpers outside `#[test]` fns (mock server, port picking, target
+// dir lookup): a panic there is the test failure, which is what we want.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test helpers: panicking is how a test fails"
+)]
+
 use std::io::Write;
 use std::net::TcpListener;
 use std::process::{Command, Stdio};

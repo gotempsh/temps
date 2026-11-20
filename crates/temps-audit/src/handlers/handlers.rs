@@ -10,8 +10,8 @@ use axum::{
     Json, Router,
 };
 use std::sync::Arc;
-use temps_auth::permission_guard;
-use temps_auth::RequireAuth;
+use temps_authz::permission_guard;
+use temps_authz::RequireAuth;
 use tracing::error;
 use utoipa::OpenApi;
 
@@ -36,14 +36,18 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         .route("/audit/logs/{id}", get(get_audit_log))
 }
 
+/// Most audit logs one request returns.
+const MAX_AUDIT_LOG_LIMIT: i32 = 100;
+
 /// List audit logs with optional filtering
 #[utoipa::path(
     tag = "Audit Logs",
     get,
-    path = "audit/logs",
+    path = "/audit/logs",
     params(ListAuditLogsQuery),
     responses(
         (status = 200, description = "List of audit logs", body = Vec<AuditLogResponse>),
+        (status = 400, description = "limit is above the maximum of 100"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
         (status = 500, description = "Internal server error")
@@ -56,34 +60,46 @@ async fn list_audit_logs(
     Query(query): Query<ListAuditLogsQuery>,
 ) -> Result<impl IntoResponse, temps_core::problemdetails::Problem> {
     permission_guard!(auth, AuditRead);
+    // Refused rather than capped: this returns a bare array, so a client paging by
+    // the limit it asked for would skip records and never know.
+    if let Some(limit) = query.limit.filter(|limit| *limit > MAX_AUDIT_LOG_LIMIT) {
+        return Err(temps_core::error_builder::bad_request()
+            .title("Invalid Audit Log Limit")
+            .detail(format!(
+                "limit must be at most {MAX_AUDIT_LOG_LIMIT}, got {limit}; page with offset"
+            ))
+            .build());
+    }
     let from_date = query.from.map(Into::into);
     let to_date = query.to.map(Into::into);
 
-    match app_state
+    let logs = app_state
         .audit_service
-        .filter_audit_logs(
-            query.operation_type.as_deref(),
-            query.user_id,
-            from_date,
-            to_date,
-            query.limit.unwrap_or(100),
-            query.offset.unwrap_or(0),
-        )
-        .await
-    {
-        Ok(logs) => {
-            let responses: Vec<AuditLogResponse> = logs.into_iter().map(Into::into).collect();
-            Ok(Json(responses))
-        }
-        Err(e) => {
-            error!("Failed to list audit logs: {}", e);
-            Err(
+        .filter_audit_logs(crate::services::AuditLogFilter {
+            action: query.operation_type.as_deref(),
+            resource_id: query.resource_id.as_deref(),
+            user_id: query.user_id,
+            from: from_date,
+            to: to_date,
+            limit: query.limit.unwrap_or(20),
+            offset: query.offset.unwrap_or(0),
+        })
+        .await?;
+    let responses: Vec<AuditLogResponse> = logs.into_iter().map(Into::into).collect();
+    Ok(Json(responses))
+}
+
+impl From<crate::services::AuditQueryError> for temps_core::problemdetails::Problem {
+    fn from(error: crate::services::AuditQueryError) -> Self {
+        match error {
+            error @ crate::services::AuditQueryError::Read { .. } => {
+                error!(error = %error, "Failed to list audit logs");
                 temps_core::error_builder::ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .type_("https://temps.sh/probs/audit-error")
                     .title("Audit Log Error")
-                    .detail(format!("Failed to list audit logs: {}", e))
-                    .build(),
-            )
+                    .detail("Could not list audit logs; see the server logs")
+                    .build()
+            }
         }
     }
 }
@@ -92,7 +108,7 @@ async fn list_audit_logs(
 #[utoipa::path(
     tag = "Audit Logs",
     get,
-    path = "audit/logs/{id}",
+    path = "/audit/logs/{id}",
     responses(
         (status = 200, description = "Audit log details", body = AuditLogResponse),
         (status = 404, description = "Audit log not found"),
@@ -139,11 +155,22 @@ mod tests {
     use axum::http::StatusCode;
     use sea_orm::{DatabaseBackend, MockDatabase};
     use std::sync::Arc;
-    use temps_auth::context::AuthContext;
-    use temps_auth::permissions::{Permission, Role};
-    use temps_auth::RequireAuth;
+    use temps_authz::context::AuthContext;
+    use temps_authz::permissions::{Permission, Role};
+    use temps_authz::RequireAuth;
     use temps_entities::users;
     use temps_geo::{GeoIpService, IpAddressService, MockGeoIpService};
+
+    /// A path without its leading slash isn't a path a client can call.
+    #[test]
+    fn every_documented_path_starts_with_a_slash() {
+        use utoipa::OpenApi;
+        let spec = super::AuditApiDoc::openapi();
+        assert!(!spec.paths.paths.is_empty());
+        for path in spec.paths.paths.keys() {
+            assert!(path.starts_with('/'), "{path}");
+        }
+    }
 
     fn test_user() -> users::Model {
         let now = chrono::Utc::now();
@@ -180,6 +207,7 @@ mod tests {
     fn empty_query() -> ListAuditLogsQuery {
         ListAuditLogsQuery {
             operation_type: None,
+            resource_id: None,
             user_id: None,
             from: None,
             to: None,
@@ -202,6 +230,84 @@ mod tests {
             .await
             .err()
             .map(|p| p.status_code)
+    }
+
+    #[tokio::test]
+    async fn resource_filter_returns_an_empty_success_and_contextual_problem() {
+        use axum::response::IntoResponse;
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([
+                    // Vault audit attribution is complete.
+                    vec![std::collections::BTreeMap::from([(
+                        "ready".to_owned(),
+                        sea_orm::Value::Bool(Some(true)),
+                    )])],
+                    Vec::<std::collections::BTreeMap<String, sea_orm::Value>>::new(),
+                ])
+                .into_connection(),
+        );
+        let geoip = Arc::new(GeoIpService::Mock(MockGeoIpService::new()));
+        let service = Arc::new(AuditService::new(
+            db.clone(),
+            Arc::new(IpAddressService::new(db, geoip)),
+        ));
+        let query = ListAuditLogsQuery {
+            resource_id: Some("vault_fixture".into()),
+            ..empty_query()
+        };
+        let response = list_audit_logs(
+            State(Arc::new(AppState {
+                audit_service: service,
+            })),
+            RequireAuth(AuthContext::new_session(test_user(), Role::Admin)),
+            Query(query.clone()),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(bytes.as_ref(), b"[]");
+        let problem = list_audit_logs(
+            State(app_state()),
+            RequireAuth(AuthContext::new_session(test_user(), Role::Admin)),
+            Query(query),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(serde_json::to_string(&problem.body)
+            .unwrap()
+            .contains("Could not list audit logs; see the server logs"));
+        assert!(!serde_json::to_string(&problem.body)
+            .unwrap()
+            .contains("vault_fixture"));
+    }
+
+    /// The response is a bare array, so a capped limit would look like the end of
+    /// the data, or make a client paging by its own limit skip records.
+    #[tokio::test]
+    async fn a_limit_above_the_maximum_is_refused_rather_than_capped() {
+        let query = ListAuditLogsQuery {
+            limit: Some(200),
+            ..empty_query()
+        };
+        let problem = list_audit_logs(
+            State(app_state()),
+            RequireAuth(AuthContext::new_session(test_user(), Role::Admin)),
+            Query(query),
+        )
+        .await
+        .err()
+        .expect("refused");
+        assert_eq!(problem.status_code, StatusCode::BAD_REQUEST);
+        let body = serde_json::to_string(&problem.body).unwrap();
+        assert!(body.contains("200"), "{body}");
+        assert!(body.contains("100"), "{body}");
     }
 
     #[tokio::test]

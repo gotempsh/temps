@@ -4,8 +4,9 @@
 use super::audit::{
     EnvironmentDeletedAudit, EnvironmentSettingsUpdatedAudit, EnvironmentSettingsUpdatedFields,
     EnvironmentSleepStateChangedAudit, EnvironmentSubdomainUpdatedAudit,
-    EnvironmentVariablePromotedToSecretAudit, EnvironmentVariableValueRevealedAudit,
-    ProjectSecretDeletedAudit, ProjectSecretWrittenAudit,
+    EnvironmentVariableDeletedAudit, EnvironmentVariablePromotedToSecretAudit,
+    EnvironmentVariableSecretSuggestionDismissedAudit, EnvironmentVariableValueRevealedAudit,
+    EnvironmentVariableWrittenAudit, ProjectSecretDeletedAudit, ProjectSecretWrittenAudit,
 };
 use super::types::AppState;
 use axum::Router;
@@ -19,7 +20,7 @@ use axum::{
 use std::sync::Arc;
 use temps_auth::{
     permission_guard, project_access_guard, project_permission_guard, project_scope_guard,
-    RequireAuth,
+    Permission, RequireAuth,
 };
 use temps_core::AuditContext;
 use temps_core::RequestMetadata;
@@ -31,10 +32,11 @@ use super::types::{
     CreateProjectSecretRequest, EnvVarIntegrationInfo, EnvironmentDomainResponse, EnvironmentInfo,
     EnvironmentResponse, EnvironmentVariableResponse, EnvironmentVariableValueResponse,
     GetEnvironmentVariablesQuery, GetProjectSecretsQuery, ProjectSecretEnvironmentInfo,
-    ProjectSecretResponse, ResolvedEnvVarResponse, ResolvedEnvVarSource,
+    ProjectSecretResponse, ResolvedEnvVarResponse, ResolvedEnvVarSource, SecretSuggestionResponse,
     UpdateEnvironmentSettingsRequest, UpdateEnvironmentSubdomainRequest,
     UpdateEnvironmentVariableRequest, UpdateProjectSecretRequest,
 };
+use crate::services::EnvironmentTeardownError;
 use temps_core::problemdetails::Problem;
 
 impl From<crate::services::env_var_service::EnvVarError> for Problem {
@@ -84,6 +86,14 @@ impl From<crate::services::env_var_service::EnvVarError> for Problem {
                     .detail(err.to_string())
                     .build()
             }
+            EnvVarError::SecretValueRequiresAuditedReveal { .. } => {
+                temps_core::error_builder::forbidden()
+                    .title(
+                        "Secret environment variable must be revealed through the audited endpoint",
+                    )
+                    .detail(err.to_string())
+                    .build()
+            }
             EnvVarError::AmbiguousValue { .. } => temps_core::error_builder::conflict()
                 .title("Environment variable value is ambiguous")
                 .detail(err.to_string())
@@ -118,7 +128,7 @@ fn require_plaintext_environment_read(auth: &temps_auth::AuthContext) -> Result<
 /// (`project_access_guard!` is a no-op), so this is reachable against any
 /// project -- including one an admin just created for host Docker access,
 /// which "carries no restrictive access grants of its own" (ADR 045).
-async fn require_granted_project_write_authority(
+pub(crate) async fn require_granted_project_write_authority(
     environment_service: &crate::services::environment_service::EnvironmentService,
     auth: &temps_auth::AuthContext,
     project_id: i32,
@@ -161,7 +171,11 @@ async fn require_granted_project_write_authority_against(
     Ok(())
 }
 
-/// A regular variable can be revealed with EnvironmentsRead. Secrets remain
+/// Plaintext of a regular variable needs `SecretsRead` ("reveal plaintext
+/// credentials and environment values"), or `EnvironmentsWrite`: whoever can
+/// overwrite a value must be able to see what they are overwriting. Seeing
+/// that a variable exists (`EnvironmentsRead`) is not enough, or every
+/// read-only role and API key could export all of them. Secrets remain
 /// write-only regardless of the caller's permissions.
 fn require_environment_variable_reveal(
     auth: &temps_auth::AuthContext,
@@ -174,7 +188,101 @@ fn require_environment_variable_reveal(
             .detail("Stored secret values cannot be revealed. Replace the value to rotate it.")
             .build());
     }
+    if !auth.has_permission(&Permission::SecretsRead)
+        && !auth.has_permission(&Permission::EnvironmentsWrite)
+    {
+        return Err(
+            temps_core::error_builder::ErrorBuilder::new(StatusCode::FORBIDDEN)
+                .type_("https://temps.sh/probs/insufficient-permissions")
+                .title("Insufficient Permissions")
+                .detail(format!(
+                    "Revealing an environment variable value requires the {} or {} permission",
+                    Permission::SecretsRead,
+                    Permission::EnvironmentsWrite
+                ))
+                .value("required_permission", Permission::SecretsRead.to_string())
+                .value("user_role", auth.effective_role.to_string())
+                .build(),
+        );
+    }
     Ok(())
+}
+
+/// Whether a project-scoped permission set allows revealing values: the
+/// same rule as [`require_environment_variable_reveal`], applied to the
+/// caller's role on the project rather than their instance-wide role.
+fn project_permissions_allow_reveal(permissions: &[String]) -> bool {
+    let secrets_read = Permission::SecretsRead.to_string();
+    let environments_write = Permission::EnvironmentsWrite.to_string();
+    permissions
+        .iter()
+        .any(|permission| permission == &secrets_read || permission == &environments_write)
+}
+
+/// A team role narrows the instance-wide reveal rule to one project. A
+/// project `viewer` keeps their instance-wide `EnvironmentsWrite`, so without
+/// this they could reveal -- and export, through the `.env` editor -- every
+/// value of a project whose variables their role does not let them change.
+/// Instance administrators and deployment tokens are not narrowed, matching
+/// `project_permission_guard!`; a failed lookup denies.
+async fn require_project_environment_variable_reveal(
+    checker: Option<&Arc<dyn temps_core::ProjectAccessChecker>>,
+    auth: &temps_auth::AuthContext,
+    project_id: i32,
+) -> Result<(), Problem> {
+    let Some(checker) = checker else {
+        return Ok(());
+    };
+    if auth.is_deployment_token()
+        || auth.is_admin()
+        || auth.has_role(&temps_auth::Role::PlatformAdmin)
+    {
+        return Ok(());
+    }
+    let Some(user_id) = auth.user_id_opt() else {
+        return Err(temps_core::error_builder::forbidden()
+            .title("Insufficient Permissions")
+            .detail(format!(
+                "Could not resolve the caller's identity to check their role on project {}",
+                project_id
+            ))
+            .build());
+    };
+    match checker
+        .effective_project_permissions(user_id, project_id)
+        .await
+    {
+        // No project-specific role: project_access_guard! already decided.
+        Ok(None) => Ok(()),
+        Ok(Some(permissions)) if project_permissions_allow_reveal(&permissions) => Ok(()),
+        Ok(Some(_)) => Err(
+            temps_core::error_builder::ErrorBuilder::new(StatusCode::FORBIDDEN)
+                .type_("https://temps.sh/probs/project-permission-denied")
+                .title("Project Permission Denied")
+                .detail(format!(
+                    "Your role on project {} does not include the {} permission, which revealing an environment variable value requires",
+                    project_id,
+                    Permission::EnvironmentsWrite
+                ))
+                .value("required_permission", Permission::EnvironmentsWrite.to_string())
+                .build(),
+        ),
+        Err(e) => {
+            error!(
+                project_id = project_id,
+                user_id = user_id,
+                error = %e,
+                "Could not resolve project permissions for an environment variable reveal; denying"
+            );
+            Err(temps_core::error_builder::internal_server_error()
+                .title("Project Permission Check Failed")
+                .detail(format!(
+                    "Could not verify your role on project {}; please try again",
+                    project_id
+                ))
+                .build())
+        }
+    }
 }
 
 impl From<crate::services::secret_service::SecretError> for Problem {
@@ -260,8 +368,11 @@ pub async fn get_environments(
             protected: env.protected,
             sleeping: env.sleeping,
             attack_mode: env.attack_mode,
+            shield_mode: crate::handlers::types::stored_shield_mode(env.shield_mode.as_deref()),
+            shield_exempt_paths: env.shield_exempt_paths.0.clone(),
             force_https: env.force_https,
             last_activity_at: env.last_activity_at.map(|t| t.timestamp_millis()),
+            placement_warning: None,
             estimated_sleep_at: if !env.sleeping {
                 env.deployment_config
                     .as_ref()
@@ -315,6 +426,8 @@ pub async fn get_environment(
         .compute_environment_url(&env.subdomain)
         .await;
 
+    let placement_warning = state.environment_service.placement_warning(&env).await;
+
     Ok(Json(EnvironmentResponse {
         id: env.id,
         project_id: env.project_id,
@@ -331,8 +444,11 @@ pub async fn get_environment(
         protected: env.protected,
         sleeping: env.sleeping,
         attack_mode: env.attack_mode,
+        shield_mode: crate::handlers::types::stored_shield_mode(env.shield_mode.as_deref()),
+        shield_exempt_paths: env.shield_exempt_paths.0.clone(),
         force_https: env.force_https,
         last_activity_at: env.last_activity_at.map(|t| t.timestamp_millis()),
+        placement_warning,
         estimated_sleep_at: if !env.sleeping {
             env.deployment_config
                 .as_ref()
@@ -538,6 +654,8 @@ pub async fn get_environment_variables(
             } else {
                 Some("***".to_string())
             };
+            let secret_suggestion =
+                SecretSuggestionResponse::for_variable(v.secret_suggestion, &v.key);
             EnvironmentVariableResponse {
                 id: v.id,
                 key: v.key,
@@ -556,6 +674,7 @@ pub async fn get_environment_variables(
                     .collect(),
                 include_in_preview: v.include_in_preview,
                 is_secret: v.is_secret,
+                secret_suggestion,
             }
         })
         .collect();
@@ -597,6 +716,10 @@ pub async fn get_resolved_environment_variables(
     permission_guard!(auth, EnvironmentsRead);
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
+
+    // The integration provider reports a missing project as an opaque error;
+    // settle it here so that reads as a 404, not a 500.
+    state.environment_service.get_project(project_id).await?;
 
     // Manual vars (already includes environment memberships).
     let manual = state
@@ -760,6 +883,12 @@ pub async fn get_resolved_environment_variable_value(
     require_plaintext_environment_read(&auth)?;
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
+    require_project_environment_variable_reveal(
+        state.project_access_checker.as_ref(),
+        &auth,
+        project_id,
+    )
+    .await?;
 
     info!(
         user_id = auth.user_id(),
@@ -815,6 +944,9 @@ pub async fn get_resolved_environment_variable_value(
             ))
             .build()
     })?;
+
+    // Same as the resolved list: a missing project is a 404, not a provider failure.
+    state.environment_service.get_project(project_id).await?;
 
     let services = provider
         .get_project_integration_env_vars(project_id, params.environment_id)
@@ -888,6 +1020,7 @@ pub async fn create_environment_variable(
     State(state): State<Arc<AppState>>,
     Path(project_id): Path<i32>,
     RequireAuth(auth): RequireAuth,
+    Extension(metadata): Extension<RequestMetadata>,
     Json(request): Json<CreateEnvironmentVariableRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     project_permission_guard!(
@@ -918,6 +1051,28 @@ pub async fn create_environment_variable(
         .await
         .map_err(Problem::from)?;
 
+    // Never carries the value. An "Import .env" in the console calls this
+    // once per variable, so every imported variable is audited individually.
+    let audit = EnvironmentVariableWrittenAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        operation: "ENVIRONMENT_VARIABLE_CREATED",
+        project_id,
+        var_id: var.id,
+        key: var.key.clone(),
+        environment_ids: var.environments.iter().map(|env| env.id).collect(),
+        include_in_preview: var.include_in_preview,
+        is_secret: var.is_secret,
+        changed_fields: Vec::new(),
+    };
+    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+        error!("Failed to create audit log: {}", e);
+    }
+
+    let secret_suggestion = SecretSuggestionResponse::for_variable(var.secret_suggestion, &var.key);
     let response = EnvironmentVariableResponse {
         id: var.id,
         key: var.key,
@@ -936,6 +1091,7 @@ pub async fn create_environment_variable(
             .collect(),
         include_in_preview: var.include_in_preview,
         is_secret: var.is_secret,
+        secret_suggestion,
     };
 
     Ok((StatusCode::CREATED, Json(response)))
@@ -960,6 +1116,7 @@ pub async fn delete_environment_variable(
     State(state): State<Arc<AppState>>,
     Path((project_id, var_id)): Path<(i32, i32)>,
     RequireAuth(auth): RequireAuth,
+    Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
     project_permission_guard!(
         auth,
@@ -983,10 +1140,94 @@ pub async fn delete_environment_variable(
     )
     .await?;
 
-    state
+    let deleted = state
         .env_var_service
         .delete_environment_variable(project_id, var_id)
         .await?;
+
+    let audit = EnvironmentVariableDeletedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        project_id,
+        var_id: deleted.id,
+        key: deleted.key,
+        is_secret: deleted.is_secret,
+        environment_ids: deleted.environment_ids,
+    };
+    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+        error!("Failed to create audit log: {}", e);
+    }
+
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+/// Dismiss the "store as secret" suggestion for a regular variable
+///
+/// Records that the variable's current value is not a credential. The
+/// suggestion comes back if the value changes.
+#[utoipa::path(
+    delete,
+    path = "/projects/{project_id}/env-vars/{var_id}/secret-suggestion",
+    tag = "Projects",
+    responses(
+        (status = 204, description = "Suggestion dismissed"),
+        (status = 400, description = "The variable is already a secret"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Project or variable not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    params(
+        ("project_id" = i32, Path, description = "Project ID or slug"),
+        ("var_id" = i32, Path, description = "Environment variable ID")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn dismiss_environment_variable_secret_suggestion(
+    State(state): State<Arc<AppState>>,
+    Path((project_id, var_id)): Path<(i32, i32)>,
+    RequireAuth(auth): RequireAuth,
+    Extension(metadata): Extension<RequestMetadata>,
+) -> Result<impl IntoResponse, Problem> {
+    project_permission_guard!(
+        auth,
+        EnvironmentsWrite,
+        project_id,
+        state.project_access_checker
+    );
+    project_scope_guard!(auth, project_id);
+
+    let key = state
+        .env_var_service
+        .dismiss_secret_suggestion(project_id, var_id)
+        .await?;
+
+    info!(
+        user_id = auth.user_id(),
+        project_id,
+        var_id,
+        environment_variable_key = %key,
+        "Environment variable secret suggestion dismissed"
+    );
+    let audit = EnvironmentVariableSecretSuggestionDismissedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        project_id,
+        var_id,
+        key,
+    };
+    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+        error!(
+            project_id,
+            var_id, "Failed to audit secret suggestion dismissal: {}", e
+        );
+    }
 
     Ok(StatusCode::NO_CONTENT.into_response())
 }
@@ -1044,6 +1285,27 @@ pub async fn update_environment_variable(
         .await?;
     let var = outcome.var;
 
+    // Every update is audited; `changed_fields` names what changed and the
+    // value (old or new) is never recorded.
+    let updated_audit = EnvironmentVariableWrittenAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        operation: "ENVIRONMENT_VARIABLE_UPDATED",
+        project_id,
+        var_id,
+        key: var.key.clone(),
+        environment_ids: var.environments.iter().map(|env| env.id).collect(),
+        include_in_preview: var.include_in_preview,
+        is_secret: var.is_secret,
+        changed_fields: outcome.changed_fields,
+    };
+    if let Err(e) = state.audit_service.create_audit_log(&updated_audit).await {
+        error!("Failed to create audit log: {}", e);
+    }
+
     // Converting a variable to a secret is irreversible and removes the value
     // from list responses — audit it explicitly.
     if outcome.promoted_to_secret {
@@ -1071,6 +1333,7 @@ pub async fn update_environment_variable(
         }
     }
 
+    let secret_suggestion = SecretSuggestionResponse::for_variable(var.secret_suggestion, &var.key);
     let response = EnvironmentVariableResponse {
         id: var.id,
         key: var.key,
@@ -1089,6 +1352,7 @@ pub async fn update_environment_variable(
             .collect(),
         include_in_preview: var.include_in_preview,
         is_secret: var.is_secret,
+        secret_suggestion,
     };
 
     Ok(Json(response))
@@ -1123,6 +1387,12 @@ pub async fn get_environment_variable_value(
     permission_guard!(auth, EnvironmentsRead);
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
+    require_project_environment_variable_reveal(
+        state.project_access_checker.as_ref(),
+        &auth,
+        project_id,
+    )
+    .await?;
 
     info!(
         user_id = auth.user_id(),
@@ -1252,7 +1522,24 @@ fn environment_variable_value_response(
     )
 }
 
-/// Update environment settings
+/// Whether an environment settings write can change a granted runtime.
+fn settings_change_granted_runtime(settings: &UpdateEnvironmentSettingsRequest) -> bool {
+    settings.load_balancing.is_some()
+        || settings.branch.is_some()
+        || settings.automatic_deploy.is_some()
+        || settings.protected.is_some()
+        || settings.target_nodes.is_some()
+        || settings.target_labels.is_some()
+        || settings.exposed_port.is_some()
+        || settings.health.is_some()
+        || settings.password.is_some()
+        || settings.security.is_some()
+        || settings.force_https.is_some()
+        || settings.attack_mode.is_some()
+        || settings.shield_mode.is_some()
+        || settings.shield_exempt_paths.is_some()
+}
+
 #[utoipa::path(
     put,
     path = "/projects/{project_id}/environments/{env_id}/settings",
@@ -1302,29 +1589,31 @@ pub async fn update_environment_settings(
     // public URL -- disabling the HTTPS redirect makes an operator's
     // environment password interceptable on-path, and disabling the CAPTCHA
     // challenge removes the other half of what stands in front of a
-    // host-root-equivalent service's public endpoint.
-    if settings.branch.is_some()
-        || settings.automatic_deploy.is_some()
-        || settings.protected.is_some()
-        || settings.target_nodes.is_some()
-        || settings.target_labels.is_some()
-        || settings.exposed_port.is_some()
-        || settings.password.is_some()
-        || settings.security.is_some()
-        || settings.force_https.is_some()
-        || settings.attack_mode.is_some()
-    {
+    // host-root-equivalent service's public endpoint. A health command runs
+    // inside the next candidate and inherits that same Docker socket grant.
+    if settings_change_granted_runtime(&settings) {
         require_granted_project_write_authority(
             &state.environment_service,
             &auth,
             project_id,
-            "the tracked branch, exposed port, public access or deployment triggers",
+            "the tracked branch, exposed port, health command, public access or deployment triggers",
         )
         .await?;
     }
 
     // Get project details for audit log
     let project = state.environment_service.get_project(project_id).await?;
+
+    if settings.health.is_some()
+        && temps_core::docker_socket_grant::process_grant().declares(&project.slug)
+    {
+        temps_auth::require_sensitive_action(
+            state.sensitive_action_authorizer.as_ref(),
+            &auth,
+            temps_core::SensitiveAction::ChangeDockerSocketHealth { project_id },
+        )
+        .await?;
+    }
 
     // Get environment details for audit log
     let environment = state
@@ -1340,7 +1629,7 @@ pub async fn update_environment_settings(
             settings.clone(),
             // An operator who can edit the instance-wide ceilings is not
             // meaningfully constrained by them.
-            temps_core::CeilingEnforcement::from_has_settings_write(
+            temps_config::CeilingEnforcement::from_has_settings_write(
                 auth.has_permission(&temps_auth::Permission::SettingsWrite),
             ),
         )
@@ -1360,11 +1649,24 @@ pub async fn update_environment_settings(
         cpu_limit: settings.cpu_limit.flatten(),
         memory_request: settings.memory_request.flatten(),
         memory_limit: settings.memory_limit.flatten(),
-        branch: settings.branch,
+        branch: settings.branch.flatten(),
         replicas: settings.replicas,
         security_updated: settings.security.is_some(),
+        health_updated: settings.health.is_some(),
         attack_mode: settings.attack_mode,
+        shield_mode: (settings.shield_mode.is_some() || settings.attack_mode.is_some()).then(
+            || {
+                crate::handlers::types::stored_shield_mode(
+                    updated_environment.shield_mode.as_deref(),
+                )
+            },
+        ),
+        shield_exempt_paths: settings
+            .shield_exempt_paths
+            .is_some()
+            .then(|| updated_environment.shield_exempt_paths.0.clone()),
         force_https: settings.force_https,
+        load_balancing: settings.load_balancing,
         build_location: settings.build_location,
     };
 
@@ -1425,6 +1727,12 @@ pub async fn update_environment_settings(
         .compute_environment_url(&updated_environment.subdomain)
         .await;
 
+    // Stacking replicas is allowed, so say so here rather than only in a deploy log.
+    let placement_warning = state
+        .environment_service
+        .placement_warning(&updated_environment)
+        .await;
+
     Ok(Json(EnvironmentResponse {
         id: updated_environment.id,
         project_id: updated_environment.project_id,
@@ -1441,10 +1749,15 @@ pub async fn update_environment_settings(
         protected: updated_environment.protected,
         sleeping: updated_environment.sleeping,
         attack_mode: updated_environment.attack_mode,
+        shield_mode: crate::handlers::types::stored_shield_mode(
+            updated_environment.shield_mode.as_deref(),
+        ),
+        shield_exempt_paths: updated_environment.shield_exempt_paths.0.clone(),
         force_https: updated_environment.force_https,
         last_activity_at: updated_environment
             .last_activity_at
             .map(|t| t.timestamp_millis()),
+        placement_warning,
         estimated_sleep_at: if !updated_environment.sleeping {
             updated_environment
                 .deployment_config
@@ -1554,10 +1867,15 @@ pub async fn update_environment_subdomain(
         protected: updated_environment.protected,
         sleeping: updated_environment.sleeping,
         attack_mode: updated_environment.attack_mode,
+        shield_mode: crate::handlers::types::stored_shield_mode(
+            updated_environment.shield_mode.as_deref(),
+        ),
+        shield_exempt_paths: updated_environment.shield_exempt_paths.0.clone(),
         force_https: updated_environment.force_https,
         last_activity_at: updated_environment
             .last_activity_at
             .map(|t| t.timestamp_millis()),
+        placement_warning: None,
         estimated_sleep_at: if !updated_environment.sleeping {
             updated_environment
                 .deployment_config
@@ -1710,10 +2028,15 @@ pub async fn wake_environment(
         protected: updated_environment.protected,
         sleeping: updated_environment.sleeping,
         attack_mode: updated_environment.attack_mode,
+        shield_mode: crate::handlers::types::stored_shield_mode(
+            updated_environment.shield_mode.as_deref(),
+        ),
+        shield_exempt_paths: updated_environment.shield_exempt_paths.0.clone(),
         force_https: updated_environment.force_https,
         last_activity_at: updated_environment
             .last_activity_at
             .map(|t| t.timestamp_millis()),
+        placement_warning: None,
         estimated_sleep_at: if !updated_environment.sleeping {
             updated_environment
                 .deployment_config
@@ -1852,10 +2175,15 @@ pub async fn sleep_environment(
         protected: updated_environment.protected,
         sleeping: updated_environment.sleeping,
         attack_mode: updated_environment.attack_mode,
+        shield_mode: crate::handlers::types::stored_shield_mode(
+            updated_environment.shield_mode.as_deref(),
+        ),
+        shield_exempt_paths: updated_environment.shield_exempt_paths.0.clone(),
         force_https: updated_environment.force_https,
         last_activity_at: updated_environment
             .last_activity_at
             .map(|t| t.timestamp_millis()),
+        placement_warning: None,
         estimated_sleep_at: if !updated_environment.sleeping {
             updated_environment
                 .deployment_config
@@ -1888,6 +2216,7 @@ pub async fn sleep_environment(
         (status = 204, description = "Environment permanently deleted"),
         (status = 400, description = "Cannot delete production environment"),
         (status = 404, description = "Project or environment not found"),
+        (status = 409, description = "The environment still has CDN delivery, or a worker holding its containers is unreachable; a retry finishes once it is back"),
         (status = 428, description = "Recent MFA verification required"),
         (status = 500, description = "Internal server error")
     ),
@@ -1922,58 +2251,18 @@ pub async fn delete_environment(
 
     let project = state.environment_service.get_project(project_id).await?;
 
-    // Persist the deletion fence before cancelling workflows or touching
-    // Docker. Deployment workers already reject soft-deleted environments.
     state
-        .environment_service
-        .delete_environment(project_id, env_id)
-        .await?;
-
-    // Cancel all active deployments for this environment
-    match state
-        .deployment_service
-        .cancel_all_environment_deployments(env_id)
-        .await
-    {
-        Ok(count) => {
-            if count > 0 {
-                info!(
-                    "Cancelled {} active deployment(s) before deleting environment {}",
-                    count, env_id
-                );
-            }
-        }
-        Err(error) => {
-            error!(
-                project_id,
-                environment_id = env_id,
-                %error,
-                "Failed to cancel environment deployments"
-            );
-            return Err(
-                temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                    .with_title("Environment Deployment Cancellation Failed")
-                    .with_detail(format!(
-                        "Failed to cancel active deployments for environment {env_id}: {error}"
-                    )),
-            );
-        }
-    }
-
-    state
-        .deployment_container_cleaner
-        .cleanup_environment_containers(project_id, env_id)
+        .environment_teardown
+        .tear_down(project_id, env_id)
         .await
         .map_err(|error| {
             error!(
                 project_id,
                 environment_id = env_id,
                 %error,
-                "Failed to clean up environment containers"
+                "Failed to tear down environment"
             );
-            temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Environment Container Cleanup Failed")
-                .with_detail(error.to_string())
+            Problem::from(error)
         })?;
 
     // Create audit event
@@ -1998,6 +2287,30 @@ pub async fn delete_environment(
     }
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+impl From<EnvironmentTeardownError> for Problem {
+    fn from(error: EnvironmentTeardownError) -> Self {
+        match error {
+            EnvironmentTeardownError::Environment(error) => Problem::from(error),
+            EnvironmentTeardownError::Cancel { .. } => {
+                temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Environment Deployment Cancellation Failed")
+                    .with_detail(error.to_string())
+            }
+            // An unreachable worker is a state to wait out, and a retry finishes.
+            EnvironmentTeardownError::Cleanup(
+                temps_core::ContainerCleanupError::NodeUnreachable { .. },
+            ) => temps_core::problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Environment Container Cleanup Failed")
+                .with_detail(error.to_string()),
+            EnvironmentTeardownError::Cleanup(_) => {
+                temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Environment Container Cleanup Failed")
+                    .with_detail(error.to_string())
+            }
+        }
+    }
 }
 
 async fn require_environment_deletion_authorization(
@@ -2098,8 +2411,13 @@ pub async fn create_environment(
             protected: environment.protected,
             sleeping: environment.sleeping,
             attack_mode: environment.attack_mode,
+            shield_mode: crate::handlers::types::stored_shield_mode(
+                environment.shield_mode.as_deref(),
+            ),
+            shield_exempt_paths: environment.shield_exempt_paths.0.clone(),
             force_https: environment.force_https,
             last_activity_at: environment.last_activity_at.map(|t| t.timestamp_millis()),
+            placement_warning: None,
             estimated_sleep_at: if !environment.sleeping {
                 environment
                     .deployment_config
@@ -2498,6 +2816,10 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
             delete(delete_environment_variable),
         )
         .route(
+            "/projects/{project_id}/env-vars/{var_id}/secret-suggestion",
+            delete(dismiss_environment_variable_secret_suggestion),
+        )
+        .route(
             "/projects/{project_id}/env-vars/{key}/value",
             get(get_environment_variable_value),
         )
@@ -2535,6 +2857,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         create_environment_variable,
         update_environment_variable,
         delete_environment_variable,
+        dismiss_environment_variable_secret_suggestion,
         get_environment_variable_value,
         get_resolved_environment_variable_value,
         list_project_secrets,
@@ -2544,6 +2867,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
     ),
     components(
         schemas(
+            temps_core::repo_config::HealthCheckConfig,
             EnvironmentResponse,
             CreateEnvironmentRequest,
             UpdateEnvironmentSettingsRequest,
@@ -2551,6 +2875,8 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
             EnvironmentDomainResponse,
             AddEnvironmentDomainRequest,
             EnvironmentVariableResponse,
+            SecretSuggestionResponse,
+            crate::services::secret_suggestion::SecretSuggestionReason,
             CreateEnvironmentVariableRequest,
             UpdateEnvironmentVariableRequest,
             EnvironmentVariableValueResponse,
@@ -2576,6 +2902,53 @@ pub struct ApiDoc;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An unreachable worker is a 409 the caller can retry; any other
+    /// teardown failure is a 500 naming the environment.
+    #[test]
+    fn teardown_failures_map_to_retryable_or_internal_problems() {
+        let unreachable =
+            EnvironmentTeardownError::Cleanup(temps_core::ContainerCleanupError::NodeUnreachable {
+                project_id: 3,
+                environment_id: 7,
+                container_id: "container-1".to_string(),
+                node_id: Some(2),
+                reason: "connection refused".to_string(),
+            });
+        assert_eq!(Problem::from(unreachable).status_code, StatusCode::CONFLICT);
+
+        let removal =
+            EnvironmentTeardownError::Cleanup(temps_core::ContainerCleanupError::Removal {
+                project_id: 3,
+                environment_id: 7,
+                container_id: "container-1".to_string(),
+                node_id: None,
+                reason: "device busy".to_string(),
+            });
+        assert_eq!(
+            Problem::from(removal).status_code,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+
+        let cancel = EnvironmentTeardownError::Cancel {
+            environment_id: 7,
+            reason: "workflow store unavailable".to_string(),
+        };
+        let problem = Problem::from(cancel);
+        assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        let detail = problem
+            .body
+            .get("detail")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        assert!(detail.contains("environment 7"), "{detail}");
+
+        let refused =
+            EnvironmentTeardownError::Environment(crate::services::EnvironmentError::InvalidInput(
+                "Cannot delete production environment".to_string(),
+            ));
+        assert_eq!(Problem::from(refused).status_code, StatusCode::BAD_REQUEST);
+    }
     use std::sync::Mutex;
     use temps_core::{AuditLogger, AuditOperation};
 
@@ -2628,9 +3001,12 @@ mod tests {
         async fn create_audit_log(
             &self,
             operation: &dyn AuditOperation,
-        ) -> Result<(), temps_core::anyhow::Error> {
+        ) -> temps_core::AuditResult<()> {
             if self.fail {
-                return Err(temps_core::anyhow::anyhow!("audit database unavailable"));
+                return Err(temps_core::AuditError::write(
+                    operation.operation_type(),
+                    "audit database unavailable",
+                ));
             }
             self.serialized_operations
                 .lock()
@@ -2695,6 +3071,30 @@ mod tests {
     }
 
     #[test]
+    fn secret_reveal_through_the_legacy_service_maps_to_forbidden() {
+        let problem = Problem::from(
+            crate::services::env_var_service::EnvVarError::SecretValueRequiresAuditedReveal {
+                var_id: 7,
+                key: "API_KEY".to_string(),
+            },
+        );
+
+        assert_eq!(problem.into_response().status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn empty_secret_value_maps_to_bad_request() {
+        let problem = Problem::from(
+            crate::services::env_var_service::EnvVarError::SecretValueRequired {
+                key: "API_KEY".to_string(),
+                omit_keeps_stored: true,
+            },
+        );
+
+        assert_eq!(problem.into_response().status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
     fn reader_cannot_reveal_plaintext_environment_values() {
         let problem =
             require_plaintext_environment_read(&test_auth_context(temps_auth::Role::Reader))
@@ -2717,6 +3117,188 @@ mod tests {
         // value it's about to overwrite.
         require_environment_variable_reveal(&test_auth_context(temps_auth::Role::User), false)
             .expect("a non-admin who can edit a plain variable must be able to reveal it");
+    }
+
+    #[test]
+    fn reader_cannot_reveal_a_non_secret_environment_variable() {
+        // Reader holds EnvironmentsRead, which shows that a variable exists.
+        // Without this check it could export every plaintext value through
+        // the per-variable reveal, one request per key.
+        let problem = require_environment_variable_reveal(
+            &test_auth_context(temps_auth::Role::Reader),
+            false,
+        )
+        .expect_err("a read-only role must not reveal plaintext environment values");
+
+        assert_eq!(problem.into_response().status(), StatusCode::FORBIDDEN);
+    }
+
+    fn test_api_key_context(permissions: Vec<Permission>) -> temps_auth::AuthContext {
+        let user = test_auth_context(temps_auth::Role::User)
+            .user
+            .expect("session context has a user");
+        temps_auth::AuthContext::new_api_key(user, None, Some(permissions), "ci".to_string(), 7)
+    }
+
+    #[test]
+    fn api_key_with_only_environments_read_cannot_reveal_values() {
+        let problem = require_environment_variable_reveal(
+            &test_api_key_context(vec![Permission::EnvironmentsRead]),
+            false,
+        )
+        .expect_err("environments:read alone must not reveal plaintext");
+
+        assert_eq!(problem.into_response().status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn api_key_with_secrets_read_can_reveal_values() {
+        require_environment_variable_reveal(
+            &test_api_key_context(vec![Permission::EnvironmentsRead, Permission::SecretsRead]),
+            false,
+        )
+        .expect("secrets:read is the permission for revealing environment values");
+    }
+
+    #[test]
+    fn api_key_with_environments_write_can_reveal_values() {
+        require_environment_variable_reveal(
+            &test_api_key_context(vec![
+                Permission::EnvironmentsRead,
+                Permission::EnvironmentsWrite,
+            ]),
+            false,
+        )
+        .expect("a key that can overwrite a value must be able to read it first");
+    }
+
+    /// Answers `effective_project_permissions` with a fixed result, as a
+    /// team-membership checker would for one (user, project) pair.
+    struct FixedProjectPermissions(Result<Option<Vec<Permission>>, ()>);
+
+    #[temps_core::async_trait::async_trait]
+    impl temps_core::ProjectAccessChecker for FixedProjectPermissions {
+        async fn user_can_access_project(
+            &self,
+            _user_id: i32,
+            _project_id: i32,
+        ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(true)
+        }
+
+        async fn effective_project_permissions(
+            &self,
+            _user_id: i32,
+            _project_id: i32,
+        ) -> Result<Option<Vec<String>>, Box<dyn std::error::Error + Send + Sync>> {
+            match &self.0 {
+                Ok(permissions) => Ok(permissions
+                    .as_ref()
+                    .map(|perms| perms.iter().map(ToString::to_string).collect())),
+                Err(()) => Err("membership lookup failed".into()),
+            }
+        }
+    }
+
+    fn checker(
+        result: Result<Option<Vec<Permission>>, ()>,
+    ) -> Arc<dyn temps_core::ProjectAccessChecker> {
+        Arc::new(FixedProjectPermissions(result))
+    }
+
+    /// What the fixed `viewer` team role grants on environments.
+    fn project_viewer() -> Vec<Permission> {
+        vec![Permission::ProjectsRead, Permission::EnvironmentsRead]
+    }
+
+    #[tokio::test]
+    async fn project_viewer_cannot_reveal_values_despite_instance_environments_write() {
+        let viewer_checker = checker(Ok(Some(project_viewer())));
+
+        let problem = require_project_environment_variable_reveal(
+            Some(&viewer_checker),
+            &test_auth_context(temps_auth::Role::User),
+            7,
+        )
+        .await
+        .expect_err("a project viewer must not reveal that project's values");
+
+        let response = problem.into_response();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn project_role_with_environments_write_can_reveal_values() {
+        let mut deployer = project_viewer();
+        deployer.push(Permission::EnvironmentsWrite);
+        let deployer_checker = checker(Ok(Some(deployer)));
+
+        require_project_environment_variable_reveal(
+            Some(&deployer_checker),
+            &test_auth_context(temps_auth::Role::User),
+            7,
+        )
+        .await
+        .expect("a role that can change values can read them");
+    }
+
+    #[tokio::test]
+    async fn api_key_of_a_project_viewer_cannot_reveal_values_with_secrets_read() {
+        let viewer_checker = checker(Ok(Some(project_viewer())));
+
+        let problem = require_project_environment_variable_reveal(
+            Some(&viewer_checker),
+            &test_api_key_context(vec![Permission::EnvironmentsRead, Permission::SecretsRead]),
+            7,
+        )
+        .await
+        .expect_err("the project role caps what an API key may do on that project");
+
+        assert_eq!(problem.into_response().status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn instance_admin_is_not_narrowed_by_a_project_role() {
+        let viewer_checker = checker(Ok(Some(project_viewer())));
+
+        require_project_environment_variable_reveal(
+            Some(&viewer_checker),
+            &test_auth_context(temps_auth::Role::Admin),
+            7,
+        )
+        .await
+        .expect("instance administrators are never restricted by team membership");
+    }
+
+    #[tokio::test]
+    async fn reveal_is_unrestricted_without_a_project_role_or_checker() {
+        let no_role = checker(Ok(None));
+        let user = test_auth_context(temps_auth::Role::User);
+
+        require_project_environment_variable_reveal(Some(&no_role), &user, 7)
+            .await
+            .expect("no project-specific role leaves the instance-wide rule in charge");
+        require_project_environment_variable_reveal(None, &user, 7)
+            .await
+            .expect("without a checker there are no project roles to apply");
+    }
+
+    #[tokio::test]
+    async fn reveal_is_denied_when_the_project_role_cannot_be_resolved() {
+        let failing = checker(Err(()));
+
+        let problem = require_project_environment_variable_reveal(
+            Some(&failing),
+            &test_auth_context(temps_auth::Role::User),
+            7,
+        )
+        .await
+        .expect_err("a failed role lookup must deny, not allow");
+
+        assert_eq!(
+            problem.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 
     #[test]
@@ -2748,8 +3330,69 @@ mod tests {
         use sea_orm::{ActiveModelTrait, Set};
         use temps_config::{ConfigService, ServerConfig};
         use temps_core::docker_socket_grant::DockerSocketGrant;
-        use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
         use temps_entities::{preset::Preset, projects};
+        use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
+
+        #[tokio::test]
+        async fn health_and_routing_only_settings_enforce_granted_project_authority() {
+            use sea_orm::{DatabaseBackend, MockDatabase};
+            for body in [
+                serde_json::json!({"health":{"type":"exec","command":["check-worker"]}}),
+                serde_json::json!({"health":null}),
+                serde_json::json!({"load_balancing":{"strategy":"preferred_nodes"}}),
+                serde_json::json!({"load_balancing":null}),
+            ] {
+                let request: UpdateEnvironmentSettingsRequest =
+                    serde_json::from_value(body).unwrap();
+                assert!(
+                    settings_change_granted_runtime(&request),
+                    "setting and clearing health or routing must both be guarded"
+                );
+                for (slug, role, allowed) in [
+                    ("node-daemon", temps_auth::Role::User, false),
+                    ("node-daemon", temps_auth::Role::Admin, true),
+                    ("ordinary-app", temps_auth::Role::User, true),
+                ] {
+                    let project: projects::Model = serde_json::from_value(serde_json::json!({
+                        "id":10,"name":"Worker","slug":slug,"repo_name":"worker","repo_owner":"operator","directory":"/","main_branch":"main","preset":"dockerfile",
+                        "pull_only_root_directory":false,"created_at":chrono::Utc::now(),"updated_at":chrono::Utc::now(),"is_deleted":false,"is_public_repo":false,"attack_mode":false,"shield_mode":"log","ai_write_actions_enabled":false,
+                        "error_source_context_enabled":false,"vulnerability_scanning_enabled":false,"enable_preview_environments":false,"preview_envs_on_demand":false,"preview_envs_idle_timeout_seconds":300,"preview_envs_wake_timeout_seconds":30,
+                        "source_type":"docker_image","project_type":"Server","cross_project_trace_sharing":true,"cloud_telemetry_fidelity":"metered","cloud_telemetry_attribute_allowlist":[],"cloud_telemetry_write_mode":"local","cloud_analytics_write_mode":"local","hosting":"hosted"
+                    })).unwrap();
+                    let db = Arc::new(
+                        MockDatabase::new(DatabaseBackend::Postgres)
+                            .append_query_results([vec![project]])
+                            .into_connection(),
+                    );
+                    let config = Arc::new(ConfigService::new(
+                        Arc::new(
+                            ServerConfig::new(
+                                "127.0.0.1:3000".into(),
+                                "postgres://localhost/test".into(),
+                                None,
+                                None,
+                            )
+                            .unwrap(),
+                        ),
+                        db.clone(),
+                    ));
+                    let service =
+                        crate::services::environment_service::EnvironmentService::new(db, config);
+                    let result = require_granted_project_write_authority_against(
+                        &service,
+                        &DockerSocketGrant::parse(Some("node-daemon")),
+                        &test_auth_context(role),
+                        10,
+                        "health command",
+                    )
+                    .await;
+                    assert_eq!(result.is_ok(), allowed);
+                    if let Err(problem) = result {
+                        assert_eq!(problem.into_response().status(), StatusCode::FORBIDDEN);
+                    }
+                }
+            }
+        }
 
         async fn test_database() -> Option<TestDatabase> {
             match TestDatabase::with_migrations().await {
@@ -2971,6 +3614,14 @@ mod tests {
         .expect_err("reveal must fail if the audit cannot be persisted");
 
         assert_eq!(
+            problem.body["title"],
+            "Environment variable could not be revealed"
+        );
+        assert_eq!(
+            problem.body["detail"],
+            "The audit record for this reveal could not be written"
+        );
+        assert_eq!(
             problem.into_response().status(),
             StatusCode::INTERNAL_SERVER_ERROR
         );
@@ -3035,5 +3686,349 @@ mod tests {
             resolve_integration_environment_variable(&services, "DATABASE_URL", None),
             Err(IntegrationEnvironmentVariableResolutionError::Ambiguous)
         );
+    }
+
+    /// `DELETE /projects/{project_id}/env-vars/{var_id}/secret-suggestion`
+    /// through the router: guards, status, audit and Problem Details.
+    mod dismiss_secret_suggestion_route {
+        use super::*;
+        use crate::services::EnvVarService;
+        use axum::body::Body;
+        use axum::http::{HeaderMap, Request};
+        use sea_orm::{ActiveModelTrait, DatabaseBackend, EntityTrait, MockDatabase, Set};
+        use temps_config::{ConfigService, ServerConfig};
+        use temps_core::EncryptionService;
+        use temps_entities::{env_vars, preset::Preset, projects};
+        use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
+        use tower::ServiceExt;
+
+        const ENCRYPTION_KEY: &str =
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+        struct NoDeployments;
+
+        #[temps_core::async_trait::async_trait]
+        impl temps_core::DeploymentCanceller for NoDeployments {
+            async fn cancel_all_project_deployments(
+                &self,
+                _project_id: i32,
+            ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+                Ok(0)
+            }
+            async fn cancel_all_environment_deployments(
+                &self,
+                _environment_id: i32,
+            ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+                Ok(0)
+            }
+        }
+
+        #[temps_core::async_trait::async_trait]
+        impl temps_core::DeploymentContainerCleaner for NoDeployments {
+            async fn cleanup_project_containers(
+                &self,
+                _project_id: i32,
+            ) -> Result<u64, temps_core::ContainerCleanupError> {
+                Ok(0)
+            }
+            async fn cleanup_environment_containers(
+                &self,
+                _project_id: i32,
+                _environment_id: i32,
+            ) -> Result<u64, temps_core::ContainerCleanupError> {
+                Ok(0)
+            }
+        }
+
+        struct AllowSensitiveActions;
+
+        #[temps_core::async_trait::async_trait]
+        impl temps_core::SensitiveActionAuthorizer for AllowSensitiveActions {
+            async fn authorize(
+                &self,
+                _action: &temps_core::SensitiveAction,
+                _principal: &temps_core::SensitiveActionPrincipal,
+            ) -> Result<
+                temps_core::SensitiveActionDecision,
+                temps_core::SensitiveActionAuthorizationError,
+            > {
+                Ok(temps_core::SensitiveActionDecision::Allow)
+            }
+        }
+
+        fn app(
+            db: Arc<temps_database::DbConnection>,
+            audit: Arc<RecordingAuditLogger>,
+            project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
+        ) -> axum::Router {
+            let encryption = Arc::new(EncryptionService::new(ENCRYPTION_KEY).unwrap());
+            let config = Arc::new(ConfigService::new(
+                Arc::new(
+                    ServerConfig::new(
+                        "127.0.0.1:3000".to_string(),
+                        "postgres://localhost/test".to_string(),
+                        None,
+                        None,
+                    )
+                    .unwrap(),
+                ),
+                db.clone(),
+            ));
+            let environment_service = Arc::new(
+                crate::services::environment_service::EnvironmentService::new(db.clone(), config),
+            );
+            let state = Arc::new(AppState {
+                environment_service: environment_service.clone(),
+                env_var_service: Arc::new(EnvVarService::new(db.clone(), encryption.clone())),
+                secret_service: Arc::new(crate::services::SecretService::new(db, encryption)),
+                audit_service: audit,
+                environment_teardown: Arc::new(crate::services::EnvironmentTeardownService::new(
+                    environment_service.clone(),
+                    Arc::new(NoDeployments),
+                    Arc::new(NoDeployments),
+                )),
+                on_demand_waker: None,
+                integration_env_provider: None,
+                telemetry: Arc::new(temps_core::telemetry::NoopTelemetryReporter),
+                project_access_checker,
+                sensitive_action_authorizer: Arc::new(AllowSensitiveActions),
+            });
+            configure_routes().with_state(state)
+        }
+
+        /// A database that fails every query: the guard tests prove the
+        /// request is refused before anything is read or written.
+        fn untouchable_db() -> Arc<temps_database::DbConnection> {
+            Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection())
+        }
+
+        async fn dismiss(
+            app: axum::Router,
+            project_id: i32,
+            var_id: i32,
+            auth: Option<temps_auth::AuthContext>,
+        ) -> (StatusCode, HeaderMap, serde_json::Value) {
+            let mut request = Request::builder()
+                .method("DELETE")
+                .uri(format!(
+                    "/projects/{project_id}/env-vars/{var_id}/secret-suggestion"
+                ))
+                .body(Body::empty())
+                .unwrap();
+            request.extensions_mut().insert(RequestMetadata {
+                ip_address: "127.0.0.1".to_string(),
+                user_agent: "dismiss-test".to_string(),
+                headers: HeaderMap::new(),
+                visitor_id_cookie: None,
+                session_id_cookie: None,
+                base_url: "https://cp.example.test".to_string(),
+                scheme: "https".to_string(),
+                host: "cp.example.test".to_string(),
+                is_secure: true,
+            });
+            if let Some(auth) = auth {
+                request.extensions_mut().insert(auth);
+            }
+            let response = app.oneshot(request).await.unwrap();
+            let status = response.status();
+            let headers = response.headers().clone();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body = if bytes.is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::from_slice(&bytes).unwrap()
+            };
+            (status, headers, body)
+        }
+
+        fn is_problem(headers: &HeaderMap) -> bool {
+            headers
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with("application/problem+json"))
+        }
+
+        #[tokio::test]
+        async fn resolved_variables_of_a_missing_project_are_a_404() {
+            let db = MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([Vec::<temps_entities::projects::Model>::new()])
+                .into_connection();
+            let audit = Arc::new(RecordingAuditLogger::default());
+            let mut request = Request::builder()
+                .uri("/projects/999/env-vars/resolved")
+                .body(Body::empty())
+                .unwrap();
+            request
+                .extensions_mut()
+                .insert(test_auth_context(temps_auth::Role::Admin));
+
+            let response = app(Arc::new(db), audit, None)
+                .oneshot(request)
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+
+        #[tokio::test]
+        async fn without_a_token_it_is_401() {
+            let audit = Arc::new(RecordingAuditLogger::default());
+            let (status, _, _) =
+                dismiss(app(untouchable_db(), audit.clone(), None), 3, 9, None).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+            assert!(audit.serialized_operations.lock().unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_reader_is_refused_with_a_problem() {
+            let audit = Arc::new(RecordingAuditLogger::default());
+            let (status, headers, body) = dismiss(
+                app(untouchable_db(), audit.clone(), None),
+                3,
+                9,
+                Some(test_auth_context(temps_auth::Role::Reader)),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert!(is_problem(&headers), "403 must be Problem Details");
+            assert!(body["title"].is_string());
+            assert!(audit.serialized_operations.lock().unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_project_viewer_is_refused_despite_an_instance_role_that_could() {
+            let audit = Arc::new(RecordingAuditLogger::default());
+            let (status, _, _) = dismiss(
+                app(
+                    untouchable_db(),
+                    audit.clone(),
+                    Some(checker(Ok(Some(project_viewer())))),
+                ),
+                3,
+                9,
+                Some(test_auth_context(temps_auth::Role::User)),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert!(audit.serialized_operations.lock().unwrap().is_empty());
+        }
+
+        async fn test_database() -> Option<TestDatabase> {
+            match TestDatabase::with_migrations().await {
+                Ok(database) => Some(database),
+                Err(error) if is_container_runtime_unavailable(&error.to_string()) => {
+                    eprintln!("Docker unavailable, skipping dismiss route test: {error:#}");
+                    None
+                }
+                Err(error) => panic!("dismiss route test database setup failed: {error:#}"),
+            }
+        }
+
+        async fn insert_project(test_db: &TestDatabase) -> i32 {
+            projects::ActiveModel {
+                name: Set("Shop".to_string()),
+                slug: Set("shop".to_string()),
+                repo_name: Set("shop".to_string()),
+                repo_owner: Set("operator".to_string()),
+                directory: Set("/".to_string()),
+                main_branch: Set("main".to_string()),
+                preset: Set(Preset::Nixpacks),
+                ..Default::default()
+            }
+            .insert(test_db.connection())
+            .await
+            .unwrap()
+            .id
+        }
+
+        async fn insert_variable(test_db: &TestDatabase, project_id: i32, is_secret: bool) -> i32 {
+            EnvVarService::new(
+                test_db.connection_arc(),
+                Arc::new(EncryptionService::new(ENCRYPTION_KEY).unwrap()),
+            )
+            .create_environment_variable(
+                project_id,
+                vec![],
+                "DATABASE_URL".to_string(),
+                "postgres://app:hunter2@db/app".to_string(),
+                false,
+                is_secret,
+            )
+            .await
+            .unwrap()
+            .id
+        }
+
+        #[tokio::test]
+        async fn a_writer_dismisses_and_the_dismissal_is_audited() {
+            let Some(test_db) = test_database().await else {
+                return;
+            };
+            let project_id = insert_project(&test_db).await;
+            let var_id = insert_variable(&test_db, project_id, false).await;
+            let audit = Arc::new(RecordingAuditLogger::default());
+
+            let (status, _, body) = dismiss(
+                app(test_db.connection_arc(), audit.clone(), None),
+                project_id,
+                var_id,
+                Some(test_auth_context(temps_auth::Role::User)),
+            )
+            .await;
+
+            assert_eq!(status, StatusCode::NO_CONTENT);
+            assert_eq!(body, serde_json::Value::Null);
+            let stored = env_vars::Entity::find_by_id(var_id)
+                .one(test_db.connection())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(stored.secret_suggestion_dismissed_at.is_some());
+            let records = audit.serialized_operations.lock().unwrap();
+            assert_eq!(records.len(), 1);
+            assert_eq!(
+                records[0].0,
+                "ENVIRONMENT_VARIABLE_SECRET_SUGGESTION_DISMISSED"
+            );
+            let record: serde_json::Value = serde_json::from_str(&records[0].1).unwrap();
+            assert_eq!(record["project_id"], project_id);
+            assert_eq!(record["var_id"], var_id);
+            assert_eq!(record["key"], "DATABASE_URL");
+            assert!(
+                !records[0].1.contains("hunter2"),
+                "the audit record never carries the value"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_secret_is_a_400_problem_and_a_missing_variable_a_404() {
+            let Some(test_db) = test_database().await else {
+                return;
+            };
+            let project_id = insert_project(&test_db).await;
+            let secret_id = insert_variable(&test_db, project_id, true).await;
+            let audit = Arc::new(RecordingAuditLogger::default());
+            let app = app(test_db.connection_arc(), audit.clone(), None);
+            let writer = || Some(test_auth_context(temps_auth::Role::User));
+
+            let (status, headers, body) =
+                dismiss(app.clone(), project_id, secret_id, writer()).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(is_problem(&headers));
+            assert!(body["detail"].as_str().unwrap().contains("DATABASE_URL"));
+
+            let missing = secret_id + 1000;
+            let (status, headers, body) = dismiss(app, project_id, missing, writer()).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            assert!(is_problem(&headers));
+            assert!(body["detail"]
+                .as_str()
+                .unwrap()
+                .contains(&missing.to_string()));
+
+            assert!(audit.serialized_operations.lock().unwrap().is_empty());
+        }
     }
 }

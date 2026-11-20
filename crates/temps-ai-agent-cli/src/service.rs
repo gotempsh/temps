@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+use temps_core::crypto::constant_time_eq;
 
 use async_trait::async_trait;
 use axum::response::{IntoResponse, Response};
@@ -24,18 +25,17 @@ use temps_agent_runtime::{
 };
 use tokio::sync::Semaphore;
 
-use temps_agents::ai_cli::{
-    cached_model_capabilities, cached_status, discover_model_capabilities_cached,
-    extract_session_metadata, get_status_cached, provider_capabilities_from_models,
-    scrub_and_bound, scrub_secrets, AiCliProvider, AiRunConfig, OnEventCallback, PermissionBridge,
-    ProviderSessionMetadata,
-};
-use temps_agents::error::AgentError;
-use temps_agents::sandbox::{SandboxBackend, SandboxCreateConfig, SandboxProvider};
+use temps_agent_core::error::AgentError;
 use temps_ai::{
     extract_json_block, AiError, AiRequest, AiResponse, AiService, ChatStreamDelta, ChatTool,
     ChatTurnRequest, ChatTurnStream, TokenStream, ToolCall, ToolExecutor, TurnServices,
 };
+use temps_ai_cli::{
+    cached_model_capabilities, cached_status, discover_model_capabilities_cached,
+    get_status_cached, provider_capabilities_from_models, scrub_and_bound, scrub_secrets,
+    AiCliProvider, AiRunConfig, OnEventCallback, PermissionBridge,
+};
+use temps_sandbox_providers::{SandboxBackend, SandboxCreateConfig, SandboxProvider};
 
 use crate::model_relay::{SandboxHarnessCredentials, SandboxModelRelay, SandboxModelRelayService};
 use crate::runtime_transport::SandboxRuntimeConnector;
@@ -204,17 +204,6 @@ const MCP_TOOL_TIMEOUT: Duration = Duration::from_secs(30);
 const MCP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const MCP_BODY_LIMIT_BYTES: usize = 1024 * 1024;
 
-/// Constant-time equality for the bridge's bearer token check.
-///
-/// Same primitive `temps-routes` uses for its route-sync token check
-/// (`subtle::ConstantTimeEq`), applied here as defense-in-depth: the bridge
-/// already binds to loopback on an ephemeral port behind a random per-instance
-/// path and token, but a length-preserving `==` still leaks a timing signal.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    use subtle::ConstantTimeEq;
-    a.ct_eq(b).into()
-}
-
 fn build_bridge_router(path: &str, state: McpBridgeState) -> axum::Router {
     axum::Router::new()
         .route(path, axum::routing::post(mcp_bridge_handler))
@@ -223,6 +212,41 @@ fn build_bridge_router(path: &str, state: McpBridgeState) -> axum::Router {
 }
 
 const PROVIDER_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
+/// Cached harness version status for one principal's workspace.
+#[derive(Default)]
+struct HarnessUpdateState {
+    status: Option<temps_ai::HarnessUpdateStatus>,
+    checked_at: Option<Instant>,
+    updating: bool,
+}
+
+type HarnessUpdates = Arc<std::sync::Mutex<HashMap<i32, HarnessUpdateState>>>;
+
+/// Marks a workspace's harness as "updating" and clears the mark when dropped.
+///
+/// The update runs in a detached task that owns this guard, so a client that
+/// disconnects mid-update can neither strand the flag nor cancel the install.
+/// Dropping also discards the cached check: whatever finished (or failed)
+/// changed what is installed, so the next read looks inside the workspace again.
+struct HarnessUpdateGuard {
+    states: HarnessUpdates,
+    principal_id: i32,
+}
+
+impl Drop for HarnessUpdateGuard {
+    fn drop(&mut self) {
+        let mut states = self
+            .states
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(state) = states.get_mut(&self.principal_id) {
+            state.updating = false;
+            state.status = None;
+            state.checked_at = None;
+        }
+    }
+}
+
 const WORKSPACE_MODEL_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const WORKSPACE_MODEL_REFRESH_COOLDOWN: Duration = Duration::from_secs(15);
 const WORKSPACE_MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(20);
@@ -270,127 +294,6 @@ fn should_reuse_completed_refresh(
 }
 
 type NativeToolCalls = Arc<Mutex<HashMap<String, ToolCall>>>;
-
-#[allow(dead_code)] // retained only for legacy command-construction regression tests
-fn merge_session_metadata(
-    slot: &Arc<Mutex<Option<ProviderSessionMetadata>>>,
-    incoming: ProviderSessionMetadata,
-) {
-    let mut metadata = slot
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    match metadata.as_mut() {
-        Some(current) => {
-            if incoming.session_id.is_some() {
-                current.session_id = incoming.session_id;
-            }
-            if incoming.title.is_some() {
-                current.title = incoming.title;
-            }
-        }
-        None => *metadata = Some(incoming),
-    }
-}
-
-#[allow(dead_code)]
-fn bounded_harness_title(value: &str) -> Option<String> {
-    const MAX_CHARS: usize = 120;
-    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    if normalized.is_empty() {
-        return None;
-    }
-    Some(normalized.chars().take(MAX_CHARS).collect())
-}
-
-/// Claude currently stores its human-facing session label in local metadata
-/// rather than emitting it on `stream-json`. Newer indexes may write a
-/// `custom-title`; loose transcripts expose the first prompt. Temps sends a
-/// flattened role transcript as that prompt, so take its final `[user]`
-/// segment instead of using the system framing as a navigation label.
-#[allow(dead_code)]
-fn claude_session_title_from_transcript(contents: &[u8]) -> Option<String> {
-    let text = std::str::from_utf8(contents).ok()?;
-    let mut first_prompt: Option<String> = None;
-    for line in text.lines().take(40) {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        if value.get("type").and_then(serde_json::Value::as_str) == Some("custom-title") {
-            if let Some(title) = value
-                .get("customTitle")
-                .and_then(serde_json::Value::as_str)
-                .and_then(bounded_harness_title)
-            {
-                return Some(title);
-            }
-        }
-        if first_prompt.is_none()
-            && value.get("type").and_then(serde_json::Value::as_str) == Some("user")
-            && value
-                .pointer("/message/role")
-                .and_then(serde_json::Value::as_str)
-                == Some("user")
-        {
-            first_prompt = value
-                .pointer("/message/content")
-                .and_then(serde_json::Value::as_array)
-                .and_then(|items| {
-                    items.iter().find_map(|item| {
-                        (item.get("type").and_then(serde_json::Value::as_str) == Some("text"))
-                            .then(|| item.get("text").and_then(serde_json::Value::as_str))
-                            .flatten()
-                    })
-                })
-                .or_else(|| {
-                    value
-                        .pointer("/message/content")
-                        .and_then(serde_json::Value::as_str)
-                })
-                .map(str::to_string);
-        }
-    }
-    let prompt = first_prompt?;
-    let user_prompt = prompt
-        .rsplit("\n\n[user]\n")
-        .next()
-        .unwrap_or(prompt.as_str());
-    let user_prompt = user_prompt
-        .split("\n\n[assistant]\n")
-        .next()
-        .unwrap_or(user_prompt);
-    bounded_harness_title(user_prompt)
-}
-
-#[allow(dead_code)]
-async fn resolve_sandbox_session_title(
-    provider_name: &str,
-    sandbox: &dyn SandboxProvider,
-    handle: &temps_agents::sandbox::SandboxHandle,
-    session_id: &str,
-) -> Option<String> {
-    if provider_name != "claude_cli"
-        || session_id.is_empty()
-        || session_id.len() > 200
-        || !session_id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
-    {
-        return None;
-    }
-    let path = format!("/home/temps/.claude/projects/-home-temps-workspace/{session_id}.jsonl");
-    match sandbox.read_file(handle, &path).await {
-        Ok(contents) => claude_session_title_from_transcript(&contents),
-        Err(error) => {
-            tracing::debug!(
-                provider = provider_name,
-                %session_id,
-                %error,
-                "provider session title metadata was unavailable"
-            );
-            None
-        }
-    }
-}
 
 struct StreamingSecretRedactor {
     secrets: Vec<String>,
@@ -552,7 +455,7 @@ fn native_tool_deltas_redacted(
     let mut deltas = Vec::new();
     for event in provider.extract_native_tool_events(line) {
         match event {
-            temps_agents::ai_cli::NativeToolEvent::Call {
+            temps_ai_cli::NativeToolEvent::Call {
                 id,
                 name,
                 arguments,
@@ -574,7 +477,7 @@ fn native_tool_deltas_redacted(
                     deltas.push(ChatStreamDelta::ToolCall(call));
                 }
             }
-            temps_agents::ai_cli::NativeToolEvent::Result { call_id, result } => {
+            temps_ai_cli::NativeToolEvent::Result { call_id, result } => {
                 let call = match calls.lock() {
                     Ok(calls) => calls.get(&call_id).cloned(),
                     Err(poisoned) => poisoned.into_inner().get(&call_id).cloned(),
@@ -619,13 +522,14 @@ pub type SandboxCandidateCredentialResolver = Arc<
 
 struct CandidateSandbox {
     provider: Arc<dyn SandboxProvider>,
-    handle: Option<temps_agents::sandbox::SandboxHandle>,
+    handle: Option<temps_sandbox_providers::SandboxHandle>,
     scratch: Arc<tempfile::TempDir>,
 }
 
 struct CandidateCreateGuard {
     provider: Arc<dyn SandboxProvider>,
-    task: Option<tokio::task::JoinHandle<Result<temps_agents::sandbox::SandboxHandle, AgentError>>>,
+    task:
+        Option<tokio::task::JoinHandle<Result<temps_sandbox_providers::SandboxHandle, AgentError>>>,
     scratch: Arc<tempfile::TempDir>,
 }
 
@@ -650,7 +554,7 @@ impl Drop for CandidateCreateGuard {
 
 fn candidate_probe_has_answer(provider: &str, output: &str) -> bool {
     output.lines().any(|line| {
-        temps_agents::ai_cli::extract_assistant_text(provider, line)
+        temps_ai_cli::extract_assistant_text(provider, line)
             .is_some_and(|text| !text.trim().is_empty())
     })
 }
@@ -937,7 +841,7 @@ async fn mcp_bridge_handler(
 }
 
 pub struct ScopedMcpBridge {
-    pub config: temps_agents::ai_cli::McpServerConfig,
+    pub config: temps_ai_cli::McpServerConfig,
     pub events: tokio::sync::mpsc::Receiver<Result<ChatStreamDelta, AiError>>,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     task: tokio::task::JoinHandle<()>,
@@ -977,7 +881,7 @@ impl ScopedMcpBridge {
                 .await;
         });
         Ok(Self {
-            config: temps_agents::ai_cli::McpServerConfig {
+            config: temps_ai_cli::McpServerConfig {
                 url,
                 authorization_token: token,
             },
@@ -1097,7 +1001,7 @@ pub struct AgentCliAiService {
     /// performs recursive ownership repair for legacy/root-owned workspaces;
     /// repeating that on every chat message can walk a large node_modules tree
     /// twice. A cached handle still gets a cheap liveness check before reuse.
-    sandbox_handles: Arc<Mutex<HashMap<String, temps_agents::sandbox::SandboxHandle>>>,
+    sandbox_handles: Arc<Mutex<HashMap<String, temps_sandbox_providers::SandboxHandle>>>,
     /// A persistent application sandbox may host multiple conversations, but
     /// only one harness process may mutate it at a time.
     sandbox_slots: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
@@ -1116,6 +1020,9 @@ pub struct AgentCliAiService {
     /// `workspace_models` so one slow workspace never blocks another user's
     /// model refresh.
     workspace_model_refreshes: Arc<tokio::sync::Mutex<HashMap<i32, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Last known harness version status per principal's workspace, and
+    /// whether an update is running (see `harness_update`).
+    harness_updates: HarnessUpdates,
     /// Credential replacement takes the write side; discoveries hold the read
     /// side. This keeps invalidation a hard freshness boundary while allowing
     /// different principals to refresh concurrently.
@@ -1134,7 +1041,7 @@ pub type SandboxWorkspaceStopper =
 #[derive(Clone)]
 pub struct ResolvedSandboxWorkspace {
     pub workspace: temps_ai::HarnessWorkspace,
-    pub handle: temps_agents::sandbox::SandboxHandle,
+    pub handle: temps_sandbox_providers::SandboxHandle,
     pub stop: SandboxWorkspaceStopper,
 }
 
@@ -1277,8 +1184,8 @@ impl SandboxWorkspaceResolverSlot {
 struct StopSandboxOnDrop {
     armed: bool,
     provider: Arc<dyn SandboxProvider>,
-    handle: temps_agents::sandbox::SandboxHandle,
-    handles: Arc<Mutex<HashMap<String, temps_agents::sandbox::SandboxHandle>>>,
+    handle: temps_sandbox_providers::SandboxHandle,
+    handles: Arc<Mutex<HashMap<String, temps_sandbox_providers::SandboxHandle>>>,
     sandbox_label: String,
     sandbox_slot: Arc<Semaphore>,
     global_permit: Option<tokio::sync::OwnedSemaphorePermit>,
@@ -1519,6 +1426,7 @@ impl AgentCliAiService {
             sandbox_timeout: None,
             workspace_models: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             workspace_model_refreshes: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            harness_updates: Arc::new(std::sync::Mutex::new(HashMap::new())),
             workspace_model_refresh_barrier: Arc::new(tokio::sync::RwLock::new(())),
             host_model_refresh: Arc::new(tokio::sync::Mutex::new(HostModelRefreshState::default())),
         }
@@ -1575,7 +1483,7 @@ impl AgentCliAiService {
     fn cached_sandbox_handle(
         &self,
         sandbox_label: &str,
-    ) -> Option<temps_agents::sandbox::SandboxHandle> {
+    ) -> Option<temps_sandbox_providers::SandboxHandle> {
         self.sandbox_handles
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1672,7 +1580,7 @@ impl AgentCliAiService {
     fn cache_sandbox_handle(
         &self,
         sandbox_label: String,
-        handle: temps_agents::sandbox::SandboxHandle,
+        handle: temps_sandbox_providers::SandboxHandle,
     ) {
         self.sandbox_handles
             .lock()
@@ -1700,7 +1608,7 @@ impl AgentCliAiService {
         &self,
         workspace: &temps_ai::HarnessWorkspace,
         project_id: Option<i32>,
-    ) -> Result<temps_agents::sandbox::SandboxHandle, AiError> {
+    ) -> Result<temps_sandbox_providers::SandboxHandle, AiError> {
         self.validate_sandbox_workspace(workspace)?;
         let provider = self
             .sandbox_provider
@@ -1773,6 +1681,8 @@ impl AgentCliAiService {
                     memory_limit_mb: None,
                     pids_limit: None,
                     disk_size_mb: None,
+                    allow_docker: false,
+                    egress_policy: Default::default(),
                     network_mode: None,
                     // No host credential, API key, or browser value crosses
                     // this boundary. A harness authenticates inside its own
@@ -1897,7 +1807,7 @@ impl AgentCliAiService {
         };
         let base_url = endpoint.base_url.as_str();
         let models_url = format!("{base_url}/models");
-        let client = temps_agents::ai_cli::openai_compatible::external_only_http_client(Some(
+        let client = temps_ai_cli::openai_compatible::external_only_http_client(Some(
             COMPATIBLE_MODEL_DISCOVERY_TIMEOUT,
         ))
         .map_err(|error| {
@@ -1931,7 +1841,7 @@ impl AgentCliAiService {
             }
             body.extend_from_slice(&chunk);
         }
-        let model_ids = temps_agents::ai_cli::openai_compatible::parse_model_list(
+        let model_ids = temps_ai_cli::openai_compatible::parse_model_list(
             base_url,
             &body,
             endpoint.verified_model.as_deref(),
@@ -1939,8 +1849,8 @@ impl AgentCliAiService {
         .map_err(|error| provider_error(error.to_string()))?;
         let models = model_ids
             .into_iter()
-            .map(|id| temps_agents::ai_cli::AiCliModelCapability {
-                id: temps_agents::ai_cli::openai_compatible::opencode_selection(&id),
+            .map(|id| temps_ai_cli::AiCliModelCapability {
+                id: temps_ai_cli::openai_compatible::opencode_selection(&id),
                 name: id,
                 reasoning_options: Vec::new(),
                 default_reasoning_option: None,
@@ -1956,7 +1866,7 @@ impl AgentCliAiService {
 
     fn workspace_capabilities_from_models(
         &self,
-        models: Vec<temps_agents::ai_cli::AiCliModelCapability>,
+        models: Vec<temps_ai_cli::AiCliModelCapability>,
     ) -> Result<temps_ai::ProviderCapabilities, AiError> {
         let mut capabilities = provider_capabilities_from_models(self.provider.name(), models)
             .ok_or_else(|| AiError::Provider {
@@ -2007,6 +1917,283 @@ impl AgentCliAiService {
             },
             models_refreshed_at: Some(snapshot.refreshed_at.to_rfc3339()),
         }
+    }
+
+    /// Resolve the principal's persistent workspace and run `command` in it,
+    /// bounded by `timeout`. `as_root` is for the update only, and only for
+    /// images that installed the harness as root.
+    async fn run_in_workspace(
+        &self,
+        principal_id: i32,
+        command: Vec<String>,
+        timeout: Duration,
+        as_root: bool,
+    ) -> Result<(i32, String, String), AiError> {
+        let purpose = "provider.harness.update";
+        let sandbox_provider = self
+            .sandbox_provider
+            .as_ref()
+            .ok_or_else(|| AiError::Provider {
+                purpose: purpose.to_string(),
+                reason: "Temps sandbox execution is not configured".to_string(),
+            })?;
+        let resolved = self
+            .sandbox_workspace_resolver
+            .as_ref()
+            .ok_or_else(|| AiError::Provider {
+                purpose: purpose.to_string(),
+                reason: "the persistent global workspace resolver is not configured".to_string(),
+            })?
+            .resolve(principal_id)
+            .await?;
+        self.validate_sandbox_workspace(&resolved.workspace)?;
+        let execution = async {
+            if as_root {
+                sandbox_provider
+                    .exec_as_root(&resolved.handle, command, HashMap::new(), None)
+                    .await
+            } else {
+                sandbox_provider
+                    .exec(&resolved.handle, command, HashMap::new(), None)
+                    .await
+            }
+        };
+        let output = tokio::time::timeout(timeout, execution)
+            .await
+            .map_err(|_| AiError::Provider {
+                purpose: purpose.to_string(),
+                reason: format!(
+                    "the workspace command timed out after {}s",
+                    timeout.as_secs()
+                ),
+            })?
+            .map_err(|error| map_agent_error(purpose, error))?;
+        Ok((output.exit_code, output.stdout, output.stderr))
+    }
+
+    /// Install the latest release of the harness in the workspace and
+    /// re-read its version. Refuses while a harness operation (a turn, a model
+    /// refresh) holds the workspace, because the binary is replaced in place.
+    async fn run_workspace_harness_update(
+        &self,
+        principal_id: i32,
+        package: crate::harness_update::HarnessPackage,
+        guard: HarnessUpdateGuard,
+    ) -> Result<temps_ai::HarnessUpdateStatus, AiError> {
+        use crate::harness_update as hu;
+
+        let purpose = "provider.harness.update";
+        let sandbox_provider =
+            self.sandbox_provider
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| AiError::Provider {
+                    purpose: purpose.to_string(),
+                    reason: "Temps sandbox execution is not configured".to_string(),
+                })?;
+        let resolved = self
+            .sandbox_workspace_resolver
+            .as_ref()
+            .ok_or_else(|| AiError::Provider {
+                purpose: purpose.to_string(),
+                reason: "the persistent global workspace resolver is not configured".to_string(),
+            })?
+            .resolve(principal_id)
+            .await?;
+        self.validate_sandbox_workspace(&resolved.workspace)?;
+        let slot = self
+            .sandbox_slot(&resolved.workspace.sandbox_label)
+            .try_acquire_owned()
+            .map_err(|_| AiError::Provider {
+                purpose: "provider.harness.update.busy".to_string(),
+                reason: "the persistent workspace is busy with a turn; retry when it finishes"
+                    .to_string(),
+            })?;
+
+        // The install runs in its own task that owns the workspace slot and
+        // the updating mark. If the caller goes away (client disconnect) the
+        // install is not cancelled halfway and nothing else may touch the
+        // workspace until it has really ended: the command also bounds itself
+        // inside the sandbox (`timeout`), so it cannot outlive its slot.
+        let handle = resolved.handle.clone();
+        let command = hu::update_command(package);
+        // Pick the account the install runs as. A prefix the sandbox user
+        // owns is updated by that user; only an older root-owned install is
+        // updated as root. A probe that cannot run is an error, never a
+        // reason to fall back to root.
+        let probe = tokio::time::timeout(
+            hu::VERSION_COMMAND_TIMEOUT,
+            sandbox_provider.exec(
+                &handle,
+                hu::install_writable_probe_command(),
+                HashMap::new(),
+                None,
+            ),
+        )
+        .await
+        .map_err(|_| AiError::Provider {
+            purpose: purpose.to_string(),
+            reason: format!(
+                "checking whether the {} install is writable timed out after {}s",
+                package.binary,
+                hu::VERSION_COMMAND_TIMEOUT.as_secs()
+            ),
+        })?
+        .map_err(|error| map_agent_error(purpose, error))?;
+        let as_root = match hu::install_owner_from_probe(probe.exit_code) {
+            Some(hu::InstallOwner::SandboxUser) => false,
+            Some(hu::InstallOwner::Root) => true,
+            None => {
+                tracing::warn!(
+                    provider = self.provider.name(),
+                    principal_id,
+                    binary = package.binary,
+                    exit_code = probe.exit_code,
+                    stderr = %scrub_and_bound(&probe.stderr),
+                    "workspace harness install owner could not be determined"
+                );
+                return Err(AiError::Provider {
+                    purpose: purpose.to_string(),
+                    reason: format!(
+                        "could not tell who owns the {} install (probe exited with {}); nothing was changed",
+                        package.binary, probe.exit_code
+                    ),
+                });
+            }
+        };
+        // The task hands the slot and the mark back when the install ends so
+        // the caller keeps both through the version check below: nothing may
+        // run in the workspace, or start another update, until the installed
+        // version has been read.
+        let task = tokio::spawn(async move {
+            let outcome = if as_root {
+                tokio::time::timeout(
+                    hu::UPDATE_COMMAND_TIMEOUT,
+                    sandbox_provider.exec_as_root(&handle, command, HashMap::new(), None),
+                )
+                .await
+            } else {
+                tokio::time::timeout(
+                    hu::UPDATE_COMMAND_TIMEOUT,
+                    sandbox_provider.exec(&handle, command, HashMap::new(), None),
+                )
+                .await
+            };
+            (outcome, slot, guard)
+        });
+        let (outcome, _slot, _guard) = task.await.map_err(|error| AiError::Provider {
+            purpose: purpose.to_string(),
+            reason: format!("the update task ended unexpectedly: {error}"),
+        })?;
+        let output = outcome
+            .map_err(|_| AiError::Provider {
+                purpose: purpose.to_string(),
+                reason: format!(
+                    "the update did not finish within {}s",
+                    hu::UPDATE_COMMAND_TIMEOUT.as_secs()
+                ),
+            })?
+            .map_err(|error| map_agent_error(purpose, error))?;
+        if output.exit_code != 0 {
+            tracing::warn!(
+                provider = self.provider.name(),
+                principal_id,
+                exit_code = output.exit_code,
+                stderr = %scrub_and_bound(&output.stderr),
+                "workspace harness update failed"
+            );
+            return Err(AiError::Provider {
+                purpose: purpose.to_string(),
+                reason: format!(
+                    "the update command exited with status {}: {}",
+                    output.exit_code,
+                    scrub_and_bound(&output.stderr)
+                ),
+            });
+        }
+        // New models only appear after the next discovery, so drop the cached
+        // catalog; the caller refreshes models right after this returns.
+        self.workspace_models.lock().await.remove(&principal_id);
+        self.check_workspace_harness(principal_id, package).await
+    }
+
+    /// Read the installed and latest versions inside the workspace and cache
+    /// the result. A failed lookup is reported in `detail`, never as a guess.
+    async fn check_workspace_harness(
+        &self,
+        principal_id: i32,
+        package: crate::harness_update::HarnessPackage,
+    ) -> Result<temps_ai::HarnessUpdateStatus, AiError> {
+        use crate::harness_update as hu;
+
+        let installed = self
+            .run_in_workspace(
+                principal_id,
+                hu::version_command(package),
+                hu::VERSION_COMMAND_TIMEOUT,
+                false,
+            )
+            .await?;
+        let installed_version = (installed.0 == 0)
+            .then(|| hu::parse_version(&installed.1))
+            .flatten();
+        let latest = self
+            .run_in_workspace(
+                principal_id,
+                hu::latest_version_command(package),
+                hu::LATEST_COMMAND_TIMEOUT,
+                false,
+            )
+            .await;
+        let (latest_version, latest_detail) = match latest {
+            Ok((0, stdout, _)) => (hu::parse_version(&stdout), None),
+            Ok((code, _, stderr)) => (
+                None,
+                Some(format!(
+                    "the latest version could not be looked up (exit {code}): {}",
+                    scrub_and_bound(&stderr)
+                )),
+            ),
+            Err(error) => (
+                None,
+                Some(format!(
+                    "the latest version could not be looked up: {error}"
+                )),
+            ),
+        };
+        let detail = match (&installed_version, &latest_version) {
+            (None, _) => {
+                Some("the installed version could not be read from the workspace".to_string())
+            }
+            (_, None) => latest_detail,
+            _ => None,
+        };
+        let update_available = match (&installed_version, &latest_version) {
+            (Some(installed), Some(latest)) => hu::is_newer(latest, installed),
+            _ => false,
+        };
+        let status = temps_ai::HarnessUpdateStatus {
+            provider_id: self.provider.name().to_string(),
+            installed_version,
+            latest_version,
+            update_available,
+            updating: false,
+            checked_at: Some(
+                chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            ),
+            detail,
+        };
+        let mut states = self
+            .harness_updates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = states.entry(principal_id).or_default();
+        state.status = Some(status.clone());
+        state.checked_at = Some(Instant::now());
+        Ok(temps_ai::HarnessUpdateStatus {
+            updating: state.updating,
+            ..status
+        })
     }
 
     async fn discover_workspace_capabilities(
@@ -2081,6 +2268,16 @@ impl AgentCliAiService {
                 })
             }
             Err(error) => {
+                // A failed live discovery that is hidden behind a stale
+                // catalog would otherwise leave no trace of why the model
+                // list stopped refreshing.
+                tracing::warn!(
+                    provider = self.provider.name(),
+                    principal_id,
+                    serving_stale_catalog = state.snapshot.is_some(),
+                    reason = %temps_ai_cli::scrub_and_bound(&error.to_string()),
+                    "workspace model discovery failed"
+                );
                 if let Some(snapshot) = state.snapshot.as_ref() {
                     Ok(temps_ai::ProviderCapabilitiesSnapshot {
                         capabilities: snapshot.capabilities.clone(),
@@ -2262,10 +2459,10 @@ impl AgentCliAiService {
                 });
             }
             let models = match self.provider.name() {
-                "claude_cli" => temps_agents::ai_cli::claude::parse_model_capabilities_from_initialize_output(
+                "claude_cli" => temps_ai_cli::claude::parse_model_capabilities_from_initialize_output(
                     &execution.stdout,
                 ),
-                "codex_cli" => temps_agents::ai_cli::codex::parse_model_capabilities_from_app_server_output(
+                "codex_cli" => temps_ai_cli::codex::parse_model_capabilities_from_app_server_output(
                     &execution.stdout,
                 ),
                 other => {
@@ -2453,8 +2650,8 @@ impl AgentCliAiService {
         // Confirm the SDK socket before issuing credentials or turns.
         for attempt in 0..5 {
             match sandbox.check_agent_runtime(&handle).await {
-                Ok(temps_agents::sandbox::RuntimeCompatibility::Compatible) => break,
-                Ok(temps_agents::sandbox::RuntimeCompatibility::Incompatible { .. }) => {
+                Ok(temps_sandbox_providers::RuntimeCompatibility::Compatible) => break,
+                Ok(temps_sandbox_providers::RuntimeCompatibility::Incompatible { .. }) => {
                     return Err(AiError::Provider {
                         purpose: purpose.clone(),
                         reason: "workspace runtime update required: open Workspace settings and choose Update runtime".into(),
@@ -2730,484 +2927,6 @@ impl AgentCliAiService {
         });
         Ok(Box::pin(stream))
     }
-
-    #[allow(dead_code)]
-    async fn sandbox_chat_stream_turn(
-        &self,
-        request: ChatTurnRequest,
-    ) -> Result<ChatTurnStream, AiError> {
-        let timing_started = Instant::now();
-        let trace_id = request
-            .trace_id
-            .clone()
-            .unwrap_or_else(|| "untracked".to_string());
-        let workspace = request
-            .harness_workspace
-            .clone()
-            .ok_or_else(|| AiError::Provider {
-                purpose: request.purpose.clone(),
-                reason: "development harness requests require a managed workspace".to_string(),
-            })?;
-        if !request.tools.is_empty() && request.harness_mcp_server.is_none() {
-            return Err(AiError::Provider {
-                purpose: request.purpose.clone(),
-                reason: "sandboxed harness platform tools require a turn-scoped MCP capability"
-                    .to_string(),
-            });
-        }
-        let prompt = build_sandbox_chat_prompt(&request);
-        check_prompt_size(&request.purpose, &prompt)?;
-        tracing::info!(
-            component = "ai_turn_timing",
-            turn_id = %trace_id,
-            provider = %self.provider.name(),
-            phase = "sandbox_adapter_started",
-            message_count = request.messages.len(),
-            prompt_bytes = prompt.len(),
-            native_session_resumed = request.resume_session_id.is_some(),
-            model = request.model.as_deref().unwrap_or("default"),
-            thinking_level = request.thinking_level.as_deref().unwrap_or("default"),
-            total_ms = timing_started.elapsed().as_millis() as u64,
-            "AI turn timing"
-        );
-        let permit = Arc::clone(&self.concurrency)
-            .try_acquire_owned()
-            .map_err(|_| AiError::Provider {
-                purpose: request.purpose.clone(),
-                reason: "sandboxed harness concurrency limit reached — try again shortly"
-                    .to_string(),
-            })?;
-        let sandbox_slot = self.sandbox_slot(&workspace.sandbox_label);
-        let sandbox_permit =
-            sandbox_slot
-                .clone()
-                .try_acquire_owned()
-                .map_err(|_| AiError::Provider {
-                    purpose: request.purpose.clone(),
-                    reason: "another harness turn is already running in this application sandbox"
-                        .to_string(),
-                })?;
-        let phase_started = Instant::now();
-        let handle = self
-            .get_or_create_sandbox(&workspace, request.project_id)
-            .await?;
-        tracing::info!(
-            component = "ai_turn_timing",
-            turn_id = %trace_id,
-            provider = %self.provider.name(),
-            phase = "sandbox_ready",
-            phase_ms = phase_started.elapsed().as_millis() as u64,
-            total_ms = timing_started.elapsed().as_millis() as u64,
-            "AI turn timing"
-        );
-        let phase_started = Instant::now();
-        let credentials = self
-            .sandbox_credentials
-            .as_ref()
-            .ok_or_else(|| AiError::Provider {
-                purpose: request.purpose.clone(),
-                reason: "sandboxed harness credentials are not configured for this instance"
-                    .to_string(),
-            })?(self.provider.name())
-        .await?;
-        tracing::info!(
-            component = "ai_turn_timing",
-            turn_id = %trace_id,
-            provider = %self.provider.name(),
-            phase = "credentials_resolved",
-            phase_ms = phase_started.elapsed().as_millis() as u64,
-            total_ms = timing_started.elapsed().as_millis() as u64,
-            "AI turn timing"
-        );
-        let timeout = self.sandbox_timeout.unwrap_or(self.timeout);
-        let relay_service = self
-            .sandbox_model_relay
-            .as_ref()
-            .ok_or_else(|| AiError::Provider {
-                purpose: request.purpose.clone(),
-                reason: "sandboxed harness model relay is not configured for this instance"
-                    .to_string(),
-            })?;
-        let sandbox_provider = self
-            .sandbox_provider
-            .as_ref()
-            .ok_or_else(|| AiError::Provider {
-                purpose: request.purpose.clone(),
-                reason: "sandboxed harness execution is not configured for this instance"
-                    .to_string(),
-            })?;
-        let relay_base_url = sandbox_provider
-            .model_relay_base_url(&handle, &credentials.internal_api_url)
-            .await
-            .map_err(|error| map_agent_error(&request.purpose, error))?;
-        let harness_mcp_server = match request.harness_mcp_server.as_ref() {
-            Some(server) => Some(temps_ai::HarnessMcpServer {
-                url: sandbox_provider
-                    .harness_mcp_url(&handle, &credentials.internal_api_url, &server.url)
-                    .await
-                    .map_err(|error| map_agent_error(&request.purpose, error))?,
-                authorization_token: server.authorization_token.clone(),
-            }),
-            None => None,
-        };
-        let (model_relay, model_relay_guard) = relay_service.register(
-            self.provider.name(),
-            request.principal_id.ok_or_else(|| AiError::Provider {
-                purpose: request.purpose.clone(),
-                reason: "sandboxed harness turn is missing its authenticated principal".to_string(),
-            })?,
-            request.model.as_deref(),
-            credentials,
-            &relay_base_url,
-            timeout + Duration::from_secs(30),
-        )?;
-        let mut streamed_secrets = vec![model_relay.bearer.clone()];
-        if let Some((contents, _providers)) = model_relay.native_opencode_auth.as_ref() {
-            streamed_secrets.extend(native_opencode_redaction_values(contents));
-        }
-        streamed_secrets.extend(request.sandbox_environment.redaction_values().cloned());
-        if let Some(server) = request.harness_mcp_server.as_ref() {
-            streamed_secrets.push(server.authorization_token.clone());
-        }
-        let native_tool_secrets = Arc::new(streamed_secrets.clone());
-        let stream_redactor = Arc::new(Mutex::new(StreamingSecretRedactor::new(streamed_secrets)));
-        let sandbox = self
-            .sandbox_provider
-            .clone()
-            .ok_or_else(|| AiError::Provider {
-                purpose: request.purpose.clone(),
-                reason: "Temps sandbox execution is not configured for this instance".to_string(),
-            })?;
-        let mut staged = stage_sandbox_attachments(
-            sandbox.clone(),
-            &handle,
-            &request.sandbox_attachments,
-            &request.purpose,
-        )
-        .await?;
-        let attachment_cleanup = staged.cleanup.take();
-        let mut staged_request = request.clone();
-        staged_request.sandbox_file_paths =
-            staged.paths.iter().map(|entry| entry.0.clone()).collect();
-        staged_request.sandbox_image_paths = staged
-            .paths
-            .iter()
-            .filter(|entry| entry.1)
-            .map(|entry| entry.0.clone())
-            .collect();
-        let attachment_prompt =
-            sandbox_attachment_prompt(&request.sandbox_attachments, &staged.paths);
-        let mut command = sandbox_harness_command(
-            self.provider.name(),
-            &format!("{prompt}{attachment_prompt}"),
-            &staged_request,
-        )?;
-        let mut sandbox_env = request.sandbox_environment.clone().into_inner();
-        let mut turn_secret_files = Vec::new();
-        configure_sandbox_model_relay(
-            self.provider.name(),
-            &mut command,
-            &mut sandbox_env,
-            &mut turn_secret_files,
-            &model_relay,
-        )?;
-        prepare_native_opencode_auth(
-            sandbox.as_ref(),
-            &handle,
-            &model_relay,
-            "chat.application.sandbox",
-        )
-        .await?;
-        let _mcp_secret_path = configure_sandbox_mcp(
-            self.provider.name(),
-            &mut command,
-            &mut sandbox_env,
-            &mut turn_secret_files,
-            harness_mcp_server.as_ref(),
-        )?;
-        let turn_secret_paths = turn_secret_files
-            .iter()
-            .map(|(path, _)| path.clone())
-            .collect::<Vec<_>>();
-        let credential_file_count = turn_secret_files.len();
-        let phase_started = Instant::now();
-        for (path, contents) in &turn_secret_files {
-            sandbox
-                .write_file(&handle, path, contents, 0o600)
-                .await
-                .map_err(|error| map_agent_error("chat.application.sandbox", error))?;
-        }
-        tracing::info!(
-            component = "ai_turn_timing",
-            turn_id = %trace_id,
-            provider = %self.provider.name(),
-            phase = "credentials_seeded",
-            credential_file_count,
-            phase_ms = phase_started.elapsed().as_millis() as u64,
-            total_ms = timing_started.elapsed().as_millis() as u64,
-            "AI turn timing"
-        );
-        let provider = self.provider.clone();
-        let purpose = request.purpose.clone();
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<ChatStreamDelta, AiError>>(64);
-        let emitted_partial = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let first_raw_logged = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let first_visible_logged = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let callback_tx = tx.clone();
-        let callback_partial = emitted_partial.clone();
-        let callback_first_raw = first_raw_logged.clone();
-        let callback_first_visible = first_visible_logged.clone();
-        let provider_for_callback = provider.clone();
-        let callback_trace_id = trace_id.clone();
-        let native_tool_calls: NativeToolCalls = Arc::new(Mutex::new(HashMap::new()));
-        let callback_native_tool_calls = native_tool_calls.clone();
-        let callback_native_tool_secrets = native_tool_secrets.clone();
-        let callback_stream_redactor = stream_redactor.clone();
-        let session_metadata: Arc<Mutex<Option<ProviderSessionMetadata>>> =
-            Arc::new(Mutex::new(None));
-        let callback_session_metadata = session_metadata.clone();
-        let callback_model = request.model.clone();
-        let on_output: OnEventCallback = Arc::new(move |line: String| {
-            let tx = callback_tx.clone();
-            let provider = provider_for_callback.clone();
-            let emitted_partial = callback_partial.clone();
-            let first_raw_logged = callback_first_raw.clone();
-            let first_visible_logged = callback_first_visible.clone();
-            let native_tool_calls = callback_native_tool_calls.clone();
-            let native_tool_secrets = callback_native_tool_secrets.clone();
-            let stream_redactor = callback_stream_redactor.clone();
-            let trace_id = callback_trace_id.clone();
-            let session_metadata = callback_session_metadata.clone();
-            let selected_model = callback_model.clone();
-            Box::pin(async move {
-                if !first_raw_logged.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                    tracing::info!(
-                    component = "ai_turn_timing",
-                                turn_id = %trace_id,
-                                provider = %provider.name(),
-                                phase = "harness_first_raw_output",
-                                total_ms = timing_started.elapsed().as_millis() as u64,
-                                "AI turn timing"
-                            );
-                }
-                let native_deltas = native_tool_deltas_redacted(
-                    provider.as_ref(),
-                    &line,
-                    &native_tool_calls,
-                    native_tool_secrets.as_ref(),
-                );
-                if let Some(metadata) = extract_session_metadata(provider.name(), &line) {
-                    merge_session_metadata(&session_metadata, metadata);
-                }
-                let mut emitted_visible = !native_deltas.is_empty();
-                for delta in native_deltas {
-                    if tx.send(Ok(delta)).await.is_err() {
-                        return;
-                    }
-                }
-                if let Some(mut usage) = provider.extract_context_window_usage(&line) {
-                    pin_context_usage_model(&mut usage, selected_model);
-                    emitted_visible = true;
-                    if tx
-                        .send(Ok(ChatStreamDelta::ContextUsage(usage)))
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
-                if let Some(text) = provider.extract_partial_text(&line) {
-                    emitted_partial.store(true, std::sync::atomic::Ordering::Relaxed);
-                    let text = match stream_redactor.lock() {
-                        Ok(mut redactor) => redactor.push(&text),
-                        Err(poisoned) => poisoned.into_inner().push(&text),
-                    };
-                    if !text.is_empty() {
-                        emitted_visible = true;
-                        let _ = tx.send(Ok(ChatStreamDelta::Text(text))).await;
-                    }
-                } else if !emitted_partial.load(std::sync::atomic::Ordering::Relaxed) {
-                    if let Some(text) = provider.extract_assistant_text(&line) {
-                        let text = match stream_redactor.lock() {
-                            Ok(mut redactor) => redactor.push(&text),
-                            Err(poisoned) => poisoned.into_inner().push(&text),
-                        };
-                        if !text.is_empty() {
-                            emitted_visible = true;
-                            let _ = tx.send(Ok(ChatStreamDelta::Text(text))).await;
-                        }
-                    }
-                }
-                if emitted_visible
-                    && !first_visible_logged.swap(true, std::sync::atomic::Ordering::Relaxed)
-                {
-                    tracing::info!(
-                    component = "ai_turn_timing",
-                                turn_id = %trace_id,
-                                provider = %provider.name(),
-                                phase = "harness_first_visible_delta",
-                                total_ms = timing_started.elapsed().as_millis() as u64,
-                                "AI turn timing"
-                            );
-                }
-            })
-        });
-        let tx_for_error = tx.clone();
-        drop(tx);
-        let task_trace_id = trace_id.clone();
-        let sandbox_handles = self.sandbox_handles.clone();
-        let sandbox_label = workspace.sandbox_label.clone();
-        let capture_session_title = request.capture_session_title;
-        let task = tokio::spawn(async move {
-            let mut attachment_cleanup = attachment_cleanup;
-            let _model_relay_guard = model_relay_guard;
-            let mut stop_on_drop = StopSandboxOnDrop {
-                armed: true,
-                provider: sandbox.clone(),
-                handle: handle.clone(),
-                handles: sandbox_handles,
-                sandbox_label,
-                sandbox_slot,
-                global_permit: Some(permit),
-                sandbox_permit: Some(sandbox_permit),
-                managed_stop: None,
-            };
-            tracing::info!(
-            component = "ai_turn_timing",
-                turn_id = %task_trace_id,
-                provider = %provider.name(),
-                phase = "harness_exec_started",
-                total_ms = timing_started.elapsed().as_millis() as u64,
-                "AI turn timing"
-            );
-            let result = tokio::time::timeout(
-                timeout,
-                sandbox.exec(&handle, command, sandbox_env, Some(on_output)),
-            )
-            .await;
-            let redactor_tail = match stream_redactor.lock() {
-                Ok(mut redactor) => redactor.finish(),
-                Err(poisoned) => poisoned.into_inner().finish(),
-            };
-            if !redactor_tail.is_empty() {
-                let _ = tx_for_error
-                    .send(Ok(ChatStreamDelta::Text(redactor_tail)))
-                    .await;
-            }
-            let timed_out = result.is_err();
-            let outcome = match &result {
-                Ok(Ok(output)) if output.exit_code == 0 => "success",
-                Ok(Ok(_)) => "nonzero_exit",
-                Ok(Err(_)) => "sandbox_error",
-                Err(_) => "timeout",
-            };
-            tracing::info!(
-            component = "ai_turn_timing",
-                turn_id = %task_trace_id,
-                provider = %provider.name(),
-                phase = "harness_process_complete",
-                outcome,
-                total_ms = timing_started.elapsed().as_millis() as u64,
-                "AI turn timing"
-            );
-            let mut provider_session_metadata = session_metadata
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone();
-            if capture_session_title {
-                if let Some(metadata) = provider_session_metadata.as_mut() {
-                    if metadata.title.is_none() {
-                        if let Some(session_id) = metadata.session_id.as_deref() {
-                            metadata.title = resolve_sandbox_session_title(
-                                provider.name(),
-                                sandbox.as_ref(),
-                                &handle,
-                                session_id,
-                            )
-                            .await;
-                        }
-                    }
-                }
-            }
-            if let Some(metadata) = provider_session_metadata {
-                let _ = tx_for_error
-                    .send(Ok(ChatStreamDelta::SessionMetadata {
-                        session_id: metadata.session_id,
-                        title: metadata.title,
-                    }))
-                    .await;
-            }
-            let cleanup_paths = turn_secret_paths;
-            if !timed_out && !cleanup_paths.is_empty() {
-                match sandbox
-                    .exec_as_root(
-                        &handle,
-                        sandbox_secret_cleanup_command(&cleanup_paths),
-                        HashMap::new(),
-                        None,
-                    )
-                    .await
-                {
-                    Ok(output) if output.exit_code == 0 => {}
-                    Ok(output) => tracing::warn!(
-                        provider = %provider.name(),
-                        exit_code = output.exit_code,
-                        stderr = %scrub_and_bound(&output.stderr),
-                        "failed to remove expired sandbox capability files"
-                    ),
-                    Err(error) => tracing::warn!(
-                        provider = %provider.name(),
-                        error = %error,
-                        "failed to remove expired sandbox capability files"
-                    ),
-                }
-            }
-            if let Some(cleanup) = attachment_cleanup.as_mut() {
-                if !cleanup.cleanup().await {
-                    tracing::error!(provider = %provider.name(), "attachment cleanup failed; a best-effort retry is scheduled on guard drop and staged user attachment bytes may remain in this container layer");
-                }
-            }
-            if timed_out {
-                stop_on_drop.stop_now().await;
-            } else {
-                stop_on_drop.disarm();
-            }
-            let error = match result {
-                Ok(Ok(output)) if output.exit_code == 0 => None,
-                Ok(Ok(output)) => Some(AiError::Provider {
-                    purpose,
-                    reason: scrub_and_bound(&format!(
-                        "sandboxed {} exited with code {}: {}",
-                        provider.name(),
-                        output.exit_code,
-                        if output.stderr.trim().is_empty() {
-                            output.stdout
-                        } else {
-                            output.stderr
-                        }
-                    )),
-                }),
-                Ok(Err(error)) => Some(map_agent_error("chat.application.sandbox", error)),
-                Err(_) => Some(AiError::Provider {
-                    purpose,
-                    reason: format!("sandboxed harness timed out after {}s", timeout.as_secs()),
-                }),
-            };
-            if let Some(error) = error {
-                let _ = tx_for_error.send(Err(error)).await;
-            }
-        });
-        let stream = futures::stream::unfold(
-            (rx, AbortTaskOnDrop(task)),
-            |(mut receiver, abort_on_drop)| async move {
-                receiver
-                    .recv()
-                    .await
-                    .map(|item| (item, (receiver, abort_on_drop)))
-            },
-        );
-        Ok(Box::pin(stream))
-    }
 }
 
 fn sandbox_launch_context(provider: Provider) -> LaunchContext {
@@ -3440,7 +3159,7 @@ struct StagedSandboxAttachments {
 
 struct AttachmentCleanupGuard {
     sandbox: Arc<dyn SandboxProvider>,
-    handle: temps_agents::sandbox::SandboxHandle,
+    handle: temps_sandbox_providers::SandboxHandle,
     root: Option<String>,
 }
 
@@ -3496,7 +3215,7 @@ impl AttachmentCleanupGuard {
 
 async fn stage_sandbox_attachments(
     sandbox: Arc<dyn SandboxProvider>,
-    handle: &temps_agents::sandbox::SandboxHandle,
+    handle: &temps_sandbox_providers::SandboxHandle,
     attachments: &[temps_ai::SandboxAttachment],
     purpose: &str,
 ) -> Result<StagedSandboxAttachments, AiError> {
@@ -3516,7 +3235,7 @@ async fn stage_sandbox_attachments(
 
 async fn stage_sandbox_attachments_inner(
     sandbox: Arc<dyn SandboxProvider>,
-    handle: &temps_agents::sandbox::SandboxHandle,
+    handle: &temps_sandbox_providers::SandboxHandle,
     attachments: &[temps_ai::SandboxAttachment],
     purpose: &str,
 ) -> Result<StagedSandboxAttachments, AiError> {
@@ -3834,9 +3553,7 @@ fn configure_sandbox_model_relay(
                 purpose: "chat.application.model_relay".to_string(),
                 reason: "the OpenCode relay is missing its validated provider".to_string(),
             })?;
-            if provider_id
-                == temps_agents::ai_cli::openai_compatible::OPENCODE_COMPATIBLE_PROVIDER_ID
-            {
+            if provider_id == temps_ai_cli::openai_compatible::OPENCODE_COMPATIBLE_PROVIDER_ID {
                 // A custom provider: OpenCode only selects models declared
                 // here, and appends `/chat/completions` to the relay URL. The
                 // sandbox holds the turn-scoped relay bearer, never the key.
@@ -3958,7 +3675,7 @@ fn redact_native_export_value(value: &mut serde_json::Value, secrets: &[String])
 
 async fn prepare_native_opencode_auth(
     sandbox: &dyn SandboxProvider,
-    handle: &temps_agents::sandbox::SandboxHandle,
+    handle: &temps_sandbox_providers::SandboxHandle,
     relay: &SandboxModelRelay,
     purpose: &str,
 ) -> Result<(), AiError> {
@@ -4197,96 +3914,6 @@ async fn prepare_native_opencode_auth(
     Ok(())
 }
 
-/// Register the same turn-scoped platform MCP server with each supported
-/// sandbox harness. Only Claude needs a file; it lives on the sandbox tmpfs
-/// and is removed when the provider process finishes. Codex/OpenCode receive
-/// the bearer only in their process environment. In every case the value is a
-/// narrow capability, not a reusable user/API token.
-#[allow(dead_code)]
-fn configure_sandbox_mcp(
-    provider: &str,
-    command: &mut Vec<String>,
-    environment: &mut HashMap<String, String>,
-    secret_files: &mut Vec<(String, Vec<u8>)>,
-    server: Option<&temps_ai::HarnessMcpServer>,
-) -> Result<Option<String>, AiError> {
-    let Some(server) = server else {
-        return Ok(None);
-    };
-    match provider {
-        "claude_cli" => {
-            let secret_path = format!(
-                "/run/secrets/temps-chat-mcp-{}.json",
-                uuid::Uuid::new_v4().simple()
-            );
-            let contents = serde_json::to_vec(&serde_json::json!({
-                "mcpServers": {
-                    "temps-chat": {
-                        "type": "http",
-                        "url": server.url,
-                        "headers": {
-                            "Authorization": format!("Bearer {}", server.authorization_token),
-                        }
-                    }
-                }
-            }))
-            .map_err(|error| AiError::Provider {
-                purpose: "chat.application.mcp".to_string(),
-                reason: format!("could not encode sandbox MCP configuration: {error}"),
-            })?;
-            secret_files.push((secret_path.clone(), contents));
-            command.extend([
-                "--mcp-config".to_string(),
-                secret_path.clone(),
-                "--allowedTools".to_string(),
-                // Claude documents the bare server name as the way to allow
-                // every tool on that server; glob patterns are not supported.
-                // Platform tools remain scoped by the one-turn bearer and
-                // perform their own server-side authorization.
-                "mcp__temps-chat".to_string(),
-                "--permission-prompt-tool".to_string(),
-                "mcp__temps-chat__temps_native_permission".to_string(),
-            ]);
-            Ok(Some(secret_path))
-        }
-        "codex_cli" => {
-            command.extend([
-                "--config".to_string(),
-                format!("mcp_servers.temps_chat.url=\"{}\"", server.url),
-                "--config".to_string(),
-                "mcp_servers.temps_chat.bearer_token_env_var=\"TEMPS_CHAT_MCP_TOKEN\"".to_string(),
-            ]);
-            environment.insert(
-                "TEMPS_CHAT_MCP_TOKEN".to_string(),
-                server.authorization_token.clone(),
-            );
-            Ok(None)
-        }
-        "opencode" => {
-            merge_opencode_config(
-                environment,
-                serde_json::json!({
-                    "mcp": {
-                        "temps-chat": {
-                            "type": "remote",
-                            "url": server.url,
-                            "headers": {
-                                "Authorization": format!("Bearer {}", server.authorization_token),
-                            }
-                        }
-                    },
-                    "permission": {"temps_chat_*": "allow"}
-                }),
-            )?;
-            Ok(None)
-        }
-        other => Err(AiError::Provider {
-            purpose: "chat.application.mcp".to_string(),
-            reason: format!("sandbox MCP configuration is not implemented for '{other}'"),
-        }),
-    }
-}
-
 fn merge_opencode_config(
     environment: &mut HashMap<String, String>,
     addition: serde_json::Value,
@@ -4318,257 +3945,6 @@ fn merge_opencode_config(
             reason: format!("could not encode OpenCode relay configuration: {error}"),
         })?,
     );
-    Ok(())
-}
-
-#[allow(dead_code)]
-fn sandbox_harness_command(
-    provider: &str,
-    prompt: &str,
-    request: &ChatTurnRequest,
-) -> Result<Vec<String>, AiError> {
-    let mut command = match provider {
-        "claude_cli" => {
-            let mut command = vec!["claude".to_string(), "--print".to_string()];
-            if let Some(session_id) = request.resume_session_id.as_deref() {
-                command.push("--resume".to_string());
-                command.push(session_id.to_string());
-            }
-            command.extend([
-                prompt.to_string(),
-                "--output-format".to_string(),
-                "stream-json".to_string(),
-                "--verbose".to_string(),
-                "--include-partial-messages".to_string(),
-            ]);
-            let mut roots = request
-                .sandbox_file_paths
-                .iter()
-                .map(|path| {
-                    if !valid_staged_attachment_path(path) {
-                        return Err(AiError::Provider {
-                            purpose: request.purpose.clone(),
-                            reason: "Claude attachment path is outside the root-owned turn staging directory".to_string(),
-                        });
-                    }
-                    Path::new(path)
-                        .parent()
-                        .map(|path| path.to_string_lossy().into_owned())
-                        .ok_or_else(|| AiError::Provider {
-                            purpose: request.purpose.clone(),
-                            reason: "Claude attachment path has no managed turn directory".to_string(),
-                        })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            roots.sort();
-            roots.dedup();
-            for root in roots {
-                command.push("--add-dir".to_string());
-                command.push(root);
-            }
-            command
-        }
-        "codex_cli" => {
-            let mut command = vec![
-                "codex".to_string(),
-                "exec".to_string(),
-                "--strict-config".to_string(),
-                "--ignore-user-config".to_string(),
-            ];
-            if let Some(session_id) = request.resume_session_id.as_deref() {
-                command.push("resume".to_string());
-                command.push(session_id.to_string());
-            }
-            for image_path in &request.sandbox_image_paths {
-                if !valid_staged_attachment_path(image_path) {
-                    return Err(AiError::Provider {
-                        purpose: request.purpose.clone(),
-                        reason: "sandbox image path is outside the managed attachment directory"
-                            .to_string(),
-                    });
-                }
-                command.push("--image".to_string());
-                command.push(image_path.clone());
-            }
-            command.extend([
-                prompt.to_string(),
-                "--json".to_string(),
-                "--skip-git-repo-check".to_string(),
-            ]);
-            command
-        }
-        "opencode" => {
-            let mut command = vec![
-                "opencode".to_string(),
-                "run".to_string(),
-                "--format".to_string(),
-                "json".to_string(),
-            ];
-            if let Some(session_id) = request.resume_session_id.as_deref() {
-                command.push("--session".to_string());
-                command.push(session_id.to_string());
-            }
-            for file_path in &request.sandbox_file_paths {
-                if !valid_staged_attachment_path(file_path) {
-                    return Err(AiError::Provider { purpose: request.purpose.clone(), reason: "OpenCode attachment path is outside the root-owned turn staging directory".to_string() });
-                }
-                command.push("--file".to_string());
-                command.push(file_path.clone());
-            }
-            command
-        }
-        _ => {
-            return Err(AiError::Provider {
-                purpose: request.purpose.clone(),
-                reason: format!("sandbox execution is not implemented for harness '{provider}'"),
-            })
-        }
-    };
-    if provider != "opencode" {
-        if let Some(model) = request.model.as_deref().filter(|model| !model.is_empty()) {
-            // All registered harnesses accept an explicit model flag. Claude's
-            // parser accepts it after --print's prompt (matching its native CLI).
-            command.push("--model".to_string());
-            command.push(model.to_string());
-        }
-    }
-    apply_sandbox_runtime_options(&mut command, provider, request)?;
-    if provider == "opencode" {
-        if let Some(model) = request.model.as_deref().filter(|model| !model.is_empty()) {
-            command.push("--model".to_string());
-            command.push(model.to_string());
-        }
-        command.push("--".to_string());
-        command.push(prompt.to_string());
-    }
-    Ok(command)
-}
-
-#[allow(dead_code)]
-fn valid_staged_attachment_path(path: &str) -> bool {
-    const PREFIX: &str = "/run/temps-attachments/";
-    let Some(suffix) = path.strip_prefix(PREFIX) else {
-        return false;
-    };
-    let mut components = suffix.split('/');
-    let (Some(turn_id), Some(file_name), None) =
-        (components.next(), components.next(), components.next())
-    else {
-        return false;
-    };
-    let valid_opaque_id = |value: &str| {
-        !value.is_empty()
-            && value.len() <= 128
-            && value
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-    };
-    path.len() <= 1024
-        && turn_id.starts_with("turn-")
-        && valid_opaque_id(turn_id)
-        && !file_name.is_empty()
-        && file_name.len() <= 255
-        && file_name.starts_with("attachment-")
-        && file_name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.'))
-        && !file_name.contains('\r')
-        && !file_name.contains('\n')
-}
-
-/// Keep sandbox harness invocations honest about the controls shown in the
-/// composer.  The Docker/Firecracker sandbox remains the outer boundary, but
-/// it must not silently ignore the model's own effort or permission policy.
-///
-/// These flags mirror the provider adapters' normal `AiRunConfig` mappings.
-/// We keep the mapping here because sandbox execution deliberately avoids the
-/// host subprocess and its ambient configuration.
-#[allow(dead_code)]
-fn apply_sandbox_runtime_options(
-    command: &mut Vec<String>,
-    provider: &str,
-    request: &ChatTurnRequest,
-) -> Result<(), AiError> {
-    match provider {
-        "claude_cli" => {
-            let permission = match request.permission_mode.as_deref() {
-                Some("plan") => "plan",
-                _ => "default",
-            };
-            command.push("--permission-mode".to_string());
-            command.push(permission.to_string());
-
-            match request.thinking_level.as_deref() {
-                None | Some("default") => {}
-                Some("off") => {
-                    command.push("--effort".to_string());
-                    command.push("high".to_string());
-                    command.push("--settings".to_string());
-                    command.push(r#"{\"alwaysThinkingEnabled\":false}"#.to_string());
-                }
-                Some("ultracode") => {
-                    command.push("--effort".to_string());
-                    command.push("xhigh".to_string());
-                    command.push("--settings".to_string());
-                    command.push(r#"{\"ultracode\":true}"#.to_string());
-                }
-                Some(effort) => {
-                    command.push("--effort".to_string());
-                    command.push(effort.to_string());
-                }
-            }
-        }
-        "codex_cli" => {
-            match request.permission_mode.as_deref() {
-                Some("full-access") | Some("auto-review") | Some("auto") | None => {
-                    command.extend([
-                        "--config".to_string(),
-                        "sandbox_mode=\"workspace-write\"".to_string(),
-                        "--config".to_string(),
-                        "approval_policy=\"on-request\"".to_string(),
-                        "--config".to_string(),
-                        "approvals_reviewer=\"auto_review\"".to_string(),
-                    ]);
-                }
-                Some(mode) => {
-                    return Err(AiError::Provider {
-                        purpose: request.purpose.clone(),
-                        reason: format!("unsupported Codex sandbox permission mode '{mode}'"),
-                    });
-                }
-            }
-            if let Some(effort) = request
-                .thinking_level
-                .as_deref()
-                .filter(|effort| *effort != "default")
-            {
-                command.push("--config".to_string());
-                command.push(format!("model_reasoning_effort=\"{effort}\""));
-            }
-        }
-        "opencode" => {
-            // OpenCode calls its permission selection an agent and its
-            // reasoning selection a variant. Both precede the positional
-            // prompt, which `sandbox_harness_command` appends afterwards.
-            if let Some(agent) = request
-                .permission_mode
-                .as_deref()
-                .filter(|agent| *agent != "full-access")
-            {
-                command.push("--agent".to_string());
-                command.push(agent.to_string());
-            }
-            if let Some(variant) = request
-                .thinking_level
-                .as_deref()
-                .filter(|variant| *variant != "default")
-            {
-                command.push("--variant".to_string());
-                command.push(variant.to_string());
-            }
-        }
-        _ => {}
-    }
     Ok(())
 }
 
@@ -4639,7 +4015,7 @@ fn build_sandbox_chat_prompt(request: &ChatTurnRequest) -> String {
 /// of the answer.
 ///
 /// Concatenates every line's extracted text (via
-/// [`temps_agents::ai_cli::extract_assistant_text`], dispatched by
+/// [`temps_ai_cli::extract_assistant_text`], dispatched by
 /// `provider_name`) and falls back to the raw trimmed output only when no
 /// line yielded anything — a defensive net for a provider/output mode that
 /// isn't JSON at all, so a real answer is never dropped just because
@@ -4647,11 +4023,9 @@ fn build_sandbox_chat_prompt(request: &ChatTurnRequest) -> String {
 fn extract_final_text(provider_name: &str, raw_output: &str) -> String {
     let mut extracted = String::new();
     for line in raw_output.lines() {
-        if let Some(text) = temps_agents::ai_cli::extract_assistant_text(provider_name, line) {
+        if let Some(text) = temps_ai_cli::extract_assistant_text(provider_name, line) {
             extracted.push_str(&text);
-        } else if let Some(tool_name) =
-            temps_agents::ai_cli::dropped_tool_use_name(provider_name, line)
-        {
+        } else if let Some(tool_name) = temps_ai_cli::dropped_tool_use_name(provider_name, line) {
             // ADR-038: see the matching log point in chat_stream's on_event —
             // same rationale, `complete()`'s one-shot path hits it too.
             tracing::warn!(
@@ -4728,6 +4102,8 @@ fn candidate_probe_create_config(
         memory_limit_mb: Some(1024),
         pids_limit: Some(128),
         disk_size_mb: None,
+        allow_docker: false,
+        egress_policy: Default::default(),
         network_mode: Some("restricted".into()),
         env_vars: HashMap::new(),
         idle_timeout: Duration::from_secs(120),
@@ -4779,7 +4155,7 @@ fn validate_candidate_probe(
     provider: &str,
     relay_status: Option<u16>,
     relay_succeeded: bool,
-    output: &temps_agents::sandbox::SandboxExecResult,
+    output: &temps_sandbox_providers::SandboxExecResult,
 ) -> Result<(), AiError> {
     let answered = candidate_probe_has_answer(provider, &output.stdout);
     let transport_failure = candidate_probe_transport_failure(&output.stdout, &output.stderr);
@@ -4876,7 +4252,7 @@ fn validate_candidate_probe(
 fn validate_additional_opencode_probe(
     model: &str,
     relay_status: Option<u16>,
-    output: &temps_agents::sandbox::SandboxExecResult,
+    output: &temps_sandbox_providers::SandboxExecResult,
 ) -> Result<(), AiError> {
     match relay_status {
         Some(401 | 403) => {
@@ -5483,11 +4859,12 @@ impl AgentCliAiService {
                     purpose: "provider.credentials.verify.invalid".into(),
                     reason: "an OpenAI-compatible endpoint needs a model to verify".into(),
                 })?;
-                temps_agents::ai_cli::openai_compatible::upstream_model_from_selection(model)
-                    .map_err(|error| AiError::Provider {
+                temps_ai_cli::openai_compatible::upstream_model_from_selection(model).map_err(
+                    |error| AiError::Provider {
                         purpose: "provider.credentials.verify.invalid".into(),
                         reason: error.to_string(),
-                    })?;
+                    },
+                )?;
                 Some(model)
             } else {
                 selected_opencode_probe_model(&opencode_models, verification_model)?
@@ -5917,6 +5294,94 @@ impl AiService for AgentCliAiService {
             return self.discover_workspace_capabilities(principal_id).await;
         }
         self.host_capabilities_snapshot(refresh).await
+    }
+
+    async fn workspace_harness_update_status(
+        &self,
+        provider: &str,
+        principal_id: i32,
+        refresh: bool,
+    ) -> Result<temps_ai::HarnessUpdateStatus, AiError> {
+        use crate::harness_update as hu;
+
+        let unavailable = || AiError::Provider {
+            purpose: "provider.harness.update".into(),
+            reason: format!("harness updates are unavailable for '{provider}'"),
+        };
+        if provider != self.provider.name() {
+            return Err(unavailable());
+        }
+        let package = hu::harness_package(provider).ok_or_else(unavailable)?;
+        if !refresh {
+            let states = self
+                .harness_updates
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(state) = states.get(&principal_id) {
+                let fresh = state
+                    .checked_at
+                    .is_some_and(|at| at.elapsed() < hu::CHECK_INTERVAL);
+                if let (true, Some(status)) = (fresh, state.status.as_ref()) {
+                    return Ok(temps_ai::HarnessUpdateStatus {
+                        updating: state.updating,
+                        ..status.clone()
+                    });
+                }
+                if state.updating {
+                    return Ok(temps_ai::HarnessUpdateStatus {
+                        provider_id: provider.to_string(),
+                        installed_version: None,
+                        latest_version: None,
+                        update_available: false,
+                        updating: true,
+                        checked_at: None,
+                        detail: None,
+                    });
+                }
+            }
+        }
+        self.check_workspace_harness(principal_id, package).await
+    }
+
+    async fn update_workspace_harness(
+        &self,
+        provider: &str,
+        principal_id: i32,
+    ) -> Result<temps_ai::HarnessUpdateStatus, AiError> {
+        use crate::harness_update as hu;
+
+        let unavailable = || AiError::Provider {
+            purpose: "provider.harness.update".into(),
+            reason: format!("harness updates are unavailable for '{provider}'"),
+        };
+        if provider != self.provider.name() {
+            return Err(unavailable());
+        }
+        let package = hu::harness_package(provider).ok_or_else(unavailable)?;
+        let guard = {
+            let mut states = self
+                .harness_updates
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let state = states.entry(principal_id).or_default();
+            if state.updating {
+                return Err(AiError::Provider {
+                    purpose: "provider.harness.update.busy".into(),
+                    reason: format!("{provider} is already being updated in this workspace"),
+                });
+            }
+            state.updating = true;
+            HarnessUpdateGuard {
+                states: self.harness_updates.clone(),
+                principal_id,
+            }
+        };
+        self.run_workspace_harness_update(principal_id, package, guard)
+            .await
+            .map(|status| temps_ai::HarnessUpdateStatus {
+                updating: false,
+                ..status
+            })
     }
 
     async fn invalidate_capabilities_for(&self, _provider: Option<&str>) {
@@ -6389,18 +5854,16 @@ impl AiService for AgentCliAiService {
             let provider_name = provider_name.clone();
             let streamed_partial = streamed_partial.clone();
             Box::pin(async move {
-                if let Some(delta) =
-                    temps_agents::ai_cli::extract_partial_text(&provider_name, &line)
-                {
+                if let Some(delta) = temps_ai_cli::extract_partial_text(&provider_name, &line) {
                     streamed_partial.store(true, std::sync::atomic::Ordering::Relaxed);
                     let _ = tx.send(Ok(delta)).await;
                 } else if let (false, Some(text)) = (
                     streamed_partial.load(std::sync::atomic::Ordering::Relaxed),
-                    temps_agents::ai_cli::extract_assistant_text(&provider_name, &line),
+                    temps_ai_cli::extract_assistant_text(&provider_name, &line),
                 ) {
                     let _ = tx.send(Ok(text)).await;
                 } else if let Some(tool_name) =
-                    temps_agents::ai_cli::dropped_tool_use_name(&provider_name, &line)
+                    temps_ai_cli::dropped_tool_use_name(&provider_name, &line)
                 {
                     // ADR-038: CLI-chat has no channel to bridge this back to
                     // the user (no open stdin, no permission UI) — the turn
@@ -6533,6 +5996,13 @@ impl AiService for AgentCliAiService {
                 reason: format!("failed to create isolated CLI chat directory: {error}"),
             })?;
 
+        // One chat turn's events. The producer is a single CLI process bounded
+        // by the turn timeout and output limits, and the callback that feeds
+        // it is synchronous, so a bounded `send().await` is not available.
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "per-turn stream fed from a sync callback; bounded by the turn's timeout and output limits"
+        )]
         let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
         let (mut mcp_bridge, bridge_event_task, mcp_config) = if request.tools.is_empty() {
             (None, None, None)
@@ -6584,14 +6054,11 @@ impl AiService for AgentCliAiService {
                         return;
                     }
                 }
-                if let Some(text) =
-                    temps_agents::ai_cli::extract_partial_text(&provider_name, &line)
-                {
+                if let Some(text) = temps_ai_cli::extract_partial_text(&provider_name, &line) {
                     streamed_partial.store(true, std::sync::atomic::Ordering::Relaxed);
                     let _ = callback_tx.send(Ok(ChatStreamDelta::Text(text)));
                 } else if !streamed_partial.load(std::sync::atomic::Ordering::Relaxed) {
-                    if let Some(text) =
-                        temps_agents::ai_cli::extract_assistant_text(&provider_name, &line)
+                    if let Some(text) = temps_ai_cli::extract_assistant_text(&provider_name, &line)
                     {
                         let _ = callback_tx.send(Ok(ChatStreamDelta::Text(text)));
                     }
@@ -6697,10 +6164,10 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
 
-    use temps_agents::ai_cli::{invalidate_status_cache, AiCliStatus, AiRunResult};
-    use temps_agents::error::AgentError;
+    use temps_agent_core::error::AgentError;
     use temps_ai::streaming::ChatTool;
     use temps_ai::AiRequest;
+    use temps_ai_cli::{invalidate_status_cache, AiCliStatus, AiRunResult};
 
     #[test]
     fn credential_probe_uses_managed_workspace_runtime_image() {
@@ -6841,13 +6308,14 @@ mod tests {
                             "/managed/global-user-{principal_id}"
                         )),
                     },
-                    handle: temps_agents::sandbox::SandboxHandle {
+                    handle: temps_sandbox_providers::SandboxHandle {
                         node_id: None,
                         sandbox_id: format!("sandbox-{principal_id}"),
                         sandbox_name: format!("workspace-{principal_id}"),
                         work_dir: PathBuf::from("/home/temps/workspace"),
-                        backend: temps_agents::sandbox::SandboxBackend::Docker,
+                        backend: temps_sandbox_providers::SandboxBackend::Docker,
                         image: "test-image".to_string(),
+                        conditions: Vec::new(),
                     },
                     stop: Arc::new(|| Box::pin(async { Ok(()) })),
                 })
@@ -6865,14 +6333,15 @@ mod tests {
         assert!(!slot.set(Arc::new(|_| Box::pin(async { Err(AiError::NotAvailable) }))));
     }
 
-    fn test_sandbox_handle() -> temps_agents::sandbox::SandboxHandle {
-        temps_agents::sandbox::SandboxHandle {
+    fn test_sandbox_handle() -> temps_sandbox_providers::SandboxHandle {
+        temps_sandbox_providers::SandboxHandle {
             node_id: None,
             sandbox_id: "sandbox-model-discovery".to_string(),
             sandbox_name: "workspace-model-discovery".to_string(),
             work_dir: PathBuf::from("/tmp/workspace-model-discovery"),
-            backend: temps_agents::sandbox::SandboxBackend::Local,
+            backend: temps_sandbox_providers::SandboxBackend::Local,
             image: "test-image".to_string(),
+            conditions: Vec::new(),
         }
     }
 
@@ -6889,7 +6358,7 @@ mod tests {
         async fn create(
             &self,
             config: SandboxCreateConfig,
-        ) -> Result<temps_agents::sandbox::SandboxHandle, AgentError> {
+        ) -> Result<temps_sandbox_providers::SandboxHandle, AgentError> {
             self.lifecycle_calls.fetch_add(1, Ordering::SeqCst);
             if self.candidate_mode {
                 assert!(config
@@ -6911,11 +6380,11 @@ mod tests {
 
         async fn exec(
             &self,
-            _handle: &temps_agents::sandbox::SandboxHandle,
+            _handle: &temps_sandbox_providers::SandboxHandle,
             command: Vec<String>,
             environment: HashMap<String, String>,
             _on_output: Option<OnEventCallback>,
-        ) -> Result<temps_agents::sandbox::SandboxExecResult, AgentError> {
+        ) -> Result<temps_sandbox_providers::SandboxExecResult, AgentError> {
             self.exec_calls.fetch_add(1, Ordering::SeqCst);
             if self.candidate_mode {
                 assert_eq!(command.first().map(String::as_str), Some("claude"));
@@ -6924,7 +6393,7 @@ mod tests {
                     .windows(2)
                     .any(|args| args == ["--model", "claude-selected-model"]));
                 assert!(environment.contains_key("ANTHROPIC_AUTH_TOKEN"));
-                return Ok(temps_agents::sandbox::SandboxExecResult {
+                return Ok(temps_sandbox_providers::SandboxExecResult {
                     exit_code: 0,
                     stdout: r#"{"type":"assistant","message":{"content":[{"type":"text","text":"OK"}]}}"#.into(),
                     stderr: String::new(),
@@ -6941,7 +6410,7 @@ mod tests {
                         sandbox_id: "runtime-test".to_string(),
                         reason: "missing queued runtime response".to_string(),
                     })?;
-                return Ok(temps_agents::sandbox::SandboxExecResult {
+                return Ok(temps_sandbox_providers::SandboxExecResult {
                     exit_code: 0,
                     stdout: response,
                     stderr: String::new(),
@@ -6949,7 +6418,7 @@ mod tests {
             }
             if command.first().map(String::as_str) == Some("/bin/rm") {
                 self.cleanup_calls.fetch_add(1, Ordering::SeqCst);
-                return Ok(temps_agents::sandbox::SandboxExecResult {
+                return Ok(temps_sandbox_providers::SandboxExecResult {
                     exit_code: 0,
                     stdout: String::new(),
                     stderr: String::new(),
@@ -6973,7 +6442,7 @@ mod tests {
                     }
                 }
             });
-            Ok(temps_agents::sandbox::SandboxExecResult {
+            Ok(temps_sandbox_providers::SandboxExecResult {
                 exit_code: 0,
                 stdout: format!("{response}\n"),
                 stderr: String::new(),
@@ -6982,14 +6451,14 @@ mod tests {
 
         async fn is_alive(
             &self,
-            _handle: &temps_agents::sandbox::SandboxHandle,
+            _handle: &temps_sandbox_providers::SandboxHandle,
         ) -> Result<bool, AgentError> {
             Ok(true)
         }
 
         async fn write_file(
             &self,
-            _handle: &temps_agents::sandbox::SandboxHandle,
+            _handle: &temps_sandbox_providers::SandboxHandle,
             _path: &str,
             _contents: &[u8],
             _mode: u32,
@@ -6999,7 +6468,7 @@ mod tests {
 
         async fn read_file(
             &self,
-            _handle: &temps_agents::sandbox::SandboxHandle,
+            _handle: &temps_sandbox_providers::SandboxHandle,
             _path: &str,
         ) -> Result<Vec<u8>, AgentError> {
             Ok(Vec::new())
@@ -7007,7 +6476,7 @@ mod tests {
 
         async fn write_directory(
             &self,
-            _handle: &temps_agents::sandbox::SandboxHandle,
+            _handle: &temps_sandbox_providers::SandboxHandle,
             _local_dir: &Path,
             _target_path: &str,
         ) -> Result<(), AgentError> {
@@ -7016,16 +6485,16 @@ mod tests {
 
         async fn kill_processes(
             &self,
-            _handle: &temps_agents::sandbox::SandboxHandle,
+            _handle: &temps_sandbox_providers::SandboxHandle,
             _pattern: &str,
-            _signal: temps_agents::sandbox::KillSignal,
+            _signal: temps_sandbox_providers::KillSignal,
         ) -> Result<(), AgentError> {
             Ok(())
         }
 
         async fn destroy(
             &self,
-            _handle: &temps_agents::sandbox::SandboxHandle,
+            _handle: &temps_sandbox_providers::SandboxHandle,
             _purge_volumes: bool,
         ) -> Result<(), AgentError> {
             self.lifecycle_calls.fetch_add(1, Ordering::SeqCst);
@@ -7034,7 +6503,7 @@ mod tests {
 
         async fn stop(
             &self,
-            _handle: &temps_agents::sandbox::SandboxHandle,
+            _handle: &temps_sandbox_providers::SandboxHandle,
         ) -> Result<(), AgentError> {
             self.lifecycle_calls.fetch_add(1, Ordering::SeqCst);
             Ok(())
@@ -7042,7 +6511,7 @@ mod tests {
 
         async fn start(
             &self,
-            _handle: &temps_agents::sandbox::SandboxHandle,
+            _handle: &temps_sandbox_providers::SandboxHandle,
         ) -> Result<(), AgentError> {
             self.lifecycle_calls.fetch_add(1, Ordering::SeqCst);
             Ok(())
@@ -7051,7 +6520,7 @@ mod tests {
         async fn recover(
             &self,
             _run_id: i32,
-        ) -> Result<Option<temps_agents::sandbox::SandboxHandle>, AgentError> {
+        ) -> Result<Option<temps_sandbox_providers::SandboxHandle>, AgentError> {
             self.lifecycle_calls.fetch_add(1, Ordering::SeqCst);
             Ok(None)
         }
@@ -7205,7 +6674,7 @@ mod tests {
         for status in [None, Some(200), Some(401), Some(402), Some(429)] {
             assert_eq!(candidate_relay_infrastructure_diagnostic(status), None);
         }
-        let successful_output = temps_agents::sandbox::SandboxExecResult {
+        let successful_output = temps_sandbox_providers::SandboxExecResult {
             exit_code: 0,
             stdout: r#"{"type":"text","part":{"text":"OK"}}"#.into(),
             stderr: String::new(),
@@ -7227,7 +6696,7 @@ mod tests {
                 diagnostic: temps_ai::CredentialVerificationDiagnostic::NetworkUnavailable,
             } if provider == "opencode"
         ));
-        let failed_output = temps_agents::sandbox::SandboxExecResult {
+        let failed_output = temps_sandbox_providers::SandboxExecResult {
             exit_code: 1,
             stdout: String::new(),
             stderr: String::new(),
@@ -7267,7 +6736,7 @@ mod tests {
                 "error sending request: connection refused",
                 "request timed out before a response was received",
             ] {
-                let failed_output = temps_agents::sandbox::SandboxExecResult {
+                let failed_output = temps_sandbox_providers::SandboxExecResult {
                     exit_code: 1,
                     stdout: String::new(),
                     stderr: stderr.into(),
@@ -7287,7 +6756,7 @@ mod tests {
     #[test]
     fn unknown_pre_relay_failures_are_harness_execution_failures() {
         for provider in ["claude_cli", "codex_cli"] {
-            let failed_output = temps_agents::sandbox::SandboxExecResult {
+            let failed_output = temps_sandbox_providers::SandboxExecResult {
                 exit_code: 1,
                 stdout: String::new(),
                 stderr: "native harness stopped without a diagnostic".into(),
@@ -7302,7 +6771,7 @@ mod tests {
             ));
         }
 
-        let missing_answer = temps_agents::sandbox::SandboxExecResult {
+        let missing_answer = temps_sandbox_providers::SandboxExecResult {
             exit_code: 0,
             stdout: String::new(),
             stderr: String::new(),
@@ -7316,7 +6785,7 @@ mod tests {
 
     #[test]
     fn missing_relay_classification_does_not_mask_native_or_model_failures() {
-        let native_failure = temps_agents::sandbox::SandboxExecResult {
+        let native_failure = temps_sandbox_providers::SandboxExecResult {
             exit_code: 127,
             stdout: String::new(),
             stderr: "command not found".into(),
@@ -7329,7 +6798,7 @@ mod tests {
             })
         ));
 
-        let auth_failure = temps_agents::sandbox::SandboxExecResult {
+        let auth_failure = temps_sandbox_providers::SandboxExecResult {
             exit_code: 1,
             stdout: String::new(),
             stderr: "authentication failed".into(),
@@ -7340,7 +6809,7 @@ mod tests {
                 if purpose == "provider.credentials.verify.auth"
         ));
 
-        let model_failure = temps_agents::sandbox::SandboxExecResult {
+        let model_failure = temps_sandbox_providers::SandboxExecResult {
             exit_code: 1,
             stdout: String::new(),
             stderr: "model not found".into(),
@@ -7353,7 +6822,7 @@ mod tests {
             ));
         }
 
-        let missing_answer = temps_agents::sandbox::SandboxExecResult {
+        let missing_answer = temps_sandbox_providers::SandboxExecResult {
             exit_code: 0,
             stdout: String::new(),
             stderr: String::new(),
@@ -7555,7 +7024,7 @@ mod tests {
         )])));
         let guard = StopSandboxOnDrop {
             armed: true,
-            provider: Arc::new(temps_agents::sandbox::local::LocalSandboxProvider::new()),
+            provider: Arc::new(temps_sandbox_providers::local::LocalSandboxProvider::new()),
             handle,
             handles: handles.clone(),
             sandbox_label: "workspace-model-discovery".to_string(),
@@ -7595,7 +7064,7 @@ mod tests {
         let handle = test_sandbox_handle();
         let mut guard = StopSandboxOnDrop {
             armed: true,
-            provider: Arc::new(temps_agents::sandbox::local::LocalSandboxProvider::new()),
+            provider: Arc::new(temps_sandbox_providers::local::LocalSandboxProvider::new()),
             handle,
             handles: Arc::new(Mutex::new(HashMap::new())),
             sandbox_label: "workspace-model-discovery".to_string(),
@@ -7657,13 +7126,14 @@ mod tests {
             Duration::from_secs(30),
             2,
         );
-        let handle = temps_agents::sandbox::SandboxHandle {
+        let handle = temps_sandbox_providers::SandboxHandle {
             node_id: None,
             sandbox_id: "sandbox-id".to_string(),
             sandbox_name: "temps-sandbox-app-one".to_string(),
             work_dir: PathBuf::from("/home/temps/workspace"),
-            backend: temps_agents::sandbox::SandboxBackend::Docker,
+            backend: temps_sandbox_providers::SandboxBackend::Docker,
             image: "test-image".to_string(),
+            conditions: Vec::new(),
         };
 
         service.cache_sandbox_handle("app-one".to_string(), handle);
@@ -7730,7 +7200,7 @@ mod tests {
 
     #[test]
     fn codex_native_tool_lifecycle_is_emitted_once_and_updates_in_place() {
-        let provider = temps_agents::ai_cli::codex::CodexCliProvider;
+        let provider = temps_ai_cli::codex::CodexCliProvider;
         let calls: NativeToolCalls = Arc::new(Mutex::new(HashMap::new()));
         let started = r#"{"type":"item.started","item":{"id":"mcp-1","type":"mcp_tool_call","server":"temps","tool":"get_projects","arguments":{}}}"#;
         let completed = r#"{"type":"item.completed","item":{"id":"mcp-1","type":"mcp_tool_call","server":"temps","tool":"get_projects","arguments":{},"status":"completed","result":{"content":[{"type":"text","text":"Found one project"}]}}}"#;
@@ -7756,7 +7226,7 @@ mod tests {
 
     #[test]
     fn opencode_native_tool_frames_emit_start_completion_and_error_deltas() {
-        let provider = temps_agents::ai_cli::opencode::OpenCodeCliProvider;
+        let provider = temps_ai_cli::opencode::OpenCodeCliProvider;
         let calls: NativeToolCalls = Arc::new(Mutex::new(HashMap::new()));
         let running = r#"{"type":"tool","part":{"id":"part_1","callID":"call_1","tool":"bash","state":{"status":"running","input":{"command":"pwd"}}}}"#;
         assert!(matches!(
@@ -7785,7 +7255,7 @@ mod tests {
 
     #[test]
     fn opencode_context_usage_delta_keeps_provider_snapshot_semantics() {
-        let provider = temps_agents::ai_cli::opencode::OpenCodeCliProvider;
+        let provider = temps_ai_cli::opencode::OpenCodeCliProvider;
         let line = r#"{"type":"step_finish","part":{"type":"step-finish","tokens":{"input":200,"output":30,"cache":{"read":800,"write":15}}}}"#;
         let mut usage = provider.extract_context_window_usage(line).unwrap();
         pin_context_usage_model(&mut usage, Some("anthropic/selected".to_string()));
@@ -7824,7 +7294,7 @@ mod tests {
 
     #[test]
     fn native_tool_deltas_pair_claude_bash_call_and_result() {
-        let provider = temps_agents::ai_cli::claude::ClaudeCliProvider;
+        let provider = temps_ai_cli::claude::ClaudeCliProvider;
         let calls: NativeToolCalls = Arc::new(Mutex::new(HashMap::new()));
         let call_line = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_bash","name":"Bash","input":{"command":"pwd"}}]}}"#;
         let result_line = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_bash","content":"/workspace"}]}}"#;
@@ -7846,7 +7316,7 @@ mod tests {
 
     #[test]
     fn native_tool_deltas_redact_exact_runtime_secrets_from_arguments_and_results() {
-        let provider = temps_agents::ai_cli::claude::ClaudeCliProvider;
+        let provider = temps_ai_cli::claude::ClaudeCliProvider;
         let calls: NativeToolCalls = Arc::new(Mutex::new(HashMap::new()));
         let secrets = vec![
             "relay-value-not-token-shaped".to_string(),
@@ -7888,7 +7358,7 @@ mod tests {
 
     #[test]
     fn codex_native_tool_results_redact_json_escaped_exact_secrets() {
-        let provider = temps_agents::ai_cli::codex::CodexCliProvider;
+        let provider = temps_ai_cli::codex::CodexCliProvider;
         let calls: NativeToolCalls = Arc::new(Mutex::new(HashMap::new()));
         let secrets = vec![
             "quote-\"-secret".to_string(),
@@ -7965,9 +7435,7 @@ mod tests {
             available_status()
         }
 
-        async fn discover_model_capabilities(
-            &self,
-        ) -> Vec<temps_agents::ai_cli::AiCliModelCapability> {
+        async fn discover_model_capabilities(&self) -> Vec<temps_ai_cli::AiCliModelCapability> {
             self.discovery_calls.fetch_add(1, Ordering::SeqCst);
             Vec::new()
         }
@@ -8075,7 +7543,7 @@ mod tests {
         async fn create(
             &self,
             config: SandboxCreateConfig,
-        ) -> Result<temps_agents::sandbox::SandboxHandle, AgentError> {
+        ) -> Result<temps_sandbox_providers::SandboxHandle, AgentError> {
             self.creates.fetch_add(1, Ordering::SeqCst);
             assert!(config
                 .container_name_override
@@ -8110,15 +7578,15 @@ mod tests {
 
         async fn exec(
             &self,
-            _handle: &temps_agents::sandbox::SandboxHandle,
+            _handle: &temps_sandbox_providers::SandboxHandle,
             command: Vec<String>,
             environment: HashMap<String, String>,
             _on_output: Option<OnEventCallback>,
-        ) -> Result<temps_agents::sandbox::SandboxExecResult, AgentError> {
+        ) -> Result<temps_sandbox_providers::SandboxExecResult, AgentError> {
             self.execs.fetch_add(1, Ordering::SeqCst);
             assert_eq!(command, vec!["mock".to_string(), "--version".to_string()]);
             assert!(environment.is_empty());
-            Ok(temps_agents::sandbox::SandboxExecResult {
+            Ok(temps_sandbox_providers::SandboxExecResult {
                 exit_code: if matches!(self.failure, PreflightFailure::Harness) {
                     1
                 } else {
@@ -8131,14 +7599,14 @@ mod tests {
 
         async fn is_alive(
             &self,
-            _handle: &temps_agents::sandbox::SandboxHandle,
+            _handle: &temps_sandbox_providers::SandboxHandle,
         ) -> Result<bool, AgentError> {
             Ok(!matches!(self.failure, PreflightFailure::Health))
         }
 
         async fn write_file(
             &self,
-            handle: &temps_agents::sandbox::SandboxHandle,
+            handle: &temps_sandbox_providers::SandboxHandle,
             path: &str,
             _contents: &[u8],
             _mode: u32,
@@ -8153,7 +7621,7 @@ mod tests {
 
         async fn read_file(
             &self,
-            handle: &temps_agents::sandbox::SandboxHandle,
+            handle: &temps_sandbox_providers::SandboxHandle,
             path: &str,
         ) -> Result<Vec<u8>, AgentError> {
             assert_eq!(Path::new(path), handle.work_dir.join(".temps-preflight"));
@@ -8162,7 +7630,7 @@ mod tests {
 
         async fn write_directory(
             &self,
-            _handle: &temps_agents::sandbox::SandboxHandle,
+            _handle: &temps_sandbox_providers::SandboxHandle,
             _local_dir: &Path,
             _target_path: &str,
         ) -> Result<(), AgentError> {
@@ -8170,15 +7638,15 @@ mod tests {
         }
         async fn kill_processes(
             &self,
-            _handle: &temps_agents::sandbox::SandboxHandle,
+            _handle: &temps_sandbox_providers::SandboxHandle,
             _pattern: &str,
-            _signal: temps_agents::sandbox::KillSignal,
+            _signal: temps_sandbox_providers::KillSignal,
         ) -> Result<(), AgentError> {
             Ok(())
         }
         async fn destroy(
             &self,
-            _handle: &temps_agents::sandbox::SandboxHandle,
+            _handle: &temps_sandbox_providers::SandboxHandle,
             _purge_volumes: bool,
         ) -> Result<(), AgentError> {
             self.destroys.fetch_add(1, Ordering::SeqCst);
@@ -8187,7 +7655,7 @@ mod tests {
         async fn recover(
             &self,
             _run_id: i32,
-        ) -> Result<Option<temps_agents::sandbox::SandboxHandle>, AgentError> {
+        ) -> Result<Option<temps_sandbox_providers::SandboxHandle>, AgentError> {
             Ok(None)
         }
         fn name(&self) -> &str {
@@ -8294,6 +7762,277 @@ mod tests {
         assert_eq!(destroys.load(Ordering::SeqCst), 1);
         assert_eq!(execs.load(Ordering::SeqCst), 1);
         assert!(!provider_called.load(Ordering::SeqCst));
+    }
+
+    /// Records which account ran the harness install, so the update tests can
+    /// prove the sandbox user is preferred and root is only the fallback.
+    struct HarnessUpdateSandbox {
+        /// Exit status of the "can the sandbox user write the install" probe.
+        probe_exit_code: i32,
+        probe_fails_to_run: bool,
+        user_updates: Arc<AtomicUsize>,
+        root_updates: Arc<AtomicUsize>,
+    }
+
+    impl HarnessUpdateSandbox {
+        fn answer(&self, command: &[String]) -> temps_sandbox_providers::SandboxExecResult {
+            let joined = command.join(" ");
+            let (exit_code, stdout) = if joined.contains("test -w") {
+                (self.probe_exit_code, String::new())
+            } else if joined.contains("npm view") {
+                (0, "2.1.296\n".to_string())
+            } else if joined.contains("--version") {
+                (0, "2.1.296 (Claude Code)\n".to_string())
+            } else {
+                (0, String::new())
+            };
+            temps_sandbox_providers::SandboxExecResult {
+                exit_code,
+                stdout,
+                stderr: String::new(),
+            }
+        }
+
+        fn is_update(command: &[String]) -> bool {
+            command.windows(2).any(|pair| pair == ["npm", "install"])
+        }
+    }
+
+    #[async_trait]
+    impl SandboxProvider for HarnessUpdateSandbox {
+        async fn create(
+            &self,
+            _config: SandboxCreateConfig,
+        ) -> Result<temps_sandbox_providers::SandboxHandle, AgentError> {
+            Err(AgentError::SandboxCreationFailed {
+                run_id: 0,
+                provider: "test".into(),
+                reason: "a harness update must adopt the managed handle".into(),
+            })
+        }
+
+        async fn exec(
+            &self,
+            _handle: &temps_sandbox_providers::SandboxHandle,
+            command: Vec<String>,
+            _environment: HashMap<String, String>,
+            _on_output: Option<OnEventCallback>,
+        ) -> Result<temps_sandbox_providers::SandboxExecResult, AgentError> {
+            if self.probe_fails_to_run && command.join(" ").contains("test -w") {
+                return Err(AgentError::SandboxExecFailed {
+                    run_id: 0,
+                    sandbox_id: "harness-update-test".into(),
+                    reason: "synthetic probe failure".into(),
+                });
+            }
+            if Self::is_update(&command) {
+                self.user_updates.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(self.answer(&command))
+        }
+
+        async fn exec_as_root(
+            &self,
+            _handle: &temps_sandbox_providers::SandboxHandle,
+            command: Vec<String>,
+            _environment: HashMap<String, String>,
+            _on_output: Option<OnEventCallback>,
+        ) -> Result<temps_sandbox_providers::SandboxExecResult, AgentError> {
+            if Self::is_update(&command) {
+                self.root_updates.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(self.answer(&command))
+        }
+
+        async fn is_alive(
+            &self,
+            _handle: &temps_sandbox_providers::SandboxHandle,
+        ) -> Result<bool, AgentError> {
+            Ok(true)
+        }
+
+        async fn write_file(
+            &self,
+            _handle: &temps_sandbox_providers::SandboxHandle,
+            _path: &str,
+            _contents: &[u8],
+            _mode: u32,
+        ) -> Result<(), AgentError> {
+            Ok(())
+        }
+
+        async fn read_file(
+            &self,
+            _handle: &temps_sandbox_providers::SandboxHandle,
+            _path: &str,
+        ) -> Result<Vec<u8>, AgentError> {
+            Ok(Vec::new())
+        }
+
+        async fn write_directory(
+            &self,
+            _handle: &temps_sandbox_providers::SandboxHandle,
+            _local_dir: &Path,
+            _target_path: &str,
+        ) -> Result<(), AgentError> {
+            Ok(())
+        }
+
+        async fn kill_processes(
+            &self,
+            _handle: &temps_sandbox_providers::SandboxHandle,
+            _pattern: &str,
+            _signal: temps_sandbox_providers::KillSignal,
+        ) -> Result<(), AgentError> {
+            Ok(())
+        }
+
+        async fn destroy(
+            &self,
+            _handle: &temps_sandbox_providers::SandboxHandle,
+            _purge_volumes: bool,
+        ) -> Result<(), AgentError> {
+            Ok(())
+        }
+
+        async fn recover(
+            &self,
+            _run_id: i32,
+        ) -> Result<Option<temps_sandbox_providers::SandboxHandle>, AgentError> {
+            Ok(None)
+        }
+
+        fn name(&self) -> &str {
+            "harness-update-test"
+        }
+
+        async fn is_available(&self) -> bool {
+            true
+        }
+
+        async fn image_status(&self) -> Result<(bool, String), AgentError> {
+            Ok((true, "test-image".into()))
+        }
+
+        async fn rebuild_image(&self) -> Result<String, AgentError> {
+            Ok("test-image".into())
+        }
+    }
+
+    /// Runs `update_workspace_harness` against a sandbox whose install probe
+    /// and failure mode are configured; returns the result plus the number of
+    /// installs run as the sandbox user and as root.
+    async fn run_harness_update(
+        probe_exit_code: i32,
+        probe_fails_to_run: bool,
+    ) -> (Result<temps_ai::HarnessUpdateStatus, AiError>, usize, usize) {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let workspace_root = scratch.path().join("ai-applications");
+        let workspace_path = workspace_root.join("global-user-42");
+        std::fs::create_dir_all(&workspace_path).expect("managed workspace path");
+        let handle = test_sandbox_handle();
+        let resolver = SandboxWorkspaceResolverSlot::new();
+        assert!(resolver.set(Arc::new(move |principal_id| {
+            let handle = handle.clone();
+            let workspace_path = workspace_path.clone();
+            Box::pin(async move {
+                assert_eq!(principal_id, 42);
+                Ok(ResolvedSandboxWorkspace {
+                    workspace: temps_ai::HarnessWorkspace {
+                        sandbox_label: handle.sandbox_name.clone(),
+                        host_work_dir: workspace_path,
+                    },
+                    handle,
+                    stop: Arc::new(|| Box::pin(async { Ok(()) })),
+                })
+            })
+        })));
+        let user_updates = Arc::new(AtomicUsize::new(0));
+        let root_updates = Arc::new(AtomicUsize::new(0));
+        let sandbox: Arc<dyn SandboxProvider> = Arc::new(HarnessUpdateSandbox {
+            probe_exit_code,
+            probe_fails_to_run,
+            user_updates: user_updates.clone(),
+            root_updates: root_updates.clone(),
+        });
+        let service = AgentCliAiService::new(
+            Arc::new(CountingClaudeProvider {
+                status_calls: Arc::new(AtomicUsize::new(0)),
+                discovery_calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            scratch.path().join("cli-scratch"),
+            Duration::from_secs(30),
+            1,
+        )
+        .with_temps_sandbox(
+            sandbox,
+            workspace_root,
+            Arc::new(|_| Box::pin(async { Err(AiError::NotAvailable) })),
+            Arc::new(|_, _, _| Box::pin(async { Err(AiError::NotAvailable) })),
+            Arc::new(SandboxModelRelayService::new().expect("model relay")),
+            resolver,
+        );
+        let result = service.update_workspace_harness("claude_cli", 42).await;
+        (
+            result,
+            user_updates.load(Ordering::SeqCst),
+            root_updates.load(Ordering::SeqCst),
+        )
+    }
+
+    #[tokio::test]
+    async fn harness_update_runs_as_the_sandbox_user_when_it_owns_the_install() {
+        let (result, as_user, as_root) = run_harness_update(0, false).await;
+
+        let status = result.expect("update succeeds");
+        assert_eq!(status.installed_version.as_deref(), Some("2.1.296"));
+        assert_eq!(
+            (as_user, as_root),
+            (1, 0),
+            "root must never run npm inside a tree the sandbox user owns"
+        );
+    }
+
+    #[tokio::test]
+    async fn harness_update_falls_back_to_root_for_a_root_owned_install() {
+        let (result, as_user, as_root) = run_harness_update(10, false).await;
+
+        assert!(
+            result.is_ok(),
+            "older images are still updatable: {result:?}"
+        );
+        assert_eq!((as_user, as_root), (0, 1));
+    }
+
+    #[tokio::test]
+    async fn harness_update_does_not_pick_root_from_an_inconclusive_probe() {
+        // 124 is `timeout` killing the probe; 127 a missing shell; 1 and 3
+        // are `test` and npm failing. None of them says the install is root's.
+        for exit_code in [1, 3, 124, 127] {
+            let (result, as_user, as_root) = run_harness_update(exit_code, false).await;
+
+            assert!(result.is_err(), "probe exit {exit_code} must not update");
+            assert_eq!(
+                (as_user, as_root),
+                (0, 0),
+                "probe exit {exit_code} must never default to a root install"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn harness_update_does_not_guess_when_the_probe_cannot_run() {
+        let (result, as_user, as_root) = run_harness_update(0, true).await;
+
+        assert!(
+            result.is_err(),
+            "an unreadable install state must not update"
+        );
+        assert_eq!(
+            (as_user, as_root),
+            (0, 0),
+            "an unknown install owner must never default to a root install"
+        );
     }
 
     #[test]
@@ -8817,6 +8556,7 @@ mod tests {
                 content: "hello".into(),
                 tool_calls: None,
                 tool_call_id: None,
+                images: Vec::new(),
             }],
             ..Default::default()
         };
@@ -8887,7 +8627,7 @@ mod tests {
     #[tokio::test]
     async fn cached_capabilities_never_probe_the_cli_on_a_cold_cache() {
         invalidate_status_cache().await;
-        temps_agents::ai_cli::invalidate_model_discovery_cache().await;
+        temps_ai_cli::invalidate_model_discovery_cache().await;
         let status_calls = Arc::new(AtomicUsize::new(0));
         let discovery_calls = Arc::new(AtomicUsize::new(0));
         let scratch = tempfile::tempdir().expect("scratch directory");
@@ -8921,7 +8661,7 @@ mod tests {
     #[tokio::test]
     async fn concurrent_host_refreshes_share_one_cli_probe() {
         invalidate_status_cache().await;
-        temps_agents::ai_cli::invalidate_model_discovery_cache().await;
+        temps_ai_cli::invalidate_model_discovery_cache().await;
         let status_calls = Arc::new(AtomicUsize::new(0));
         let discovery_calls = Arc::new(AtomicUsize::new(0));
         let scratch = tempfile::tempdir().expect("scratch directory");
@@ -8994,7 +8734,7 @@ mod tests {
         );
         let capabilities = provider_capabilities_from_models(
             "claude_cli",
-            vec![temps_agents::ai_cli::AiCliModelCapability {
+            vec![temps_ai_cli::AiCliModelCapability {
                 id: "principal-seven-model".to_string(),
                 name: "Principal seven model".to_string(),
                 reasoning_options: Vec::new(),
@@ -9086,7 +8826,7 @@ mod tests {
         );
         let capabilities = provider_capabilities_from_models(
             "claude_cli",
-            vec![temps_agents::ai_cli::AiCliModelCapability {
+            vec![temps_ai_cli::AiCliModelCapability {
                 id: "account-model".to_string(),
                 name: "Account model".to_string(),
                 reasoning_options: Vec::new(),
@@ -9187,7 +8927,7 @@ mod tests {
         let service = compatible_endpoint_service(scratch.path(), usize::MAX);
         let capabilities = provider_capabilities_from_models(
             "opencode",
-            vec![temps_agents::ai_cli::AiCliModelCapability {
+            vec![temps_ai_cli::AiCliModelCapability {
                 id: "openai-compatible/served-model".to_string(),
                 name: "served-model".to_string(),
                 reasoning_options: Vec::new(),
@@ -9673,7 +9413,7 @@ mod tests {
         let (_events_tx, events) = tokio::sync::mpsc::channel(1);
         let task = tokio::spawn(std::future::pending::<()>());
         let mut bridge = ScopedMcpBridge {
-            config: temps_agents::ai_cli::McpServerConfig {
+            config: temps_ai_cli::McpServerConfig {
                 url: "http://127.0.0.1:1/mcp/test".to_string(),
                 authorization_token: "test".to_string(),
             },
@@ -9767,65 +9507,6 @@ mod tests {
             !called.load(Ordering::SeqCst),
             "a managed workspace request must fail closed instead of using the host CLI"
         );
-    }
-
-    #[test]
-    fn sandbox_harness_command_respects_claude_runtime_controls() {
-        let request = ChatTurnRequest {
-            purpose: "chat.application".into(),
-            model: Some("claude-opus-5".into()),
-            thinking_level: Some("high".into()),
-            permission_mode: Some("plan".into()),
-            ..Default::default()
-        };
-
-        let command = sandbox_harness_command("claude_cli", "build it", &request)
-            .expect("Claude sandbox command should build");
-
-        assert!(command
-            .windows(2)
-            .any(|pair| pair == ["--model", "claude-opus-5"]));
-        assert!(command.windows(2).any(|pair| pair == ["--effort", "high"]));
-        assert!(command
-            .windows(2)
-            .any(|pair| pair == ["--permission-mode", "plan"]));
-        assert!(
-            !command
-                .iter()
-                .any(|arg| arg == "--dangerously-skip-permissions"),
-            "a selected permission mode must not be silently bypassed"
-        );
-    }
-
-    #[test]
-    fn sandbox_full_access_never_bypasses_the_server_authorization_gate() {
-        let request = ChatTurnRequest {
-            purpose: "chat.application".into(),
-            permission_mode: Some("full-access".into()),
-            ..Default::default()
-        };
-
-        let claude = sandbox_harness_command("claude_cli", "build it", &request)
-            .expect("Claude sandbox command should build");
-        assert!(claude
-            .windows(2)
-            .any(|pair| pair == ["--permission-mode", "default"]));
-        assert!(!claude.iter().any(|arg| arg == "bypassPermissions"));
-
-        let codex = sandbox_harness_command("codex_cli", "build it", &request)
-            .expect("Codex sandbox command should build");
-        assert!(!codex
-            .iter()
-            .any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox"));
-        assert!(codex
-            .windows(2)
-            .any(|pair| pair == ["--config", "sandbox_mode=\"workspace-write\""]));
-
-        let opencode = sandbox_harness_command("opencode", "build it", &request)
-            .expect("OpenCode sandbox command should build");
-        assert!(!opencode
-            .windows(2)
-            .any(|pair| pair == ["--agent", "full-access"]));
     }
 
     #[test]
@@ -10058,40 +9739,6 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_harness_commands_resume_each_native_provider_session() {
-        let request = ChatTurnRequest {
-            purpose: "chat.application".into(),
-            resume_session_id: Some("session-123".into()),
-            ..Default::default()
-        };
-
-        let claude = sandbox_harness_command("claude_cli", "continue", &request)
-            .expect("Claude sandbox command should build");
-        assert!(claude
-            .windows(2)
-            .any(|pair| pair == ["--resume", "session-123"]));
-
-        let codex = sandbox_harness_command("codex_cli", "continue", &request)
-            .expect("Codex sandbox command should build");
-        assert!(codex
-            .windows(2)
-            .any(|pair| pair == ["--config", "sandbox_mode=\"workspace-write\""]));
-        assert!(
-            !codex.iter().any(|arg| arg == "--sandbox"),
-            "the resume subcommand rejects the exec-only --sandbox flag"
-        );
-        assert!(codex
-            .windows(3)
-            .any(|args| { args == ["resume", "session-123", "continue"] }));
-
-        let opencode = sandbox_harness_command("opencode", "continue", &request)
-            .expect("OpenCode sandbox command should build");
-        assert!(opencode
-            .windows(2)
-            .any(|pair| pair == ["--session", "session-123"]));
-    }
-
-    #[test]
     fn resumed_sandbox_prompt_sends_only_the_latest_user_turn() {
         let request = ChatTurnRequest {
             purpose: "chat.application".into(),
@@ -10112,84 +9759,6 @@ mod tests {
     }
 
     #[test]
-    fn all_harnesses_receive_only_staged_attachment_paths_on_fresh_and_resumed_turns() {
-        const ATTACHMENT_PATH: &str = "/run/temps-attachments/turn-abc123/attachment-0.png";
-        for (provider, resumed) in [
-            ("claude_cli", false),
-            ("claude_cli", true),
-            ("codex_cli", false),
-            ("codex_cli", true),
-            ("opencode", false),
-            ("opencode", true),
-        ] {
-            let attachment_context =
-                format!("The user attached an image/png file. Inspect it at: {ATTACHMENT_PATH}");
-            let request = ChatTurnRequest {
-                purpose: "chat.application".into(),
-                resume_session_id: resumed.then(|| "session-123".into()),
-                sandbox_image_paths: vec![ATTACHMENT_PATH.into()],
-                sandbox_file_paths: vec![ATTACHMENT_PATH.into()],
-                messages: vec![
-                    temps_ai::ChatMessage::user("older request"),
-                    temps_ai::ChatMessage::assistant("older response"),
-                    temps_ai::ChatMessage::user(format!(
-                        "{attachment_context}\n\nDescribe the attached image"
-                    )),
-                ],
-                ..Default::default()
-            };
-            let prompt = build_sandbox_chat_prompt(&request);
-            let command = sandbox_harness_command(provider, &prompt, &request).unwrap();
-
-            assert!(
-                command
-                    .iter()
-                    .any(|argument| argument.contains(ATTACHMENT_PATH)),
-                "{provider} must receive the mounted attachment path when resumed={resumed}"
-            );
-            if provider == "codex_cli" {
-                assert!(command
-                    .windows(2)
-                    .any(|arguments| arguments == ["--image", ATTACHMENT_PATH]));
-            } else if provider == "opencode" {
-                assert!(command
-                    .windows(2)
-                    .any(|arguments| arguments == ["--file", ATTACHMENT_PATH]));
-                assert!(command.windows(2).any(|arguments| arguments[0] == "--"));
-            } else {
-                assert!(!command.iter().any(|argument| argument == "--image"));
-            }
-        }
-    }
-
-    #[test]
-    fn harnesses_reject_untrusted_native_attachment_paths() {
-        for path in [
-            "/tmp/untrusted.png",
-            "/home/temps/workspace/.temps/chat-attachments/conversation/file/image.png",
-            "/home/temps/workspace/.temps/chat-attachments/other.png",
-        ] {
-            let request = ChatTurnRequest {
-                purpose: "chat.application".into(),
-                sandbox_image_paths: vec![path.into()],
-                ..Default::default()
-            };
-
-            assert!(matches!(
-                sandbox_harness_command("codex_cli", "inspect", &request),
-                Err(AiError::Provider { reason, .. })
-                    if reason.contains("outside the managed attachment directory")
-            ));
-            let request = ChatTurnRequest {
-                purpose: "chat.application".into(),
-                sandbox_file_paths: vec![path.into()],
-                ..Default::default()
-            };
-            assert!(sandbox_harness_command("opencode", "inspect", &request).is_err());
-        }
-    }
-
-    #[test]
     fn attachment_staging_accepts_only_non_writable_root_owned_directories() {
         assert!(trusted_root_directory_stat("directory:0:0:711\n"));
         assert!(!trusted_root_directory_stat("symbolic link:0:0:777\n"));
@@ -10205,12 +9774,6 @@ mod tests {
             is_image: false,
         };
         assert!(validate_sandbox_attachment_budget(&[oversized], "test").is_err());
-        assert!(valid_staged_attachment_path(
-            "/run/temps-attachments/turn-abc/attachment-0.png"
-        ));
-        assert!(!valid_staged_attachment_path(
-            "/home/temps/workspace/.temps/chat-attachments/c/a/image.png"
-        ));
     }
 
     fn cleanup_test_sandbox() -> (Arc<dyn SandboxProvider>, Arc<AtomicUsize>) {
@@ -10267,7 +9830,7 @@ mod tests {
     }
 
     #[test]
-    fn attachment_prompt_maps_original_names_and_claude_scopes_the_turn_directory() {
+    fn attachment_prompt_maps_original_names() {
         const PATH: &str = "/run/temps-attachments/turn-abc/attachment-0.txt";
         let attachments = vec![temps_ai::SandboxAttachment {
             name: "foo.txt".into(),
@@ -10276,17 +9839,6 @@ mod tests {
         }];
         let prompt = sandbox_attachment_prompt(&attachments, &[(PATH.into(), false)]);
         assert!(prompt.contains("\"foo.txt\" -> /run/temps-attachments/turn-abc/attachment-0.txt"));
-
-        let request = ChatTurnRequest {
-            purpose: "chat.application".into(),
-            sandbox_file_paths: vec![PATH.into()],
-            ..Default::default()
-        };
-        let command = sandbox_harness_command("claude_cli", "inspect foo.txt", &request)
-            .expect("Claude attachment command");
-        assert!(command
-            .windows(2)
-            .any(|args| { args == ["--add-dir", "/run/temps-attachments/turn-abc"] }));
     }
 
     #[test]
@@ -10306,123 +9858,6 @@ mod tests {
                 "{SANDBOX_RUNTIME_GUIDANCE}\n\n[system]\nplatform context\n\n[user]\nfirst request"
             )
         );
-    }
-
-    #[test]
-    fn sandbox_harness_command_places_opencode_flags_before_prompt() {
-        let request = ChatTurnRequest {
-            purpose: "chat.application".into(),
-            model: Some("openai/gpt-5.6".into()),
-            thinking_level: Some("max".into()),
-            permission_mode: Some("build".into()),
-            ..Default::default()
-        };
-
-        let command = sandbox_harness_command("opencode", "build it", &request)
-            .expect("OpenCode sandbox command should build");
-        let prompt = command
-            .iter()
-            .position(|arg| arg == "build it")
-            .expect("prompt is present");
-        let agent = command
-            .iter()
-            .position(|arg| arg == "--agent")
-            .expect("agent flag is present");
-        let variant = command
-            .iter()
-            .position(|arg| arg == "--variant")
-            .expect("variant flag is present");
-        assert!(agent < prompt && variant < prompt);
-    }
-
-    #[test]
-    fn sandbox_claude_registers_scoped_mcp_without_putting_bearer_in_arguments() {
-        let request = ChatTurnRequest {
-            purpose: "chat.application".into(),
-            ..Default::default()
-        };
-        let mut command = sandbox_harness_command("claude_cli", "build it", &request)
-            .expect("Claude sandbox command should build");
-        let mut environment = HashMap::new();
-        let mut secret_files = Vec::new();
-        let server = temps_ai::HarnessMcpServer {
-            url: "http://host.docker.internal:8080/api/ai/sandbox-tools/id/mcp".to_string(),
-            authorization_token: "tmcp_super_secret".to_string(),
-        };
-
-        let cleanup = configure_sandbox_mcp(
-            "claude_cli",
-            &mut command,
-            &mut environment,
-            &mut secret_files,
-            Some(&server),
-        )
-        .expect("MCP configuration should be generated");
-
-        let cleanup = cleanup.expect("Claude uses a temporary MCP config");
-        assert!(cleanup.starts_with("/run/secrets/temps-chat-mcp-"));
-        assert!(command
-            .windows(2)
-            .any(|pair| pair == ["--mcp-config", cleanup.as_str()]));
-        assert!(command
-            .windows(2)
-            .any(|pair| pair == ["--allowedTools", "mcp__temps-chat"]));
-        assert!(command.windows(2).any(|pair| {
-            pair == [
-                "--permission-prompt-tool",
-                "mcp__temps-chat__temps_native_permission",
-            ]
-        }));
-        assert!(!command
-            .iter()
-            .any(|argument| argument.contains("super_secret")));
-        let config: serde_json::Value =
-            serde_json::from_slice(&secret_files[0].1).expect("valid MCP JSON");
-        assert_eq!(
-            config["mcpServers"]["temps-chat"]["headers"]["Authorization"],
-            "Bearer tmcp_super_secret"
-        );
-        assert_eq!(
-            sandbox_secret_cleanup_command(std::slice::from_ref(&cleanup)),
-            ["/bin/rm", "-rf", "--", cleanup.as_str()]
-        );
-    }
-
-    #[test]
-    fn sandbox_codex_registers_scoped_mcp_through_process_environment() {
-        let request = ChatTurnRequest {
-            purpose: "chat.application".into(),
-            ..Default::default()
-        };
-        let mut command = sandbox_harness_command("codex_cli", "build it", &request)
-            .expect("Codex sandbox command should build");
-        let mut environment = HashMap::new();
-        let mut secret_files = Vec::new();
-        let server = temps_ai::HarnessMcpServer {
-            url: "http://host.docker.internal:8080/api/ai/sandbox-tools/id/mcp".to_string(),
-            authorization_token: "tmcp_super_secret".to_string(),
-        };
-
-        configure_sandbox_mcp(
-            "codex_cli",
-            &mut command,
-            &mut environment,
-            &mut secret_files,
-            Some(&server),
-        )
-        .expect("MCP configuration should be generated");
-
-        assert!(command.iter().any(|argument| {
-            argument == "mcp_servers.temps_chat.bearer_token_env_var=\"TEMPS_CHAT_MCP_TOKEN\""
-        }));
-        assert!(!command
-            .iter()
-            .any(|argument| argument.contains("super_secret")));
-        assert_eq!(
-            environment.get("TEMPS_CHAT_MCP_TOKEN").map(String::as_str),
-            Some("tmcp_super_secret")
-        );
-        assert!(secret_files.is_empty());
     }
 
     #[test]
@@ -10574,53 +10009,6 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_opencode_config_contains_only_the_relay_bearer_and_preserves_mcp() {
-        let relay = SandboxModelRelay {
-            base_url: "https://temps.example.test/relay/id".into(),
-            bearer: "tmodel_short_lived".into(),
-            provider_id: Some("anthropic"),
-            native_opencode_auth: None,
-            compatible_model: None,
-        };
-        let mut environment = HashMap::new();
-        environment.insert(
-            "OPENCODE_CONFIG_CONTENT".into(),
-            r#"{"plugin":["evil"],"permission":{"*":"allow"}}"#.into(),
-        );
-        environment.insert("OPENCODE_AUTH_CONTENT".into(), "real-provider-key".into());
-        let mut command = Vec::new();
-        let mut files = Vec::new();
-        configure_sandbox_model_relay(
-            "opencode",
-            &mut command,
-            &mut environment,
-            &mut files,
-            &relay,
-        )
-        .unwrap();
-        configure_sandbox_mcp(
-            "opencode",
-            &mut command,
-            &mut environment,
-            &mut files,
-            Some(&temps_ai::HarnessMcpServer {
-                url: "https://temps.example.test/mcp".into(),
-                authorization_token: "tmcp_short_lived".into(),
-            }),
-        )
-        .unwrap();
-        let auth = environment.get("OPENCODE_AUTH_CONTENT").unwrap();
-        assert!(auth.contains("tmodel_short_lived"));
-        assert!(!auth.contains("real-provider-key"));
-        let config = environment.get("OPENCODE_CONFIG_CONTENT").unwrap();
-        assert!(config.contains("temps-chat"));
-        assert!(config.contains("/relay/id/v1"));
-        assert!(config.contains("enabled_providers"));
-        assert!(!config.contains("evil"));
-        assert!(!config.contains(r#""*""#));
-    }
-
-    #[test]
     fn sandbox_opencode_native_auth_uses_runtime_private_store_without_secret_env() {
         let relay = SandboxModelRelay {
             base_url: "https://unused.example.test".into(),
@@ -10768,27 +10156,6 @@ mod tests {
             scratch.path().to_owned(),
             Duration::from_secs(30),
             0,
-        );
-    }
-
-    #[test]
-    fn claude_session_title_uses_current_user_segment_from_flattened_prompt() {
-        let transcript = br#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[system]\nOperate Temps safely.\n\n[user]\nCan you create a MongoDB instance?"}]}}
-"#;
-        assert_eq!(
-            claude_session_title_from_transcript(transcript).as_deref(),
-            Some("Can you create a MongoDB instance?")
-        );
-    }
-
-    #[test]
-    fn claude_session_title_prefers_provider_custom_title() {
-        let transcript = br#"{"type":"custom-title","customTitle":"  MongoDB   Service Setup  "}
-{"type":"user","message":{"role":"user","content":"ignored"}}
-"#;
-        assert_eq!(
-            claude_session_title_from_transcript(transcript).as_deref(),
-            Some("MongoDB Service Setup")
         );
     }
 
@@ -10981,5 +10348,40 @@ mod tests {
             deltas.as_slice(),
             [ChatStreamDelta::ToolResult { result, .. }] if result == "failed with [REDACTED]"
         ));
+    }
+
+    #[test]
+    fn dropping_the_update_guard_clears_the_flag_and_the_stale_check() {
+        let states: HarnessUpdates = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        states.lock().expect("lock").insert(
+            7,
+            HarnessUpdateState {
+                status: Some(temps_ai::HarnessUpdateStatus {
+                    provider_id: "claude_cli".to_string(),
+                    installed_version: Some("2.1.263".to_string()),
+                    latest_version: Some("2.1.296".to_string()),
+                    update_available: true,
+                    updating: true,
+                    checked_at: None,
+                    detail: None,
+                }),
+                checked_at: Some(Instant::now()),
+                updating: true,
+            },
+        );
+
+        // A request that is cancelled mid-update drops its guard like this.
+        drop(HarnessUpdateGuard {
+            states: states.clone(),
+            principal_id: 7,
+        });
+
+        let states = states.lock().expect("lock");
+        let state = states.get(&7).expect("state kept");
+        assert!(!state.updating, "the flag must not be stranded");
+        assert!(
+            state.status.is_none() && state.checked_at.is_none(),
+            "what is installed changed, so the cached check is discarded"
+        );
     }
 }

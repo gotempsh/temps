@@ -63,8 +63,8 @@ export function FlagsSetupGuide({
           <CardDescription>
             Apps deployed on this instance already have these. Set them yourself
             only when running locally or somewhere else — a deployment token
-            pins the project and environment, so no app can read another
-            project&apos;s flags.
+            pins the service and environment, so no app can read another
+            service&apos;s flags.
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-3">
@@ -115,7 +115,7 @@ TEMPS_API_TOKEN=dt_...`}
               value={aiPrompt(flagKey, envQuery)}
               className="shrink-0 rounded-md border border-border px-3 py-1.5 text-xs font-medium"
             >
-              Copy AI Prompt
+              Copy AI prompt
             </CopyButton>
           </div>
         </CardHeader>

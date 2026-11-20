@@ -12,6 +12,7 @@
  * unit-testable without rendering the dialog.
  */
 
+import { httpStatusOf } from '@/lib/http-error-status'
 import { extractProblemDetails } from '@/utils/errorHandling'
 
 /** Headline for any failed read of the destination list. */
@@ -27,6 +28,13 @@ export const DESTINATIONS_PERMISSION_EXPLANATION =
 
 export const DESTINATIONS_UNAVAILABLE_EXPLANATION =
   'The server could not be reached or is temporarily unavailable.'
+
+/**
+ * Shown when the caller may start a backup but not list the destinations: the
+ * server uses the default destination when none is named.
+ */
+export const DESTINATIONS_RESTRICTED_MESSAGE =
+  'Your role cannot choose a backup destination. The backup is saved to the default destination set by an administrator.'
 
 export const SELECTED_DESTINATION_MISSING_MESSAGE =
   'The selected destination is no longer available. Choose another destination.'
@@ -63,6 +71,12 @@ export type DestinationState<T extends DestinationLike> =
   | { kind: 'error'; failure: DestinationFailure }
   /** A refresh failed, but a previously loaded non-empty list is cached. */
   | { kind: 'stale'; destinations: T[]; failure: DestinationFailure }
+  /**
+   * The caller is refused the list (401/403) and nothing is cached. A refusal
+   * does not mean no destination exists, and a retry cannot change it, but the
+   * caller may still start a backup: left unnamed, the server uses the default.
+   */
+  | { kind: 'restricted'; failure: DestinationFailure }
   /** The server successfully reported that no destinations exist. */
   | { kind: 'empty' }
   /** The server successfully returned at least one destination. */
@@ -121,7 +135,7 @@ export function classifyDestinationError(error: unknown): DestinationFailure {
 
   const problem = extractProblemDetails(error)
   const status =
-    typeof problem?.status === 'number' ? problem.status : undefined
+    typeof problem?.status === 'number' ? problem.status : httpStatusOf(error)
   const detail =
     typeof problem?.detail === 'string' && problem.detail.trim().length > 0
       ? problem.detail
@@ -188,7 +202,9 @@ export function deriveDestinationState<T extends DestinationLike>(
       const failure = classifyDestinationError(error)
       return data.length > 0
         ? { kind: 'stale', destinations: data, failure }
-        : { kind: 'error', failure }
+        : failure.reason === 'permission'
+          ? { kind: 'restricted', failure }
+          : { kind: 'error', failure }
     }
     return data.length > 0
       ? { kind: 'ready', destinations: data }
@@ -196,7 +212,10 @@ export function deriveDestinationState<T extends DestinationLike>(
   }
 
   if (isError) {
-    return { kind: 'error', failure: classifyDestinationError(error) }
+    const failure = classifyDestinationError(error)
+    return failure.reason === 'permission'
+      ? { kind: 'restricted', failure }
+      : { kind: 'error', failure }
   }
 
   // `isPending` without data, or a disabled query that has not run yet:
@@ -240,7 +259,88 @@ export function canSubmitBackup<T extends DestinationLike>(
   state: DestinationState<T>,
   selectedId: number | undefined
 ): boolean {
+  // The list is refused, so no destination can be named; the server uses the
+  // default. Naming one anyway would be a guess at an id nobody can verify.
+  if (state.kind === 'restricted') return selectedId === undefined
   const destinations = knownDestinations(state)
   if (!destinations) return false
   return selectionStatus(destinations, selectedId) === 'valid'
+}
+
+/**
+ * The destination to submit with the backup: none when the list is refused
+ * (the server uses the default), whatever the form still holds from before.
+ */
+export function destinationToSubmit<T extends DestinationLike>(
+  state: DestinationState<T>,
+  selectedId: number | undefined
+): number | undefined {
+  return state.kind === 'restricted' ? undefined : selectedId
+}
+
+/** What the server said a backup run would do, as far as the dialog cares. */
+export interface RunPreflightLike {
+  restarts_database: boolean
+  reason?: string | null
+}
+
+/**
+ * Whether starting this backup needs the operator to acknowledge a database
+ * restart (#1415: the first WAL-G backup of a PostgreSQL service with
+ * archiving off recreates its container).
+ *
+ * - `checking`: the preflight is in flight; submitting is held until known.
+ * - `not-needed`: the backup does not restart anything.
+ * - `needs-confirmation`: it does; submit only once acknowledged.
+ * - `unknown`: the preflight failed. Submitting is allowed: the server
+ *   refuses an unacknowledged restart with a 409 and says why.
+ */
+export type RestartGate =
+  | { kind: 'checking' }
+  | { kind: 'not-needed' }
+  | { kind: 'needs-confirmation'; reason: string }
+  | { kind: 'unknown' }
+
+export const RESTART_REASON_FALLBACK =
+  'This backup restarts the database to turn on WAL archiving.'
+
+export function deriveRestartGate(query: {
+  data?: RunPreflightLike
+  isPending: boolean
+  isError: boolean
+}): RestartGate {
+  if (query.data) {
+    return query.data.restarts_database
+      ? {
+          kind: 'needs-confirmation',
+          reason: query.data.reason?.trim() || RESTART_REASON_FALLBACK,
+        }
+      : { kind: 'not-needed' }
+  }
+  if (query.isError) return { kind: 'unknown' }
+  return { kind: 'checking' }
+}
+
+/** Whether the gate lets the backup be submitted. */
+export function restartGateAllowsSubmit(
+  gate: RestartGate,
+  confirmed: boolean
+): boolean {
+  switch (gate.kind) {
+    case 'checking':
+      return false
+    case 'not-needed':
+    case 'unknown':
+      return true
+    case 'needs-confirmation':
+      return confirmed
+  }
+}
+
+/** The `confirm_restart` value to send for this gate. */
+export function confirmRestartParam(
+  gate: RestartGate,
+  confirmed: boolean
+): boolean | undefined {
+  return gate.kind === 'needs-confirmation' ? confirmed : undefined
 }

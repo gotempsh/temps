@@ -283,7 +283,10 @@ function CustomEventNode({ event }: { event: JourneyEvent }) {
           )}
         </div>
         {expanded && hasData && (
-          <pre className="mt-1.5 rounded bg-muted p-2 text-xs font-mono overflow-x-auto max-h-48">
+          <pre
+            tabIndex={0}
+            className="mt-1.5 rounded bg-muted p-2 text-xs font-mono overflow-x-auto max-h-48"
+          >
             <HighlightedCode
               code={JSON.stringify(event.event_data, null, 2)}
               language="json"
@@ -427,7 +430,7 @@ export function VisitorJourney({ project, visitorId }: VisitorJourneyProps) {
     return (
       <Card>
         <CardHeader>
-          <CardTitle>Visitor Journey</CardTitle>
+          <CardTitle>Visitor journey</CardTitle>
           <CardDescription>Loading journey data...</CardDescription>
         </CardHeader>
         <CardContent>
@@ -441,7 +444,7 @@ export function VisitorJourney({ project, visitorId }: VisitorJourneyProps) {
     return (
       <Card>
         <CardHeader>
-          <CardTitle>Visitor Journey</CardTitle>
+          <CardTitle>Visitor journey</CardTitle>
         </CardHeader>
         <CardContent>
           <div className="flex flex-col items-center justify-center py-12">
@@ -465,7 +468,7 @@ export function VisitorJourney({ project, visitorId }: VisitorJourneyProps) {
     return (
       <Card>
         <CardHeader>
-          <CardTitle>Visitor Journey</CardTitle>
+          <CardTitle>Visitor journey</CardTitle>
         </CardHeader>
         <CardContent>
           <div className="flex flex-col items-center justify-center py-12">
@@ -485,7 +488,7 @@ export function VisitorJourney({ project, visitorId }: VisitorJourneyProps) {
       <CardHeader>
         <div className="flex items-center justify-between">
           <div>
-            <CardTitle>Visitor Journey</CardTitle>
+            <CardTitle>Visitor journey</CardTitle>
             <CardDescription>
               {journey.total_sessions} session
               {journey.total_sessions !== 1 ? 's' : ''}, {journey.total_events}{' '}

@@ -767,12 +767,15 @@ mod tests {
         projects::Model {
             id,
             image_retention_hours: None,
+            log_ingest_lines_per_sec: None,
+            log_ingest_kib_per_sec: None,
             cloud_telemetry_fidelity:
                 temps_entities::cloud_telemetry_fidelity::CloudTelemetryFidelity::Metered,
             cloud_telemetry_write_mode:
                 temps_entities::cloud_telemetry_write_mode::CloudTelemetryWriteMode::Local,
             cloud_analytics_write_mode:
                 temps_entities::cloud_analytics_write_mode::CloudAnalyticsWriteMode::Local,
+            instantiation_token: None,
             cloud_telemetry_attribute_allowlist: Vec::new(),
             name: "test".to_string(),
             repo_name: "repo".to_string(),
@@ -794,9 +797,11 @@ mod tests {
             git_url: None,
             git_provider_connection_id: connection_id,
             attack_mode: false,
+            shield_mode: "log".to_string(),
             ai_alert_summaries_enabled: None,
             ai_api_traffic_summary_enabled: None,
             allow_alternate_sources: None,
+            hosting: Default::default(),
             ai_debug_chat_enabled: None,
             ai_write_actions_enabled: false,
             error_source_context_enabled: false,
@@ -812,10 +817,13 @@ mod tests {
             gitlab_webhook_id: None,
             gitlab_webhook_signing_token: None,
             gitea_webhook_signing_token: None,
+            github_webhook_id: None,
+            github_webhook_signing_token: None,
             bitbucket_webhook_token: None,
             bitbucket_webhook_hook_id: None,
             generic_webhook_token: None,
             cross_project_trace_sharing: true,
+            serves_own_temps_api: false,
         }
     }
 }

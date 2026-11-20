@@ -71,6 +71,35 @@ pub struct TurnServices {
     pub interactions: Option<InteractionExecutor>,
 }
 
+/// An image that rides along with a user message for the current turn only.
+/// Never persisted with the message: the stored row keeps the attachment
+/// reference, and the bytes are read again when a turn needs them.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ChatImage {
+    /// `image/png`, `image/jpeg`, `image/gif` or `image/webp`.
+    pub media_type: String,
+    /// Standard base64 of the image bytes (no `data:` prefix).
+    pub base64: String,
+}
+
+// The payload is large and may be sensitive, so logs show its size only.
+impl std::fmt::Debug for ChatImage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ChatImage")
+            .field("media_type", &self.media_type)
+            .field("base64_len", &self.base64.len())
+            .finish()
+    }
+}
+
+impl ChatImage {
+    /// The `data:` URL form OpenAI-compatible providers accept.
+    pub fn data_url(&self) -> String {
+        format!("data:{};base64,{}", self.media_type, self.base64)
+    }
+}
+
 /// One turn of a conversation. Deliberately flat so it is provider-agnostic and
 /// trivially persisted as an `ai_messages` row. `tool_calls` / `tool_call_id`
 /// are only populated transiently during an agentic tool loop and are never
@@ -86,6 +115,10 @@ pub struct ChatMessage {
     /// Which tool call this message answers (`tool` role messages only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// Images the user attached to this message (user messages only), sent to
+    /// the model alongside `content` for this turn.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ChatImage>,
 }
 
 impl ChatMessage {
@@ -117,6 +150,7 @@ impl ChatMessage {
             content: content.into(),
             tool_calls: None,
             tool_call_id: Some(tool_call_id.into()),
+            images: Vec::new(),
         }
     }
 }

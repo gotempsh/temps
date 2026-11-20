@@ -4,6 +4,17 @@
 //! Generated-preset regressions with disposable sources and an isolated BuildKit cache.
 //! These exercise images directly; they do not claim console or published-artifact qualification.
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "integration test: reads fixture configuration from the environment"
+)]
+// Test-only helpers outside `#[test]` fns (docker/fixture wrappers): a panic
+// there is the test failure, which is what we want.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test helpers: panicking is how a test fails"
+)]
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};

@@ -113,8 +113,9 @@ pub struct ClickhouseBackfillArgs {
     /// PostgreSQL connection URL (system of record).
     // hide_env_values: a Postgres URL embeds credentials
     // (postgres://user:password@host/db), so keep its env value out of --help.
+    /// When unset, the installed `temps serve` service's URL is used.
     #[arg(long, env = "TEMPS_DATABASE_URL", hide_env_values = true)]
-    pub database_url: String,
+    pub database_url: Option<String>,
 
     /// ClickHouse HTTP endpoint URL (e.g. https://ch.example.internal:8443).
     #[arg(long, env = "TEMPS_CLICKHOUSE_URL")]
@@ -242,7 +243,12 @@ async fn run_clickhouse_async(args: ClickhouseBackfillArgs) -> anyhow::Result<()
         single => vec![single],
     };
 
-    let db = temps_database::establish_connection(&args.database_url).await?;
+    let database = crate::database_url_source::resolve_database_url(
+        args.database_url.as_deref(),
+        crate::database_url_source::UrlDiscovery::InstalledService,
+    )?;
+    database.announce_discovery();
+    let db = temps_schema::establish_connection(database.url()).await?;
     info!("Connected to PostgreSQL");
 
     for domain in domains {
@@ -270,12 +276,15 @@ async fn run_events_backfill(
 ) -> anyhow::Result<()> {
     println!("{}", "▸ Domain: analytics events".bright_white().bold());
 
+    // The same wire-compression mode `temps serve` uses for this instance's
+    // ClickHouse: the stored `clickhouse.compression` setting.
     let ch_cfg = ClickHouseConfig::new(
         &args.clickhouse_url,
         &args.clickhouse_database,
         &args.clickhouse_user,
         &args.clickhouse_password,
-    );
+    )
+    .with_compression(temps_config::stored_clickhouse_compression(db.as_ref()).await);
     let backend = ClickHouseBackend::new(ch_cfg);
     let ch = Arc::new(backend.client_clone());
 
@@ -372,7 +381,7 @@ async fn run_events_backfill(
         ProgressStyle::with_template(
             "  {bar:40.cyan/blue} {pos:>10}/{len:<10} {percent:>3}%  ETA {eta_precise}  {msg}",
         )
-        .expect("valid progress template")
+        .map_err(|e| anyhow::anyhow!("invalid progress bar template: {e}"))?
         .progress_chars("█▓░"),
     );
     pb.set_position(already_pushed);
@@ -396,10 +405,9 @@ async fn run_events_backfill(
             }
         }
 
-        let chunk_start = if cursor.last_timestamp.map(|ts| ts > cf).unwrap_or(false) {
-            cursor.last_timestamp.unwrap()
-        } else {
-            cf
+        let chunk_start = match cursor.last_timestamp {
+            Some(ts) if ts > cf => ts,
+            _ => cf,
         };
 
         let report = backfill_events_window(

@@ -2,7 +2,7 @@
 
 > Auto-generated documentation for the Temps CLI.
 >
-> Generated from: `@temps-sdk/cli@0.1.37`
+> Generated from: `@temps-sdk/cli@0.1.38`
 >
 > Apply the authorization, target-context, and secret-handling rules in
 > [the Temps CLI skill](../SKILL.md) before executing a command.
@@ -10,10 +10,10 @@
 ## Installation
 
 ```bash
-bunx @temps-sdk/cli@0.1.37 [command]
+bunx @temps-sdk/cli@latest [command]
 
 # Fallback when Bun is unavailable
-npx @temps-sdk/cli@0.1.37 [command]
+npx @temps-sdk/cli@latest [command]
 ```
 
 ## Authentication
@@ -22,10 +22,10 @@ Before using most commands, you need to authenticate:
 
 ```bash
 # Login interactively
-bunx @temps-sdk/cli@0.1.37 login
+bunx @temps-sdk/cli@latest login
 
 # Or configure with wizard
-bunx @temps-sdk/cli@0.1.37 configure
+bunx @temps-sdk/cli@latest configure
 ```
 
 ## Global Options
@@ -47,7 +47,7 @@ Use this index or search for a top-level command heading to load only the releva
 - [`whoami`](#whoami) - Display current authenticated user and active context
 - [`context`](#context) - Manage CLI contexts (one set of credentials per Temps server)
 - [`configure`](#configure) - Configure CLI settings (AWS-style wizard)
-- [`projects`](#projects) - Manage projects
+- [`projects`](#projects) - Manage services: each one deployable app (the console calls these Services). To group services that ship together into a Project, as the console calls it, use `project-groups`.
 - [`drop`](#drop) - Detect and deploy a local source directory or ZIP without Git
 - [`deploy`](#deploy) - Deploy a project from git
 - [`deploy:static`](#deploystatic) - Deploy static files (tar.gz, zip, or directory)
@@ -59,19 +59,22 @@ Use this index or search for a top-level command heading to load only the releva
 - [`providers`](#providers) - Manage Git providers
 - [`backups`](#backups) - Manage backup schedules and backups
 - [`runtime-logs`](#runtime-logs) - View runtime container logs (use -f to follow in real-time)
-- [`notifications`](#notifications) - Manage notification providers (Slack, Email, Webhook, etc.)
+- [`notifications`](#notifications) - Manage notification providers (Slack, Email, Webhook, Telegram, etc.)
 - [`dns`](#dns) - Manage DNS providers and Temps-managed DNS records
 - [`services`](#services) - Manage external services (databases, caches, storage)
 - [`settings`](#settings) - Manage platform settings
 - [`users`](#users) - Manage platform users
 - [`teams`](#teams) - Manage teams and project access
 - [`access`](#access) - Manage which teams can reach a project
+- [`project-groups`](#project-groups) - Manage Projects (what the console calls a Project): groups of services that ship together and share a repository, variables and path routes. A service is what the `projects` command manages; the `services` command manages databases and caches, not these.
+- [`instantiations`](#instantiations) - Follow and retry template creations and imports
 - [`apikeys`](#apikeys) - Manage API keys for programmatic access
 - [`monitors`](#monitors) - Manage uptime monitors for status pages
 - [`webhooks`](#webhooks) - Manage webhooks for project events
 - [`containers`](#containers) - Manage project containers in environments
 - [`cluster`](#cluster) - Cluster-wide multi-node operations
 - [`nodes`](#nodes) - Worker nodes and workload placement
+- [`tunnels`](#tunnels) - Ingress tunnels: publish apps on workers with no open ports or certificates. Apps under a tunnel's domain go live by adding the hostname to an environment
 - [`tokens`](#tokens) - Manage deployment tokens for project API access (KV, Blob, etc.)
 - [`errors`](#errors) - Manage error tracking and error groups
 - [`metrics`](#metrics) - Query OTel application metrics for debugging (not container/docker stats — see "temps containers metrics" for those)
@@ -88,19 +91,21 @@ Use this index or search for a top-level command heading to load only the releva
 - [`dns-provider`](#dns-provider) - Manage DNS providers and managed domains
 - [`delivery-profiles`](#delivery-profiles) - Manage traffic delivery profiles (Cloudflare proxy, Bunny CDN) used by project domains
 - [`delivery`](#delivery) - Route project domains through a delivery provider (Cloudflare proxy, Bunny CDN)
-- [`ip-access`](#ip-access) - Manage IP access control rules
+- [`ip-access`](#ip-access) - Manage instance-wide IP access control rules, and per-project lists (ip-access project)
+- [`edge-rules`](#edge-rules) - Block, allow, challenge, redirect or log requests before they reach the app. Rules run top to bottom; the first match decides
+- [`network-policy`](#network-policy) - Manage network policy for workloads: rules, egress/ingress profiles and the effective policy
 - [`audit`](#audit) - View audit logs
 - [`proxy-logs`](#proxy-logs) - View proxy request logs and statistics
 - [`logs`](#logs) - Search collected logs across every project and database you can access
 - [`email-domains`](#email-domains) - Manage email domains for transactional email
 - [`email-providers`](#email-providers) - Manage email providers (SES, Scaleway) for transactional email
 - [`incidents`](#incidents) - Manage incidents for status pages and monitoring
-- [`status-pages`](#status-pages) - Publish public status pages for selected monitors
+- [`status-pages`](#status-pages) - Publish public status pages showing monitors from any of your projects
 - [`alarms`](#alarms) - List, acknowledge, and resolve alarms (container crashes, uptime, metrics, databases)
 - [`emails`](#emails) - Manage and send emails
 - [`load-balancer`](#load-balancer) - Manage load balancer routes
 - [`migrate`](#migrate) - Migrate a project from another platform (Vercel, Coolify, Dokploy, CapRover, Portainer, Kubernetes, Docker) into temps
-- [`templates`](#templates) - Browse deployment templates
+- [`templates`](#templates) - Browse templates and create them
 - [`platform`](#platform) - View platform and server information
 - [`presets`](#presets) - Browse available build presets
 - [`analytics`](#analytics) - View project analytics
@@ -112,6 +117,7 @@ Use this index or search for a top-level command heading to load only the releva
 - [`secrets`](#secrets) - Manage agent secrets. env-type: reference as ${TEMPS_SECRET:name} in MCP config. file-type: written to --mount-path in sandbox; reference that path.
 - [`sandbox`](#sandbox) - Manage standalone sandboxes (/v1/sandbox API)
 - [`workflow`](#workflow) - Trigger and inspect agent/workflow runs
+- [`workflows`](#workflows) - Durable application workflows
 - [`revenue`](#revenue) - Manage revenue integrations and import historical data
 - [`session-replay`](#session-replay) - Manage session replay recordings
 - [`traefik-discovery`](#traefik-discovery) - Route containers Temps did not deploy by reading their Traefik labels (an existing docker-compose / Coolify / Dokploy stack)
@@ -136,6 +142,8 @@ Use this index or search for a top-level command heading to load only the releva
 ## `login`
 
 Authenticate with a Temps server. Opens the browser for interactive logins; use --api-key for headless / CI.
+
+**Usage:** `login [url] [options]`
 
 **Options:**
 
@@ -192,13 +200,19 @@ List all configured contexts
 
 Switch the active context
 
+**Usage:** `context use <name>`
+
 ### `context remove` (alias: `rm`)
 
 Remove a context (does NOT revoke the key on the server)
 
+**Usage:** `context remove <name>`
+
 ### `context rename`
 
 Rename a context
+
+**Usage:** `context rename <old-name> <new-name>`
 
 ### `context current`
 
@@ -238,9 +252,13 @@ Configure CLI settings (AWS-style wizard)
 
 Get a configuration value
 
+**Usage:** `configure get <key>`
+
 ### `configure set`
 
 Set a configuration value
+
+**Usage:** `configure set <key> <value>`
 
 ### `configure list`
 
@@ -262,21 +280,23 @@ Reset configuration to defaults
 
 ## `projects` (alias: `project`, `p`)
 
-Manage projects
+Manage services: each one deployable app (the console calls these Services). To group services that ship together into a Project, as the console calls it, use `project-groups`.
 
 **Subcommands:**
 
 - `secrets` - Manage project secrets — mounted into the deployed container as files at /run/secrets/<KEY>, not environment variables. Distinct from `temps secrets` (agent/MCP-sandbox-scoped).
-- `list` (`ls`) - List all projects
-- `create` (`new`) - Create a new project (git-based or manual deployment)
-- `cloudflare-capability` (`delivery-capability`) - Show whether Cloudflare/Bunny delivery is ready and which one new projects get by default
-- `show` (`get`) - Show project details
-- `update` (`edit`) - Update project name and description
-- `settings` - Update project settings (name, slug, attack mode, preview environments, vulnerability scanning, image retention)
+- `list` (`ls`) - List all services
+- `create` (`new`) - Create a new service (git-based or manual deployment); add it to a project with `project-groups add`
+- `cloudflare-capability` (`delivery-capability`) - Show whether Cloudflare/Bunny delivery is ready and which one new services get by default
+- `show` (`get`) - Show service details, including the project (group) it belongs to
+- `group` - Show which project (group of services) a service belongs to
+- `update` (`edit`) - Update service name and description
+- `settings` - Update service settings (name, slug, attack mode, preview environments, vulnerability scanning, image retention)
 - `git` - Update git repository settings
-- `source` - Show or change how a project is deployed (primary source, and whether it also accepts `drop` uploads)
+- `source` - Show or change how a service is deployed (primary source, and whether it also accepts `drop` uploads)
+- `hosting` - Show or set whether Temps runs the app (hosted) or it runs elsewhere (external, labelled External and never deployed)
 - `config` - Update deployment configuration (resources, replicas)
-- `delete` (`rm`) - Delete a project
+- `delete` (`rm`) - Delete a service
 
 ### `projects secrets`
 
@@ -337,6 +357,8 @@ Update a project secret (a redeploy is required for running containers to pick i
 
 Delete a project secret
 
+**Usage:** `projects secrets delete <key> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -347,7 +369,7 @@ Delete a project secret
 
 ### `projects list` (alias: `ls`)
 
-List all projects
+List all services
 
 **Options:**
 
@@ -359,29 +381,30 @@ List all projects
 
 ### `projects create` (alias: `new`)
 
-Create a new project (git-based or manual deployment)
+Create a new service (git-based or manual deployment); add it to a project with `project-groups add`
 
 **Options:**
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-n, --name <name>` | Project name | - | No |
-| `-d, --description <description>` | Project description | - | No |
+| `-n, --name <name>` | Service name | - | No |
+| `-d, --description <description>` | Service description | - | No |
 | `--repo <repository>` | Repository in owner/name format (nested groups supported: group/subgroup/name) | - | No |
 | `--branch <branch>` | Git branch | - | No |
 | `--directory <directory>` | Root directory (relative to repo) | - | No |
 | `--preset <preset>` | Build preset (e.g., nextjs, nodejs, static, docker) | - | No |
 | `--connection <id>` | Git connection ID | - | No |
-| `--manual` | Create a manual (non-git) project - deploy via Docker image or static files | - | No |
+| `--manual` | Create a manual (non-git) service - deploy via Docker image or static files | - | No |
 | `--source-type <type>` | Manual deployment method: manual (flexible), docker_image, or static_files | - | No |
 | `--image <image>` | Docker image for the first deployment (manual mode) | - | No |
 | `--port <port>` | Application/container port (manual mode, default: 3000) | - | No |
-| `--delivery-provider <provider>` | Delivery provider for the new project: none, cloudflare or bunny (default: instance setting; see `projects cloudflare-capability`) | - | No |
+| `--external` | The app runs elsewhere (Vercel, Netlify, a VPS): Temps only receives its telemetry and never deploys it (needs --name with --yes) | - | No |
+| `--delivery-provider <provider>` | Delivery provider for the new service: none, cloudflare or bunny (default: instance setting; see `projects cloudflare-capability`) | - | No |
 | `-y, --yes` | Skip optional prompts (services, env vars, set-default) | - | No |
 
 ### `projects cloudflare-capability` (alias: `delivery-capability`)
 
-Show whether Cloudflare/Bunny delivery is ready and which one new projects get by default
+Show whether Cloudflare/Bunny delivery is ready and which one new services get by default
 
 **Options:**
 
@@ -391,18 +414,29 @@ Show whether Cloudflare/Bunny delivery is ready and which one new projects get b
 
 ### `projects show` (alias: `get`)
 
-Show project details
+Show service details, including the project (group) it belongs to
 
 **Options:**
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | No |
+| `-p, --project <project>` | Service slug or ID | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `projects group`
+
+Show which project (group of services) a service belongs to
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Service slug or ID | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `projects update` (alias: `edit`)
 
-Update project name and description
+Update service name and description
 
 **Options:**
 
@@ -416,7 +450,7 @@ Update project name and description
 
 ### `projects settings`
 
-Update project settings (name, slug, attack mode, preview environments, vulnerability scanning, image retention)
+Update service settings (name, slug, attack mode, preview environments, vulnerability scanning, image retention)
 
 **Options:**
 
@@ -456,7 +490,7 @@ Update git repository settings
 
 ### `projects source`
 
-Show or change how a project is deployed (primary source, and whether it also accepts `drop` uploads)
+Show or change how a service is deployed (primary source, and whether it also accepts `drop` uploads)
 
 **Options:**
 
@@ -466,6 +500,19 @@ Show or change how a project is deployed (primary source, and whether it also ac
 | `--type <type>` | Set the primary source: docker_image, static_files, uploaded_source or manual (use `projects git` to switch to git) | - | No |
 | `--allow-alternate` | Also accept an uploaded source archive from `drop`, keeping the current source as default | - | No |
 | `--no-allow-alternate` | Only deploy from the configured source | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `projects hosting`
+
+Show or set whether Temps runs the app (hosted) or it runs elsewhere (external, labelled External and never deployed)
+
+**Usage:** `projects hosting [hosting] [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `projects config`
@@ -490,7 +537,7 @@ Update deployment configuration (resources, replicas)
 
 ### `projects delete` (alias: `rm`)
 
-Delete a project
+Delete a service
 
 **Options:**
 
@@ -503,6 +550,8 @@ Delete a project
 ## `drop`
 
 Detect and deploy a local source directory or ZIP without Git
+
+**Usage:** `drop <path> [options]`
 
 **Options:**
 
@@ -519,6 +568,8 @@ Detect and deploy a local source directory or ZIP without Git
 ## `deploy`
 
 Deploy a project from git
+
+**Usage:** `deploy [project] [options]`
 
 **Options:**
 
@@ -647,6 +698,7 @@ Rollback to previous deployment
 | `-p, --project <project>` | Project slug or ID (defaults to the linked project) | - | No |
 | `-e, --environment <env>` | Target environment | `production` | No |
 | `--to <deployment>` | Rollback to specific deployment ID | - | No |
+| `-y, --yes` | Skip confirmation | - | No |
 
 ### `deployments cancel`
 
@@ -795,6 +847,7 @@ Add a custom domain
 |------|-------------|---------|----------|
 | `-d, --domain <domain>` | Domain name | - | Yes |
 | `-c, --challenge <type>` | Challenge type (http-01 or dns-01) | `http-01` | No |
+| `--manual-dns` | With dns-01, print the TXT record to add by hand even when a DNS provider in Temps manages the zone | - | No |
 | `-y, --yes` | Skip confirmation prompts | - | No |
 
 ### `domains verify`
@@ -954,6 +1007,10 @@ Manage environments and environment variables
 - `timeouts` - View or set upstream request/idle timeouts for an environment
 - `force-https` - View or set the HTTP to HTTPS redirect override for an environment
 - `scale` - View or set the number of replicas for an environment
+- `placement` - Where the scheduler would run an environment's replicas, and why
+- `isolation` - How an environment's replicas are isolated: a container (process) or a Firecracker microVM (micro_vm). Honoured only for environments whose deployments run on the workload plane
+- `volumes` - Persistent volumes mounted into an environment's replicas; a replica that mounts one is pinned to its node
+- `ingress` - Whether visitors must sign in to Temps to open an environment
 - `crons` - Manage cron jobs
 
 ### `environments list` (alias: `ls`)
@@ -983,6 +1040,8 @@ Create a new environment
 ### `environments delete` (alias: `rm`)
 
 Delete an environment
+
+**Usage:** `environments delete <environment> [options]`
 
 **Options:**
 
@@ -1026,6 +1085,8 @@ List environment variables
 
 Get a specific environment variable
 
+**Usage:** `environments vars get <key> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -1035,6 +1096,8 @@ Get a specific environment variable
 #### `environments vars set`
 
 Set an environment variable
+
+**Usage:** `environments vars set <key> [value] [options]`
 
 **Options:**
 
@@ -1050,6 +1113,8 @@ Set an environment variable
 
 Delete an environment variable
 
+**Usage:** `environments vars delete <key> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -1060,6 +1125,8 @@ Delete an environment variable
 #### `environments vars import`
 
 Import environment variables from a .env file
+
+**Usage:** `environments vars import [file] [options]`
 
 **Options:**
 
@@ -1083,6 +1150,8 @@ Export environment variables to .env format
 
 View or set CPU/memory resources for an environment
 
+**Usage:** `environments resources <environment> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -1098,6 +1167,8 @@ View or set CPU/memory resources for an environment
 
 View or set upstream request/idle timeouts for an environment
 
+**Usage:** `environments timeouts <environment> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -1112,6 +1183,8 @@ View or set upstream request/idle timeouts for an environment
 ### `environments force-https`
 
 View or set the HTTP to HTTPS redirect override for an environment
+
+**Usage:** `environments force-https <environment> [options]`
 
 **Options:**
 
@@ -1134,6 +1207,215 @@ View or set the number of replicas for an environment
 | `-p, --project <project>` | Project slug or ID | - | No |
 | `-e, --environment <env>` | Environment name or slug | `production` | No |
 | `-r, --replicas <count>` | Number of replicas to set | - | No |
+| `--load-balancing <json>` | Replica routing policy as JSON; null restores project inheritance | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `environments placement`
+
+Where the scheduler would run an environment's replicas, and why
+
+**Subcommands:**
+
+- `explain` - Show the nodes each replica would run on now, the eligible nodes ranked, and the ones excluded with the reason
+- `recommend` - Recommend target nodes from where the environment actually ran (recommended, never applied)
+
+#### `environments placement explain`
+
+Show the nodes each replica would run on now, the eligible nodes ranked, and the ones excluded with the reason
+
+**Usage:** `environments placement explain <environment> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments placement recommend`
+
+Recommend target nodes from where the environment actually ran (recommended, never applied)
+
+**Usage:** `environments placement recommend <environment> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug | - | No |
+| `--window-days <days>` | How many days of history to consider (1-90, default 7) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `environments isolation`
+
+How an environment's replicas are isolated: a container (process) or a Firecracker microVM (micro_vm). Honoured only for environments whose deployments run on the workload plane
+
+**Subcommands:**
+
+- `show` - Show the isolation and whether it takes effect
+- `set` - Set the isolation: process or micro_vm (a microVM replica only runs on a node that provides one)
+
+#### `environments isolation show`
+
+Show the isolation and whether it takes effect
+
+**Usage:** `environments isolation show <environment> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments isolation set`
+
+Set the isolation: process or micro_vm (a microVM replica only runs on a node that provides one)
+
+**Usage:** `environments isolation set <environment> <isolation> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `environments volumes`
+
+Persistent volumes mounted into an environment's replicas; a replica that mounts one is pinned to its node
+
+**Subcommands:**
+
+- `list` (`ls`) - List the environment's volumes, newest first
+- `create` - Create a volume (attach it to mount it)
+- `status` - Show whether the next deploy mounts the attached volumes, and what to fix if not
+- `attach` - Mount a volume (id or name) into every replica at --mount-path
+- `detach` - Stop mounting a volume (id or name); its data is kept
+- `rm` (`delete`) - Delete a volume (id or name), and its data unless it was created with --retain
+
+#### `environments volumes list` (alias: `ls`)
+
+List the environment's volumes, newest first
+
+**Usage:** `environments volumes list <environment> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug | - | No |
+| `--page <page>` | Page number (default 1) | - | No |
+| `--page-size <size>` | Results per page (default 20, max 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments volumes create`
+
+Create a volume (attach it to mount it)
+
+**Usage:** `environments volumes create <environment> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug | - | No |
+| `-n, --name <name>` | Volume name: 2-64 characters of a-z, 0-9, "_", "." or "-" | - | Yes |
+| `--size-mb <mb>` | Size in MB, when the backend supports a size | - | No |
+| `--retain` | Keep the data when the volume is deleted | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments volumes status`
+
+Show whether the next deploy mounts the attached volumes, and what to fix if not
+
+**Usage:** `environments volumes status <environment> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments volumes attach`
+
+Mount a volume (id or name) into every replica at --mount-path
+
+**Usage:** `environments volumes attach <environment> <volume> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug | - | No |
+| `--mount-path <path>` | Absolute path inside each replica | - | Yes |
+| `--read-only` | Mount it read-only | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments volumes detach`
+
+Stop mounting a volume (id or name); its data is kept
+
+**Usage:** `environments volumes detach <environment> <volume> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments volumes rm` (alias: `delete`)
+
+Delete a volume (id or name), and its data unless it was created with --retain
+
+**Usage:** `environments volumes rm <environment> <volume> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug | - | No |
+| `-f, --force` | Skip confirmation | - | No |
+| `-y, --yes` | Skip confirmation (alias for --force) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `environments ingress`
+
+Whether visitors must sign in to Temps to open an environment
+
+**Subcommands:**
+
+- `show` - Show the login requirement and whether the proxy enforces it now
+- `set` - Require visitors to sign in to Temps, or stop requiring it
+
+#### `environments ingress show`
+
+Show the login requirement and whether the proxy enforces it now
+
+**Usage:** `environments ingress show <environment> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments ingress set`
+
+Require visitors to sign in to Temps, or stop requiring it
+
+**Usage:** `environments ingress set <environment> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug | - | No |
+| `--require-login` | Require sign-in only when ingress mode is enforce. Check login_enforced in JSON output or Enforced now in text output | - | No |
+| `--no-require-login` | Visitors do not need to sign in | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `environments crons`
@@ -1715,6 +1997,7 @@ Run a backup for an external service
 | `--id <id>` | External service ID | - | Yes |
 | `--s3-source-id <id>` | S3 source ID to store the backup | - | Yes |
 | `-t, --type <type>` | Backup type (e.g., full, incremental) | - | No |
+| `--confirm-restart` | Allow the backup to restart the database (PostgreSQL with WAL archiving off restarts once to turn it on) | - | No |
 
 ## `runtime-logs` (alias: `rlogs`)
 
@@ -1734,7 +2017,7 @@ View runtime container logs (use -f to follow in real-time)
 
 ## `notifications` (alias: `notify`)
 
-Manage notification providers (Slack, Email, Webhook, etc.)
+Manage notification providers (Slack, Email, Webhook, Telegram, etc.)
 
 **Subcommands:**
 
@@ -1766,7 +2049,7 @@ Add a new notification provider
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-t, --type <type>` | Provider type (slack, email, webhook) | - | No |
+| `-t, --type <type>` | Provider type (slack, email, webhook, telegram) | - | No |
 | `-n, --name <name>` | Provider name | - | No |
 | `-w, --webhook-url <url>` | Webhook URL (for slack) | - | No |
 | `-c, --channel <channel>` | Channel name (for slack, optional) | - | No |
@@ -1779,6 +2062,10 @@ Add a new notification provider
 | `--to-addresses <addresses>` | Comma-separated recipient addresses (for email) | - | No |
 | `--url <url>` | Webhook URL (for webhook) | - | No |
 | `--method <method>` | HTTP method: POST, PUT, PATCH (for webhook, default: POST) | - | No |
+| `--header <header>` | Request header "Name: value" (for webhook, repeatable) | - | No |
+| `--bot-token <token>` | Bot token from @BotFather (for telegram) | - | No |
+| `--chat-id <id>` | Chat ID, e.g. -1001234567890 or @channelname (for telegram) | - | No |
+| `--topic-id <id>` | Forum topic ID (for telegram, optional) | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 
 ### `notifications update`
@@ -1803,6 +2090,10 @@ Update a notification provider
 | `--to-addresses <addresses>` | Comma-separated recipient addresses (for email) | - | No |
 | `--url <url>` | Webhook URL (for webhook) | - | No |
 | `--method <method>` | HTTP method: POST, PUT, PATCH (for webhook) | - | No |
+| `--header <header>` | Request header "Name: value" (for webhook, repeatable; replaces the stored headers) | - | No |
+| `--bot-token <token>` | Bot token from @BotFather (for telegram) | - | No |
+| `--chat-id <id>` | Chat ID, e.g. -1001234567890 or @channelname (for telegram) | - | No |
+| `--topic-id <id>` | Forum topic ID (for telegram; empty string clears it) | - | No |
 | `--json` | Output in JSON format | - | No |
 | `-y, --yes` | Skip confirmation prompts | - | No |
 
@@ -2175,6 +2466,8 @@ Create a new external service
 | `-t, --type <type>` | Service type (postgres, mongodb, redis, s3) | - | No |
 | `-n, --name <name>` | Service name | - | No |
 | `-s, --set <key=value>` | Set a parameter (repeatable) | `` | No |
+| `--backend <backend>` | S3 storage engine: rustfs (default) or garage (s3/blob only) | - | No |
+| `--bucket <name>` | Bucket to create (repeatable, s3/blob only; the first is S3_BUCKET) | `` | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 
 ### `services show`
@@ -2237,6 +2530,8 @@ List available service types
 #### `services types info`
 
 Show parameters schema for a service type (useful for automation)
+
+**Usage:** `services types info <type> [options]`
 
 **Options:**
 
@@ -2331,6 +2626,8 @@ Unlink a service from a project
 ### `services connect`
 
 Get connection info for a service by name or slug
+
+**Usage:** `services connect <name> [options]`
 
 **Options:**
 
@@ -2800,6 +3097,7 @@ Manage platform users
 - `remove` (`rm`) - Remove a user
 - `restore` - Restore a deleted user
 - `reset-password` - Reset another user's password to a generated temporary one. The user is signed out of every browser session and must choose a new password at next sign-in
+- `reset-mfa` - Remove another user's MFA (authenticator and recovery codes) after they lost both. The user is signed out of every session. Password sign-in is blocked when require_mfa_for_admins applies; arrange SSO access or a temporary policy change before resetting MFA. Otherwise, sign in with a password to enroll again
 - `role` - Manage user roles
 
 ### `users list` (alias: `ls`)
@@ -2870,6 +3168,18 @@ Reset another user's password to a generated temporary one. The user is signed o
 | `--json` | Output in JSON format | - | No |
 | `-y, --yes` | Skip confirmation prompt (for automation) | - | No |
 
+### `users reset-mfa`
+
+Remove another user's MFA (authenticator and recovery codes) after they lost both. The user is signed out of every session. Password sign-in is blocked when require_mfa_for_admins applies; arrange SSO access or a temporary policy change before resetting MFA. Otherwise, sign in with a password to enroll again
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | User ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+| `-y, --yes` | Skip confirmation prompt (for automation) | - | No |
+
 ### `users role`
 
 Manage user roles
@@ -2922,6 +3232,8 @@ Create a new team
 
 Show a team with its members and projects
 
+**Usage:** `teams show <team> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -2931,6 +3243,8 @@ Show a team with its members and projects
 ### `teams update`
 
 Update a team name or description
+
+**Usage:** `teams update <team> [options]`
 
 **Options:**
 
@@ -2943,6 +3257,8 @@ Update a team name or description
 ### `teams delete` (alias: `rm`)
 
 Delete a team (removes its members and project grants)
+
+**Usage:** `teams delete <team> [options]`
 
 **Options:**
 
@@ -2965,6 +3281,8 @@ Manage team membership
 
 List a team's members
 
+**Usage:** `teams members list <team> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -2974,6 +3292,8 @@ List a team's members
 #### `teams members add`
 
 Add a user to a team
+
+**Usage:** `teams members add <team> [options]`
 
 **Options:**
 
@@ -2987,6 +3307,8 @@ Add a user to a team
 
 Change a member's role in the team
 
+**Usage:** `teams members set-role <team> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -2998,6 +3320,8 @@ Change a member's role in the team
 #### `teams members remove` (alias: `rm`)
 
 Remove a user from a team
+
+**Usage:** `teams members remove <team> [options]`
 
 **Options:**
 
@@ -3031,6 +3355,8 @@ List the teams granted access to a project
 
 Grant a team access to a project
 
+**Usage:** `access grant <team> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -3043,12 +3369,352 @@ Grant a team access to a project
 
 Revoke a team's access to a project
 
+**Usage:** `access revoke <team> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `-p, --project <project>` | Project slug or ID | - | No |
 | `-y, --yes` | Skip confirmation | - | No |
+
+## `project-groups` (alias: `pg`)
+
+Manage Projects (what the console calls a Project): groups of services that ship together and share a repository, variables and path routes. A service is what the `projects` command manages; the `services` command manages databases and caches, not these.
+
+**Subcommands:**
+
+- `list` (`ls`) - List projects (groups) and their services
+- `show` (`get`) - Show a project (group), by slug or id
+- `create` (`new`) - Create a project (group), optionally with services
+- `update` (`edit`) - Rename a project (group) or change its description
+- `delete` (`rm`) - Delete a project (group); its services keep running as standalone services
+- `add` - Add services to a project (group), by slug or id as listed by `projects list`; moves them out of any other project
+- `remove` - Remove a service (slug or id) from a project (group); it becomes a standalone service
+- `repo` - The repository a project deploys its services from (monorepos)
+- `import` - Scan the project's repository and add its apps as services that follow it
+- `follow` - Make a service follow the project's repository and branch (keeps its directory)
+- `unfollow` - Stop a service following the project's repository; it keeps its current settings
+- `routes` - Serve a path of one service's domains from another service (e.g. /api → backend)
+- `vars` - Variables shared by every service in a project (group)
+
+### `project-groups list` (alias: `ls`)
+
+List projects (groups) and their services
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--page <n>` | Page number (default 1) | - | No |
+| `--per-page <n>` | How many per page (default 100, at most 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `project-groups show` (alias: `get`)
+
+Show a project (group), by slug or id
+
+**Usage:** `project-groups show <group> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `project-groups create` (alias: `new`)
+
+Create a project (group), optionally with services
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-n, --name <name>` | Project name | - | No |
+| `-s, --slug <slug>` | URL slug (derived from the name when omitted) | - | No |
+| `-d, --description <text>` | What the services do together | - | No |
+| `--service <service...>` | Services to put in the project, by slug or id as listed by `projects list` (apps, not the databases of the `services` command) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `project-groups update` (alias: `edit`)
+
+Rename a project (group) or change its description
+
+**Usage:** `project-groups update <group> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-n, --name <name>` | New name | - | No |
+| `-s, --slug <slug>` | New slug | - | No |
+| `-d, --description <text>` | New description ("" clears it) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `project-groups delete` (alias: `rm`)
+
+Delete a project (group); its services keep running as standalone services
+
+**Usage:** `project-groups delete <group> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Skip confirmation | - | No |
+
+### `project-groups add`
+
+Add services to a project (group), by slug or id as listed by `projects list`; moves them out of any other project
+
+**Usage:** `project-groups add <group> <services...>`
+
+### `project-groups remove`
+
+Remove a service (slug or id) from a project (group); it becomes a standalone service
+
+**Usage:** `project-groups remove <group> <service>`
+
+### `project-groups repo`
+
+The repository a project deploys its services from (monorepos)
+
+**Subcommands:**
+
+- `show` - Show the project's repository and which services follow it
+- `set` - Point the project at a repository and branch; services that follow it are updated to match
+- `unset` - Remove the repository; services keep their current settings and stop following
+
+#### `project-groups repo show`
+
+Show the project's repository and which services follow it
+
+**Usage:** `project-groups repo show <group> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `project-groups repo set`
+
+Point the project at a repository and branch; services that follow it are updated to match
+
+**Usage:** `project-groups repo set <group> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-c, --connection <id>` | Git connection id (see: git-providers / connections) | - | No |
+| `--public <provider>` | Use a public repository without a connection: github or gitlab | - | No |
+| `-r, --repo <owner/name|url>` | Repository, e.g. acme/shop; a github.com/gitlab.com URL implies --public | - | Yes |
+| `-b, --branch <branch>` | Branch to deploy from, e.g. main | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `project-groups repo unset`
+
+Remove the repository; services keep their current settings and stop following
+
+**Usage:** `project-groups repo unset <group> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Skip confirmation | - | No |
+
+### `project-groups import`
+
+Scan the project's repository and add its apps as services that follow it
+
+**Usage:** `project-groups import <group> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --path <dir...>` | Only these app directories (default: every app without a service) | - | No |
+| `--dry-run` | List what would be created without creating anything | - | No |
+| `--timeout <minutes>` | Stop waiting after this long (default 30); the import keeps running on the server | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `project-groups follow`
+
+Make a service follow the project's repository and branch (keeps its directory)
+
+**Usage:** `project-groups follow <group> <service>`
+
+### `project-groups unfollow`
+
+Stop a service following the project's repository; it keeps its current settings
+
+**Usage:** `project-groups unfollow <group> <service>`
+
+### `project-groups routes`
+
+Serve a path of one service's domains from another service (e.g. /api → backend)
+
+**Subcommands:**
+
+- `list` (`ls`) - List path routes and how each applies per environment
+- `add` - Send requests under <prefix> on <source>'s domains to <target>, e.g. `routes add shop web /api api`
+- `remove` (`rm`) - Stop routing <prefix>; <source> serves it itself again
+
+#### `project-groups routes list` (alias: `ls`)
+
+List path routes and how each applies per environment
+
+**Usage:** `project-groups routes list <group> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `project-groups routes add`
+
+Send requests under <prefix> on <source>'s domains to <target>, e.g. `routes add shop web /api api`
+
+**Usage:** `project-groups routes add <group> <source> <prefix> <target> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--strip-prefix` | Forward /api/users as /users (default: keep the full path) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `project-groups routes remove` (alias: `rm`)
+
+Stop routing <prefix>; <source> serves it itself again
+
+**Usage:** `project-groups routes remove <group> <source> <prefix> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Skip confirmation | - | No |
+
+### `project-groups vars`
+
+Variables shared by every service in a project (group)
+
+**Subcommands:**
+
+- `list` (`ls`) - List shared variables (secret values are never shown)
+- `set` - Create or update a shared variable; a service's own variable still wins. Omit the value to type it at a hidden prompt, or pass --value-stdin to pipe it (keeps secrets out of shell history)
+- `inherited` - Show the shared variables a service (slug or id) receives from its project, and which of them the service's own variables override
+- `unset` - Remove a shared variable
+
+#### `project-groups vars list` (alias: `ls`)
+
+List shared variables (secret values are never shown)
+
+**Usage:** `project-groups vars list <group> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `project-groups vars set`
+
+Create or update a shared variable; a service's own variable still wins. Omit the value to type it at a hidden prompt, or pass --value-stdin to pipe it (keeps secrets out of shell history)
+
+**Usage:** `project-groups vars set <group> <key> [value] [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-e, --environment <slug>` | Only this environment (e.g. production); default: all | - | No |
+| `--secret` | Write-only: the value can never be read back | - | No |
+| `--value-stdin` | Read the value from stdin, e.g. `cat key.pem \| ... vars set shop TLS_KEY --secret --value-stdin` | - | No |
+| `--preview` | Also send an all-environments variable to preview deployments (off by default) | - | No |
+| `--no-preview` | Do not send it to preview deployments | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `project-groups vars inherited`
+
+Show the shared variables a service (slug or id) receives from its project, and which of them the service's own variables override
+
+**Usage:** `project-groups vars inherited <service> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `project-groups vars unset`
+
+Remove a shared variable
+
+**Usage:** `project-groups vars unset <group> <key> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-e, --environment <slug>` | The environment it was scoped to; default: all | - | No |
+| `-y, --yes` | Skip confirmation | - | No |
+
+## `instantiations` (alias: `inst`)
+
+Follow and retry template creations and imports
+
+**Subcommands:**
+
+- `list` (`ls`) - List your recent template creations and imports, newest first
+- `show` (`get`) - Show every step of a template creation or import
+- `retry` - Continue from the step that failed; finished steps are not repeated
+
+### `instantiations list` (alias: `ls`)
+
+List your recent template creations and imports, newest first
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--group <project>` | Only those that added services to this project (group slug or id) | - | No |
+| `--page <n>` | Page number (default 1) | - | No |
+| `--per-page <n>` | How many per page (default 20, at most 100) | - | No |
+| `--limit <n>` | Same as --per-page | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `instantiations show` (alias: `get`)
+
+Show every step of a template creation or import
+
+**Usage:** `instantiations show <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--wait` | Wait until it finishes | - | No |
+| `--timeout <minutes>` | With --wait: stop waiting after this long (default 30) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `instantiations retry`
+
+Continue from the step that failed; finished steps are not repeated
+
+**Usage:** `instantiations retry <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--no-wait` | Return right away instead of waiting until it finishes | - | No |
+| `--timeout <minutes>` | Stop waiting after this long (default 30); it keeps running on the server | - | No |
+| `--json` | Output in JSON format | - | No |
 
 ## `apikeys` (alias: `keys`)
 
@@ -3086,6 +3752,8 @@ Create a new API key
 | `-r, --role <role>` | Role type (admin, platform_admin, user, reader, api_reader, custom, metrics_ingest) | - | No |
 | `-e, --expires-in <days>` | Expires in N days (7, 30, 90, 365) | - | No |
 | `-p, --permissions <permissions>` | Comma-separated list of permissions | - | No |
+| `--project-id <id>` | Confine to one project’s deployment and environment APIs | - | No |
+| `--environment-id <id>` | Confine to one environment (requires --project-id) | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 
 ### `apikeys show`
@@ -3529,6 +4197,8 @@ Worker nodes and workload placement
 - `mesh` - WireGuard mesh: lets nodes that only share the internet with the control plane join it, encrypted. Shows whether it is on and how each node is connected
 - `pair` - Pair nodes this control plane dials: for a control plane nodes cannot reach (a laptop, a server behind NAT). Lists recent pairings and their progress
 - `ssh` - Add servers over SSH: the control plane logs in, installs temps if needed, pairs the server and starts its agent. Lists recent ones and their progress
+- `resources` - What the scheduler keeps for the OS and Temps on a node, and whether a placement that does not fit the remaining capacity is refused
+- `state-status` - Show the workload plane's desired-state stream: whether it runs here, its lag and counters
 
 ### `nodes capability`
 
@@ -3589,6 +4259,8 @@ Mesh hub: a member that relays between members that cannot reach each other (two
 
 Make <member> the hub: control-plane, or a node name. Pairs that never connect move onto it within a few minutes. The hub can read the traffic it relays: pick your own machine
 
+**Usage:** `nodes mesh hub set <member> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -3647,6 +4319,8 @@ Start pairing the node at --address. Prints the one command to run on it; the co
 #### `nodes pair cancel`
 
 Cancel a pending pairing: its command stops working and its address is released
+
+**Usage:** `nodes pair cancel <id> [options]`
 
 **Options:**
 
@@ -3708,11 +4382,193 @@ Read the SSH host key of the server at --host, to verify it before `nodes ssh ad
 
 Show one enrollment: its progress and the log with the server output
 
+**Usage:** `nodes ssh show <id> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--json` | Output in JSON format | - | No |
+
+### `nodes resources`
+
+What the scheduler keeps for the OS and Temps on a node, and whether a placement that does not fit the remaining capacity is refused
+
+**Subcommands:**
+
+- `show` - Show a node's reservation and resource policy (node id; 0 or "control-plane" for the control plane)
+- `set` - Change a node's resource policy or reservation. Giving only one of --reserve-cpu and --reserve-memory keeps the node's current value for the other
+
+#### `nodes resources show`
+
+Show a node's reservation and resource policy (node id; 0 or "control-plane" for the control plane)
+
+**Usage:** `nodes resources show <node> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `nodes resources set`
+
+Change a node's resource policy or reservation. Giving only one of --reserve-cpu and --reserve-memory keeps the node's current value for the other
+
+**Usage:** `nodes resources set <node> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--policy <policy>` | best_effort (reservations not checked) or enforced (placements that do not fit are refused) | - | No |
+| `--reserve-cpu <millis>` | CPU kept for the OS and Temps, in millicores (1000 = one core) | - | No |
+| `--reserve-memory <mb>` | Memory kept for the OS and Temps, in MB | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `nodes state-status`
+
+Show the workload plane's desired-state stream: whether it runs here, its lag and counters
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+## `tunnels`
+
+Ingress tunnels: publish apps on workers with no open ports or certificates. Apps under a tunnel's domain go live by adding the hostname to an environment
+
+**Subcommands:**
+
+- `list` - List tunnels, what each publishes and the workers it runs on
+- `workers` - List worker nodes, for choosing where a tunnel runs (create --node)
+- `create` - Create a tunnel for a managed zone and run it on workers. The zone must already be managed by the DNS provider (dns-providers domains add); workers must allow ingress
+- `hostnames` - List hostnames tunnels publish or could publish, with their state and why
+- `explain` - Explain how a hostname reaches visitors: which tunnel carries it, or why none does
+- `route` - Choose how a hostname reaches visitors: through a tunnel (--tunnel <id>), whichever tunnel covers it (--automatic), or no tunnel (--off)
+- `publish` - Set what a tunnel publishes: every app under its domain (--all) or only chosen hostnames (--chosen)
+- `nodes` - Set the workers a tunnel runs on (an empty list stops it everywhere)
+- `links` - Show a tunnel's live connections to the provider: data centre, age, worker
+- `sync` - Re-check a tunnel with its provider and recreate it if it was deleted there
+
+### `tunnels list`
+
+List tunnels, what each publishes and the workers it runs on
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--page <page>` | Page number (1-indexed) | `1` | No |
+| `--page-size <pageSize>` | Items per page (max 100) | `20` | No |
+| `--json` | Output in JSON format | - | No |
+
+### `tunnels workers`
+
+List worker nodes, for choosing where a tunnel runs (create --node)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `tunnels create`
+
+Create a tunnel for a managed zone and run it on workers. The zone must already be managed by the DNS provider (dns-providers domains add); workers must allow ingress
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--name <name>` | Lowercase letters, digits and hyphens | - | Yes |
+| `--dns-provider <id>` | Cloudflare DNS provider id | - | Yes |
+| `--domain <domain>` | Zone (or subdomain of one) whose apps it publishes | - | Yes |
+| `--node <ids...>` | Worker node ids to run it on | - | Yes |
+| `--provider <kind>` | Tunnel provider kind | `cloudflare_tunnel` | No |
+| `--json` | Output in JSON format | - | No |
+
+### `tunnels hostnames`
+
+List hostnames tunnels publish or could publish, with their state and why
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `tunnels explain`
+
+Explain how a hostname reaches visitors: which tunnel carries it, or why none does
+
+**Usage:** `tunnels explain <hostname> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `tunnels route`
+
+Choose how a hostname reaches visitors: through a tunnel (--tunnel <id>), whichever tunnel covers it (--automatic), or no tunnel (--off)
+
+**Usage:** `tunnels route <hostname> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--tunnel <id>` | Pin it to this tunnel | - | No |
+| `--automatic` | Let the most specific covering tunnel publish it | - | No |
+| `--off` | Keep every tunnel away from it (DNS managed elsewhere) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `tunnels publish`
+
+Set what a tunnel publishes: every app under its domain (--all) or only chosen hostnames (--chosen)
+
+**Usage:** `tunnels publish <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--all` | Publish every app under its domain | - | No |
+| `--chosen` | Publish only hostnames routed to it | - | No |
+
+### `tunnels nodes`
+
+Set the workers a tunnel runs on (an empty list stops it everywhere)
+
+**Usage:** `tunnels nodes <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--node <ids...>` | Worker node ids | - | Yes |
+
+### `tunnels links`
+
+Show a tunnel's live connections to the provider: data centre, age, worker
+
+**Usage:** `tunnels links <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `tunnels sync`
+
+Re-check a tunnel with its provider and recreate it if it was deleted there
+
+**Usage:** `tunnels sync <id>`
 
 ## `tokens` (alias: `token`)
 
@@ -3793,8 +4649,21 @@ Manage error tracking and error groups
 **Subcommands:**
 
 - `list` (`ls`) - List error groups for a project
+- `assign` - Assign an error group to a user or team, or unassign it
 - `show` - Show error group details
 - `update` - Update error group status
+- `bulk` - Resolve, reopen or ignore many error groups in one request
+- `merge` - Merge other error groups into one surviving group
+- `unmerge` - Take an error group back out of the merge it is part of
+- `split` - Split fingerprints out of an error group into a new one
+- `fingerprints` - List the fingerprints routing to an error group
+- `filters` - Drop noisy error events before they are stored (browser extensions, crawlers, localhost, message or release patterns)
+- `comment` - Comment on an error group, or edit or delete a comment
+- `activity` - Show the comments and history of an error group, newest first
+- `searches` - Saved searches over error groups
+- `performance` - Show whether traces are checked for performance issues, and what is detected
+- `releases` - Show the health of each release: crash-free sessions and users, adoption and deployment
+- `release` - Show one release's sessions and crash-free rate per hour
 - `events` - List events in an error group
 - `event` - Show a specific error event
 - `stats` - Get error statistics for a project
@@ -3820,6 +4689,26 @@ List error groups for a project
 | `--end-date <date>` | Filter by end date (ISO 8601) | - | No |
 | `--sort-by <field>` | Sort by field (e.g., total_count, last_seen, first_seen) | - | No |
 | `--sort-order <order>` | Sort order: asc or desc | - | No |
+| `--assignee <who>` | Only groups assigned to: me (you or your teams), none, user:<id> or team:<id> | - | No |
+| `--search <text>` | Only groups whose title, type or message contains this text | - | No |
+| `--saved-search <id>` | Apply a saved search; flags given here override its filters | - | No |
+| `--type <type>` | Only errors, or only performance issues found in traces: error or performance | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `errors assign`
+
+Assign an error group to a user or team, or unassign it
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--group-id <id>` | Error group ID | - | Yes |
+| `--user-id <id>` | Assign to this user | - | No |
+| `--team-id <id>` | Assign to this team | - | No |
+| `--me` | Assign to yourself | - | No |
+| `--none` | Unassign the group | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `errors show`
@@ -3845,7 +4734,270 @@ Update error group status
 | `--project-id <id>` | Project ID | - | Yes |
 | `--group-id <id>` | Error group ID | - | Yes |
 | `--status <status>` | New status (unresolved, resolved, ignored) | - | Yes |
-| `--assigned-to <user>` | Assign to user | - | No |
+| `--assigned-to <email>` | Assign to the user with this email ("" unassigns); see also errors assign | - | No |
+| `--ignore-for <duration>` | With ignore: come back after this long (30m, 12h, 7d, 2w) | - | No |
+| `--ignore-until <date>` | With ignore: come back at this time (ISO 8601) | - | No |
+| `--ignore-count <n>` | With ignore: come back after this many more occurrences | - | No |
+| `--ignore-users <n>` | With ignore: come back once this many new users are affected | - | No |
+| `--ignore-forever` | With ignore: never come back on its own | - | No |
+| `--in-next-release` | With resolve: stay resolved until an event arrives from a release newer than the current one | - | No |
+
+### `errors bulk`
+
+Resolve, reopen or ignore many error groups in one request
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--action <action>` | Transition to apply (resolve, unresolve, ignore) | - | Yes |
+| `--group-ids <ids>` | Comma-separated group IDs (at most 1000) | - | No |
+| `--status <status>` | Select every group in this status instead of listing IDs | - | No |
+| `--environment-id <id>` | Select every group of this environment | - | No |
+| `--start-date <date>` | With --end-date: only groups with events in the window (ISO 8601) | - | No |
+| `--end-date <date>` | With --start-date: only groups with events in the window (ISO 8601) | - | No |
+| `--search <text>` | Select groups whose title, type or message contains this text | - | No |
+| `--json` | Output in JSON format | - | No |
+| `--ignore-for <duration>` | With ignore: come back after this long (30m, 12h, 7d, 2w) | - | No |
+| `--ignore-until <date>` | With ignore: come back at this time (ISO 8601) | - | No |
+| `--ignore-count <n>` | With ignore: come back after this many more occurrences | - | No |
+| `--ignore-users <n>` | With ignore: come back once this many new users are affected | - | No |
+| `--ignore-forever` | With ignore: never come back on its own | - | No |
+| `--in-next-release` | With resolve: stay resolved until an event arrives from a release newer than the current one | - | No |
+
+### `errors merge`
+
+Merge other error groups into one surviving group
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--group-id <id>` | Surviving error group ID | - | Yes |
+| `--source-group-ids <ids>` | Comma-separated group IDs to merge in (at most 50) | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `errors unmerge`
+
+Take an error group back out of the merge it is part of
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--group-id <id>` | Merged-away error group ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `errors split`
+
+Split fingerprints out of an error group into a new one
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--group-id <id>` | Error group ID | - | Yes |
+| `--fingerprints <hashes>` | Comma-separated fingerprint hashes to move out | - | Yes |
+| `--title <title>` | Title for the new group | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `errors fingerprints`
+
+List the fingerprints routing to an error group
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--group-id <id>` | Error group ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `errors filters`
+
+Drop noisy error events before they are stored (browser extensions, crawlers, localhost, message or release patterns)
+
+**Subcommands:**
+
+- `list` - List a project's inbound filters and how many events each dropped
+- `add` - Add an inbound filter
+- `update` - Change a filter's pattern, or switch it on or off
+- `remove` (`delete`) - Delete an inbound filter; matching events are stored again
+
+#### `errors filters list`
+
+List a project's inbound filters and how many events each dropped
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `errors filters add`
+
+Add an inbound filter
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--kind <kind>` | browser-extensions, web-crawlers, localhost, error-message or release | - | Yes |
+| `--pattern <glob>` | For error-message and release: a case-insensitive glob, * and ? wildcards | - | No |
+| `--disabled` | Create the filter switched off | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `errors filters update`
+
+Change a filter's pattern, or switch it on or off
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--filter-id <id>` | Filter ID | - | Yes |
+| `--pattern <glob>` | New pattern | - | No |
+| `--enable` | Switch the filter on | - | No |
+| `--disable` | Switch the filter off | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `errors filters remove` (alias: `delete`)
+
+Delete an inbound filter; matching events are stored again
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--filter-id <id>` | Filter ID | - | Yes |
+
+### `errors comment`
+
+Comment on an error group, or edit or delete a comment
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--group-id <id>` | Error group ID | - | Yes |
+| `--body <text>` | The comment (at most 10,000 characters) | - | No |
+| `--edit <comment-id>` | Replace the text of your comment with --body | - | No |
+| `--delete <comment-id>` | Delete a comment (yours, or any as an administrator) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `errors activity`
+
+Show the comments and history of an error group, newest first
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--group-id <id>` | Error group ID | - | Yes |
+| `--page <n>` | Page number | `1` | No |
+| `--page-size <n>` | Entries per page (max 100) | `20` | No |
+| `--json` | Output in JSON format | - | No |
+
+### `errors searches`
+
+Saved searches over error groups
+
+**Subcommands:**
+
+- `list` (`ls`) - List your saved searches and the ones shared with the project
+- `save` - Save a set of list filters under a name
+- `delete` - Delete a saved search (yours, or a shared one as an administrator)
+
+#### `errors searches list` (alias: `ls`)
+
+List your saved searches and the ones shared with the project
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `errors searches save`
+
+Save a set of list filters under a name
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--name <name>` | Name, unique among your saved searches in the project | - | Yes |
+| `--shared` | Share with everyone who can open the project | - | No |
+| `--status <status>` | unresolved, resolved or ignored | - | No |
+| `--environment-id <id>` | An environment of the project | - | No |
+| `--assignee <who>` | me, none, user:<id> or team:<id> | - | No |
+| `--search <text>` | Text in the title, type or message | - | No |
+| `--sort-by <field>` | last_seen, first_seen, total_count or events_in_range | - | No |
+| `--sort-order <order>` | asc or desc | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `errors searches delete`
+
+Delete a saved search (yours, or a shared one as an administrator)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--id <id>` | Saved search ID | - | Yes |
+
+### `errors performance`
+
+Show whether traces are checked for performance issues, and what is detected
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `errors releases`
+
+Show the health of each release: crash-free sessions and users, adoption and deployment
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--environment <name>` | SDK environment (as the SDK sends it) | - | No |
+| `--days <n>` | Window in days, 1 to 14 | `7` | No |
+| `--page <n>` | Page | `1` | No |
+| `--json` | Output in JSON format | - | No |
+
+### `errors release`
+
+Show one release's sessions and crash-free rate per hour
+
+**Usage:** `errors release <release> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--environment <name>` | SDK environment (as the SDK sends it) | - | No |
+| `--days <n>` | Window in days, 1 to 14 | `7` | No |
+| `--json` | Output in JSON format | - | No |
 
 ### `errors events`
 
@@ -4157,6 +5309,10 @@ Inspect distributed traces and operation latency
 **Subcommands:**
 
 - `span-stats` (`operations`, `ops`) - Rank operations by time spent, latency percentiles, or inconsistency
+- `trend` - Show how one operation's latency moved, day by day, with deployments
+- `regressions` - List the operations that got slower or faster after a deployment
+- `breakdown` - Show where the time inside one operation goes: queries, downstream calls, its own code
+- `page` - Compare a page's web vitals with the backend requests that served it
 
 ### `traces span-stats` (alias: `operations`, `ops`)
 
@@ -4181,10 +5337,64 @@ Rank operations by time spent, latency percentiles, or inconsistency
 | `--attributes <pairs>` | Span attribute filters, e.g. db.system=postgresql | - | No |
 | `--min-duration-ms <ms>` | Ignore spans faster than this | - | No |
 | `--min-count <n>` | Drop operations with fewer samples than this | - | No |
+| `--apdex-ms <ms>` | Apdex threshold: calls at or under this satisfy, up to 4x tolerate (default 500) | - | No |
 | `--sort-by <field>` | Ranking (total_time, p50, p95, p99, max, avg, stddev, count, errors, error_rate, variability, tail_ratio) | `total_time` | No |
 | `--sort-order <order>` | asc or desc | `desc` | No |
 | `--limit <n>` | Rows to show (max 100) | `20` | No |
 | `--offset <n>` | Page offset | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `traces trend`
+
+Show how one operation's latency moved, day by day, with deployments
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | No |
+| `--service <name>` | Service of the operation | - | No |
+| `--operation <name>` | The operation (span name) | - | No |
+| `--days <n>` | Days to show (max 30) | `14` | No |
+| `--json` | Output the hourly points in JSON format | - | No |
+
+### `traces regressions`
+
+List the operations that got slower or faster after a deployment
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | No |
+| `--deployment-id <id>` | Deployment to compare across | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `traces breakdown`
+
+Show where the time inside one operation goes: queries, downstream calls, its own code
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | No |
+| `--service <name>` | Service of the operation | - | No |
+| `--operation <name>` | The operation (span name) | - | No |
+| `--sample <kind>` | Calls to sample (recent, slow) | `recent` | No |
+| `--attribute <key>` | Also split the calls by this attribute, e.g. http.route | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `traces page`
+
+Compare a page's web vitals with the backend requests that served it
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | No |
+| `--path <path>` | The page path, e.g. /checkout | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ## `facets`
@@ -4212,6 +5422,8 @@ List registered span attribute facets
 
 Register an attribute key as a facet, making it fast to filter on across all traces. Backfills existing spans that carry the attribute. Capped at 20 facets platform-wide.
 
+**Usage:** `facets create <attribute-key> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -4221,6 +5433,8 @@ Register an attribute key as a facet, making it fast to filter on across all tra
 ### `facets remove` (alias: `rm`)
 
 Remove a registered facet, freeing its slot for reuse
+
+**Usage:** `facets remove <attribute-key> [options]`
 
 **Options:**
 
@@ -4232,6 +5446,8 @@ Remove a registered facet, freeing its slot for reuse
 ### `facets retry`
 
 Retry a failed historical backfill. Only valid when the facet's status is "failed" — resets progress and lets the background poller re-attempt from the beginning.
+
+**Usage:** `facets retry <attribute-key> [options]`
 
 **Options:**
 
@@ -4292,6 +5508,8 @@ Create a new OTel forwarding destination
 
 Show OTel forwarding destination details
 
+**Usage:** `otel-forward show <id> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -4301,6 +5519,8 @@ Show OTel forwarding destination details
 ### `otel-forward update`
 
 Update an OTel forwarding destination
+
+**Usage:** `otel-forward update <id> [options]`
 
 **Options:**
 
@@ -4326,6 +5546,8 @@ Update an OTel forwarding destination
 
 Remove an OTel forwarding destination
 
+**Usage:** `otel-forward remove <id> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -4336,6 +5558,8 @@ Remove an OTel forwarding destination
 ### `otel-forward test`
 
 Send a test delivery to an OTel forwarding destination
+
+**Usage:** `otel-forward test <id> [options]`
 
 **Options:**
 
@@ -4393,6 +5617,8 @@ Create a new instance-wide default forwarding destination
 
 Show instance default destination details
 
+**Usage:** `otel-forward instance-default show <id> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -4402,6 +5628,8 @@ Show instance default destination details
 #### `otel-forward instance-default update`
 
 Update an instance default forwarding destination
+
+**Usage:** `otel-forward instance-default update <id> [options]`
 
 **Options:**
 
@@ -4427,6 +5655,8 @@ Update an instance default forwarding destination
 
 Remove an instance default forwarding destination
 
+**Usage:** `otel-forward instance-default remove <id> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -4437,6 +5667,8 @@ Remove an instance default forwarding destination
 #### `otel-forward instance-default test`
 
 Send a test delivery to an instance default forwarding destination
+
+**Usage:** `otel-forward instance-default test <id> [options]`
 
 **Options:**
 
@@ -4487,6 +5719,9 @@ Manage feature flags (runtime config that changes without a redeploy)
 - `get` - Show a feature flag and its per-environment values
 - `create` - Create a feature flag
 - `update` - Update a flag definition (default value, description, visibility)
+- `rules` - Targeting rules: serve a different value to some users, or to a percentage of them
+- `evaluate` (`eval`) - Show what a user would get, and why, in one environment
+- `reshuffle` - Draw new rollout buckets for every rollout and split of this flag (never during an experiment)
 - `set` - Set a flag value in one environment
 - `clear` - Clear a flag override so the environment inherits the default
 - `disable` - Kill switch: serve the default in this environment, ignoring any override
@@ -4513,6 +5748,8 @@ List feature flags
 
 Show a feature flag and its per-environment values
 
+**Usage:** `flags get <key> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -4523,6 +5760,8 @@ Show a feature flag and its per-environment values
 ### `flags create`
 
 Create a feature flag
+
+**Usage:** `flags create <key> [options]`
 
 **Options:**
 
@@ -4539,6 +5778,8 @@ Create a feature flag
 
 Update a flag definition (default value, description, visibility)
 
+**Usage:** `flags update <key> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -4548,11 +5789,95 @@ Update a flag definition (default value, description, visibility)
 | `--description <text>` | New description | - | No |
 | `--client-visible` | Expose this flag to browsers | - | No |
 | `--no-client-visible` | Make this flag server-only | - | No |
+| `--variants <json|@file>` | Replace the variants, as a JSON array of {key, value, description?} (or @path to a file) | - | No |
+| `--exposure-rate <percent>` | Share of visitors (0-100) whose browser records a flag_exposure event; 0 turns it off | - | No |
 | `--json` | Output in JSON format | - | No |
+
+### `flags rules`
+
+Targeting rules: serve a different value to some users, or to a percentage of them
+
+**Subcommands:**
+
+- `list` (`ls`) - Show the ordered rules of a flag in one environment
+- `set` - Replace the rules of a flag in one environment, from a JSON array (or @path to a file, or - for stdin)
+- `clear` - Remove every rule of a flag in one environment
+
+#### `flags rules list` (alias: `ls`)
+
+Show the ordered rules of a flag in one environment
+
+**Usage:** `flags rules list <key> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `-e, --environment <name>` | Environment name or slug | - | Yes |
+| `--json` | Output the rules as JSON (the format `rules set` reads) | - | No |
+
+#### `flags rules set`
+
+Replace the rules of a flag in one environment, from a JSON array (or @path to a file, or - for stdin)
+
+**Usage:** `flags rules set <key> <rules> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `-e, --environment <name>` | Environment name or slug | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `flags rules clear`
+
+Remove every rule of a flag in one environment
+
+**Usage:** `flags rules clear <key> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `-e, --environment <name>` | Environment name or slug | - | Yes |
+
+### `flags evaluate` (alias: `eval`)
+
+Show what a user would get, and why, in one environment
+
+**Usage:** `flags evaluate <key> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `-e, --environment <name>` | Environment name or slug | - | Yes |
+| `-s, --subject <key>` | Bucketing subject, e.g. a user id | - | No |
+| `-a, --attr <name=value>` | Targeting attribute (repeatable) | `` | No |
+| `--json` | Output in JSON format | - | No |
+
+### `flags reshuffle`
+
+Draw new rollout buckets for every rollout and split of this flag (never during an experiment)
+
+**Usage:** `flags reshuffle <key> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `-y, --yes` | Skip the confirmation | - | No |
 
 ### `flags set`
 
 Set a flag value in one environment
+
+**Usage:** `flags set <key> <value> [options]`
 
 **Options:**
 
@@ -4566,6 +5891,8 @@ Set a flag value in one environment
 
 Clear a flag override so the environment inherits the default
 
+**Usage:** `flags clear <key> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -4576,6 +5903,8 @@ Clear a flag override so the environment inherits the default
 ### `flags disable`
 
 Kill switch: serve the default in this environment, ignoring any override
+
+**Usage:** `flags disable <key> [options]`
 
 **Options:**
 
@@ -4588,6 +5917,8 @@ Kill switch: serve the default in this environment, ignoring any override
 
 Re-enable a flag in this environment after a kill switch
 
+**Usage:** `flags enable <key> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -4599,6 +5930,8 @@ Re-enable a flag in this environment after a kill switch
 
 Restore an archived flag
 
+**Usage:** `flags restore <key> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -4608,6 +5941,8 @@ Restore an archived flag
 ### `flags archive`
 
 Archive a flag (callers fall back to their own default)
+
+**Usage:** `flags archive <key> [options]`
 
 **Options:**
 
@@ -4626,11 +5961,12 @@ Browse the data inside a service (tables, collections, keys, objects) — read-o
 - `tables` (`entities`) - List tables, collections, keys or objects in a container
 - `schema` (`columns`) - Show an entity's columns, types and row count
 - `rows` (`select`) - Read rows from an entity
-- `ai-access` - Show or set whether the built-in AI assistant may read this service's rows
 
 ### `data info`
 
 Show what a service supports and how its containers nest
+
+**Usage:** `data info <service> [options]`
 
 **Options:**
 
@@ -4642,6 +5978,8 @@ Show what a service supports and how its containers nest
 
 List top-level containers (databases, or buckets for S3)
 
+**Usage:** `data containers <service> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -4652,6 +5990,8 @@ List top-level containers (databases, or buckets for S3)
 ### `data tables` (alias: `entities`)
 
 List tables, collections, keys or objects in a container
+
+**Usage:** `data tables <service> [options]`
 
 **Options:**
 
@@ -4665,6 +6005,8 @@ List tables, collections, keys or objects in a container
 
 Show an entity's columns, types and row count
 
+**Usage:** `data schema <service> <entity> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -4676,6 +6018,8 @@ Show an entity's columns, types and row count
 
 Read rows from an entity
 
+**Usage:** `data rows <service> <entity> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -4686,18 +6030,6 @@ Read rows from an entity
 | `--offset <n>` | Rows to skip (default: 0) | - | No |
 | `--sort-by <field>` | Field to sort by | - | No |
 | `--sort-order <order>` | asc or desc (default: asc) | - | No |
-| `--json` | Output in JSON format | - | No |
-
-### `data ai-access`
-
-Show or set whether the built-in AI assistant may read this service's rows
-
-**Options:**
-
-| Flag | Description | Default | Required |
-|------|-------------|---------|----------|
-| `--enable` | Allow the built-in assistant to read row data | - | No |
-| `--disable` | Stop the built-in assistant reading row data | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ## `dsn`
@@ -5348,7 +6680,7 @@ Remove a delivery binding and the DNS record it manages
 
 ## `ip-access` (alias: `ipa`)
 
-Manage IP access control rules
+Manage instance-wide IP access control rules, and per-project lists (ip-access project)
 
 **Subcommands:**
 
@@ -5358,6 +6690,7 @@ Manage IP access control rules
 - `update` - Update an IP access control rule
 - `remove` (`rm`) - Delete an IP access control rule
 - `check` - Check if an IP address is blocked
+- `project` - Allow or deny IP ranges for one project or environment
 
 ### `ip-access list` (alias: `ls`)
 
@@ -5427,6 +6760,398 @@ Check if an IP address is blocked
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--ip <ip>` | IP address to check | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `ip-access project`
+
+Allow or deny IP ranges for one project or environment
+
+**Subcommands:**
+
+- `show` - Show the IP access list
+- `set` - Replace the IP access list. A list that would lock out this machine needs --acknowledge-lockout
+- `clear` - Remove the list (an environment then follows the project list)
+- `test` - Check whether an address would be allowed
+
+#### `ip-access project show`
+
+Show the IP access list
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--environment-id <id>` | Environment ID (omit for the project-wide list) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ip-access project set`
+
+Replace the IP access list. A list that would lock out this machine needs --acknowledge-lockout
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--environment-id <id>` | Environment ID (omit for the project-wide list) | - | No |
+| `--mode <mode>` | disabled, allow (only listed) or deny (block listed) | - | Yes |
+| `--cidr <cidr>` | Address or CIDR range; repeat or comma-separate | `` | No |
+| `--tailscale` | Include the Tailscale ranges (100.64.0.0/10 and fd7a:115c:a1e0::/48) | - | No |
+| `--acknowledge-lockout` | Apply even if it would block the address you are calling from | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ip-access project clear`
+
+Remove the list (an environment then follows the project list)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--environment-id <id>` | Environment ID (omit for the project-wide list) | - | No |
+| `-y, --yes` | Skip confirmation | - | No |
+
+#### `ip-access project test`
+
+Check whether an address would be allowed
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--environment-id <id>` | Environment ID (omit for the project-wide list) | - | No |
+| `--ip <ip>` | Address to evaluate | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+## `edge-rules` (alias: `edge-rule`)
+
+Block, allow, challenge, redirect or log requests before they reach the app. Rules run top to bottom; the first match decides
+
+**Subcommands:**
+
+- `list` (`ls`) - List the rules in evaluation order
+- `get` - Show one rule
+- `create` - Add a rule. New rules start in log-only mode unless --mode enforce is given
+- `update` - Change a rule; only the given parts change
+- `delete` (`rm`) - Delete a rule
+- `move` - Move a rule to another position
+- `enable` - Enable a rule
+- `disable` - Disable a rule (kept, never evaluated)
+- `enforce` - Act on matches
+- `log-only` - Only record matches, never act on them
+- `test` - Dry-run a request against the saved rules (or a rules file) and show the trace
+- `export` - Print the rules as a file apply accepts
+- `apply` - Make the project rules match a file: rules are matched by name, changed ones updated, missing ones created, others deleted, then ordered as in the file
+
+### `edge-rules list` (alias: `ls`)
+
+List the rules in evaluation order
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `edge-rules get`
+
+Show one rule
+
+**Usage:** `edge-rules get <rule-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `edge-rules create`
+
+Add a rule. New rules start in log-only mode unless --mode enforce is given
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--file <path>` | JSON file with the rule: {name?, expression, action, mode?, enabled?, environment_id?} | - | No |
+| `--name <name>` | Rule name (generated from the rule when omitted) | - | No |
+| `--expression <json>` | Match expression as JSON, e.g. {"combinator":"all","children":[...]} | - | No |
+| `--action <json>` | Action as JSON, e.g. {"type":"block","status":403} | - | No |
+| `--environment-id <id>` | Apply only to this environment | - | No |
+| `--project-id <id>` | Project ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+| `--mode <mode>` | enforce or log-only (default: the file's mode, else log-only) | - | No |
+| `--disabled` | Create it disabled | - | No |
+| `--position <n>` | Insert at this 1-based position (default: last) | - | No |
+
+### `edge-rules update`
+
+Change a rule; only the given parts change
+
+**Usage:** `edge-rules update <rule-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--file <path>` | JSON file with the rule: {name?, expression, action, mode?, enabled?, environment_id?} | - | No |
+| `--name <name>` | Rule name (generated from the rule when omitted) | - | No |
+| `--expression <json>` | Match expression as JSON, e.g. {"combinator":"all","children":[...]} | - | No |
+| `--action <json>` | Action as JSON, e.g. {"type":"block","status":403} | - | No |
+| `--environment-id <id>` | Apply only to this environment | - | No |
+| `--project-id <id>` | Project ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+| `--mode <mode>` | enforce or log-only | - | No |
+| `--all-environments` | Apply to every environment | - | No |
+| `--revision <n>` | Fail if the rule changed since this revision (default: the current one) | - | No |
+
+### `edge-rules delete` (alias: `rm`)
+
+Delete a rule
+
+**Usage:** `edge-rules delete <rule-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+| `-y, --yes` | Skip confirmation | - | No |
+
+### `edge-rules move`
+
+Move a rule to another position
+
+**Usage:** `edge-rules move <rule-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+| `--to <n>` | New 1-based position | - | Yes |
+
+### `edge-rules enable`
+
+Enable a rule
+
+**Usage:** `edge-rules enable <rule-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `edge-rules disable`
+
+Disable a rule (kept, never evaluated)
+
+**Usage:** `edge-rules disable <rule-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `edge-rules enforce`
+
+Act on matches
+
+**Usage:** `edge-rules enforce <rule-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `edge-rules log-only`
+
+Only record matches, never act on them
+
+**Usage:** `edge-rules log-only <rule-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `edge-rules test`
+
+Dry-run a request against the saved rules (or a rules file) and show the trace
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+| `--url <url>` | Request URL or path, e.g. https://app.example.com/admin?x=1 | - | Yes |
+| `--method <method>` | HTTP method | `GET` | No |
+| `--header <header>` | "Name: value"; repeatable | `` | No |
+| `--ip <ip>` | Client address | - | No |
+| `--country <code>` | ISO country code, e.g. DE | - | No |
+| `--continent <code>` | Continent code, e.g. EU | - | No |
+| `--asn <n>` | Autonomous system number | - | No |
+| `--user-agent <ua>` | User agent | - | No |
+| `--bot-class <class>` | human, search_engine, ai_crawler, ai_agent or unknown_bot | - | No |
+| `--environment-id <id>` | Environment the request is for | - | No |
+| `--cleared` | The visitor already solved a challenge | - | No |
+| `--file <path>` | Evaluate these rules instead of the saved ones (same format as export) | - | No |
+
+### `edge-rules export`
+
+Print the rules as a file apply accepts
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+| `--output <path>` | Write to a file instead of stdout | - | No |
+
+### `edge-rules apply`
+
+Make the project rules match a file: rules are matched by name, changed ones updated, missing ones created, others deleted, then ordered as in the file
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+| `--file <path>` | Rules file ({"rules": [...]}, as written by export) | - | Yes |
+| `--dry-run` | Show the plan without changing anything | - | No |
+| `-y, --yes` | Skip confirmation | - | No |
+
+## `network-policy` (alias: `netpol`)
+
+Manage network policy for workloads: rules, egress/ingress profiles and the effective policy
+
+**Subcommands:**
+
+- `rules` - Manage network policy rules
+- `effective` - Show the policy in force for a workload: profile, rules, inbound links and where it is enforced. <kind> is one of deployment, sandbox, service, function, job; <id> is the environment id for a deployment
+- `profile` - Manage a workload's egress and ingress profile
+
+### `network-policy rules`
+
+Manage network policy rules
+
+**Subcommands:**
+
+- `list` (`ls`) - List network policy rules
+- `show` - Show one network policy rule
+- `create` (`add`) - Create a network policy rule
+- `rm` (`remove`) - Delete a network policy rule (link rules are removed by unlinking instead)
+
+#### `network-policy rules list` (alias: `ls`)
+
+List network policy rules
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--subject-kind <kind>` | Only rules for this kind (deployment, sandbox, service, function, job) | - | No |
+| `--subject-id <id>` | Only rules for this subject (environment id for deployments) | - | No |
+| `--origin <origin>` | Only rules of this origin (link, operator, system) | - | No |
+| `--page <n>` | Page number (default 1) | - | No |
+| `--page-size <n>` | Rules per page (default 20, max 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `network-policy rules show`
+
+Show one network policy rule
+
+**Usage:** `network-policy rules show <ruleId> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `network-policy rules create` (alias: `add`)
+
+Create a network policy rule
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--subject-kind <kind>` | Workload kind (deployment, sandbox, service, function, job) | - | Yes |
+| `--subject-id <id>` | Environment id for a deployment; the row id for other kinds | - | Yes |
+| `--direction <direction>` | Traffic direction (egress, ingress) | - | Yes |
+| `--peer-kind <kind>` | Peer type: service (by id), workload (<kind>/<id>) or cidr. host rules are refused until a node runs the shared egress proxy | - | Yes |
+| `--peer <ref>` | Peer reference: a service id, <kind>/<id>, or a CIDR | - | Yes |
+| `--action <action>` | What to do with matching traffic (allow, deny) | - | Yes |
+| `--protocol <protocol>` | tcp, udp, any (default tcp) | - | No |
+| `--port <port>` | Port, or the start of a range. Omit for every port | - | No |
+| `--port-end <port>` | End of the port range (needs --port) | - | No |
+| `--description <text>` | Why this rule exists | - | No |
+| `--json` | Output the created rule in JSON format | - | No |
+
+#### `network-policy rules rm` (alias: `remove`)
+
+Delete a network policy rule (link rules are removed by unlinking instead)
+
+**Usage:** `network-policy rules rm <ruleId> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-f, --force` | Skip confirmation | - | No |
+| `-y, --yes` | Skip confirmation (alias for --force) | - | No |
+
+### `network-policy effective`
+
+Show the policy in force for a workload: profile, rules, inbound links and where it is enforced. <kind> is one of deployment, sandbox, service, function, job; <id> is the environment id for a deployment
+
+**Usage:** `network-policy effective <kind> <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `network-policy profile`
+
+Manage a workload's egress and ingress profile
+
+**Subcommands:**
+
+- `set` - Set a workload's profile. Each direction is open, restricted, none; a direction left out is reset to the kind's default
+
+#### `network-policy profile set`
+
+Set a workload's profile. Each direction is open, restricted, none; a direction left out is reset to the kind's default
+
+**Usage:** `network-policy profile set <kind> <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--egress <profile>` | Outbound profile (open, restricted, none). Omit for the kind's default | - | No |
+| `--ingress <profile>` | Inbound profile (open, restricted, none). Omit for the kind's default | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ## `audit`
@@ -5989,6 +7714,10 @@ Create a new incident
 | `-t, --title <title>` | Incident title | - | No |
 | `-d, --description <description>` | Incident description | - | No |
 | `-s, --severity <severity>` | Severity level (critical, major, minor) | - | No |
+| `--public-title <title>` | Headline shown on published status pages (the title stays internal) | - | No |
+| `-m, --message <message>` | First update, written by you instead of the automatic one | - | No |
+| `--public` | Post the first update to published status pages (needs --message) | - | No |
+| `--monitor-id <id>` | Monitor (status page component) the incident affects; omit for the whole project | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 
 ### `incidents show`
@@ -6056,42 +7785,43 @@ Get bucketed incident data for a project
 
 ## `status-pages` (alias: `status-page`)
 
-Publish public status pages for selected monitors
+Publish public status pages showing monitors from any of your projects
 
 **Subcommands:**
 
-- `list` (`ls`) - List a project's status pages
-- `create` - Create a draft status page
+- `list` (`ls`) - List status pages, optionally only those showing one project
+- `create` - Create a draft status page; monitors may come from any project
 - `show` - Show a status page
 - `update` - Change the title, description or monitor selection
 - `publish` - Publish the page at its public URL
 - `unpublish` - Unpublish; the public URL returns 404 immediately
 - `rotate-url` - Replace the public URL; the old one stops working
 - `delete` (`rm`) - Delete a status page; its public URL returns 404 immediately
+- `domains` (`domain`) - Serve a status page on your own hostname
 
 ### `status-pages list` (alias: `ls`)
 
-List a project's status pages
+List status pages, optionally only those showing one project
 
 **Options:**
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `--project-id <id>` | Project ID | - | Yes |
+| `--project-id <id>` | Only pages with a component from this project | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `status-pages create`
 
-Create a draft status page
+Create a draft status page; monitors may come from any project
 
 **Options:**
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `--project-id <id>` | Project ID | - | Yes |
 | `-t, --title <title>` | Public page title | - | Yes |
+| `-m, --monitor <id=name>` | Monitor to show and its public name (repeatable) | - | Yes |
+| `-g, --group <name=ids>` | Show monitors together under a group, e.g. "Cloud=12,13" (repeatable) | - | No |
 | `-d, --description <text>` | Public description | - | No |
-| `-m, --monitor <id=name>` | Monitor to show and its public name (repeatable) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `status-pages show`
@@ -6117,7 +7847,7 @@ Change the title, description or monitor selection
 | `-t, --title <title>` | Public page title | - | No |
 | `-d, --description <text>` | Public description ("" clears it) | - | No |
 | `-m, --monitor <id=name>` | Replace the selection; repeat for each monitor | - | No |
-| `--clear-monitors` | Remove every monitor (drafts only) | - | No |
+| `-g, --group <name=ids>` | With --monitor: group monitors, e.g. "Cloud=12,13" (repeatable) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `status-pages publish`
@@ -6162,6 +7892,78 @@ Delete a status page; its public URL returns 404 immediately
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--id <id>` | Status page ID | - | Yes |
+| `-y, --yes` | Skip the confirmation prompt | - | No |
+
+### `status-pages domains` (alias: `domain`)
+
+Serve a status page on your own hostname
+
+**Subcommands:**
+
+- `list` (`ls`) - List a status page's custom domains and the DNS records they need
+- `add` - Attach a hostname; it serves only after ownership is verified
+- `verify` - Prove ownership and issue the certificate
+- `renew` - Renew the certificate; the current one keeps serving meanwhile (DNS-01: prints the new TXT record)
+- `remove` (`rm`) - Detach a hostname; it answers 404 immediately and its certificate is deleted
+
+#### `status-pages domains list` (alias: `ls`)
+
+List a status page's custom domains and the DNS records they need
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Status page ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `status-pages domains add`
+
+Attach a hostname; it serves only after ownership is verified
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Status page ID | - | Yes |
+| `--hostname <hostname>` | Hostname, e.g. status.example.com | - | Yes |
+| `--dns` | Verify with a DNS TXT record instead of HTTP | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `status-pages domains verify`
+
+Prove ownership and issue the certificate
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Status page ID | - | Yes |
+| `--domain-id <id>` | Custom domain ID (see `domains list`) | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `status-pages domains renew`
+
+Renew the certificate; the current one keeps serving meanwhile (DNS-01: prints the new TXT record)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Status page ID | - | Yes |
+| `--domain-id <id>` | Custom domain ID (see `domains list`) | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `status-pages domains remove` (alias: `rm`)
+
+Detach a hostname; it answers 404 immediately and its certificate is deleted
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Status page ID | - | Yes |
+| `--domain-id <id>` | Custom domain ID (see `domains list`) | - | Yes |
 | `-y, --yes` | Skip the confirmation prompt | - | No |
 
 ## `alarms` (alias: `alarm`)
@@ -6212,6 +8014,8 @@ Show active alarm counts by status, severity, and type
 
 Acknowledge alarms by ID, or every alarm matching the filters with --all
 
+**Usage:** `alarms ack [alarmIds...] [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -6230,6 +8034,8 @@ Acknowledge alarms by ID, or every alarm matching the filters with --all
 ### `alarms resolve`
 
 Resolve alarms by ID, or every alarm matching the filters with --all
+
+**Usage:** `alarms resolve [alarmIds...] [options]`
 
 **Options:**
 
@@ -6494,11 +8300,12 @@ Show a stored import session (the plan it was created with)
 
 ## `templates` (alias: `tpl`)
 
-Browse deployment templates
+Browse templates and create them
 
 **Subcommands:**
 
 - `list` (`ls`) - List available templates
+- `create` - Create a template: every service (an app, what `projects` manages), the databases it needs, its shared variables and path routes
 - `validate` - Validate a Temps-native template YAML file or directory offline
 
 ### `templates list` (alias: `ls`)
@@ -6510,11 +8317,40 @@ List available templates
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--json` | Output in JSON format | - | No |
-| `--kind <kind>` | Filter by template gallery (starter, service) | - | No |
+| `--kind <kind>` | Filter by kind: starter or app | - | No |
+
+### `templates create`
+
+Create a template: every service (an app, what `projects` manages), the databases it needs, its shared variables and path routes
+
+**Usage:** `templates create <slug> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project <name>` | Put the services in a new project (group) with this name; the default for several services | - | No |
+| `--into <project>` | Add the services to an existing project (group), by slug or id (see: project-groups list) | - | No |
+| `--standalone` | Create a one-service template without a project (group); the default for one service | - | No |
+| `--name <service=name...>` | Name a created service; a one-service template also takes a bare name | - | No |
+| `--env <[service:]KEY=VALUE...>` | Set a variable; prefix the service when the template cannot tell | - | No |
+| `--secret <[service:]KEY=VALUE...>` | Set a secret variable (write-only once stored) | - | No |
+| `--database <type=new|type=new:name|type=id...>` | Create or link each database the template needs (default: create) | - | No |
+| `--fork-connection <id>` | Starters only: copy the code into a new repository on this git connection | - | No |
+| `--repo-name <name>` | Name of the new repository (with --fork-connection) | - | No |
+| `--repo-owner <owner>` | Account or organization for the new repository | - | No |
+| `--public-repo` | Make the new repository public (private by default) | - | No |
+| `--no-auto-deploy` | Do not deploy on push to the new repository | - | No |
+| `--idempotency-key <key>` | Reuse a key to get the same result instead of creating twice | - | No |
+| `--no-wait` | Return right away instead of waiting until it finishes | - | No |
+| `--timeout <minutes>` | Stop waiting after this long (default 30); it keeps running on the server | - | No |
+| `--json` | Output in JSON format | - | No |
 
 ### `templates validate`
 
 Validate a Temps-native template YAML file or directory offline
+
+**Usage:** `templates validate <path> [options]`
 
 **Options:**
 
@@ -6609,6 +8445,8 @@ Ask the release API for the newest version on this channel now
 
 Show or set the release channel: stable, beta, nightly, or "auto" to follow the installed version
 
+**Usage:** `platform update channel [channel] [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -6651,6 +8489,8 @@ List the alert rules watching this node (proxy health, socket exhaustion)
 
 Retune, enable, or disable an alert rule on this node
 
+**Usage:** `platform alert-rules set <rule-id> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -6687,6 +8527,8 @@ List available presets
 ### `presets show` (alias: `get`)
 
 Show details for a specific preset
+
+**Usage:** `presets show <slug> [options]`
 
 **Options:**
 
@@ -6816,6 +8658,8 @@ Show analytics dashboard overview
 
 Show breakdown by dimension: pages, referrers, browsers, os, devices, countries, regions, cities, channels, events, languages, utm_source, utm_medium, utm_campaign
 
+**Usage:** `analytics top <dimension> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -6896,6 +8740,8 @@ Show pages crawled by AI agents, with distinct-agent counts
 
 Show which agents/providers crawled a single page (e.g. /docs)
 
+**Usage:** `analytics ai-page <path> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -6959,6 +8805,8 @@ Show top API callers by client IP from /api-analytics/callers
 
 Show routes called by one client IP with latency and error analytics
 
+**Usage:** `analytics api-ip <ip> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -6976,6 +8824,8 @@ Show routes called by one client IP with latency and error analytics
 ### `analytics api-path`
 
 Show client IPs calling one path with latency and error analytics
+
+**Usage:** `analytics api-path <path> [options]`
 
 **Options:**
 
@@ -7028,6 +8878,8 @@ Show an AI-generated summary of API traffic from /api-analytics/summary (require
 ### `analytics enrich`
 
 Attach identity or attributes to a visitor (merges into custom_data; a null value removes a key)
+
+**Usage:** `analytics enrich <visitor-id> [options]`
 
 **Options:**
 
@@ -7211,6 +9063,8 @@ Create a new skill definition. Use @path for content from a file, directory, or 
 
 Update an existing skill definition
 
+**Usage:** `skills update <slug> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -7225,6 +9079,8 @@ Update an existing skill definition
 
 Delete a skill definition
 
+**Usage:** `skills delete <slug> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -7237,6 +9093,8 @@ Delete a skill definition
 ### `skills import`
 
 Import a skill from a public GitHub repository (skills.sh-compatible). Source: <owner>/<repo> or <owner>/<repo>/<skill-name>
+
+**Usage:** `skills import <source> [options]`
 
 **Options:**
 
@@ -7292,6 +9150,8 @@ Create a new MCP server definition
 
 Update an existing MCP server definition
 
+**Usage:** `mcp-servers update <slug> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -7305,6 +9165,8 @@ Update an existing MCP server definition
 ### `mcp-servers delete` (alias: `rm`)
 
 Delete an MCP server definition
+
+**Usage:** `mcp-servers delete <slug> [options]`
 
 **Options:**
 
@@ -7351,11 +9213,13 @@ Disable the Temps MCP server on this instance (admin)
 
 Configure an AI client to connect to this Temps instance over MCP. Clients: claude-code, claude-desktop, codex, cursor, vscode, windsurf, zed
 
+**Usage:** `mcp add [client] [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-g, --groups <groups>` | Comma-separated tool groups to enable (default: all) | - | No |
+| `-g, --groups <groups>` | Legacy tool-group filter (optional; does not restrict temps/temps_write permissions) | - | No |
 | `-w, --write` | Enable write tools (deploy, delete, restart, etc). Default: read-only | - | No |
 | `-k, --api-key <key>` | Use this API key instead of creating or prompting for one | - | No |
 | `-u, --url <url>` | Target this Temps instance directly (e.g. copied from the Settings UI), without needing a saved CLI context or changing the active one. Defaults to the current context/login when omitted. | - | No |
@@ -7364,6 +9228,8 @@ Configure an AI client to connect to this Temps instance over MCP. Clients: clau
 ### `mcp remove`
 
 Remove the Temps MCP server from an AI client
+
+**Usage:** `mcp remove [client]`
 
 ### `mcp status`
 
@@ -7428,6 +9294,8 @@ Update an existing secret (alias for create — upserts)
 
 Delete a secret
 
+**Usage:** `secrets delete <name> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -7456,6 +9324,8 @@ Manage standalone sandboxes (/v1/sandbox API)
 - `logs` - Stream logs from a detached job (SSE)
 - `domain` - Resolve the preview URL for a port inside a sandbox
 - `password` - Generate, rotate, or clear the preview-URL password for a sandbox
+- `preview-access` - Show or set who may open the preview URLs: Temps login (default), the preview password, or anyone, optionally from listed networks only
+- `egress` - Show or set where the sandbox may connect to: the internet, nothing, or only listed hosts and CIDRs. Private, loopback and metadata addresses are always refused
 - `fs` - Filesystem operations inside a sandbox
 - `snapshots` - Manage sandbox snapshots (ADR-037)
 - `snapshot` - Take a snapshot of a sandbox
@@ -7488,9 +9358,12 @@ Create a new sandbox
 | `--new-branch <name>` | Create and switch to a new branch after cloning, based on whatever was checked out | - | No |
 | `--preview-password` | Generate a random preview-URL password and print it once on stdout | - | No |
 | `--preview-password-length <n>` | Length of the generated preview password (8..=256, default 24) | - | No |
+| `--egress-allow <host|cidr[:ports]>` | Restrict outbound traffic to this destination (repeatable; no ports = 80 and 443). IPv6 with ports: [addr/prefix]:port | - | No |
+| `--egress-deny-all` | Allow no outbound traffic at all | - | No |
 | `--from-snapshot <snap-id>` | Create sandbox from a snapshot (mutually exclusive with --image) | - | No |
 | `--node <name|id>` | Node to run the sandbox on (name, id, or 'control-plane'). Omit to let Temps place it; see `sandbox nodes` | - | No |
 | `--backend <backend>` | Isolation backend: docker, firecracker, microsandbox. Omit for the host default. An unavailable backend fails instead of downgrading | - | No |
+| `--allow-docker` | Allow installing/running Docker inside microsandbox; relaxes guest privilege restrictions. Requires --backend microsandbox | - | No |
 | `--json` | Output as JSON | - | No |
 
 ### `sandbox list` (alias: `ls`)
@@ -7537,6 +9410,8 @@ List nodes with their sandbox placement state (the default)
 
 Show a node's placement state and every live sandbox on it, from all users (name, id, or 'control-plane'). Admin only
 
+**Usage:** `sandbox nodes show <node> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -7549,6 +9424,8 @@ Show a node's placement state and every live sandbox on it, from all users (name
 
 Allow exactly these nodes to run new sandboxes, replacing the list (names, ids, or 'control-plane'). Admin only
 
+**Usage:** `sandbox nodes set <nodes...> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -7559,6 +9436,8 @@ Allow exactly these nodes to run new sandboxes, replacing the list (names, ids, 
 
 Add nodes to the list allowed to run new sandboxes. Admin only
 
+**Usage:** `sandbox nodes allow <nodes...> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -7568,6 +9447,8 @@ Add nodes to the list allowed to run new sandboxes. Admin only
 #### `sandbox nodes deny`
 
 Stop nodes from taking new sandboxes (existing ones keep running). Admin only
+
+**Usage:** `sandbox nodes deny <nodes...> [options]`
 
 **Options:**
 
@@ -7599,6 +9480,8 @@ Stop every node from taking new sandboxes (existing ones keep running). Admin on
 
 Destroy every sandbox on a worker node, from all users, so the node can be removed. Works on a node that is offline for good. Admin only
 
+**Usage:** `sandbox nodes evict <node> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -7610,6 +9493,8 @@ Destroy every sandbox on a worker node, from all users, so the node can be remov
 
 Show details for a sandbox
 
+**Usage:** `sandbox show <id> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -7619,6 +9504,8 @@ Show details for a sandbox
 ### `sandbox rm` (alias: `stop`, `destroy`)
 
 Remove a sandbox permanently (aliases: stop, destroy)
+
+**Usage:** `sandbox rm <id> [options]`
 
 **Options:**
 
@@ -7630,17 +9517,25 @@ Remove a sandbox permanently (aliases: stop, destroy)
 
 Pause a running sandbox (non-destructive — resume later with `sandbox resume`)
 
+**Usage:** `sandbox pause <id>`
+
 ### `sandbox resume`
 
 Resume a paused sandbox
+
+**Usage:** `sandbox resume <id>`
 
 ### `sandbox restart`
 
 Restart a running sandbox (preserves filesystem)
 
+**Usage:** `sandbox restart <id>`
+
 ### `sandbox clone`
 
 Clone a git repo or extract a tarball into a running sandbox
+
+**Usage:** `sandbox clone <id> [options]`
 
 **Options:**
 
@@ -7658,6 +9553,8 @@ Clone a git repo or extract a tarball into a running sandbox
 
 Open an interactive terminal in a sandbox. Detach with Ctrl-P Ctrl-Q to leave the program running; `exit` ends it. Reattach with the same --tab
 
+**Usage:** `sandbox shell <id> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -7669,6 +9566,8 @@ Open an interactive terminal in a sandbox. Detach with Ctrl-P Ctrl-Q to leave th
 
 Extend a sandbox's idle timeout
 
+**Usage:** `sandbox extend <id> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -7678,6 +9577,8 @@ Extend a sandbox's idle timeout
 ### `sandbox exec`
 
 Run a command inside a sandbox. Use `--` to pass flags: `exec ID -- ls -la`
+
+**Usage:** `sandbox exec <id> [args...] [options]`
 
 **Options:**
 
@@ -7691,9 +9592,13 @@ Run a command inside a sandbox. Use `--` to pass flags: `exec ID -- ls -la`
 
 Stream logs from a detached job (SSE)
 
+**Usage:** `sandbox logs <id> <jobId>`
+
 ### `sandbox domain`
 
 Resolve the preview URL for a port inside a sandbox
+
+**Usage:** `sandbox domain <id> [options]`
 
 **Options:**
 
@@ -7705,6 +9610,8 @@ Resolve the preview URL for a port inside a sandbox
 
 Generate, rotate, or clear the preview-URL password for a sandbox
 
+**Usage:** `sandbox password <id> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -7712,6 +9619,36 @@ Generate, rotate, or clear the preview-URL password for a sandbox
 | `--rotate` | Generate a new random password and set it (default when no flag is given) | - | No |
 | `--length <n>` | Length of the generated password (8..=256, default 24) | - | No |
 | `--clear` | Remove the preview password — preview URLs become open again | - | No |
+
+### `sandbox preview-access`
+
+Show or set who may open the preview URLs: Temps login (default), the preview password, or anyone, optionally from listed networks only
+
+**Usage:** `sandbox preview-access <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--access <mode>` | temps_login (alias 'login'), password, or public. 'password' needs a preview password first (`sandbox password`) | - | No |
+| `--allow-ip <ip|cidr>` | Only these client networks may open previews, in every mode (repeatable; replaces the list) | - | No |
+| `--any-ip` | Clear the allow-list: any client address may open previews | - | No |
+| `--json` | Output as JSON | - | No |
+
+### `sandbox egress`
+
+Show or set where the sandbox may connect to: the internet, nothing, or only listed hosts and CIDRs. Private, loopback and metadata addresses are always refused
+
+**Usage:** `sandbox egress <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--internet` | Remove the restriction | - | No |
+| `--deny-all` | Allow no outbound traffic at all | - | No |
+| `--allow <host|cidr[:ports]>` | Allow only these destinations (repeatable; replaces the policy; no ports = 80 and 443). IPv6 with ports: [addr/prefix]:port | - | No |
+| `--json` | Output as JSON | - | No |
 
 ### `sandbox fs`
 
@@ -7728,6 +9665,8 @@ Filesystem operations inside a sandbox
 
 Read a file from the sandbox
 
+**Usage:** `sandbox fs read <id> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -7738,6 +9677,8 @@ Read a file from the sandbox
 #### `sandbox fs write`
 
 Write a file to the sandbox
+
+**Usage:** `sandbox fs write <id> [options]`
 
 **Options:**
 
@@ -7752,6 +9693,8 @@ Write a file to the sandbox
 
 Stat a path inside the sandbox
 
+**Usage:** `sandbox fs stat <id> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -7762,6 +9705,8 @@ Stat a path inside the sandbox
 #### `sandbox fs mkdir`
 
 Create a directory inside the sandbox (mkdir -p)
+
+**Usage:** `sandbox fs mkdir <id> [options]`
 
 **Options:**
 
@@ -7798,6 +9743,8 @@ List your snapshots
 
 Show details for a snapshot
 
+**Usage:** `sandbox snapshots show <snapId> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -7807,6 +9754,8 @@ Show details for a snapshot
 #### `sandbox snapshots delete` (alias: `rm`)
 
 Delete a snapshot permanently
+
+**Usage:** `sandbox snapshots delete <snapId> [options]`
 
 **Options:**
 
@@ -7827,6 +9776,8 @@ Show snapshot storage usage and quota
 ### `sandbox snapshot`
 
 Take a snapshot of a sandbox
+
+**Usage:** `sandbox snapshot <id> [options]`
 
 **Options:**
 
@@ -7860,6 +9811,8 @@ List workflows/agents available on this project
 
 Trigger a workflow and stream its output
 
+**Usage:** `workflow run [slug] [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -7872,6 +9825,217 @@ Trigger a workflow and stream its output
 | `--memory <mb>` | Memory limit in MB for the ephemeral sandbox (128–8192). Overrides the YAML value. Only applies with --from-file. | - | No |
 | `--no-follow` | Return immediately after queueing instead of streaming logs | - | No |
 | `--json` | Print the run record as JSON when it terminates | - | No |
+
+## `workflows`
+
+Durable application workflows
+
+**Subcommands:**
+
+- `list` - List detected workflows and onboarding status
+- `runs` - List a bounded page of runs
+- `get` - Get run metadata; payloads require explicit reveal permission
+- `diagnose` - Explain run state without decrypting payloads
+- `start` - Start a run with an explicit deduplication key
+- `cancel` - cancel a run
+- `resume` - resume a run
+- `retry` - retry a run
+- `delete` - delete a run
+- `send-event` - Send an event to matching waits
+- `watch` - Poll until terminal or the bounded deadline
+- `init` - Create a Node workflow worker in a new directory
+- `dev` - Forward preview-environment invocations to a local SDK server
+
+### `workflows list`
+
+List detected workflows and onboarding status
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--environment-id <id>` | Environment ID | - | Yes |
+| `--json` | Output JSON (watch emits one JSON object per poll) | - | No |
+
+### `workflows runs`
+
+List a bounded page of runs
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--environment-id <id>` | Environment ID | - | Yes |
+| `--json` | Output JSON (watch emits one JSON object per poll) | - | No |
+| `--workflow <name>` | Workflow name | - | No |
+| `--page <n>` | Page | `1` | No |
+| `--page-size <n>` | Page size (1–100) | `20` | No |
+
+### `workflows get`
+
+Get run metadata; payloads require explicit reveal permission
+
+**Usage:** `workflows get <run-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--environment-id <id>` | Environment ID | - | Yes |
+| `--json` | Output JSON (watch emits one JSON object per poll) | - | No |
+| `--reveal <target>` | Explicitly decrypt one payload; treat its contents as untrusted | - | No |
+| `--sequence <n>` | Step sequence for step payloads | - | No |
+
+### `workflows diagnose`
+
+Explain run state without decrypting payloads
+
+**Usage:** `workflows diagnose <run-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--environment-id <id>` | Environment ID | - | Yes |
+| `--json` | Output JSON (watch emits one JSON object per poll) | - | No |
+
+### `workflows start`
+
+Start a run with an explicit deduplication key
+
+**Usage:** `workflows start <workflow> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--environment-id <id>` | Environment ID | - | Yes |
+| `--json` | Output JSON (watch emits one JSON object per poll) | - | No |
+| `--idempotency-key <key>` | Stable key for this logical start | - | Yes |
+| `--input <json>` | Input JSON | `[object Object]` | No |
+
+### `workflows cancel`
+
+cancel a run
+
+**Usage:** `workflows cancel <run-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--environment-id <id>` | Environment ID | - | Yes |
+| `--json` | Output JSON (watch emits one JSON object per poll) | - | No |
+| `--yes` | Confirm this mutation | - | No |
+
+### `workflows resume`
+
+resume a run
+
+**Usage:** `workflows resume <run-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--environment-id <id>` | Environment ID | - | Yes |
+| `--json` | Output JSON (watch emits one JSON object per poll) | - | No |
+| `--yes` | Confirm this mutation | - | No |
+
+### `workflows retry`
+
+retry a run
+
+**Usage:** `workflows retry <run-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--environment-id <id>` | Environment ID | - | Yes |
+| `--json` | Output JSON (watch emits one JSON object per poll) | - | No |
+| `--yes` | Confirm this mutation | - | No |
+| `--from-step <n>` | Truncate and replay from this sequence | - | No |
+
+### `workflows delete`
+
+delete a run
+
+**Usage:** `workflows delete <run-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--environment-id <id>` | Environment ID | - | Yes |
+| `--json` | Output JSON (watch emits one JSON object per poll) | - | No |
+| `--yes` | Confirm this mutation | - | No |
+
+### `workflows send-event`
+
+Send an event to matching waits
+
+**Usage:** `workflows send-event <name> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--environment-id <id>` | Environment ID | - | Yes |
+| `--json` | Output JSON (watch emits one JSON object per poll) | - | No |
+| `--key <key>` | Wait correlation key | - | No |
+| `--payload <json>` | Event JSON | `[object Object]` | No |
+
+### `workflows watch`
+
+Poll until terminal or the bounded deadline
+
+**Usage:** `workflows watch <run-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--environment-id <id>` | Environment ID | - | Yes |
+| `--json` | Output JSON (watch emits one JSON object per poll) | - | No |
+| `--timeout <seconds>` | Overall timeout (max 3600 seconds) | `300` | No |
+
+### `workflows init`
+
+Create a Node workflow worker in a new directory
+
+**Usage:** `workflows init <directory> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--sdk-package <tarball>` | Use a locally built npm pack tarball before SDK publication | - | No |
+| `--json` | Output the created path and next steps as JSON | - | No |
+
+### `workflows dev`
+
+Forward preview-environment invocations to a local SDK server
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--environment-id <id>` | Undeployed, unprotected preview environment ID | - | Yes |
+| `--port <port>` | Local SDK server port | `3000` | No |
+| `--json` | Output tunnel readiness as JSON | - | No |
 
 ## `revenue`
 
@@ -7894,6 +10058,8 @@ Import historical revenue data from a CSV export
 
 Import current subscriptions CSV (e.g., Stripe → Subscriptions → Export)
 
+**Usage:** `revenue import subscriptions <file> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -7906,6 +10072,8 @@ Import current subscriptions CSV (e.g., Stripe → Subscriptions → Export)
 #### `revenue import invoices`
 
 Import paid invoices CSV to backfill the revenue chart
+
+**Usage:** `revenue import invoices <file> [options]`
 
 **Options:**
 
@@ -7946,6 +10114,8 @@ List session replays for a project
 
 List session replays for a specific visitor
 
+**Usage:** `session-replay visitor <visitor-id> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -7958,6 +10128,8 @@ List session replays for a specific visitor
 
 Show session metadata (use numeric session ID from list)
 
+**Usage:** `session-replay show <visitor-id> <session-id> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -7967,6 +10139,8 @@ Show session metadata (use numeric session ID from list)
 ### `session-replay events`
 
 Download or page through all rrweb events for a session
+
+**Usage:** `session-replay events <visitor-id> <session-id> [options]`
 
 **Options:**
 
@@ -7980,6 +10154,8 @@ Download or page through all rrweb events for a session
 ### `session-replay delete` (alias: `rm`)
 
 Delete a session replay
+
+**Usage:** `session-replay delete <visitor-id> <session-id> [options]`
 
 **Options:**
 
@@ -8033,6 +10209,8 @@ List every route discovered from Traefik labels, including the labelled containe
 
 Restore a previously suppressed discovered route
 
+**Usage:** `traefik-discovery routes enable <host> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -8042,6 +10220,8 @@ Restore a previously suppressed discovered route
 #### `traefik-discovery routes disable`
 
 Stop routing one discovered host without touching the container labels; the route stays listed so you can see what was found
+
+**Usage:** `traefik-discovery routes disable <host> [options]`
 
 **Options:**
 
@@ -8063,6 +10243,8 @@ Manage HTTPS certificates for Traefik-discovered routes (ADR-041). A discovered 
 
 Authorize Temps to obtain a Let's Encrypt certificate for a discovered route (Path A). The certificate renews automatically using the declared challenge type.
 
+**Usage:** `traefik-discovery tls request <host> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -8075,6 +10257,8 @@ Authorize Temps to obtain a Let's Encrypt certificate for a discovered route (Pa
 
 Remove TLS authorization for a discovered route. Stops Temps from attempting renewal. Does NOT delete the certificate — use `temps domains delete <host>` to remove the certificate itself.
 
+**Usage:** `traefik-discovery tls revoke <host> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -8084,6 +10268,8 @@ Remove TLS authorization for a discovered route. Stops Temps from attempting ren
 #### `traefik-discovery tls import`
 
 Import certificates from a Traefik acme.json file (Path B). Use this to get HTTPS immediately at cutover — Traefik already holds the cert, so there is no outage window. Each host is validated (8-step X.509 chain) and a per-host result is returned. Add --dry-run to preview without writing.
+
+**Usage:** `traefik-discovery tls import <acme-json-file> [options]`
 
 **Options:**
 
@@ -8099,6 +10285,8 @@ Import certificates from a Traefik acme.json file (Path B). Use this to get HTTP
 
 Initialize a Temps project in the current directory
 
+**Usage:** `init [project-slug] [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -8110,6 +10298,8 @@ Initialize a Temps project in the current directory
 
 Link current directory to a Temps project
 
+**Usage:** `link [project-slug] [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -8119,6 +10309,8 @@ Link current directory to a Temps project
 ## `up`
 
 Deploy the current project (runs setup wizard if not linked)
+
+**Usage:** `up [project] [options]`
 
 **Options:**
 
@@ -8140,6 +10332,8 @@ Deploy the current project (runs setup wizard if not linked)
 
 Show project deployment status
 
+**Usage:** `status [project] [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -8154,11 +10348,34 @@ AI assistant status for a project
 
 **Subcommands:**
 
+- `provider` - Manage the AI CLIs (Claude Code, Codex) Temps runs on this server
 - `readiness` - Show which AI prerequisites this project meets, and how to fix the rest
+
+### `ai provider`
+
+Manage the AI CLIs (Claude Code, Codex) Temps runs on this server
+
+**Subcommands:**
+
+- `login` - Sign an AI CLI in to your subscription. Prints a link to open, then asks for the code (Claude) or shows a device code (Codex)
+
+#### `ai provider login`
+
+Sign an AI CLI in to your subscription. Prints a link to open, then asks for the code (Claude) or shows a device code (Codex)
+
+**Usage:** `ai provider login <provider-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Print the final sign-in state as JSON | - | No |
 
 ### `ai readiness`
 
 Show which AI prerequisites this project meets, and how to fix the rest
+
+**Usage:** `ai readiness [project] [options]`
 
 **Options:**
 
@@ -8204,13 +10421,19 @@ Add a new instance
 
 Remove an instance
 
+**Usage:** `instances remove <name>`
+
 ### `instances switch` (alias: `use`)
 
 Switch to a different instance
 
+**Usage:** `instances switch <name>`
+
 ### `instances show`
 
 Show instance details (or current instance)
+
+**Usage:** `instances show [name] [options]`
 
 **Options:**
 
@@ -8222,6 +10445,8 @@ Show instance details (or current instance)
 
 Pull environment variables to a .env file
 
+**Usage:** `env:pull [file] [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -8232,6 +10457,8 @@ Pull environment variables to a .env file
 ## `env:push`
 
 Push environment variables from a .env file
+
+**Usage:** `env:push [file] [options]`
 
 **Options:**
 
@@ -8245,6 +10472,8 @@ Push environment variables from a .env file
 
 Rollback to a previous deployment
 
+**Usage:** `rollback [project] [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -8257,6 +10486,8 @@ Rollback to a previous deployment
 ## `open`
 
 Open project URL in browser
+
+**Usage:** `open [project] [options]`
 
 **Options:**
 
@@ -8388,6 +10619,8 @@ Provision a new VPS instance
 
 Show VPS instance details and provisioning logs
 
+**Usage:** `cloud vps show <id> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -8398,13 +10631,19 @@ Show VPS instance details and provisioning logs
 
 Destroy a VPS instance
 
+**Usage:** `cloud vps destroy <id>`
+
 #### `cloud vps retry`
 
 Retry failed VPS provisioning
 
+**Usage:** `cloud vps retry <id>`
+
 #### `cloud vps credentials`
 
 Show VPS panel credentials
+
+**Usage:** `cloud vps credentials <id> [options]`
 
 **Options:**
 
@@ -8560,6 +10799,8 @@ Show where a project’s spans are written, what is queued, and any gaps
 
 Set the write mode to "local" (stored on this instance) or "cloud" (written to Temps Cloud, not stored here)
 
+**Usage:** `cloud telemetry write-mode set <mode> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -8600,6 +10841,8 @@ Switch many projects to Temps Cloud and ship their history in one job — estima
 
 Show the Temps Cloud activation running on this instance — progress, ETA, skips and failures
 
+**Usage:** `cloud telemetry bulk-status [batch_id] [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -8610,6 +10853,8 @@ Show the Temps Cloud activation running on this instance — progress, ETA, skip
 #### `cloud telemetry bulk-cancel`
 
 Stop a Temps Cloud activation at its next chunk boundary
+
+**Usage:** `cloud telemetry bulk-cancel <batch_id> [options]`
 
 **Options:**
 
@@ -8636,6 +10881,8 @@ Create, install, update and build TypeScript plugins
 
 Install a GitHub TypeScript plugin on the configured Temps server; the server uses its host Git credentials and Docker
 
+**Usage:** `plugin install <repository> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -8651,6 +10898,8 @@ Install a GitHub TypeScript plugin on the configured Temps server; the server us
 ### `plugin update`
 
 Rebuild an installed GitHub plugin from its stored source; keep the current plugin if the update fails
+
+**Usage:** `plugin update <name> [options]`
 
 **Options:**
 
@@ -8672,9 +10921,13 @@ Inspect or replace a plugin's host API permissions and AI limits
 
 Show current grants, actor identity, and AI availability
 
+**Usage:** `plugin grants get <name>`
+
 #### `plugin grants set`
 
 Replace all host grants; --clear revokes all permissions immediately
+
+**Usage:** `plugin grants set <name> [options]`
 
 **Options:**
 
@@ -8688,6 +10941,8 @@ Replace all host grants; --clear revokes all permissions immediately
 ### `plugin dev`
 
 Run a plugin with a local simulated host, UI preview, and events (no Temps server)
+
+**Usage:** `plugin dev [binary] [args...] [options]`
 
 **Options:**
 
@@ -8740,6 +10995,8 @@ Show the last 200 redacted simulator records
 
 Deliver an event; sent does not mean handler completed
 
+**Usage:** `plugin dev emit [type] [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -8779,6 +11036,8 @@ Replace all grants or revoke all with --clear
 ### `plugin init`
 
 Create a TypeScript plugin project
+
+**Usage:** `plugin init <directory> [options]`
 
 **Options:**
 
@@ -8836,6 +11095,7 @@ Run Temps on this computer, sign in the CLI and add the Temps skill for your cod
 |------|-------------|---------|----------|
 | `--channel <channel>` | Release channel for a fresh install: stable, beta or nightly | `beta` | No |
 | `--runtime-version <tag>` | Run this exact Temps release | - | No |
+| `--allow-unsigned` | Run a release that publishes no Sigstore signature (only releases from before signing), trusting its checksum alone | - | No |
 | `--skills <scope>` | Where to add the Temps agent skill: project, global or none (default: project inside a project, otherwise global) | - | No |
 | `--port <port>` | Port for your apps and the console on a fresh install (default: 8080 or the next free port) | - | No |
 | `--make-default` | Make "local" the default CLI context even if another one is active | - | No |
@@ -8861,51 +11121,51 @@ Stop the Temps server and database started by `temps start`
 
 ```bash
 # Login to Temps
-bunx @temps-sdk/cli@0.1.37 login
+bunx @temps-sdk/cli@latest login
 
 # Create a new project on the intended server
-bunx @temps-sdk/cli@0.1.37 --target-context production projects create --name my-app
+bunx @temps-sdk/cli@latest --target-context production projects create --name my-app
 
 # Deploy to production
-bunx @temps-sdk/cli@0.1.37 --target-context production deploy --project my-app --environment production
+bunx @temps-sdk/cli@latest --target-context production deploy --project my-app --environment production
 
 # View deployment logs
-bunx @temps-sdk/cli@0.1.37 deployments logs --project my-app --follow
+bunx @temps-sdk/cli@latest deployments logs --project my-app --follow
 
 # Stream runtime container logs
-bunx @temps-sdk/cli@0.1.37 runtime-logs --project my-app
+bunx @temps-sdk/cli@latest runtime-logs --project my-app
 
 # List containers
-bunx @temps-sdk/cli@0.1.37 containers list --project-id 1 --environment-id 1
+bunx @temps-sdk/cli@latest containers list --project-id 1 --environment-id 1
 ```
 
 ### Managing Environments
 
 ```bash
 # List environments
-bunx @temps-sdk/cli@0.1.37 environments list --project my-app
+bunx @temps-sdk/cli@latest environments list --project my-app
 
 # Set an environment variable on the intended server (prompts for the value)
-bunx @temps-sdk/cli@0.1.37 --target-context production environments vars set --project my-app DATABASE_URL --environments production
+bunx @temps-sdk/cli@latest --target-context production environments vars set --project my-app DATABASE_URL --environments production
 
 # View environment variables
-bunx @temps-sdk/cli@0.1.37 environments vars list --project my-app
+bunx @temps-sdk/cli@latest environments vars list --project my-app
 ```
 
 ### Managing Domains
 
 ```bash
 # Request a certificate for a domain on the intended server
-bunx @temps-sdk/cli@0.1.37 --target-context production domains add --domain app.example.com
+bunx @temps-sdk/cli@latest --target-context production domains add --domain app.example.com
 
 # Route the domain to a project environment
-bunx @temps-sdk/cli@0.1.37 --target-context production custom-domains create --project-id 1 --environment-id 1 --domain app.example.com
+bunx @temps-sdk/cli@latest --target-context production custom-domains create --project-id 1 --environment-id 1 --domain app.example.com
 
 # List domains
-bunx @temps-sdk/cli@0.1.37 domains list
+bunx @temps-sdk/cli@latest domains list
 
 # Remove a domain from the intended server
-bunx @temps-sdk/cli@0.1.37 --target-context production domains remove --domain app.example.com
+bunx @temps-sdk/cli@latest --target-context production domains remove --domain app.example.com
 ```
 
 ## Environment Variables
@@ -8925,7 +11185,7 @@ Configuration is stored in:
 - **Config file**: `~/.temps/config.json`
 - **Credentials**: Stored securely in `~/.temps/` with restricted file permissions
 
-Use `bunx @temps-sdk/cli@0.1.37 configure show` to view current configuration.
+Use `bunx @temps-sdk/cli@latest configure show` to view current configuration.
 
 ## Support
 

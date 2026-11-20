@@ -12,7 +12,7 @@
 //!
 //! This module defines the *abstraction* only. The concrete reporter (HTTP
 //! client, anonymous-id persistence, opt-out handling) lives in the
-//! `temps-telemetry` crate. Feature crates depend on the [`TelemetryReporter`]
+//! `temps-product-telemetry` crate. Feature crates depend on the [`TelemetryReporter`]
 //! trait via `Arc<dyn TelemetryReporter>` so they never need a direct
 //! dependency on the telemetry crate, mirroring the [`crate::AuditLogger`]
 //! pattern.
@@ -56,9 +56,13 @@ pub enum TelemetryEventKind {
     DeployCancelled,
     RollbackTriggered,
     FirstDeploySucceeded,
+    /// First workflow attempt observed on this instance; no properties.
+    FirstDeployAttempted,
 
     // ---- Project & environment ----
     ProjectCreated,
+    /// First project creation observed on this instance; no properties.
+    FirstProjectCreated,
     /// A project was created from a curated template. Carries the (public,
     /// non-identifying) `template_slug` so we can measure which templates drive
     /// activation. Emitted in addition to `ProjectCreated`.
@@ -70,6 +74,8 @@ pub enum TelemetryEventKind {
 
     // ---- Git & source ----
     GitProviderConnected,
+    /// First successful provider connection observed on this instance; no properties.
+    FirstGitProviderConnected,
     GitProviderConnectFailed,
 
     // ---- Domains & networking ----
@@ -146,8 +152,10 @@ impl TelemetryEventKind {
             Self::DeployCancelled => "deploy_cancelled",
             Self::RollbackTriggered => "rollback_triggered",
             Self::FirstDeploySucceeded => "first_deploy_succeeded",
+            Self::FirstDeployAttempted => "first_deploy_attempted",
 
             Self::ProjectCreated => "project_created",
+            Self::FirstProjectCreated => "first_project_created",
             Self::ProjectCreatedFromTemplate => "project_created_from_template",
             Self::EnvironmentCreated => "environment_created",
             Self::ScaleToZeroConfigured => "scale_to_zero_configured",
@@ -155,6 +163,7 @@ impl TelemetryEventKind {
             Self::AttackModeEnabled => "attack_mode_enabled",
 
             Self::GitProviderConnected => "git_provider_connected",
+            Self::FirstGitProviderConnected => "first_git_provider_connected",
             Self::GitProviderConnectFailed => "git_provider_connect_failed",
 
             Self::CustomDomainAdded => "custom_domain_added",
@@ -214,16 +223,20 @@ impl TelemetryEventKind {
             | Self::DeployFailed
             | Self::DeployCancelled
             | Self::RollbackTriggered
+            | Self::FirstDeployAttempted
             | Self::FirstDeploySucceeded => C::Deployments,
 
             Self::ProjectCreated
+            | Self::FirstProjectCreated
             | Self::ProjectCreatedFromTemplate
             | Self::EnvironmentCreated
             | Self::ScaleToZeroConfigured
             | Self::AutoDeployEnabled
             | Self::AttackModeEnabled => C::Projects,
 
-            Self::GitProviderConnected | Self::GitProviderConnectFailed => C::Git,
+            Self::GitProviderConnected
+            | Self::FirstGitProviderConnected
+            | Self::GitProviderConnectFailed => C::Git,
 
             Self::CustomDomainAdded | Self::SslCertificateIssued | Self::SslCertificateFailed => {
                 C::Domains
@@ -277,13 +290,16 @@ impl TelemetryEventKind {
             Self::DeployCancelled,
             Self::RollbackTriggered,
             Self::FirstDeploySucceeded,
+            Self::FirstDeployAttempted,
             Self::ProjectCreated,
+            Self::FirstProjectCreated,
             Self::ProjectCreatedFromTemplate,
             Self::EnvironmentCreated,
             Self::ScaleToZeroConfigured,
             Self::AutoDeployEnabled,
             Self::AttackModeEnabled,
             Self::GitProviderConnected,
+            Self::FirstGitProviderConnected,
             Self::GitProviderConnectFailed,
             Self::CustomDomainAdded,
             Self::SslCertificateIssued,
@@ -699,25 +715,6 @@ impl TelemetryEvent {
     pub fn with_duration(self, duration: std::time::Duration) -> Self {
         self.with("duration_bucket", duration_bucket(duration))
     }
-
-    /// Attach bounded template provenance without allowing operator-defined
-    /// slugs to leave the instance. Only reviewed bundled slugs are emitted.
-    pub fn with_template_provenance(self, provenance: Option<&str>) -> Self {
-        let (source, safe_slug) = match provenance {
-            None => ("none", None),
-            Some(value) => {
-                if let Some(slug) = crate::templates::telemetry_safe_template_slug(value) {
-                    ("bundled", Some(slug))
-                } else {
-                    ("custom", None)
-                }
-            }
-        };
-
-        self.with("is_template", provenance.is_some())
-            .with("template_source", source)
-            .with_opt("template_slug", safe_slug.map(str::to_string))
-    }
 }
 
 /// Trait for services that can report anonymous product telemetry.
@@ -813,8 +810,9 @@ mod tests {
         // If a variant is added but not added to all(), as_str() on it will be
         // missing from the list and this length check is a cheap tripwire.
         // 38 events (34 initial + instance_heartbeat + project_created_from_template
-        // + error_summary + deploy_cancelled), plus 10 operation outcome events.
-        assert_eq!(TelemetryEventKind::all().len(), 48);
+        // + error_summary + deploy_cancelled), plus 10 operation outcome events
+        // and 3 first-run funnel milestones.
+        assert_eq!(TelemetryEventKind::all().len(), 51);
     }
 
     #[test]
@@ -830,22 +828,6 @@ mod tests {
         assert_eq!(event.properties.get("duration_ms").unwrap(), 8700);
         assert_eq!(event.properties.get("region").unwrap(), "fsn1");
         assert!(!event.properties.contains_key("absent"));
-    }
-
-    #[test]
-    fn template_provenance_exposes_only_reviewed_public_slugs() {
-        let service_event = TelemetryEvent::new(TelemetryEventKind::DeployAttempted)
-            .with_template_provenance(Some("keycloak"));
-        assert_eq!(service_event.properties["template_source"], "bundled");
-        assert_eq!(service_event.properties["template_slug"], "keycloak");
-
-        let private = "customer-private-template";
-        let private_event = TelemetryEvent::new(TelemetryEventKind::DeployAttempted)
-            .with_template_provenance(Some(private));
-        let serialized = serde_json::to_string(&private_event).unwrap();
-        assert_eq!(private_event.properties["template_source"], "custom");
-        assert!(!private_event.properties.contains_key("template_slug"));
-        assert!(!serialized.contains(private));
     }
 
     #[test]

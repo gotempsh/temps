@@ -25,7 +25,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
-function isTempsReadTool(name: string): boolean {
+export function isTempsReadTool(name: string): boolean {
   return name === 'temps' || name === 'mcp__temps-chat__temps'
 }
 

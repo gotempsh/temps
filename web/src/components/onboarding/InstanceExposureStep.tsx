@@ -148,7 +148,7 @@ export function InstanceExposureStep({
       </div>
 
       {selectedValue === false && (
-        <Alert className="border-orange-200 bg-orange-50/50 dark:bg-orange-950/20">
+        <Alert className="border-orange-200 dark:border-orange-900 bg-orange-50/50 dark:bg-orange-950/20">
           <Info className="h-4 w-4 text-orange-600" />
           <AlertDescription className="text-sm">
             <strong>Note:</strong> Running in local mode will limit some

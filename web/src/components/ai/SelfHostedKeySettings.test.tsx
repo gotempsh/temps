@@ -57,3 +57,13 @@ test('offers trusting an IP-literal base URL and stays empty for plain vendor ke
     })
   ).toBe('')
 })
+
+test('a key on a public endpoint has no private address trust row', () => {
+  const html = render({
+    ...baseKey,
+    trusted_private_address: null,
+    base_url: 'https://api.example.com/v1',
+  })
+  expect(html).not.toContain('Private address trust')
+  expect(html).toContain('Embeddings')
+})

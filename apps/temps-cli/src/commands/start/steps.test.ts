@@ -9,22 +9,27 @@ import { createServer as createHttpServer } from 'node:http'
 import { createServer, type AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { localPaths, type LocalState } from './runtime.js'
+import { StartError as StartErrorClass, localPaths, type LocalState } from './runtime.js'
 import {
   acquireLock,
   destroySandboxes,
+  fetchSigstoreBundle,
   findBundledSkill,
   installSkill,
   isLocalServer,
   isPortFree,
+  originWarning,
   pickPort,
   processAlive,
   readState,
   removeWorkloads,
   stopServer,
   tailFile,
+  verifyArchiveOrigin,
   withLock,
   writeState,
+  type OriginDeps,
+  type RunResult,
 } from './steps.js'
 
 const dirs: string[] = []
@@ -431,4 +436,206 @@ describe('removeWorkloads', () => {
       cleanup()
     }
   }, 180_000)
+})
+
+describe('originWarning', () => {
+  const identity = 'https://github.com/gotempsh/temps/.github/workflows/release.yml@refs/tags/v1.2.3'
+
+  test('nothing to say when the origin was verified or the binary was cached', () => {
+    expect(originWarning('v1.2.3', 'temps-linux-amd64', { kind: 'cosign', identity }, 'ab')).toBeNull()
+    expect(originWarning('v1.2.3', 'temps-linux-amd64', { kind: 'gh', identity }, 'ab')).toBeNull()
+    expect(originWarning('v1.2.3', 'temps-linux-amd64', undefined, undefined)).toBeNull()
+  })
+
+  test('an unverified origin gives the digest and the commands to check it', () => {
+    const warning = originWarning('v1.2.3', 'temps-linux-amd64', { kind: 'unverified', identity }, 'c0ffee')
+    expect(warning).toContain('NOT verified')
+    expect(warning).toContain('SHA-256 c0ffee')
+    expect(warning).toContain(`--certificate-identity ${identity}`)
+    expect(warning).toContain('gh release download v1.2.3')
+  })
+
+  test('an unsigned release says --allow-unsigned let it in', () => {
+    const warning = originWarning('v0.0.8', 'temps-linux-amd64', { kind: 'unsigned' }, 'c0ffee')
+    expect(warning).toContain('--allow-unsigned')
+    expect(warning).toContain('NOT verified')
+  })
+})
+
+describe('fetchSigstoreBundle', () => {
+  /** Answer with `statuses` in turn (the last one repeats); 200 sends `body`. */
+  async function bundleServer(statuses: number[], body = '{"bundle":true}') {
+    let requests = 0
+    const server = createHttpServer((_req, res) => {
+      const status = statuses[Math.min(requests, statuses.length - 1)] as number
+      requests++
+      res.writeHead(status).end(status === 200 ? body : '')
+    })
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+    const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}/bundle`
+    return {
+      url,
+      requests: () => requests,
+      close: () => new Promise((resolve) => server.close(resolve)),
+    }
+  }
+  const fast = { baseDelayMs: 1 }
+
+  test('retries transient failures, then returns the bundle', async () => {
+    const server = await bundleServer([503, 429, 200])
+    try {
+      expect(await fetchSigstoreBundle(server.url, fast)).toBe('{"bundle":true}')
+      expect(server.requests()).toBe(3)
+    } finally {
+      await server.close()
+    }
+  })
+
+  test('gives up after the last attempt with the status', async () => {
+    const server = await bundleServer([502])
+    try {
+      const error = await fetchSigstoreBundle(server.url, fast).catch((e) => e)
+      expect(error).toBeInstanceOf(StartErrorClass)
+      expect(error.reason).toBe('http_error')
+      expect(error.message).toContain('HTTP 502')
+      expect(error.message).toContain('after 3 attempts')
+      expect(server.requests()).toBe(3)
+    } finally {
+      await server.close()
+    }
+  })
+
+  test('a 404 means no bundle, without retrying', async () => {
+    const server = await bundleServer([404])
+    try {
+      expect(await fetchSigstoreBundle(server.url, fast)).toBeNull()
+      expect(server.requests()).toBe(1)
+    } finally {
+      await server.close()
+    }
+  })
+
+  test('another client error fails at once', async () => {
+    const server = await bundleServer([403])
+    try {
+      const error = await fetchSigstoreBundle(server.url, fast).catch((e) => e)
+      expect(error.message).toContain('HTTP 403')
+      expect(server.requests()).toBe(1)
+    } finally {
+      await server.close()
+    }
+  })
+
+  test('refuses an oversized bundle without buffering or retrying it', async () => {
+    const server = await bundleServer([200], 'x'.repeat(4096))
+    try {
+      const error = await fetchSigstoreBundle(server.url, { ...fast, maxBytes: 1024 }).catch((e) => e)
+      expect(error).toBeInstanceOf(StartErrorClass)
+      expect(error.reason).toBe('bundle_too_large')
+      expect(server.requests()).toBe(1)
+    } finally {
+      await server.close()
+    }
+  })
+})
+
+describe('verifyArchiveOrigin', () => {
+  const identity = 'https://github.com/gotempsh/temps/.github/workflows/release.yml@refs/tags/v1.2.3'
+
+  /** Fake network and tools: `tools` maps a command to its exit code; absent means not installed. */
+  function fakeDeps(bundle: string | null, tools: Record<string, number>, ghAuth = 0) {
+    const calls: { command: string; args: readonly string[]; bundleOnDisk: boolean }[] = []
+    const fetched: string[] = []
+    const deps: OriginDeps = {
+      async fetchBundle(url) {
+        fetched.push(url)
+        return bundle
+      },
+      async runTool(command, args): Promise<RunResult | null> {
+        const bundleArg = args.indexOf('--bundle')
+        calls.push({
+          command,
+          args,
+          bundleOnDisk: bundleArg >= 0 && existsSync(args[bundleArg + 1] as string),
+        })
+        if (!(command in tools)) return null
+        if (command === 'gh' && args[0] === 'auth') return { code: ghAuth, stdout: '', stderr: '' }
+        const code = tools[command] as number
+        return { code, stdout: '', stderr: code ? `${command}: refused by test` : '' }
+      },
+    }
+    return { deps, calls, fetched }
+  }
+
+  async function archive(): Promise<string> {
+    const path = join(tempDir(), 'temps-linux-amd64.tar.gz')
+    await writeFile(path, 'archive bytes')
+    return path
+  }
+
+  test('a release without a signature is refused, naming the tag, the asset and the opt-out', async () => {
+    const { deps, fetched } = fakeDeps(null, { cosign: 0 })
+    const error = await verifyArchiveOrigin(await archive(), 'v0.0.8', 'temps-linux-amd64', false, deps).catch((e) => e)
+    expect(error).toBeInstanceOf(StartErrorClass)
+    expect(error.reason).toBe('unsigned_release')
+    expect(error.message).toContain('v0.0.8')
+    expect(error.message).toContain('temps-linux-amd64.tar.gz.sigstore.json')
+    expect(error.message).toContain('--allow-unsigned')
+    expect(fetched).toEqual([
+      'https://github.com/gotempsh/temps/releases/download/v0.0.8/temps-linux-amd64.tar.gz.sigstore.json',
+    ])
+  })
+
+  test('--allow-unsigned accepts a release without a signature', async () => {
+    const { deps, calls } = fakeDeps(null, { cosign: 0 })
+    const origin = await verifyArchiveOrigin(await archive(), 'v0.0.8', 'temps-linux-amd64', true, deps)
+    expect(origin).toEqual({ kind: 'unsigned' })
+    expect(calls).toEqual([])
+  })
+
+  test('cosign verifies the bundle with the pinned identity, then the bundle is removed', async () => {
+    const path = await archive()
+    const { deps, calls } = fakeDeps('{}', { cosign: 0, gh: 0 })
+    const origin = await verifyArchiveOrigin(path, 'v1.2.3', 'temps-linux-amd64', false, deps)
+    expect(origin).toEqual({ kind: 'cosign', identity })
+    expect(calls).toHaveLength(1)
+    const [call] = calls
+    expect(call?.command).toBe('cosign')
+    expect(call?.args).toContain(identity)
+    expect(call?.bundleOnDisk).toBe(true)
+    expect(existsSync(`${path}.sigstore.json`)).toBe(false)
+  })
+
+  test('a cosign failure throws, even with --allow-unsigned', async () => {
+    for (const allowUnsigned of [false, true]) {
+      const { deps } = fakeDeps('{}', { cosign: 1 })
+      const error = await verifyArchiveOrigin(await archive(), 'v1.2.3', 'temps-linux-amd64', allowUnsigned, deps).catch((e) => e)
+      expect(error.reason).toBe('signature_failed')
+      expect(error.message).toContain(identity)
+      expect(error.message).toContain('refused by test')
+    }
+  })
+
+  test('without cosign, an authenticated gh checks the build attestation at the tag', async () => {
+    const { deps, calls } = fakeDeps('{}', { gh: 0 })
+    const origin = await verifyArchiveOrigin(await archive(), 'v1.2.3', 'temps-linux-amd64', false, deps)
+    expect(origin).toEqual({ kind: 'gh', identity })
+    const verify = calls.find((c) => c.command === 'gh' && c.args[0] === 'attestation')
+    expect(verify?.args).toContain('refs/tags/v1.2.3')
+  })
+
+  test('a gh failure throws', async () => {
+    const { deps } = fakeDeps('{}', { gh: 1 })
+    const error = await verifyArchiveOrigin(await archive(), 'v1.2.3', 'temps-linux-amd64', false, deps).catch((e) => e)
+    expect(error.reason).toBe('signature_failed')
+  })
+
+  test('with no verifier, or gh signed out, the origin is reported as unverified', async () => {
+    for (const { tools, ghAuth } of [{ tools: {}, ghAuth: 0 }, { tools: { gh: 0 }, ghAuth: 1 }]) {
+      const { deps, calls } = fakeDeps('{}', tools, ghAuth)
+      const origin = await verifyArchiveOrigin(await archive(), 'v1.2.3', 'temps-linux-amd64', false, deps)
+      expect(origin).toEqual({ kind: 'unverified', identity })
+      expect(calls.some((c) => c.args[0] === 'attestation')).toBe(false)
+    }
+  })
 })

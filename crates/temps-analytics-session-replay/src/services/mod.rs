@@ -4,3 +4,6 @@
 pub mod service;
 pub use service::*;
 mod user_agent;
+
+// Shared request enrichment for other telemetry adapters.
+pub use user_agent::BrowserInfo;

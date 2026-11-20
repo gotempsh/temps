@@ -1,0 +1,34 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "temps-workload"
+description = "Workload plane leaf types: identity, spec, conditions, events and the runtime driver trait (ADR-052, ADR-055)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+# A leaf: nothing in Temps. Every other workload crate depends on this one.
+[dependencies]
+async-trait = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+# `AsyncWrite`, for the sandbox byte channels.
+tokio = { workspace = true }
+# Only for API schemas of the types products expose (the egress policy).
+utoipa = { workspace = true, optional = true }
+
+[features]
+openapi = ["dep:utoipa"]
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

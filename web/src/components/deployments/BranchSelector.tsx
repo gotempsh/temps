@@ -289,7 +289,7 @@ export function BranchSelector({
           <Link to="/git-providers">
             <Button type="button" variant="outline" size="sm">
               <Key className="mr-2 h-4 w-4" />
-              Manage Git Providers
+              Manage Git providers
             </Button>
           </Link>
         </AlertDescription>
@@ -599,6 +599,7 @@ function BranchRow({ branch, selected, onSelect }: BranchRowProps) {
       <span className="flex shrink-0 items-center gap-1.5 pl-2">
         {branch.commit_sha && (
           <span
+            role="img"
             className="font-mono text-[10px] text-muted-foreground"
             aria-label={`commit ${branch.commit_sha.slice(0, 7)}`}
           >

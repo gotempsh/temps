@@ -20,7 +20,8 @@ import type { DeploymentResponse } from '@/api/client'
 export function resolvePrimaryUrl(
   deployment: DeploymentResponse
 ): string | null {
-  const envUrl = deployment.environment.domains?.[0]
+  const envUrl =
+    deployment.environment.primary_url ?? deployment.environment.domains?.[0]
   // Ordered candidates; the first that resolves to a usable http(s) URL wins.
   // A rejected candidate falls through rather than yielding null, so one bad
   // stored domain cannot suppress an otherwise valid link.
@@ -50,8 +51,33 @@ export function resolvePrimaryUrl(
 export function resolveStableUrl(
   deployment: DeploymentResponse
 ): string | null {
-  const envUrl = deployment.environment.domains?.[0]
-  return envUrl ? normalizeUrl(envUrl) : null
+  return resolveStableLink(deployment).url
+}
+
+/** The project-level link, or why there is none to open. */
+export interface StableLink {
+  url: string | null
+  /** Set when the backend knows nobody can reach the environment yet. */
+  unavailableReason: string | null
+}
+
+/**
+ * {@link resolveStableUrl} with its reason. The backend names the primary
+ * address (ADR 068 D4) in `primary_url` and leads `domains` with it; when it
+ * knows nobody can reach the environment it says why in `no_address_reason`,
+ * and the console disables the button with that reason rather than linking
+ * to a host that cannot load.
+ */
+export function resolveStableLink(deployment: DeploymentResponse): StableLink {
+  const environment = deployment.environment
+  if (environment.no_address_reason) {
+    return { url: null, unavailableReason: environment.no_address_reason }
+  }
+  const candidate = environment.primary_url ?? environment.domains?.[0]
+  return {
+    url: candidate ? normalizeUrl(candidate) : null,
+    unavailableReason: null,
+  }
 }
 
 /**

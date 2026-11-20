@@ -28,6 +28,9 @@ pub struct EnvVarWithEnvironments {
     pub environments: Vec<EnvVarEnvironment>,
     pub include_in_preview: bool,
     pub is_secret: bool,
+    /// Why this regular variable looks like a credential, unless it is
+    /// already a secret or the operator dismissed the suggestion.
+    pub secret_suggestion: Option<super::secret_suggestion::SecretSuggestionReason>,
 }
 
 /// Result of an env-var update. Carries the updated row plus whether this
@@ -39,6 +42,22 @@ pub struct UpdateEnvVarOutcome {
     /// True only when the row was non-secret before this update and is secret
     /// after it. A no-op update of an already-secret row reports `false`.
     pub promoted_to_secret: bool,
+    /// Names of the fields this update changed (`key`, `value`,
+    /// `environments`, `include_in_preview`, `is_secret`). `value` means a new
+    /// value was supplied; the value itself is never reported. Empty for a
+    /// no-op update. Lets the handler audit the write without re-reading the
+    /// row or ever touching the value.
+    pub changed_fields: Vec<&'static str>,
+}
+
+/// What a delete removed, so the handler can audit it without the value.
+#[derive(Debug, Clone, Serialize)]
+pub struct DeletedEnvVar {
+    pub id: i32,
+    pub key: String,
+    pub is_secret: bool,
+    /// Environments the variable applied to before it was removed.
+    pub environment_ids: Vec<i32>,
 }
 
 // Secret types. Deliberately NO `value` field — secret plaintext never leaves

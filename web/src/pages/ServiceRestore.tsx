@@ -14,6 +14,7 @@ import type {
 } from '@/api/client/types.gen'
 import { PageContainer, PageHeader } from '@/components/layout/PageContainer'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
+import { ConfirmNameBadge } from '@/components/ui/confirm-name-badge'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import {
@@ -88,9 +89,14 @@ import {
 import { invalidateOperations } from '@/lib/operations'
 import { RunTrackingPanel } from './service-restore/RunTrackingPanel'
 import {
+  noBackupsMessage,
+  ownBackupsAsEntries,
+} from './service-restore/own-backups'
+import {
   restoreCapabilitiesQuery,
   restoreRunQuery,
   restoreServiceQuery,
+  restoreOwnBackupsQuery,
   restoreSourceBackupsQuery,
   restoreSourcesQuery,
   serviceRestoreRunsQuery,
@@ -178,6 +184,8 @@ export function ServiceRestore() {
   })
   const s3Sources = sourcesQuery.data
   const sourcesView = sourcesState(sourcesQuery)
+  const sourcesRefused =
+    sourcesView.kind === 'error' && sourcesView.errorKind === 'forbidden'
   const defaultSource = useMemo(
     () => s3Sources?.find((s) => s.is_default === true),
     [s3Sources]
@@ -328,13 +336,34 @@ export function ServiceRestore() {
   }, [serviceName, serviceId, validServiceId, setBreadcrumbs])
 
   // ----- Backups list ------------------------------------------------------
-  const backupsQuery = useQuery({
+  const sourceBackupsQuery = useQuery({
     ...restoreSourceBackupsQuery(effectiveSourceId ?? 0),
-    enabled: effectiveSourceId !== undefined,
+    enabled: effectiveSourceId !== undefined && !sourcesRefused,
   })
-  const backupIndex = backupsQuery.data
-  const backupsSection = sectionState(backupsQuery)
+  // A role that may not read storage sources can still list and restore this
+  // database's own backups, so the page falls back to them instead of
+  // stopping at "ask an administrator".
+  const ownBackupsQuery = useQuery({
+    ...restoreOwnBackupsQuery(serviceId),
+    enabled: validServiceId && sourcesRefused,
+  })
+  const ownBackupIndex = useMemo(
+    () =>
+      sourcesRefused && ownBackupsQuery.data && service
+        ? { backups: ownBackupsAsEntries(ownBackupsQuery.data, service) }
+        : undefined,
+    [sourcesRefused, ownBackupsQuery.data, service]
+  )
+  const backupsQuery = sourcesRefused ? ownBackupsQuery : sourceBackupsQuery
+  const backupIndex = sourcesRefused ? ownBackupIndex : sourceBackupsQuery.data
+  const backupsSection = sectionState(
+    sourcesRefused
+      ? { ...ownBackupsQuery, data: ownBackupIndex }
+      : sourceBackupsQuery
+  )
   const refetchBackups = backupsQuery.refetch
+  // Backups can be listed: from the chosen source, or from the database itself.
+  const canListBackups = effectiveSourceId !== undefined || sourcesRefused
 
   const allBackups = useMemo<SourceBackupEntry[]>(
     () => backupIndex?.backups ?? [],
@@ -794,9 +823,15 @@ export function ServiceRestore() {
         <CardContent>
           {sourcesView.kind === 'loading' ? (
             <Skeleton
+              role="status"
               className="h-10 w-full max-w-md"
               aria-label="Loading storage sources"
             />
+          ) : sourcesRefused ? (
+            <p className="text-sm text-muted-foreground">
+              Your role cannot choose a storage source. The backups of this
+              database are listed below.
+            </p>
           ) : sourcesView.kind === 'error' ? (
             <InlineLoadError
               title="Could not load storage sources"
@@ -863,9 +898,9 @@ export function ServiceRestore() {
             Pick a backup
           </CardTitle>
           <CardDescription>
-            All {service.service_type} backups on this source. Backups produced
-            by a different service can be selected — useful for
-            disaster-recovery restores.
+            {sourcesRefused
+              ? `The ${service.service_type} backups of this database.`
+              : `All ${service.service_type} backups on this source. Backups produced by a different service can be selected — useful for disaster-recovery restores.`}
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-3">
@@ -886,9 +921,7 @@ export function ServiceRestore() {
               variant="outline"
               size="sm"
               onClick={() => refetchBackups()}
-              disabled={
-                effectiveSourceId === undefined || backupsQuery.isFetching
-              }
+              disabled={!canListBackups || backupsQuery.isFetching}
             >
               Refresh
             </Button>
@@ -909,7 +942,7 @@ export function ServiceRestore() {
             />
           ) : null}
 
-          {effectiveSourceId === undefined ? (
+          {!canListBackups ? (
             <div className="text-sm text-muted-foreground py-8 text-center border rounded-md">
               {sourcesView.kind === 'ready'
                 ? 'Select a storage source to list its backups.'
@@ -935,7 +968,25 @@ export function ServiceRestore() {
             />
           ) : filteredBackups.length === 0 ? (
             <div className="text-sm text-muted-foreground py-8 text-center border rounded-md">
-              No compatible backups on this source.
+              {noBackupsMessage({
+                fromOwnList: sourcesRefused,
+                total: allBackups.length,
+                filter: search,
+              })}
+              {search.trim() !== '' && allBackups.length > 0 ? (
+                <div className="mt-2">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => {
+                      setSearch('')
+                      setBackupsPage(1)
+                    }}
+                  >
+                    Clear filter
+                  </Button>
+                </div>
+              ) : null}
             </div>
           ) : (
             <div className="border rounded-md">
@@ -973,7 +1024,11 @@ export function ServiceRestore() {
                       >
                         <TableCell>
                           <RadioGroup value={isSel ? 'on' : ''}>
-                            <RadioGroupItem value="on" checked={!!isSel} />
+                            <RadioGroupItem
+                              value="on"
+                              checked={!!isSel}
+                              aria-label={`Restore backup from ${b.created_at ? new Date(b.created_at).toLocaleString() : 'unknown time'}`}
+                            />
                           </RadioGroup>
                         </TableCell>
                         <TableCell className="font-mono text-xs whitespace-nowrap">
@@ -1011,7 +1066,7 @@ export function ServiceRestore() {
             </div>
           )}
 
-          {effectiveSourceId !== undefined &&
+          {canListBackups &&
             backupsSection.kind === 'ready' &&
             backupsTotalPages > 1 && (
               <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
@@ -1036,7 +1091,7 @@ export function ServiceRestore() {
                     disabled={backupsPage === 1}
                   >
                     <ChevronLeft className="h-4 w-4" />
-                    <span className="hidden sm:inline">Previous</span>
+                    <span className="max-sm:sr-only">Previous</span>
                   </Button>
                   <div className="hidden sm:flex items-center gap-1">
                     {backupsPageWindow.map((pageNum) => (
@@ -1061,7 +1116,7 @@ export function ServiceRestore() {
                     }
                     disabled={backupsPage === backupsTotalPages}
                   >
-                    <span className="hidden sm:inline">Next</span>
+                    <span className="max-sm:sr-only">Next</span>
                     <ChevronRight className="h-4 w-4" />
                   </Button>
                 </div>
@@ -1278,7 +1333,7 @@ export function ServiceRestore() {
           {needsTypedConfirm ? (
             <div className="space-y-2">
               <Label htmlFor="confirm-name">
-                Type <code>{service.name}</code> to confirm
+                Type <ConfirmNameBadge value={service.name} /> to confirm
               </Label>
               <Input
                 id="confirm-name"
@@ -1574,7 +1629,11 @@ function ServiceLoadError({
 /** Placeholder shaped like the restore steps while the database loads. */
 function RestorePageSkeleton() {
   return (
-    <div className="space-y-6" aria-label="Loading restore options">
+    <div
+      role="status"
+      className="space-y-6"
+      aria-label="Loading restore options"
+    >
       {[0, 1, 2].map((step) => (
         <div key={step} className="space-y-3 rounded-lg border p-6">
           <div className="flex items-center gap-2">
@@ -1592,6 +1651,7 @@ function RestorePageSkeleton() {
 function BackupsSkeleton() {
   return (
     <div
+      role="status"
       className="space-y-2 rounded-md border p-3"
       aria-label="Loading backups"
     >

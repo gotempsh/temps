@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { PageHeader } from '@/components/layout/PageContainer'
 import { ProjectResponse } from '@/api/client'
 import {
   listAlertsOptions,
@@ -8,6 +9,7 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import type { OtelMetricAlertRuleResponse } from '@/api/client'
 import { Button } from '@/components/ui/button'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { CreateActionButton } from '@/components/ui/create-action-button'
 import {
   DropdownMenu,
@@ -15,16 +17,6 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog'
 import { EmptyState } from '@/components/ui/empty-state'
 import { Skeleton } from '@/components/ui/skeleton'
 import { usePageTitle } from '@/hooks/usePageTitle'
@@ -90,32 +82,26 @@ export default function MetricAlerts({ project }: MetricAlertsProps) {
 
   return (
     <div className="flex w-full flex-col gap-4">
-      {/* Header */}
-      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-        <div className="flex flex-col gap-1">
-          <div className="flex items-center gap-2">
-            <Bell className="size-5 text-muted-foreground" />
-            <h1 className="text-lg font-semibold tracking-tight">Alerts</h1>
-          </div>
-          <p className="text-sm text-muted-foreground">
-            Threshold alerts on OpenTelemetry metrics for {project.name}.
-          </p>
-        </div>
-        <div className="flex flex-wrap items-center gap-2 self-start">
-          <SuggestAlertsButton
-            projectId={project.id}
-            projectSlug={project.slug}
-            projectName={project.name}
-          />
-          <CreateActionButton
-            size="sm"
-            onClick={goToNew}
-            label="New alert"
-            icon={<Plus className="size-4" />}
-            className="gap-1.5"
-          />
-        </div>
-      </div>
+      <PageHeader
+        title="Metric alerts"
+        description={`Threshold alerts on OpenTelemetry metrics for ${project.name}.`}
+        actions={
+          <>
+            <SuggestAlertsButton
+              projectId={project.id}
+              projectSlug={project.slug}
+              projectName={project.name}
+            />
+            <CreateActionButton
+              size="sm"
+              onClick={goToNew}
+              label="New alert"
+              icon={<Plus className="size-4" />}
+              className="gap-1.5"
+            />
+          </>
+        }
+      />
 
       {alertsQuery.isPending ? (
         <div className="flex flex-col gap-1">
@@ -177,42 +163,24 @@ export default function MetricAlerts({ project }: MetricAlertsProps) {
         </div>
       )}
 
-      <AlertDialog
-        open={!!pendingDelete}
+      <ConfirmDeleteDialog
+        open={pendingDelete !== null}
         onOpenChange={(open) => {
           if (!open) setPendingDelete(null)
         }}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Delete alert rule?</AlertDialogTitle>
-            <AlertDialogDescription>
-              This permanently deletes
-              {pendingDelete ? ` “${pendingDelete.name}”` : ' this alert rule'}.
-              This action cannot be undone.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel disabled={deleteMutation.isPending}>
-              Cancel
-            </AlertDialogCancel>
-            <AlertDialogAction
-              disabled={deleteMutation.isPending}
-              onClick={(e) => {
-                e.preventDefault()
-                if (pendingDelete) {
-                  deleteMutation.mutate({
-                    path: { id: pendingDelete.id },
-                    query: { project_id: project.id },
-                  })
-                }
-              }}
-            >
-              {deleteMutation.isPending ? 'Deleting…' : 'Delete'}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+        resourceType="alert rule"
+        resourceName={pendingDelete?.name ?? ''}
+        consequences={`${project.name} stops being monitored for this rule and no longer receives its alerts.`}
+        isPending={deleteMutation.isPending}
+        onConfirm={() => {
+          if (pendingDelete) {
+            deleteMutation.mutate({
+              path: { id: pendingDelete.id },
+              query: { project_id: project.id },
+            })
+          }
+        }}
+      />
     </div>
   )
 }
@@ -282,7 +250,7 @@ function AlertRow({
           </DropdownMenuItem>
           <DropdownMenuItem
             onClick={onDelete}
-            className="text-rose-500 focus:text-rose-500"
+            className="text-rose-700 dark:text-rose-500 focus:text-rose-500"
           >
             <Trash2 className="size-4" />
             Delete

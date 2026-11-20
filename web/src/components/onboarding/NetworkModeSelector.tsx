@@ -47,7 +47,7 @@ export function NetworkModeSelector({
     {
       id: 'direct',
       title: 'Direct/VPS',
-      subtitle: 'Public IP Address',
+      subtitle: 'Public IP address',
       description:
         'Your server has a direct public IP address (e.g., VPS, cloud VM)',
       icon: <Server className="h-6 w-6" />,
@@ -64,7 +64,7 @@ export function NetworkModeSelector({
     {
       id: 'nat',
       title: 'NAT/Port Forwarding',
-      subtitle: 'Behind Router',
+      subtitle: 'Behind router',
       description:
         'Your server is behind a router or firewall (home network, corporate)',
       icon: <Router className="h-6 w-6" />,
@@ -85,7 +85,7 @@ export function NetworkModeSelector({
     {
       id: 'cloudflare',
       title: 'Cloudflare Tunnel',
-      subtitle: 'No Port Forwarding',
+      subtitle: 'No port forwarding',
       description:
         'Use Cloudflare Tunnel to expose your server without port forwarding',
       icon: <Cloud className="h-6 w-6" />,
@@ -109,7 +109,7 @@ export function NetworkModeSelector({
   return (
     <div className="space-y-6">
       <div className="text-center space-y-2">
-        <h2 className="text-2xl font-bold">Select Network Mode</h2>
+        <h2 className="text-2xl font-bold">Select network mode</h2>
         <p className="text-muted-foreground">
           Choose how your server will be accessed from the internet
         </p>
@@ -170,7 +170,7 @@ export function NetworkModeSelector({
                 {/* Pros and Cons */}
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mb-3">
                   <div className="space-y-1">
-                    <p className="text-xs font-medium text-green-600 dark:text-green-400">
+                    <p className="text-xs font-medium text-green-700 dark:text-green-400">
                       Pros:
                     </p>
                     <ul className="space-y-0.5">
@@ -186,7 +186,7 @@ export function NetworkModeSelector({
                     </ul>
                   </div>
                   <div className="space-y-1">
-                    <p className="text-xs font-medium text-orange-600 dark:text-orange-400">
+                    <p className="text-xs font-medium text-orange-700 dark:text-orange-400">
                       Cons:
                     </p>
                     <ul className="space-y-0.5">

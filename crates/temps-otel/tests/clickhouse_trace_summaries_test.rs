@@ -43,6 +43,14 @@
 //! Docker-dependent, and per CLAUDE.md must never be `#[ignore]`d: it detects an
 //! unavailable Docker at runtime and returns.
 
+// Test-only helpers outside `#[test]` fns (fixtures, mock servers, setup):
+// a panic there is the test failure, which is what we want.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test helpers: panicking is how a test fails"
+)]
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -93,11 +101,13 @@ struct Harness {
 }
 
 fn client(url: &str) -> ::clickhouse::Client {
-    ::clickhouse::Client::default()
-        .with_url(url)
-        .with_database(DB)
-        .with_user("default")
-        .with_password("test")
+    temps_clickhouse::build_client(
+        url,
+        DB,
+        "default",
+        "test",
+        temps_clickhouse::ClickHouseCompression::Lz4,
+    )
 }
 
 fn storage_for(url: &str) -> ClickHouseOtelStorage {
@@ -222,6 +232,7 @@ fn span(
 ) -> SpanRecord {
     let start = Utc::now() - Duration::minutes(minutes_ago);
     SpanRecord {
+        ingest_identity: None,
         project_id,
         deployment_id,
         resource: ResourceInfo {

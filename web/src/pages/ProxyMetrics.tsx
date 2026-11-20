@@ -9,8 +9,10 @@ import { DateTimeRange } from '@/components/ui/date-time-range'
  * Route: /proxy
  *
  * Two data sources, switched by the project/environment filter:
- *   - "All projects" (default): process-wide proxy.* node metrics on the
- *     control-plane node (id 0). These have no project dimension by design.
+ *   - "All projects" (default): process-wide proxy.* node metrics of the
+ *     node picked in the node selector — the control plane (id 0), a worker's
+ *     edge proxy, or all nodes combined (ADR 061). These have no project
+ *     dimension by design.
  *   - Project/environment filtered: proxy-log-derived time buckets from
  *     GET /proxy-logs/stats/time-buckets (request/error counts, avg + p50/p95/p99
  *     latency, bandwidth).
@@ -22,10 +24,22 @@ import {
   getEnvironmentsOptions,
   getProjectOptions,
   getProjectsHealthOptions,
+  getProjectsHealthQueryKey,
   getProjectsOptions,
+  getProjectsQueryKey,
   getTimeBucketStatsOptions,
-  nodeMetricsGetRangeOptions,
+  getTimeBucketStatsQueryKey,
+  nodeMetricsGetClusterRangeQueryKey,
+  nodeMetricsGetRangeQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
+import { RefreshButton } from '@/components/ui/refresh-button'
+import { keepPreviousWindow, queryKeyPrefix } from '@/lib/refresh'
+import {
+  NodeReportingNotice,
+  NodeScopeSelect,
+} from '@/components/monitoring/NodeScopeSelect'
+import { useMetricNodeScope } from '@/hooks/useMetricNodeScope'
+import { nodeRangeQuery, type NodeScope } from '@/lib/node-scope'
 import type { TimeBucketStats } from '@/api/client/types.gen'
 import { Link } from 'react-router'
 import { ProjectSelect } from '@/components/project/ProjectSelect'
@@ -54,7 +68,10 @@ import {
   TableRow,
 } from '@/components/ui/table'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
+import { useIsInstanceAdmin } from '@/hooks/useIsInstanceAdmin'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import { NodeMetricsAccessDenied } from '@/components/monitoring/NodeMetricsAccessDenied'
+import { refetchUnlessRefused, shouldRetryQuery } from '@/lib/query-retry'
 import { TOOLTIP_CONTENT_STYLE, TOOLTIP_LABEL_STYLE } from '@/lib/chart-tooltip'
 import {
   formatProxyTimeLabel,
@@ -66,7 +83,7 @@ import {
   type ResolvedProxyWindow,
 } from '@/lib/proxy-metrics-window'
 import { useQueries, useQuery } from '@tanstack/react-query'
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useReducer, useRef, useState } from 'react'
 import type { DateRange } from 'react-day-picker'
 import { PageContainer, PageHeader } from '@/components/layout/PageContainer'
 import {
@@ -78,13 +95,11 @@ import {
   XAxis,
   YAxis,
 } from 'recharts'
+import { useWindowMoves, useWindowQuery } from '@/hooks/useWindowQuery'
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
-
-/** The control-plane node always has id 0. */
-const CONTROL_PLANE_NODE_ID = 0
 
 /** One line in a chart panel: data key + display label + stroke color. */
 type SeriesDef = {
@@ -126,7 +141,8 @@ type NodePanelDef = {
 const NODE_PANELS: NodePanelDef[] = [
   {
     title: 'Requests by status class',
-    description: 'Per-interval request count, split by response status class',
+    description:
+      'Requests per time bucket, split by response status class. Bucket width grows with the selected range, so a longer range shows larger counts',
     series: [
       {
         metric: 'proxy.requests',
@@ -158,12 +174,12 @@ const NODE_PANELS: NodePanelDef[] = [
   {
     title: 'Requests by destination',
     description:
-      'Per-interval request count, split by destination: project routes, console fallback, or handled by the proxy itself',
+      'Requests per time bucket, split by destination: service routes, console fallback, or handled by the proxy itself',
     series: [
       {
         metric: 'proxy.requests_project',
         dataKey: 'proxy.requests_project',
-        label: 'Project',
+        label: 'Service',
         color: '#2563eb',
       },
       {
@@ -300,7 +316,7 @@ const NODE_PANELS: NodePanelDef[] = [
   {
     title: 'Streaming sessions',
     description:
-      'WebSocket tunnels and SSE streams that closed, averaged per collection interval (not a total for the bucket). These are held open deliberately — up to 1h idle for WebSockets — so activity here is expected and is not proxy latency',
+      'WebSocket tunnels and SSE streams that closed in each time bucket. These are held open deliberately — up to 1h idle for WebSockets — so activity here is expected and is not proxy latency',
     series: [
       {
         metric: 'proxy.streaming_sessions',
@@ -342,7 +358,7 @@ const FD_PANELS: NodePanelDef[] = [
   {
     title: 'File descriptors in use',
     description:
-      'How close the host is to running out of file descriptors — which is how it runs out of sockets. System-wide is against /proc/sys/fs/file-nr; process is the temps binary against its own RLIMIT_NOFILE',
+      'How close the host is to running out of file descriptors — which is how it runs out of sockets. System-wide is against /proc/sys/fs/file-nr; process is the control plane’s temps binary against its own RLIMIT_NOFILE',
     series: [
       {
         metric: 'node.fd_percent',
@@ -399,34 +415,49 @@ function isMetricsUnavailable(err: unknown): boolean {
   return msg.includes('not available') || msg.includes('unavailable')
 }
 
-/** Shared query options for one proxy metric series on the CP node. */
-function proxySeriesQuery(metric: string, window: ResolvedProxyWindow) {
+/** Shared query options for one proxy metric series over the node scope. */
+function proxySeriesQuery(
+  metric: string,
+  window: ResolvedProxyWindow,
+  scope: NodeScope
+) {
+  const options = nodeRangeQuery(
+    scope,
+    window.rangeParam
+      ? { metric, range: window.rangeParam }
+      : {
+          metric,
+          start_time: window.startIso,
+          end_time: window.endIso,
+        }
+  )
   return {
-    ...nodeMetricsGetRangeOptions({
-      path: { id: CONTROL_PLANE_NODE_ID },
-      query: window.rangeParam
-        ? { metric, range: window.rangeParam }
-        : {
-            metric,
-            start_time: window.startIso,
-            end_time: window.endIso,
-          },
-    }),
+    ...options,
     staleTime: 15_000,
-    refetchInterval: 30_000,
-    retry: 1,
+    // Refresh moves a preset window: keep the chart on screen meanwhile, but
+    // not across another node scope.
+    placeholderData: keepPreviousWindow(options.queryKey),
+    // A refused read (a role without settings:read) is neither retried nor
+    // polled again: the answer cannot change until the role does.
+    refetchInterval: refetchUnlessRefused(30_000),
+    retry: (failureCount: number, error: unknown) =>
+      failureCount < 1 && shouldRetryQuery(failureCount, error),
   }
 }
 
-/** Memoized window bounds for the selected range (stable query keys). */
+/**
+ * Memoized window bounds for the selected range (stable query keys). A new
+ * `moves` (Refresh) resolves a preset again from now.
+ */
 function useResolvedWindow(
   range: ProxyRangeValue,
-  custom: DateRange | undefined
+  custom: DateRange | undefined,
+  moves: number
 ) {
-  return useMemo(
-    () => resolveProxyWindow(range, custom, new Date()),
-    [range, custom]
-  )
+  return useMemo(() => {
+    void moves
+    return resolveProxyWindow(range, custom, new Date())
+  }, [range, custom, moves])
 }
 
 /**
@@ -434,7 +465,7 @@ function useResolvedWindow(
  * stat cards and every chart panel, so React Query dedupes to one request.
  */
 function useBucketStats(window: ResolvedProxyWindow, filter: ProxyFilter) {
-  return useQuery({
+  return useWindowQuery({
     ...getTimeBucketStatsOptions({
       query: {
         start_time: window.startIso,
@@ -488,7 +519,9 @@ function ChartPanel({
           <div className="flex h-[220px] items-center justify-center px-6 text-center text-sm text-muted-foreground">
             {errorText}
           </div>
-        ) : data.length === 0 ? (
+        ) : !data.some((row) =>
+            series.some((s) => typeof row[s.dataKey] === 'number')
+          ) ? (
           <div className="flex h-[220px] items-center justify-center px-6 text-center text-sm text-muted-foreground">
             {emptyText}
           </div>
@@ -535,7 +568,10 @@ function ChartPanel({
                     dot={false}
                     strokeWidth={2}
                     stroke={s.color}
-                    connectNulls
+                    // Null buckets are "nothing measured" (the proxy was
+                    // down, or the bucket had no timed requests): break the
+                    // line instead of interpolating across them.
+                    connectNulls={false}
                     isAnimationActive={false}
                   />
                 ))}
@@ -571,15 +607,19 @@ function ChartPanel({
 function NodeMetricPanel({
   panel,
   window,
+  scope,
   emptyText = 'No proxy metrics yet — data appears within a minute of traffic',
 }: {
   panel: NodePanelDef
   window: ResolvedProxyWindow
+  scope: NodeScope
   emptyText?: string
 }) {
-  const results = useQueries({
-    queries: panel.series.map((s) => proxySeriesQuery(s.metric, window)),
-  })
+  const queries = panel.series.map((s) =>
+    proxySeriesQuery(s.metric, window, scope)
+  )
+  useWindowMoves(queries.map((q) => q.queryKey))
+  const results = useQueries({ queries })
 
   const isPending = results.some((r) => r.isPending)
   const errors = results.filter((r) => r.isError).map((r) => r.error)
@@ -600,7 +640,9 @@ function NodeMetricPanel({
         time: p.time,
         label: formatProxyTimeLabel(p.time, window.showDate),
       }
-      row[key] = p.value
+      // Every bucket of the window is returned; one nothing was sampled in
+      // is null and stays a gap (request counters already read 0 there).
+      row[key] = p.value ?? null
       rows.set(p.time, row)
     }
   })
@@ -630,17 +672,22 @@ function bucketChartRows(
   stats: TimeBucketStats[],
   window: ResolvedProxyWindow
 ) {
+  // The endpoint gap-fills idle buckets with 0 for every column. That is
+  // right for the counts, but a latency or error rate of 0 in a bucket with
+  // no requests is invented: leave those null so the lines break instead.
+  const timed = (b: TimeBucketStats, v: number) =>
+    b.latency_count > 0 ? v : null
   return stats.map((b) => ({
     time: b.bucket,
     label: formatProxyTimeLabel(b.bucket, window.showDate),
     request_count: b.request_count,
     error_count: b.error_count,
     error_rate:
-      b.request_count > 0 ? (b.error_count / b.request_count) * 100 : 0,
-    avg_response_time_ms: b.avg_response_time_ms,
-    p50_response_time_ms: b.p50_response_time_ms,
-    p95_response_time_ms: b.p95_response_time_ms,
-    p99_response_time_ms: b.p99_response_time_ms,
+      b.request_count > 0 ? (b.error_count / b.request_count) * 100 : null,
+    avg_response_time_ms: timed(b, b.avg_response_time_ms),
+    p50_response_time_ms: timed(b, b.p50_response_time_ms),
+    p95_response_time_ms: timed(b, b.p95_response_time_ms),
+    p99_response_time_ms: timed(b, b.p99_response_time_ms),
     total_request_bytes: b.total_request_bytes,
     total_response_bytes: b.total_response_bytes,
   }))
@@ -782,21 +829,27 @@ function StatCard({ title, value, isPending, sub }: StatCardProps) {
 }
 
 /** Unfiltered stats — computed from the process-wide node metric series. */
-function NodeSummaryStats({ window }: { window: ResolvedProxyWindow }) {
+function NodeSummaryStats({
+  window,
+  scope,
+}: {
+  window: ResolvedProxyWindow
+  scope: NodeScope
+}) {
   // Same query keys the chart panels use — React Query dedupes the fetches.
+  const queries = [
+    proxySeriesQuery('proxy.requests', window, scope),
+    proxySeriesQuery('proxy.requests_5xx', window, scope),
+    proxySeriesQuery('proxy.request_duration_p95_ms', window, scope),
+    // Destination split — same options the "Requests by destination"
+    // panel uses, so React Query dedupes the fetches.
+    proxySeriesQuery('proxy.requests_project', window, scope),
+    proxySeriesQuery('proxy.requests_console', window, scope),
+    proxySeriesQuery('proxy.requests_other', window, scope),
+  ]
+  useWindowMoves(queries.map((q) => q.queryKey))
   const [requests, errors5xx, p95, destProject, destConsole, destOther] =
-    useQueries({
-      queries: [
-        proxySeriesQuery('proxy.requests', window),
-        proxySeriesQuery('proxy.requests_5xx', window),
-        proxySeriesQuery('proxy.request_duration_p95_ms', window),
-        // Destination split — same options the "Requests by destination"
-        // panel uses, so React Query dedupes the fetches.
-        proxySeriesQuery('proxy.requests_project', window),
-        proxySeriesQuery('proxy.requests_console', window),
-        proxySeriesQuery('proxy.requests_other', window),
-      ],
-    })
+    useQueries({ queries })
 
   const totalRequests = (requests.data ?? []).reduce(
     (acc, p) => acc + (p.value ?? 0),
@@ -824,7 +877,7 @@ function NodeSummaryStats({ window }: { window: ResolvedProxyWindow }) {
     hasRequests && destsReady && totalRequests > 0
       ? (() => {
           const pct = (n: number) => Math.round((n / totalRequests) * 100)
-          return `${pct(sumSeries(destProject))}% project · ${pct(sumSeries(destConsole))}% console · ${pct(sumSeries(destOther))}% other`
+          return `${pct(sumSeries(destProject))}% service · ${pct(sumSeries(destConsole))}% console · ${pct(sumSeries(destOther))}% other`
         })()
       : null
 
@@ -940,6 +993,7 @@ function FilterBar({
   return (
     <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center">
       <ProjectSelect
+        ariaLabel="Filter by service"
         value={filter.projectId}
         onValueChange={(projectId) =>
           onChange({ projectId, environmentId: null })
@@ -1005,7 +1059,7 @@ const TRAFFIC_COLUMNS: {
   numeric: boolean
   secondary: boolean
 }[] = [
-  { key: 'project_name', label: 'Project', numeric: false, secondary: false },
+  { key: 'project_name', label: 'Service', numeric: false, secondary: false },
   { key: 'total_requests', label: 'Requests', numeric: true, secondary: false },
   { key: 'total_errors', label: 'Errors', numeric: true, secondary: true },
   { key: 'error_rate', label: 'Error rate', numeric: true, secondary: false },
@@ -1019,9 +1073,12 @@ const TRAFFIC_COLUMNS: {
 ]
 
 const STATUS_STYLES: Record<string, { dot: string; text: string }> = {
-  healthy: { dot: 'bg-emerald-500', text: 'text-emerald-600' },
+  healthy: {
+    dot: 'bg-emerald-500',
+    text: 'text-emerald-700 dark:text-emerald-600',
+  },
   degraded: { dot: 'bg-amber-500', text: 'text-amber-700 dark:text-amber-600' },
-  down: { dot: 'bg-red-500', text: 'text-red-600' },
+  down: { dot: 'bg-red-500', text: 'text-red-700 dark:text-red-600' },
   unknown: { dot: 'bg-muted-foreground/40', text: 'text-muted-foreground' },
 }
 
@@ -1104,7 +1161,7 @@ function TrafficByProject({
   const totalPages = Math.max(1, Math.ceil(total / TRAFFIC_PAGE_SIZE))
 
   const idsParam = projects.map((p) => p.id).join(',')
-  const healthQ = useQuery({
+  const healthQ = useWindowQuery({
     ...getProjectsHealthOptions({
       query: {
         project_ids: idsParam,
@@ -1162,9 +1219,9 @@ function TrafficByProject({
   return (
     <Card ref={containerRef}>
       <CardHeader className="pb-2">
-        <CardTitle className="text-base">Traffic by project</CardTitle>
+        <CardTitle className="text-base">Traffic by service</CardTitle>
         <CardDescription>
-          Requests per project from proxy logs over the selected window
+          Requests per service from proxy logs over the selected window
         </CardDescription>
       </CardHeader>
       <CardContent>
@@ -1175,12 +1232,12 @@ function TrafficByProject({
             <Skeleton className="h-8 w-full" />
           </div>
         ) : hasError ? (
-          <div className="py-8 text-center text-sm text-rose-500">
-            Failed to load project traffic
+          <div className="py-8 text-center text-sm text-rose-700 dark:text-rose-500">
+            Failed to load service traffic
           </div>
         ) : sorted.length === 0 ? (
           <div className="py-8 text-center text-sm text-muted-foreground">
-            No projects yet
+            No services yet
           </div>
         ) : (
           <>
@@ -1283,7 +1340,8 @@ export default function ProxyMetrics() {
     projectId: null,
     environmentId: null,
   })
-  const resolved = useResolvedWindow(range, customRange)
+  const [windowMoves, moveWindow] = useReducer((n: number) => n + 1, 0)
+  const resolved = useResolvedWindow(range, customRange, windowMoves)
   const isFiltered = filter.projectId != null
   const tooWide = proxyWindowTooWide(resolved, isFiltered)
   const maxDays = isFiltered
@@ -1296,14 +1354,41 @@ export default function ProxyMetrics() {
 
   usePageTitle('Proxy')
 
+  // Node metrics need settings:read, which only instance administrators hold.
+  // Everyone else gets one explanation instead of 26 refused series queries.
+  const canReadNodeMetrics = useIsInstanceAdmin()
+  // ADR 061: one node, or all of them. Hidden with only the control plane.
+  const nodes = useMetricNodeScope(canReadNodeMetrics)
+
   return (
     <div className="flex-1 overflow-auto">
       <PageContainer innerClassName="space-y-6">
         <PageHeader
           title="Proxy"
-          description="Hot-path traffic and latency metrics for the control-plane proxy"
+          description="Hot-path traffic and latency metrics for the Temps proxy"
           actions={
             <div className="flex w-full flex-col gap-2 sm:w-auto sm:flex-row sm:flex-wrap sm:items-center">
+              <RefreshButton
+                queryKeys={[
+                  queryKeyPrefix(nodeMetricsGetClusterRangeQueryKey),
+                  queryKeyPrefix(nodeMetricsGetRangeQueryKey),
+                  queryKeyPrefix(getTimeBucketStatsQueryKey),
+                  queryKeyPrefix(getProjectsHealthQueryKey),
+                  queryKeyPrefix(getProjectsQueryKey, {
+                    query: { per_page: TRAFFIC_PAGE_SIZE },
+                  }),
+                ]}
+                onRefresh={moveWindow}
+              />
+              {/* Per-project views read the control plane's request logs,
+                  so the node choice only applies to the unfiltered view. */}
+              {!isFiltered && canReadNodeMetrics && (
+                <NodeScopeSelect
+                  options={nodes.options}
+                  scope={nodes.scope}
+                  onChange={nodes.setScope}
+                />
+              )}
               <FilterBar filter={filter} onChange={setFilter} />
               <DateTimeRange
                 value={{
@@ -1327,7 +1412,7 @@ export default function ProxyMetrics() {
         {tooWide ? (
           <p className="rounded-md border border-dashed px-4 py-8 text-center text-sm text-muted-foreground">
             Custom range exceeds the {maxDays}-day maximum
-            {isFiltered ? ' for a project' : ''}. Narrow the window, or request
+            {isFiltered ? ' for a service' : ''}. Narrow the window, or request
             older data {maxDays} days at a time.
           </p>
         ) : isFiltered ? (
@@ -1335,15 +1420,25 @@ export default function ProxyMetrics() {
             <FilteredSummaryStats window={resolved} filter={filter} />
             <FilteredCharts window={resolved} filter={filter} />
           </>
+        ) : !canReadNodeMetrics ? (
+          <NodeMetricsAccessDenied />
+        ) : !nodes.ready ? (
+          <Skeleton className="h-24 w-full" />
         ) : (
           <>
-            <NodeSummaryStats window={resolved} />
+            <NodeReportingNotice
+              scope={nodes.scope}
+              options={nodes.options}
+              statuses={nodes.statuses}
+            />
+            <NodeSummaryStats window={resolved} scope={nodes.scope} />
             <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
               {NODE_PANELS.map((panel) => (
                 <NodeMetricPanel
                   key={panel.title}
                   panel={panel}
                   window={resolved}
+                  scope={nodes.scope}
                 />
               ))}
             </div>
@@ -1369,6 +1464,7 @@ export default function ProxyMetrics() {
                     key={panel.title}
                     panel={panel}
                     window={resolved}
+                    scope={nodes.scope}
                     emptyText="No file-descriptor samples in this window. These are read from /proc, so they are only collected when temps runs on Linux."
                   />
                 ))}

@@ -134,7 +134,7 @@ pub fn resolve_kubeconfig(
     context_override: Option<&str>,
 ) -> Result<ResolvedKubeconfig, KubernetesImportError> {
     let file: KubeconfigFile =
-        serde_yaml::from_str(yaml).map_err(|e| KubernetesImportError::InvalidKubeconfig {
+        yaml_serde::from_str(yaml).map_err(|e| KubernetesImportError::InvalidKubeconfig {
             reason: e.to_string(),
         })?;
 

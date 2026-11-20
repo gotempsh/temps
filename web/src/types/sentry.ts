@@ -19,7 +19,7 @@ export interface SentryRequest {
   url: string
   method: string
   cookies?: Array<[string, string]>
-  headers?: Array<[string, string]>
+  headers?: Array<[string, string]> | Record<string, string>
   query_string?: Array<[string, string]>
 }
 
@@ -178,9 +178,12 @@ export interface SentryUser {
 }
 
 export interface SentryEvent {
+  stack_trace?: SentryStackFrame[]
   sentry: {
+    message?: string | SentryLogEntry
+    stacktrace?: { frames: SentryStackFrame[] }
     sdk: SentrySDK
-    tags?: Array<[string, string]>
+    tags?: Array<[string, string]> | Record<string, string>
     level: string
     type?: string
     spans?: SentrySpan[]
@@ -191,13 +194,9 @@ export interface SentryEvent {
     event_id: string
     logentry?: SentryLogEntry
     platform: string
-    exception?: {
-      values: SentryException[]
-    }
+    exception?: SentryException[] | { values: SentryException[] }
     timestamp: SentryTimestamp
-    breadcrumbs?: {
-      values: SentryBreadcrumb[]
-    }
+    breadcrumbs?: SentryBreadcrumb[] | { values: SentryBreadcrumb[] }
     environment?: string
     server_name?: string
     transaction?: string

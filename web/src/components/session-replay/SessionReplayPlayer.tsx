@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useCallback, useEffect, useRef } from 'react'
+import { useEffect, useRef } from 'react'
 import rrwebPlayer from 'rrweb-player'
 import 'rrweb-player/dist/style.css'
 import {
@@ -24,6 +24,13 @@ import { SessionEventDto } from '@/api/client'
 type RRwebEvent = ConstructorParameters<
   typeof rrwebPlayer
 >[0]['props']['events'][number]
+
+// rrweb bundles the Svelte runtime, but its published lifecycle types depend
+// on a Svelte development dependency that React consumers do not install.
+type ManagedReplayPlayer = rrwebPlayer & {
+  $set(props: { width: number; height: number }): void
+  $destroy(): void
+}
 
 interface SessionReplayPlayerProps {
   events: SessionEventDto[]
@@ -49,42 +56,52 @@ export function SessionReplayPlayer({
   error = null,
 }: SessionReplayPlayerProps) {
   const playerContainerRef = useRef<HTMLDivElement>(null)
-  const playerRef = useRef<any>(null)
-  const initPlayer = useCallback(
-    (eventData: SessionEventDto[]) => {
-      if (!playerContainerRef.current) return
+  const recordedWidth = sessionData?.viewport_width || 1280
+  const recordedHeight = sessionData?.viewport_height || 720
 
-      // Destroy existing player if any
-      if (playerRef.current) {
-        playerRef.current.destroy?.()
+  useEffect(() => {
+    const container = playerContainerRef.current
+    if (!container || !events.length || isLoading || error) return
+
+    let player: ManagedReplayPlayer | undefined
+    let animationFrame: number | undefined
+    let previousWidth = 0
+    let previousHeight = 0
+
+    const fitPlayer = () => {
+      // rrweb handles its own fullscreen dimensions and restores them on exit.
+      if (
+        document.fullscreenElement &&
+        container.contains(document.fullscreenElement)
+      ) {
+        return
       }
+      const availableWidth = container.clientWidth
+      if (!availableWidth) return
+      const scale = Math.min(
+        availableWidth / recordedWidth,
+        Math.max(1, window.innerHeight - 300) / recordedHeight,
+        1
+      )
+      const width = Math.max(1, Math.floor(recordedWidth * scale))
+      const height = Math.max(1, Math.floor(recordedHeight * scale))
+      if (width === previousWidth && height === previousHeight) return
+      previousWidth = width
+      previousHeight = height
 
+      if (player) {
+        // Resize in place so changing the layout keeps the playback position.
+        player.$set({ width, height })
+        player.triggerResize()
+        return
+      }
       try {
-        // Clear container
-        playerContainerRef.current.innerHTML = ''
-
-        // Get the viewport dimensions from the session data or use defaults
-        const recordedWidth = sessionData?.viewport_width || 1280
-        const recordedHeight = sessionData?.viewport_height || 720
-
-        // Calculate scale to fit within viewport
-        const containerWidth = window.innerWidth - 80 // Account for padding
-        const containerHeight = window.innerHeight - 300 // Account for header and controls
-
-        const scaleX = containerWidth / recordedWidth
-        const scaleY = containerHeight / recordedHeight
-        const scale = Math.min(scaleX, scaleY, 1) // Don't scale up beyond 100%
-
-        const width = Math.floor(recordedWidth * scale)
-        const height = Math.floor(recordedHeight * scale)
-
-        // Create new player instance
-        playerRef.current = new rrwebPlayer({
-          target: playerContainerRef.current,
+        player = new rrwebPlayer({
+          target: container,
           props: {
-            events: eventData.map((event) => event.data as RRwebEvent),
-            width: width,
-            height: height,
+            events: events.map((event) => event.data as RRwebEvent),
+            width,
+            height,
             autoPlay: false,
             showController: true,
             skipInactive: true,
@@ -95,27 +112,30 @@ export function SessionReplayPlayer({
             },
             UNSAFE_replayCanvas: false,
           },
-        })
+        }) as ManagedReplayPlayer
       } catch (error) {
         console.error('Failed to initialize replay player:', error)
       }
-    },
-    [sessionData]
-  )
-
-  useEffect(() => {
-    // Initialize player when events are available
-    if (events && events.length > 0 && playerContainerRef.current) {
-      initPlayer(events)
     }
 
-    // Cleanup on unmount
+    const scheduleFit = () => {
+      if (animationFrame !== undefined) cancelAnimationFrame(animationFrame)
+      animationFrame = requestAnimationFrame(fitPlayer)
+    }
+    const observer = new ResizeObserver(scheduleFit)
+    observer.observe(container)
+    window.addEventListener('resize', scheduleFit)
+    document.addEventListener('fullscreenchange', scheduleFit)
+    fitPlayer()
+
     return () => {
-      if (playerRef.current) {
-        playerRef.current.destroy?.()
-      }
+      observer.disconnect()
+      window.removeEventListener('resize', scheduleFit)
+      document.removeEventListener('fullscreenchange', scheduleFit)
+      if (animationFrame !== undefined) cancelAnimationFrame(animationFrame)
+      player?.$destroy()
     }
-  }, [events, initPlayer])
+  }, [events, recordedWidth, recordedHeight, isLoading, error])
 
   if (isLoading) {
     return (
@@ -162,14 +182,14 @@ export function SessionReplayPlayer({
   }
 
   return (
-    <div className="space-y-4">
+    <div className="min-w-0 space-y-4">
       {/* Player */}
       <Card className="overflow-hidden">
         <CardHeader>
           <CardTitle className="flex items-center justify-between">
             <span className="flex items-center gap-2">
               <Monitor className="h-5 w-5" />
-              Session Replay
+              Session replay
             </span>
             {sessionData?.created_at && (
               <Badge variant="outline" className="font-normal">
@@ -188,8 +208,11 @@ export function SessionReplayPlayer({
           )}
         </CardHeader>
         <CardContent className="p-0">
-          <div className="bg-muted/50 p-4 flex justify-center">
-            <div ref={playerContainerRef} className="mx-auto" />
+          <div className="bg-muted/50 p-4">
+            <div
+              ref={playerContainerRef}
+              className="flex w-full min-w-0 justify-center"
+            />
           </div>
         </CardContent>
       </Card>

@@ -1,7 +1,14 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { beforeEach, describe, expect, test } from 'bun:test'
+import {
+  afterAll,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  test,
+} from 'bun:test'
 
 /**
  * Regression coverage for the post-login 404.
@@ -21,7 +28,7 @@ import { beforeEach, describe, expect, test } from 'bun:test'
  */
 const store = new Map<string, string>()
 
-Object.defineProperty(globalThis, 'window', {
+const stubWindow = {
   configurable: true,
   value: {
     location: { pathname: '/', search: '', hash: '' },
@@ -32,9 +39,26 @@ Object.defineProperty(globalThis, 'window', {
       clear: () => store.clear(),
     },
   },
-})
+}
 
-const { captureReturnTo, consumeReturnTo } = await import('./return-to')
+// The stub is scoped to this file: `bun test` shares one global across files,
+// and a `window` left behind at load time changes how react-dom (evaluated by
+// later, interactive component tests) decides whether a DOM exists.
+const realWindow = Object.getOwnPropertyDescriptor(globalThis, 'window')
+function restoreWindow() {
+  if (realWindow) Object.defineProperty(globalThis, 'window', realWindow)
+  else Reflect.deleteProperty(globalThis, 'window')
+}
+
+Object.defineProperty(globalThis, 'window', stubWindow)
+const { captureReturnTo, consumeReturnTo, goToReturnTo, rememberReturnTo } =
+  await import('./return-to')
+restoreWindow()
+
+beforeAll(() => {
+  Object.defineProperty(globalThis, 'window', stubWindow)
+})
+afterAll(restoreWindow)
 
 function setLocation(path: string) {
   const [pathAndSearch = '', hash = ''] = path.split('#')
@@ -90,5 +114,52 @@ describe('captureReturnTo', () => {
 
     expect(consumeReturnTo('/dashboard')).toBe('/domains')
     expect(consumeReturnTo('/dashboard')).toBe('/dashboard')
+  })
+})
+
+describe('rememberReturnTo', () => {
+  beforeEach(() => {
+    store.clear()
+  })
+
+  test('keeps a destination carried in a query string across a restarted sign-in', () => {
+    setLocation('/mfa-verify')
+    rememberReturnTo('/projects/web?tab=deployments')
+
+    expect(consumeReturnTo('/dashboard')).toBe('/projects/web?tab=deployments')
+  })
+
+  test.each(['https://evil.example/', '//evil.example', '/\\evil.example'])(
+    'ignores the unsafe destination %s',
+    (path) => {
+      rememberReturnTo(path)
+
+      expect(consumeReturnTo('/dashboard')).toBe('/dashboard')
+    }
+  )
+
+  test('ignores auth-only pages and a missing value', () => {
+    rememberReturnTo('/login')
+    rememberReturnTo(null)
+
+    expect(consumeReturnTo('/dashboard')).toBe('/dashboard')
+  })
+})
+
+describe('goToReturnTo', () => {
+  test('loads the signed-in gate authorize step as a page after sign-in', () => {
+    const replaced: string[] = []
+    const location = stubWindow.value.location as Record<string, unknown>
+    location.replace = (path: string) => void replaced.push(path)
+    const routed: string[] = []
+
+    const authorize =
+      '/_temps/gate/authorize?address=custom%3A1&state=s&code_challenge=c'
+    goToReturnTo((to) => void routed.push(to), authorize)
+    goToReturnTo((to) => void routed.push(to), '/projects/web')
+
+    expect(replaced).toEqual([authorize])
+    expect(routed).toEqual(['/projects/web'])
+    delete location.replace
   })
 })

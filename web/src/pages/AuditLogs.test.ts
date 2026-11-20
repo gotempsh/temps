@@ -17,7 +17,7 @@ describe('audit operation filters', () => {
       options.find(
         (option) => option.value === 'EXTERNAL_PLUGIN_GRANTS_CHANGED'
       )?.label
-    ).toBe('Plugin Permissions Changed')
+    ).toBe('Plugin permissions changed')
   })
   test('offers visitor enrichment so token writes are filterable', () => {
     expect(
@@ -26,10 +26,38 @@ describe('audit operation filters', () => {
       )
     ).toEqual({
       value: 'VISITOR_ENRICHED',
-      label: 'Visitor Enriched',
-      group: 'Analytics & Visitors',
+      label: 'Visitor enriched',
+      group: 'Analytics & visitors',
       keywords: 'VISITOR_ENRICHED',
     })
+  })
+  test('offers every project group operation under Projects', () => {
+    const projectOptions = buildOperationOptions().filter(
+      (option) => option.group === 'Projects'
+    )
+    expect(projectOptions.map((option) => option.value)).toEqual([
+      'TEMPLATE_INSTANTIATION_STARTED',
+      'TEMPLATE_INSTANTIATION_RETRIED',
+      'PROJECT_GROUP_CREATED',
+      'PROJECT_GROUP_UPDATED',
+      'PROJECT_GROUP_DELETED',
+      'PROJECT_GROUP_PROJECT_ADDED',
+      'PROJECT_GROUP_PROJECT_REMOVED',
+      'PROJECT_GROUP_ENV_VAR_CREATED',
+      'PROJECT_GROUP_ENV_VAR_UPDATED',
+      'PROJECT_GROUP_ENV_VAR_DELETED',
+      'PROJECT_GROUP_REPOSITORY_SET',
+      'PROJECT_GROUP_REPOSITORY_CLEARED',
+      'PROJECT_GROUP_PROJECT_FOLLOWS_REPOSITORY',
+      'PROJECT_GROUP_PROJECT_UNFOLLOWS_REPOSITORY',
+      'PROJECT_GROUP_ROUTE_ADDED',
+      'PROJECT_GROUP_ROUTE_REMOVED',
+    ])
+    expect(
+      projectOptions.find(
+        (option) => option.value === 'PROJECT_GROUP_PROJECT_ADDED'
+      )?.label
+    ).toBe('Service added to project')
   })
   test('offers permission denials in the authentication group', () => {
     expect(
@@ -38,9 +66,23 @@ describe('audit operation filters', () => {
       )
     ).toEqual({
       value: 'PERMISSION_DENIED',
-      label: 'Permission Denied',
+      label: 'Permission denied',
       group: 'Authentication',
       keywords: 'PERMISSION_DENIED',
     })
   })
+})
+
+test('Vault operations are selectable in the shared audit table', () => {
+  const operations = buildOperationOptions().filter(
+    (entry) => entry.group === 'Vault'
+  )
+  expect(operations).toHaveLength(17)
+  expect(
+    operations.find((entry) => entry.value === 'CREATE_ACCESS_SESSION')?.label
+  ).toBe('Vault session issued')
+  expect(
+    operations.find((entry) => entry.value === 'SANDBOX_SERVICE_GRANT_REVOKED')
+      ?.label
+  ).toBe('Service access revoked')
 })

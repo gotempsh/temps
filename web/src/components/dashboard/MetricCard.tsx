@@ -51,7 +51,7 @@ export function MetricCard({
         <div
           className={cn(
             'text-2xl font-semibold tracking-tight tabular-nums',
-            locked && 'text-muted-foreground/60'
+            locked && 'text-muted-foreground'
           )}
         >
           {value}
@@ -71,7 +71,7 @@ export function MetricCard({
             <p className="text-xs text-muted-foreground">{change}</p>
           )
         ) : (
-          <p className="text-xs text-muted-foreground/60">&nbsp;</p>
+          <p className="text-xs text-muted-foreground">&nbsp;</p>
         )}
         {sparkline && !locked ? <div className="pt-2">{sparkline}</div> : null}
       </CardContent>

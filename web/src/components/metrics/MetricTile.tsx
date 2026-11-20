@@ -220,7 +220,7 @@ export function MetricTile({
         <Skeleton className="w-full" style={{ height }} />
       ) : q.isError ? (
         <div
-          className="flex items-center justify-center text-center text-xs text-rose-500"
+          className="flex items-center justify-center text-center text-xs text-rose-700 dark:text-rose-500"
           style={{ height }}
         >
           Failed to load metric

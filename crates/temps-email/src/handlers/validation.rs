@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::post, Json, Router};
 use serde::{Deserialize, Serialize};
-use temps_auth::{permission_guard, RequireAuth};
+use temps_authz::{permission_guard, RequireAuth};
 use temps_core::{
     error_builder::{bad_request, internal_server_error},
     problemdetails::Problem,

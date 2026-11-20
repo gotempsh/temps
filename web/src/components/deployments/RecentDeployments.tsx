@@ -114,7 +114,7 @@ function RecentDeploymentRow({
             {deployment.environment.name}
           </span>
           {deployment.is_current && (
-            <span className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap text-[10px] font-medium text-emerald-600 dark:text-emerald-400">
+            <span className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap text-[10px] font-medium text-emerald-700 dark:text-emerald-400">
               <CheckCircle2 className="size-3" aria-hidden="true" />
               Current
             </span>

@@ -15,6 +15,7 @@ import {
   FormMessage,
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
+import { NumberInput } from '@/components/ui/number-input'
 import {
   Select,
   SelectContent,
@@ -28,6 +29,7 @@ import { Eye, EyeOff, Loader2 } from 'lucide-react'
 import { InputHTMLAttributes, useEffect, useRef, useState } from 'react'
 import { UseFormReturn } from 'react-hook-form'
 import { toast } from 'sonner'
+import { reportSubmitFailure } from '@/lib/unhandled-rejections'
 import { ProviderFormData } from './schemas'
 
 interface ProviderFormProps {
@@ -116,7 +118,13 @@ function RevealableInput({
         {...inputProps}
         type={type === 'password' && isRevealed ? 'text' : type}
         value={value ?? ''}
-        onChange={(event) => onChange(event.target.value)}
+        onChange={(event) => {
+          // What the user types wins over a reveal still in flight: its
+          // response must not overwrite the replacement they are entering.
+          revealGuard.current.cancel(fieldPath)
+          setIsRevealing(false)
+          onChange(event.target.value)
+        }}
       />
       {canReveal && (
         <Button
@@ -155,6 +163,16 @@ export function ProviderForm({
   const providerType = form.watch('provider_type')
   const tlsMode = form.watch('config.tls_mode')
 
+  // The page's mutation reports a failed save with the server's reason; a
+  // rejection left to react-hook-form would escape as an unhandled one.
+  const submitProvider = async (data: ProviderFormData) => {
+    try {
+      await onSubmit(data)
+    } catch (error) {
+      reportSubmitFailure(error)
+    }
+  }
+
   // Suggest port based on TLS mode
   const getSuggestedPort = () => {
     switch (tlsMode) {
@@ -172,7 +190,7 @@ export function ProviderForm({
     <Form {...form}>
       <form
         id={formId}
-        onSubmit={form.handleSubmit(onSubmit, showToastFormError)}
+        onSubmit={form.handleSubmit(submitProvider, showToastFormError)}
         className="space-y-4 py-4"
       >
         <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
@@ -196,7 +214,7 @@ export function ProviderForm({
               name="provider_type"
               render={({ field }) => (
                 <FormItem>
-                  <FormLabel>Provider Type</FormLabel>
+                  <FormLabel>Provider type</FormLabel>
                   <Select onValueChange={field.onChange} value={field.value}>
                     <FormControl>
                       <SelectTrigger>
@@ -210,6 +228,7 @@ export function ProviderForm({
                       <SelectItem value="cloudflare">
                         Cloudflare Email
                       </SelectItem>
+                      <SelectItem value="telegram">Telegram</SelectItem>
                     </SelectContent>
                   </Select>
                   <FormMessage />
@@ -224,7 +243,7 @@ export function ProviderForm({
             {/* Server Configuration Section */}
             <div className="space-y-4">
               <h3 className="text-sm font-medium leading-none">
-                Server Configuration
+                Server configuration
               </h3>
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <FormField
@@ -232,7 +251,7 @@ export function ProviderForm({
                   name="config.smtp_host"
                   render={({ field }) => (
                     <FormItem>
-                      <FormLabel>SMTP Host</FormLabel>
+                      <FormLabel>SMTP host</FormLabel>
                       <FormControl>
                         <Input {...field} placeholder="smtp.example.com" />
                       </FormControl>
@@ -246,17 +265,18 @@ export function ProviderForm({
                   name="config.smtp_port"
                   render={({ field }) => (
                     <FormItem>
-                      <FormLabel>SMTP Port</FormLabel>
+                      <FormLabel>SMTP port</FormLabel>
                       <FormControl>
-                        <Input
-                          {...field}
-                          type="number"
+                        <NumberInput
+                          name={field.name}
+                          ref={field.ref}
+                          onBlur={field.onBlur}
                           placeholder={getSuggestedPort()}
-                          onChange={(e) =>
-                            field.onChange(
-                              e.target.value ? parseInt(e.target.value) : ''
-                            )
+                          inputMode="numeric"
+                          onValueChange={(value) =>
+                            field.onChange(value ?? Number.NaN)
                           }
+                          value={field.value}
                         />
                       </FormControl>
                       <FormDescription>
@@ -275,7 +295,7 @@ export function ProviderForm({
               name="config.tls_mode"
               render={({ field }) => (
                 <FormItem>
-                  <FormLabel>TLS Mode</FormLabel>
+                  <FormLabel>TLS mode</FormLabel>
                   <Select
                     onValueChange={(value) =>
                       field.onChange(value || undefined)
@@ -336,7 +356,7 @@ export function ProviderForm({
                 <FormItem className="flex flex-row items-center justify-between rounded-lg border p-4">
                   <div className="space-y-0.5">
                     <FormLabel className="text-base">
-                      Accept Invalid Certificates
+                      Accept invalid certificates
                     </FormLabel>
                     <FormDescription>
                       Allow connection to SMTP servers with self-signed or
@@ -361,7 +381,7 @@ export function ProviderForm({
                 <FormItem className="flex flex-row items-center justify-between rounded-lg border p-4 md:col-span-2">
                   <div className="space-y-0.5">
                     <FormLabel className="text-base">
-                      Use Authentication
+                      Use authentication
                     </FormLabel>
                     <FormDescription>
                       Enable SMTP authentication with username and password
@@ -382,7 +402,7 @@ export function ProviderForm({
               name="config.smtp_username"
               render={({ field }) => (
                 <FormItem>
-                  <FormLabel>SMTP Username</FormLabel>
+                  <FormLabel>SMTP username</FormLabel>
                   <FormControl>
                     <Input
                       {...field}
@@ -400,7 +420,7 @@ export function ProviderForm({
               name="config.password"
               render={({ field }) => (
                 <FormItem>
-                  <FormLabel>SMTP Password</FormLabel>
+                  <FormLabel>SMTP password</FormLabel>
                   <FormControl>
                     <RevealableInput
                       key={`${revealScopeKey}:password`}
@@ -423,7 +443,7 @@ export function ProviderForm({
               name="config.from_name"
               render={({ field }) => (
                 <FormItem>
-                  <FormLabel>From Name</FormLabel>
+                  <FormLabel>From name</FormLabel>
                   <FormControl>
                     <Input {...field} placeholder="Notification System" />
                   </FormControl>
@@ -440,7 +460,7 @@ export function ProviderForm({
               name="config.from_address"
               render={({ field }) => (
                 <FormItem>
-                  <FormLabel>From Address</FormLabel>
+                  <FormLabel>From address</FormLabel>
                   <FormControl>
                     <Input
                       {...field}
@@ -458,7 +478,7 @@ export function ProviderForm({
               name="config.to_addresses"
               render={({ field }) => (
                 <FormItem>
-                  <FormLabel>To Addresses</FormLabel>
+                  <FormLabel>To addresses</FormLabel>
                   <FormControl>
                     <Input
                       {...field}
@@ -530,7 +550,7 @@ export function ProviderForm({
           <div className="space-y-6">
             <div className="space-y-4">
               <h3 className="text-sm font-medium leading-none">
-                Webhook Configuration
+                Webhook configuration
               </h3>
               <p className="text-sm text-muted-foreground">
                 Send notifications as JSON payloads to any HTTP endpoint. Use
@@ -568,7 +588,7 @@ export function ProviderForm({
                 name="config.method"
                 render={({ field }) => (
                   <FormItem>
-                    <FormLabel>HTTP Method</FormLabel>
+                    <FormLabel>HTTP method</FormLabel>
                     <Select
                       onValueChange={field.onChange}
                       value={field.value || 'POST'}
@@ -596,18 +616,17 @@ export function ProviderForm({
                   <FormItem>
                     <FormLabel>Timeout (seconds)</FormLabel>
                     <FormControl>
-                      <Input
-                        {...field}
-                        type="number"
+                      <NumberInput
+                        name={field.name}
+                        ref={field.ref}
+                        onBlur={field.onBlur}
                         placeholder="30"
                         min={1}
                         max={300}
-                        onChange={(e) =>
-                          field.onChange(
-                            e.target.value ? parseInt(e.target.value) : 30
-                          )
+                        onValueChange={(value) =>
+                          field.onChange(value ?? Number.NaN)
                         }
-                        value={field.value || 30}
+                        value={field.value}
                       />
                     </FormControl>
                     <FormMessage />
@@ -618,7 +637,7 @@ export function ProviderForm({
 
             <div className="space-y-4">
               <h4 className="text-sm font-medium leading-none">
-                Custom Headers
+                Custom headers
               </h4>
               <p className="text-sm text-muted-foreground">
                 Add custom headers for authentication (e.g., Authorization:
@@ -701,7 +720,7 @@ export function ProviderForm({
                           size="sm"
                           onClick={addHeader}
                         >
-                          Add Header
+                          Add header
                         </Button>
                       </div>
                       <FormDescription>
@@ -717,9 +736,12 @@ export function ProviderForm({
 
             <div className="rounded-lg border p-4 bg-muted/50">
               <h4 className="text-sm font-medium mb-2">
-                Webhook Payload Format
+                Webhook payload format
               </h4>
-              <pre className="text-xs text-muted-foreground overflow-x-auto">
+              <pre
+                tabIndex={0}
+                className="text-xs text-muted-foreground overflow-x-auto"
+              >
                 <HighlightedCode
                   code={`{
   "id": "notification-uuid",
@@ -776,7 +798,7 @@ export function ProviderForm({
               name="config.api_token"
               render={({ field }) => (
                 <FormItem>
-                  <FormLabel>API Token</FormLabel>
+                  <FormLabel>API token</FormLabel>
                   <FormControl>
                     <RevealableInput
                       key={`${revealScopeKey}:api_token`}
@@ -802,7 +824,7 @@ export function ProviderForm({
               name="config.from_name"
               render={({ field }) => (
                 <FormItem>
-                  <FormLabel>From Name</FormLabel>
+                  <FormLabel>From name</FormLabel>
                   <FormControl>
                     <Input {...field} placeholder="Notification System" />
                   </FormControl>
@@ -819,7 +841,7 @@ export function ProviderForm({
               name="config.from_address"
               render={({ field }) => (
                 <FormItem>
-                  <FormLabel>From Address</FormLabel>
+                  <FormLabel>From address</FormLabel>
                   <FormControl>
                     <Input
                       {...field}
@@ -840,7 +862,7 @@ export function ProviderForm({
               name="config.to_addresses"
               render={({ field }) => (
                 <FormItem>
-                  <FormLabel>To Addresses</FormLabel>
+                  <FormLabel>To addresses</FormLabel>
                   <FormControl>
                     <Input
                       {...field}
@@ -863,6 +885,107 @@ export function ProviderForm({
           </div>
         )}
 
+        {providerType === 'telegram' && (
+          <div className="space-y-6">
+            <div className="space-y-2">
+              <h3 className="text-sm font-medium leading-none">Telegram bot</h3>
+              <p className="text-sm text-muted-foreground">
+                Sends each notification as a message from your bot, with its
+                severity, details and a link back to Temps. Create a bot with{' '}
+                <a
+                  href="https://t.me/BotFather"
+                  target="_blank"
+                  rel="noreferrer"
+                  className="underline underline-offset-2"
+                >
+                  @BotFather
+                </a>
+                , then add it to the group or channel (or start a chat with it)
+                so it is allowed to post there.
+              </p>
+            </div>
+
+            <FormField
+              control={form.control}
+              name="config.bot_token"
+              render={({ field }) => (
+                <FormItem>
+                  <FormLabel>Bot token</FormLabel>
+                  <FormControl>
+                    <RevealableInput
+                      key={`${revealScopeKey}:bot_token`}
+                      fieldPath="bot_token"
+                      value={field.value}
+                      onChange={field.onChange}
+                      onRevealCredential={onRevealCredential}
+                      type="password"
+                      placeholder="123456789:AA…"
+                      autoComplete="off"
+                    />
+                  </FormControl>
+                  <FormDescription>
+                    The token @BotFather gives you. It is stored encrypted.
+                  </FormDescription>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <FormField
+                control={form.control}
+                name="config.chat_id"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>Chat ID</FormLabel>
+                    <FormControl>
+                      <Input
+                        {...field}
+                        value={field.value ?? ''}
+                        placeholder="-1001234567890"
+                        autoComplete="off"
+                      />
+                    </FormControl>
+                    <FormDescription>
+                      A user, group or channel ID (groups and channels start
+                      with -100), or a public @channelusername
+                    </FormDescription>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+
+              <FormField
+                control={form.control}
+                name="config.message_thread_id"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>Topic ID (optional)</FormLabel>
+                    <FormControl>
+                      <NumberInput
+                        name={field.name}
+                        ref={field.ref}
+                        onBlur={field.onBlur}
+                        placeholder="42"
+                        inputMode="numeric"
+                        onValueChange={(value) =>
+                          field.onChange(value ?? Number.NaN)
+                        }
+                        value={field.value}
+                      />
+                    </FormControl>
+                    <FormDescription>
+                      For forum-style groups: the topic to post in. Leave empty
+                      for the General topic or a regular chat.
+                    </FormDescription>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+            </div>
+          </div>
+        )}
+
         {!hideSubmit && (
           <div className="flex justify-end pt-2">
             <Button type="submit" disabled={isLoading}>
@@ -870,7 +993,7 @@ export function ProviderForm({
                 ? 'Saving...'
                 : isEdit
                   ? 'Update Provider'
-                  : 'Add Provider'}
+                  : 'Add provider'}
             </Button>
           </div>
         )}

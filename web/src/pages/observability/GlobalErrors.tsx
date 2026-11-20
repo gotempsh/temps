@@ -4,8 +4,11 @@
 import { number } from '@/lib/global-observability'
 import { useGlobalView } from '@/hooks/useGlobalView'
 import { Link } from 'react-router'
-import { useQuery } from '@tanstack/react-query'
-import { listGlobalErrorGroupsOptions } from '@/api/client/@tanstack/react-query.gen'
+import {
+  listGlobalErrorGroupsOptions,
+  listGlobalErrorGroupsQueryKey,
+} from '@/api/client/@tanstack/react-query.gen'
+import { queryKeyPrefix } from '@/lib/refresh'
 import {
   GlobalPage,
   GlobalPagination,
@@ -23,6 +26,10 @@ import {
 import { Badge } from '@/components/ui/badge'
 import { TimeAgo } from '@/components/utils/TimeAgo'
 import { OBSERVABILITY_PAGE_SIZE } from '@/lib/global-observability'
+import { FixErrorWithAgentButton } from '@/components/ai/FixErrorWithAgentButton'
+import { offersFixInList } from '@/components/ai/fix-error-with-agent'
+import { useGlobalPageInRange } from '@/hooks/useGlobalView'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
 
 export default function GlobalErrors() {
   const view = useGlobalView()
@@ -31,7 +38,7 @@ export default function GlobalErrors() {
   )
     ? view.params.get('status')!
     : 'all'
-  const query = useQuery({
+  const query = useWindowQuery({
     ...listGlobalErrorGroupsOptions({
       query: {
         project_id: view.projectId,
@@ -45,13 +52,21 @@ export default function GlobalErrors() {
     }),
     retry: false,
   })
+  useGlobalPageInRange(
+    view,
+    query.data && !query.isPlaceholderData
+      ? {
+          rows: query.data.data.length,
+          total: query.data.pagination.total_count,
+        }
+      : undefined
+  )
   return (
     <GlobalPage
       title="Errors"
-      description="Review application issues across your projects. Event and user counts cover the selected time range."
+      description="Review application issues across your services. Event and user counts cover the selected time range."
       view={view}
-      fetching={query.isFetching}
-      refresh={() => void query.refetch()}
+      refreshQueryKeys={[queryKeyPrefix(listGlobalErrorGroupsQueryKey)]}
       searchLabel="Search errors"
       filters={
         <FilterSelect
@@ -81,7 +96,7 @@ export default function GlobalErrors() {
             <TableHeader>
               <TableRow>
                 <TableHead>Issue</TableHead>
-                <TableHead className="hidden md:table-cell">Project</TableHead>
+                <TableHead className="hidden md:table-cell">Service</TableHead>
                 <TableHead>Status</TableHead>
                 <TableHead className="text-right">Events</TableHead>
                 <TableHead className="hidden md:table-cell text-right">
@@ -89,6 +104,9 @@ export default function GlobalErrors() {
                 </TableHead>
                 <TableHead className="hidden md:table-cell">
                   Last seen
+                </TableHead>
+                <TableHead>
+                  <span className="sr-only">Actions</span>
                 </TableHead>
               </TableRow>
             </TableHeader>
@@ -100,7 +118,8 @@ export default function GlobalErrors() {
                       {issue.project_name}
                     </p>
                     <Link
-                      className="font-medium hover:underline break-words"
+                      className="line-clamp-2 font-medium break-words hover:underline"
+                      title={issue.title}
                       to={`/projects/${encodeURIComponent(issue.project_slug)}/errors/${issue.id}`}
                     >
                       {issue.title}
@@ -130,10 +149,40 @@ export default function GlobalErrors() {
                     {number(issue.events_in_range)}
                   </TableCell>
                   <TableCell className="hidden md:table-cell text-right tabular-nums">
-                    {number(issue.affected_users)}
+                    {/* Users are linked visitors; a server-side error with
+                        none says nothing about how many people it hit. */}
+                    {issue.affected_users > 0 ? (
+                      number(issue.affected_users)
+                    ) : (
+                      <span
+                        className="text-muted-foreground"
+                        title="No visitor is linked to these events"
+                      >
+                        —
+                      </span>
+                    )}
                   </TableCell>
                   <TableCell className="hidden md:table-cell">
                     <TimeAgo date={issue.last_seen} />
+                  </TableCell>
+                  <TableCell className="text-right">
+                    {/* Every error opens Agents in its own service, so the
+                        agent reads the right project's code and events. */}
+                    {offersFixInList(issue.status) && (
+                      <FixErrorWithAgentButton
+                        error={{
+                          id: issue.id,
+                          title: issue.title,
+                          error_type: issue.error_type,
+                          environment_name: issue.environment_name,
+                          project: {
+                            id: issue.project_id,
+                            slug: issue.project_slug,
+                            name: issue.project_name,
+                          },
+                        }}
+                      />
+                    )}
                   </TableCell>
                 </TableRow>
               ))}

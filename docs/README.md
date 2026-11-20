@@ -2,6 +2,9 @@
 
 These docs are rendered at [temps.sh/docs](https://temps.sh/docs).
 
+Start with [What Temps supports](capabilities/page.mdx): platforms, server
+layouts, upgrades, backups and observability on one page.
+
 The documentation uses MDX (Markdown + JSX) and is pulled into the
 [temps-landing](https://github.com/gotempsh/temps-landing-new) site at build time.
 
@@ -14,4 +17,10 @@ The documentation uses MDX (Markdown + JSX) and is pulled into the
 
 ## Feature configuration
 
+- [Background workers and deployment health probes](deploy/docker-containers/page.mdx#background-workers)
 - [Docker Compose security exceptions](features/compose-security-policies.md)
+
+## Architecture proposals
+
+- [Distributed runtime health and worker uptime](adr/053-distributed-runtime-health-and-worker-uptime.md)
+  (in progress; engine foundations, single-host and Docker-free control-plane design)

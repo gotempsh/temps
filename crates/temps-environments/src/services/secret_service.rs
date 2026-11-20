@@ -314,6 +314,34 @@ impl SecretService {
             .collect()
     }
 
+    /// Soft-deleted environments of `project_id` that `secret_id` is still
+    /// bound to, ordered by id.
+    ///
+    /// A deleted environment is restored when one is created again for the
+    /// same branch, and keeps its secret bindings so it gets its secrets
+    /// back. Updates leave these bindings in place rather than replacing
+    /// them: a secret with no bindings is mounted in every environment, so
+    /// dropping them would widen a secret scoped only to deleted environments
+    /// to every environment, production included.
+    async fn bound_deleted_environments(
+        txn: &DatabaseTransaction,
+        project_id: i32,
+        secret_id: i32,
+    ) -> Result<Vec<environments::Model>, SecretError> {
+        let bindings = secret_environments::Entity::find()
+            .filter(secret_environments::Column::SecretId.eq(secret_id))
+            .find_also_related(environments::Entity)
+            .filter(environments::Column::ProjectId.eq(project_id))
+            .filter(environments::Column::DeletedAt.is_not_null())
+            .order_by_asc(environments::Column::Id)
+            .all(txn)
+            .await?;
+        Ok(bindings
+            .into_iter()
+            .filter_map(|(_, environment)| environment)
+            .collect())
+    }
+
     /// Serialize and validate one key's scope. Empty bindings mean project-wide,
     /// so they overlap every scoped secret with the same key.
     async fn claim_key_scope(
@@ -599,17 +627,39 @@ impl SecretService {
                 let compose_services = compose_services.clone();
                 Box::pin(async move {
                     let row = Self::lock_for_write(txn, project_id, secret_id).await?;
+                    // Bindings to deleted environments survive the update
+                    // (see `bound_deleted_environments`). Their ids may come
+                    // back from a client that echoes the secret's current
+                    // environments; treat them as "keep as-is". Any other
+                    // deleted or foreign id is still rejected below.
+                    let preserved_environments =
+                        Self::bound_deleted_environments(txn, project_id, secret_id).await?;
+                    let preserved_ids = preserved_environments
+                        .iter()
+                        .map(|environment| environment.id)
+                        .collect::<Vec<_>>();
+                    let requested_ids = environment_ids
+                        .into_iter()
+                        .filter(|environment_id| !preserved_ids.contains(environment_id))
+                        .collect::<Vec<_>>();
                     let scoped_environments =
-                        Self::environments_in_project(txn, project_id, &environment_ids).await?;
+                        Self::environments_in_project(txn, project_id, &requested_ids).await?;
                     let environment_ids = scoped_environments
                         .iter()
                         .map(|environment| environment.id)
+                        .collect::<Vec<_>>();
+                    // The scope the secret ends up with, preserved bindings
+                    // included: what collisions and history are judged on.
+                    let final_environment_ids = environment_ids
+                        .iter()
+                        .chain(preserved_ids.iter())
+                        .copied()
                         .collect::<Vec<_>>();
                     Self::claim_key_scope(
                         txn,
                         project_id,
                         &row.key,
-                        &environment_ids,
+                        &final_environment_ids,
                         Some(secret_id),
                     )
                     .await?;
@@ -637,12 +687,24 @@ impl SecretService {
                     active.updated_at = Set(chrono::Utc::now());
                     let row = active.update(txn).await?;
 
-                    secret_environments::Entity::delete_many()
-                        .filter(secret_environments::Column::SecretId.eq(secret_id))
-                        .exec(txn)
-                        .await?;
+                    let mut replaced_bindings = secret_environments::Entity::delete_many()
+                        .filter(secret_environments::Column::SecretId.eq(secret_id));
+                    if !preserved_ids.is_empty() {
+                        replaced_bindings = replaced_bindings.filter(
+                            secret_environments::Column::EnvironmentId
+                                .is_not_in(preserved_ids.iter().copied()),
+                        );
+                    }
+                    replaced_bindings.exec(txn).await?;
 
-                    let mut envs = Vec::new();
+                    let mut envs = preserved_environments
+                        .into_iter()
+                        .map(|env| SecretEnvironmentRef {
+                            id: env.id,
+                            name: env.name,
+                            main_url: env.subdomain,
+                        })
+                        .collect::<Vec<_>>();
                     for (env_id, env) in environment_ids.iter().zip(scoped_environments) {
                         let junction = secret_environments::ActiveModel {
                             secret_id: Set(row.id),
@@ -680,7 +742,7 @@ impl SecretService {
                     if let Some(details) = scope_change(
                         previous_environments,
                         previous_services,
-                        &environment_ids,
+                        &final_environment_ids,
                         &compose_services,
                     ) {
                         secret_history::ActiveModel {
@@ -1204,8 +1266,8 @@ mod integration_tests {
     use super::*;
     use chrono::Utc;
     use std::time::Duration;
-    use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
     use temps_entities::{preset::Preset, projects, upstream_config::UpstreamList};
+    use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
 
     const ENCRYPTION_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -1854,6 +1916,129 @@ mod integration_tests {
             .into_iter()
             .map(|entry| entry.kind)
             .collect()
+    }
+
+    async fn bound_environment_ids(test_db: &TestDatabase, secret_id: i32) -> Vec<i32> {
+        secret_environments::Entity::find()
+            .filter(secret_environments::Column::SecretId.eq(secret_id))
+            .order_by_asc(secret_environments::Column::EnvironmentId)
+            .all(test_db.connection())
+            .await
+            .expect("bindings should load")
+            .into_iter()
+            .map(|binding| binding.environment_id)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn update_of_secret_bound_to_deleted_environment_keeps_the_binding() {
+        let Some(test_db) = test_database().await else {
+            return;
+        };
+        let service = secret_service(&test_db);
+        let project = create_project(&test_db, "deleted-binding").await;
+        let live = create_environment(&test_db, project.id, "deleted-binding-live").await;
+        let removed = create_environment(&test_db, project.id, "deleted-binding-removed").await;
+        let secret = create_secret(&service, project.id, vec![removed.id], "SCOPED", "value")
+            .await
+            .expect("secret fixture should insert");
+        soft_delete_environment(test_db.connection_arc(), removed.id).await;
+
+        // Echoing the stale id back (as a client that re-sends the current
+        // scope does) is accepted, keeps the binding and is not a scope change.
+        let updated = service
+            .update(
+                project.id,
+                secret.id,
+                Some("rotated".into()),
+                vec![removed.id],
+                false,
+                Vec::new(),
+            )
+            .await
+            .expect("a stale id for a bound deleted environment must not block the save");
+        assert_eq!(
+            updated
+                .environments
+                .iter()
+                .map(|e| e.id)
+                .collect::<Vec<_>>(),
+            vec![removed.id]
+        );
+        assert_eq!(
+            bound_environment_ids(&test_db, secret.id).await,
+            vec![removed.id]
+        );
+        assert_eq!(
+            secret_history_kinds(&test_db, secret.id).await,
+            vec!["created", "value_changed"]
+        );
+
+        // Clearing the selection must not drop the deleted binding: with no
+        // bindings left the secret would be mounted in every environment.
+        service
+            .update(project.id, secret.id, None, vec![], false, Vec::new())
+            .await
+            .expect("clearing the live selection should succeed");
+        assert_eq!(
+            bound_environment_ids(&test_db, secret.id).await,
+            vec![removed.id]
+        );
+
+        // A live environment is added next to it, not instead of it.
+        service
+            .update(
+                project.id,
+                secret.id,
+                None,
+                vec![live.id],
+                false,
+                Vec::new(),
+            )
+            .await
+            .expect("adding a live environment should succeed");
+        let mut expected = vec![live.id, removed.id];
+        expected.sort();
+        assert_eq!(bound_environment_ids(&test_db, secret.id).await, expected);
+    }
+
+    #[tokio::test]
+    async fn update_rejects_environment_from_another_project() {
+        let Some(test_db) = test_database().await else {
+            return;
+        };
+        let service = secret_service(&test_db);
+        let project = create_project(&test_db, "foreign-update-owner").await;
+        let other = create_project(&test_db, "foreign-update-other").await;
+        let live = create_environment(&test_db, project.id, "foreign-update-live").await;
+        let foreign = create_environment(&test_db, other.id, "foreign-update-env").await;
+        let secret = create_secret(&service, project.id, vec![live.id], "FOREIGN", "value")
+            .await
+            .expect("secret fixture should insert");
+
+        let error = service
+            .update(
+                project.id,
+                secret.id,
+                None,
+                vec![live.id, foreign.id],
+                false,
+                Vec::new(),
+            )
+            .await
+            .expect_err("another project's environment must be rejected");
+        assert!(
+            matches!(
+                error,
+                SecretError::EnvironmentNotFound { environment_id, project_id }
+                    if environment_id == foreign.id && project_id == project.id
+            ),
+            "unexpected error: {error:?}"
+        );
+        assert_eq!(
+            bound_environment_ids(&test_db, secret.id).await,
+            vec![live.id]
+        );
     }
 
     #[tokio::test]

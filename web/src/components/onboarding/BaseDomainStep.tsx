@@ -68,7 +68,7 @@ export function BaseDomainStep({
   return (
     <div className="space-y-6">
       <div className="text-center space-y-2">
-        <h2 className="text-2xl font-bold">Configure Base Domain</h2>
+        <h2 className="text-2xl font-bold">Configure base domain</h2>
         <p className="text-muted-foreground">
           This domain will be used for all your deployments
         </p>
@@ -93,7 +93,7 @@ export function BaseDomainStep({
 
       <div className="space-y-4">
         <div className="space-y-2">
-          <Label htmlFor="baseDomain">Base Domain</Label>
+          <Label htmlFor="baseDomain">Base domain</Label>
           <div className="relative">
             <Globe className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
             <Input
@@ -119,7 +119,7 @@ export function BaseDomainStep({
               <p className="font-medium">This domain will be used to create:</p>
               <ul className="space-y-1 ml-4">
                 <li>
-                  • Wildcard domain for all projects: *.{value || 'example.com'}
+                  • Wildcard domain for all services: *.{value || 'example.com'}
                 </li>
                 <li>
                   • Preview deployments: *.preview.{value || 'example.com'}
@@ -130,7 +130,7 @@ export function BaseDomainStep({
           </AlertDescription>
         </Alert>
 
-        <Alert className="border-blue-200 bg-blue-50/50 dark:bg-blue-950/20">
+        <Alert className="border-blue-200 dark:border-blue-900 bg-blue-50/50 dark:bg-blue-950/20">
           <Info className="h-4 w-4 text-blue-600" />
           <AlertDescription className="text-sm">
             <strong>Next step:</strong> You&apos;ll need to configure DNS

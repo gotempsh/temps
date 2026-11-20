@@ -10,17 +10,47 @@
 //! deployment provider seeds from a failure diagnosis). Built on the `temps-ai`
 //! foundation; the AI is injected as `Arc<dyn AiService>`.
 
+pub mod application_link;
 pub mod applications;
+pub mod ask_user;
+pub mod attachment_upload_handlers;
+pub mod attachment_uploads;
+pub mod attachments;
 pub mod audit;
+pub mod autofix;
+pub mod autofix_handlers;
+pub mod blueprint;
+pub mod blueprint_handlers;
+pub mod chat_operations;
+pub mod chat_operations_handlers;
+pub mod chat_resources;
+pub mod chat_resources_handlers;
+pub mod compaction;
+pub mod compaction_handlers;
 pub mod git_bindings;
 pub mod git_bindings_handlers;
+pub mod goals;
+pub mod goals_handlers;
 pub mod handlers;
+pub mod harness;
 pub mod pending_actions;
 pub mod plugin;
 pub mod provider;
 pub mod providers;
+pub mod sandbox_deploy;
+pub mod sandbox_files;
+pub mod sandbox_files_handlers;
+pub mod sandbox_link;
+pub mod sandbox_link_handlers;
+pub mod secret_slot_handlers;
+pub mod secret_slots;
 mod sensitive;
 pub mod service;
+pub mod suggestion_handlers;
+pub mod suggestions;
+pub mod thread_kind;
+pub mod usage;
+pub mod workspace_chats;
 
 pub use applications::{ApplicationError, ApplicationService, ApplicationWorkspaceService};
 pub use git_bindings::{GitBindingError, GitBindingService};
@@ -30,6 +60,7 @@ pub use provider::{ConversationContextProvider, ConversationSeed};
 pub use providers::alert::AlertChatProvider;
 pub use providers::api_tools::ApiToolsProvider;
 pub use providers::application::ApplicationChatProvider;
+pub use providers::assistant::{AssistantChatProvider, ASSISTANT_CONTEXT_ID_PREFIX};
 pub use providers::deployment::DeploymentChatProvider;
 pub use providers::global::GlobalChatProvider;
 pub use providers::project::ProjectChatProvider;
@@ -38,12 +69,12 @@ pub use service::{ChatStreamEvent, ConversationService, HarnessMcpError, Pending
 /// Errors from the conversation layer. All map cleanly to HTTP at the handler.
 #[derive(Debug, thiserror::Error)]
 pub enum ChatError {
-    #[error("conversation '{0}' not found")]
-    NotFound(String),
+    #[error("conversation '{conversation_id}' not found")]
+    NotFound { conversation_id: String },
     #[error("project {0} not found")]
     ProjectNotFound(i32),
-    #[error("no AI context provider registered for type '{0}'")]
-    NoProvider(String),
+    #[error("no AI context provider registered for type '{context_type}'")]
+    NoProvider { context_type: String },
     #[error("AI is not configured for this project")]
     AiUnavailable,
     #[error("context not found or not accessible")]
@@ -60,6 +91,19 @@ pub enum ChatError {
     Ai(String),
     #[error("retained AI harness diagnostic for '{purpose}': {reason}")]
     RetainedHarnessDiagnostic { purpose: String, reason: String },
+    /// The provider's reply stream ended before the provider finished it.
+    /// `partial_bytes` is how much text had already been received and kept.
+    #[error(
+        "AI turn '{turn_id}' of conversation {conversation_id} was interrupted: the provider \
+         stream ended before the reply was complete ({partial_bytes} bytes of partial text \
+         kept): {cause}"
+    )]
+    StreamInterrupted {
+        conversation_id: i64,
+        turn_id: String,
+        partial_bytes: usize,
+        cause: String,
+    },
     #[error(transparent)]
     AuthorizationRefresh(#[from] ToolAuthorizationRefreshError),
     #[error("the assistant claimed a proposal was staged without a write-tool receipt")]
@@ -101,8 +145,8 @@ pub enum ToolAuthorizationRefreshError {
     PrincipalInactive,
     #[error("deployment credentials cannot execute conversation tools")]
     UnsupportedCredential,
-    #[error("stored API-key role '{0}' is invalid")]
-    InvalidRole(String),
+    #[error("stored API-key role '{role}' is invalid")]
+    InvalidRole { role: String },
     #[error("stored API-key permissions are invalid")]
     InvalidPermissions,
     #[error("permission to execute in the harness workspace has been revoked")]
@@ -148,6 +192,18 @@ impl ChatError {
                 }
                 failure
             }
+            // The raw cause may carry a provider URL or transport detail, so
+            // it stays in the server log; the browser gets the category.
+            Self::StreamInterrupted { partial_bytes, .. } => PublicChatFailure {
+                code: "provider_stream_interrupted",
+                title: "AI response was interrupted",
+                detail: if *partial_bytes == 0 {
+                    "The AI provider stopped sending the reply before it finished (the connection closed or timed out) and nothing was received. Retry the message.".to_string()
+                } else {
+                    "The AI provider stopped sending the reply before it finished (the connection closed or timed out). The text received so far is kept and marked incomplete. Retry the message to get a full answer.".to_string()
+                },
+                retryable: true,
+            },
             Self::AiUnavailable => PublicChatFailure {
                 code: "ai_not_configured",
                 title: "AI harness unavailable",

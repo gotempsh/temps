@@ -5,7 +5,7 @@ use aws_sdk_s3::Client as S3Client;
 use serde::Deserialize;
 use tokio::io::AsyncReadExt;
 
-use temps_backup_core::engine_v2::BackupError;
+use crate::execution::engine_v2::BackupError;
 
 const WROTE_BACKUP_MARKER: &str = "Wrote backup with name ";
 const MAX_SENTINEL_SIZE_BYTES: usize = 1024 * 1024;

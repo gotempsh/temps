@@ -1,16 +1,19 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { useEnvironmentFilter } from '@/components/project-frame/use-environment-filter'
 import { TimeRangeFilter } from '@/components/ui/time-range-filter'
 
-import { EnvironmentResponse, ProjectResponse, SpanStats } from '@/api/client'
-import {
-  getEnvironmentsOptions,
-  querySpanStatsOptions,
-} from '@/api/client/@tanstack/react-query.gen'
+import { ProjectResponse, SpanStats } from '@/api/client'
+import { querySpanStatsOptions } from '@/api/client/@tanstack/react-query.gen'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
+import { DeploymentRegressionsCard } from '@/components/traces/DeploymentRegressionsCard'
+import {
+  OperationTrendSheet,
+  type TrendTarget,
+} from '@/components/traces/OperationTrendSheet'
 import { EmptyState } from '@/components/ui/empty-state'
 import { Input } from '@/components/ui/input'
 import {
@@ -38,6 +41,13 @@ import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { useDebounce } from '@/hooks/useDebounce'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import {
+  APDEX_THRESHOLD_OPTIONS,
+  DEFAULT_APDEX_THRESHOLD,
+  apdexBreakdown,
+  apdexRating,
+  apdexThresholdFromParam,
+} from '@/lib/apdex'
+import {
   computeTracesTimeWindow,
   type TracesTimeRange,
 } from '@/lib/traces-time-window'
@@ -48,6 +58,7 @@ import {
   Gauge,
   RefreshCw,
   Search,
+  TrendingUp,
   Workflow,
 } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useState } from 'react'
@@ -139,6 +150,41 @@ function tailRatioBadge(ratio: number) {
   return <span className="text-muted-foreground">{label}</span>
 }
 
+/**
+ * Apdex: the share of calls that satisfied users (at or under the threshold),
+ * with tolerating calls (up to four times it) counted half.
+ */
+function apdexCell(row: SpanStats) {
+  if (row.apdex == null) {
+    return <span className="text-muted-foreground">—</span>
+  }
+  const label = row.apdex.toFixed(2)
+  const rating = apdexRating(row.apdex)
+  const breakdown = apdexBreakdown(row)
+  const badge =
+    rating === 'unacceptable' || rating === 'poor' ? (
+      <Badge variant="destructive">{label}</Badge>
+    ) : rating === 'fair' ? (
+      <Badge variant="warning">{label}</Badge>
+    ) : (
+      <span className="text-muted-foreground">{label}</span>
+    )
+  return (
+    <Tooltip>
+      <TooltipTrigger
+        className="cursor-help"
+        aria-label={`Apdex ${label}, ${rating}`}
+      >
+        {badge}
+      </TooltipTrigger>
+      <TooltipContent>
+        {rating[0].toUpperCase() + rating.slice(1)}
+        {breakdown ? `: ${breakdown}` : ''}
+      </TooltipContent>
+    </Tooltip>
+  )
+}
+
 export default function TraceOperations({ project }: TraceOperationsProps) {
   const navigate = useNavigate()
   const [searchParams, setSearchParams] = useSearchParams()
@@ -162,27 +208,32 @@ export default function TraceOperations({ project }: TraceOperationsProps) {
   const [minCount, setMinCount] = useState(
     searchParams.get('min_count') || '10'
   )
-  const [environmentId, setEnvironmentId] = useState(
-    searchParams.get('environment') || 'all'
+  const [apdexThreshold, setApdexThreshold] = useState(() =>
+    apdexThresholdFromParam(searchParams.get('apdex'))
   )
+  // The project bar picks the environment.
+  const [environmentFilter] = useEnvironmentFilter()
+  const environmentId =
+    environmentFilter === undefined ? 'all' : String(environmentFilter)
   const [search, setSearch] = useState(searchParams.get('q') || '')
   const [page, setPage] = useState(1)
+  const [listedEnvironment, setListedEnvironment] = useState(environmentId)
+  if (listedEnvironment !== environmentId) {
+    setListedEnvironment(environmentId)
+    setPage(1)
+  }
   // Bumping this recomputes the relative window against a fresh `now`; freezing
   // it at mount would silently exclude everything ingested since page load.
   const [refreshKey, setRefreshKey] = useState(0)
 
   const debouncedSearch = useDebounce(search, 300)
+  const [trendTarget, setTrendTarget] = useState<TrendTarget | null>(null)
 
   const timeWindow = useMemo(
     () => computeTracesTimeWindow(timeRange, new Date()),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [timeRange, refreshKey]
   )
-
-  const { data: environments } = useQuery({
-    ...getEnvironmentsOptions({ path: { project_id: project.id } }),
-    enabled: !!project.id,
-  })
 
   const { data, isLoading, isFetching, isError, error, refetch } = useQuery({
     ...querySpanStatsOptions({
@@ -192,6 +243,7 @@ export default function TraceOperations({ project }: TraceOperationsProps) {
         end_time: timeWindow.endTime,
         sort_by: sortBy,
         min_count: Number(minCount),
+        apdex_threshold_ms: Number(apdexThreshold),
         ...(debouncedSearch ? { name_pattern: debouncedSearch } : {}),
         ...(environmentId !== 'all'
           ? { environment_id: Number(environmentId) }
@@ -241,11 +293,11 @@ export default function TraceOperations({ project }: TraceOperationsProps) {
     },
     [updateParam]
   )
-  const handleEnvironmentChange = useCallback(
+
+  const handleApdexChange = useCallback(
     (v: string) => {
-      setEnvironmentId(v)
-      setPage(1)
-      updateParam('environment', v, 'all')
+      setApdexThreshold(v)
+      updateParam('apdex', v, DEFAULT_APDEX_THRESHOLD)
     },
     [updateParam]
   )
@@ -284,7 +336,7 @@ export default function TraceOperations({ project }: TraceOperationsProps) {
             onClick={() => navigate(`/projects/${project.slug}/traces`)}
           >
             <Workflow className="h-3.5 w-3.5" />
-            <span className="hidden sm:inline">All Traces</span>
+            <span className="max-sm:sr-only">All Traces</span>
           </Button>
           {totalCount > 0 && (
             <span className="text-sm text-muted-foreground">
@@ -328,24 +380,21 @@ export default function TraceOperations({ project }: TraceOperationsProps) {
               </SelectContent>
             </Select>
 
-            {environments && environments.length > 0 && (
-              <Select
-                value={environmentId}
-                onValueChange={handleEnvironmentChange}
+            <Select value={apdexThreshold} onValueChange={handleApdexChange}>
+              <SelectTrigger
+                className="w-full sm:w-[190px]"
+                aria-label="Apdex threshold"
               >
-                <SelectTrigger className="w-full sm:w-[180px]">
-                  <SelectValue placeholder="Environment" />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="all">All Environments</SelectItem>
-                  {environments.map((env: EnvironmentResponse) => (
-                    <SelectItem key={env.id} value={String(env.id)}>
-                      {env.name}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            )}
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {APDEX_THRESHOLD_OPTIONS.map((value) => (
+                  <SelectItem key={value} value={value}>
+                    Satisfied under {formatMs(Number(value))}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
 
             <div className="relative flex-1 sm:min-w-[220px]">
               <Search className="absolute left-2.5 top-2.5 h-3.5 w-3.5 text-muted-foreground" />
@@ -367,6 +416,15 @@ export default function TraceOperations({ project }: TraceOperationsProps) {
           )}
         </CardContent>
       </Card>
+
+      <DeploymentRegressionsCard
+        projectId={project.id}
+        projectSlug={project.slug}
+        environmentId={
+          environmentId !== 'all' ? Number(environmentId) : undefined
+        }
+        onOpenTrend={setTrendTarget}
+      />
 
       {/* Results */}
       <Card>
@@ -412,7 +470,7 @@ export default function TraceOperations({ project }: TraceOperationsProps) {
                     size="sm"
                     onClick={() => navigate(`/projects/${project.slug}/traces`)}
                   >
-                    Go to Traces
+                    Go to traces
                   </Button>
                 }
               />
@@ -446,6 +504,22 @@ export default function TraceOperations({ project }: TraceOperationsProps) {
                           if its average looks fine.
                         </TooltipContent>
                       </Tooltip>
+                    </TableHead>
+                    <TableHead className="text-right">
+                      <Tooltip>
+                        <TooltipTrigger className="cursor-help underline decoration-dotted underline-offset-4">
+                          Apdex
+                        </TooltipTrigger>
+                        <TooltipContent>
+                          User satisfaction from 0 to 1: calls under{' '}
+                          {formatMs(Number(apdexThreshold))} count fully, calls
+                          up to four times that count half, slower calls not at
+                          all.
+                        </TooltipContent>
+                      </Tooltip>
+                    </TableHead>
+                    <TableHead className="w-10">
+                      <span className="sr-only">Trend</span>
                     </TableHead>
                   </TableRow>
                 </TableHeader>
@@ -501,6 +575,26 @@ export default function TraceOperations({ project }: TraceOperationsProps) {
                       <TableCell className="text-right tabular-nums">
                         {tailRatioBadge(row.tail_ratio)}
                       </TableCell>
+                      <TableCell className="text-right tabular-nums">
+                        {apdexCell(row)}
+                      </TableCell>
+                      <TableCell className="w-10 p-1">
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          aria-label={`Trend of ${row.span_name}`}
+                          title="Latency over 14 days, and where the time goes"
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            setTrendTarget({
+                              serviceName: row.service_name,
+                              spanName: row.span_name,
+                            })
+                          }}
+                        >
+                          <TrendingUp className="h-4 w-4" />
+                        </Button>
+                      </TableCell>
                     </TableRow>
                   ))}
                 </TableBody>
@@ -509,6 +603,13 @@ export default function TraceOperations({ project }: TraceOperationsProps) {
           )}
         </CardContent>
       </Card>
+
+      <OperationTrendSheet
+        projectId={project.id}
+        projectSlug={project.slug}
+        target={trendTarget}
+        onClose={() => setTrendTarget(null)}
+      />
 
       {/* Pagination */}
       {totalPages > 1 && (

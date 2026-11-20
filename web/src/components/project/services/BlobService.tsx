@@ -1,3 +1,4 @@
+import { PageTitle } from '@temps-sdk/ds'
 import { CodeBlock, HighlightedCode } from '@/components/ui/code-block'
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
@@ -50,7 +51,7 @@ export function BlobService({ project: _project }: BlobServiceProps) {
   useEffect(() => {
     setBreadcrumbs([
       { label: 'Databases', href: `../storage` },
-      { label: 'Blob Storage' },
+      { label: 'Blob storage' },
     ])
   }, [setBreadcrumbs])
 
@@ -65,9 +66,9 @@ export function BlobService({ project: _project }: BlobServiceProps) {
               <HardDrive className="h-6 w-6 text-primary" />
             </div>
             <div>
-              <h1 className="text-xl font-semibold sm:text-2xl">
-                Blob Storage
-              </h1>
+              <PageTitle className="text-xl font-semibold sm:text-2xl">
+                Blob storage
+              </PageTitle>
               <p className="text-muted-foreground text-sm">
                 S3-compatible file storage
               </p>
@@ -97,7 +98,9 @@ export function BlobService({ project: _project }: BlobServiceProps) {
             <HardDrive className="h-6 w-6 text-primary" />
           </div>
           <div className="min-w-0">
-            <h1 className="text-xl font-semibold sm:text-2xl">Blob Storage</h1>
+            <PageTitle className="text-xl font-semibold sm:text-2xl">
+              Blob storage
+            </PageTitle>
             <p className="text-muted-foreground text-sm">
               Upload, list, and serve files with a simple S3-backed API
             </p>
@@ -123,16 +126,13 @@ export function BlobService({ project: _project }: BlobServiceProps) {
 
       <Tabs defaultValue="overview" className="space-y-6">
         <TabsList>
-          <TabsTrigger value="overview" className="gap-2">
-            <Settings2 className="h-4 w-4" />
+          <TabsTrigger value="overview" icon={Settings2}>
             Overview
           </TabsTrigger>
-          <TabsTrigger value="docs" className="gap-2">
-            <BookOpen className="h-4 w-4" />
+          <TabsTrigger value="docs" icon={BookOpen}>
             Documentation
           </TabsTrigger>
-          <TabsTrigger value="examples" className="gap-2">
-            <Terminal className="h-4 w-4" />
+          <TabsTrigger value="examples" icon={Terminal}>
             Examples
           </TabsTrigger>
         </TabsList>
@@ -140,9 +140,9 @@ export function BlobService({ project: _project }: BlobServiceProps) {
         <TabsContent value="overview" className="space-y-6">
           <Card>
             <CardHeader>
-              <CardTitle>Service Status</CardTitle>
+              <CardTitle>Service status</CardTitle>
               <CardDescription>
-                Cluster-wide status of Blob Storage. Once enabled, every project
+                Cluster-wide status of Blob storage. Once enabled, every service
                 on this instance can store files through the SDK below.
               </CardDescription>
             </CardHeader>
@@ -153,7 +153,7 @@ export function BlobService({ project: _project }: BlobServiceProps) {
                     <div className="p-4 rounded-lg border bg-muted/30">
                       <p className="text-sm text-muted-foreground">Status</p>
                       <p
-                        className={`font-medium flex items-center gap-1.5 mt-1 ${status?.healthy ? 'text-green-600' : 'text-red-600'}`}
+                        className={`font-medium flex items-center gap-1.5 mt-1 ${status?.healthy ? 'text-green-700 dark:text-green-600' : 'text-red-700 dark:text-red-600'}`}
                       >
                         {status?.healthy ? (
                           <CheckCircle2 className="h-4 w-4" />
@@ -171,7 +171,7 @@ export function BlobService({ project: _project }: BlobServiceProps) {
                     </div>
                     <div className="p-4 rounded-lg border bg-muted/30">
                       <p className="text-sm text-muted-foreground">
-                        Docker Image
+                        Docker image
                       </p>
                       <p className="font-medium mt-1 font-mono text-xs break-all">
                         {status?.docker_image || 'Not reported'}
@@ -181,7 +181,7 @@ export function BlobService({ project: _project }: BlobServiceProps) {
                   <Button variant="outline" asChild>
                     <Link to="/storage?tab=platform" className="gap-2">
                       <ExternalLink className="h-4 w-4" />
-                      Manage in Storage Settings
+                      Manage in storage settings
                     </Link>
                   </Button>
                 </div>
@@ -189,18 +189,18 @@ export function BlobService({ project: _project }: BlobServiceProps) {
                 <div className="space-y-4">
                   <Alert>
                     <Info className="h-4 w-4" />
-                    <AlertTitle>Blob Storage is not enabled</AlertTitle>
+                    <AlertTitle>Blob storage is not enabled</AlertTitle>
                     <AlertDescription>
                       An administrator must enable the Blob service from{' '}
-                      <strong>Storage Settings → Platform Services</strong>.
-                      Once enabled, the SDK on the Documentation tab works out
-                      of the box — no further per-project setup needed.
+                      <strong>Databases → Platform services</strong>. Once
+                      enabled, the SDK on the Documentation tab works out of the
+                      box — no further per-service setup needed.
                     </AlertDescription>
                   </Alert>
                   <Button asChild>
                     <Link to="/storage?tab=platform" className="gap-2">
                       <ExternalLink className="h-4 w-4" />
-                      Enable in Storage Settings
+                      Enable in Platform services
                     </Link>
                   </Button>
                 </div>
@@ -305,7 +305,7 @@ TEMPS_PROJECT_ID=42`}
                   language="bash"
                 />
                 <p className="text-sm text-muted-foreground">
-                  Need an isolated client (multiple projects, custom timeouts,
+                  Need an isolated client (multiple services, custom timeouts,
                   testing)? Use{' '}
                   <code className="bg-muted px-1.5 py-0.5 rounded text-xs">
                     createClient
@@ -325,7 +325,7 @@ const storage = createClient({
               </div>
 
               <div className="space-y-4">
-                <h3 className="font-medium">API Reference</h3>
+                <h3 className="font-medium">API reference</h3>
 
                 <ApiMethod
                   name="put"
@@ -335,15 +335,11 @@ const storage = createClient({
   body: BlobBody,
   options?: {
     contentType?: string         // override auto-detection
-    addRandomSuffix?: boolean    // default: true — prevents collisions
-    cacheControl?: string        // Cache-Control header
-    contentEncoding?: string     // e.g., 'gzip'
-    contentDisposition?: string  // e.g., 'attachment; filename="x.txt"'
+    addRandomSuffix?: boolean    // default: false — set true to prevent collisions
   },
 ): Promise<BlobInfo>`}
                   example={`const result = await blob.put('images/avatar.png', imageBuffer, {
   contentType: 'image/png',
-  cacheControl: 'public, max-age=31536000, immutable',
 })
 
 console.log(result.url)         // https://your-instance.temps.dev/api/blob/...
@@ -437,7 +433,7 @@ console.log(snapshot.url)`}
                 <CodeBlock
                   code={`interface BlobInfo {
   url: string         // Full URL to access the blob
-  pathname: string    // Path within project storage
+  pathname: string    // Path within service storage
   contentType: string // MIME type (e.g., 'image/png')
   size: number        // Size in bytes
   uploadedAt: string  // ISO 8601 timestamp
@@ -487,7 +483,7 @@ try {
         <TabsContent value="examples" className="space-y-6">
           <Card>
             <CardHeader>
-              <CardTitle>Usage Patterns</CardTitle>
+              <CardTitle>Usage patterns</CardTitle>
               <CardDescription>
                 Battle-tested recipes for common file storage workflows.
               </CardDescription>
@@ -517,7 +513,6 @@ export async function POST(request: Request) {
     {
       contentType: file.type,
       addRandomSuffix: false,
-      cacheControl: 'public, max-age=31536000, immutable',
     },
   )
 
@@ -561,7 +556,6 @@ async function uploadAsset(filePath: string) {
 
   const { url } = await blob.put(\`assets/\${hash}.\${ext}\`, content, {
     addRandomSuffix: false,
-    cacheControl: 'public, max-age=31536000, immutable',
   })
 
   return url
@@ -673,7 +667,10 @@ function ApiMethod({
       </div>
       <div>
         <p className="text-xs text-muted-foreground mb-1">Signature</p>
-        <pre className="bg-muted rounded px-2 py-1 text-xs font-mono overflow-x-auto whitespace-pre-wrap">
+        <pre
+          tabIndex={0}
+          className="bg-muted rounded px-2 py-1 text-xs font-mono overflow-x-auto whitespace-pre-wrap"
+        >
           <HighlightedCode code={signature} language="typescript" />
         </pre>
       </div>

@@ -21,6 +21,7 @@ import {
   listSourceBackups,
   runBackupForSource,
   runExternalServiceBackup,
+  externalServiceBackupPreflight,
 } from '../../api/sdk.gen.js'
 import type { BackupScheduleResponse, BackupResponse, S3SourceResponse, SourceBackupEntry } from '../../api/types.gen.js'
 import { withSpinner } from '../../ui/spinner.js'
@@ -133,6 +134,8 @@ interface RunServiceBackupOptions {
   id: string
   s3SourceId: string
   type?: string
+  /** Acknowledge in advance that the backup may restart the database. */
+  confirmRestart?: boolean
 }
 
 type ScheduleAutomationInput = {
@@ -332,6 +335,10 @@ export function registerBackupsCommands(program: Command): void {
     .requiredOption('--id <id>', 'External service ID')
     .requiredOption('--s3-source-id <id>', 'S3 source ID to store the backup')
     .option('-t, --type <type>', 'Backup type (e.g., full, incremental)')
+    .option(
+      '--confirm-restart',
+      'Allow the backup to restart the database (PostgreSQL with WAL archiving off restarts once to turn it on)',
+    )
     .action(runServiceBackup)
 }
 
@@ -941,6 +948,27 @@ async function runServiceBackup(options: RunServiceBackupOptions): Promise<void>
     return
   }
 
+  // The first WAL-G backup of a PostgreSQL service with archiving off
+  // restarts it; the server refuses that unless it is acknowledged.
+  const consent = await resolveRestartConsent({
+    confirmFlag: options.confirmRestart === true,
+    isTTY: process.stdin.isTTY === true,
+    warn: (message) => warning(message),
+    loadPreflight: async () =>
+      (await externalServiceBackupPreflight({ client, path: { id } })).data,
+    prompt: () =>
+      promptConfirm({
+        message: 'Restart the database and run the backup?',
+        default: false,
+      }),
+  })
+  if (consent.kind === 'abort') {
+    info(consent.message)
+    if (consent.exitCode !== 0) process.exitCode = consent.exitCode
+    return
+  }
+  const confirmRestart = consent.confirmRestart
+
   const backup = await withSpinner('Triggering external service backup...', async () => {
     const { data, error } = await runExternalServiceBackup({
       client,
@@ -948,6 +976,7 @@ async function runServiceBackup(options: RunServiceBackupOptions): Promise<void>
       body: {
         s3_source_id: s3SourceId,
         backup_type: options.type || null,
+        confirm_restart: confirmRestart ? true : null,
       },
     })
     if (error) {
@@ -957,6 +986,9 @@ async function runServiceBackup(options: RunServiceBackupOptions): Promise<void>
   })
 
   success(`Backup started for external service #${options.id}`)
+  if (backup.restarts_database) {
+    warning('The database restarts first to turn on WAL archiving')
+  }
   info(`Backup ID: ${backup.backup_id}`)
   info(`State: ${backup.state}`)
   info(`S3 Location: ${backup.s3_location}`)
@@ -1177,6 +1209,49 @@ async function cleanupBackups(options: CleanupBackupsOptions): Promise<void> {
 }
 
 // Helpers
+
+/** What `run-service` should do about a backup that may restart the database. */
+export type RestartConsent =
+  | { kind: 'proceed'; confirmRestart: boolean }
+  | { kind: 'abort'; message: string; exitCode: 0 | 1 }
+
+/**
+ * Decide whether `run-service` may start a backup that restarts the
+ * database (#1415): `--confirm-restart` proceeds without asking; otherwise
+ * the run preflight decides, an interactive terminal is asked, and a
+ * non-interactive one stops with a non-zero exit instead of sending the
+ * request. When the preflight cannot be read the request is sent without
+ * confirmation; the server still refuses an unacknowledged restart (409).
+ * The preflight's reason is given to `warn` before anything is asked, so the
+ * operator answers knowing why (including that the backup will be refused).
+ */
+export async function resolveRestartConsent(deps: {
+  confirmFlag: boolean
+  isTTY: boolean
+  loadPreflight: () => Promise<{ restarts_database: boolean; reason?: string | null } | undefined>
+  prompt: () => Promise<boolean>
+  warn: (message: string) => void
+}): Promise<RestartConsent> {
+  if (deps.confirmFlag) {
+    return { kind: 'proceed', confirmRestart: true }
+  }
+  const preflight = await deps.loadPreflight()
+  if (!preflight?.restarts_database) {
+    return { kind: 'proceed', confirmRestart: false }
+  }
+  deps.warn(preflight.reason || 'This backup restarts the database.')
+  if (!deps.isTTY) {
+    return {
+      kind: 'abort',
+      message: 'Nothing was started. Re-run with --confirm-restart to proceed.',
+      exitCode: 1,
+    }
+  }
+  if (await deps.prompt()) {
+    return { kind: 'proceed', confirmRestart: true }
+  }
+  return { kind: 'abort', message: 'Backup not started', exitCode: 0 }
+}
 
 export function parseCleanupScheduleId(value?: string): number | undefined {
   if (!value) return undefined

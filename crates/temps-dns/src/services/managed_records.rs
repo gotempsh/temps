@@ -99,6 +99,10 @@ pub struct OwnershipScope {
     pub project_id: Option<i32>,
     pub environment_id: Option<i32>,
     pub controller: Option<&'static str>,
+    /// The run writing the record, for a workflow with runs (ADR 064).
+    /// Stamped into the marker it writes; never part of [`Self::permits`]:
+    /// any run of the same scope may change what an earlier one wrote.
+    pub run_id: Option<i32>,
 }
 
 impl OwnershipScope {
@@ -110,6 +114,7 @@ impl OwnershipScope {
             project_id: None,
             environment_id: None,
             controller: Some(controller),
+            run_id: None,
         }
     }
 
@@ -144,6 +149,7 @@ impl OwnershipScope {
             project_id: self.project_id.or(existing.project_id),
             environment_id: self.environment_id.or(existing.environment_id),
             controller: self.controller,
+            run_id: self.run_id,
         }
     }
 
@@ -190,6 +196,72 @@ pub enum RecordOwnership {
     RegistryConflict,
 }
 
+/// One provider record and its owner, as read just now.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RecordSnapshot {
+    pub provider_id: i32,
+    /// The provider's id for the record.
+    pub record_id: Option<String>,
+    pub record_type: String,
+    /// The record's value, canonical (`203.0.113.7`, `origin.example.net`).
+    pub content: String,
+    /// When the provider says it last changed, where it says.
+    pub modified_on: Option<String>,
+    /// This install's signed marker covers it.
+    pub managed: bool,
+    pub controller: Option<String>,
+    pub project_id: Option<i32>,
+    pub environment_id: Option<i32>,
+    /// The run that last wrote it, from its marker.
+    pub run_id: Option<i32>,
+    /// Whether the provider proxies it (Cloudflare's orange cloud).
+    #[serde(default)]
+    pub proxied: bool,
+    /// Set when this install's marker covers the record except for its
+    /// proxy flag, which someone toggled at the provider after the write:
+    /// the run that wrote it. Such a record is unmanaged (`managed` is
+    /// false) until that run reclaims it with
+    /// [`ManagedDnsRecordService::reclaim_proxy_toggled_record`].
+    #[serde(default)]
+    pub proxy_toggled_run_id: Option<i32>,
+}
+
+impl RecordSnapshot {
+    fn of(
+        provider_id: i32,
+        record_type: DnsRecordType,
+        ownership: RecordOwnership,
+    ) -> Option<Self> {
+        let (record, marker) = match ownership {
+            RecordOwnership::Owned(record, marker) => (record, Some(marker)),
+            RecordOwnership::Unmanaged(record) | RecordOwnership::OwnedByOther(record, _) => {
+                (record, None)
+            }
+            RecordOwnership::NotFound
+            | RecordOwnership::Orphaned(_)
+            | RecordOwnership::BlockedByOther(_)
+            | RecordOwnership::RegistryConflict => return None,
+        };
+        Some(Self {
+            provider_id,
+            record_id: record.id.clone(),
+            record_type: record_type.to_string(),
+            content: record.content.canonical().to_value_string(),
+            modified_on: record
+                .metadata
+                .get(crate::providers::METADATA_MODIFIED_ON)
+                .cloned(),
+            managed: marker.is_some(),
+            controller: marker.as_ref().and_then(|m| m.controller.clone()),
+            project_id: marker.as_ref().and_then(|m| m.project_id),
+            environment_id: marker.as_ref().and_then(|m| m.environment_id),
+            run_id: marker.as_ref().and_then(|m| m.run_id),
+            proxied: record.proxied,
+            proxy_toggled_run_id: None,
+        })
+    }
+}
+
 /// State of the ownership registry name itself (the `_temps-owned-<type>.…`
 /// TXT), independent of whether the target record exists. Distinguishing
 /// "no TXT" from "a TXT that is not our marker" is what keeps the marker
@@ -206,6 +278,17 @@ enum RegistryState {
     /// (instance, type) — user content or a tampered/mismatched marker.
     /// Never overwrite it.
     Occupied,
+}
+
+/// This install's marker over a record whose proxy flag was toggled at the
+/// provider since, and the TXT record holding it.
+struct ProxyToggled {
+    marker: OwnershipMarker,
+    marker_record: DnsRecord,
+    /// The record as it was verified: its content unchanged since the run
+    /// wrote it, only its proxy flag flipped. A reclaim signs exactly this
+    /// fingerprint, never a later read of the record.
+    fingerprint: String,
 }
 
 /// Per-key async locks that self-clean when the last holder releases.
@@ -645,6 +728,95 @@ impl ManagedDnsRecordService {
         .await
     }
 
+    /// The record at `name` and `record_type` under `domain`'s zone as the
+    /// provider has it now, and who owns it: what a workflow compares with
+    /// what it saw before writing (ADR 064 D4). `None` when there is none.
+    pub async fn read_record(
+        &self,
+        domain: &str,
+        name: &str,
+        record_type: DnsRecordType,
+    ) -> Result<Option<RecordSnapshot>, DnsError> {
+        let (provider_model, managed) = self
+            .provider_service
+            .find_provider_for_domain(domain)
+            .await?
+            .ok_or_else(|| DnsError::DomainNotManaged(domain.to_string()))?;
+        let ownership = self.record_ownership(domain, name, record_type).await?;
+        let Some(mut snapshot) = RecordSnapshot::of(provider_model.id, record_type, ownership)
+        else {
+            return Ok(None);
+        };
+        if !snapshot.managed {
+            let provider = self
+                .provider_service
+                .create_provider_instance(&provider_model)?;
+            let name = Self::validate_record_name(&managed.domain, name)?;
+            let instance = self.instance_id().await?;
+            snapshot.proxy_toggled_run_id = Self::proxy_toggled_marker(
+                provider.as_ref(),
+                &managed.domain,
+                &name,
+                record_type,
+                &instance,
+                &self.signing_key,
+            )
+            .await?
+            .and_then(|toggled| toggled.marker.run_id);
+        }
+        Ok(Some(snapshot))
+    }
+
+    /// Take back a record a workflow run wrote whose only change since is
+    /// its proxy flag, toggled at the provider (Cloudflare's orange cloud):
+    /// re-sign its marker for the record as it is now, keeping the marker's
+    /// project, environment, controller and run. The record itself is not
+    /// touched. Afterwards the run can undo it like any record it wrote
+    /// (ADR 064 D4), which a stale marker would refuse.
+    ///
+    /// Refused unless this install's marker, in a scope `scope` permits and
+    /// naming `run_id`, covers the record's current content with the
+    /// opposite proxy flag: any other change is someone else's.
+    pub async fn reclaim_proxy_toggled_record(
+        &self,
+        domain: &str,
+        name: &str,
+        record_type: DnsRecordType,
+        scope: OwnershipScope,
+        run_id: i32,
+    ) -> Result<(), DnsError> {
+        let (provider_model, managed) = self
+            .provider_service
+            .find_provider_for_domain(domain)
+            .await?
+            .ok_or_else(|| DnsError::DomainNotManaged(domain.to_string()))?;
+        let provider = self
+            .provider_service
+            .create_provider_instance(&provider_model)?;
+        let zone = managed.domain.clone();
+        Self::validate_record_type(record_type)?;
+        let name = Self::validate_record_name(&zone, name)?;
+        let instance = self.instance_id().await?;
+        let _db_lock = Self::lock_record_in_db(self.db.as_ref(), &zone, &name).await?;
+        let _lease = self.locks.acquire(&zone, &name).await;
+        Self::guarded_reclaim_proxy_toggle(
+            provider.as_ref(),
+            &zone,
+            &name,
+            record_type,
+            &instance,
+            &self.signing_key,
+            scope,
+            run_id,
+        )
+        .await?;
+        info!(
+            "Reclaimed {} record '{}' in zone {} for run {} after its proxy flag was toggled at provider {}",
+            record_type, name, zone, run_id, provider_model.name
+        );
+        Ok(())
+    }
+
     async fn validate_scope(&self, scope: OwnershipScope) -> Result<(), DnsError> {
         let project = if let Some(project_id) = scope.project_id {
             Some(
@@ -986,7 +1158,8 @@ impl ManagedDnsRecordService {
                 stamp_scope.project_id,
                 stamp_scope.environment_id,
                 stamp_scope.controller,
-            )
+            )?
+            .with_run_id(signing_key, stamp_scope.run_id)
         };
 
         // Creates are marker-first and create-only: a TXT or target record
@@ -1154,6 +1327,127 @@ impl ManagedDnsRecordService {
                 );
             }
         }
+    }
+
+    /// The single record at (name, type) when this install's marker covers
+    /// its content with the opposite proxy flag, and nothing else differs:
+    /// someone toggled the proxy at the provider after Temps wrote it.
+    /// `None` for anything else, a record the marker covers as it is
+    /// included.
+    async fn proxy_toggled_marker(
+        provider: &dyn DnsProvider,
+        zone: &str,
+        name: &str,
+        record_type: DnsRecordType,
+        instance: &str,
+        signing_key: &[u8; 32],
+    ) -> Result<Option<ProxyToggled>, DnsError> {
+        let mut existing = provider.get_records(zone, name, record_type).await?;
+        if existing.len() != 1 {
+            return Ok(None);
+        }
+        let record = existing.remove(0);
+        let RegistryState::Owned(marker, marker_record) =
+            Self::registry_state(provider, zone, name, record_type, instance, signing_key).await?
+        else {
+            return Ok(None);
+        };
+        let current = record_fingerprint(&record.content, record.proxied)?;
+        let toggled = record_fingerprint(&record.content, !record.proxied)?;
+        if marker.matches_fingerprint(&current) || !marker.matches_fingerprint(&toggled) {
+            return Ok(None);
+        }
+        Ok(Some(ProxyToggled {
+            marker,
+            marker_record: *marker_record,
+            fingerprint: current,
+        }))
+    }
+
+    /// See [`Self::reclaim_proxy_toggled_record`]. The caller holds the
+    /// record's locks.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the zone, record key, install identity, signing key, scope and run each \
+                  identify a different part of the marker being re-signed, matching the \
+                  other guarded_* helpers"
+    )]
+    pub(crate) async fn guarded_reclaim_proxy_toggle(
+        provider: &dyn DnsProvider,
+        zone: &str,
+        name: &str,
+        record_type: DnsRecordType,
+        instance: &str,
+        signing_key: &[u8; 32],
+        scope: OwnershipScope,
+        run_id: i32,
+    ) -> Result<(), DnsError> {
+        Self::require_lossless_writes(provider, zone, name, record_type)?;
+        let Some(ProxyToggled {
+            marker,
+            marker_record,
+            fingerprint,
+        }) = Self::proxy_toggled_marker(provider, zone, name, record_type, instance, signing_key)
+            .await?
+        else {
+            return Err(Self::record_conflict(
+                zone,
+                name,
+                record_type,
+                &format!(
+                    "the record is not one run {run_id} wrote with only its proxy flag changed since, so temps will not take it back"
+                ),
+            ));
+        };
+        if !scope.permits(&marker) {
+            return Err(scope.refusal(zone, name, record_type, &marker));
+        }
+        if marker.run_id != Some(run_id) {
+            return Err(Self::record_conflict(
+                zone,
+                name,
+                record_type,
+                &format!(
+                    "the record was last written by {}, not run {run_id}, so that run cannot take it back",
+                    marker
+                        .run_id
+                        .map_or_else(|| "a write outside any run".to_string(), |id| format!("run {id}"))
+                ),
+            ));
+        }
+        // Sign only the record that was verified above. A record edited
+        // since (another address, another proxy flag, a second record) is
+        // someone else's change: refuse rather than sign it as this run's.
+        let records = provider.get_records(zone, name, record_type).await?;
+        let unchanged = match records.as_slice() {
+            [record] => record_fingerprint(&record.content, record.proxied)? == fingerprint,
+            _ => false,
+        };
+        if !unchanged {
+            return Err(Self::record_conflict(
+                zone,
+                name,
+                record_type,
+                "the record changed while temps was taking it back, so temps will not take it back",
+            ));
+        }
+        let stamp_scope = scope.stamped_over(Some(&marker));
+        let reclaimed = OwnershipMarker::new_signed(
+            signing_key,
+            instance,
+            zone,
+            name,
+            record_type,
+            &fingerprint,
+            stamp_scope.project_id,
+            stamp_scope.environment_id,
+            stamp_scope.controller,
+        )?
+        .with_run_id(signing_key, marker.run_id)?;
+        let registry_request =
+            Self::marker_request(&registry_record_name(name, record_type), &reclaimed)?;
+        Self::rewrite_marker(provider, zone, &marker_record, registry_request).await?;
+        Ok(())
     }
 
     pub(crate) async fn guarded_remove(
@@ -1709,7 +2003,7 @@ mod tests {
 
     #[tokio::test]
     async fn database_record_lock_serializes_processes_sharing_a_database() {
-        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(error) => {
                 eprintln!("Docker/Postgres unavailable; skipping DNS advisory lock test: {error}");
@@ -1769,6 +2063,10 @@ mod tests {
         /// Simulates a concurrent writer: inserted into the zone right after
         /// the first TXT (marker) write, i.e. after every ownership check.
         race_record: Mutex<Option<(String, DnsRecordContent)>>,
+        /// Simulates an operator's edit between two reads: once this many
+        /// zone listings have been answered, the `app` record of the
+        /// content's type takes the new content.
+        edit_after_reads: Mutex<Option<(usize, DnsRecordContent)>>,
     }
 
     impl MockProvider {
@@ -1785,6 +2083,7 @@ mod tests {
                 apply_failed_target_updates: false,
                 provider_type: DnsProviderType::Cloudflare,
                 race_record: Mutex::new(None),
+                edit_after_reads: Mutex::new(None),
             }
         }
 
@@ -1878,7 +2177,24 @@ mod tests {
             if *self.listings_fail.lock().unwrap() {
                 return Err(DnsError::ApiError("simulated listing failure".to_string()));
             }
-            Ok(self.records.lock().unwrap().values().cloned().collect())
+            let listed = self.records.lock().unwrap().values().cloned().collect();
+            let mut pending = self.edit_after_reads.lock().unwrap();
+            if let Some((reads, content)) = pending.as_mut() {
+                *reads = reads.saturating_sub(1);
+                if *reads == 0 {
+                    let record_type = content.record_type().to_string();
+                    if let Some(record) = self
+                        .records
+                        .lock()
+                        .unwrap()
+                        .get_mut(&("app".to_string(), record_type))
+                    {
+                        record.content = content.clone();
+                    }
+                    *pending = None;
+                }
+            }
+            Ok(listed)
         }
 
         async fn get_record(
@@ -2044,6 +2360,7 @@ mod tests {
                 project_id: Some(1),
                 environment_id: Some(2),
                 controller: None,
+                run_id: None,
             },
         )
         .await
@@ -2767,6 +3084,7 @@ mod tests {
                 project_id: Some(1),
                 environment_id: Some(2),
                 controller: None,
+                run_id: None,
             },
         )
         .await
@@ -2951,6 +3269,7 @@ mod tests {
         project_id: Some(1),
         environment_id: Some(2),
         controller: Some("domain-delivery"),
+        run_id: None,
     };
 
     async fn test_guarded_set_scoped(
@@ -3025,6 +3344,7 @@ mod tests {
             project_id: Some(4),
             environment_id: Some(6),
             controller: None,
+            run_id: None,
         }
         .stamped_over(Some(&marker));
         assert_eq!(explicit.environment_id, Some(6));
@@ -3085,6 +3405,7 @@ mod tests {
                 project_id: Some(3),
                 environment_id: Some(30),
                 controller: Some("domain-delivery"),
+                run_id: None,
             },
         )
         .await
@@ -4032,5 +4353,188 @@ mod tests {
         let service = service_with_db(db);
 
         assert_eq!(service.instance_id().await.unwrap(), "winner-id");
+    }
+
+    // ==================== proxy toggled at the provider ====================
+
+    const RUN_SCOPE: OwnershipScope = OwnershipScope {
+        project_id: Some(1),
+        environment_id: Some(2),
+        controller: Some("reachability"),
+        run_id: Some(7),
+    };
+
+    /// `app` A written DNS-only by run 7, then proxied by hand at the
+    /// provider, as a reported install did after the record pointed at the
+    /// wrong address.
+    async fn record_proxied_after_run_wrote_it() -> MockProvider {
+        let provider = MockProvider::new();
+        test_guarded_set_scoped(&provider, a_request("app", false), RUN_SCOPE)
+            .await
+            .unwrap();
+        set_proxied(&provider, true);
+        provider
+    }
+
+    fn set_proxied(provider: &MockProvider, proxied: bool) {
+        provider
+            .records
+            .lock()
+            .unwrap()
+            .get_mut(&("app".to_string(), "A".to_string()))
+            .unwrap()
+            .proxied = proxied;
+    }
+
+    async fn reclaim(provider: &MockProvider, run_id: i32) -> Result<(), DnsError> {
+        ManagedDnsRecordService::guarded_reclaim_proxy_toggle(
+            provider,
+            "example.com",
+            "app",
+            DnsRecordType::A,
+            INSTANCE,
+            &SIGNING_KEY,
+            RUN_SCOPE,
+            run_id,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_proxy_toggle_alone_is_reclaimed_by_the_run_that_wrote_the_record() {
+        let provider = record_proxied_after_run_wrote_it().await;
+        // The toggle leaves the marker stale: the record reads as unmanaged
+        // and a plain removal is refused, which is how undo left it behind.
+        assert!(matches!(
+            ownership_of_app(&provider).await,
+            RecordOwnership::Unmanaged(_)
+        ));
+        assert!(test_guarded_remove_scoped(
+            &provider,
+            "example.com",
+            "app",
+            DnsRecordType::A,
+            INSTANCE,
+            RUN_SCOPE
+        )
+        .await
+        .is_err());
+        let toggled = ManagedDnsRecordService::proxy_toggled_marker(
+            &provider,
+            "example.com",
+            "app",
+            DnsRecordType::A,
+            INSTANCE,
+            &SIGNING_KEY,
+        )
+        .await
+        .unwrap()
+        .expect("the marker covers the record with its proxy flag flipped");
+        assert_eq!(toggled.marker.run_id, Some(7));
+
+        reclaim(&provider, 7).await.unwrap();
+
+        let RecordOwnership::Owned(record, marker) = ownership_of_app(&provider).await else {
+            panic!("the reclaimed record is managed again");
+        };
+        assert!(record.proxied, "the record itself is not touched");
+        assert_eq!(marker.run_id, Some(7));
+        assert_eq!(marker.project_id, Some(1));
+        assert_eq!(marker.environment_id, Some(2));
+        assert_eq!(marker.controller.as_deref(), Some("reachability"));
+
+        test_guarded_remove_scoped(
+            &provider,
+            "example.com",
+            "app",
+            DnsRecordType::A,
+            INSTANCE,
+            RUN_SCOPE,
+        )
+        .await
+        .unwrap();
+        assert!(!provider.has_record("app", DnsRecordType::A));
+        assert!(!provider.has_record(
+            &registry_record_name("app", DnsRecordType::A),
+            DnsRecordType::TXT
+        ));
+    }
+
+    #[tokio::test]
+    async fn another_run_cannot_reclaim_a_proxy_toggled_record() {
+        let provider = record_proxied_after_run_wrote_it().await;
+        let error = reclaim(&provider, 8).await.unwrap_err();
+        assert!(error.to_string().contains("run 7"), "{error}");
+        assert!(matches!(
+            ownership_of_app(&provider).await,
+            RecordOwnership::Unmanaged(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_record_whose_content_changed_is_never_reclaimed() {
+        let provider = record_proxied_after_run_wrote_it().await;
+        provider
+            .records
+            .lock()
+            .unwrap()
+            .get_mut(&("app".to_string(), "A".to_string()))
+            .unwrap()
+            .content = a_content("192.0.2.99");
+        assert!(ManagedDnsRecordService::proxy_toggled_marker(
+            &provider,
+            "example.com",
+            "app",
+            DnsRecordType::A,
+            INSTANCE,
+            &SIGNING_KEY,
+        )
+        .await
+        .unwrap()
+        .is_none());
+        assert!(reclaim(&provider, 7).await.is_err());
+        assert_eq!(
+            provider.record_value("app", DnsRecordType::A).as_deref(),
+            Some("192.0.2.99")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_edit_after_the_proxy_toggle_is_verified_is_never_signed() {
+        let provider = record_proxied_after_run_wrote_it().await;
+        // The operator points the record elsewhere right after temps has
+        // verified that only its proxy flag changed.
+        *provider.edit_after_reads.lock().unwrap() = Some((1, a_content("192.0.2.99")));
+
+        let error = reclaim(&provider, 7).await.unwrap_err();
+
+        assert!(error.to_string().contains("changed while temps"), "{error}");
+        assert_eq!(
+            provider.record_value("app", DnsRecordType::A).as_deref(),
+            Some("192.0.2.99")
+        );
+        // The edit is not signed as run 7's: the record stays unmanaged, so
+        // undo cannot delete or overwrite it.
+        assert!(matches!(
+            ownership_of_app(&provider).await,
+            RecordOwnership::Unmanaged(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_record_the_marker_still_covers_is_not_a_proxy_toggle() {
+        let provider = record_proxied_after_run_wrote_it().await;
+        set_proxied(&provider, false);
+        assert!(ManagedDnsRecordService::proxy_toggled_marker(
+            &provider,
+            "example.com",
+            "app",
+            DnsRecordType::A,
+            INSTANCE,
+            &SIGNING_KEY,
+        )
+        .await
+        .unwrap()
+        .is_none());
     }
 }

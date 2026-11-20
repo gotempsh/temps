@@ -4,7 +4,13 @@
 import { describe, expect, test } from 'bun:test'
 
 import { sandboxUrl, toSandboxView } from './index.js'
-import { terminalWsUrl } from './shell.js'
+import { PassThrough } from 'node:stream'
+import {
+  decodeChunkedBody,
+  describeUpgradeRejection,
+  readBoundedBody,
+  terminalWsUrl,
+} from './shell.js'
 
 describe('toSandboxView', () => {
   // The response types in this module were written against an older, flat
@@ -98,5 +104,165 @@ describe('terminalWsUrl', () => {
   test('encodes the sandbox id rather than trusting it', () => {
     const url = terminalWsUrl('https://x.test/api', 'sbx a/b', {})
     expect(url).toBe('wss://x.test/api/v1/sandboxes/sbx%20a%2Fb/terminal')
+  })
+})
+
+describe('describeUpgradeRejection', () => {
+  test('surfaces the problem document detail the server sent', () => {
+    // The 409 body is the only place the actionable instruction lives; the
+    // ws client's own error message carries just the status code.
+    const body = JSON.stringify({
+      type: 'about:blank',
+      title: 'Terminal Unavailable',
+      status: 409,
+      detail:
+        'Could not attach a terminal to sandbox sbx_test: temps-pty-agent is not staged. Run `temps firecracker setup`.',
+    })
+    const message = describeUpgradeRejection(409, body, 'sbx_test')
+    expect(message).toContain('sbx_test')
+    expect(message).toContain('Terminal Unavailable')
+    expect(message).toContain('temps firecracker setup')
+    expect(message).not.toContain('HTTP 409')
+  })
+
+  test('falls back to the title when there is no detail', () => {
+    const message = describeUpgradeRejection(
+      429,
+      JSON.stringify({ title: 'Too Many Terminals' }),
+      'sbx_test',
+    )
+    expect(message).toContain('Too Many Terminals')
+    expect(message).toContain('HTTP 429')
+  })
+
+  test('does not trust a non-problem body', () => {
+    // A reverse proxy's HTML error page must not be echoed at the user.
+    const message = describeUpgradeRejection(
+      502,
+      '<html><body>Bad Gateway</body></html>',
+      'sbx_test',
+    )
+    expect(message).toContain('HTTP 502')
+    expect(message).toContain('temps sandbox show sbx_test')
+    expect(message).not.toContain('<html>')
+  })
+
+  test('ignores non-string problem fields', () => {
+    const message = describeUpgradeRejection(
+      409,
+      JSON.stringify({ title: 7, detail: { nested: true } }),
+      'sbx_test',
+    )
+    expect(message).toContain('HTTP 409')
+  })
+
+  test('copes with an empty body', () => {
+    expect(describeUpgradeRejection(409, '', 'sbx_test')).toContain('HTTP 409')
+  })
+})
+
+describe('decodeChunkedBody', () => {
+  const chunked = (parts: string[]) =>
+    Buffer.from(
+      parts
+        .map((p) => `${Buffer.byteLength(p).toString(16)}\r\n${p}\r\n`)
+        .join('') + '0\r\n\r\n',
+    )
+
+  test('leaves an unframed body untouched', () => {
+    const raw = Buffer.from('{"detail":"plain"}')
+    expect(decodeChunkedBody(raw).toString()).toBe('{"detail":"plain"}')
+  })
+
+  test('joins chunks so the problem document parses again', () => {
+    const body = decodeChunkedBody(
+      chunked(['{"title":"Terminal Unavail', 'able","detail":"run setup"}']),
+    ).toString()
+    expect(
+      describeUpgradeRejection(409, body, 'sbx_test'),
+    ).toContain('run setup')
+  })
+
+  test('counts chunk sizes in bytes, not characters', () => {
+    const body = decodeChunkedBody(
+      chunked(['{"detail":"é—ü', '"}']),
+    ).toString()
+    expect(JSON.parse(body)).toEqual({ detail: 'é—ü' })
+  })
+
+  test('honours chunk extensions', () => {
+    const raw = Buffer.from('5;name=value\r\nhello\r\n0\r\n\r\n')
+    expect(decodeChunkedBody(raw).toString()).toBe('hello')
+  })
+
+  test('keeps what arrived when the body is cut off mid-chunk', () => {
+    const raw = Buffer.from('a\r\nhello')
+    expect(decodeChunkedBody(raw).toString()).toBe('hello')
+  })
+
+  test('does not mistake ordinary text for framing', () => {
+    const raw = Buffer.from('Bad Gateway\r\n')
+    expect(decodeChunkedBody(raw)).toEqual(raw)
+  })
+})
+
+describe('readBoundedBody', () => {
+  test('returns the whole body when the response ends', async () => {
+    const stream = new PassThrough()
+    const read = readBoundedBody(stream, 1024, 1000)
+    stream.write('{"detail":')
+    stream.end('"ok"}')
+    expect((await read).toString()).toBe('{"detail":"ok"}')
+  })
+
+  test('settles at the deadline for a response that never ends', async () => {
+    const stream = new PassThrough()
+    const read = readBoundedBody(stream, 1024, 50)
+    stream.write('partial')
+    const started = Date.now()
+    const body = await read
+    expect(body.toString()).toBe('partial')
+    expect(Date.now() - started).toBeLessThan(1000)
+    // The socket is not kept open behind the failed attach.
+    expect(stream.destroyed).toBe(true)
+  })
+
+  test('stops reading and destroys the stream at the byte cap', async () => {
+    const stream = new PassThrough()
+    const read = readBoundedBody(stream, 8, 5000)
+    stream.write(Buffer.alloc(32, 0x61))
+    const body = await read
+    expect(body.length).toBe(8)
+    expect(stream.destroyed).toBe(true)
+  })
+
+  test('keeps only the leading bytes of one chunk far larger than the cap', async () => {
+    const stream = new PassThrough()
+    const read = readBoundedBody(stream, 16, 5000)
+    const huge = Buffer.alloc(1024 * 1024, 0x62)
+    huge.write('HEAD', 0)
+    stream.write(huge)
+    const body = await read
+    expect(body.length).toBe(16)
+    expect(body.subarray(0, 4).toString()).toBe('HEAD')
+  })
+
+  test('cuts exactly at the cap when the limit falls inside a later chunk', async () => {
+    const stream = new PassThrough()
+    const read = readBoundedBody(stream, 10, 5000)
+    stream.write('abcdef')
+    // Let the first chunk be consumed before the second arrives.
+    await new Promise((r) => setTimeout(r, 10))
+    stream.write('ghijklmnop')
+    expect((await read).toString()).toBe('abcdefghij')
+    expect(stream.destroyed).toBe(true)
+  })
+
+  test('settles when the stream errors', async () => {
+    const stream = new PassThrough()
+    const read = readBoundedBody(stream, 1024, 5000)
+    stream.write('x')
+    stream.destroy(new Error('reset'))
+    expect((await read).toString()).toBe('x')
   })
 })

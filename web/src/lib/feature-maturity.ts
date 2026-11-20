@@ -32,10 +32,10 @@ export function featureKeyForPath(pathname: string): string | undefined {
   }
   if (projectRoute.startsWith('speed')) return 'performance-monitoring'
   if (projectRoute.startsWith('revenue')) return 'revenue-tracking'
-  if (projectRoute.startsWith('agents')) return 'ai-agents-workflows'
   if (projectRoute.startsWith('ai-gateway')) return 'ai-gateway'
   if (projectRoute.includes('database-browser')) return 'database-browser'
 
+  if (pathname.startsWith('/p/')) return 'project-groups'
   if (pathname.startsWith('/monitoring')) return 'alerts-metric-alerts'
   if (pathname.startsWith('/sandboxes')) return 'sandboxes-preview-environments'
   if (pathname.startsWith('/settings/teams')) return 'teams'
@@ -43,10 +43,6 @@ export function featureKeyForPath(pathname: string): string | undefined {
   if (pathname.startsWith('/settings/plugins')) return 'plugin-system'
   if (pathname.startsWith('/ai-gateway')) return 'ai-gateway'
   if (pathname.startsWith('/chat')) return 'ai-chat'
-  // The AI workspace is the chat-driven surface over harness sessions.
-  if (pathname.startsWith('/ai-first')) return 'ai-chat'
-  if (pathname.startsWith('/ai-workflows')) return 'ai-agents-workflows'
-  if (pathname.startsWith('/agent-sandbox')) return 'agent-execution-sandbox'
   if (pathname.startsWith('/revenue')) return 'revenue-tracking'
   if (pathname.startsWith('/status-pages')) return 'status-pages'
   if (pathname.startsWith('/screenshots')) return 'screenshots'

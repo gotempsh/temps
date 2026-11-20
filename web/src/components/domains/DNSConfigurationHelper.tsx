@@ -26,8 +26,9 @@ import {
 
 /**
  * Component that displays DNS configuration instructions based on the platform access mode
- * Shows the correct IP address to use for DNS records and mode-specific guidance
- * Hidden when external_url and preview_domain are both configured
+ * Shows the correct IP address to use for DNS records and mode-specific guidance.
+ * It always renders something: a configured platform still adds new domains,
+ * and the disclosure around it would otherwise open onto nothing.
  */
 export function DNSConfigurationHelper() {
   const {
@@ -36,22 +37,18 @@ export function DNSConfigurationHelper() {
     isUsingCloudflare,
     needsPortForwarding,
     isLoading,
+    publicIP,
   } = usePlatformCapabilities()
 
   const { data: settings } = useSettings()
 
   const targetIP = getDNSTargetIP()
 
-  // Hide if platform is fully configured (external_url and preview_domain are set)
-  if (settings?.external_url && settings?.preview_domain) {
-    return null
-  }
-
   if (isLoading) {
     return (
       <Card>
         <CardHeader>
-          <CardTitle>DNS Configuration</CardTitle>
+          <CardTitle>DNS configuration</CardTitle>
           <CardDescription>
             Loading platform access information...
           </CardDescription>
@@ -63,7 +60,7 @@ export function DNSConfigurationHelper() {
   // Cloudflare Tunnel - domains managed externally
   if (isUsingCloudflare()) {
     return (
-      <Alert className="border-purple-200 bg-purple-50/50 dark:bg-purple-950/10">
+      <Alert className="border-purple-200 dark:border-purple-900 bg-purple-50/50 dark:bg-purple-950/10">
         <Cloud className="h-4 w-4 text-purple-600" />
         <AlertTitle>Cloudflare Tunnel Active</AlertTitle>
         <AlertDescription className="space-y-2 mt-2">
@@ -74,21 +71,21 @@ export function DNSConfigurationHelper() {
           <div className="flex items-center gap-2 mt-3">
             <Badge
               variant="secondary"
-              className="bg-purple-100 text-purple-800"
+              className="bg-purple-100 dark:bg-purple-950/40 text-purple-800 dark:text-purple-400"
             >
               Automatic SSL
             </Badge>
             <Badge
               variant="secondary"
-              className="bg-purple-100 text-purple-800"
+              className="bg-purple-100 dark:bg-purple-950/40 text-purple-800 dark:text-purple-400"
             >
               Managed DNS
             </Badge>
             <Badge
               variant="secondary"
-              className="bg-purple-100 text-purple-800"
+              className="bg-purple-100 dark:bg-purple-950/40 text-purple-800 dark:text-purple-400"
             >
-              DDoS Protection
+              DDoS protection
             </Badge>
           </div>
           <p className="text-sm mt-3">
@@ -97,7 +94,7 @@ export function DNSConfigurationHelper() {
               href="https://dash.cloudflare.com"
               target="_blank"
               rel="noopener noreferrer"
-              className="text-purple-600 hover:text-purple-700 underline"
+              className="text-purple-600 dark:text-purple-400 hover:text-purple-700 dark:hover:text-purple-300 underline"
             >
               Cloudflare Dashboard
             </a>
@@ -121,10 +118,43 @@ export function DNSConfigurationHelper() {
     )
   }
 
+  // The access mode describes how this browser reached the server, not how the
+  // server is exposed: a platform with a public URL can still be opened locally.
+  if (accessMode === 'local' && settings?.external_url) {
+    return (
+      <Alert>
+        <Info className="h-4 w-4" />
+        <AlertTitle>
+          Point DNS at the same address as your public URL
+        </AlertTitle>
+        <AlertDescription className="space-y-3 mt-2">
+          <p>
+            This console is open through a local address, so it can&apos;t tell
+            how the internet reaches this server. Point your domain at the same
+            address as{' '}
+            <code className="font-mono">{settings.external_url}</code>.
+          </p>
+          {publicIP && (
+            <div className="flex flex-wrap items-center gap-2">
+              <span>Detected public IP</span>
+              <code className="rounded border bg-background px-2 py-0.5 font-mono">
+                {publicIP}
+              </code>
+              <CopyButton
+                value={publicIP}
+                className="h-8 px-3 rounded-md border border-input bg-background hover:bg-accent hover:text-accent-foreground"
+              />
+            </div>
+          )}
+        </AlertDescription>
+      </Alert>
+    )
+  }
+
   // Local mode - needs external setup
   if (accessMode === 'local') {
     return (
-      <Alert className="border-yellow-200 bg-yellow-50/50 dark:bg-yellow-950/10">
+      <Alert className="border-yellow-200 dark:border-yellow-900 bg-yellow-50/50 dark:bg-yellow-950/10">
         <Server className="h-4 w-4 text-yellow-600" />
         <AlertTitle>Local Development Mode</AlertTitle>
         <AlertDescription className="space-y-2 mt-2">
@@ -159,22 +189,22 @@ export function DNSConfigurationHelper() {
     const getAccessModeBadgeColor = () => {
       switch (accessMode) {
         case 'direct':
-          return 'bg-green-100 text-green-800 border-green-200'
+          return 'bg-green-100 dark:bg-green-950/40 text-green-800 dark:text-green-400 border-green-200 dark:border-green-900'
         case 'nat':
-          return 'bg-orange-100 text-orange-800 border-orange-200'
+          return 'bg-orange-100 dark:bg-orange-950/40 text-orange-800 dark:text-orange-400 border-orange-200 dark:border-orange-900'
         default:
-          return 'bg-blue-100 text-blue-800 border-blue-200'
+          return 'bg-blue-100 dark:bg-blue-950/40 text-blue-800 dark:text-blue-400 border-blue-200 dark:border-blue-900'
       }
     }
 
     return (
       <Card>
         <CardHeader>
-          <div className="flex items-center justify-between">
+          <div className="flex items-start justify-between gap-2">
             <div className="space-y-1">
               <CardTitle className="flex items-center gap-2">
                 {getAccessModeIcon()}
-                DNS Configuration
+                DNS configuration
               </CardTitle>
               <CardDescription>
                 Configure your DNS records to point to this server
@@ -188,7 +218,7 @@ export function DNSConfigurationHelper() {
         <CardContent className="space-y-4">
           {/* Public IP Display */}
           <div className="p-4 bg-muted/50 rounded-lg space-y-3">
-            <div className="flex items-center justify-between">
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
               <span className="text-sm font-medium">DNS Target IP Address</span>
               <div className="flex items-center gap-2">
                 <code className="px-3 py-1 bg-background border rounded text-lg font-mono font-semibold">
@@ -202,7 +232,7 @@ export function DNSConfigurationHelper() {
             </div>
 
             {needsPortForwarding() && (
-              <Alert className="border-orange-200 bg-orange-50/50 dark:bg-orange-950/10">
+              <Alert className="border-orange-200 dark:border-orange-900 bg-orange-50/50 dark:bg-orange-950/10">
                 <Router className="h-4 w-4 text-orange-600" />
                 <AlertDescription>
                   <strong>Port Forwarding Required:</strong> Ensure ports 80
@@ -215,13 +245,13 @@ export function DNSConfigurationHelper() {
 
           {/* DNS Record Examples */}
           <div className="space-y-3">
-            <h4 className="text-sm font-medium">Example DNS Records</h4>
+            <h4 className="text-sm font-medium">Example DNS records</h4>
             <div className="space-y-2">
               <div className="p-3 bg-muted/30 rounded-md border">
                 <div className="flex items-center justify-between">
                   <div>
                     <div className="text-xs text-muted-foreground mb-1">
-                      Wildcard subdomain (for all projects)
+                      Wildcard subdomain (for all services)
                     </div>
                     <code className="text-sm font-mono">
                       A *.yourdomain.com {targetIP}
@@ -254,7 +284,7 @@ export function DNSConfigurationHelper() {
           </div>
 
           {/* TTL Recommendation */}
-          <div className="p-3 bg-blue-50/50 dark:bg-blue-950/10 rounded-lg border border-blue-200">
+          <div className="p-3 bg-blue-50/50 dark:bg-blue-950/10 rounded-lg border border-blue-200 dark:border-blue-900">
             <div className="flex gap-2">
               <Info className="h-4 w-4 text-blue-600 mt-0.5" />
               <div className="space-y-1 text-sm">
@@ -284,7 +314,7 @@ export function DNSConfigurationHelper() {
           </div>
 
           {/* SSL Certificate Note */}
-          <div className="flex items-start gap-2 p-3 bg-green-50/50 dark:bg-green-950/10 rounded-lg border border-green-200">
+          <div className="flex items-start gap-2 p-3 bg-green-50/50 dark:bg-green-950/10 rounded-lg border border-green-200 dark:border-green-900">
             <CheckCircle2 className="h-4 w-4 text-green-600 mt-0.5" />
             <div className="text-sm">
               <p className="text-green-900 dark:text-green-100">

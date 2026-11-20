@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { PageHeader } from '@/components/layout/PageContainer'
 import {
   ExternalServiceInfo,
   ProjectResponse,
@@ -31,6 +32,7 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { ServiceLogo } from '@/components/ui/service-logo'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { useKeyboardShortcut } from '@/hooks/useKeyboardShortcut'
@@ -51,6 +53,13 @@ import { serviceCreateHref } from '@/lib/service-project-link'
 import type { ServiceLinkChange } from '@/lib/service-link-redeploy'
 import { ServiceLinkRedeployPrompt } from './ServiceLinkRedeployPrompt'
 import { projectServiceResourcePath } from '@/lib/database-provisioning'
+import {
+  CONTAINER_CPU_METRIC,
+  containerCpuChartMetric,
+  containerCpuHistoryMetric,
+  withCpuHistory,
+} from '@/lib/container-cpu'
+import { formatCpuUsage } from '@/lib/cpu-format'
 import { serviceBackupsHref } from '@/lib/service-backup-setup'
 import { toast } from 'sonner'
 
@@ -62,11 +71,14 @@ import { toast } from 'sonner'
 function ResourceSparkline({
   serviceId,
   metric,
+  historyMetric,
   label,
   format,
 }: {
   serviceId: number
   metric: string
+  /** Charted before `metric` has readings; see `withCpuHistory`. */
+  historyMetric?: string
   label: string
   format: (value: number) => string
 }) {
@@ -80,10 +92,25 @@ function ResourceSparkline({
     // Metrics disabled on the service → the endpoint 503s; don't retry-spam.
     retry: false,
   })
+  const { data: historyData } = useQuery({
+    ...externalServiceMetricsGetRangeOptions({
+      path: { id: serviceId },
+      query: { metric: historyMetric ?? metric, range: '1h' },
+    }),
+    enabled: historyMetric != null,
+    staleTime: 30_000,
+    refetchInterval: 30_000,
+    retry: false,
+  })
 
-  if (!data?.length) return null
-
-  const values = data.map((p) => p.value)
+  const points = historyMetric
+    ? withCpuHistory(data ?? [], historyData ?? [])
+    : (data ?? [])
+  // Trend glyph only: buckets nothing was sampled in (`null`) are dropped.
+  const values = points
+    .map((p) => p.value)
+    .filter((v): v is number => v != null && Number.isFinite(v))
+  if (values.length === 0) return null
   const last = values[values.length - 1]
 
   return (
@@ -96,7 +123,7 @@ function ResourceSparkline({
   )
 }
 
-function ServiceRow({
+export function ServiceRow({
   service,
   isLinked,
   isBusy,
@@ -125,6 +152,12 @@ function ServiceRow({
     : `/storage/${service.id}`
 
   const goToPrimary = () => navigate(primaryHref)
+  // A cluster's `container.cpu_percent` is one series per member, which a
+  // range query averages; read its busiest member, as its service page does.
+  const cpuMetric = containerCpuChartMetric(
+    CONTAINER_CPU_METRIC,
+    service.topology === 'cluster'
+  )
 
   return (
     <li
@@ -174,7 +207,7 @@ function ServiceRow({
                 {link?.database_provisioning_mode === 'custom'
                   ? 'Custom database'
                   : link?.database_provisioning_mode === 'project'
-                    ? 'Per project'
+                    ? 'Per service'
                     : 'Per environment'}
               </span>
             )}
@@ -188,9 +221,13 @@ function ServiceRow({
         <>
           <ResourceSparkline
             serviceId={service.id}
-            metric="container.cpu_percent"
+            metric={cpuMetric}
+            historyMetric={containerCpuHistoryMetric(
+              CONTAINER_CPU_METRIC,
+              cpuMetric
+            )}
             label="CPU"
-            format={(v) => `${v.toFixed(1)}%`}
+            format={(v) => formatCpuUsage(v, null)}
           />
           <ResourceSparkline
             serviceId={service.id}
@@ -216,7 +253,7 @@ function ServiceRow({
             }}
           >
             <Database className="size-3.5" />
-            <span className="hidden sm:inline">Browse</span>
+            <span className="max-sm:sr-only">Browse</span>
           </Button>
         ) : (
           <Button
@@ -298,7 +335,7 @@ function ServiceRow({
                 onSelect={() => void onToggle()}
               >
                 <Link2Off className="size-3.5" />
-                Unlink from project
+                Unlink from service
               </DropdownMenuItem>
             ) : (
               <DropdownMenuItem
@@ -306,7 +343,7 @@ function ServiceRow({
                 onSelect={() => void onToggle()}
               >
                 <Link2 className="size-3.5" />
-                Link to project
+                Link to service
               </DropdownMenuItem>
             )}
           </DropdownMenuContent>
@@ -330,6 +367,8 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
   // The last link change, until the operator redeploys or dismisses it: the
   // running app only sees the new variables after its next deployment.
   const [linkChange, setLinkChange] = useState<ServiceLinkChange | null>(null)
+  const [serviceToUnlink, setServiceToUnlink] =
+    useState<ExternalServiceInfo | null>(null)
   const providers = useQuery({ ...getProvidersMetadataOptions(), retry: false })
 
   useEffect(() => {
@@ -365,13 +404,13 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
 
   const linkServiceMutation = useMutation({
     ...linkServiceToProjectMutation(),
-    meta: { errorTitle: 'Failed to link service to project' },
+    meta: { errorTitle: 'Failed to link database to service' },
     onSuccess: () => refetchServicesLinked(),
   })
 
   const unlinkServiceMutation = useMutation({
     ...unlinkServiceFromProjectMutation(),
-    meta: { errorTitle: 'Failed to unlink service from project' },
+    meta: { errorTitle: 'Failed to unlink database from service' },
     onSuccess: () => refetchServicesLinked(),
   })
 
@@ -389,44 +428,49 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
     toast.promise(promise, {
       loading: 'Linking service...',
       success: 'Service linked',
-      error: 'Failed to link service',
     })
     await promise
     setLinkChange({ kind: 'linked', serviceName: serviceName(serviceId) })
     await refetchServicesLinked()
   }
 
-  const handleServiceToggle = async (serviceId: number) => {
-    const isLinked = servicesLinked?.some((s) => s.service.id === serviceId)
+  const unlinkService = async (serviceId: number) => {
+    const promise = unlinkServiceMutation.mutateAsync({
+      path: { id: serviceId, project_id: project.id },
+    })
+    toast.promise(promise, {
+      loading: 'Unlinking service...',
+      success: 'Service unlinked',
+    })
+    await promise.then(
+      () =>
+        setLinkChange({
+          kind: 'unlinked',
+          serviceName: serviceName(serviceId),
+        }),
+      () => {}
+    )
+    await refetchServicesLinked()
+  }
 
-    if (isLinked) {
-      const promise = unlinkServiceMutation.mutateAsync({
-        path: { id: serviceId, project_id: project.id },
-      })
-      toast.promise(promise, {
-        loading: 'Unlinking service...',
-        success: 'Service unlinked',
-        error: 'Failed to unlink service',
-      })
-      await promise.then(
-        () =>
-          setLinkChange({
-            kind: 'unlinked',
-            serviceName: serviceName(serviceId),
-          }),
-        () => {}
-      )
-    } else {
-      const service = services?.find((item) => item.id === serviceId)
-      if (
-        service &&
-        ['postgres', 'mariadb', 'mongodb'].includes(service.service_type)
-      ) {
-        setServicePendingLink(service)
-        return
-      }
-      await linkService(serviceId).catch(() => {})
+  const handleServiceToggle = async (serviceId: number) => {
+    const linked = servicesLinked?.find((s) => s.service.id === serviceId)
+
+    if (linked) {
+      // Unlinking is confirmed first; the request is sent from the dialog.
+      setServiceToUnlink(linked.service)
+      return
     }
+
+    const service = services?.find((item) => item.id === serviceId)
+    if (
+      service &&
+      ['postgres', 'mariadb', 'mongodb'].includes(service.service_type)
+    ) {
+      setServicePendingLink(service)
+      return
+    }
+    await linkService(serviceId).catch(() => {})
 
     await refetchServicesLinked()
   }
@@ -488,7 +532,6 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
             <Link
               key={provider.service_type}
               to={serviceCreateHref(provider.service_type, project.id)}
-              aria-label={`Create ${provider.display_name}`}
               className="group flex min-w-0 flex-col items-start rounded-lg border bg-background p-5 transition-colors hover:border-foreground/30 hover:bg-muted/40 focus-visible:outline focus-visible:outline-2 focus-visible:outline-ring"
             >
               <div className="mb-4 flex size-10 items-center justify-center">
@@ -517,39 +560,39 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
   )
 
   const header = (
-    <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-      <div>
-        <h1 className="text-xl font-semibold tracking-tight sm:text-2xl">
-          Databases
-        </h1>
-        <p className="mt-1 text-sm text-muted-foreground">
-          Link an existing database or create a new one for this project.
+    <PageHeader
+      title="Databases"
+      description={
+        <>
+          Link an existing database or create a new one for this service.
           {totalCount > 0 ? (
             <span className="ml-1 tabular-nums">
               {linkedCount} of {totalCount} linked.
             </span>
           ) : null}
-        </p>
-      </div>
-      <CreateServiceButton
-        projectId={project.id}
-        label="Create database"
-        open={isCreateDropdownOpen}
-        onOpenChange={setIsCreateDropdownOpen}
-      />
-    </div>
+        </>
+      }
+      actions={
+        <CreateServiceButton
+          projectId={project.id}
+          label="Create database"
+          open={isCreateDropdownOpen}
+          onOpenChange={setIsCreateDropdownOpen}
+        />
+      }
+    />
   )
 
   if (servicesError || linksError) {
     return (
-      <div className="space-y-6 p-4 md:p-6">
+      <div className="space-y-6">
         {header}
         <Alert variant="destructive">
           <AlertTitle>Databases could not be loaded</AlertTitle>
           <AlertDescription>
             {servicesError
               ? 'Could not load the available databases.'
-              : 'Could not determine which databases are linked to this project.'}
+              : 'Could not determine which databases are linked to this service.'}
             <Button
               variant="outline"
               size="sm"
@@ -569,7 +612,7 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
   if (isLoadingServices || loadingLinks) {
     return (
       <div className="flex-1 overflow-auto">
-        <div className="space-y-6 p-4 md:p-6">
+        <div className="space-y-6">
           {header}
           <ul
             role="list"
@@ -594,7 +637,7 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
   if (!services?.length) {
     return (
       <div className="flex-1 overflow-auto">
-        <div className="space-y-6 p-4 md:p-6">
+        <div className="space-y-6">
           {header}
           {databaseTypes}
         </div>
@@ -613,13 +656,13 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
 
   return (
     <div className="flex-1 overflow-auto">
-      <div className="space-y-8 p-4 md:p-6">
+      <div className="space-y-8">
         {header}
 
         <p className="text-sm text-muted-foreground">
           Choose an existing database below, or create a new database of any
           supported type. Linking makes its connection settings available to
-          this project from its next deployment.
+          this service from its next deployment.
         </p>
 
         <ServiceLinkRedeployPrompt
@@ -697,11 +740,25 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
           </section>
         ) : (
           <p className="text-sm text-muted-foreground">
-            All existing databases are linked to this project. You can create
+            All existing databases are linked to this service. You can create
             another database above.
           </p>
         )}
         {databaseTypes}
+        <ConfirmDeleteDialog
+          open={serviceToUnlink !== null}
+          onOpenChange={(open) => {
+            if (!open) setServiceToUnlink(null)
+          }}
+          verb="Unlink"
+          resourceType="database service"
+          resourceName={serviceToUnlink?.name ?? ''}
+          consequences={`${project.slug} stops receiving its connection variables, and the running app loses access after its next deployment. The service itself and its data are kept.`}
+          irreversible={false}
+          onConfirm={() => {
+            if (serviceToUnlink) void unlinkService(serviceToUnlink.id)
+          }}
+        />
         {servicePendingLink && (
           <DatabaseProvisioningDialog
             key={servicePendingLink.id}

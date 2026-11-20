@@ -22,6 +22,14 @@
 //! with empty result sets — they resolve to empty streams rather than erroring
 //! when a test enables all four kinds.
 
+// Test-only helpers outside `#[test]` fns (fixtures, mock servers, setup):
+// a panic there is the test failure, which is what we want.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test helpers: panicking is how a test fails"
+)]
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -84,11 +92,13 @@ async fn setup() -> Option<ChTestEnv> {
     };
     let url = format!("http://127.0.0.1:{host_port}");
 
-    let probe = ::clickhouse::Client::default()
-        .with_url(&url)
-        .with_database(CH_DB)
-        .with_user("default")
-        .with_password("test");
+    let probe = temps_clickhouse::build_client(
+        &url,
+        CH_DB,
+        "default",
+        "test",
+        temps_clickhouse::ClickHouseCompression::Lz4,
+    );
 
     let mut last_err = String::new();
     for _ in 0..30 {
@@ -124,7 +134,7 @@ async fn setup() -> Option<ChTestEnv> {
     ));
     // Seed proxy logs through the REAL ClickHouse write path.
     ch_proxy_store
-        .write_batch(vec![
+        .write_batch(&[
             proxy_log_entry("req-ch-1", "/api/orders", 200, None),
             proxy_log_entry("req-ch-2", "/api/orders/17", 500, None),
             proxy_log_entry("req-ch-bot", "/robots.txt", 200, Some("GPTBot")),
@@ -232,12 +242,17 @@ fn proxy_log_entry(
         response_headers: None,
         trace_id: None,
         error_group_id: None,
+        shield_verdict: None,
+        shield_reasons: Vec::new(),
+        ja4: None,
+        ja4_source: None,
     }
 }
 
 fn span(trace_id: &str, span_id: &str, parent: Option<&str>, name: &str) -> SpanRecord {
     let start = Utc::now() - Duration::minutes(1);
     SpanRecord {
+        ingest_identity: None,
         project_id: PROJECT_ID,
         deployment_id: Some(1),
         resource: ResourceInfo {

@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use temps_core::{AuditLogger, ProjectAccessChecker};
 use temps_providers::externalsvc::RedisService;
+use temps_providers::managed_names::ManagedServiceNames;
 use temps_providers::ExternalServiceManager;
 use utoipa::ToSchema;
 
@@ -19,6 +20,8 @@ pub struct KvAppState {
     pub kv_service: Arc<KvService>,
     pub redis_service: Arc<RedisService>,
     pub external_service_manager: Arc<ExternalServiceManager>,
+    /// Resolves and edits the name of this instance's KV service/container.
+    pub managed_names: Arc<ManagedServiceNames>,
     pub audit_service: Arc<dyn AuditLogger>,
     /// Team-based project access checker (registered by a plugin; `None` in
     /// plain OSS, where the guard is a no-op). Confines KV data-plane access to
@@ -221,7 +224,7 @@ pub struct KvStatusResponse {
     pub version: Option<String>,
 
     /// Docker image being used
-    #[schema(example = "gotempsh/redis-walg:8-bookworm")]
+    #[schema(example = "ghcr.io/gotempsh/redis-walg:8-trixie")]
     pub docker_image: Option<String>,
 }
 
@@ -229,7 +232,7 @@ pub struct KvStatusResponse {
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct EnableKvRequest {
     /// Docker image to use (optional, uses default if not provided)
-    #[schema(example = "gotempsh/redis-walg:8-bookworm")]
+    #[schema(example = "ghcr.io/gotempsh/redis-walg:8-trixie")]
     pub docker_image: Option<String>,
 
     /// Maximum memory allocation (e.g., "256mb", "1gb")
@@ -273,8 +276,8 @@ pub struct DisableKvResponse {
 /// Request to update KV service configuration
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct UpdateKvRequest {
-    /// Docker image to use (e.g., "gotempsh/redis-walg:8-bookworm")
-    #[schema(example = "gotempsh/redis-walg:8-bookworm")]
+    /// Docker image to use (e.g., "ghcr.io/gotempsh/redis-walg:8-trixie")
+    #[schema(example = "ghcr.io/gotempsh/redis-walg:8-trixie")]
     pub docker_image: Option<String>,
 }
 

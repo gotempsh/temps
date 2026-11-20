@@ -55,3 +55,26 @@ test('a malformed problem body still renders the recovery state', () => {
   expect(html).toContain('Retry')
   expect(html).not.toContain('Server response')
 })
+
+test('the route-level report is one line with the reason and a retry', () => {
+  const html = renderToStaticMarkup(
+    <ReadFailure
+      resource="Data on this page"
+      error={{
+        title: 'Bad Gateway',
+        status: 502,
+        detail: 'upstream returned nothing for request 7',
+      }}
+      onRetry={() => {}}
+      routeLevel
+    />
+  )
+  expect(html).toContain('role="alert"')
+  expect(html).toContain('Data on this page unavailable')
+  expect(html).toContain('upstream returned nothing for request 7')
+  // The explanation is kept for hover and screen readers, not stacked below.
+  expect(html).toContain('title="Could not contact Temps')
+  expect(html).toContain('flex-1 truncate')
+  expect(html).not.toContain('Server response:')
+  expect(html).toContain('>Retry<')
+})

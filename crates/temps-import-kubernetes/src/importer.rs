@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use tracing::{debug, info, warn};
 
+use temps_import_types::sanitize_slug;
 use temps_import_types::{
     CredentialValidation, DataImplication, DataImplicationSeverity, DomainAction, DomainPlan,
     DomainSnapshot, ImportContext, ImportCredentials, ImportError, ImportOutcome, ImportPlan,
@@ -183,13 +184,6 @@ fn detect_database(image: &str) -> Option<(SnapshotServiceType, Option<String>)>
         "minio" => Some((SnapshotServiceType::S3, version)),
         _ => None,
     }
-}
-
-fn sanitize_slug(name: &str) -> String {
-    name.to_lowercase()
-        .replace(|c: char| !c.is_alphanumeric() && c != '-', "-")
-        .trim_matches('-')
-        .to_string()
 }
 
 /// Result of resolving a container's environment through ConfigMaps/Secrets
@@ -1813,12 +1807,11 @@ async fn execute_plan(
     plan: ImportPlan,
     services: &dyn ImportServiceProvider,
 ) -> ImportResult<ImportOutcome> {
-    use sea_orm::{
-        ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter,
-    };
+    use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter};
     use std::time::Instant;
     use temps_entities::{
-        deployment_containers, deployments, environments, prelude::DeploymentMetadata, projects,
+        deployment_containers, deployments, environments, prelude::DeploymentMetadata,
+        project_deployment_counters, projects,
     };
 
     let start_time = Instant::now();
@@ -1948,6 +1941,7 @@ async fn execute_plan(
         // try to plan a git deploy on any future redeploy with no metadata override).
         source_type: temps_entities::source_type::SourceType::DockerImage,
         template_slug: None,
+        hosting: Default::default(),
     };
 
     let project = project_service
@@ -1984,13 +1978,15 @@ async fn execute_plan(
         resource_name: environment.name.clone(),
     });
 
-    let deployment_count = deployments::Entity::find()
-        .filter(deployments::Column::ProjectId.eq(project.id))
-        .paginate(db, 100)
-        .num_items()
-        .await
-        .map_err(|e| ImportError::ExecutionFailed(format!("Failed to count deployments: {}", e)))?;
-    let deployment_slug = format!("{}-{}", project.slug, deployment_count + 1);
+    let deployment_slug =
+        project_deployment_counters::allocate_deployment_slug(db, project.id, &project.slug)
+            .await
+            .map_err(|e| {
+                ImportError::ExecutionFailed(format!(
+                    "Failed to allocate the next deployment number for project {}: {}",
+                    project.id, e
+                ))
+            })?;
 
     let deployment_metadata = DeploymentMetadata {
         builder: Some("kubernetes-import".to_string()),
@@ -2039,7 +2035,7 @@ async fn execute_plan(
             deployment_id: Set(deployment.id),
             container_id: Set(plan.source_id.clone()),
             container_name: Set(container_name),
-            container_port: Set(port_mapping.container_port as i32),
+            container_port: Set(Some(port_mapping.container_port as i32)),
             host_port: Set(port_mapping.host_port.map(|p| p as i32)),
             image_name: Set(Some(plan.deployment.image.clone())),
             status: Set(Some("pending".to_string())),

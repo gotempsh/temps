@@ -3,8 +3,7 @@
 
 import * as React from 'react'
 import { getProjects } from '@/api/client/sdk.gen'
-import { ProjectCardMedia } from '@/components/dashboard/ProjectCardMedia'
-import { useLatestDeploymentMedia } from '@/hooks/useLatestDeploymentMedia'
+import { ServiceIcon } from '@/components/project/ServiceIcon'
 import { Button } from '@/components/ui/button'
 import {
   Command,
@@ -32,6 +31,8 @@ interface ProjectSelectProps {
   onValueChange: (projectId: number | null) => void
   /** Show the "All projects" row. Off for pickers that require a project. */
   allowAll?: boolean
+  /** Text of the `null` row and trigger, when it means more than a filter. */
+  allLabel?: string
   /** Project ids to omit from the list, e.g. ones already assigned elsewhere. */
   excludeIds?: number[]
   placeholder?: string
@@ -54,8 +55,9 @@ export function ProjectSelect({
   value,
   onValueChange,
   allowAll = true,
+  allLabel = 'All services',
   excludeIds,
-  placeholder = 'Select project…',
+  placeholder = 'Select service…',
   disabled,
   className,
   open: openProp,
@@ -68,6 +70,10 @@ export function ProjectSelect({
     onOpenChange?.(next)
   }
   const queryClient = useQueryClient()
+  // A button with role="combobox" takes no name from its content, so without
+  // `ariaLabel` the picker would be an unnamed control. Fall back to the
+  // visible value (e.g. "All projects") by reference.
+  const valueId = React.useId()
 
   const projectsQuery = useQuery({
     queryKey: ['project-selector-catalog'],
@@ -105,32 +111,21 @@ export function ProjectSelect({
     [projects, value]
   )
 
-  const media = useLatestDeploymentMedia(
-    (projectsQuery.data?.projects ?? []).map((p) => p.id).sort((a, b) => a - b)
-  )
   const projectImage = (project: NonNullable<typeof selected>) => (
-    <ProjectCardMedia
-      name={project.name}
-      className="mr-2 size-5 [&_img]:p-0.5"
-      templateImageUrl={project.service_template_image_url}
-      deploymentUrl={media.data?.projects?.[String(project.id)]?.url}
-      screenshotLocation={
-        media.data?.projects?.[String(project.id)]?.screenshot_location
-      }
-    />
+    <ServiceIcon service={project} size="xs" className="mr-2" />
   )
   const handleRefresh = (e: React.MouseEvent) => {
     e.stopPropagation()
     void queryClient.invalidateQueries({
       queryKey: ['project-selector-catalog'],
     })
-    void media.refetch()
+    void queryClient.invalidateQueries({ queryKey: ['service-media'] })
   }
 
   const triggerLabel =
     value == null
       ? allowAll
-        ? 'All projects'
+        ? allLabel
         : placeholder
       : (selected?.name ?? placeholder)
 
@@ -142,6 +137,7 @@ export function ProjectSelect({
           variant="outline"
           role="combobox"
           aria-label={ariaLabel}
+          aria-labelledby={ariaLabel ? undefined : valueId}
           aria-expanded={open}
           disabled={disabled}
           className={cn(
@@ -152,7 +148,9 @@ export function ProjectSelect({
         >
           <span className="flex min-w-0 items-center">
             {selected && projectImage(selected)}
-            <span className="truncate">{triggerLabel}</span>
+            <span id={valueId} className="truncate">
+              {triggerLabel}
+            </span>
           </span>
           <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
         </Button>
@@ -176,7 +174,7 @@ export function ProjectSelect({
               className="mr-1 h-7 w-7 shrink-0"
               onClick={handleRefresh}
               disabled={projectsQuery.isFetching}
-              title="Refresh projects"
+              title="Refresh services"
             >
               <RefreshCw
                 className={cn(
@@ -195,7 +193,7 @@ export function ProjectSelect({
               </div>
             ) : projectsQuery.isError ? (
               <div className="flex flex-col items-center gap-2 p-4 text-center text-sm text-muted-foreground">
-                Failed to load projects
+                Failed to load services
                 <Button
                   type="button"
                   variant="outline"
@@ -207,7 +205,7 @@ export function ProjectSelect({
               </div>
             ) : (
               <>
-                <CommandEmpty>No projects found.</CommandEmpty>
+                <CommandEmpty>No services found.</CommandEmpty>
                 {allowAll && (
                   <CommandGroup>
                     <CommandItem
@@ -223,7 +221,7 @@ export function ProjectSelect({
                           value == null ? 'opacity-100' : 'opacity-0'
                         )}
                       />
-                      <span className="truncate">All projects</span>
+                      <span className="truncate">{allLabel}</span>
                     </CommandItem>
                   </CommandGroup>
                 )}

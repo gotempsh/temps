@@ -56,6 +56,10 @@ pub fn resolve_installation_secrets(
     resolve_installation_secrets_with(data_dir, |name| values.get(name).cloned().flatten())
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "bootstrap: the auth secret and encryption key are needed before the database exists (the key decrypts its rows)"
+)]
 fn read_environment(name: &'static str) -> Result<Option<String>, ConfigServiceError> {
     match std::env::var(name) {
         Ok(value) => Ok(Some(value)),
@@ -109,6 +113,92 @@ fn parse_stateless(value: Option<&str>) -> Result<bool, ConfigServiceError> {
     }
 }
 
+/// Where an installation secret comes from when `temps serve` starts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SecretSource {
+    /// The value itself is in this environment variable.
+    Environment { variable: &'static str },
+    /// Read from the file this environment variable names.
+    InjectedFile {
+        variable: &'static str,
+        path: PathBuf,
+    },
+    /// Persisted in the data directory.
+    DataDir { path: PathBuf },
+}
+
+/// An installation secret as `temps serve` would load it, found without
+/// creating anything. The value never appears in `Debug`.
+#[derive(Clone, PartialEq, Eq)]
+pub enum InspectedSecret {
+    /// Present: serve uses this value.
+    Found { source: SecretSource, value: String },
+    /// Absent from the data directory and not injected: serve generates
+    /// `path` the next time it starts.
+    NotCreatedYet { path: PathBuf },
+}
+
+impl std::fmt::Debug for InspectedSecret {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            InspectedSecret::Found { source, .. } => formatter
+                .debug_struct("Found")
+                .field("source", source)
+                .field("value", &"[REDACTED]")
+                .finish(),
+            InspectedSecret::NotCreatedYet { path } => formatter
+                .debug_struct("NotCreatedYet")
+                .field("path", path)
+                .finish(),
+        }
+    }
+}
+
+/// Both installation secrets as [`resolve_installation_secrets`] would load
+/// them. Each is inspected on its own, so a problem with one does not hide
+/// the state of the other.
+#[derive(Debug)]
+pub struct InstallationSecretsInspection {
+    pub auth_secret: Result<InspectedSecret, ConfigServiceError>,
+    pub encryption_key: Result<InspectedSecret, ConfigServiceError>,
+}
+
+/// Inspect the installation secrets the way `temps serve` resolves them, with
+/// `env` standing in for its environment, but never create a missing one.
+/// For diagnostics (`temps doctor`), which must not write secrets into a
+/// directory it is only looking at.
+pub fn inspect_installation_secrets_with(
+    data_dir: &Path,
+    env: impl Fn(&str) -> Option<String>,
+) -> InstallationSecretsInspection {
+    let inspect = |local_filename, value_env, file_env, validate| {
+        let stateless = parse_stateless(env(STATELESS_ENV).as_deref())?;
+        locate_secret(
+            data_dir,
+            local_filename,
+            value_env,
+            file_env,
+            stateless,
+            &env,
+            validate,
+        )
+    };
+    InstallationSecretsInspection {
+        auth_secret: inspect(
+            AUTH_SECRET_FILE,
+            AUTH_SECRET_ENV,
+            AUTH_SECRET_FILE_ENV,
+            validate_auth_secret,
+        ),
+        encryption_key: inspect(
+            ENCRYPTION_KEY_FILE,
+            ENCRYPTION_KEY_ENV,
+            ENCRYPTION_KEY_FILE_ENV,
+            validate_encryption_key,
+        ),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn resolve_secret(
     data_dir: &Path,
@@ -119,6 +209,34 @@ fn resolve_secret(
     env: &impl Fn(&str) -> Option<String>,
     validate: fn(&str, &'static str) -> Result<(), ConfigServiceError>,
 ) -> Result<String, ConfigServiceError> {
+    match locate_secret(
+        data_dir,
+        local_filename,
+        value_env,
+        file_env,
+        stateless,
+        env,
+        validate,
+    )? {
+        InspectedSecret::Found { value, .. } => Ok(value),
+        InspectedSecret::NotCreatedYet { .. } => {
+            load_or_create_local_secret(data_dir, local_filename)
+        }
+    }
+}
+
+/// Find a secret in serve's order (the variable, the `*_FILE` variable, then
+/// the data directory) without creating it.
+#[allow(clippy::too_many_arguments)]
+fn locate_secret(
+    data_dir: &Path,
+    local_filename: &'static str,
+    value_env: &'static str,
+    file_env: &'static str,
+    stateless: bool,
+    env: &impl Fn(&str) -> Option<String>,
+    validate: fn(&str, &'static str) -> Result<(), ConfigServiceError>,
+) -> Result<InspectedSecret, ConfigServiceError> {
     let direct = env(value_env);
     let file = env(file_env);
     if direct.is_some() && file.is_some() {
@@ -130,7 +248,12 @@ fn resolve_secret(
 
     if let Some(value) = direct {
         validate(&value, value_env)?;
-        return Ok(value);
+        return Ok(InspectedSecret::Found {
+            source: SecretSource::Environment {
+                variable: value_env,
+            },
+            value,
+        });
     }
     if let Some(path) = file {
         if path.trim().is_empty() {
@@ -148,7 +271,13 @@ fn resolve_secret(
             .trim()
             .to_string();
         validate(&value, file_env)?;
-        return Ok(value);
+        return Ok(InspectedSecret::Found {
+            source: SecretSource::InjectedFile {
+                variable: file_env,
+                path: PathBuf::from(path),
+            },
+            value,
+        });
     }
     if stateless {
         return Err(ConfigServiceError::MissingStatelessSecret {
@@ -157,7 +286,17 @@ fn resolve_secret(
         });
     }
 
-    load_or_create_local_secret(data_dir, local_filename)
+    let path = data_dir.join(local_filename);
+    match fs::read_to_string(&path) {
+        Ok(value) => Ok(InspectedSecret::Found {
+            source: SecretSource::DataDir { path },
+            value: value.trim().to_string(),
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(InspectedSecret::NotCreatedYet { path })
+        }
+        Err(source) => Err(ConfigServiceError::LocalSecretRead { path, source }),
+    }
 }
 
 fn load_or_create_local_secret(
@@ -223,12 +362,63 @@ fn write_new_secret(path: &Path, value: &str) -> Result<bool, ConfigServiceError
     }
 }
 
+/// Fewer distinct characters than this marks an injected auth secret as weak.
+/// A uniformly random 64-hex secret (the auto-generated format) has ~16 distinct
+/// characters; falling below 10 by chance is astronomically unlikely.
+const AUTH_SECRET_MIN_DISTINCT_CHARS: usize = 10;
+
+/// Why an auth secret looks low-entropy, or `None` when it passes the heuristic.
+///
+/// Heuristic only: it catches obviously weak values (repeated characters, short
+/// alphabets, a single-class passphrase) without pretending to measure entropy.
+fn auth_secret_weakness(value: &str) -> Option<String> {
+    let distinct = value
+        .chars()
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    if distinct < AUTH_SECRET_MIN_DISTINCT_CHARS {
+        return Some(format!(
+            "only {distinct} distinct characters (expected at least {AUTH_SECRET_MIN_DISTINCT_CHARS})"
+        ));
+    }
+    let is_hex = value.chars().all(|c| c.is_ascii_hexdigit());
+    let classes = [
+        value.chars().any(|c| c.is_ascii_lowercase()),
+        value.chars().any(|c| c.is_ascii_uppercase()),
+        value.chars().any(|c| c.is_ascii_digit()),
+        value.chars().any(|c| !c.is_ascii_alphanumeric()),
+    ]
+    .into_iter()
+    .filter(|present| *present)
+    .count();
+    // Hex output of a CSPRNG is fine even though it only spans two classes.
+    if !is_hex && classes < 2 {
+        return Some("uses a single character class (looks like a passphrase)".to_string());
+    }
+    None
+}
+
 fn validate_auth_secret(value: &str, origin: &'static str) -> Result<(), ConfigServiceError> {
     if value.len() < 32 {
         return Err(ConfigServiceError::InvalidInjectedSecret {
             origin,
             details: "auth secret must contain at least 32 bytes".to_string(),
         });
+    }
+    // This validator runs on every boot for injected secrets, so it cannot tell a
+    // freshly chosen value from the one an existing installation has always used.
+    // Refusing to start would lock existing operators out (and invalidate nothing:
+    // the secret is still what their sessions are keyed by), so a weak value is
+    // reported loudly instead. Generate a replacement with `openssl rand -hex 32`.
+    if let Some(reason) = auth_secret_weakness(value) {
+        tracing::warn!(
+            origin,
+            reason = %reason,
+            "Injected auth secret looks low-entropy: {}. It keys session cookies, \
+             preview grants and plugin actor tokens; replace it with a random value \
+             (e.g. `openssl rand -hex 32`). Rotating it signs every user out.",
+            reason
+        );
     }
     Ok(())
 }
@@ -337,6 +527,42 @@ mod tests {
     }
 
     #[test]
+    fn auth_secret_weakness_flags_obviously_low_entropy_values() {
+        assert!(auth_secret_weakness(&"a".repeat(64)).is_some());
+        assert!(auth_secret_weakness(&"ab".repeat(32)).is_some());
+        assert!(auth_secret_weakness("correcthorsebatterystaplecorrecthorse").is_some());
+        assert!(auth_secret_weakness("ONLYUPPERCASELETTERSFORMSAPASSPHRASE").is_some());
+    }
+
+    #[test]
+    fn auth_secret_weakness_accepts_random_secrets() {
+        // The auto-generated format must never be flagged.
+        for _ in 0..64 {
+            let mut bytes = [0_u8; 32];
+            rand::rngs::SysRng
+                .try_fill_bytes(&mut bytes)
+                .expect("system randomness");
+            let generated = hex::encode(bytes);
+            assert_eq!(auth_secret_weakness(&generated), None, "{generated}");
+        }
+        assert_eq!(
+            auth_secret_weakness("Zq7#pL2v!Rk9@xW4mN8$tB6^hJ3&yC5*"),
+            None
+        );
+    }
+
+    #[test]
+    fn weak_injected_auth_secret_still_boots() {
+        // Existing installations may already run with a weak injected value; the
+        // check warns rather than refusing to start (no lockout on upgrade).
+        assert!(validate_auth_secret(&"a".repeat(64), AUTH_SECRET_ENV).is_ok());
+        assert!(matches!(
+            validate_auth_secret("short", AUTH_SECRET_ENV),
+            Err(ConfigServiceError::InvalidInjectedSecret { .. })
+        ));
+    }
+
+    #[test]
     fn invalid_stateless_value_is_rejected() {
         let dir = tempfile::tempdir().expect("temporary directory");
         let error =
@@ -345,5 +571,99 @@ mod tests {
             error,
             ConfigServiceError::InvalidEnvironmentValue { .. }
         ));
+    }
+
+    fn inspect(dir: &Path, values: &[(&str, &str)]) -> InstallationSecretsInspection {
+        let values = values
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect::<HashMap<_, _>>();
+        inspect_installation_secrets_with(dir, |name| values.get(name).cloned())
+    }
+
+    #[test]
+    fn inspection_reports_missing_local_secrets_without_creating_them() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let inspected = inspect(dir.path(), &[]);
+        assert_eq!(
+            inspected.auth_secret.expect("auth secret inspected"),
+            InspectedSecret::NotCreatedYet {
+                path: dir.path().join(AUTH_SECRET_FILE)
+            }
+        );
+        assert_eq!(
+            inspected.encryption_key.expect("encryption key inspected"),
+            InspectedSecret::NotCreatedYet {
+                path: dir.path().join(ENCRYPTION_KEY_FILE)
+            }
+        );
+        assert!(!dir.path().join(AUTH_SECRET_FILE).exists());
+        assert!(!dir.path().join(ENCRYPTION_KEY_FILE).exists());
+    }
+
+    #[test]
+    fn inspection_finds_what_serve_resolves() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let generated = resolve(dir.path(), &[]).expect("serve generates local secrets");
+        let inspected = inspect(dir.path(), &[]);
+        assert_eq!(
+            inspected.auth_secret.expect("auth secret inspected"),
+            InspectedSecret::Found {
+                source: SecretSource::DataDir {
+                    path: dir.path().join(AUTH_SECRET_FILE)
+                },
+                value: generated.auth_secret,
+            }
+        );
+
+        let auth_path = dir.path().join("injected-auth");
+        fs::write(&auth_path, format!("{}\n", "c".repeat(64))).expect("auth file");
+        let inspected = inspect(
+            dir.path(),
+            &[(AUTH_SECRET_FILE_ENV, &auth_path.to_string_lossy())],
+        );
+        assert_eq!(
+            inspected.auth_secret.expect("auth secret inspected"),
+            InspectedSecret::Found {
+                source: SecretSource::InjectedFile {
+                    variable: AUTH_SECRET_FILE_ENV,
+                    path: auth_path,
+                },
+                value: "c".repeat(64),
+            }
+        );
+    }
+
+    #[test]
+    fn inspection_keeps_each_secrets_error_separate() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let inspected = inspect(
+            dir.path(),
+            &[
+                (AUTH_SECRET_ENV, &"a".repeat(64)),
+                (AUTH_SECRET_FILE_ENV, "/nonexistent/auth"),
+            ],
+        );
+        assert!(matches!(
+            inspected.auth_secret,
+            Err(ConfigServiceError::ConflictingSecretSources { .. })
+        ));
+        assert!(matches!(
+            inspected.encryption_key,
+            Ok(InspectedSecret::NotCreatedYet { .. })
+        ));
+    }
+
+    #[test]
+    fn inspected_secret_debug_never_shows_the_value() {
+        let secret = InspectedSecret::Found {
+            source: SecretSource::Environment {
+                variable: AUTH_SECRET_ENV,
+            },
+            value: "do-not-print-this-value".to_string(),
+        };
+        let debug = format!("{secret:?}");
+        assert!(!debug.contains("do-not-print-this-value"), "{debug}");
+        assert!(debug.contains("REDACTED"), "{debug}");
     }
 }

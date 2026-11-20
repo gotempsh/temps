@@ -2,6 +2,12 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use crate::externalsvc::{
+    garage::{
+        fill_missing_parameters as fill_missing_garage_parameters, DEFAULT_GARAGE_IMAGE,
+        GARAGE_ADMIN_PORT, GARAGE_S3_PORT,
+    },
+    is_empty_parameter_value as is_empty_value,
+    managed_s3::{parse_bucket_parameter, ManagedS3BackendKind},
     mariadb::{validate_immutable_mariadb_image, MariaDbSizeProfile, MARIADB_DEFAULT_IMAGE},
     rustfs::DEFAULT_RUSTFS_IMAGE,
     s3::S3ServerKind,
@@ -122,7 +128,9 @@ fn is_valid_mariadb_identifier(s: &str) -> bool {
         return false;
     }
     let mut chars = s.chars();
-    let first = chars.next().expect("non-empty checked above");
+    let Some(first) = chars.next() else {
+        return false;
+    };
     if !first.is_ascii_alphabetic() && first != '_' {
         return false;
     }
@@ -267,6 +275,53 @@ fn reject_non_loopback_host(params: &HashMap<String, JsonValue>) -> Result<(), S
     ))
 }
 
+/// JSON Schema of the `buckets` parameter, shared by every managed S3 backend.
+fn buckets_schema() -> JsonValue {
+    json!({
+        "type": "array",
+        "items": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*[a-z0-9]$", "minLength": 3, "maxLength": 32 },
+        "maxItems": crate::externalsvc::managed_s3::MAX_MANAGED_S3_BUCKETS,
+        "uniqueItems": true,
+        "description": "Bucket names every linked project environment receives (3-32 chars: a-z, 0-9, '-'). The first is exposed as S3_BUCKET and each as S3_BUCKET_<NAME>. Leave empty for one bucket per environment (updateable)."
+    })
+}
+
+/// `backend` must name the engine the strategy configures (or be absent), and
+/// `buckets` must be a valid bucket list. Rejecting a mismatch here keeps a
+/// `backend: garage` request from being configured with RustFS defaults.
+fn validate_managed_s3_selection(
+    params: &HashMap<String, JsonValue>,
+    expected: ManagedS3BackendKind,
+) -> Result<(), String> {
+    match params.get("backend") {
+        None | Some(JsonValue::Null) => {}
+        Some(JsonValue::String(value)) => {
+            let backend = ManagedS3BackendKind::parse(value).map_err(|e| e.to_string())?;
+            if backend != expected {
+                return Err(format!(
+                    "'backend' is '{backend}' but these parameters configure the {expected} backend"
+                ));
+            }
+        }
+        Some(other) => return Err(format!("'backend' must be a string, got {other}")),
+    }
+    parse_bucket_parameter(params.get("buckets")).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Validate and canonicalise a `buckets` update (trimmed, lower-cased, de-duplicated).
+fn normalize_buckets_update(updates: &mut HashMap<String, JsonValue>) -> Result<(), String> {
+    let Some(value) = updates.get("buckets") else {
+        return Ok(());
+    };
+    let buckets = parse_bucket_parameter(Some(value)).map_err(|e| e.to_string())?;
+    updates.insert(
+        "buckets".to_string(),
+        JsonValue::Array(buckets.into_iter().map(JsonValue::String).collect()),
+    );
+    Ok(())
+}
+
 fn reject_known_cross_engine_image(
     params: &HashMap<String, JsonValue>,
     incompatible_marker: &str,
@@ -319,7 +374,12 @@ pub struct PostgresParameterStrategy;
 
 impl ParameterStrategy for PostgresParameterStrategy {
     fn validate_for_creation(&self, params: &HashMap<String, JsonValue>) -> Result<(), String> {
-        reject_internal_only_keys(params, &["container_name"])?;
+        // `server_tls_*` are injected by the control plane from the TLS record
+        // (ADR 093) and never stored with the parameters.
+        reject_internal_only_keys(
+            params,
+            &["container_name", "server_tls_mode", "server_tls_material"],
+        )?;
         reject_non_loopback_host(params)?;
         if !params.contains_key("database") || is_empty_value(params.get("database")) {
             return Err("'database' is required for PostgreSQL".to_string());
@@ -455,11 +515,10 @@ impl ParameterStrategy for MariaDbParameterStrategy {
         reject_internal_only_keys(params, &["container_name"])?;
         reject_non_loopback_host(params)?;
         // Absent/empty is fine here -- `auto_generate_missing` (which runs
-        // after this) fills it with `MARIADB_DEFAULT_IMAGE`, same as every
-        // other optional field on this strategy. Only a caller-supplied
-        // image is held to the immutable-digest bar: our own default is a
-        // known-safe, logical-backup-only image we control, not something
-        // that needs pinning against drift.
+        // after this) fills it with `MARIADB_DEFAULT_IMAGE`, the pinned
+        // managed WAL-G image, same as every other optional field on this
+        // strategy. A caller-supplied image, including that default sent
+        // back from the schema, is held to the immutable-digest bar.
         if let Some(image) = params
             .get("docker_image")
             .and_then(JsonValue::as_str)
@@ -619,7 +678,7 @@ impl ParameterStrategy for MariaDbParameterStrategy {
                 },
                 "docker_image": {
                     "type": "string",
-                    "description": "MariaDB image (updateable). Defaults to a plain upstream tag; set an immutable repository@sha256:<64-hex-digest> reference to enable continuous archiving (mariadb_physical backups).",
+                    "description": "MariaDB image (updateable), an immutable repository@sha256:<64-hex-digest> reference. Defaults to the managed MariaDB 11.4 image with WAL-G, which supports logical and physical backups and continuous archiving.",
                     "default": MARIADB_DEFAULT_IMAGE
                 },
                 "size_profile": {
@@ -662,7 +721,7 @@ impl ParameterStrategy for RedisParameterStrategy {
         if is_empty_value(params.get("docker_image")) {
             params.insert(
                 "docker_image".to_string(),
-                JsonValue::String("gotempsh/redis-walg:8-bookworm".to_string()),
+                JsonValue::String(crate::externalsvc::redis::DEFAULT_REDIS_IMAGE.to_string()),
             );
         }
 
@@ -721,8 +780,11 @@ impl ParameterStrategy for RedisParameterStrategy {
                 },
                 "docker_image": {
                     "type": "string",
-                    "description": "Docker image (updateable, e.g., gotempsh/redis-walg:8-bookworm)",
-                    "default": "gotempsh/redis-walg:8-bookworm"
+                    "description": format!(
+                        "Docker image (updateable, e.g., {})",
+                        crate::externalsvc::redis::DEFAULT_REDIS_IMAGE
+                    ),
+                    "default": crate::externalsvc::redis::DEFAULT_REDIS_IMAGE
                 }
             },
             "readonly": ["password"]
@@ -751,6 +813,7 @@ impl ParameterStrategy for S3ParameterStrategy {
         )?;
         reject_non_loopback_host(params)?;
         reject_known_cross_engine_image(params, "minio/minio", "RustFS")?;
+        validate_managed_s3_selection(params, ManagedS3BackendKind::Rustfs)?;
         Ok(())
     }
 
@@ -838,22 +901,27 @@ impl ParameterStrategy for S3ParameterStrategy {
     }
 
     fn updateable_keys(&self) -> Vec<&'static str> {
-        vec!["port", "console_port", "docker_image"]
+        vec!["port", "console_port", "docker_image", "buckets"]
     }
 
     fn readonly_keys(&self) -> Vec<&'static str> {
-        vec!["access_key", "secret_key", "host", "region"]
+        vec!["backend", "access_key", "secret_key", "host", "region"]
     }
 
     fn merge_updates(
         &self,
         existing: &mut HashMap<String, JsonValue>,
-        updates: HashMap<String, JsonValue>,
+        mut updates: HashMap<String, JsonValue>,
     ) -> Result<(), String> {
         self.validate_for_update(&updates)?;
+        normalize_buckets_update(&mut updates)?;
 
         for (key, value) in updates {
-            existing.insert(key, value);
+            if key == "buckets" && matches!(&value, JsonValue::Array(a) if a.is_empty()) {
+                existing.remove("buckets");
+            } else {
+                existing.insert(key, value);
+            }
         }
         Ok(())
     }
@@ -865,10 +933,11 @@ impl ParameterStrategy for S3ParameterStrategy {
             "properties": {
                 "backend": {
                     "type": "string",
-                    "description": "Managed S3-compatible backend to provision. RustFS is the default; Garage is reserved for external provider support.",
+                    "description": "Managed S3-compatible storage engine. RustFS is the default; Garage is a lightweight alternative.",
                     "enum": ["rustfs", "garage"],
                     "default": "rustfs"
                 },
+                "buckets": buckets_schema(),
                 "access_key": {
                     "type": "string",
                     "description": "Access key (read-only after creation, auto-generated)",
@@ -1078,6 +1147,7 @@ impl ParameterStrategy for RustfsParameterStrategy {
         )?;
         reject_non_loopback_host(params)?;
         reject_known_cross_engine_image(params, "minio/minio", "RustFS")?;
+        validate_managed_s3_selection(params, ManagedS3BackendKind::Rustfs)?;
         Ok(())
     }
 
@@ -1165,22 +1235,27 @@ impl ParameterStrategy for RustfsParameterStrategy {
     }
 
     fn updateable_keys(&self) -> Vec<&'static str> {
-        vec!["port", "console_port", "docker_image"]
+        vec!["port", "console_port", "docker_image", "buckets"]
     }
 
     fn readonly_keys(&self) -> Vec<&'static str> {
-        vec!["access_key", "secret_key", "host", "region"]
+        vec!["backend", "access_key", "secret_key", "host", "region"]
     }
 
     fn merge_updates(
         &self,
         existing: &mut HashMap<String, JsonValue>,
-        updates: HashMap<String, JsonValue>,
+        mut updates: HashMap<String, JsonValue>,
     ) -> Result<(), String> {
         self.validate_for_update(&updates)?;
+        normalize_buckets_update(&mut updates)?;
 
         for (key, value) in updates {
-            existing.insert(key, value);
+            if key == "buckets" && matches!(&value, JsonValue::Array(a) if a.is_empty()) {
+                existing.remove("buckets");
+            } else {
+                existing.insert(key, value);
+            }
         }
         Ok(())
     }
@@ -1190,6 +1265,13 @@ impl ParameterStrategy for RustfsParameterStrategy {
             "type": "object",
             "title": "RustFS/Blob Parameters",
             "properties": {
+                "backend": {
+                    "type": "string",
+                    "description": "Managed S3-compatible storage engine (read-only after creation)",
+                    "enum": ["rustfs", "garage"],
+                    "default": "rustfs"
+                },
+                "buckets": buckets_schema(),
                 "access_key": {
                     "type": "string",
                     "description": "Access key (read-only after creation, auto-generated)",
@@ -1232,6 +1314,150 @@ impl ParameterStrategy for RustfsParameterStrategy {
 
     fn service_name(&self) -> &'static str {
         "RustFS/Blob"
+    }
+}
+
+/// Garage parameter strategy (managed S3 backend `garage`).
+pub struct GarageParameterStrategy;
+
+impl ParameterStrategy for GarageParameterStrategy {
+    fn validate_for_creation(&self, params: &HashMap<String, JsonValue>) -> Result<(), String> {
+        // The admin token and RPC secret are generated; a client-chosen value
+        // would be a credential Temps did not mint.
+        reject_internal_only_keys(params, &["container_name", "admin_token", "rpc_secret"])?;
+        reject_non_loopback_host(params)?;
+        reject_known_cross_engine_image(params, "minio/minio", "Garage")?;
+        reject_known_cross_engine_image(params, "rustfs/rustfs", "Garage")?;
+        validate_managed_s3_selection(params, ManagedS3BackendKind::Garage)?;
+        if let Some(access_key) = params.get("access_key").and_then(JsonValue::as_str) {
+            let valid = access_key.len() == 26
+                && access_key.starts_with("GK")
+                && access_key[2..].chars().all(|c| c.is_ascii_hexdigit());
+            if !access_key.is_empty() && !valid {
+                return Err(
+                    "Garage 'access_key' must be 'GK' followed by 24 hexadecimal characters"
+                        .to_string(),
+                );
+            }
+        }
+        if let Some(secret_key) = params.get("secret_key").and_then(JsonValue::as_str) {
+            let valid = secret_key.len() == 64 && secret_key.chars().all(|c| c.is_ascii_hexdigit());
+            if !secret_key.is_empty() && !valid {
+                return Err("Garage 'secret_key' must be 64 hexadecimal characters".to_string());
+            }
+        }
+        Ok(())
+    }
+
+    fn auto_generate_missing(&self, params: &mut HashMap<String, JsonValue>) -> Result<(), String> {
+        fill_missing_garage_parameters(params);
+        Ok(())
+    }
+
+    fn validate_for_update(&self, updates: &HashMap<String, JsonValue>) -> Result<(), String> {
+        for key in updates.keys() {
+            if !self.updateable_keys().contains(&key.as_str()) {
+                return Err(format!(
+                    "Cannot update parameter '{}' for Garage. Read-only parameters: {}. Updateable parameters: {}",
+                    key,
+                    self.readonly_keys().join(", "),
+                    self.updateable_keys().join(", ")
+                ));
+            }
+        }
+        // The container is recreated on the new image with a `garage.toml`
+        // only Garage can read, so another engine's image is refused here
+        // just as it is at creation.
+        reject_known_cross_engine_image(updates, "minio/minio", "Garage")?;
+        reject_known_cross_engine_image(updates, "rustfs/rustfs", "Garage")?;
+        Ok(())
+    }
+
+    fn updateable_keys(&self) -> Vec<&'static str> {
+        vec!["port", "admin_port", "docker_image", "buckets"]
+    }
+
+    fn readonly_keys(&self) -> Vec<&'static str> {
+        vec![
+            "backend",
+            "access_key",
+            "secret_key",
+            "admin_token",
+            "rpc_secret",
+            "host",
+            "region",
+        ]
+    }
+
+    fn merge_updates(
+        &self,
+        existing: &mut HashMap<String, JsonValue>,
+        mut updates: HashMap<String, JsonValue>,
+    ) -> Result<(), String> {
+        self.validate_for_update(&updates)?;
+        normalize_buckets_update(&mut updates)?;
+        for (key, value) in updates {
+            if key == "buckets" && matches!(&value, JsonValue::Array(a) if a.is_empty()) {
+                existing.remove("buckets");
+            } else {
+                existing.insert(key, value);
+            }
+        }
+        Ok(())
+    }
+
+    fn get_schema(&self) -> Option<JsonValue> {
+        Some(json!({
+            "type": "object",
+            "title": "Garage Parameters",
+            "properties": {
+                "backend": {
+                    "type": "string",
+                    "description": "Managed S3-compatible storage engine (read-only after creation)",
+                    "enum": ["rustfs", "garage"],
+                    "default": "garage"
+                },
+                "buckets": buckets_schema(),
+                "access_key": {
+                    "type": "string",
+                    "description": "Service access key id (read-only, auto-generated: 'GK' + 24 hex)"
+                },
+                "secret_key": {
+                    "type": "string",
+                    "description": "Service secret key (read-only, auto-generated: 64 hex)"
+                },
+                "host": {
+                    "type": "string",
+                    "description": "Host address (read-only after creation)",
+                    "default": "localhost"
+                },
+                "region": {
+                    "type": "string",
+                    "description": "S3 region (read-only after creation)",
+                    "default": "us-east-1"
+                },
+                "port": {
+                    "type": "integer",
+                    "description": "S3 API port (updateable)",
+                    "default": GARAGE_S3_PORT
+                },
+                "admin_port": {
+                    "type": "integer",
+                    "description": "Admin API port (updateable)",
+                    "default": GARAGE_ADMIN_PORT
+                },
+                "docker_image": {
+                    "type": "string",
+                    "description": "Docker image (updateable)",
+                    "default": DEFAULT_GARAGE_IMAGE
+                }
+            },
+            "readonly": ["backend", "access_key", "secret_key", "host", "region"]
+        }))
+    }
+
+    fn service_name(&self) -> &'static str {
+        "Garage"
     }
 }
 
@@ -1388,6 +1614,8 @@ pub fn get_strategy(service_type: &str) -> Option<Box<dyn ParameterStrategy>> {
         "kv" => Some(Box::new(RedisParameterStrategy)),
         // MinIO is deprecated, kept for backward compatibility with existing services
         "minio" => Some(Box::new(MinioParameterStrategy)),
+        // Managed S3 backend `garage`; the stored service type stays s3/blob
+        "garage" => Some(Box::new(GarageParameterStrategy)),
         _ => None,
     }
 }
@@ -1406,15 +1634,6 @@ fn validate_s3_server_kind(params: &HashMap<String, JsonValue>) -> Result<(), St
             "Invalid S3 server kind {other}: expected 'rustfs' or 'minio'"
         )),
         None => Ok(()),
-    }
-}
-
-fn is_empty_value(value: Option<&JsonValue>) -> bool {
-    match value {
-        None => true,
-        Some(JsonValue::Null) => true,
-        Some(JsonValue::String(s)) => s.is_empty(),
-        _ => false,
     }
 }
 
@@ -1475,6 +1694,25 @@ mod tests {
         assert!(strategy.updateable_keys().contains(&"port"));
         assert!(strategy.updateable_keys().contains(&"max_connections"));
         assert!(strategy.updateable_keys().contains(&"ssl_mode"));
+    }
+
+    /// ADR 093: the TLS mode and certificate are injected by the control
+    /// plane; a client can neither create nor update them as parameters, so
+    /// they can never land in the stored parameter blob.
+    #[test]
+    fn test_postgres_rejects_client_supplied_server_tls_parameters() {
+        let strategy = PostgresParameterStrategy;
+        for key in ["server_tls_mode", "server_tls_material"] {
+            let params = HashMap::from([
+                ("database".to_string(), JsonValue::String("app".into())),
+                ("username".to_string(), JsonValue::String("app".into())),
+                (key.to_string(), JsonValue::String("available".into())),
+            ]);
+            let err = strategy.validate_for_creation(&params).unwrap_err();
+            assert!(err.contains(key), "{err}");
+            let updates = HashMap::from([(key.to_string(), JsonValue::String("off".into()))]);
+            assert!(strategy.validate_for_update(&updates).is_err());
+        }
     }
 
     #[test]
@@ -1585,7 +1823,7 @@ mod tests {
 
     #[test]
     fn test_mariadb_missing_image_defaults_instead_of_failing() {
-        // A caller who names no image at all gets the safe, mutable
+        // A caller who names no image at all gets the pinned
         // MARIADB_DEFAULT_IMAGE from auto_generate_missing -- creation must
         // not require every caller to already know about WAL-G pinning.
         let strategy = MariaDbParameterStrategy;
@@ -1600,6 +1838,23 @@ mod tests {
             params.get("docker_image"),
             Some(&JsonValue::String(MARIADB_DEFAULT_IMAGE.to_string()))
         );
+    }
+
+    /// A client that fills in the schema's advertised default and sends it
+    /// back, as the console and CLI do, is accepted: the default is pinned.
+    #[test]
+    fn test_mariadb_accepts_the_advertised_default_image() {
+        let strategy = MariaDbParameterStrategy;
+        let schema = strategy.get_schema().expect("a MariaDB schema");
+        let advertised = schema["properties"]["docker_image"]["default"]
+            .as_str()
+            .expect("an advertised default image")
+            .to_string();
+        assert_eq!(advertised, MARIADB_DEFAULT_IMAGE);
+        let params = HashMap::from([("docker_image".to_string(), JsonValue::String(advertised))]);
+        strategy
+            .validate_for_creation(&params)
+            .expect("the advertised default must be accepted");
     }
 
     #[test]
@@ -2326,6 +2581,299 @@ mod tests {
         assert!(
             is_valid_pg_password(generated).is_ok(),
             "auto-generated password must itself pass validation"
+        );
+    }
+
+    fn string_params(pairs: &[(&str, &str)]) -> HashMap<String, JsonValue> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), JsonValue::String(v.to_string())))
+            .collect()
+    }
+
+    #[test]
+    fn garage_generates_every_credential_and_a_pinned_image() {
+        let strategy = GarageParameterStrategy;
+        let mut params = HashMap::new();
+        strategy.validate_for_creation(&params).unwrap();
+        strategy.auto_generate_missing(&mut params).unwrap();
+
+        assert_eq!(
+            params.get("docker_image").and_then(JsonValue::as_str),
+            Some(DEFAULT_GARAGE_IMAGE)
+        );
+        assert!(
+            !DEFAULT_GARAGE_IMAGE.ends_with(":latest") && DEFAULT_GARAGE_IMAGE.contains(':'),
+            "the default Garage image must be pinned to a version tag"
+        );
+        let access_key = params["access_key"].as_str().unwrap();
+        assert!(access_key.starts_with("GK") && access_key.len() == 26);
+        assert_eq!(params["secret_key"].as_str().unwrap().len(), 64);
+        assert!(params["admin_token"].as_str().unwrap().len() >= 32);
+        assert_eq!(params["rpc_secret"].as_str().unwrap().len(), 64);
+        assert_ne!(params["port"], params["admin_port"]);
+    }
+
+    #[test]
+    fn garage_generated_secrets_are_unique_per_service() {
+        let strategy = GarageParameterStrategy;
+        let mut first = HashMap::new();
+        let mut second = HashMap::new();
+        strategy.auto_generate_missing(&mut first).unwrap();
+        strategy.auto_generate_missing(&mut second).unwrap();
+        for key in ["secret_key", "admin_token", "rpc_secret"] {
+            assert_ne!(first[key], second[key], "{key} must not repeat");
+        }
+    }
+
+    #[test]
+    fn garage_rejects_client_supplied_internal_secrets() {
+        let strategy = GarageParameterStrategy;
+        for key in ["admin_token", "rpc_secret", "container_name"] {
+            let params = string_params(&[(key, "attacker-chosen")]);
+            let err = strategy.validate_for_creation(&params).unwrap_err();
+            assert!(err.contains(key), "error should name '{key}': {err}");
+        }
+    }
+
+    #[test]
+    fn garage_rejects_malformed_keys_and_foreign_images() {
+        let strategy = GarageParameterStrategy;
+        assert!(strategy
+            .validate_for_creation(&string_params(&[("access_key", "minioadmin")]))
+            .is_err());
+        assert!(strategy
+            .validate_for_creation(&string_params(&[("secret_key", "short")]))
+            .is_err());
+        assert!(strategy
+            .validate_for_creation(&string_params(&[("docker_image", "minio/minio:latest")]))
+            .is_err());
+        assert!(strategy
+            .validate_for_creation(&string_params(&[("docker_image", "rustfs/rustfs:1.0.0")]))
+            .is_err());
+        assert!(strategy
+            .validate_for_creation(&string_params(&[("host", "storage.example.com")]))
+            .is_err());
+    }
+
+    #[test]
+    fn garage_rejects_a_different_backend_in_its_own_parameters() {
+        let strategy = GarageParameterStrategy;
+        let err = strategy
+            .validate_for_creation(&string_params(&[("backend", "rustfs")]))
+            .unwrap_err();
+        assert!(err.contains("garage"), "{err}");
+        strategy
+            .validate_for_creation(&string_params(&[("backend", "garage")]))
+            .unwrap();
+    }
+
+    #[test]
+    fn garage_secrets_and_backend_are_read_only_after_creation() {
+        let strategy = GarageParameterStrategy;
+        for key in [
+            "backend",
+            "access_key",
+            "secret_key",
+            "admin_token",
+            "rpc_secret",
+            "host",
+            "region",
+        ] {
+            let updates = string_params(&[(key, "x")]);
+            assert!(
+                strategy.validate_for_update(&updates).is_err(),
+                "{key} must be read-only"
+            );
+        }
+        assert!(strategy
+            .validate_for_update(&string_params(&[("docker_image", "dxflrs/garage:v2.1.0")]))
+            .is_ok());
+    }
+
+    #[test]
+    fn garage_bucket_updates_are_normalised_and_empty_clears_them() {
+        let strategy = GarageParameterStrategy;
+        let mut existing = HashMap::from([("buckets".to_string(), json!(["uploads"]))]);
+
+        let updates = HashMap::from([(
+            "buckets".to_string(),
+            JsonValue::String(" Uploads , media ,uploads".to_string()),
+        )]);
+        strategy.merge_updates(&mut existing, updates).unwrap();
+        assert_eq!(existing["buckets"], json!(["uploads", "media"]));
+
+        let clear = HashMap::from([("buckets".to_string(), json!([]))]);
+        strategy.merge_updates(&mut existing, clear).unwrap();
+        assert!(!existing.contains_key("buckets"));
+    }
+
+    #[test]
+    fn garage_schema_offers_both_backends_and_buckets() {
+        let schema = GarageParameterStrategy.get_schema().unwrap();
+        let backends = schema["properties"]["backend"]["enum"].as_array().unwrap();
+        assert!(backends.contains(&json!("garage")) && backends.contains(&json!("rustfs")));
+        assert!(schema["properties"]["buckets"].is_object());
+        for secret in ["admin_token", "rpc_secret"] {
+            assert!(
+                schema["properties"].get(secret).is_none(),
+                "{secret} is generated and must not be requested from the user"
+            );
+        }
+    }
+
+    #[test]
+    fn s3_and_rustfs_validate_the_bucket_list_at_creation() {
+        for strategy in [
+            &S3ParameterStrategy as &dyn ParameterStrategy,
+            &RustfsParameterStrategy as &dyn ParameterStrategy,
+        ] {
+            strategy
+                .validate_for_creation(&HashMap::from([(
+                    "buckets".to_string(),
+                    json!(["uploads", "media-2"]),
+                )]))
+                .unwrap();
+            assert!(
+                strategy
+                    .validate_for_creation(&HashMap::from([(
+                        "buckets".to_string(),
+                        json!(["Bad_Name"]),
+                    )]))
+                    .is_err(),
+                "{} must reject an invalid bucket name",
+                strategy.service_name()
+            );
+            assert!(
+                strategy
+                    .validate_for_creation(&HashMap::from([(
+                        "buckets".to_string(),
+                        json!(["a", "a"]),
+                    )]))
+                    .is_err(),
+                "{} must reject duplicate buckets",
+                strategy.service_name()
+            );
+            let too_many: Vec<String> = (0..64).map(|i| format!("bucket-{i}")).collect();
+            assert!(
+                strategy
+                    .validate_for_creation(&HashMap::from([(
+                        "buckets".to_string(),
+                        json!(too_many),
+                    )]))
+                    .is_err(),
+                "{} must cap the bucket count",
+                strategy.service_name()
+            );
+        }
+    }
+
+    #[test]
+    fn s3_without_a_backend_behaves_as_rustfs_and_rejects_garage_parameters() {
+        let strategy = S3ParameterStrategy;
+        strategy.validate_for_creation(&HashMap::new()).unwrap();
+        strategy
+            .validate_for_creation(&string_params(&[("backend", "rustfs")]))
+            .unwrap();
+        let err = strategy
+            .validate_for_creation(&string_params(&[("backend", "garage")]))
+            .unwrap_err();
+        assert!(err.contains("garage"), "{err}");
+    }
+
+    #[test]
+    fn garage_updates_allow_the_admin_port_and_reject_a_foreign_engine_image() {
+        let strategy = GarageParameterStrategy;
+        strategy
+            .validate_for_update(&string_params(&[("admin_port", "3903")]))
+            .unwrap();
+        strategy
+            .validate_for_update(&string_params(&[("docker_image", "dxflrs/garage:v2.0.0")]))
+            .unwrap();
+        let err = strategy
+            .validate_for_update(&string_params(&[("docker_image", "rustfs/rustfs:latest")]))
+            .unwrap_err();
+        assert!(err.contains("incompatible with Garage"), "{err}");
+        let err = strategy
+            .validate_for_update(&string_params(&[("console_port", "9001")]))
+            .unwrap_err();
+        assert!(err.contains("console_port"), "{err}");
+    }
+
+    #[test]
+    fn get_strategy_dispatches_garage() {
+        let strategy = get_strategy("garage").expect("garage strategy");
+        assert_eq!(
+            strategy.service_name(),
+            GarageParameterStrategy.service_name()
+        );
+    }
+
+    /// Regression guard for the cross-tenant IDOR: a client-supplied
+    /// `container_name` in a create request would make every subsequent Docker
+    /// operation (start, exec, backup, restore) target that named container
+    /// instead of creating a new one. Because Docker names are global and
+    /// predictable (`mariadb-{slug}`), this lets a tenant redirect operations
+    /// to a different tenant's live database container.
+    ///
+    /// The schema-level `#[schemars(skip)]` only hides the field from the UI
+    /// form — it does NOT stop `serde_json::from_value` from deserialising a
+    /// client-supplied value. `validate_for_creation` must reject it explicitly.
+    #[test]
+    fn test_mariadb_container_name_rejected_by_validate_for_creation() {
+        let strategy = MariaDbParameterStrategy;
+        let mut params = std::collections::HashMap::new();
+        params.insert(
+            "container_name".to_string(),
+            serde_json::Value::String("mariadb-victim-slug".to_string()),
+        );
+        let result = ParameterStrategy::validate_for_creation(&strategy, &params);
+        assert!(
+            result.is_err(),
+            "validate_for_creation must reject a client-supplied container_name"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("container_name"),
+            "error message should mention 'container_name', got: {err}"
+        );
+    }
+
+    /// Regression guard for the cross-tenant IDOR: a client-supplied
+    /// `container_name` in a create request would make every subsequent Docker
+    /// operation (start, exec, backup, restore) target that named container
+    /// instead of creating a new one. Because Docker names are global and
+    /// predictable (`postgres-{slug}`), this lets a tenant redirect operations
+    /// to a different tenant's live database container.
+    ///
+    /// The schema-level `#[schemars(skip)]` only hides the field from the UI
+    /// form — it does NOT stop `serde_json::from_value` from deserialising a
+    /// client-supplied value. `validate_for_creation` must reject it explicitly.
+    #[test]
+    fn test_postgres_container_name_rejected_by_validate_for_creation() {
+        let strategy = PostgresParameterStrategy;
+        let mut params = std::collections::HashMap::new();
+        params.insert(
+            "database".to_string(),
+            serde_json::Value::String("mydb".to_string()),
+        );
+        params.insert(
+            "username".to_string(),
+            serde_json::Value::String("myuser".to_string()),
+        );
+        params.insert(
+            "container_name".to_string(),
+            serde_json::Value::String("postgres-victim-slug".to_string()),
+        );
+        let result = ParameterStrategy::validate_for_creation(&strategy, &params);
+        assert!(
+            result.is_err(),
+            "validate_for_creation must reject a client-supplied container_name"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("container_name"),
+            "error message should mention 'container_name', got: {err}"
         );
     }
 }

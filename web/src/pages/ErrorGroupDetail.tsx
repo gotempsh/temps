@@ -1,26 +1,41 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
+import { PageTitle } from '@temps-sdk/ds'
 import { HighlightedCode } from '@/components/ui/code-block'
+import { FixErrorWithAgentButton } from '@/components/ai/FixErrorWithAgentButton'
 
-import {
-  ErrorEventResponse,
-  ProjectResponse,
-  RouteUserWithRoles,
-  UserResponse,
-} from '@/api/client'
+import { ErrorEventResponse, ProjectResponse } from '@/api/client'
 import {
   getEnvironmentsOptions,
   getErrorGroupOptions,
+  getErrorGroupQueryKey,
   listErrorEventsOptions,
-  listUsersOptions,
+  listErrorEventsQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
-import { AutofixButton } from '@/components/autofixer/AutofixButton'
+import { AutofixIncidentCard } from '@/components/autofix/AutofixIncidentCard'
 import { SentryEventDetail } from '@/components/error-tracking/SentryEventDetail'
 import { SentryListItem } from '@/components/error-tracking/SentryListItem'
-import { updateErrorGroupMutation } from '@/api/client/@tanstack/react-query.gen'
+import {
+  listErrorGroupActivityQueryKey,
+  updateErrorGroupMutation,
+} from '@/api/client/@tanstack/react-query.gen'
+import { GroupMergeActions } from '@/components/error-tracking/GroupMergeActions'
+import { IgnoreMenu } from '@/components/error-tracking/IgnoreMenu'
+import { ResolveMenu } from '@/components/error-tracking/ResolveMenu'
+import { AssigneeMenu } from '@/components/error-tracking/AssigneeMenu'
+import { GroupActivity } from '@/components/error-tracking/GroupActivity'
+import { PerformanceIssueCard } from '@/components/error-tracking/PerformanceIssueCard'
+import { performanceEvidence } from '@/components/error-tracking/performance-evidence'
+import {
+  IGNORE_PRESETS,
+  describeIgnoreState,
+  ignorePresetConditions,
+  type IgnoreConditions,
+} from '@/components/error-tracking/ignore-presets'
 import { Alert, AlertDescription } from '@/components/ui/alert'
-import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import { Badge } from '@/components/ui/badge'
+import { RefreshButton } from '@/components/ui/refresh-button'
+import { queryKeyPrefix } from '@/lib/refresh'
 import { Button } from '@/components/ui/button'
 import {
   Card,
@@ -33,8 +48,6 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
-  DropdownMenuLabel,
-  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { ScrollArea } from '@/components/ui/scroll-area'
@@ -55,13 +68,14 @@ import {
   ArrowLeft,
   Check,
   EyeOff,
+  Home,
+  List,
+  MessageSquare,
   MoreVertical,
   RotateCcw,
-  UserRound,
 } from 'lucide-react'
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useNavigate, useParams } from 'react-router'
-import { useIsInstanceAdmin } from '@/hooks/useIsInstanceAdmin'
 
 export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
   const { projectSlug, errorGroupId } = useParams<{
@@ -107,13 +121,22 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
           path: { group_id: parseInt(errorGroupId!), project_id: project.id },
         }).queryKey,
       })
+      queryClient.invalidateQueries({
+        queryKey: queryKeyPrefix(listErrorGroupActivityQueryKey, {
+          path: { group_id: parseInt(errorGroupId!), project_id: project.id },
+        }),
+      })
     },
   })
 
-  const updateStatus = (status: string) => {
+  const updateStatus = (
+    status: string,
+    ignore?: IgnoreConditions,
+    inNextRelease = false
+  ) => {
     statusMutation.mutate({
       path: { group_id: parseInt(errorGroupId!), project_id: project.id },
-      body: { status },
+      body: { status, ignore, in_next_release: inNextRelease },
     })
   }
 
@@ -123,45 +146,6 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
     ...getEnvironmentsOptions({ path: { project_id: project.id } }),
   })
 
-  // No per-project members endpoint exists yet — same instance-wide user
-  // source TeamDetail's AddMemberDialog uses to resolve `assigned_to` (an
-  // email/username string) to a display name + avatar.
-  // Listing users needs `users:write` (instance administrators only); other
-  // roles fall back to showing the raw assignee string.
-  const isInstanceAdmin = useIsInstanceAdmin()
-  const { data: usersData } = useQuery({
-    ...listUsersOptions({ query: { include_deleted: false } }),
-    enabled: isInstanceAdmin,
-  })
-  const userByIdentity = useMemo(() => {
-    const map = new Map<string, NonNullable<typeof usersData>[number]>()
-    for (const u of usersData ?? []) {
-      if (u.user.email) map.set(u.user.email.toLowerCase(), u)
-      if (u.user.username) map.set(u.user.username.toLowerCase(), u)
-    }
-    return map
-  }, [usersData])
-
-  const assigneeMutation = useMutation({
-    ...updateErrorGroupMutation(),
-    meta: { errorTitle: 'Failed to update assignee' },
-    onSuccess: () => {
-      queryClient.invalidateQueries({
-        queryKey: getErrorGroupOptions({
-          path: { group_id: parseInt(errorGroupId!), project_id: project.id },
-        }).queryKey,
-      })
-    },
-  })
-  const assign = (assignedTo: string) =>
-    assigneeMutation.mutate({
-      path: { group_id: parseInt(errorGroupId!), project_id: project.id },
-      body: {
-        status: (errorGroup as { status?: string })?.status ?? 'unresolved',
-        assigned_to: assignedTo,
-      },
-    })
-
   usePageTitle(errorGroup ? `Error: ${errorGroup.title}` : 'Error Details')
 
   useEffect(() => {
@@ -169,7 +153,7 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
       setBreadcrumbs([
         { label: 'Projects', href: '/projects' },
         { label: projectSlug, href: `/projects/${projectSlug}` },
-        { label: 'Error Tracking', href: `/projects/${projectSlug}/errors` },
+        { label: 'Error tracking', href: `/projects/${projectSlug}/errors` },
         { label: errorGroup.title || 'Error Details' },
       ])
     }
@@ -179,7 +163,7 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
   const assistantContext = errorGroup
     ? [
         'The user is viewing an error group (error tracking) in the Temps console.',
-        `Project: "${project.name}" (slug: ${project.slug}, id: ${project.id}).`,
+        `Service: "${project.name}" (project slug: ${project.slug}, project id: ${project.id}).`,
         `Error group #${errorGroupId}: "${errorGroup.title}" (type: ${errorGroup.error_type ?? 'unknown'}).`,
         `Seen ${errorGroup.total_count} time(s); first ${errorGroup.first_seen}, last ${errorGroup.last_seen}.`,
         'Fetch details via the temps CLI: `error-tracking get_error_group --group_id` and `list_error_events --group_id`.',
@@ -191,9 +175,9 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
     switch (level?.toLowerCase()) {
       case 'error':
       case 'fatal':
-        return 'text-red-600 bg-red-100 dark:bg-red-900/20'
+        return 'text-red-700 dark:text-red-600 bg-red-100 dark:bg-red-900/20'
       case 'warning':
-        return 'text-yellow-600 bg-yellow-100 dark:bg-yellow-900/20'
+        return 'text-yellow-700 dark:text-yellow-600 bg-yellow-100 dark:bg-yellow-900/20'
       case 'info':
         return 'text-blue-600 bg-blue-100 dark:bg-blue-900/20'
       default:
@@ -203,7 +187,7 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
 
   if (isLoadingGroup || isLoadingEvents) {
     return (
-      <div className="space-y-6 p-4 sm:p-6">
+      <div className="space-y-6">
         <div className="flex items-center justify-between">
           <Skeleton className="h-8 w-64" />
           <div className="flex gap-2">
@@ -254,7 +238,7 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
             onClick={() => navigate(`/projects/${project.slug}/errors`)}
           >
             <ArrowLeft className="mr-2 h-4 w-4" />
-            Back to Error Tracking
+            Back to error tracking
           </Button>
         </div>
       </div>
@@ -272,11 +256,16 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
     )
   }
 
+  const groupPath = { group_id: errorGroup.id, project_id: project.id }
   const latestEvent = errorEvents?.data?.[0] as ErrorEventResponse | undefined
   const sentryEvent = latestEvent ? extractSentryEvent(latestEvent.data) : null
+  const evidence =
+    errorGroup?.issue_type === 'performance' && latestEvent
+      ? performanceEvidence(latestEvent.data)
+      : null
 
   return (
-    <div className="p-4 sm:p-6">
+    <div>
       {/* Error Title Bar with Back Button */}
       <div className="mb-6 space-y-3">
         <div className="flex flex-wrap items-center gap-2">
@@ -315,12 +304,38 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
           )}
         </div>
 
-        <h1 className="text-lg sm:text-xl md:text-2xl font-semibold break-words">
+        <PageTitle className="text-lg sm:text-xl md:text-2xl font-semibold break-words">
           {errorGroup.title}
-        </h1>
+        </PageTitle>
 
-        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-          <div className="flex flex-col gap-1 text-sm text-muted-foreground sm:flex-row sm:flex-wrap sm:items-center sm:gap-x-2 sm:gap-y-1">
+        <GroupMergeActions
+          projectId={project.id}
+          projectSlug={project.slug}
+          groupId={errorGroup.id}
+          mergedIntoGroupId={errorGroup.merged_into_group_id}
+        />
+
+        {errorGroup.ignore && (
+          <p className="text-sm text-muted-foreground">
+            {describeIgnoreState(
+              errorGroup.ignore,
+              errorGroup.total_count ?? 0
+            )}
+          </p>
+        )}
+
+        {errorGroup.resolution?.in_next_release && (
+          <p className="text-sm text-muted-foreground">
+            {errorGroup.resolution.after_release
+              ? `Resolved in the release after ${errorGroup.resolution.after_release}: events from that release or an older one keep it resolved, and the first event from a newer release reopens it.`
+              : 'Resolved in the next release: the first event from a newer release reopens it.'}
+          </p>
+        )}
+
+        {/* The actions stay one group: when they do not fit beside the
+            details they move below them together. */}
+        <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-3">
+          <div className="flex min-w-0 flex-col gap-1 text-sm text-muted-foreground sm:flex-row sm:flex-wrap sm:items-center sm:gap-x-2 sm:gap-y-1">
             <span>{errorGroup.total_count || 0} occurrences</span>
             <span className="hidden sm:inline">•</span>
             <span>
@@ -332,120 +347,168 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
             </span>
           </div>
 
-          <div className="flex items-center gap-2">
-            <AssigneeControl
-              assignedTo={errorGroup.assigned_to}
-              userByIdentity={userByIdentity}
-              currentUser={currentUser}
-              users={usersData}
-              onAssign={assign}
-              isPending={assigneeMutation.isPending}
+          <div
+            role="group"
+            aria-label="Error actions"
+            className="flex shrink-0 items-center gap-2"
+          >
+            <RefreshButton
+              queryKeys={[
+                getErrorGroupQueryKey({ path: groupPath }),
+                queryKeyPrefix(listErrorEventsQueryKey, { path: groupPath }),
+              ]}
             />
-          </div>
-
-          {/* Desktop: full action buttons */}
-          <div className="hidden gap-2 sm:flex sm:flex-wrap">
             {(errorGroup as any).status !== 'resolved' && (
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => updateStatus('resolved')}
-                disabled={statusMutation.isPending}
-              >
-                <Check className="h-4 w-4 mr-1.5" />
-                Resolve
-              </Button>
+              <FixErrorWithAgentButton
+                error={{
+                  id: errorGroup.id,
+                  title: errorGroup.title,
+                  error_type: errorGroup.error_type,
+                  environment_name:
+                    errorGroup.environment_id != null
+                      ? environments?.find(
+                          (e) => e.id === errorGroup.environment_id
+                        )?.name
+                      : undefined,
+                  project: {
+                    id: project.id,
+                    slug: project.slug,
+                    name: project.name,
+                  },
+                }}
+              />
             )}
-            {(errorGroup as any).status !== 'ignored' &&
-              (errorGroup as any).status !== 'resolved' && (
+            <AssigneeMenu
+              projectId={project.id}
+              groupId={errorGroup.id}
+              assignee={errorGroup.assignee}
+              legacyAssignedTo={errorGroup.assigned_to}
+              currentUserId={currentUser?.id}
+            />
+
+            {/* Desktop: full action buttons */}
+            <div className="hidden items-center gap-2 sm:flex">
+              {(errorGroup as any).status !== 'resolved' && (
+                <ResolveMenu
+                  onResolve={(inNextRelease) =>
+                    updateStatus('resolved', undefined, inNextRelease)
+                  }
+                  disabled={statusMutation.isPending}
+                />
+              )}
+              {(errorGroup as any).status !== 'resolved' && (
+                <IgnoreMenu
+                  onIgnore={(conditions) => updateStatus('ignored', conditions)}
+                  disabled={statusMutation.isPending}
+                />
+              )}
+              {((errorGroup as any).status === 'resolved' ||
+                (errorGroup as any).status === 'ignored') && (
                 <Button
                   variant="outline"
                   size="sm"
-                  onClick={() => updateStatus('ignored')}
+                  onClick={() => updateStatus('unresolved')}
                   disabled={statusMutation.isPending}
                 >
-                  <EyeOff className="h-4 w-4 mr-1.5" />
-                  Ignore
+                  <RotateCcw className="h-4 w-4 mr-1.5" />
+                  Unresolve
                 </Button>
               )}
-            {((errorGroup as any).status === 'resolved' ||
-              (errorGroup as any).status === 'ignored') && (
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => updateStatus('unresolved')}
-                disabled={statusMutation.isPending}
-              >
-                <RotateCcw className="h-4 w-4 mr-1.5" />
-                Unresolve
-              </Button>
-            )}
-          </div>
+            </div>
 
-          {/* Mobile: actions collapsed behind a kebab menu */}
-          <div className="sm:hidden">
-            <DropdownMenu>
-              <DropdownMenuTrigger asChild>
-                <Button
-                  variant="outline"
-                  size="icon"
-                  disabled={statusMutation.isPending}
-                  aria-label="Error actions"
-                >
-                  <MoreVertical className="h-4 w-4" />
-                </Button>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent align="end">
-                {(errorGroup as any).status !== 'resolved' && (
-                  <DropdownMenuItem onClick={() => updateStatus('resolved')}>
-                    <Check className="mr-2 h-4 w-4" />
-                    Resolve
-                  </DropdownMenuItem>
-                )}
-                {(errorGroup as any).status !== 'ignored' &&
-                  (errorGroup as any).status !== 'resolved' && (
-                    <DropdownMenuItem onClick={() => updateStatus('ignored')}>
-                      <EyeOff className="mr-2 h-4 w-4" />
-                      Ignore
+            {/* Mobile: actions collapsed behind a kebab menu */}
+            <div className="sm:hidden">
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button
+                    variant="outline"
+                    size="icon"
+                    disabled={statusMutation.isPending}
+                    aria-label="Error actions"
+                  >
+                    <MoreVertical className="h-4 w-4" />
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end">
+                  {(errorGroup as any).status !== 'resolved' && (
+                    <DropdownMenuItem onClick={() => updateStatus('resolved')}>
+                      <Check className="mr-2 h-4 w-4" />
+                      Resolve
                     </DropdownMenuItem>
                   )}
-                {((errorGroup as any).status === 'resolved' ||
-                  (errorGroup as any).status === 'ignored') && (
-                  <DropdownMenuItem onClick={() => updateStatus('unresolved')}>
-                    <RotateCcw className="mr-2 h-4 w-4" />
-                    Unresolve
-                  </DropdownMenuItem>
-                )}
-              </DropdownMenuContent>
-            </DropdownMenu>
+                  {(errorGroup as any).status !== 'resolved' && (
+                    <DropdownMenuItem
+                      onClick={() => updateStatus('resolved', undefined, true)}
+                    >
+                      <Check className="mr-2 h-4 w-4" />
+                      Resolve in next release
+                    </DropdownMenuItem>
+                  )}
+                  {(errorGroup as any).status !== 'resolved' &&
+                    IGNORE_PRESETS.map(({ preset, label }) => (
+                      <DropdownMenuItem
+                        key={preset}
+                        onClick={() =>
+                          updateStatus(
+                            'ignored',
+                            ignorePresetConditions(preset)
+                          )
+                        }
+                      >
+                        <EyeOff className="mr-2 h-4 w-4" />
+                        Ignore {label.charAt(0).toLowerCase() + label.slice(1)}
+                      </DropdownMenuItem>
+                    ))}
+                  {((errorGroup as any).status === 'resolved' ||
+                    (errorGroup as any).status === 'ignored') && (
+                    <DropdownMenuItem
+                      onClick={() => updateStatus('unresolved')}
+                    >
+                      <RotateCcw className="mr-2 h-4 w-4" />
+                      Unresolve
+                    </DropdownMenuItem>
+                  )}
+                </DropdownMenuContent>
+              </DropdownMenu>
+            </div>
           </div>
         </div>
       </div>
 
-      {/* Autofix section — always rendered. When the repo/provider/sandbox
-          aren't set up yet the card onboards the user instead of vanishing. */}
+      {/* Autofix (ADR-054) — always rendered. When autofix cannot run the
+          card says why and links to the setting that fixes it. */}
       <div className="mb-6">
-        <AutofixButton
+        <AutofixIncidentCard
           projectId={project.id}
-          projectSlug={project.slug}
           errorGroupId={parseInt(errorGroupId!)}
-          git={{
-            connected: !!project.git_provider_connection_id,
-            hasRepo: !!project.repo_owner && !!project.repo_name,
-            label:
-              project.repo_owner && project.repo_name
-                ? `${project.repo_owner}/${project.repo_name}`
-                : undefined,
-          }}
         />
       </div>
 
+      {evidence && errorGroup && (
+        <div className="mb-6">
+          <PerformanceIssueCard
+            projectSlug={project.slug}
+            title={errorGroup.error_type}
+            evidence={evidence}
+          />
+        </div>
+      )}
+
       {/* Tabs for different views */}
       <Tabs value={selectedTab} onValueChange={setSelectedTab}>
-        <TabsList className="grid w-full max-w-[400px] grid-cols-2">
-          <TabsTrigger value="overview">Overview</TabsTrigger>
-          <TabsTrigger value="events">
-            Events ({errorEvents?.data?.length || 0})
+        <TabsList className="grid w-full max-w-[600px] grid-cols-3">
+          <TabsTrigger value="overview" icon={Home}>
+            Overview
+          </TabsTrigger>
+          <TabsTrigger
+            value="events"
+            icon={List}
+            count={errorEvents?.data?.length || 0}
+          >
+            Events
+          </TabsTrigger>
+          <TabsTrigger value="activity" icon={MessageSquare}>
+            Activity
           </TabsTrigger>
         </TabsList>
 
@@ -460,7 +523,7 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
           ) : latestEvent ? (
             <Card>
               <CardHeader>
-                <CardTitle>Latest Event</CardTitle>
+                <CardTitle>Latest event</CardTitle>
                 <CardDescription>
                   {format(new Date(latestEvent.timestamp), 'PPpp')}
                 </CardDescription>
@@ -545,95 +608,17 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
             </div>
           </ScrollArea>
         </TabsContent>
+
+        {/* Activity Tab: comments and history */}
+        <TabsContent value="activity" className="mt-6">
+          <GroupActivity
+            projectId={project.id}
+            groupId={parseInt(errorGroupId!)}
+            currentUserId={currentUser?.id}
+            canModerate={currentUser?.role === 'admin'}
+          />
+        </TabsContent>
       </Tabs>
     </div>
-  )
-}
-
-function AssigneeControl({
-  assignedTo,
-  userByIdentity,
-  currentUser,
-  users,
-  onAssign,
-  isPending,
-}: {
-  assignedTo?: string | null
-  userByIdentity: Map<string, RouteUserWithRoles>
-  currentUser: UserResponse | null
-  users?: RouteUserWithRoles[]
-  onAssign: (assignedTo: string) => void
-  isPending: boolean
-}) {
-  const assignedUser = assignedTo
-    ? userByIdentity.get(assignedTo.toLowerCase())
-    : undefined
-  const label = assignedTo
-    ? (assignedUser?.user.name ?? assignedTo)
-    : 'Unassigned'
-  const initials = (
-    assignedUser?.user.username ||
-    assignedUser?.user.name ||
-    assignedTo ||
-    '?'
-  )
-    .slice(0, 2)
-    .toUpperCase()
-  const isAssignedToMe =
-    !!assignedTo &&
-    !!currentUser?.email &&
-    assignedTo.toLowerCase() === currentUser.email.toLowerCase()
-
-  return (
-    <DropdownMenu>
-      <DropdownMenuTrigger asChild>
-        <Button
-          variant="outline"
-          size="sm"
-          disabled={isPending}
-          className="gap-2"
-        >
-          {assignedTo ? (
-            <Avatar className="h-5 w-5">
-              <AvatarImage src={assignedUser?.user.image} />
-              <AvatarFallback className="text-[9px]">{initials}</AvatarFallback>
-            </Avatar>
-          ) : (
-            <UserRound className="h-4 w-4 text-muted-foreground" />
-          )}
-          {label}
-        </Button>
-      </DropdownMenuTrigger>
-      <DropdownMenuContent align="end" className="max-h-72 overflow-y-auto">
-        {!isAssignedToMe && currentUser && (
-          <DropdownMenuItem
-            onClick={() => onAssign(currentUser.email || currentUser.username)}
-          >
-            Assign to me
-          </DropdownMenuItem>
-        )}
-        {assignedTo && (
-          <DropdownMenuItem onClick={() => onAssign('')}>
-            Unassign
-          </DropdownMenuItem>
-        )}
-        {users && users.length > 0 && (
-          <>
-            <DropdownMenuSeparator />
-            <DropdownMenuLabel className="text-xs font-normal text-muted-foreground">
-              Assign to someone else
-            </DropdownMenuLabel>
-            {users.map((u) => (
-              <DropdownMenuItem
-                key={u.user.id}
-                onClick={() => onAssign(u.user.email || u.user.username)}
-              >
-                {u.user.name}
-              </DropdownMenuItem>
-            ))}
-          </>
-        )}
-      </DropdownMenuContent>
-    </DropdownMenu>
   )
 }

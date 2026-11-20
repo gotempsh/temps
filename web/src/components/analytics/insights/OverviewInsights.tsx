@@ -7,7 +7,6 @@ import {
   getUniqueCountsOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import type { ProjectResponse } from '@/api/client/types.gen'
-import { useQuery } from '@tanstack/react-query'
 import { useMemo } from 'react'
 import {
   deriveBreakdownInsights,
@@ -16,6 +15,8 @@ import {
 } from './derive'
 import { InsightsPanel } from './InsightsPanel'
 import type { AiInsightContext, Insight } from './types'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
+import { sameWindow } from '@/lib/refresh'
 
 interface OverviewInsightsProps {
   project: ProjectResponse
@@ -46,28 +47,24 @@ export function OverviewInsights({
     environment_id: environment,
   }
 
-  const visitorsQuery = useQuery({
-    ...getUniqueCountsOptions({
-      path: { project_id: project.id },
-      query: { ...baseQuery, metric: 'visitors' },
-    }),
-    enabled,
+  const visitorsOptions = getUniqueCountsOptions({
+    path: { project_id: project.id },
+    query: { ...baseQuery, metric: 'visitors' },
   })
-  const sessionsQuery = useQuery({
-    ...getUniqueCountsOptions({
-      path: { project_id: project.id },
-      query: { ...baseQuery, metric: 'sessions' },
-    }),
-    enabled,
+  const visitorsQuery = useWindowQuery({ ...visitorsOptions, enabled })
+  const sessionsOptions = getUniqueCountsOptions({
+    path: { project_id: project.id },
+    query: { ...baseQuery, metric: 'sessions' },
   })
-  const hourlyQuery = useQuery({
+  const sessionsQuery = useWindowQuery({ ...sessionsOptions, enabled })
+  const hourlyQuery = useWindowQuery({
     ...getHourlyVisitsOptions({
       path: { project_id: project.id },
       query: { ...baseQuery, aggregation_level: 'visitors' },
     }),
     enabled,
   })
-  const channelsQuery = useQuery({
+  const channelsQuery = useWindowQuery({
     ...getPropertyBreakdownOptions({
       path: { project_id: project.id },
       query: {
@@ -79,7 +76,7 @@ export function OverviewInsights({
     }),
     enabled,
   })
-  const countriesQuery = useQuery({
+  const countriesQuery = useWindowQuery({
     ...getPropertyBreakdownOptions({
       path: { project_id: project.id },
       query: {
@@ -98,6 +95,14 @@ export function OverviewInsights({
     hourlyQuery.isLoading ||
     channelsQuery.isLoading ||
     countriesQuery.isLoading
+  // While a moved window loads, some of these still hold the previous
+  // window's data; the AI must not get a mix of two windows under one label.
+  const isPreviousWindow =
+    visitorsQuery.isPlaceholderData ||
+    sessionsQuery.isPlaceholderData ||
+    hourlyQuery.isPlaceholderData ||
+    channelsQuery.isPlaceholderData ||
+    countriesQuery.isPlaceholderData
 
   const channelRows = useMemo(
     () =>
@@ -116,12 +121,21 @@ export function OverviewInsights({
     [countriesQuery.data]
   )
 
+  // Sessions per visitor only from counts of one window, never the new
+  // window's visitors over the previous window's sessions.
+  const countsShareWindow = sameWindow(
+    [visitorsOptions.queryKey, visitorsQuery],
+    [sessionsOptions.queryKey, sessionsQuery]
+  )
+
   const insights = useMemo<Insight[]>(() => {
     const timing = deriveTimingInsights(hourlyQuery.data ?? [], 'visitors')
-    const returnRate = deriveReturnRateInsight(
-      visitorsQuery.data?.count ?? 0,
-      sessionsQuery.data?.count ?? 0
-    )
+    const returnRate = countsShareWindow
+      ? deriveReturnRateInsight(
+          visitorsQuery.data?.count ?? 0,
+          sessionsQuery.data?.count ?? 0
+        )
+      : null
     const channels = deriveBreakdownInsights({
       rows: channelRows,
       singular: 'channel',
@@ -143,6 +157,7 @@ export function OverviewInsights({
     ].slice(0, MAX_OVERVIEW_INSIGHTS)
   }, [
     hourlyQuery.data,
+    countsShareWindow,
     visitorsQuery.data,
     sessionsQuery.data,
     channelRows,
@@ -150,7 +165,8 @@ export function OverviewInsights({
   ])
 
   const aiContext = useMemo<AiInsightContext | undefined>(() => {
-    if (isLoading || (visitorsQuery.data?.count ?? 0) === 0) return undefined
+    if (isLoading || isPreviousWindow) return undefined
+    if ((visitorsQuery.data?.count ?? 0) === 0) return undefined
 
     // Compact the hourly series into per-day totals so the prompt stays small.
     const dailyVisitors: Record<string, number> = {}
@@ -173,6 +189,7 @@ export function OverviewInsights({
     }
   }, [
     isLoading,
+    isPreviousWindow,
     visitorsQuery.data,
     sessionsQuery.data,
     hourlyQuery.data,
@@ -187,6 +204,7 @@ export function OverviewInsights({
       insights={insights}
       isLoading={isLoading}
       aiContext={aiContext}
+      aiPending={isPreviousWindow}
       project={{ id: project.id, slug: project.slug, name: project.name }}
     />
   )

@@ -22,7 +22,7 @@ export function CloudAiMetadataNotice({
     <Alert>
       <AlertTitle>AI metadata is not fully enabled for Cloud</AlertTitle>
       <AlertDescription>
-        This project stores spans in Cloud without all the metadata needed for
+        This service stores spans in Cloud without all the metadata needed for
         AI Activity. Enable AI metadata in telemetry settings to see model calls
         and token usage for new spans. Previously omitted attributes cannot be
         recovered.{' '}

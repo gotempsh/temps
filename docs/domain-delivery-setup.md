@@ -171,7 +171,7 @@ production database into this test setup.
 
 An additional instance on a shared Docker daemon needs its own preview gateway
 container name and host port. Set both on its **Preview Gateway** tab
-(`/agent-sandbox/preview`) or with `PATCH /preview-gateway/settings`. Saving a
+(`/sandboxes/settings/preview`) or with `PATCH /preview-gateway/settings`. Saving a
 new name removes that instance's gateway under the old name. A rename is
 refused while the instance has sandboxes on that host, because their networks
 keep the old name; delete them first. The new instance's
@@ -200,7 +200,7 @@ test zone; local fake-provider tests must not access real provider credentials.
 From the Rust workspace root:
 
 ```sh
-cargo check --lib -p temps-dns -p temps-core -p temps-agents
+cargo check --lib -p temps-dns -p temps-core -p temps-ai-agents
 cargo test --lib -p temps-dns
 cargo test -p temps-dns --test domain_delivery_integration -- --nocapture
 ```

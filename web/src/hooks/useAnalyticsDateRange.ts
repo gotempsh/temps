@@ -10,8 +10,8 @@ export const QUICK_FILTERS = [
   { label: 'Today', value: 'today' },
   { label: 'Yesterday', value: 'yesterday' },
   { label: 'Last 24 hours', value: '24hours' },
-  { label: 'Last 7 Days', value: '7days' },
-  { label: 'Last 30 Days', value: '30days' },
+  { label: 'Last 7 days', value: '7days' },
+  { label: 'Last 30 days', value: '30days' },
   { label: 'Custom', value: 'custom' },
 ] as const
 
@@ -20,6 +20,23 @@ export type QuickFilter = (typeof QUICK_FILTERS)[number]['value']
 export interface AnalyticsDateFilter {
   quickFilter: QuickFilter
   dateRange: DateRange | undefined
+}
+
+/** The analytics date filter described by the `filter`/`from`/`to` params. */
+export function dateFilterFromParams(
+  filter: string | null,
+  from: string | null,
+  to: string | null
+): AnalyticsDateFilter {
+  if (filter === 'custom' && from && to) {
+    return {
+      quickFilter: 'custom',
+      dateRange: { from: new Date(from), to: new Date(to) },
+    }
+  }
+  const quick = QUICK_FILTERS.find((f) => f.value === filter)
+  if (quick) return { quickFilter: quick.value, dateRange: undefined }
+  return { quickFilter: '24hours', dateRange: undefined }
 }
 
 export function getDateRangeFromFilter(dateFilter: AnalyticsDateFilter): {

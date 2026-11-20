@@ -21,11 +21,12 @@ import { ChevronLeft, ChevronRight, Globe, Monitor } from 'lucide-react'
 import { useMemo } from 'react'
 import { EventBadge, EventIcon } from './shared'
 import { parseUserAgent, problemMessage } from './sharedUtils'
+import { IpLink } from '@/components/data-display/IpLink'
 
 // NOTE: the `/emails/{id}/tracking/events` endpoint (temps-email's
 // `get_email_events` handler / `EventsQuery`) only supports an `event_type`
 // filter — it has no `page`/`page_size` params and always returns the full
-// event list for the email. Unlike EmailAnalytics.tsx's `fetchAllEvents`
+// event list for the email. Unlike EmailEventLog.tsx's `fetchEvents`
 // (which hits the paginated `/emails/events` endpoint), there is currently
 // no server-side pagination available for a single email's event history.
 // We fetch the full list once per (emailId, eventType) — bounded by the
@@ -193,7 +194,7 @@ export function EmailEventTimeline({ emailId }: { emailId: string }) {
                     {event.ip_address && (
                       <span className="flex items-center gap-1">
                         <Globe className="h-3 w-3 shrink-0" />
-                        {event.ip_address}
+                        <IpLink ip={event.ip_address} />
                       </span>
                     )}
 

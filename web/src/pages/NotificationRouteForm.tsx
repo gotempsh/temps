@@ -40,6 +40,7 @@ import {
 } from '@/components/ui/select'
 import { Switch } from '@/components/ui/switch'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
+import { PageHeader } from '@/components/layout/PageContainer'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ArrowLeft, BellRing, Route as RouteIcon } from 'lucide-react'
@@ -66,6 +67,19 @@ type RouteDraft = {
   provider_ids: number[]
 }
 
+type RouteFieldErrors = {
+  name?: string
+  providers?: string
+}
+
+// Ids of the elements focus can move to when a field is invalid.
+const ROUTE_NAME_ID = 'route-name'
+const ROUTE_NAME_ERROR_ID = 'route-name-error'
+const ROUTE_PROVIDERS_ERROR_ID = 'route-providers-error'
+const ROUTE_FIRST_PROVIDER_ID = 'route-provider-first'
+const ROUTE_ADD_PROVIDER_ID = 'route-add-provider'
+const ROUTE_PROVIDERS_FAILURE_ID = 'route-providers-failure'
+
 const emptyDraft = (): RouteDraft => ({
   name: '',
   enabled: true,
@@ -87,10 +101,17 @@ export function NotificationRouteForm() {
   const isEditing = Boolean(id)
 
   usePageTitle(
-    isEditing ? 'Edit Notification Route' : 'Create Notification Route'
+    isEditing ? 'Edit notification route' : 'Create notification route'
   )
 
-  const { data: providers, isLoading: providersLoading } = useQuery({
+  const {
+    data: providers,
+    isLoading: providersLoading,
+    isError: providersError,
+    error: providersReadError,
+    refetch: refetchProviders,
+    isFetching: providersFetching,
+  } = useQuery({
     ...listNotificationProvidersOptions({ query: { page_size: 100 } }),
   })
   const {
@@ -105,6 +126,7 @@ export function NotificationRouteForm() {
     enabled: isEditing && Number.isInteger(routeId) && routeId > 0,
   })
   const [draftChanges, setDraftChanges] = useState<Partial<RouteDraft>>({})
+  const [fieldErrors, setFieldErrors] = useState<RouteFieldErrors>({})
   const baseDraft = useMemo<RouteDraft>(
     () =>
       route
@@ -130,7 +152,7 @@ export function NotificationRouteForm() {
     setBreadcrumbs([
       { label: 'Settings', href: '/settings' },
       {
-        label: 'Notification Routes',
+        label: 'Notification routes',
         href: '/settings/notifications?tab=routes',
       },
       { label: isEditing ? route?.name || 'Edit Route' : 'Create Route' },
@@ -172,6 +194,7 @@ export function NotificationRouteForm() {
   })
 
   const toggleProvider = (providerId: number, checked: boolean) => {
+    setFieldErrors((current) => ({ ...current, providers: undefined }))
     setDraft((current) => ({
       ...current,
       provider_ids: checked
@@ -180,24 +203,44 @@ export function NotificationRouteForm() {
     }))
   }
 
-  const save = async (event: FormEvent<HTMLFormElement>) => {
+  const save = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
+    // Report every missing field at once, each next to its own control.
+    const errors: RouteFieldErrors = {}
     if (!draft.name.trim()) {
-      toast.error('Route name is required')
-      return
+      errors.name = 'Route name is required'
     }
     if (draft.provider_ids.length === 0) {
-      toast.error('Select at least one provider')
+      errors.providers = 'Select at least one provider'
+    }
+    setFieldErrors(errors)
+    if (errors.name || errors.providers) {
+      // Destinations render above the name (`order-first`), so the first
+      // invalid field on screen is the destinations list.
+      // Which control stands for the destinations depends on whether the
+      // providers loaded, so take the first one that is actually on the page.
+      const candidates = errors.providers
+        ? [
+            ROUTE_FIRST_PROVIDER_ID,
+            ROUTE_ADD_PROVIDER_ID,
+            ROUTE_PROVIDERS_FAILURE_ID,
+            ROUTE_NAME_ID,
+          ]
+        : [ROUTE_NAME_ID]
+      candidates
+        .map((id) => document.getElementById(id))
+        .find((element) => element !== null)
+        ?.focus()
       return
     }
 
     if (isEditing) {
-      await updateMutation.mutateAsync({
+      updateMutation.mutate({
         path: { id: routeId },
         body: draft,
       })
     } else {
-      await createMutation.mutateAsync({ body: draft })
+      createMutation.mutate({ body: draft })
     }
   }
 
@@ -216,7 +259,7 @@ export function NotificationRouteForm() {
           icon={RouteIcon}
           title="Notification route not found"
           description="The requested route may have been deleted or is no longer available."
-          action={<Button onClick={returnToRoutes}>Back to Routes</Button>}
+          action={<Button onClick={returnToRoutes}>Back to routes</Button>}
         />
       </div>
     )
@@ -233,7 +276,7 @@ export function NotificationRouteForm() {
         />
         <Button variant="outline" onClick={returnToRoutes}>
           <ArrowLeft className="mr-2 h-4 w-4" />
-          {returnTo ? 'Back' : 'Back to Routes'}
+          {returnTo ? 'Back' : 'Back to routes'}
         </Button>
       </div>
     )
@@ -245,24 +288,21 @@ export function NotificationRouteForm() {
         <div className="space-y-4">
           <Button variant="ghost" className="-ml-3" onClick={returnToRoutes}>
             <ArrowLeft className="mr-2 h-4 w-4" />
-            {returnTo ? 'Back' : 'Back to Routes'}
+            {returnTo ? 'Back' : 'Back to routes'}
           </Button>
-          <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
-            <div>
-              <h1 className="text-2xl font-semibold tracking-tight">
-                {isEditing
-                  ? 'Edit Notification Route'
-                  : 'Create Notification Route'}
-              </h1>
-              <p className="mt-1 text-muted-foreground">
-                Match a severity range to one or more notification destinations.
-                Routes apply to all projects.
-              </p>
-            </div>
-            {isEditing && route && (
-              <RouteTestButton routeId={route.id} routeName={route.name} />
-            )}
-          </div>
+          <PageHeader
+            title={
+              isEditing
+                ? 'Edit notification route'
+                : 'Create notification route'
+            }
+            description="Match a severity range to one or more notification destinations. Routes apply to all projects."
+            actions={
+              isEditing && route ? (
+                <RouteTestButton routeId={route.id} routeName={route.name} />
+              ) : undefined
+            }
+          />
           {routeError && route && (
             <ReadFailure
               resource="Notification route"
@@ -285,19 +325,35 @@ export function NotificationRouteForm() {
               </CardHeader>
               <CardContent className="flex flex-col gap-6">
                 <div className="space-y-2">
-                  <Label htmlFor="route-name">Name</Label>
+                  <Label htmlFor={ROUTE_NAME_ID}>Name</Label>
                   <Input
-                    id="route-name"
+                    id={ROUTE_NAME_ID}
                     value={draft.name}
                     placeholder="Critical incidents"
                     disabled={isLoading}
-                    onChange={(event) =>
+                    aria-invalid={fieldErrors.name ? true : undefined}
+                    aria-describedby={
+                      fieldErrors.name ? ROUTE_NAME_ERROR_ID : undefined
+                    }
+                    onChange={(event) => {
+                      setFieldErrors((current) => ({
+                        ...current,
+                        name: undefined,
+                      }))
                       setDraft((current) => ({
                         ...current,
                         name: event.target.value,
                       }))
-                    }
+                    }}
                   />
+                  {fieldErrors.name && (
+                    <p
+                      id={ROUTE_NAME_ERROR_ID}
+                      className="text-sm font-medium text-destructive"
+                    >
+                      {fieldErrors.name}
+                    </p>
+                  )}
                 </div>
 
                 <div className="space-y-3">
@@ -375,7 +431,16 @@ export function NotificationRouteForm() {
                       select the channel destinations for this route.
                     </p>
                   </div>
-                  {!providersLoading && providers?.length === 0 ? (
+                  {providersError && !providers ? (
+                    <div id={ROUTE_PROVIDERS_FAILURE_ID} tabIndex={-1}>
+                      <ReadFailure
+                        resource="Notification providers"
+                        error={providersReadError}
+                        onRetry={() => refetchProviders()}
+                        retrying={providersFetching}
+                      />
+                    </div>
+                  ) : !providersLoading && providers?.length === 0 ? (
                     <div className="rounded-lg border border-dashed p-6 text-center">
                       <BellRing className="mx-auto mb-3 h-6 w-6 text-muted-foreground" />
                       <p className="font-medium">No providers available</p>
@@ -383,9 +448,15 @@ export function NotificationRouteForm() {
                         Add a destination before creating a route.
                       </p>
                       <Button
+                        id={ROUTE_ADD_PROVIDER_ID}
                         type="button"
                         variant="outline"
                         className="mt-4"
+                        aria-describedby={
+                          fieldErrors.providers
+                            ? ROUTE_PROVIDERS_ERROR_ID
+                            : undefined
+                        }
                         onClick={() =>
                           navigate(
                             withReturnTo(
@@ -395,12 +466,12 @@ export function NotificationRouteForm() {
                           )
                         }
                       >
-                        Add Provider
+                        Add provider
                       </Button>
                     </div>
                   ) : (
                     <div className="grid gap-3 sm:grid-cols-2">
-                      {providers?.map((provider) => {
+                      {providers?.map((provider, index) => {
                         const selected = draft.provider_ids.includes(
                           provider.id
                         )
@@ -411,9 +482,22 @@ export function NotificationRouteForm() {
                             className="flex cursor-pointer items-start gap-3 rounded-lg border p-4 transition-colors hover:bg-muted/40"
                           >
                             <Checkbox
+                              id={
+                                index === 0
+                                  ? ROUTE_FIRST_PROVIDER_ID
+                                  : undefined
+                              }
                               className="mt-0.5"
                               checked={selected}
                               disabled={isLoading}
+                              aria-invalid={
+                                fieldErrors.providers ? true : undefined
+                              }
+                              aria-describedby={
+                                fieldErrors.providers
+                                  ? ROUTE_PROVIDERS_ERROR_ID
+                                  : undefined
+                              }
                               onCheckedChange={(checked) =>
                                 toggleProvider(provider.id, checked === true)
                               }
@@ -431,6 +515,14 @@ export function NotificationRouteForm() {
                         )
                       })}
                     </div>
+                  )}
+                  {fieldErrors.providers && (
+                    <p
+                      id={ROUTE_PROVIDERS_ERROR_ID}
+                      className="text-sm font-medium text-destructive"
+                    >
+                      {fieldErrors.providers}
+                    </p>
                   )}
                 </div>
               </CardContent>
@@ -493,11 +585,7 @@ export function NotificationRouteForm() {
                   className="sm:min-w-36"
                   disabled={isLoading || isSaving}
                 >
-                  {isSaving
-                    ? 'Saving…'
-                    : isEditing
-                      ? 'Save Changes'
-                      : 'Create Route'}
+                  {isSaving ? 'Saving…' : isEditing ? 'Save' : 'Create route'}
                 </Button>
               </div>
             </div>

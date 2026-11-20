@@ -1,14 +1,23 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        reason = "tests read fixture configuration (database/service URLs) from the environment"
+    )
+)]
 pub mod analytics;
 pub mod api_traffic;
 pub mod channel;
+pub mod datacenter;
 pub mod global;
 pub mod global_handler;
 pub mod handler;
 pub mod ingest_keys;
 pub mod plugin;
+pub mod retention;
 pub mod traits;
 pub mod types;
 pub mod visitor_audit;

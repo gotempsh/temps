@@ -19,6 +19,16 @@ export function nextTableSort<Key extends string>(
   }
 }
 
+/**
+ * Sort rows by `value`, with missing values last in both directions.
+ *
+ * Ties are not "stable in both directions": descending keeps the incoming
+ * order and ascending reverses it, so a header click that flips the direction
+ * always visibly reorders rows that compare equal. Callers that need a
+ * specific secondary order should fold it into `value` (for example by
+ * returning a composite string) rather than rely on the incoming order.
+ * Rows whose value is missing keep their incoming order in both directions.
+ */
 export function sortTableRows<Row>(
   rows: readonly Row[],
   value: (row: Row) => string | number | null | undefined,
@@ -42,7 +52,13 @@ export function sortTableRows<Row>(
             })
           : Number(aValue) - Number(bValue)
       const directed = direction === 'asc' ? comparison : -comparison
-      return directed || a.index - b.index
+      if (directed !== 0) return directed
+      // Rows that tie keep their incoming order when descending (the default
+      // a column starts in) and the exact reverse when ascending. When every
+      // value in a column is equal (all-zero bounce rates, one view each),
+      // flipping the direction then still visibly reverses the list instead
+      // of looking like the click did nothing.
+      return direction === 'desc' ? a.index - b.index : b.index - a.index
     })
     .map(({ row }) => row)
 }

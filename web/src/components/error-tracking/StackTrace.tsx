@@ -82,14 +82,17 @@ function SourceContext({ frame }: SourceContextProps) {
             className="flex hover:bg-muted-foreground/5"
           >
             <span
-              className="flex-shrink-0 w-[var(--gutter)] text-right pr-3 pl-2 py-px text-muted-foreground/40 select-none border-r border-border/30 bg-background/50"
+              className="flex-shrink-0 w-[var(--gutter)] text-right pr-3 pl-2 py-px text-muted-foreground select-none border-r border-border/30 bg-background/50"
               style={
                 { '--gutter': `${gutterWidth + 2}ch` } as React.CSSProperties
               }
             >
               {lineNum}
             </span>
-            <pre className="flex-1 pl-3 py-px text-muted-foreground/60 overflow-x-auto">
+            <pre
+              tabIndex={0}
+              className="flex-1 pl-3 py-px text-muted-foreground overflow-x-auto"
+            >
               <HighlightedCode
                 code={line || ' '}
                 language={codeLanguageForFile(
@@ -112,7 +115,10 @@ function SourceContext({ frame }: SourceContextProps) {
           >
             {contextLineNo}
           </span>
-          <pre className="flex-1 pl-3 py-px text-foreground overflow-x-auto">
+          <pre
+            tabIndex={0}
+            className="flex-1 pl-3 py-px text-foreground overflow-x-auto"
+          >
             <HighlightedCode
               code={context_line || ' '}
               language={codeLanguageForFile(
@@ -132,14 +138,17 @@ function SourceContext({ frame }: SourceContextProps) {
             className="flex hover:bg-muted-foreground/5"
           >
             <span
-              className="flex-shrink-0 w-[var(--gutter)] text-right pr-3 pl-2 py-px text-muted-foreground/40 select-none border-r border-border/30 bg-background/50"
+              className="flex-shrink-0 w-[var(--gutter)] text-right pr-3 pl-2 py-px text-muted-foreground select-none border-r border-border/30 bg-background/50"
               style={
                 { '--gutter': `${gutterWidth + 2}ch` } as React.CSSProperties
               }
             >
               {lineNum}
             </span>
-            <pre className="flex-1 pl-3 py-px text-muted-foreground/60 overflow-x-auto">
+            <pre
+              tabIndex={0}
+              className="flex-1 pl-3 py-px text-muted-foreground overflow-x-auto"
+            >
               <HighlightedCode
                 code={line || ' '}
                 language={codeLanguageForFile(
@@ -230,7 +239,7 @@ export function StackTrace({
               tabIndex={hasContext ? 0 : -1}
             >
               {/* Expand/collapse indicator */}
-              <span className="flex-shrink-0 w-4 text-muted-foreground/50">
+              <span className="flex-shrink-0 w-4 text-muted-foreground">
                 {hasContext ? (
                   <ChevronRight
                     className={cn(
@@ -249,7 +258,7 @@ export function StackTrace({
                 <span className="text-muted-foreground ml-2">
                   {detailed && filename ? filename : shortFilename}
                   {lineNo !== undefined && (
-                    <span className="text-blue-500 dark:text-blue-400">
+                    <span className="text-blue-600 dark:text-blue-400">
                       :{lineNo}
                     </span>
                   )}

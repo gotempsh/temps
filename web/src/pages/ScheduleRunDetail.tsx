@@ -34,6 +34,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
+import { RefreshButton } from '@/components/ui/refresh-button'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
   Table,
@@ -51,12 +52,14 @@ import {
 } from '@/components/ui/tooltip'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import { isVerifiedNotFound } from '@/lib/read-failure'
 import {
   cancelBackup,
   cancelScheduleRun,
   listScheduleRunJobsOptions,
 } from '@/lib/schedule-runs'
 import { formatBytes } from '@/lib/utils'
+import { Callout, PageState } from '@temps-sdk/ds'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import {
@@ -65,7 +68,6 @@ import {
   DatabaseBackup,
   Loader2,
   MoreHorizontal,
-  RefreshCw,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router'
@@ -137,8 +139,9 @@ export function ScheduleRunDetail() {
     data: jobs,
     isPending: isJobsPending,
     isError: isJobsError,
-    isFetching: isJobsFetching,
     error: jobsError,
+    refetch: refetchJobs,
+    isFetching: isFetchingJobs,
   } = useQuery({
     ...jobsQueryOptions,
     // Auto-refresh every 5s while any child is still pending/running. The
@@ -283,6 +286,31 @@ export function ScheduleRunDetail() {
     )
   }
 
+  // Only a verified 404 proves the run is gone; a failed read says nothing
+  // about it and is explained in the jobs card below.
+  if (isJobsError && isVerifiedNotFound(jobsError)) {
+    return (
+      <PageState
+        variant="empty"
+        icon={DatabaseBackup}
+        title="Run not found"
+        description={`Run #${runIdNum} does not exist for this schedule. It may have been removed with the schedule's history.`}
+        action={
+          <div className="flex flex-wrap justify-center gap-2">
+            <Button asChild>
+              <Link to={`/backups/schedules/${scheduleIdNum}`}>
+                Back to schedule
+              </Link>
+            </Button>
+            <Button asChild variant="outline">
+              <Link to="/backups">All backups</Link>
+            </Button>
+          </div>
+        }
+      />
+    )
+  }
+
   return (
     <TooltipProvider>
       <div className="space-y-6">
@@ -328,6 +356,7 @@ export function ScheduleRunDetail() {
           </div>
 
           <div className="flex items-center gap-2 sm:shrink-0">
+            <RefreshButton queryKeys={[jobsQueryOptions.queryKey]} />
             {/* Cancel run — only when at least one child is still live.
                 Refreshing while cancelling is fine, the mutation invalidates
                 the jobs query on success. */}
@@ -346,35 +375,9 @@ export function ScheduleRunDetail() {
                 ) : (
                   <Ban className="h-4 w-4" />
                 )}
-                <span className="hidden sm:inline">Cancel run</span>
+                <span className="max-sm:sr-only">Cancel run</span>
               </Button>
             )}
-
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button
-                  variant="outline"
-                  size="icon"
-                  className="shrink-0"
-                  onClick={() => {
-                    void queryClient.invalidateQueries({
-                      queryKey: jobsQueryOptions.queryKey,
-                    })
-                  }}
-                  disabled={isJobsFetching}
-                  aria-label="Refresh run"
-                >
-                  <RefreshCw
-                    className={`h-4 w-4 ${isJobsFetching ? 'animate-spin' : ''}`}
-                  />
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent side="bottom">
-                {aggregateState === 'running' || aggregateState === 'pending'
-                  ? 'Refresh (auto-refreshing every 5s)'
-                  : 'Refresh'}
-              </TooltipContent>
-            </Tooltip>
           </div>
         </div>
 
@@ -399,7 +402,7 @@ export function ScheduleRunDetail() {
                       <Skeleton key={i} className="h-10 w-full" />
                     ))}
                   </div>
-                ) : isJobsError ? (
+                ) : isJobsError && !jobs ? (
                   <div className="px-4 pb-6 text-base text-destructive sm:px-6 sm:text-sm">
                     Failed to load jobs:{' '}
                     {jobsError instanceof Error
@@ -413,6 +416,22 @@ export function ScheduleRunDetail() {
                   </div>
                 ) : (
                   <div className="overflow-x-auto">
+                    {isJobsError ? (
+                      // A failed refresh keeps the loaded jobs.
+                      <div className="px-4 pb-4 sm:px-6">
+                        <Callout tone="error" title="Couldn't refresh jobs">
+                          Showing the last loaded jobs.{' '}
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => void refetchJobs()}
+                            disabled={isFetchingJobs}
+                          >
+                            Retry jobs
+                          </Button>
+                        </Callout>
+                      </div>
+                    ) : null}
                     <Table className="min-w-[560px]">
                       <TableHeader>
                         <TableRow>

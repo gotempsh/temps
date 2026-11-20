@@ -559,6 +559,23 @@ pub trait LogLineStore: Send + Sync {
     ) -> Result<Vec<LogLineRecord>, LogAggregatorError> {
         Ok(Vec::new())
     }
+
+    /// Per-bucket counts of matching lines that are not sealed into a chunk
+    /// yet, and so are not in the line index either — aligned and named like
+    /// [`crate::index::analytics::LogAnalytics::histogram`] so the two can be
+    /// merged with [`crate::index::analytics::merge_histogram`]. `group_by`
+    /// is a label only: attribute groups come from the index alone.
+    ///
+    /// Defaulted to "nothing unsealed" for stores that write lines straight
+    /// to their final place.
+    async fn unsealed_histogram(
+        &self,
+        _query: &LogQuery,
+        _bucket_secs: u32,
+        _group_by: Option<FacetField>,
+    ) -> Result<Vec<crate::index::analytics::HistogramBucket>, LogAggregatorError> {
+        Ok(Vec::new())
+    }
 }
 
 #[cfg(test)]

@@ -74,7 +74,7 @@ export function buildProjectSetupSteps(
       id: 'domain',
       title: 'Connect a custom domain',
       description:
-        'Give the project a production hostname and let Temps provision and renew its TLS certificate.',
+        'Give the service a production hostname and let Temps provision and renew its TLS certificate.',
       href: `${base}/domains`,
       cta: 'Manage domains',
       done: signals.customDomainCount > 0,
@@ -94,9 +94,9 @@ export function buildProjectSetupSteps(
       id: 'storage',
       title: 'Link database or storage',
       description:
-        'Attach a managed service to this project so application data and deployment configuration stay together.',
+        'Attach a managed database or storage to this service so application data and deployment configuration stay together.',
       href: `${base}/storage`,
-      cta: 'Open project storage',
+      cta: 'Open service storage',
       done: signals.serviceCount > 0,
       icon: Database,
     },

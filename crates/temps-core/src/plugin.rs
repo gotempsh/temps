@@ -28,21 +28,34 @@ use utoipa::openapi::{ComponentsBuilder, OpenApi};
 pub use axum;
 pub use utoipa;
 
-/// Middleware execution priority
-/// Lower numbers execute first, higher numbers execute later
+/// Middleware execution priority.
+///
+/// **Higher numbers see the request first.** Middleware is applied in
+/// ascending order with `Router::layer`, and the last layer added is the
+/// outermost, so a request passes through the highest number first and the
+/// lowest number last, right before the handler. The response comes back in
+/// the opposite order.
+///
+/// So [`Security`](Self::Security) (0) is the innermost: by the time auth runs,
+/// every other priority has already run, and those middlewares cannot rely on
+/// what auth adds to the request. `RequestMetadataMiddleware`
+/// ([`Observability`](Self::Observability), 100) relies on this order: it runs
+/// before auth so that auth can read the metadata it adds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum MiddlewarePriority {
-    /// Security middleware (authentication, authorization) - executes first
+    /// Security middleware (authentication, authorization): value 0, the last
+    /// to see the request before the handler
     Security,
-    /// Logging and metrics middleware
+    /// Logging and metrics middleware: value 100, runs before `Security`
     Observability,
     /// Request/response transformation middleware
     Transform,
     /// Caching and performance middleware
     Performance,
-    /// Business logic middleware
+    /// Business logic middleware: value 400, the first of the named priorities
+    /// to see the request
     Business,
-    /// Custom middleware with explicit priority
+    /// Custom middleware with explicit priority; see the ordering rule above
     Custom(u16),
 }
 
@@ -696,7 +709,12 @@ pub struct SplitApplication {
     pub admin: Router,
 }
 
-/// Type-safe service registry for dependency injection
+/// Type-safe service registry for dependency injection.
+///
+/// Its lock only guards single map inserts and lookups, which cannot leave
+/// the map half-updated, so a lock poisoned by a panic elsewhere (typically a
+/// failing plugin) is recovered rather than turning every later lookup into a
+/// panic of its own.
 pub struct ServiceRegistry {
     services: RwLock<HashMap<TypeId, Box<dyn Any + Send + Sync>>>,
 }
@@ -720,7 +738,7 @@ impl ServiceRegistry {
         debug!("Registering service: {}", std::any::type_name::<T>());
         self.services
             .write()
-            .unwrap()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(TypeId::of::<T>(), Box::new(service));
     }
 
@@ -728,7 +746,7 @@ impl ServiceRegistry {
     pub fn get<T: Send + Sync + 'static + ?Sized>(&self) -> Option<Arc<T>> {
         self.services
             .read()
-            .unwrap()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(&TypeId::of::<T>())
             .and_then(|any| any.downcast_ref::<Arc<T>>())
             .cloned()
@@ -785,7 +803,7 @@ impl PluginStateRegistry {
         debug!("Registering plugin state for: {}", plugin_name);
         self.states
             .write()
-            .unwrap()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(plugin_name.to_string(), Box::new(state));
     }
 
@@ -796,7 +814,7 @@ impl PluginStateRegistry {
     ) -> Option<Arc<T>> {
         self.states
             .read()
-            .unwrap()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(plugin_name)
             .and_then(|any| any.downcast_ref::<Arc<T>>())
             .cloned()
@@ -1305,7 +1323,9 @@ impl PluginManager {
             }
         }
 
-        // Sort middleware by priority (lower numbers execute first)
+        // Ascending, because `apply_middleware_to_router` layers in this order
+        // and the last layer added is the outermost: the highest number sees
+        // the request first (see `MiddlewarePriority`).
         all_middleware.sort_by_key(|mw| mw.priority.value());
 
         debug!("Collected {} middleware from plugins", all_middleware.len());
@@ -1498,10 +1518,11 @@ pub mod middleware_helpers {
                 // Add request ID if not present
                 let request_id = if !req.headers().contains_key("x-request-id") {
                     let request_id = uuid::Uuid::new_v4().to_string();
-                    req.headers_mut().insert(
-                        "x-request-id",
-                        axum::http::HeaderValue::from_str(&request_id).unwrap(),
-                    );
+                    // A hyphenated UUID is always a valid header value;
+                    // skip the header rather than panic if that ever changes.
+                    if let Ok(value) = axum::http::HeaderValue::from_str(&request_id) {
+                        req.headers_mut().insert("x-request-id", value);
+                    }
                     Some(request_id)
                 } else {
                     req.headers()
@@ -1541,7 +1562,9 @@ pub mod middleware_helpers {
     ///
     /// Apply the layer directly to your Axum `Router`:
     /// ```rust,no_run
-    /// router.layer(cors)
+    /// # let router = axum::Router::<()>::new();
+    /// # let cors = tower_http::cors::CorsLayer::new();
+    /// let router = router.layer(cors);
     /// ```
     pub fn cors_layer(allowed_origins: Vec<String>) -> tower_http::cors::CorsLayer {
         use axum::http::{HeaderValue, Method};
@@ -1779,6 +1802,78 @@ mod split_application_tests {
             probe_status(split.admin.clone(), "/admin-needs-metadata").await,
             axum::http::StatusCode::OK,
             "admin route extracting RequestMetadata must succeed"
+        );
+    }
+
+    /// Registers two middlewares, in the order that would hide a missing sort,
+    /// which record their priority as a request passes through them.
+    struct RecordingOrderPlugin {
+        seen: std::sync::Arc<std::sync::Mutex<Vec<u16>>>,
+    }
+
+    impl TempsPlugin for RecordingOrderPlugin {
+        fn name(&self) -> &'static str {
+            "recording-order"
+        }
+
+        fn register_services<'a>(
+            &'a self,
+            _ctx: &'a ServiceRegistrationContext,
+        ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn configure_routes(&self, _ctx: &PluginContext) -> Option<PluginRoutes> {
+            let router = Router::new().route("/order-probe", get(|| async { "ok" }));
+            Some(PluginRoutes::new(router))
+        }
+
+        fn configure_middleware(&self, _ctx: &PluginContext) -> Option<PluginMiddlewareCollection> {
+            let mut collection = PluginMiddlewareCollection::new();
+            for priority in [
+                MiddlewarePriority::Business,
+                MiddlewarePriority::Security,
+                MiddlewarePriority::Observability,
+            ] {
+                let seen = self.seen.clone();
+                collection.add_simple_middleware(
+                    format!("recorder-{}", priority.value()),
+                    "recording-order",
+                    priority,
+                    move |req: Request, next: Next| {
+                        let seen = seen.clone();
+                        async move {
+                            seen.lock().unwrap().push(priority.value());
+                            Ok(next.run(req).await)
+                        }
+                    },
+                );
+            }
+            Some(collection)
+        }
+    }
+
+    #[tokio::test]
+    async fn the_highest_middleware_priority_sees_the_request_first() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut manager = PluginManager::default();
+        manager.register_plugin(Box::new(RecordingOrderPlugin { seen: seen.clone() }));
+
+        let split = manager.build_split_application().unwrap();
+
+        assert_eq!(
+            probe_status(split.admin.clone(), "/order-probe").await,
+            axum::http::StatusCode::OK,
+        );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                MiddlewarePriority::Business.value(),
+                MiddlewarePriority::Observability.value(),
+                MiddlewarePriority::Security.value(),
+            ],
+            "RequestMetadataMiddleware relies on running before auth; changing \
+             this order changes what every middleware can read from the request"
         );
     }
 
@@ -2189,6 +2284,37 @@ mod required_services_tests {
         manager
             .verify_required_services()
             .expect("the default impl declares nothing");
+    }
+
+    /// A panic while the registry lock was held (a plugin failing during
+    /// registration) must not turn every later lookup into a panic.
+    #[test]
+    fn poisoned_registries_keep_working() {
+        let registry = Arc::new(ServiceRegistry::new());
+        registry.register(Arc::new(DatabaseStub));
+        let poisoner = Arc::clone(&registry);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.services.write().unwrap();
+            panic!("poison the service registry");
+        })
+        .join();
+        assert!(registry.services.is_poisoned());
+
+        assert!(registry.get::<DatabaseStub>().is_some());
+        registry.register(Arc::new(DockerStub));
+        assert!(registry.get::<DockerStub>().is_some());
+
+        let states = Arc::new(PluginStateRegistry::new());
+        states.register_state("provider", Arc::new(DatabaseStub));
+        let poisoner = Arc::clone(&states);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.states.write().unwrap();
+            panic!("poison the state registry");
+        })
+        .join();
+        assert!(states.get_state::<DatabaseStub>("provider").is_some());
+        states.register_state("docker", Arc::new(DockerStub));
+        assert!(states.get_state::<DockerStub>("docker").is_some());
     }
 
     #[test]

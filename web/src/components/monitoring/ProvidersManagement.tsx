@@ -31,7 +31,14 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
+import { AdminOnlyNote } from '@/components/ui/admin-only-note'
 import { EmptyState } from '@/components/ui/empty-state'
+import { ReadFailure } from '@/components/ui/read-failure'
+import { Skeleton } from '@/components/ui/skeleton'
+import { useCurrentUserRole } from '@/hooks/useCurrentUserRole'
+import { useIsInstanceAdmin } from '@/hooks/useIsInstanceAdmin'
+import { isForbiddenRead } from '@/lib/read-failure'
 import { Switch } from '@/components/ui/switch'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery } from '@tanstack/react-query'
@@ -48,10 +55,14 @@ import {
 } from '@/lib/notification-provider-test'
 import { ProviderForm } from './ProviderForm'
 import { NotificationProviderIcon } from './NotificationProviderIcon'
-import { ProviderFormData, providerUpdateSchema } from './schemas'
+import {
+  ProviderFormData,
+  providerUpdateSchema,
+  telegramConfigFromForm,
+} from './schemas'
 
 interface ExtendedNotificationProvider extends NotificationProviderResponse {
-  provider_type: 'email' | 'slack' | 'webhook' | 'cloudflare'
+  provider_type: 'email' | 'slack' | 'webhook' | 'cloudflare' | 'telegram'
   config: {
     // Slack config
     webhook_url?: string
@@ -76,7 +87,22 @@ interface ExtendedNotificationProvider extends NotificationProviderResponse {
     // Cloudflare config
     account_id?: string
     api_token?: string
+
+    // Telegram config
+    bot_token?: string
+    chat_id?: string
+    message_thread_id?: number | null
   }
+}
+
+/** Where a Telegram provider posts, as shown in the providers list. */
+function telegramDestination(
+  config: ExtendedNotificationProvider['config'] | undefined
+): string {
+  if (!config?.chat_id) return 'No chat configured'
+  return config.message_thread_id
+    ? `Chat ${config.chat_id}, topic ${config.message_thread_id}`
+    : `Chat ${config.chat_id}`
 }
 
 interface ProvidersManagementProps {
@@ -96,10 +122,16 @@ export function ProvidersManagement({
   const {
     data: providers,
     isLoading,
+    error: providersError,
+    isFetching,
     refetch,
   } = useQuery({
     ...listNotificationProvidersOptions(),
   })
+  // Creating a provider is offered to administrators only; for anyone else it
+  // would just lead to a refusal.
+  const canManageProviders = useIsInstanceAdmin()
+  const currentRole = useCurrentUserRole()
 
   const updateEmailMutation = useMutation({
     ...updateNotificationEmailProviderMutation(),
@@ -155,6 +187,19 @@ export function ProvidersManagement({
     },
   })
 
+  const updateTelegramMutation = useMutation({
+    ...updateNotificationProviderMutation(),
+    meta: {
+      errorTitle: 'Failed to update Telegram provider',
+    },
+    onSuccess: () => {
+      toast.success('Telegram provider updated successfully')
+      setIsEditDialogOpen(false)
+      setEditingProvider(null)
+      refetch()
+    },
+  })
+
   const toggleEnabledMutation = useMutation({
     ...updateNotificationProviderMutation(),
     meta: {
@@ -196,71 +241,86 @@ export function ProvidersManagement({
   const onEditSubmit = async (data: ProviderFormData) => {
     if (!editingProvider) return
 
-    if (data.provider_type === 'slack') {
-      await updateSlackMutation.mutateAsync({
-        path: { id: editingProvider.id },
-        body: {
-          name: data.name,
-          enabled: editingProvider.enabled,
-          config: {
-            webhook_url: data.config.webhook_url!,
-            channel: data.config.channel ?? null,
+    try {
+      if (data.provider_type === 'slack') {
+        await updateSlackMutation.mutateAsync({
+          path: { id: editingProvider.id },
+          body: {
+            name: data.name,
+            enabled: editingProvider.enabled,
+            config: {
+              webhook_url: data.config.webhook_url!,
+              channel: data.config.channel ?? null,
+            },
           },
-        },
-      })
-    } else if (data.provider_type === 'webhook') {
-      await updateWebhookMutation.mutateAsync({
-        path: { id: editingProvider.id },
-        body: {
-          name: data.name,
-          enabled: editingProvider.enabled,
-          config: {
-            url: data.config.url!,
-            method: data.config.method || 'POST',
-            headers: (data.config.headers || {}) as Record<string, string>,
-            timeout_secs: data.config.timeout_secs || 30,
+        })
+      } else if (data.provider_type === 'webhook') {
+        await updateWebhookMutation.mutateAsync({
+          path: { id: editingProvider.id },
+          body: {
+            name: data.name,
+            enabled: editingProvider.enabled,
+            config: {
+              url: data.config.url!,
+              method: data.config.method || 'POST',
+              headers: (data.config.headers || {}) as Record<string, string>,
+              timeout_secs: data.config.timeout_secs || 30,
+            },
           },
-        },
-      })
-    } else if (data.provider_type === 'cloudflare') {
-      await updateCloudflareMutation.mutateAsync({
-        path: { id: editingProvider.id },
-        body: {
-          name: data.name,
-          enabled: editingProvider.enabled,
-          config: {
-            account_id: data.config.account_id!,
-            api_token: data.config.api_token!,
-            from_address: data.config.from_address!,
-            from_name: data.config.from_name || undefined,
-            to_addresses: data.config.to_addresses!,
+        })
+      } else if (data.provider_type === 'cloudflare') {
+        await updateCloudflareMutation.mutateAsync({
+          path: { id: editingProvider.id },
+          body: {
+            name: data.name,
+            enabled: editingProvider.enabled,
+            config: {
+              account_id: data.config.account_id!,
+              api_token: data.config.api_token!,
+              from_address: data.config.from_address!,
+              from_name: data.config.from_name || undefined,
+              to_addresses: data.config.to_addresses!,
+            },
           },
-        },
-      })
-    } else {
-      await updateEmailMutation.mutateAsync({
-        path: { id: editingProvider.id },
-        body: {
-          name: data.name,
-          enabled: editingProvider.enabled,
-          config: {
-            smtp_host: data.config.smtp_host!,
-            smtp_port: data.config.smtp_port!,
-            username: data.config.use_credentials
-              ? data.config.smtp_username || ''
-              : '',
-            password: data.config.use_credentials
-              ? data.config.password || ''
-              : '',
-            from_address: data.config.from_address!,
-            to_addresses: data.config.to_addresses!,
-            from_name: data.config.from_name || undefined,
-            tls_mode: data.config.tls_mode || undefined,
-            starttls_required: data.config.starttls_required,
-            accept_invalid_certs: data.config.accept_invalid_certs,
+        })
+      } else if (data.provider_type === 'telegram') {
+        await updateTelegramMutation.mutateAsync({
+          path: { id: editingProvider.id },
+          body: {
+            name: data.name,
+            enabled: editingProvider.enabled,
+            config: telegramConfigFromForm(data.config),
           },
-        },
-      })
+        })
+      } else {
+        await updateEmailMutation.mutateAsync({
+          path: { id: editingProvider.id },
+          body: {
+            name: data.name,
+            enabled: editingProvider.enabled,
+            config: {
+              smtp_host: data.config.smtp_host!,
+              smtp_port: data.config.smtp_port!,
+              username: data.config.use_credentials
+                ? data.config.smtp_username || ''
+                : '',
+              password: data.config.use_credentials
+                ? data.config.password || ''
+                : '',
+              from_address: data.config.from_address!,
+              to_addresses: data.config.to_addresses!,
+              from_name: data.config.from_name || undefined,
+              tls_mode: data.config.tls_mode || undefined,
+              starttls_required: data.config.starttls_required,
+              accept_invalid_certs: data.config.accept_invalid_certs,
+            },
+          },
+        })
+      }
+    } catch {
+      // The mutation's error handler already shows the failure toast; the
+      // rejection must not escape react-hook-form's submit handler as an
+      // unhandled promise rejection.
     }
   }
 
@@ -279,10 +339,15 @@ export function ProvidersManagement({
     return data.value
   }
 
-  const handleDelete = async (provider: ExtendedNotificationProvider) => {
-    await deleteMutation.mutateAsync({
-      path: { id: provider.id },
-    })
+  const [providerToDelete, setProviderToDelete] =
+    useState<ExtendedNotificationProvider | null>(null)
+
+  // `mutate`, not `mutateAsync`: a failed delete is reported by the mutation's
+  // error handler and must not also surface as an unhandled rejection.
+  const handleConfirmDelete = () => {
+    if (!providerToDelete) return
+    deleteMutation.mutate({ path: { id: providerToDelete.id } })
+    setProviderToDelete(null)
   }
 
   const handleTest = async (provider: ExtendedNotificationProvider) => {
@@ -314,10 +379,8 @@ export function ProvidersManagement({
     navigate(`/settings/notifications/${provider.id}`)
   }
 
-  const handleToggleEnabled = async (
-    provider: ExtendedNotificationProvider
-  ) => {
-    await toggleEnabledMutation.mutateAsync({
+  const handleToggleEnabled = (provider: ExtendedNotificationProvider) => {
+    toggleEnabledMutation.mutate({
       path: { id: provider.id },
       body: {
         name: provider.name,
@@ -342,12 +405,15 @@ export function ProvidersManagement({
           ? updateSlackMutation.isPending
           : watchedProviderType === 'cloudflare'
             ? updateCloudflareMutation.isPending
-            : updateWebhookMutation.isPending,
+            : watchedProviderType === 'telegram'
+              ? updateTelegramMutation.isPending
+              : updateWebhookMutation.isPending,
     [
       watchedProviderType,
       updateEmailMutation.isPending,
       updateSlackMutation.isPending,
       updateCloudflareMutation.isPending,
+      updateTelegramMutation.isPending,
       updateWebhookMutation.isPending,
     ]
   )
@@ -360,24 +426,52 @@ export function ProvidersManagement({
         </p>
         {/* Only one of this and the empty-state button is ever mounted, so
             the `N` shortcut is registered exactly once either way. */}
-        {hasProviders && (
+        {hasProviders && canManageProviders && (
           <CreateActionButton
             onClick={() => navigate(addProviderHref)}
-            label="Add Provider"
+            label="Add provider"
           />
         )}
       </div>
 
-      {!hasProviders && !isLoading ? (
+      {!canManageProviders && (
+        <AdminOnlyNote action="add or change providers" role={currentRole} />
+      )}
+
+      {providersError && !hasProviders ? (
+        // A failed or refused read is not an empty list: it must not claim no
+        // provider exists and invite the user to add one.
+        <ReadFailure
+          resource="Notification providers"
+          error={providersError}
+          onRetry={
+            isForbiddenRead(providersError) ? undefined : () => void refetch()
+          }
+          retrying={isFetching}
+        />
+      ) : isLoading ? (
+        <div
+          role="status"
+          aria-label="Loading notification providers"
+          className="space-y-3 rounded-lg border p-4"
+        >
+          {Array.from({ length: 3 }, (_, index) => (
+            <Skeleton key={index} className="h-12 w-full" />
+          ))}
+        </div>
+      ) : !hasProviders ? (
         <EmptyState
+          size="compact"
           icon={Bell}
           title="No notification providers configured"
           description="Add your first notification provider to start receiving alerts about your deployments and infrastructure."
           action={
-            <CreateActionButton
-              onClick={() => navigate(addProviderHref)}
-              label="Add Provider"
-            />
+            canManageProviders ? (
+              <CreateActionButton
+                onClick={() => navigate(addProviderHref)}
+                label="Add provider"
+              />
+            ) : undefined
           }
         />
       ) : (
@@ -394,15 +488,17 @@ export function ProvidersManagement({
                 ? config?.from_address
                   ? `From ${config.from_address}`
                   : 'No sender address configured'
-                : provider.provider_type === 'slack'
-                  ? config?.channel && config.channel !== '***'
-                    ? config.channel
-                    : config?.webhook_url
+                : provider.provider_type === 'telegram'
+                  ? telegramDestination(config)
+                  : provider.provider_type === 'slack'
+                    ? config?.channel && config.channel !== '***'
+                      ? config.channel
+                      : config?.webhook_url
+                        ? 'Webhook configured'
+                        : 'No webhook configured'
+                    : config?.url
                       ? 'Webhook configured'
                       : 'No webhook configured'
-                  : config?.url
-                    ? 'Webhook configured'
-                    : 'No webhook configured'
             return (
               <li
                 key={provider.id}
@@ -477,7 +573,7 @@ export function ProvidersManagement({
                       <DropdownMenuSeparator />
                       <DropdownMenuItem
                         className="text-destructive"
-                        onClick={() => handleDelete(typedProvider)}
+                        onClick={() => setProviderToDelete(typedProvider)}
                       >
                         Delete
                       </DropdownMenuItem>
@@ -493,7 +589,7 @@ export function ProvidersManagement({
       <Dialog open={isEditDialogOpen} onOpenChange={setIsEditDialogOpen}>
         <DialogContent className="max-w-2xl max-h-[90vh] flex flex-col">
           <DialogHeader>
-            <DialogTitle>Edit Provider</DialogTitle>
+            <DialogTitle>Edit provider</DialogTitle>
             <DialogDescription>
               Update your notification provider settings.
             </DialogDescription>
@@ -510,6 +606,17 @@ export function ProvidersManagement({
           </div>
         </DialogContent>
       </Dialog>
+
+      <ConfirmDeleteDialog
+        open={providerToDelete !== null}
+        onOpenChange={(open) => {
+          if (!open) setProviderToDelete(null)
+        }}
+        resourceType="notification provider"
+        resourceName={providerToDelete?.name ?? ''}
+        consequences="Notification routes that use it will stop delivering to it."
+        onConfirm={handleConfirmDelete}
+      />
     </div>
   )
 }

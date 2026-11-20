@@ -18,15 +18,15 @@ use tokio_stream::StreamExt;
 use utoipa::{OpenApi, ToSchema};
 
 use axum::Extension;
-use temps_auth::{permission_guard, project_access_guard, RequireAuth, Role};
+use temps_authz::{permission_guard, project_access_guard, RequireAuth, Role};
 use temps_core::problemdetails;
 use temps_core::problemdetails::{Problem, ProblemDetails};
 use temps_core::RequestMetadata;
 
 use super::global::{
     facet_global_logs, global_log_aggregate, global_log_attribute_keys, global_log_capabilities,
-    global_log_facets_attrs, global_log_histogram, search_global_logs, AggregateResponse,
-    AttributeKeysResponse, FacetsAttrsResponse, HistogramResponse,
+    global_log_facets_attrs, global_log_histogram, log_ingest_budget, search_global_logs,
+    AggregateResponse, AttributeKeysResponse, FacetsAttrsResponse, HistogramResponse,
 };
 use crate::error::LogAggregatorError;
 use crate::handlers::types::LogAggregatorAppState;
@@ -197,7 +197,7 @@ impl From<LogAggregatorError> for Problem {
 /// tokens require a link to their bound project. With no `ProjectAccessChecker`,
 /// session/API-key access follows the unrestricted OSS database access policy.
 async fn guard_external_service_access(
-    auth: &temps_auth::AuthContext,
+    auth: &temps_authz::AuthContext,
     external_service_id: i32,
     project_ids: &[i32],
     created_by_user_id: Option<i32>,
@@ -299,8 +299,8 @@ impl temps_core::AuditOperation for LogsPurgedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> temps_core::anyhow::Result<String> {
-        Ok(serde_json::to_string(self)?)
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -419,6 +419,7 @@ pub struct PurgeLogsRequest {
         super::global::search_global_logs,
         super::global::facet_global_logs,
         super::global::global_log_capabilities,
+        super::global::log_ingest_budget,
         super::global::global_log_attribute_keys,
         super::global::global_log_facets_attrs,
         super::global::global_log_histogram,
@@ -439,6 +440,9 @@ pub struct PurgeLogsRequest {
             super::global::LogCollectionCapability,
             super::global::LogCollectionState,
             super::global::DeferredWalGeneration,
+            super::global::LogIngestBudgetStatus,
+            crate::services::ThrottledLogSource,
+            crate::services::IngestDropReason,
             AttributeKeysResponse,
             FacetsAttrsResponse,
             HistogramResponse,
@@ -486,6 +490,7 @@ pub fn configure_routes() -> Router<Arc<LogAggregatorAppState>> {
         .route("/logs/global/search", post(search_global_logs))
         .route("/logs/global/facets", post(facet_global_logs))
         .route("/logs/global/capabilities", get(global_log_capabilities))
+        .route("/logs/ingest-budget", get(log_ingest_budget))
         .route("/logs/global/attributes", get(global_log_attribute_keys))
         .route("/logs/global/facets/attrs", get(global_log_facets_attrs))
         .route("/logs/global/histogram", get(global_log_histogram))
@@ -876,7 +881,7 @@ mod tests {
     use chrono::{Duration, Utc};
     use sea_orm::ConnectionTrait;
     use std::sync::Arc;
-    use temps_database::test_utils::TestDatabase;
+    use temps_test_utils::TestDatabase;
     use uuid::Uuid;
 
     use std::sync::atomic::{AtomicI32, Ordering};
@@ -908,7 +913,7 @@ mod tests {
         async fn create_audit_log(
             &self,
             _operation: &dyn temps_core::AuditOperation,
-        ) -> Result<(), temps_core::anyhow::Error> {
+        ) -> temps_core::AuditResult<()> {
             Ok(())
         }
     }
@@ -982,6 +987,9 @@ mod tests {
                 db.connection_arc(),
             )),
             chunk_writer: chunk_writer.clone(),
+            ingest_budget: Arc::new(crate::services::IngestBudget::new(
+                crate::services::IngestLimits::UNLIMITED,
+            )),
         });
 
         TestContext {
@@ -994,7 +1002,7 @@ mod tests {
     }
 
     /// Helper to create a mock AuthContext for testing
-    fn create_test_auth_context() -> temps_auth::AuthContext {
+    fn create_test_auth_context() -> temps_authz::AuthContext {
         let user = temps_entities::users::Model {
             id: 1,
             name: "Test User".to_string(),
@@ -1015,18 +1023,18 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
-        temps_auth::AuthContext::new_session(user, temps_auth::Role::Admin)
+        temps_authz::AuthContext::new_session(user, temps_authz::Role::Admin)
     }
 
     /// Build a TestServer with auth middleware that injects AuthContext and RequestMetadata.
     fn build_test_server(app_state: Arc<LogAggregatorAppState>) -> TestServer {
-        build_test_server_with_role(app_state, temps_auth::Role::Admin)
+        build_test_server_with_role(app_state, temps_authz::Role::Admin)
     }
 
     /// Build a TestServer with a specific role for permission testing.
     fn build_test_server_with_role(
         app_state: Arc<LogAggregatorAppState>,
-        role: temps_auth::Role,
+        role: temps_authz::Role,
     ) -> TestServer {
         let auth_middleware =
             middleware::from_fn(move |mut req: Request, next: axum::middleware::Next| {
@@ -1052,7 +1060,7 @@ mod tests {
                         created_at: Utc::now(),
                         updated_at: Utc::now(),
                     };
-                    let auth_context = temps_auth::AuthContext::new_session(user, role);
+                    let auth_context = temps_authz::AuthContext::new_session(user, role);
                     req.extensions_mut().insert(auth_context);
                     req.extensions_mut().insert(temps_core::RequestMetadata {
                         ip_address: "127.0.0.1".to_string(),
@@ -2089,7 +2097,7 @@ mod tests {
         seed_logs(&ctx, lines).await;
 
         // Build server with Reader role (has LogsRead but NOT LogsDelete)
-        let server = build_test_server_with_role(ctx.app_state.clone(), temps_auth::Role::Reader);
+        let server = build_test_server_with_role(ctx.app_state.clone(), temps_authz::Role::Reader);
 
         let response = server
             .delete(&format!("/projects/{}/logs", project_id))
@@ -2198,15 +2206,18 @@ mod tests {
             line_index: base_state.line_index.clone(),
             manifests: base_state.manifests.clone(),
             chunk_writer: base_state.chunk_writer.clone(),
+            ingest_budget: base_state.ingest_budget.clone(),
         });
-        build_test_server_with_role(app_state, temps_auth::Role::User)
+        build_test_server_with_role(app_state, temps_authz::Role::User)
     }
 
     #[tokio::test]
     async fn test_external_service_access_standalone_policy() {
         let admin = create_test_auth_context();
-        let user =
-            temps_auth::AuthContext::new_session(admin.require_user().unwrap().clone(), Role::User);
+        let user = temps_authz::AuthContext::new_session(
+            admin.require_user().unwrap().clone(),
+            Role::User,
+        );
         let checker: Option<Arc<dyn temps_core::ProjectAccessChecker>> =
             Some(Arc::new(MockProjectAccessChecker { allowed: vec![7] }));
         // Administrators can aggregate logs from services without a creator/link.
@@ -2250,7 +2261,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_external_service_access_deployment_token_requires_link() {
-        let token = temps_auth::AuthContext::new_deployment_token(
+        let token = temps_authz::AuthContext::new_deployment_token(
             7,
             None,
             None,
@@ -2484,7 +2495,7 @@ mod tests {
         seed_logs(&ctx, lines).await;
 
         // Build server with Reader role (has LogsRead)
-        let server = build_test_server_with_role(ctx.app_state.clone(), temps_auth::Role::Reader);
+        let server = build_test_server_with_role(ctx.app_state.clone(), temps_authz::Role::Reader);
 
         let response = server
             .post("/logs/search")
@@ -2762,6 +2773,113 @@ mod tests {
         assert_eq!(
             response.status_code(),
             StatusCode::OK,
+            "{}",
+            response.text()
+        );
+    }
+
+    // ── Ingestion budget ────────────────────────────────────────────────
+
+    /// Push a container of `project_id` over a 1 line/s budget. Its limiter
+    /// is dropped; the container stays listed while its bucket is parked.
+    fn throttle(budget: &Arc<crate::services::IngestBudget>, project_id: i32, container_id: &str) {
+        budget.set_limits(crate::services::IngestLimits {
+            lines_per_sec: 1,
+            bytes_per_sec: 0,
+        });
+        let mut limiter = budget.limiter(crate::services::IngestSource {
+            ctx: ContainerContext {
+                project_id,
+                external_service_id: None,
+                env: "1".into(),
+                service: "web".into(),
+                container_id: container_id.into(),
+                deploy_id: None,
+            },
+            node_id: None,
+            node_name: None,
+        });
+        let now = Utc::now();
+        for i in 0..100 {
+            limiter.admit(10, now + Duration::microseconds(i));
+        }
+    }
+
+    fn throttled_ids(body: &serde_json::Value) -> Vec<String> {
+        body["throttled"]
+            .as_array()
+            .map(|sources| {
+                sources
+                    .iter()
+                    .filter_map(|s| s["container_id"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn ingest_budget_names_the_throttled_container_and_how_to_change_the_budget() {
+        let ctx = create_test_context().await;
+        throttle(&ctx.app_state.ingest_budget, 4, "noisy-container");
+        let server = build_test_server(ctx.app_state.clone());
+
+        let response = server.get("/logs/ingest-budget").await;
+
+        assert_eq!(
+            response.status_code(),
+            StatusCode::OK,
+            "{}",
+            response.text()
+        );
+        let body: serde_json::Value = response.json();
+        assert_eq!(body["lines_per_sec"], 1);
+        assert_eq!(body["burst_seconds"], crate::services::BURST_SECONDS);
+        assert_eq!(
+            body["setup_path"],
+            "/settings/metrics-monitoring#container-log-ingest-budget"
+        );
+        assert_eq!(throttled_ids(&body), ["noisy-container"]);
+        assert_eq!(body["throttled"][0]["reason"], "lines_per_sec");
+        assert_eq!(body["throttled"][0]["project_id"], 4);
+    }
+
+    // A member learns about throttled containers of projects they can read,
+    // never about another tenant's.
+    #[tokio::test]
+    async fn ingest_budget_lists_only_containers_the_member_can_read() {
+        let ctx = create_test_context().await;
+        let (_, project_id) = seed_external_service_with_project(ctx.app_state.db.as_ref()).await;
+        throttle(&ctx.app_state.ingest_budget, project_id, "readable");
+        throttle(
+            &ctx.app_state.ingest_budget,
+            project_id + 1_000,
+            "other-tenant",
+        );
+
+        let member = build_test_server_with_role(ctx.app_state.clone(), Role::Reader);
+        let response = member.get("/logs/ingest-budget").await;
+        assert_eq!(
+            response.status_code(),
+            StatusCode::OK,
+            "{}",
+            response.text()
+        );
+        assert_eq!(throttled_ids(&response.json()), ["readable"]);
+
+        let admin = build_test_server(ctx.app_state.clone());
+        let mut all = throttled_ids(&admin.get("/logs/ingest-budget").await.json());
+        all.sort();
+        assert_eq!(all, ["other-tenant", "readable"]);
+    }
+
+    #[tokio::test]
+    async fn ingest_budget_requires_logs_read() {
+        let ctx = create_test_context().await;
+        let server = build_test_server_with_role(ctx.app_state.clone(), Role::MetricsIngest);
+        let response = server.get("/logs/ingest-budget").await;
+        assert_eq!(
+            response.status_code(),
+            StatusCode::FORBIDDEN,
             "{}",
             response.text()
         );

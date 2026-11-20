@@ -37,7 +37,7 @@
 //!   passed via a bound `?` param using the deferred-bind [`Bv`] enum — never
 //!   string-interpolated.
 //! - The four substring filters (host, path, user_agent, upstream_host) and the
-//!   bot_name substring filter use `ILIKE ?` with `escape_like_pattern` so
+//!   bot_name substring filter use `ILIKE ?` with `escape_like` so
 //!   `%`/`_`/`\` in user input cannot widen the match.
 //! - The only interpolated tokens are: the ORDER BY column (from a fixed
 //!   allowlist `match`, mirroring the TimescaleDB sort), the ASC/DESC direction,
@@ -48,6 +48,7 @@
 //!   `ai_agent_detector::known_agents()` and is bound as an array regardless.
 
 use std::sync::Arc;
+use temps_core::escape::escape_like;
 
 use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
@@ -70,8 +71,8 @@ use crate::traffic_aggregation::{
 };
 
 /// Maximum rows per ClickHouse HTTP insert request. Bounds peak buffer memory
-/// in the `clickhouse` client on large batches. Proxy log batches flush at 200
-/// rows so this is rarely hit, but a backlog drain could produce more.
+/// in the `clickhouse` client on large batches. Proxy log batches flush at
+/// 2 000 rows so this is rarely hit, but a backlog drain could produce more.
 const MAX_INSERT_BATCH: usize = 5_000;
 
 // ── Client configuration ────────────────────────────────────────────────────
@@ -87,6 +88,9 @@ pub struct ClickHouseProxyLogConfig {
     pub database: String,
     pub user: String,
     pub password: String,
+    /// Wire compression, resolved from the stored `clickhouse.compression`
+    /// setting. [`ClickHouseProxyLogConfig::new`] starts at the default (LZ4).
+    pub compression: temps_clickhouse::ClickHouseCompression,
 }
 
 // Manual Debug that masks the password so it can never leak into logs.
@@ -97,6 +101,7 @@ impl std::fmt::Debug for ClickHouseProxyLogConfig {
             .field("database", &self.database)
             .field("user", &self.user)
             .field("password", &"***")
+            .field("compression", &self.compression)
             .finish()
     }
 }
@@ -113,24 +118,21 @@ impl ClickHouseProxyLogConfig {
             database: database.into(),
             user: user.into(),
             password: password.into(),
+            compression: temps_clickhouse::ClickHouseCompression::default(),
         }
+    }
+
+    /// Use `compression` for the client built from this config.
+    pub fn with_compression(
+        mut self,
+        compression: temps_clickhouse::ClickHouseCompression,
+    ) -> Self {
+        self.compression = compression;
+        self
     }
 }
 
 // ── LIKE pattern escaping ────────────────────────────────────────────────────
-
-/// Escape LIKE/ILIKE metacharacters in a user-supplied substring pattern.
-///
-/// ClickHouse LIKE uses backslash as the default escape character. We escape
-/// `\` → `\\` first, then `%` → `\%` and `_` → `\_`. The caller wraps the
-/// result with `%{escaped}%` for a case-insensitive substring search via ILIKE.
-/// (Copied from `temps-otel`'s helper — verified against live CH 26.2.)
-pub(crate) fn escape_like_pattern(pattern: &str) -> String {
-    pattern
-        .replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_")
-}
 
 /// Convert a validated `"N unit"` interval string (already passed through
 /// [`ProxyLogService::is_valid_interval`]) into a whole number of seconds for
@@ -305,6 +307,15 @@ pub struct ChProxyLogRow {
     /// serialization). The TTL expression in 0004_retention_ttl.sql reads
     /// this column: `toDateTime(timestamp) + toIntervalDay(retention_days)`.
     pub retention_days: u16,
+    /// shield_verdict LowCardinality(String) DEFAULT '' (0005_shield_verdict.sql,
+    /// after `retention_days` for the same reason).
+    pub shield_verdict: String,
+    /// shield_reasons Array(LowCardinality(String))
+    pub shield_reasons: Vec<String>,
+    /// ja4 LowCardinality(String) DEFAULT '' (0006_ja4.sql)
+    pub ja4: String,
+    /// ja4_source LowCardinality(String) DEFAULT ''
+    pub ja4_source: String,
 }
 
 impl From<&CreateProxyLogRequest> for ChProxyLogRow {
@@ -372,6 +383,10 @@ impl From<&CreateProxyLogRequest> for ChProxyLogRow {
             // Callers that hold a RetentionResolver should override this field
             // after construction. The fixed default matches the DDL DEFAULT.
             retention_days: temps_core::RetentionTable::ProxyLogs.default_days(),
+            shield_verdict: entry.shield_verdict.clone().unwrap_or_default(),
+            shield_reasons: entry.shield_reasons.clone(),
+            ja4: entry.ja4.clone().unwrap_or_default(),
+            ja4_source: entry.ja4_source.clone().unwrap_or_default(),
         }
     }
 }
@@ -424,6 +439,10 @@ struct ChProxyLogReadRow {
     cache_status: String,
     request_headers: String,
     response_headers: String,
+    shield_verdict: String,
+    shield_reasons: Vec<String>,
+    ja4: String,
+    ja4_source: String,
 }
 
 /// Parse a stored header blob into JSON for the entity model.
@@ -505,6 +524,12 @@ impl ChProxyLogReadRow {
             visitor_id: self.visitor_id,
             trace_id: None,
             error_group_id: None,
+            shield_verdict: opt_str(self.shield_verdict),
+            shield_reasons: crate::service::proxy_log_service::shield_reasons_to_json(
+                &self.shield_reasons,
+            ),
+            ja4: opt_str(self.ja4),
+            ja4_source: opt_str(self.ja4_source),
         }
     }
 }
@@ -632,11 +657,13 @@ impl ClickHouseProxyLogStore {
         config: ClickHouseProxyLogConfig,
         resolver: Arc<dyn temps_core::RetentionResolver>,
     ) -> Self {
-        let client = ::clickhouse::Client::default()
-            .with_url(&config.url)
-            .with_database(&config.database)
-            .with_user(&config.user)
-            .with_password(&config.password);
+        let client = temps_clickhouse::build_client(
+            &config.url,
+            &config.database,
+            &config.user,
+            &config.password,
+            config.compression,
+        );
         Self { client, resolver }
     }
 
@@ -743,6 +770,27 @@ fn sort_column(sort_by: Option<&str>) -> &'static str {
     }
 }
 
+/// Full `ORDER BY` expression for a list page: the requested column, then
+/// `timestamp` and `request_id` as tiebreakers.
+///
+/// Rows sharing the sort value (a status code, a method, a host) would
+/// otherwise come back in an unspecified order and `LIMIT/OFFSET` pages would
+/// overlap, so "Next page" repeats rows. ClickHouse rows carry no serial id;
+/// `request_id` is unique per request. `order_col` is allowlist-derived and
+/// `order_dir` is a fixed enum, so the result is safe to interpolate.
+fn order_by_clause(sort_by: Option<&str>, sort_order: Option<&str>) -> String {
+    let order_col = sort_column(sort_by);
+    let order_dir = match sort_order {
+        Some("asc") => "ASC",
+        _ => "DESC",
+    };
+    if order_col == "timestamp" {
+        format!("timestamp {order_dir}, request_id {order_dir}")
+    } else {
+        format!("{order_col} {order_dir}, timestamp {order_dir}, request_id {order_dir}")
+    }
+}
+
 impl ClickHouseProxyLogStore {
     /// Translate the full `ProxyLogsQuery` (plus the separately-passed date
     /// bounds) into a WHERE fragment + ordered bind list. Every value is a bound
@@ -803,11 +851,11 @@ impl ClickHouseProxyLogStore {
         }
         if let Some(ref host) = filters.host {
             clauses.push("host ILIKE ?".into());
-            binds.push(Bv::Str(format!("%{}%", escape_like_pattern(host))));
+            binds.push(Bv::Str(format!("%{}%", escape_like(host))));
         }
         if let Some(ref path) = filters.path {
             clauses.push("path ILIKE ?".into());
-            binds.push(Bv::Str(format!("%{}%", escape_like_pattern(path))));
+            binds.push(Bv::Str(format!("%{}%", escape_like(path))));
         }
         if let Some(ref path) = filters.path_exact {
             clauses.push("path = ?".into());
@@ -849,7 +897,7 @@ impl ClickHouseProxyLogStore {
         // User agent
         if let Some(ref ua) = filters.user_agent {
             clauses.push("user_agent ILIKE ?".into());
-            binds.push(Bv::Str(format!("%{}%", escape_like_pattern(ua))));
+            binds.push(Bv::Str(format!("%{}%", escape_like(ua))));
         }
         if let Some(ref browser) = filters.browser {
             clauses.push("browser = ?".into());
@@ -879,7 +927,7 @@ impl ClickHouseProxyLogStore {
         }
         if let Some(ref bot_name) = filters.bot_name {
             clauses.push("bot_name ILIKE ?".into());
-            binds.push(Bv::Str(format!("%{}%", escape_like_pattern(bot_name))));
+            binds.push(Bv::Str(format!("%{}%", escape_like(bot_name))));
         }
 
         // AI agent filters (canonical names persisted at ingest; equality / IN).
@@ -947,7 +995,7 @@ impl ClickHouseProxyLogStore {
         }
         if let Some(ref upstream_host) = filters.upstream_host {
             clauses.push("upstream_host ILIKE ?".into());
-            binds.push(Bv::Str(format!("%{}%", escape_like_pattern(upstream_host))));
+            binds.push(Bv::Str(format!("%{}%", escape_like(upstream_host))));
         }
 
         // Error presence. The CH column stores '' for "no error" (the Postgres
@@ -969,7 +1017,7 @@ impl ClickHouseProxyLogStore {
 impl ProxyLogStorage for ClickHouseProxyLogStore {
     async fn write_batch(
         &self,
-        entries: Vec<CreateProxyLogRequest>,
+        entries: &[CreateProxyLogRequest],
     ) -> Result<(), ProxyLogServiceError> {
         if entries.is_empty() {
             return Ok(());
@@ -1119,12 +1167,8 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
         // exactly the shape the DDL calls out as duplicate-tolerant: the worst
         // case is one retried request showing twice on a page until the next
         // merge, versus merge-on-read over every part on every page load.
-        let order_col = sort_column(filters.sort_by.as_deref());
-        let order_dir = match filters.sort_order.as_deref() {
-            Some("asc") => "ASC",
-            _ => "DESC",
-        };
-        let offset = (page.saturating_sub(1)) * page_size;
+        let order_by = order_by_clause(filters.sort_by.as_deref(), filters.sort_order.as_deref());
+        let offset = temps_core::config::page_offset(page, page_size);
 
         let select_sql = format!(
             "SELECT \
@@ -1134,10 +1178,11 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
                 container_id, upstream_host, error_message, client_ip, user_agent, referrer, \
                 request_id, ip_geolocation_id, browser, browser_version, operating_system, \
                 device_type, is_bot, bot_name, request_size_bytes, response_size_bytes, \
-                cache_status, '' AS request_headers, '' AS response_headers \
+                cache_status, '' AS request_headers, '' AS response_headers, \
+                shield_verdict, shield_reasons, ja4, ja4_source \
              FROM proxy_logs \
              {where_clause} \
-             ORDER BY {order_col} {order_dir} \
+             ORDER BY {order_by} \
              LIMIT ? OFFSET ?"
         );
 
@@ -1183,11 +1228,7 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
         // Same page projection as `list_with_filters`, minus the count()
         // aggregate — feed callers discard the total. ORDER BY column is
         // allowlist-derived; direction is a fixed enum (injection-safe).
-        let order_col = sort_column(filters.sort_by.as_deref());
-        let order_dir = match filters.sort_order.as_deref() {
-            Some("asc") => "ASC",
-            _ => "DESC",
-        };
+        let order_by = order_by_clause(filters.sort_by.as_deref(), filters.sort_order.as_deref());
         let select_sql = format!(
             "SELECT \
                 toUnixTimestamp64Milli(timestamp) AS timestamp_ms, method, path, query_string, \
@@ -1196,10 +1237,11 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
                 container_id, upstream_host, error_message, client_ip, user_agent, referrer, \
                 request_id, ip_geolocation_id, browser, browser_version, operating_system, \
                 device_type, is_bot, bot_name, request_size_bytes, response_size_bytes, \
-                cache_status, '' AS request_headers, '' AS response_headers \
+                cache_status, '' AS request_headers, '' AS response_headers, \
+                shield_verdict, shield_reasons, ja4, ja4_source \
              FROM proxy_logs \
              {where_clause} \
-             ORDER BY {order_col} {order_dir} \
+             ORDER BY {order_by} \
              LIMIT ?"
         );
 
@@ -1260,7 +1302,8 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
                 container_id, upstream_host, error_message, client_ip, user_agent, referrer, \
                 request_id, ip_geolocation_id, browser, browser_version, operating_system, \
                 device_type, is_bot, bot_name, request_size_bytes, response_size_bytes, \
-                cache_status, request_headers, response_headers \
+                cache_status, request_headers, response_headers, \
+                shield_verdict, shield_reasons, ja4, ja4_source \
              FROM proxy_logs \
              WHERE request_id = ?{time_clause} \
              ORDER BY timestamp DESC \
@@ -2373,7 +2416,7 @@ fn status_class_range(class: &str) -> Option<(i16, i16)> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::traffic_aggregation::TrafficOrderBy;
 
@@ -2381,7 +2424,7 @@ mod tests {
     /// is optional for local/unit-test environments, so startup failures skip
     /// gracefully; once the server starts, migration/query failures are real
     /// test failures.
-    async fn setup_clickhouse_store(
+    pub(crate) async fn setup_clickhouse_store(
     ) -> Option<(ClickHouseProxyLogStore, Box<dyn std::any::Any + Send>)> {
         use testcontainers::{
             core::{wait::HttpWaitStrategy, ContainerPort, WaitFor},
@@ -2491,6 +2534,10 @@ mod tests {
             error_group_id: None,
             visitor_uuid: None,
             session_uuid: None,
+            shield_verdict: None,
+            shield_reasons: Vec::new(),
+            ja4: None,
+            ja4_source: None,
         }
     }
 
@@ -2504,7 +2551,7 @@ mod tests {
         entry.is_bot = Some(true);
         entry.bot_name = Some("GPTBot".to_string());
         store
-            .write_batch(vec![entry])
+            .write_batch(&[entry])
             .await
             .expect("insert proxy-log fixture");
 
@@ -2554,7 +2601,7 @@ mod tests {
         failed.project_id = Some(7);
         failed.status_code = 503;
         store
-            .write_batch(vec![ok, failed])
+            .write_batch(&[ok, failed])
             .await
             .expect("insert proxy-log fixtures");
 
@@ -2612,7 +2659,7 @@ mod tests {
         served.status_code = 200;
 
         store
-            .write_batch(vec![upgrade, served])
+            .write_batch(&[upgrade, served])
             .await
             .expect("insert proxy-log fixtures");
 
@@ -2666,7 +2713,7 @@ mod tests {
         crawler.bot_name = Some("ExampleBot".to_string());
 
         store
-            .write_batch(vec![fast, slow_error, monitor, crawler])
+            .write_batch(&[fast, slow_error, monitor, crawler])
             .await
             .expect("insert traffic aggregation fixtures");
 
@@ -2814,7 +2861,7 @@ mod tests {
         no_latency.path = "/api/no-latency".to_string();
         no_latency.response_time_ms = None;
         store
-            .write_batch(vec![no_latency])
+            .write_batch(&[no_latency])
             .await
             .expect("insert traffic fixture without latency");
 
@@ -2853,14 +2900,28 @@ mod tests {
     }
 
     #[test]
-    fn escape_like_pattern_escapes_metacharacters() {
-        assert_eq!(escape_like_pattern("a%b"), "a\\%b");
-        assert_eq!(escape_like_pattern("a_b"), "a\\_b");
-        assert_eq!(escape_like_pattern("a\\b"), "a\\\\b");
-        // backslash must be escaped first so we don't double-escape.
-        assert_eq!(escape_like_pattern("%_\\"), "\\%\\_\\\\");
-        // plain text is unchanged.
-        assert_eq!(escape_like_pattern("/api/users"), "/api/users");
+    fn configured_compression_reaches_the_proxy_log_client() {
+        use temps_clickhouse::ClickHouseCompression;
+
+        let build = |mode| {
+            let store = ClickHouseProxyLogStore::new(
+                ClickHouseProxyLogConfig::new("http://127.0.0.1:1", "otel", "temps", "pw")
+                    .with_compression(mode),
+                Arc::new(temps_core::FixedRetentionResolver),
+            );
+            format!("{:?}", store.client())
+        };
+
+        let lz4 = build(ClickHouseCompression::Lz4);
+        assert!(lz4.contains("compression: Lz4"), "{lz4}");
+        assert!(
+            lz4.contains("\"network_compression_method\": \"lz4\""),
+            "{lz4}"
+        );
+
+        let none = build(ClickHouseCompression::None);
+        assert!(none.contains("compression: None"), "{none}");
+        assert!(!none.contains("network_compression_method"), "{none}");
     }
 
     #[test]
@@ -2920,6 +2981,132 @@ mod tests {
     }
 
     #[test]
+    fn shield_verdicts_round_trip_through_clickhouse_rows() {
+        let mut entry = make_entry("req-shield");
+        let row = ChProxyLogRow::from(&entry);
+        assert_eq!(row.shield_verdict, "");
+        assert!(row.shield_reasons.is_empty());
+
+        entry.shield_verdict = Some("block".into());
+        entry.shield_reasons = vec!["spamhaus_drop (192.0.2.0/24)".into()];
+        let row = ChProxyLogRow::from(&entry);
+        assert_eq!(row.shield_verdict, "block");
+        assert_eq!(row.shield_reasons, ["spamhaus_drop (192.0.2.0/24)"]);
+
+        let model = ChProxyLogReadRow {
+            timestamp_ms: 1_717_200_000_000,
+            method: "GET".into(),
+            path: "/".into(),
+            query_string: String::new(),
+            host: "h".into(),
+            status_code: 200,
+            response_time_ms: None,
+            request_source: "proxy".into(),
+            is_system_request: 0,
+            routing_status: "routed".into(),
+            project_id: None,
+            environment_id: None,
+            deployment_id: None,
+            session_id: None,
+            visitor_id: None,
+            container_id: String::new(),
+            upstream_host: String::new(),
+            error_message: String::new(),
+            client_ip: "192.0.2.9".into(),
+            user_agent: String::new(),
+            referrer: String::new(),
+            request_id: "rid".into(),
+            ip_geolocation_id: None,
+            browser: String::new(),
+            browser_version: String::new(),
+            operating_system: String::new(),
+            device_type: String::new(),
+            is_bot: None,
+            bot_name: String::new(),
+            request_size_bytes: None,
+            response_size_bytes: None,
+            cache_status: String::new(),
+            request_headers: String::new(),
+            response_headers: String::new(),
+            shield_verdict: row.shield_verdict,
+            shield_reasons: row.shield_reasons,
+            ja4: row.ja4,
+            ja4_source: row.ja4_source,
+        }
+        .into_model();
+        let response = crate::service::proxy_log_service::ProxyLogResponse::from(model);
+        assert_eq!(response.shield_verdict.as_deref(), Some("block"));
+        assert_eq!(response.shield_reasons, ["spamhaus_drop (192.0.2.0/24)"]);
+    }
+
+    #[test]
+    fn ja4_round_trips_through_clickhouse_rows() {
+        let mut entry = make_entry("req-ja4");
+        let row = ChProxyLogRow::from(&entry);
+        assert_eq!((row.ja4.as_str(), row.ja4_source.as_str()), ("", ""));
+
+        entry.ja4 = Some("t13d1516h2_8daaf6152771_e5627efa2ab1".into());
+        entry.ja4_source = Some("cloudflare".into());
+        let row = ChProxyLogRow::from(&entry);
+        assert_eq!(row.ja4, "t13d1516h2_8daaf6152771_e5627efa2ab1");
+        assert_eq!(row.ja4_source, "cloudflare");
+
+        let read = |ja4: String, ja4_source: String| {
+            let model = ChProxyLogReadRow {
+                timestamp_ms: 1_717_200_000_000,
+                method: "GET".into(),
+                path: "/".into(),
+                query_string: String::new(),
+                host: "h".into(),
+                status_code: 200,
+                response_time_ms: None,
+                request_source: "proxy".into(),
+                is_system_request: 0,
+                routing_status: "routed".into(),
+                project_id: None,
+                environment_id: None,
+                deployment_id: None,
+                session_id: None,
+                visitor_id: None,
+                container_id: String::new(),
+                upstream_host: String::new(),
+                error_message: String::new(),
+                client_ip: "192.0.2.9".into(),
+                user_agent: String::new(),
+                referrer: String::new(),
+                request_id: "rid".into(),
+                ip_geolocation_id: None,
+                browser: String::new(),
+                browser_version: String::new(),
+                operating_system: String::new(),
+                device_type: String::new(),
+                is_bot: None,
+                bot_name: String::new(),
+                request_size_bytes: None,
+                response_size_bytes: None,
+                cache_status: String::new(),
+                request_headers: String::new(),
+                response_headers: String::new(),
+                shield_verdict: String::new(),
+                shield_reasons: Vec::new(),
+                ja4,
+                ja4_source,
+            }
+            .into_model();
+            crate::service::proxy_log_service::ProxyLogResponse::from(model)
+        };
+        let response = read(row.ja4, row.ja4_source);
+        assert_eq!(
+            response.ja4.as_deref(),
+            Some("t13d1516h2_8daaf6152771_e5627efa2ab1")
+        );
+        assert_eq!(response.ja4_source.as_deref(), Some("cloudflare"));
+        // ClickHouse's empty default reads back as absent.
+        let response = read(String::new(), String::new());
+        assert_eq!((response.ja4, response.ja4_source), (None, None));
+    }
+
+    #[test]
     fn row_conversion_is_bot_tristate() {
         let mut entry = make_entry("req-2");
         entry.is_bot = None;
@@ -2969,6 +3156,10 @@ mod tests {
             request_headers: r#"{"accept":"text/html"}"#.into(),
             // `''` is what the list queries alias in place of the column.
             response_headers: String::new(),
+            shield_verdict: String::new(),
+            shield_reasons: Vec::new(),
+            ja4: String::new(),
+            ja4_source: String::new(),
         };
         let model = read.into_model();
         assert_eq!(model.id, 0);
@@ -3007,6 +3198,23 @@ mod tests {
         assert_eq!(
             opt_headers_json(r#"{"a":"b"}"#.to_string()),
             Some(serde_json::json!({"a": "b"}))
+        );
+    }
+
+    #[test]
+    fn order_by_clause_breaks_ties_with_timestamp_and_request_id() {
+        assert_eq!(
+            order_by_clause(Some("status_code"), Some("asc")),
+            "status_code ASC, timestamp ASC, request_id ASC"
+        );
+        assert_eq!(
+            order_by_clause(Some("method"), None),
+            "method DESC, timestamp DESC, request_id DESC"
+        );
+        // Sorting by timestamp must not repeat the column.
+        assert_eq!(
+            order_by_clause(None, Some("desc")),
+            "timestamp DESC, request_id DESC"
         );
     }
 
@@ -3183,7 +3391,7 @@ mod tests {
             ClickHouseProxyLogConfig::new("http://127.0.0.1:1", "otel", "temps", "temps_dev"),
             Arc::new(temps_core::FixedRetentionResolver),
         );
-        assert!(store.write_batch(vec![]).await.is_ok());
+        assert!(store.write_batch(&[]).await.is_ok());
     }
 
     #[tokio::test]

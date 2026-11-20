@@ -7,14 +7,15 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import type { QueryKey } from '@tanstack/react-query'
 import { MemoryRouter, Route, Routes } from 'react-router'
 import { client as apiClient } from '@/api/client/client.gen'
+import { restoreApiClient } from '@/test/api-client'
 import { getApiKeyOptions } from '@/api/client/@tanstack/react-query.gen'
 import ApiKeyEdit from './ApiKeyEdit'
 
 const apiKeyKey = getApiKeyOptions({ path: { id: 1 } }).queryKey
-const NOT_FOUND = 'API Key not found'
+const NOT_FOUND = 'API key not found'
 
 const originalConfig = apiClient.getConfig()
-afterEach(() => apiClient.setConfig(originalConfig))
+afterEach(() => restoreApiClient(originalConfig))
 
 function createClient() {
   return new QueryClient({
@@ -53,7 +54,7 @@ test('only a verified 404 shows the API key as not found', () => {
   const html = render(client)
   expect(html).toContain(NOT_FOUND)
   expect(html).not.toContain('unavailable')
-  expect(html).toContain('Back to API Keys')
+  expect(html).toContain('Back to API keys')
   client.clear()
 })
 
@@ -72,7 +73,7 @@ for (const error of [
     expect(html).not.toContain('Failed to fetch')
     expect(html).not.toContain('data is undefined')
     expect(html).toContain('Retry')
-    expect(html).toContain('Back to API Keys')
+    expect(html).toContain('Back to API keys')
     if (!(error instanceof TypeError)) expect(html).toContain(serverDetail)
     client.clear()
   })
@@ -137,7 +138,7 @@ test('a failed refresh over a cached API key keeps the form and says it is stale
   })
   const html = render(client)
   // The form itself renders (fields fill in after mount).
-  expect(html).toContain('Edit API Key')
+  expect(html).toContain('Edit API key')
   expect(html).toContain('API key unavailable')
   expect(html).toContain('Showing last-known data')
   expect(html).toContain('api key store unavailable')

@@ -2,8 +2,15 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use sea_orm::entity::prelude::*;
+use sea_orm::FromJsonQueryResult;
 use serde::{Deserialize, Serialize};
 use temps_core::DBDateTime;
+use temps_workload::SandboxEgressPolicy;
+
+/// JSON column wrapper for a sandbox's egress policy. The default is
+/// `internet`, the column default too.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, FromJsonQueryResult)]
+pub struct StoredEgressPolicy(pub SandboxEgressPolicy);
 
 /// Standalone sandboxes created via the `/v1/sandbox` API — the temps
 /// counterpart to `@vercel/sandbox`. Separate from workspace sessions
@@ -92,21 +99,43 @@ pub struct Model {
     /// its node for its whole lifetime.
     pub node_id: Option<i32>,
 
+    /// Which outside destinations the sandbox may reach, set by its owner
+    /// (`internet`, the default, or `restricted` to an allow-list of hosts
+    /// and CIDR blocks). Written only after the sandbox's backend applied
+    /// it, so the row is what the sandbox enforces.
+    #[serde(default)]
+    #[sea_orm(column_type = "JsonBinary")]
+    pub egress_policy: StoredEgressPolicy,
+
     pub created_at: DBDateTime,
     pub last_activity_at: DBDateTime,
     pub expires_at: DBDateTime,
 
     /// Optional argon2 PHC hash of a user-supplied password that protects
-    /// the sandbox's preview URLs. When null, the gateway allows any
-    /// request that can reach the sandbox's unguessable hex hostname.
-    /// When set, Pingora presents a login form and expects a cookie
-    /// minted against this hash.
+    /// the sandbox's preview URLs while `preview_access` is `password`:
+    /// Pingora then presents a login form and expects a cookie minted
+    /// against this hash. Ignored in the other modes.
+    #[serde(skip_serializing)]
     pub preview_password_hash: Option<String>,
 
     /// Last 4 characters of the plaintext password. Safe to surface in
     /// the UI so users can tell two passwords apart without storing the
     /// full plaintext anywhere.
     pub preview_password_hint: Option<String>,
+
+    /// Who may open the preview URLs (ADR-055 §11): `temps_login` (the
+    /// default), `password` (only while a password is set) or `public`. A
+    /// serialized row without the field reads as `temps_login`, the mode
+    /// that never admits an anonymous visitor.
+    #[serde(default)]
+    pub preview_access: super::ingress_mode::SandboxPreviewAccess,
+
+    /// Client networks allowed to open the preview URLs, as normalised
+    /// CIDRs (`203.0.113.0/24`, `2001:db8::/32`; a single address is a
+    /// `/32` or `/128`). Checked before `preview_access`, whatever the
+    /// mode. Empty = any client address.
+    #[serde(default)]
+    pub preview_allowed_cidrs: Vec<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -127,3 +156,69 @@ impl Related<super::users::Entity> for Entity {
 }
 
 impl ActiveModelBehavior for ActiveModel {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serializing_a_sandbox_leaves_out_its_preview_password_hash() {
+        let now = chrono::Utc::now();
+        let sandbox = Model {
+            id: 1,
+            public_id: "sbx_1".to_string(),
+            user_id: None,
+            agent_run_id: None,
+            name: "sandbox".to_string(),
+            status: "running".to_string(),
+            lifecycle: "ephemeral".to_string(),
+            project_id: None,
+            source_repo_url: None,
+            image: None,
+            work_dir: "/workspace".to_string(),
+            timeout_secs: 60,
+            metadata: None,
+            backend: None,
+            node_id: None,
+            egress_policy: StoredEgressPolicy::default(),
+            created_at: now,
+            last_activity_at: now,
+            expires_at: now,
+            preview_password_hash: Some("stored-password-hash".to_string()),
+            preview_password_hint: None,
+            preview_access: Default::default(),
+            preview_allowed_cidrs: Vec::new(),
+        };
+
+        let json = serde_json::to_string(&sandbox).expect("serializes");
+
+        assert!(!json.contains("stored-password-hash"), "{json}");
+        assert!(json.contains("sbx_1"), "{json}");
+    }
+
+    #[test]
+    fn the_default_policy_is_the_column_default() {
+        // Must equal the DEFAULT of `sandboxes.egress_policy` in
+        // m20261024_000011_sandbox_egress_policy.
+        assert_eq!(
+            serde_json::to_string(&StoredEgressPolicy::default()).expect("serializes"),
+            r#"{"mode":"internet","rules":[]}"#
+        );
+    }
+
+    #[test]
+    fn a_row_serialized_before_the_column_reads_as_internet() {
+        let stored: StoredEgressPolicy = serde_json::from_str(
+            r#"{"mode":"restricted","rules":[{"host":"api.example.com","ports":[443]}]}"#,
+        )
+        .expect("parses");
+        assert!(stored.0.is_restricted());
+        #[derive(Deserialize)]
+        struct Partial {
+            #[serde(default)]
+            egress_policy: StoredEgressPolicy,
+        }
+        let old: Partial = serde_json::from_str("{}").expect("parses");
+        assert_eq!(old.egress_policy, StoredEgressPolicy::default());
+    }
+}

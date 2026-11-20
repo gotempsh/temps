@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use anyhow::Result;
 use serde::Serialize;
 use temps_core::AuditOperation;
 
@@ -14,6 +13,7 @@ pub enum StatusPageMutationAction {
     IncidentCreated,
     IncidentStatusUpdated,
     IncidentUpdateVisibilityChanged,
+    IncidentPublicTitleChanged,
 }
 
 impl StatusPageMutationAction {
@@ -27,6 +27,7 @@ impl StatusPageMutationAction {
             Self::IncidentUpdateVisibilityChanged => {
                 "STATUS_PAGE_INCIDENT_UPDATE_VISIBILITY_CHANGED"
             }
+            Self::IncidentPublicTitleChanged => "STATUS_PAGE_INCIDENT_PUBLIC_TITLE_CHANGED",
         }
     }
 }
@@ -71,9 +72,8 @@ impl AuditOperation for StatusPageMutationAudit {
         &self.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|error| anyhow::anyhow!("failed to serialize status-page audit: {error}"))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -87,6 +87,11 @@ pub enum PublicStatusPageAction {
     Unpublished,
     UrlRotated,
     Deleted,
+    DomainAdded,
+    DomainVerified,
+    DomainVerificationAttempted,
+    DomainRenewalRequested,
+    DomainRemoved,
 }
 
 impl PublicStatusPageAction {
@@ -98,6 +103,11 @@ impl PublicStatusPageAction {
             Self::Unpublished => "STATUS_PAGE_UNPUBLISHED",
             Self::UrlRotated => "STATUS_PAGE_URL_ROTATED",
             Self::Deleted => "STATUS_PAGE_DELETED",
+            Self::DomainAdded => "STATUS_PAGE_DOMAIN_ADDED",
+            Self::DomainVerified => "STATUS_PAGE_DOMAIN_VERIFIED",
+            Self::DomainVerificationAttempted => "STATUS_PAGE_DOMAIN_VERIFICATION_ATTEMPTED",
+            Self::DomainRenewalRequested => "STATUS_PAGE_DOMAIN_RENEWAL_REQUESTED",
+            Self::DomainRemoved => "STATUS_PAGE_DOMAIN_REMOVED",
         }
     }
 }
@@ -112,12 +122,21 @@ pub struct PublicStatusPageAudit {
     pub ip_address: Option<String>,
     pub user_agent: String,
     pub action: PublicStatusPageAction,
-    pub project_id: i32,
+    /// Every project the page drew components from when the action ran:
+    /// whose monitors it exposed or stopped exposing.
+    pub project_ids: Vec<i32>,
     pub status_page_id: i32,
     pub title: Option<String>,
     pub is_published: Option<bool>,
     /// Selected monitor ids, in display order, when the selection was set.
     pub monitor_ids: Option<Vec<i32>>,
+    /// Custom hostname added, verified or removed (#1412).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
+    /// Result of a verification or renewal attempt: `verified`, `renewed`,
+    /// `pending` or the error.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
 }
 
 impl AuditOperation for PublicStatusPageAudit {
@@ -137,11 +156,11 @@ impl AuditOperation for PublicStatusPageAudit {
         &self.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self).map_err(|error| {
-            anyhow::anyhow!(
-                "failed to serialize status page {} audit: {error}",
-                self.status_page_id
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        serde_json::to_string(self).map_err(|source| {
+            temps_core::AuditError::serialize(
+                format!("status page {}", self.status_page_id),
+                source,
             )
         })
     }
@@ -195,17 +214,20 @@ mod tests {
             ip_address: None,
             user_agent: "status-page-test".to_string(),
             action: PublicStatusPageAction::Published,
-            project_id: 9,
+            project_ids: vec![4, 9],
             status_page_id: 12,
             title: Some("Public status".to_string()),
             is_published: Some(true),
             monitor_ids: Some(vec![3, 1]),
+            hostname: None,
+            outcome: None,
         };
         assert_eq!(audit.operation_type(), "STATUS_PAGE_PUBLISHED");
         let serialized = AuditOperation::serialize(&audit).expect("audit should serialize");
         let payload: serde_json::Value =
             serde_json::from_str(&serialized).expect("serialized audit should be valid JSON");
         assert_eq!(payload["status_page_id"], 12);
+        assert_eq!(payload["project_ids"], serde_json::json!([4, 9]));
         assert_eq!(payload["monitor_ids"], serde_json::json!([3, 1]));
         assert_eq!(payload["action"], "published");
         assert!(payload.get("slug").is_none());

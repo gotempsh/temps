@@ -20,6 +20,14 @@
 //! The inner `TimescaleDbStorage` is a sea-orm `MockDatabase`: the metric
 //! methods under test read/write only ClickHouse and never touch Postgres.
 
+// Test-only helpers outside `#[test]` fns (fixtures, mock servers, setup):
+// a panic there is the test failure, which is what we want.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test helpers: panicking is how a test fails"
+)]
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -197,11 +205,13 @@ async fn setup() -> Option<(
     let url = format!("http://127.0.0.1:{host_port}");
     let config = ClickHouseOtelConfig::new(&url, "temps_otel_e2e", "default", "test");
 
-    let probe = ::clickhouse::Client::default()
-        .with_url(&url)
-        .with_database("temps_otel_e2e")
-        .with_user("default")
-        .with_password("test");
+    let probe = temps_clickhouse::build_client(
+        &url,
+        "temps_otel_e2e",
+        "default",
+        "test",
+        temps_clickhouse::ClickHouseCompression::Lz4,
+    );
 
     // Wait until the HTTP listener accepts queries.
     let mut last_err = String::new();

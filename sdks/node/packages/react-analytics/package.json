@@ -1,6 +1,6 @@
 {
 	"name": "@temps-sdk/react-analytics",
-	"version": "0.0.8",
+	"version": "0.0.9",
 	"private": false,
 	"main": "./dist/index.js",
 	"types": "./dist/index.d.ts",
@@ -18,7 +18,7 @@
 		"build:types": "tsc -p tsconfig.types.json",
 		"build": "bun run build:js && bun run build:types",
 		"clean": "rm -rf dist",
-		"prepublishOnly": "bun run clean && bun run build",
+		"prepublishOnly": "node ../../scripts/require-bun-publish.mjs && bun run clean && bun run build",
 		"test": "vitest",
 		"test:coverage": "vitest run --coverage",
 		"lint": "eslint src --ext .ts,.tsx",
@@ -60,5 +60,10 @@
 		"typescript": "^5.5.4",
 		"vitest": "^4.1.0"
 	},
-	"sideEffects": false
+	"sideEffects": false,
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/gotempsh/temps.git",
+		"directory": "sdks/node/packages/react-analytics"
+	}
 }

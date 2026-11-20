@@ -4,6 +4,22 @@
 
 Apply [the CLI runtime and safety contract](../cli-runtime.md) before executing a command. Runtime `--help` is authoritative.
 
+## Contents
+
+- [`environments list`](#environments-list)
+- [`environments create`](#environments-create)
+- [`environments delete`](#environments-delete)
+- [`environments vars`](#environments-vars)
+- [`environments resources`](#environments-resources)
+- [`environments timeouts`](#environments-timeouts)
+- [`environments force-https`](#environments-force-https)
+- [`environments scale`](#environments-scale)
+- [`environments placement`](#environments-placement)
+- [`environments isolation`](#environments-isolation)
+- [`environments volumes`](#environments-volumes)
+- [`environments ingress`](#environments-ingress)
+- [`environments crons`](#environments-crons)
+
 ## `environments` (alias: `envs`, `env`)
 
 Manage environments and environment variables
@@ -18,6 +34,10 @@ Manage environments and environment variables
 - `timeouts` - View or set upstream request/idle timeouts for an environment
 - `force-https` - View or set the HTTP to HTTPS redirect override for an environment
 - `scale` - View or set the number of replicas for an environment
+- `placement` - Where the scheduler would run an environment's replicas, and why
+- `isolation` - How an environment's replicas are isolated: a container (process) or a Firecracker microVM (micro_vm). Honoured only for environments whose deployments run on the workload plane
+- `volumes` - Persistent volumes mounted into an environment's replicas; a replica that mounts one is pinned to its node
+- `ingress` - Whether visitors must sign in to Temps to open an environment
 - `crons` - Manage cron jobs
 
 ### `environments list` (alias: `ls`)
@@ -47,6 +67,8 @@ Create a new environment
 ### `environments delete` (alias: `rm`)
 
 Delete an environment
+
+**Usage:** `environments delete <environment> [options]`
 
 **Options:**
 
@@ -90,6 +112,8 @@ List environment variables
 
 Get a specific environment variable
 
+**Usage:** `environments vars get <key> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -99,6 +123,8 @@ Get a specific environment variable
 #### `environments vars set`
 
 Set an environment variable
+
+**Usage:** `environments vars set <key> [value] [options]`
 
 **Options:**
 
@@ -114,6 +140,8 @@ Set an environment variable
 
 Delete an environment variable
 
+**Usage:** `environments vars delete <key> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -124,6 +152,8 @@ Delete an environment variable
 #### `environments vars import`
 
 Import environment variables from a .env file
+
+**Usage:** `environments vars import [file] [options]`
 
 **Options:**
 
@@ -147,6 +177,8 @@ Export environment variables to .env format
 
 View or set CPU/memory resources for an environment
 
+**Usage:** `environments resources <environment> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -162,6 +194,8 @@ View or set CPU/memory resources for an environment
 
 View or set upstream request/idle timeouts for an environment
 
+**Usage:** `environments timeouts <environment> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -176,6 +210,8 @@ View or set upstream request/idle timeouts for an environment
 ### `environments force-https`
 
 View or set the HTTP to HTTPS redirect override for an environment
+
+**Usage:** `environments force-https <environment> [options]`
 
 **Options:**
 
@@ -198,6 +234,215 @@ View or set the number of replicas for an environment
 | `-p, --project <project>` | Project slug or ID | - | No |
 | `-e, --environment <env>` | Environment name or slug | `production` | No |
 | `-r, --replicas <count>` | Number of replicas to set | - | No |
+| `--load-balancing <json>` | Replica routing policy as JSON; null restores project inheritance | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `environments placement`
+
+Where the scheduler would run an environment's replicas, and why
+
+**Subcommands:**
+
+- `explain` - Show the nodes each replica would run on now, the eligible nodes ranked, and the ones excluded with the reason
+- `recommend` - Recommend target nodes from where the environment actually ran (recommended, never applied)
+
+#### `environments placement explain`
+
+Show the nodes each replica would run on now, the eligible nodes ranked, and the ones excluded with the reason
+
+**Usage:** `environments placement explain <environment> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments placement recommend`
+
+Recommend target nodes from where the environment actually ran (recommended, never applied)
+
+**Usage:** `environments placement recommend <environment> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug | - | No |
+| `--window-days <days>` | How many days of history to consider (1-90, default 7) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `environments isolation`
+
+How an environment's replicas are isolated: a container (process) or a Firecracker microVM (micro_vm). Honoured only for environments whose deployments run on the workload plane
+
+**Subcommands:**
+
+- `show` - Show the isolation and whether it takes effect
+- `set` - Set the isolation: process or micro_vm (a microVM replica only runs on a node that provides one)
+
+#### `environments isolation show`
+
+Show the isolation and whether it takes effect
+
+**Usage:** `environments isolation show <environment> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments isolation set`
+
+Set the isolation: process or micro_vm (a microVM replica only runs on a node that provides one)
+
+**Usage:** `environments isolation set <environment> <isolation> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `environments volumes`
+
+Persistent volumes mounted into an environment's replicas; a replica that mounts one is pinned to its node
+
+**Subcommands:**
+
+- `list` (`ls`) - List the environment's volumes, newest first
+- `create` - Create a volume (attach it to mount it)
+- `status` - Show whether the next deploy mounts the attached volumes, and what to fix if not
+- `attach` - Mount a volume (id or name) into every replica at --mount-path
+- `detach` - Stop mounting a volume (id or name); its data is kept
+- `rm` (`delete`) - Delete a volume (id or name), and its data unless it was created with --retain
+
+#### `environments volumes list` (alias: `ls`)
+
+List the environment's volumes, newest first
+
+**Usage:** `environments volumes list <environment> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug | - | No |
+| `--page <page>` | Page number (default 1) | - | No |
+| `--page-size <size>` | Results per page (default 20, max 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments volumes create`
+
+Create a volume (attach it to mount it)
+
+**Usage:** `environments volumes create <environment> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug | - | No |
+| `-n, --name <name>` | Volume name: 2-64 characters of a-z, 0-9, "_", "." or "-" | - | Yes |
+| `--size-mb <mb>` | Size in MB, when the backend supports a size | - | No |
+| `--retain` | Keep the data when the volume is deleted | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments volumes status`
+
+Show whether the next deploy mounts the attached volumes, and what to fix if not
+
+**Usage:** `environments volumes status <environment> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments volumes attach`
+
+Mount a volume (id or name) into every replica at --mount-path
+
+**Usage:** `environments volumes attach <environment> <volume> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug | - | No |
+| `--mount-path <path>` | Absolute path inside each replica | - | Yes |
+| `--read-only` | Mount it read-only | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments volumes detach`
+
+Stop mounting a volume (id or name); its data is kept
+
+**Usage:** `environments volumes detach <environment> <volume> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments volumes rm` (alias: `delete`)
+
+Delete a volume (id or name), and its data unless it was created with --retain
+
+**Usage:** `environments volumes rm <environment> <volume> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug | - | No |
+| `-f, --force` | Skip confirmation | - | No |
+| `-y, --yes` | Skip confirmation (alias for --force) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `environments ingress`
+
+Whether visitors must sign in to Temps to open an environment
+
+**Subcommands:**
+
+- `show` - Show the login requirement and whether the proxy enforces it now
+- `set` - Require visitors to sign in to Temps, or stop requiring it
+
+#### `environments ingress show`
+
+Show the login requirement and whether the proxy enforces it now
+
+**Usage:** `environments ingress show <environment> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments ingress set`
+
+Require visitors to sign in to Temps, or stop requiring it
+
+**Usage:** `environments ingress set <environment> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug | - | No |
+| `--require-login` | Require sign-in only when ingress mode is enforce. Check login_enforced in JSON output or Enforced now in text output | - | No |
+| `--no-require-login` | Visitors do not need to sign in | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `environments crons`

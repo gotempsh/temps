@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use anyhow::Result;
 use serde::Serialize;
 use temps_core::{AuditContext, AuditOperation};
 
@@ -98,6 +97,14 @@ pub struct MfaDisabledAudit {
     pub username: String,
 }
 
+/// An account holder started (or restarted) MFA enrollment. The pending
+/// secret and recovery codes are never part of the audit payload.
+#[derive(Debug, Clone, Serialize)]
+pub struct MfaSetupStartedAudit {
+    pub context: AuditContext,
+    pub username: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct MfaVerifiedAudit {
     pub context: AuditContext,
@@ -136,6 +143,17 @@ pub struct AdminPasswordResetAudit {
     pub username: String,
 }
 
+// An administrator removed another user's second factor (the user lost both
+// their authenticator and recovery codes). `sessions_revoked` records how many
+// of the target's sessions ended with it.
+#[derive(Debug, Clone, Serialize)]
+pub struct AdminMfaResetAudit {
+    pub context: AuditContext,
+    pub target_user_id: i32,
+    pub username: String,
+    pub sessions_revoked: u64,
+}
+
 // In-app password change for an authenticated user. `other_sessions_revoked`
 // reflects whether the operator opted to invalidate every other session on
 // submit; useful for auditors trying to reconstruct "did this user lose
@@ -164,6 +182,8 @@ pub struct ApiKeyCreatedAudit {
     pub context: AuditContext,
     pub api_key_id: i32,
     pub api_key_name: String,
+    pub project_id: Option<i32>,
+    pub environment_id: Option<i32>,
     pub role_type: String,
     pub permissions: Option<Vec<String>>,
 }
@@ -176,6 +196,16 @@ pub struct ApiKeyRotatedAudit {
     pub context: AuditContext,
     pub api_key_id: i32,
     pub api_key_name: String,
+}
+
+// API key deletion audit. Deleting a key revokes it permanently; the id, name
+// and prefix tie the event to the credential without exposing its secret.
+#[derive(Debug, Clone, Serialize)]
+pub struct ApiKeyDeletedAudit {
+    pub context: AuditContext,
+    pub api_key_id: i32,
+    pub api_key_name: String,
+    pub key_prefix: String,
 }
 
 // OIDC provider configuration audits. SSO provider config is one of
@@ -281,9 +311,8 @@ impl AuditOperation for LoginAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -304,9 +333,8 @@ impl AuditOperation for ConcurrentSessionDetectedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -327,9 +355,8 @@ impl AuditOperation for UserCreatedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -350,9 +377,8 @@ impl AuditOperation for RoleAssignedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -373,9 +399,8 @@ impl AuditOperation for RoleRemovedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -396,9 +421,8 @@ impl AuditOperation for UserUpdatedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -419,9 +443,8 @@ impl AuditOperation for UserDeletedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -442,9 +465,8 @@ impl AuditOperation for UserRestoredAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -465,9 +487,30 @@ impl AuditOperation for MfaEnabledAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
+    }
+}
+
+impl AuditOperation for MfaSetupStartedAudit {
+    fn operation_type(&self) -> String {
+        "MFA_SETUP_STARTED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -488,9 +531,8 @@ impl AuditOperation for MfaDisabledAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -511,9 +553,8 @@ impl AuditOperation for MfaVerifiedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -538,9 +579,8 @@ impl AuditOperation for StepUpVerificationAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -561,9 +601,8 @@ impl AuditOperation for LogoutAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -584,9 +623,8 @@ impl AuditOperation for PasswordResetAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -607,9 +645,30 @@ impl AuditOperation for AdminPasswordResetAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
+    }
+}
+
+impl AuditOperation for AdminMfaResetAudit {
+    fn operation_type(&self) -> String {
+        "ADMIN_MFA_RESET".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -630,9 +689,8 @@ impl AuditOperation for PasswordChangedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -653,9 +711,8 @@ impl AuditOperation for EmailVerifiedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -676,9 +733,8 @@ impl AuditOperation for ApiKeyCreatedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -699,9 +755,30 @@ impl AuditOperation for ApiKeyRotatedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
+    }
+}
+
+impl AuditOperation for ApiKeyDeletedAudit {
+    fn operation_type(&self) -> String {
+        "API_KEY_DELETED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -726,9 +803,8 @@ macro_rules! impl_oidc_audit_op {
                 &self.context.user_agent
             }
 
-            fn serialize(&self) -> Result<String> {
-                serde_json::to_string(self)
-                    .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+            fn serialize(&self) -> temps_core::AuditResult<String> {
+                temps_core::serialize_audit_operation(self)
             }
         }
     };
@@ -757,9 +833,8 @@ impl AuditOperation for OidcLoginDeniedAudit {
         &self.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -812,9 +887,8 @@ impl AuditOperation for PermissionDeniedAudit {
         &self.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -856,9 +930,8 @@ impl AuditOperation for LoginFailedAudit {
         &self.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -893,9 +966,8 @@ impl AuditOperation for MfaVerificationFailedAudit {
         &self.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 

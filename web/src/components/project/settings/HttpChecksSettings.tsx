@@ -22,6 +22,7 @@ import {
   type ResponseField,
 } from '@/api/client'
 import { Button } from '@/components/ui/button'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import {
@@ -114,7 +115,7 @@ export function HttpChecksSettings({
   const [critical, setCritical] = useState('5')
   const [comparison, setComparison] = useState<'below' | 'above'>('below')
   const [interval, setInterval] = useState('86400')
-  const [deleteId, setDeleteId] = useState<number | null>(null)
+  const [deleteTarget, setDeleteTarget] = useState<HttpCheckView | null>(null)
   const chooseKind = (next: 'http' | 'local') => {
     setKind(next)
     setName(next === 'local' ? `${subject.key} expiry` : `${subject.key} check`)
@@ -244,7 +245,7 @@ export function HttpChecksSettings({
         })
     },
     onSuccess: () => {
-      setDeleteId(null)
+      setDeleteTarget(null)
       void invalidate()
     },
     onError: () =>
@@ -308,6 +309,7 @@ export function HttpChecksSettings({
                   variant="outline"
                   size="sm"
                   disabled={action.isPending}
+                  // confirm-delete-guard: ignore -- running a check is not destructive
                   onClick={() => action.mutate({ check, operation: 'run' })}
                 >
                   Check now
@@ -317,47 +319,39 @@ export function HttpChecksSettings({
                   variant="ghost"
                   size="sm"
                   disabled={action.isPending}
+                  // confirm-delete-guard: ignore -- pausing a check is not destructive
                   onClick={() => action.mutate({ check, operation: 'pause' })}
                 >
                   {check.enabled ? 'Pause' : 'Resume'}
                 </Button>
-                {deleteId === check.id ? (
-                  <>
-                    <Button
-                      type="button"
-                      variant="destructive"
-                      size="sm"
-                      disabled={action.isPending}
-                      onClick={() =>
-                        action.mutate({ check, operation: 'delete' })
-                      }
-                    >
-                      Confirm delete
-                    </Button>
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="sm"
-                      onClick={() => setDeleteId(null)}
-                    >
-                      Cancel
-                    </Button>
-                  </>
-                ) : (
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="sm"
-                    onClick={() => setDeleteId(check.id)}
-                  >
-                    Delete
-                  </Button>
-                )}
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  disabled={action.isPending}
+                  onClick={() => setDeleteTarget(check)}
+                >
+                  Delete
+                </Button>
               </div>
             </div>
           ))}
         </div>
       )}
+      <ConfirmDeleteDialog
+        open={deleteTarget !== null}
+        onOpenChange={(open) => {
+          if (!open) setDeleteTarget(null)
+        }}
+        resourceType="check"
+        resourceName={deleteTarget?.name ?? ''}
+        consequences={`It stops monitoring ${subject.key} and its alerts no longer fire.`}
+        isPending={action.isPending}
+        onConfirm={() => {
+          if (deleteTarget)
+            action.mutate({ check: deleteTarget, operation: 'delete' })
+        }}
+      />
       {presets.isError && (
         <p role="alert" className="text-sm text-destructive">
           Could not load provider catalog.{' '}

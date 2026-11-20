@@ -214,7 +214,6 @@ impl SidecarGuard {
     /// Disarm the guard — `Drop` will not force-remove. Only for tests
     /// or when the engine has *already* removed the container itself
     /// and wants to avoid a redundant remove that would log a warning.
-    #[allow(dead_code)]
     pub fn disarm(&mut self) {
         self.armed = false;
     }

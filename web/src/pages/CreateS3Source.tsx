@@ -3,7 +3,10 @@
 
 'use client'
 
-import { Checkbox } from '@/components/ui/checkbox'
+import {
+  S3EndpointPreviewLine,
+  S3PathStyleField,
+} from '@/components/backups/S3EndpointHints'
 import { createS3SourceMutation } from '@/api/client/@tanstack/react-query.gen'
 import { Button } from '@/components/ui/button'
 import {
@@ -17,6 +20,7 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { testS3ConnectionPreview } from '@/lib/s3-sources'
 import { returnToFromSearch } from '@/lib/safe-return-to'
+import { PageHeader } from '@/components/layout/PageContainer'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useMutation } from '@tanstack/react-query'
 import { ArrowLeft, PlugZap, Plus, RefreshCw } from 'lucide-react'
@@ -35,7 +39,7 @@ interface NewS3Source {
 }
 
 export function CreateS3Source() {
-  usePageTitle('Create S3 Source')
+  usePageTitle('Create S3 source')
   const navigate = useNavigate()
   // `?returnTo=` brings the operator back to the page that sent them here
   // (for example a database's Backups card) on save or cancel.
@@ -132,28 +136,27 @@ export function CreateS3Source() {
     Boolean(formData.secret_key?.trim())
 
   return (
-    <div className="w-full px-4 py-6 sm:px-6 lg:px-8">
-      <div className="mb-6">
-        <div className="flex items-center gap-2 mb-2">
-          <Link
-            to={returnTo}
-            aria-label="Back"
-            className="flex items-center text-muted-foreground hover:text-foreground"
-          >
-            <ArrowLeft className="h-4 w-4" />
-          </Link>
-          <h1 className="text-2xl font-semibold">Add S3 Source</h1>
-        </div>
-        <p className="text-muted-foreground">
-          Configure a new S3 storage source for your backups
-        </p>
+    <div className="w-full space-y-6 px-4 py-6 sm:px-6 lg:px-8">
+      <div className="flex items-start gap-2">
+        <Link
+          to={returnTo}
+          aria-label="Back"
+          className="mt-2 flex items-center text-muted-foreground hover:text-foreground"
+        >
+          <ArrowLeft className="h-4 w-4" />
+        </Link>
+        <PageHeader
+          className="min-w-0 flex-1"
+          title="Add S3 source"
+          description="Configure a new S3 storage source for your backups"
+        />
       </div>
 
       <Card>
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
             <Plus className="h-5 w-5" />
-            S3 Configuration
+            S3 configuration
           </CardTitle>
           <CardDescription>
             Enter your S3 credentials and configuration. All fields marked with
@@ -170,7 +173,7 @@ export function CreateS3Source() {
                 </p>
               </div>
               <div className="grid gap-2 md:col-span-2">
-                <Label htmlFor="name">Source Name *</Label>
+                <Label htmlFor="name">Source name *</Label>
                 <Input
                   id="name"
                   placeholder="Backup Storage"
@@ -183,7 +186,7 @@ export function CreateS3Source() {
               </div>
 
               <div className="grid gap-2">
-                <Label htmlFor="bucket">Bucket Name *</Label>
+                <Label htmlFor="bucket">Bucket name *</Label>
                 <Input
                   id="bucket"
                   placeholder="my-backups"
@@ -226,30 +229,18 @@ export function CreateS3Source() {
                     setFormData({ ...formData, endpoint: e.target.value })
                   }
                 />
+                <S3EndpointPreviewLine endpoint={formData.endpoint} />
               </div>
 
               <div className="grid gap-2 md:col-span-2">
-                <Label
-                  htmlFor="forcePathStyle"
-                  className="flex items-center space-x-2"
-                >
-                  <Checkbox
-                    id="forcePathStyle"
-                    checked={formData.force_path_style || false}
-                    onCheckedChange={(checked) =>
-                      setFormData({
-                        ...formData,
-                        force_path_style: checked === true,
-                      })
-                    }
-                  />
-                  <div>
-                    <span>Force Path Style</span>
-                    <p className="text-xs text-muted-foreground">
-                      Enable for RustFS/MinIO compatibility
-                    </p>
-                  </div>
-                </Label>
+                <S3PathStyleField
+                  id="forcePathStyle"
+                  endpoint={formData.endpoint}
+                  checked={formData.force_path_style || false}
+                  onCheckedChange={(checked) =>
+                    setFormData({ ...formData, force_path_style: checked })
+                  }
+                />
               </div>
 
               <div className="space-y-1 border-t pt-5 md:col-span-2">
@@ -260,7 +251,7 @@ export function CreateS3Source() {
               </div>
 
               <div className="grid gap-2">
-                <Label htmlFor="accessKeyId">Access Key ID *</Label>
+                <Label htmlFor="accessKeyId">Access key ID *</Label>
                 <Input
                   id="accessKeyId"
                   type="password"
@@ -274,7 +265,7 @@ export function CreateS3Source() {
               </div>
 
               <div className="grid gap-2">
-                <Label htmlFor="secretKey">Secret Key *</Label>
+                <Label htmlFor="secretKey">Secret key *</Label>
                 <Input
                   id="secretKey"
                   type="password"
@@ -329,7 +320,7 @@ export function CreateS3Source() {
                 >
                   {createMutation.isPending
                     ? 'Creating...'
-                    : 'Create S3 Source'}
+                    : 'Create S3 source'}
                 </Button>
               </div>
             </div>

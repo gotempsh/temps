@@ -17,10 +17,12 @@ import {
   GitBranch,
   Globe,
   Mail,
+  MessageSquare,
   Network,
   PackageOpen,
   Puzzle,
   Radar,
+  Radio,
   Rocket,
   ScrollText,
   Settings,
@@ -68,13 +70,6 @@ export const platformToolGroups: PlatformToolGroup[] = [
         featureKey: 'sandboxes-preview-environments',
       },
       {
-        title: 'Workspaces',
-        description: 'Persistent working contexts with optional compute.',
-        url: '/workspaces',
-        icon: Folder,
-        keywords: ['context', 'workspace', 'projects'],
-      },
-      {
         title: 'Git connections',
         description: 'Connect repositories and source providers.',
         url: '/git-providers',
@@ -111,7 +106,7 @@ export const platformToolGroups: PlatformToolGroup[] = [
       },
       {
         title: 'Domains',
-        description: 'Attach domains to projects and services.',
+        description: 'Attach domains to services.',
         url: '/domains',
         icon: Globe,
         keywords: ['hostname', 'dns'],
@@ -164,7 +159,7 @@ export const platformToolGroups: PlatformToolGroup[] = [
       },
       {
         title: 'Analytics',
-        description: 'Compare traffic across projects.',
+        description: 'Compare traffic across services.',
         url: '/analytics',
         icon: BarChart3,
       },
@@ -186,7 +181,7 @@ export const platformToolGroups: PlatformToolGroup[] = [
       },
       {
         title: 'Traces',
-        description: 'Follow requests across projects and services.',
+        description: 'Follow requests across services.',
         url: '/traces',
         icon: Workflow,
       },
@@ -198,7 +193,7 @@ export const platformToolGroups: PlatformToolGroup[] = [
       },
       {
         title: 'Errors',
-        description: 'Review application issues across projects.',
+        description: 'Review application issues across services.',
         url: '/errors',
         icon: Bug,
       },
@@ -217,6 +212,15 @@ export const platformToolGroups: PlatformToolGroup[] = [
         url: '/proxy',
         icon: Activity,
         keywords: ['traffic', 'requests', 'metrics'],
+      },
+      {
+        title: 'Status pages',
+        description:
+          'Public uptime pages for your services, from one or many projects.',
+        url: '/status-pages',
+        icon: Radio,
+        keywords: ['uptime', 'incidents', 'status', 'public', 'outage'],
+        featureKey: 'status-pages',
       },
       {
         title: 'Proxy logs',
@@ -256,20 +260,21 @@ export const platformToolGroups: PlatformToolGroup[] = [
         ],
       },
       {
-        title: 'Built-in AI',
-        description: 'Manage providers, usage, console chat, and agent tools.',
-        url: '/ai-gateway',
-        icon: Sparkles,
-        keywords: ['models', 'providers', 'chat', 'autofix', 'gateway'],
-        featureKey: 'ai-gateway',
+        title: 'Temps assistant',
+        description:
+          'Ask questions and make changes to your platform in a chat.',
+        url: '/chat',
+        icon: MessageSquare,
+        keywords: ['ai', 'chat', 'assistant', 'ask'],
+        featureKey: 'ai-chat',
       },
       {
-        title: 'AI workflows',
-        description: 'Build reusable automated workflows.',
-        url: '/ai-workflows',
-        icon: Bot,
-        keywords: ['automation', 'agents'],
-        featureKey: 'ai-agents-workflows',
+        title: 'AI providers',
+        description: 'Manage AI providers, usage, limits, and activity.',
+        url: '/ai-gateway',
+        icon: Sparkles,
+        keywords: ['models', 'providers', 'usage', 'limits', 'gateway'],
+        featureKey: 'ai-gateway',
       },
       {
         title: 'MCP server',
@@ -302,7 +307,7 @@ export const extensionToolGroupIcon = Puzzle
 
 export const platformToolShortcuts: PlatformToolItem[] = [
   {
-    title: 'Create a project',
+    title: 'Create a service',
     description: 'Deploy an application from Git, an image, or files.',
     url: '/projects/new',
     icon: Folder,

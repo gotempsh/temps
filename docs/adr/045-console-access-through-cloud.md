@@ -85,7 +85,7 @@ underneath it is not reusable as-is:
 1. **It buffers.** `.oneshot()` then `.collect().await.to_bytes()`
    (`host_api.rs:441–451`), capped at `MAX_RESPONSE_BYTES = 8 MiB`
    (`host_api.rs:65`) / `MAX_CALL_BODY_BYTES = 32 MiB`
-   (`crates/temps-core/src/external_plugin/channel.rs:401`). A log tail
+   (`crates/temps-plugin-protocol/src/channel.rs:401`). A log tail
    never completes; buffering it just hangs forever.
 2. **No WebSocket-upgrade concept.** A `oneshot` call returns one
    `Response`; there is nothing for the raw duplex byte stream a `101`
@@ -343,7 +343,7 @@ the console-proxy `Hello` completes, Cloud sends `ConsoleOidcConfig
 rest immediately like every other provider's secret,
 `scopes = "openid email profile temps_cloud_instance_role"`,
 `template = "temps_cloud"` (a UI hint), `jit_provisioning = true`,
-`trust_idp_email = true`. **`ConsoleOidcConfig` is re-sent on every
+`trust_idp_email = false`. **`ConsoleOidcConfig` is re-sent on every
 reconnect, and the upsert is idempotent** (same shape as
 `create_provider`/`update_provider` already support for an operator editing
 a provider by hand) — an instance that was offline for a client-secret
@@ -355,19 +355,18 @@ from *its* side, and the instance runs exactly the disconnect/revoke
 sequence below — the same code path §5's local toggle uses, just triggered
 remotely.
 
-`trust_idp_email = true` is deliberate: the `email_verified` gate exists to
-stop an attacker self-registering at an arbitrary IdP with a victim's email
-(`oidc_service.rs:761–797`). Reaching this exchange at all already required
-operator-level access to the Cloud account this instance is enrolled
-under — the same carve-out `trust_idp_email`'s own doc comment describes
-for admin-controlled corporate IdPs (`oidc_providers.rs:27–34`).
+Cloud-managed providers require an affirmative `email_verified` claim for every
+login, including an already linked subject. Instance enrollment and a resource
+role do not establish email ownership. Reconnect converges older managed rows
+to `trust_idp_email = false`; resolution enforces this rule before reconnect
+as well. Ordinary operator-configured IdPs retain their explicit trust setting.
 
 **Claim mapping.** `sub` = the Cloud account's stable id — the same id for
 that person on every instance they administer, so `resolve_user`'s existing
 `(provider_id, subject)` fast path (`oidc_service.rs:744–753`) gives each
 Cloud account its own local user row and its own audit trail on this
 instance, never a shared "cloud-admin" account. `email` = the Cloud
-account's email, taken under `trust_idp_email` as described above. A custom
+account's email, accepted only with affirmative verification evidence. A custom
 claim, `temps_cloud_instance_role`, carries this account's role on *this
 specific instance* (Cloud-computed, since one account can be owner of one
 linked instance and unrelated to another) — distinct from the generic
@@ -434,7 +433,9 @@ pub struct CloudFeatureSwitches { pub telemetry: bool, pub backups: bool, pub no
 **Default off for every enrollment path.** Neither unattended bootstrap nor
 operator enrollment changes remote-console consent. Enable access explicitly
 from Settings > Temps Cloud or `temps cloud console-access enable`, matching
-the rule that linking alone never enables export.
+the rule that linking alone never enables export. **One exception, and only
+one:** consuming the `cloud-oidc.json` bootstrap file on a Cloud-hosted
+control plane — see [Amendment 1](#amendment-1-cloud-oidcjson-is-the-hosted-planes-consent-signal).
 
 **Toggling on** negotiates `Capability::ConsoleProxy`, opens the
 console-proxy connection, provisions the managed OIDC row. **Toggling off**
@@ -662,6 +663,158 @@ here, closed, so a later implementer doesn't re-litigate them:
 
 ---
 
+## Amendment 1: `cloud-oidc.json` is the hosted plane's consent signal
+
+**Date:** 2026-10-18 · **Amends:** §4 (bootstrap file), §5 (default off)
+
+### What was wrong
+
+§4 describes provisioning the managed OIDC provider from the
+`ConsoleOidcConfig` frame, and the implementation added a one-shot
+first-boot file, `<TEMPS_DATA_DIR>/cloud-oidc.json` (`issuer`, `client_id`,
+`client_secret`), so that a Cloud-*hosted* control plane has the managed
+provider before anyone can reach its console. That path never worked. It ran
+`CloudService::apply_console_oidc_config`, which (correctly, for the frame
+path) refuses unless `cloud.console_access_enabled` is on **and** the link is
+established. On a hosted plane neither is true at that point: the bootstrap
+runs before unattended enrollment, and §5 defaults the switch off for every
+enrollment path. The result was a plane whose only sign-in route was a
+provider that could never be created (`OIDC provider 0 was not found` on
+`/auth/oidc/cloud/login`, boot log `Managed Cloud feature 'console_access' is
+disabled in local settings`). §4's promise and §5's default contradicted each
+other for exactly the instances §4's file exists to serve.
+
+### Decision
+
+For the bootstrap-file path only:
+
+1. **File presence is the operator's consent.** Applying `cloud-oidc.json`
+   persists `cloud.console_access_enabled = true` through the same
+   `ConfigService::update_cloud_features` path the Settings toggle uses, so the
+   settings row, the `console_access_tx` watch channel, the link's feature
+   switches and the Settings UI stay consistent. It only ever turns the
+   switch **on**; it never turns anything off and never touches telemetry,
+   backups or notifications.
+2. **The provider is upserted without requiring the link.** The bootstrap path
+   skips the `is_linked()` check (enrollment runs after it and in the
+   background), but still requires a registered `OidcService` and still goes
+   through the same `upsert_managed_cloud_provider` validation (https issuer,
+   etc.).
+3. **The runtime frame path is unchanged.** `apply_console_oidc_config`, used on
+   every console-proxy connect, still requires *enabled and linked*. A
+   self-hosted instance, or a hosted one whose operator later turned the
+   switch off, is never re-enabled by a frame.
+4. **Fail-closed ordering.** The provider is upserted *first* and consent is
+   written *second*. The two writes go through different services and cannot
+   share a database transaction, so the order decides what a failure can leave
+   behind: if the upsert fails, consent was never touched; if the consent write
+   fails, the provider is revoked again and consent is written back off (and, if
+   even that write fails, forced off in memory so the relay stays down). The
+   reverse order — consent first, undo on failure — would leave remote-console
+   consent *on* whenever the compensating write failed. In every case the file is
+   left in place, so the next boot retries, and the error names the cause.
+5. **Audited, including failures.** Granting consent writes
+   `CLOUD_CONSOLE_ACCESS_ENABLED_BY_BOOTSTRAP` (actor: unattended bootstrap,
+   `user_id: null`) with the full before/after feature switches, in addition to
+   the existing `CLOUD_CONSOLE_OIDC_BOOTSTRAPPED` record (which now also states
+   whether consent was granted). An instance that already had the switch on gets
+   only the latter. A bootstrap that fails *after attempting* to turn consent on
+   writes `CLOUD_CONSOLE_ACCESS_BOOTSTRAP_FAILED` stating whether consent was
+   confirmed restored and whether the provider was removed again, because the
+   settings row may have been written before the error surfaced. A failure
+   before the consent write changed no consent and is only logged.
+6. **No file, no change.** Self-hosted instances never have this file. Without
+   it the switch stays off, as §5 specifies.
+
+### Why file presence is a valid consent signal
+
+§5's rule exists so that console access is "a distinct, out-of-band act
+performed for a named purpose", not a side effect of linking. The file is
+exactly that act, performed ahead of time: Cloud writes it into a data
+directory *it provisioned*, for the stated purpose of letting the customer
+sign in through Cloud, as part of standing the hosted plane up (the hosted-plane
+provisioning instruction that the Cloud side's own design records as the
+"initial-state instruction in the same bootstrap payload" that also carries
+the enrollment code). A customer who buys a *hosted* control plane is
+choosing Cloud-managed administration of it; there is no other way to sign in
+to a plane whose admin identity is Cloud's. Requiring a second click on a
+console they cannot yet open would make the hosted product unusable at
+first boot.
+
+**Security note — who can write the data directory.** Writing
+`cloud-oidc.json` requires write access to `TEMPS_DATA_DIR`. Anyone with that
+access can already run or replace the `temps` binary, read the database
+credentials and the Cloud link state, edit the settings row directly and
+create an admin user. The file therefore grants no capability to a principal
+that did not have it: it lets a *provisioner* express consent that the
+principal who controls the data directory could always have expressed. What
+the file does newly decide is *which IdP is trusted to mint admin sessions*;
+that exposure already existed since the file was introduced and is bounded
+the same way (https issuer validation, `admin_only_role_required`, the
+two-layer role gate in §4). The residual risks, accepted and documented:
+
+- If the file cannot be deleted after a successful apply, it is logged at
+  `error` and the next boot would grant consent again, overriding an operator
+  who turned the switch off in the meantime. The operator must delete the file
+  (the log line says so).
+- A self-hosted operator who deliberately creates the file is consenting in
+  the same way; that is by design, not a bypass.
+
+### Consequences
+
+- Hosted planes can sign in through Cloud at first boot, before and
+  independently of enrollment completing.
+- `console_oidc_bootstrap.rs` stays testable through its injected `apply`
+  closure, which now reports whether it granted consent.
+- Revoke/disable (`ConsoleOidcRevoke`, the Settings toggle off, disconnect) is
+  untouched: it still deletes the provider row and its sessions.
+
+## Amendment 2: the bootstrap file also carries telemetry-export consent
+
+**Date:** 2026-10-23 · **Amends:** Amendment 1 §1 ("never touches telemetry")
+
+### What was wrong
+
+A Cloud-hosted plane reads its logs and traces from Cloud (Cloud-primary read
+routing is installed at boot), but `cloud.telemetry_enabled` defaults off and
+nothing on the hosted path ever turned it on. Its Logs and Traces pages showed
+"telemetry export is switched off" and stayed empty: the product a hosted plane
+exists to deliver was off until the customer found a switch.
+
+### Decision
+
+1. The file Cloud writes (`cloud-oidc.json`) gains an optional
+   `"telemetry_enabled": true`. Cloud always sets it for hosted planes. Only an
+   explicit JSON `true` counts; a missing, `false`, mistyped or unparseable
+   value is "not asked". Older planes ignore the field (unknown fields were
+   already tolerated), and older Cloud builds simply don't send it.
+2. Applying it is **after** the console-access part and never fails it: the
+   console-access outcome stands, and a failed telemetry write is logged at
+   `error` with the remedy ("turn it on in Settings > Temps Cloud").
+3. **At most once per instance.** Cloud re-drops the file on every upgrade.
+   The grant runs in one locked settings transaction that turns
+   `cloud.telemetry_enabled` on *and* sets `cloud.telemetry_consent_bootstrapped`;
+   when that marker is already set nothing is written. An operator who turns
+   telemetry off after the first boot is therefore never overridden by an
+   upgrade. (Console access, by contrast, is re-granted by each file, per
+   Amendment 1's residual-risk note.)
+4. **Audited.** Turning it on writes `CLOUD_TELEMETRY_ENABLED_BY_BOOTSTRAP`
+   (actor: unattended bootstrap) with the before/after feature switches. The
+   plane also logs a `warn` naming the switch, like the console-access grant.
+5. **Self-hosted is unchanged.** No file, no change: telemetry export stays
+   off until the operator enables it.
+
+### Why this is a valid consent signal
+
+Same reasoning as Amendment 1: the file is written by the provisioner into a
+data directory it controls, as part of standing up a product whose stated
+purpose includes hosted telemetry retention, and anyone able to write that
+directory can already edit the settings row. Billing is unaffected in kind:
+ingest is metered server-side at Cloud's gateway as for any other enrolled
+instance, and quota behaviour (head-sampling, never silent drops) applies.
+
+---
+
 ## References
 
 - `crates/temps-cloud-protocol/src/lib.rs`, `messages.rs` — `Capability`, `Hello`, `Envelope`, `Heartbeat`, `StatusRequest`, `EnrollResponse`
@@ -672,5 +825,26 @@ here, closed, so a later implementer doesn't re-litigate them:
 - `crates/temps-auth/src/rate_limit.rs:112–128` — `auth_rate_limit_middleware`, verified to already key on `resolve_client_ip`, not the raw peer socket
 - `crates/temps-auth/src/oidc_service.rs`, `oidc_handler.rs`, `audit.rs` — `OidcService`, `resolve_user`, `evaluate_role`, `trust_idp_email`, existing audit types
 - `crates/temps-entities/src/s3_sources.rs`, `m20260830_000001_add_managed_by_cloud_to_s3_sources.rs` — the `managed_by_cloud` precedent
-- `crates/temps-core/src/app_settings.rs:249–312` — `CloudSettings`; `web/src/pages/settings/CloudSettingsPage.tsx` — switches this ADR's joins
+- `crates/temps-config/src/app_settings/mod.rs:249–312` — `CloudSettings`; `web/src/pages/settings/CloudSettingsPage.tsx` — switches this ADR's joins
 - ADR-039 (capability negotiation), ADR-040 (compromised-Cloud trust boundary this ADR extends), ADR-044 (provisioning/disconnect ordering this ADR's OIDC lifecycle follows)
+
+### Browser-bound callback correlation
+
+Every OIDC login start, including the Cloud-managed start route, sets a
+short-lived HttpOnly, SameSite=Lax cookie that seals the attempt's `state`
+with `CookieCrypto`. Its name is derived from a hash of the `state`
+(`__Host-oidc_login_<hash>` over HTTPS, with Secure, Path=/ and no Domain;
+`oidc_login_<hash>` over plain HTTP), so concurrent logins in several tabs
+coexist and the name reveals nothing. The callback requires that cookie to
+decrypt to exactly the `state` it carries before the state is consumed or the
+code is exchanged: copying an authorization callback into another browser
+cannot sign that browser in or consume the genuine attempt. The stored state
+remains atomically single-use and expires at its deadline.
+
+Login redirects and callback responses are `Cache-Control: no-store` and
+`Referrer-Policy: no-referrer`. Provider error descriptions and
+token-verification details are excluded from callback diagnostics, and the
+login `state` never appears in an error message or problem detail: operators
+see fixed reason codes, plus the provider's `error` code only when it is one of
+the registered OAuth/OIDC codes. Password login and
+local recovery remain independent of this flow, including during a Cloud outage.

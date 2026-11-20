@@ -11,6 +11,14 @@ use thiserror::Error;
 /// All errors that can arise when searching, describing, or calling an API tool.
 #[derive(Error, Debug, Clone)]
 pub enum ApiToolError {
+    #[error("Invalid CLI command: {detail}")]
+    InvalidCommand { detail: String },
+    #[error("Plugin '{plugin}' operation '{operation_id}' failed: {reason}")]
+    PluginOperation {
+        plugin: String,
+        operation_id: String,
+        reason: String,
+    },
     /// A required parameter was absent from the supplied `params` object.
     #[error(
         "Required parameter '{name}' is missing for operation '{operation_id}'. \
@@ -87,9 +95,30 @@ pub enum ApiToolError {
         operation_id: String,
     },
 
+    /// A parameter value does not have the type the schema declares (today:
+    /// a list parameter that is not an array of the declared item type).
+    ///
+    /// Like [`Self::BadObjectShape`], this is raised during validation so the
+    /// mistake surfaces before a human is asked to approve a request the API
+    /// will certainly reject.
+    #[error(
+        "Parameter '{name}' has the wrong type for operation '{operation_id}': {problem}. \
+         Expected {expected}."
+    )]
+    BadParamType {
+        /// Name of the offending parameter.
+        name: String,
+        /// What is wrong with the supplied value.
+        problem: String,
+        /// Human-readable description of the accepted JSON.
+        expected: String,
+        /// The operation being called.
+        operation_id: String,
+    },
+
     /// A parameter value is not one of the declared enum members.
     #[error(
-        "Parameter '{name}' has value '{value}' which is not one of the allowed values: \
+        "Parameter '{name}' must be one of the allowed values: \
          [{allowed}] for operation '{operation_id}'."
     )]
     BadEnum {
@@ -180,6 +209,42 @@ pub enum ApiToolError {
         /// The operation that was called.
         operation_id: String,
         /// What went wrong reading the body.
+        reason: String,
+    },
+
+    #[error(
+        "Operation '{operation_id}' was given a secret reference in {location}. A \
+         `secret_ref:` handle is only accepted as the whole value of a credential field in \
+         the request body; nothing was sent."
+    )]
+    SecretReferenceMisplaced {
+        operation_id: String,
+        location: String,
+    },
+
+    #[error(
+        "Operation '{operation_id}' requires secret input for '{field}', but no \
+         secret-input flow is available in this context. Use the console or REST API for this operation. Nothing was sent."
+    )]
+    SecretsUnavailable { operation_id: String, field: String },
+
+    /// A credential field held a real value instead of a handle. The value is
+    /// deliberately not part of the message: it must not be echoed back.
+    #[error(
+        "Operation '{operation_id}' was given a literal value for the credential field \
+         '{field}'. Credentials must not pass through the chat: call `request_secret` for \
+         this operation and field, wait for the user to fill the private form, then pass the \
+         `secret_ref:` handle as the whole value. Nothing was sent."
+    )]
+    SecretLiteralRejected { operation_id: String, field: String },
+
+    #[error(
+        "The secret reference for '{field}' of operation '{operation_id}' could not be \
+         used: {reason}. Nothing was sent."
+    )]
+    SecretUnresolved {
+        operation_id: String,
+        field: String,
         reason: String,
     },
 }

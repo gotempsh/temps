@@ -5,8 +5,10 @@ import { describe, expect, test } from 'bun:test'
 import type { DeploymentResponse } from '@/api/client'
 import {
   isActiveDeploymentStatus,
+  projectDeploymentsRefetchInterval,
   recentDeploymentsRefetchInterval,
 } from './recent-deployments'
+import { ACTIVE_LIST_POLL_MS, IDLE_LIST_POLL_MS } from './live-refetch'
 
 function deployment(status: string): DeploymentResponse {
   return { status } as DeploymentResponse
@@ -40,4 +42,23 @@ test('only building and rolling-out deployments count as active', () => {
   for (const status of ['completed', 'failed', 'cancelled', 'stopped']) {
     expect(isActiveDeploymentStatus(status)).toBe(false)
   }
+})
+
+describe('project deployments list refresh behavior', () => {
+  test('polls fast while a deployment is building', () => {
+    expect(
+      projectDeploymentsRefetchInterval([
+        deployment('completed'),
+        deployment('building'),
+      ])
+    ).toBe(ACTIVE_LIST_POLL_MS)
+  })
+
+  test('keeps polling when idle so a background deployment appears', () => {
+    expect(projectDeploymentsRefetchInterval([deployment('completed')])).toBe(
+      IDLE_LIST_POLL_MS
+    )
+    expect(projectDeploymentsRefetchInterval([])).toBe(IDLE_LIST_POLL_MS)
+    expect(projectDeploymentsRefetchInterval(undefined)).toBe(IDLE_LIST_POLL_MS)
+  })
 })

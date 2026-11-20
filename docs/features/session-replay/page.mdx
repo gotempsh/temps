@@ -64,6 +64,36 @@ Session replay captures user interactions with your application, allowing you to
 
 ---
 
+## Ingest replay from the official Sentry browser SDK
+
+Existing applications can send web replay through a Temps DSN without installing the Temps analytics SDK. Temps adapts the Sentry replay metadata and rrweb recording segments into native visitors and replay sessions. Open the resulting session in the project's **Analytics → Sessions** view.
+
+This setup was verified with `@sentry/browser@11.8.0` in Chromium:
+
+```javascript
+import * as Sentry from '@sentry/browser';
+
+Sentry.init({
+  dsn: 'YOUR_PUBLIC_TEMPS_DSN',
+  dataCollection: { userInfo: false },
+  sendClientReports: false,
+  integrations: [Sentry.replayIntegration({
+    maskAllText: true,
+    maskAllInputs: true,
+  })],
+  replaysSessionSampleRate: 0.1,
+  replaysOnErrorSampleRate: 1,
+});
+```
+
+The adapter accepts plain, zlib and gzip web recordings, validates metadata/segment pairing, orders segments and deduplicates repeated segment IDs. It reconciles viewport/start metadata when segments arrive out of order. Desktop and phone viewport playback were verified using synthetic landing-page navigation, scrolling and forms with masked input values.
+
+Playback needs a full DOM snapshot and subsequent recording data. A minimal page, heavily masked content or an incomplete recording can look sparse. Sentry also emits rrweb technical custom events for breadcrumbs/performance data; the current native timeline may label these **Custom**. They are not evidence that your application emitted that many product analytics events.
+
+This contract covers web rrweb recordings only. Native mobile and video replay require separate adapters and product support. For batch limits and unsupported signals, see the [Sentry compatibility contract](/docs/error-tracking#sentry-compatibility). The privacy controls below describe Temps analytics capture; when using Sentry, configure masking and consent in the Sentry SDK before recording.
+
+---
+
 ## Privacy Controls
 
 Session replay includes comprehensive privacy controls to protect user data.

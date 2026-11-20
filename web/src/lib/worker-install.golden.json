@@ -1,0 +1,77 @@
+{
+  "_comment": "The commands a new worker runs to install Temps. Both renderers are tested against this file: web/src/lib/worker-join-script.ts (the console's Add worker panel) and crates/temps-core/src/worker_install.rs (the server's pairing command). Change it together with both.",
+  "installer_url": "https://temps.sh/install.sh",
+  "root_temps_bin": "/root/.temps/bin/temps",
+  "user_temps_bin": "~/.temps/bin/temps",
+  "installs": [
+    {
+      "install": {
+        "kind": "release",
+        "tag": "v0.1.0-beta.60"
+      },
+      "linux": "(set -o pipefail; curl -fsSL https://temps.sh/install.sh | sudo -H bash -s -- v0.1.0-beta.60)",
+      "mac": "(set -o pipefail; curl -fsSL https://temps.sh/install.sh | bash -s -- v0.1.0-beta.60)"
+    },
+    {
+      "install": {
+        "kind": "release",
+        "tag": "v0.1.0-nightly.20261104.0123abcde"
+      },
+      "linux": "(set -o pipefail; curl -fsSL https://temps.sh/install.sh | sudo -H bash -s -- v0.1.0-nightly.20261104.0123abcde)",
+      "mac": "(set -o pipefail; curl -fsSL https://temps.sh/install.sh | bash -s -- v0.1.0-nightly.20261104.0123abcde)"
+    },
+    {
+      "install": {
+        "kind": "nightly",
+        "after": "v0.1.0-beta.60"
+      },
+      "linux": "(set -o pipefail; curl -fsSL https://temps.sh/install.sh | sudo -H bash -s -- --channel nightly)",
+      "mac": "(set -o pipefail; curl -fsSL https://temps.sh/install.sh | bash -s -- --channel nightly)"
+    },
+    {
+      "install": {
+        "kind": "latest"
+      },
+      "linux": "(set -o pipefail; curl -fsSL https://temps.sh/install.sh | sudo -H bash)",
+      "mac": "(set -o pipefail; curl -fsSL https://temps.sh/install.sh | bash)"
+    }
+  ],
+  "as_root_temps": [
+    {
+      "args": "agent service install",
+      "command": "sudo -H /root/.temps/bin/temps agent service install"
+    },
+    {
+      "args": "join --pair -",
+      "command": "sudo -H /root/.temps/bin/temps join --pair -"
+    }
+  ],
+  "release_tags": {
+    "pinned": [
+      ["v0.0.8", "v0.0.8"],
+      ["v0.2.0-beta.1", "v0.2.0-beta.1"],
+      [
+        "v0.1.0-nightly.20261104.0123abcde",
+        "v0.1.0-nightly.20261104.0123abcde"
+      ],
+      ["  v1.2.3\n", "v1.2.3"],
+      ["v1.2.3-rc-1", "v1.2.3-rc-1"]
+    ],
+    "not_pinned": [
+      "",
+      "dev",
+      "0.1.0",
+      "v0.1.0-",
+      "v0.1.0 (abc1234)",
+      "v1.2",
+      "v1.2.3.4",
+      "v1.0.0; rm -rf /",
+      "v1.0.0$(id)",
+      "v1.0.0`id`",
+      "v1.0.0-a|b",
+      "v1.0.0-'x'",
+      "v1.0.0-a\nb",
+      "v1.0.0-.a"
+    ]
+  }
+}

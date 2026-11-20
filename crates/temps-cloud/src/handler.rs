@@ -10,7 +10,7 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use temps_auth::{permission_guard, RequireAuth};
+use temps_auth::{deny_deployment_token, permission_guard, RequireAuth};
 use temps_core::{
     error_builder::ErrorBuilder, problemdetails::Problem, AuditContext, AuditLogger,
     AuditOperation, CloudTelemetryActivationTrigger, RequestMetadata, TelemetryActivationOutcome,
@@ -19,8 +19,9 @@ use temps_core::{
 use utoipa::{OpenApi, ToSchema};
 
 use crate::{
-    CloudAiCapability, CloudCapability, CloudService, CloudServiceError, CloudStatus,
-    ManagedBackupOutcome, ManagedBackupSetup, ManagedBackupSetupAction, ManagedBackupSetupStatus,
+    CloudAiCapability, CloudCapability, CloudService, CloudServiceError, CloudStatus, ConsentTrace,
+    ConsoleAccessConsent, ManagedBackupOutcome, ManagedBackupSetup, ManagedBackupSetupAction,
+    ManagedBackupSetupStatus,
 };
 use temps_cloud_client::CloudFeatureSwitches;
 
@@ -170,8 +171,8 @@ impl AuditOperation for CloudTelemetryActivationStartedAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self).map_err(Into::into)
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -188,8 +189,8 @@ impl AuditOperation for CloudLinkAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self).map_err(Into::into)
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -216,9 +217,17 @@ fn problem(error: CloudServiceError) -> Problem {
         // The reason is the operator's to act on ("Cloud did not answer the
         // plan's retention", "backup plugin not enabled"), so it is returned
         // rather than hidden behind a 500.
-        CloudServiceError::ManagedBackupSchedule(_) => StatusCode::CONFLICT,
+        CloudServiceError::ManagedBackupSchedule(
+            temps_core::ManagedBackupScheduleError::Lookup { .. }
+            | temps_core::ManagedBackupScheduleError::Create { .. }
+            | temps_core::ManagedBackupScheduleError::Release { .. },
+        ) => StatusCode::CONFLICT,
+        CloudServiceError::ManagedBackupSchedule(
+            temps_core::ManagedBackupScheduleError::NotAuthorized { .. },
+        ) => StatusCode::FORBIDDEN,
         CloudServiceError::Client(
             temps_cloud_client::CloudError::Rejected { .. }
+            | temps_cloud_client::CloudError::RouteUnavailable { .. }
             | temps_cloud_client::CloudError::InvalidAcknowledgement { .. }
             | temps_cloud_client::CloudError::InvalidBackupTarget { .. },
         ) => StatusCode::BAD_GATEWAY,
@@ -303,6 +312,7 @@ async fn update_cloud_features(
             request.backups_enabled,
             request.notifications_enabled,
             request.console_access_enabled,
+            temps_core::BackupScheduleAuthority::from_instance_admin(auth.is_instance_admin()),
         )
         .await
         .map_err(problem)?;
@@ -334,7 +344,10 @@ async fn enroll_cloud(
     }
     let (result, backup_outcome, enrollment) = state
         .service
-        .enroll(&request.enrollment_code)
+        .enroll(
+            &request.enrollment_code,
+            temps_core::BackupScheduleAuthority::from_instance_admin(auth.is_instance_admin()),
+        )
         .await
         .map_err(problem)?;
     record_enrollment_audit(
@@ -566,7 +579,9 @@ async fn reconcile_cloud_backup_source(
     permission_guard!(auth, BackupsWrite);
     let result = state
         .service
-        .reconcile_managed_backup_source()
+        .reconcile_managed_backup_source(temps_core::BackupScheduleAuthority::from_instance_admin(
+            auth.is_instance_admin(),
+        ))
         .await
         .map_err(problem)?;
     audit(
@@ -581,6 +596,30 @@ async fn reconcile_cloud_backup_source(
     Ok(Json(result))
 }
 
+/// The managed schedule backs up every database and the control plane, so
+/// `settings:write` + `backups:write` is not enough on its own: a
+/// `Role::Custom` user or API key holding both could otherwise provision it
+/// (NV1). Deployment tokens are refused outright. The service re-checks.
+fn require_managed_schedule_admin(auth: &temps_auth::AuthContext) -> Result<(), Problem> {
+    deny_deployment_token!(auth);
+    if auth.is_instance_admin() {
+        return Ok(());
+    }
+    tracing::error!(
+        user_id = auth.user_id(),
+        user_role = %auth.effective_role,
+        "non-admin caller denied creating the Temps Cloud managed backup schedule"
+    );
+    Err(ErrorBuilder::new(StatusCode::FORBIDDEN)
+        .title("Instance Administrator Required")
+        .detail(
+            "Only an instance administrator may create the Temps Cloud nightly backup \
+             schedule: it backs up every database and the control plane",
+        )
+        .value("user_role", auth.effective_role.to_string())
+        .build())
+}
+
 /// Create the nightly schedule for the Temps Cloud destination unless one
 /// already targets it (ADR-044). Answers the same shape as the reconcile so
 /// the console can swap it into the status it already holds.
@@ -591,7 +630,7 @@ async fn reconcile_cloud_backup_source(
     responses(
         (status = 200, description = "The managed destination's setup with the schedule that targets it, created when none did", body = ManagedBackupSetup),
         (status = 401, description = "Authentication required", body = temps_core::ProblemDetails),
-        (status = 403, description = "Insufficient permissions", body = temps_core::ProblemDetails),
+        (status = 403, description = "Insufficient permissions, a deployment token, or a caller that is not an instance administrator: the schedule backs up every database and the control plane", body = temps_core::ProblemDetails),
         (status = 409, description = "No schedule could be set up; the detail says why (Cloud did not answer the plan's retention, the backup plugin is not enabled)", body = temps_core::ProblemDetails),
         (status = 500, description = "Database or link state failure", body = temps_core::ProblemDetails)
     ),
@@ -604,9 +643,12 @@ async fn ensure_cloud_backup_schedule(
 ) -> Result<Json<ManagedBackupSetup>, Problem> {
     permission_guard!(auth, SettingsWrite);
     permission_guard!(auth, BackupsWrite);
+    require_managed_schedule_admin(&auth)?;
     let result = state
         .service
-        .ensure_managed_backup_schedule()
+        .ensure_managed_backup_schedule(temps_core::BackupScheduleAuthority::from_instance_admin(
+            auth.is_instance_admin(),
+        ))
         .await
         .map_err(problem)?;
     audit(
@@ -764,8 +806,8 @@ impl AuditOperation for CloudBackendUrlBootstrappedAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self).map_err(Into::into)
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -826,6 +868,90 @@ pub async fn record_backup_outcome_audit(
 /// `CLOUD_LINK_CONNECTED` for the managed console-access OIDC provider.
 pub const CLOUD_CONSOLE_OIDC_BOOTSTRAPPED: &str = "CLOUD_CONSOLE_OIDC_BOOTSTRAPPED";
 
+/// Audit action recorded when consuming `cloud-oidc.json` turned
+/// `cloud.console_access_enabled` on (ADR-045 Amendment 1). It carries the
+/// full before/after feature switches, like `CLOUD_FEATURES_UPDATED`, so the
+/// consent change is attributable to the bootstrap and not to an operator.
+pub const CLOUD_CONSOLE_ACCESS_ENABLED_BY_BOOTSTRAP: &str =
+    "CLOUD_CONSOLE_ACCESS_ENABLED_BY_BOOTSTRAP";
+
+/// Audit action recorded when consuming `cloud-oidc.json` turned
+/// `cloud.telemetry_enabled` on: the file Temps Cloud drops on a hosted plane
+/// asks for telemetry export, and its presence is the operator's consent (see
+/// [`crate::TelemetryConsent`]). Carries the before/after feature switches.
+pub const CLOUD_TELEMETRY_ENABLED_BY_BOOTSTRAP: &str = "CLOUD_TELEMETRY_ENABLED_BY_BOOTSTRAP";
+
+/// Audit action recorded when consuming `cloud-oidc.json` *failed after
+/// attempting to turn console access on*. The bootstrap as a whole failed, but
+/// the settings row may have been written and the compensating write may have
+/// failed too, so the attempt -- and whether it was undone -- is on record.
+pub const CLOUD_CONSOLE_ACCESS_BOOTSTRAP_FAILED: &str = "CLOUD_CONSOLE_ACCESS_BOOTSTRAP_FAILED";
+
+#[derive(Debug, Serialize)]
+struct CloudConsoleAccessBootstrapFailedAudit {
+    context: CloudAuditActor,
+    action: &'static str,
+    previous_features: CloudFeatureAuditValues,
+    /// `false` = the settings row may still say console access is on.
+    consent_restored: bool,
+    /// `false` = the managed OIDC provider may still exist.
+    provider_revoked: bool,
+    reason: String,
+}
+
+impl AuditOperation for CloudConsoleAccessBootstrapFailedAudit {
+    fn operation_type(&self) -> String {
+        self.action.to_string()
+    }
+    fn user_id(&self) -> Option<i32> {
+        self.context.user_id
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
+    }
+}
+
+/// Record a bootstrap that failed after it tried to switch console access on.
+/// A no-op for [`ConsentTrace::Untouched`]: a failure that never reached the
+/// consent write changed no consent, so there is nothing to audit beyond the
+/// error log. Audit write failures are logged, never propagated.
+pub async fn record_console_oidc_bootstrap_failure_audit(
+    audit: &dyn AuditLogger,
+    actor: CloudEnrollmentActor,
+    consent: &ConsentTrace,
+    reason: &str,
+) {
+    let ConsentTrace::WriteFailed {
+        previous,
+        restored,
+        provider_revoked,
+    } = consent
+    else {
+        return;
+    };
+    let event = CloudConsoleAccessBootstrapFailedAudit {
+        context: actor.into(),
+        action: CLOUD_CONSOLE_ACCESS_BOOTSTRAP_FAILED,
+        previous_features: (*previous).into(),
+        consent_restored: *restored,
+        provider_revoked: *provider_revoked,
+        reason: reason.to_string(),
+    };
+    if let Err(error) = audit.create_audit_log(&event).await {
+        tracing::error!(
+            %error,
+            action = CLOUD_CONSOLE_ACCESS_BOOTSTRAP_FAILED,
+            "failed to record console-access bootstrap failure audit event"
+        );
+    }
+}
+
 /// The `cloud-oidc.json` bootstrap file's audit shape. A dedicated struct
 /// rather than reusing [`CloudLinkAudit`] because this event carries the
 /// issuer and client id it provisioned -- context an operator needs to
@@ -838,6 +964,8 @@ struct CloudConsoleOidcBootstrapAudit {
     action: &'static str,
     issuer: String,
     client_id: String,
+    /// Whether applying the file also turned remote-console consent on.
+    console_access_enabled_by_bootstrap: bool,
 }
 
 impl AuditOperation for CloudConsoleOidcBootstrapAudit {
@@ -853,30 +981,35 @@ impl AuditOperation for CloudConsoleOidcBootstrapAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self).map_err(Into::into)
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
 /// Record that this boot consumed the `cloud-oidc.json` bootstrap file and
-/// applied the managed console-access OIDC provider it described. Called
-/// exactly once per successful application, from `temps-cli`'s startup
-/// sequence (mirroring [`record_link_connected_audit`] for
-/// `TEMPS_CLOUD_ENROLLMENT_CODE`). `issuer` and `client_id` are recorded so
+/// applied the managed console-access OIDC provider it described, plus -- when
+/// applying it turned remote-console consent on -- a second
+/// [`CLOUD_CONSOLE_ACCESS_ENABLED_BY_BOOTSTRAP`] record with the before/after
+/// feature switches. Called exactly once per successful application, from
+/// `temps-cli`'s startup sequence (mirroring [`record_link_connected_audit`]
+/// for `TEMPS_CLOUD_ENROLLMENT_CODE`). `issuer` and `client_id` are recorded so
 /// an operator can confirm which IdP was applied; the client secret never
-/// is. Failures to write the audit row are logged, never propagated: the
-/// provider has already been persisted.
-pub async fn record_console_oidc_bootstrapped_audit(
+/// is. Failures to write an audit row are logged, never propagated: the
+/// provider and the consent have already been persisted.
+pub async fn record_console_oidc_bootstrap_outcome_audit(
     audit: &dyn AuditLogger,
     actor: CloudEnrollmentActor,
     issuer: &str,
     client_id: &str,
+    consent: &ConsoleAccessConsent,
 ) {
+    let actor_fields: CloudAuditActor = actor.clone().into();
     let event = CloudConsoleOidcBootstrapAudit {
-        context: actor.into(),
+        context: actor_fields,
         action: CLOUD_CONSOLE_OIDC_BOOTSTRAPPED,
         issuer: issuer.to_string(),
         client_id: client_id.to_string(),
+        console_access_enabled_by_bootstrap: consent.was_granted(),
     };
     if let Err(error) = audit.create_audit_log(&event).await {
         tracing::error!(
@@ -884,6 +1017,38 @@ pub async fn record_console_oidc_bootstrapped_audit(
             action = CLOUD_CONSOLE_OIDC_BOOTSTRAPPED,
             "failed to record managed console-access OIDC bootstrap audit event"
         );
+    }
+    if let ConsoleAccessConsent::GrantedByBootstrap { previous, new } = consent {
+        write_cloud_link_audit(
+            audit,
+            actor,
+            CLOUD_CONSOLE_ACCESS_ENABLED_BY_BOOTSTRAP,
+            Some(*previous),
+            Some(*new),
+        )
+        .await;
+    }
+}
+
+/// Record that the bootstrap file turned telemetry export on. Nothing is
+/// written for the other [`crate::TelemetryConsent`] outcomes: they changed no
+/// setting (a failed write is logged by the caller, and the settings
+/// transaction it attempted either committed -- and the link then blocks
+/// outbound -- or rolled back).
+pub async fn record_telemetry_bootstrap_audit(
+    audit: &dyn AuditLogger,
+    actor: CloudEnrollmentActor,
+    telemetry: &crate::TelemetryConsent,
+) {
+    if let crate::TelemetryConsent::GrantedByBootstrap { previous, new } = telemetry {
+        write_cloud_link_audit(
+            audit,
+            actor,
+            CLOUD_TELEMETRY_ENABLED_BY_BOOTSTRAP,
+            Some(*previous),
+            Some(*new),
+        )
+        .await;
     }
 }
 
@@ -981,13 +1146,19 @@ mod tests {
 
     #[temps_core::async_trait::async_trait]
     impl AuditLogger for RecordingAudit {
-        async fn create_audit_log(&self, operation: &dyn AuditOperation) -> anyhow::Result<()> {
+        async fn create_audit_log(
+            &self,
+            operation: &dyn AuditOperation,
+        ) -> temps_core::AuditResult<()> {
             self.recorded
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .push(operation.operation_type());
             if self.fail {
-                anyhow::bail!("audit store is unavailable");
+                return Err(temps_core::AuditError::write(
+                    operation.operation_type(),
+                    "audit store is unavailable",
+                ));
             }
             Ok(())
         }
@@ -1254,6 +1425,85 @@ mod tests {
         assert!(!may_start_activation(&token, first_enrollment()));
     }
 
+    /// NV1: a custom grant holding exactly the two permissions the ensure
+    /// endpoint checks is still refused the managed schedule, because that
+    /// schedule backs up every database and the control plane.
+    #[test]
+    fn a_custom_settings_and_backups_writer_is_denied_the_managed_schedule() {
+        let key = temps_auth::AuthContext::new_api_key(
+            test_user(),
+            None,
+            Some(vec![
+                temps_auth::Permission::SettingsWrite,
+                temps_auth::Permission::BackupsWrite,
+            ]),
+            "ops-automation".to_string(),
+            7,
+        );
+        assert!(key.has_permission(&temps_auth::Permission::SettingsWrite));
+        assert!(key.has_permission(&temps_auth::Permission::BackupsWrite));
+        let denied = require_managed_schedule_admin(&key)
+            .expect_err("a non-admin custom key must not provision the managed schedule");
+        assert_eq!(denied.status_code, StatusCode::FORBIDDEN);
+
+        for role in [temps_auth::Role::Custom, temps_auth::Role::User] {
+            let denied = require_managed_schedule_admin(&principal(role.clone()))
+                .expect_err("only an instance administrator may provision it");
+            assert_eq!(denied.status_code, StatusCode::FORBIDDEN, "{role}");
+        }
+    }
+
+    #[test]
+    fn an_instance_admin_may_provision_the_managed_schedule() {
+        for role in [temps_auth::Role::Admin, temps_auth::Role::PlatformAdmin] {
+            assert!(
+                require_managed_schedule_admin(&principal(role.clone())).is_ok(),
+                "{role} must be allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn a_deployment_token_is_denied_the_managed_schedule() {
+        let token = temps_auth::AuthContext::new_deployment_token(
+            7,
+            None,
+            None,
+            1,
+            "deploy-token".to_string(),
+            Vec::new(),
+        );
+        let denied = require_managed_schedule_admin(&token).expect_err("tokens are refused");
+        assert_eq!(denied.status_code, StatusCode::FORBIDDEN);
+        let body = serde_json::to_value(&denied.body).expect("problem serialises");
+        assert_eq!(
+            body["type"],
+            "https://temps.sh/probs/deployment-token-not-allowed"
+        );
+    }
+
+    /// The service refuses a scoped caller even if a future handler forgets
+    /// the check, and the refusal maps to 403 rather than the 409 the other
+    /// schedule errors use.
+    #[test]
+    fn a_refused_managed_schedule_is_a_403() {
+        let problem = problem(CloudServiceError::ManagedBackupSchedule(
+            temps_core::ManagedBackupScheduleError::NotAuthorized { s3_source_id: 3 },
+        ));
+        assert_eq!(problem.status_code, StatusCode::FORBIDDEN);
+        let still_conflict = problem_status(CloudServiceError::ManagedBackupSchedule(
+            temps_core::ManagedBackupScheduleError::Create {
+                s3_source_id: 3,
+                reason: "the backup plugin is not enabled on this instance".to_string(),
+            },
+        ));
+        assert_eq!(still_conflict, StatusCode::CONFLICT);
+    }
+
+    fn problem_status(error: CloudServiceError) -> StatusCode {
+        problem(error).status_code
+    }
+
     #[test]
     fn the_started_audit_records_the_spend_and_names_the_purchase_trigger() {
         let event = CloudTelemetryActivationStartedAudit {
@@ -1396,7 +1646,10 @@ mod tests {
 
     #[temps_core::async_trait::async_trait]
     impl AuditLogger for ActorRecordingAudit {
-        async fn create_audit_log(&self, operation: &dyn AuditOperation) -> anyhow::Result<()> {
+        async fn create_audit_log(
+            &self,
+            operation: &dyn AuditOperation,
+        ) -> temps_core::AuditResult<()> {
             self.recorded
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1465,6 +1718,168 @@ mod tests {
                 None,
                 UNATTENDED_ENROLLMENT_USER_AGENT.to_string(),
             )]
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_that_granted_consent_audits_both_the_provider_and_the_consent() {
+        let audit = RecordingAudit::new(false);
+        let consent = ConsoleAccessConsent::GrantedByBootstrap {
+            previous: CloudFeatureSwitches::default(),
+            new: CloudFeatureSwitches {
+                console_access: true,
+                ..CloudFeatureSwitches::default()
+            },
+        };
+
+        record_console_oidc_bootstrap_outcome_audit(
+            audit.as_ref(),
+            CloudEnrollmentActor::UnattendedBootstrap,
+            "https://cloud.example.com",
+            "client",
+            &consent,
+        )
+        .await;
+
+        assert_eq!(
+            audit.recorded(),
+            vec![
+                CLOUD_CONSOLE_OIDC_BOOTSTRAPPED.to_string(),
+                CLOUD_CONSOLE_ACCESS_ENABLED_BY_BOOTSTRAP.to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_that_left_consent_alone_writes_no_consent_record() {
+        let audit = RecordingAudit::new(false);
+
+        record_console_oidc_bootstrap_outcome_audit(
+            audit.as_ref(),
+            CloudEnrollmentActor::UnattendedBootstrap,
+            "https://cloud.example.com",
+            "client",
+            &ConsoleAccessConsent::AlreadyEnabled,
+        )
+        .await;
+
+        assert_eq!(
+            audit.recorded(),
+            vec![CLOUD_CONSOLE_OIDC_BOOTSTRAPPED.to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_consent_attempt_is_audited_with_what_was_and_was_not_undone() {
+        let audit = actor_recorder();
+        let consent = ConsentTrace::WriteFailed {
+            previous: CloudFeatureSwitches::default(),
+            restored: false,
+            provider_revoked: true,
+        };
+
+        record_console_oidc_bootstrap_failure_audit(
+            &audit,
+            CloudEnrollmentActor::UnattendedBootstrap,
+            &consent,
+            "settings store unavailable",
+        )
+        .await;
+
+        assert_eq!(
+            rows(&audit),
+            vec![(
+                CLOUD_CONSOLE_ACCESS_BOOTSTRAP_FAILED.to_string(),
+                None,
+                None,
+                UNATTENDED_ENROLLMENT_USER_AGENT.to_string(),
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failure_before_the_consent_write_writes_no_audit_record() {
+        let audit = RecordingAudit::new(false);
+
+        record_console_oidc_bootstrap_failure_audit(
+            audit.as_ref(),
+            CloudEnrollmentActor::UnattendedBootstrap,
+            &ConsentTrace::Untouched,
+            "provider table unavailable",
+        )
+        .await;
+
+        assert!(audit.recorded().is_empty());
+    }
+
+    #[test]
+    fn the_failure_audit_says_whether_consent_and_provider_were_restored() {
+        let event = CloudConsoleAccessBootstrapFailedAudit {
+            context: CloudEnrollmentActor::UnattendedBootstrap.into(),
+            action: CLOUD_CONSOLE_ACCESS_BOOTSTRAP_FAILED,
+            previous_features: CloudFeatureSwitches::default().into(),
+            consent_restored: false,
+            provider_revoked: true,
+            reason: "settings store unavailable".to_string(),
+        };
+        let serialized = AuditOperation::serialize(&event).unwrap();
+        assert!(
+            serialized.contains("\"consent_restored\":false"),
+            "{serialized}"
+        );
+        assert!(
+            serialized.contains("\"provider_revoked\":true"),
+            "{serialized}"
+        );
+        assert!(
+            serialized.contains("settings store unavailable"),
+            "{serialized}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failing_audit_store_does_not_stop_the_consent_record_being_attempted() {
+        let audit = RecordingAudit::new(true);
+        let consent = ConsoleAccessConsent::GrantedByBootstrap {
+            previous: CloudFeatureSwitches::default(),
+            new: CloudFeatureSwitches {
+                console_access: true,
+                ..CloudFeatureSwitches::default()
+            },
+        };
+
+        record_console_oidc_bootstrap_outcome_audit(
+            audit.as_ref(),
+            CloudEnrollmentActor::UnattendedBootstrap,
+            "https://cloud.example.com",
+            "client",
+            &consent,
+        )
+        .await;
+
+        assert_eq!(audit.recorded().len(), 2, "both writes were attempted");
+    }
+
+    #[test]
+    fn the_consent_audit_shows_before_and_after_and_no_secret() {
+        let audit = CloudLinkAudit {
+            context: CloudEnrollmentActor::UnattendedBootstrap.into(),
+            action: CLOUD_CONSOLE_ACCESS_ENABLED_BY_BOOTSTRAP,
+            previous_features: Some(CloudFeatureSwitches::default().into()),
+            new_features: Some(
+                CloudFeatureSwitches {
+                    console_access: true,
+                    ..CloudFeatureSwitches::default()
+                }
+                .into(),
+            ),
+        };
+        let serialized = AuditOperation::serialize(&audit).unwrap();
+        assert!(serialized.contains("\"user_id\":null"), "{serialized}");
+        assert!(
+            serialized.contains("\"console_access_enabled\":false")
+                && serialized.contains("\"console_access_enabled\":true"),
+            "{serialized}"
         );
     }
 

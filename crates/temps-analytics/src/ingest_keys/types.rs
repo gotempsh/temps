@@ -111,6 +111,21 @@ pub struct CreateAnalyticsIngestKeyRequest {
     pub rate_limit_per_minute: Option<i32>,
 }
 
+/// The public address an app Temps does not deploy should send analytics to.
+///
+/// Served separately from the platform settings because `GET /settings`
+/// needs `settings:read`, which a project member does not hold, while the
+/// install snippet this value goes into is shown to every role that can read
+/// the project's analytics. Only the one address the snippet embeds is
+/// exposed; no other setting travels with it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct AnalyticsIngestEndpoint {
+    /// The configured external URL, without a trailing slash. `null` when no
+    /// external URL is stored (or no settings service is available), in which
+    /// case the caller must decide what to show instead; it is never guessed.
+    pub external_url: Option<String>,
+}
+
 /// Request body for a partial update.
 ///
 /// `allowed_origins` and `rate_limit_per_minute` use the three-state
@@ -196,6 +211,11 @@ pub enum AnalyticsIngestKeyError {
 
     #[error("Analytics ingest key {key_id} has a malformed allowed_origins column: {reason}")]
     MalformedAllowedOrigins { key_id: i32, reason: String },
+
+    #[error(
+        "Could not read the external URL for analytics ingest in project {project_id}: {reason}"
+    )]
+    ExternalUrlUnavailable { project_id: i32, reason: String },
 
     #[error("Database error: {0}")]
     Database(#[from] sea_orm::DbErr),

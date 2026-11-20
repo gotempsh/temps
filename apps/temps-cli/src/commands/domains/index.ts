@@ -19,6 +19,8 @@ import {
   setupDnsChallenge as setupDnsChallengeApi,
   getHttpChallengeDebug,
   listRenewalAttempts as listRenewalAttemptsApi,
+  listDnsProviders,
+  listManagedDomains,
 } from '../../api/sdk.gen.js'
 import type {
   DomainResponse,
@@ -32,6 +34,7 @@ import {
   newline, header, icons, json, colors, success, warning, info,
   keyValue, formatDate, box
 } from '../../ui/output.js'
+import { chooseDns01Route, waitForTxt, type Dns01Route, type ProviderZones } from './dns01.js'
 
 // Exact match only — a case-insensitive or partial match here would let
 // `domains ssl`/`domains status` silently target the wrong domain.
@@ -66,6 +69,7 @@ export function domainTimestamp(timestampMillis: number): Date {
 interface AddOptions {
   domain: string
   challenge?: string
+  manualDns?: boolean
   yes?: boolean
 }
 
@@ -142,6 +146,10 @@ export function registerDomainsCommands(program: Command): void {
     .description('Add a custom domain')
     .requiredOption('-d, --domain <domain>', 'Domain name')
     .option('-c, --challenge <type>', 'Challenge type (http-01 or dns-01)', 'http-01')
+    .option(
+      '--manual-dns',
+      'With dns-01, print the TXT record to add by hand even when a DNS provider in Temps manages the zone',
+    )
     .option('-y, --yes', 'Skip confirmation prompts')
     .action(addDomain)
 
@@ -296,6 +304,18 @@ async function addDomain(options: AddOptions): Promise<void> {
   newline()
   success(`Domain ${domain} added`)
 
+  if (options.challenge === 'dns-01' && result) {
+    const route: Dns01Route = options.manualDns
+      ? { mode: 'manual', reason: 'Asked for manual DNS with --manual-dns.' }
+      : await dns01Route(domain)
+    if (route.mode === 'provider') {
+      await issueWithProvider(domain, result.id, route)
+      return
+    }
+    newline()
+    info(route.reason)
+  }
+
   if (result?.dns_challenge_token && result?.dns_challenge_value) {
     const baseDomain = wildcardBaseDomain(domain)
     newline()
@@ -307,10 +327,82 @@ async function addDomain(options: AddOptions): Promise<void> {
     )
     newline()
     info(`Run "temps domains verify --domain ${domain}" after adding the record`)
+    info('Or add a DNS provider for this zone ("temps dns-providers") and Temps publishes it for you.')
   } else if (options.challenge === 'http-01') {
     newline()
     info('HTTP-01 challenge will be validated automatically when provisioning')
     info(`Run "temps domains verify --domain ${domain}" to provision SSL certificate`)
+  }
+}
+
+/** Which way `domain`'s DNS-01 challenge is answered, from the providers the server lists. */
+async function dns01Route(domain: string): Promise<Dns01Route> {
+  const { data: providers, error } = await listDnsProviders({ client })
+  if (error || !providers) {
+    return {
+      mode: 'manual',
+      reason: `Could not list DNS providers (${getErrorMessage(error)}), so the TXT record is shown to add by hand.`,
+    }
+  }
+  const candidates: ProviderZones[] = []
+  for (const provider of providers.filter((p) => p.is_active)) {
+    const { data: zones, error: listingError } = await listManagedDomains({ client, path: { id: provider.id } })
+    candidates.push(
+      listingError || !zones
+        ? { provider, zones: [], listingError: getErrorMessage(listingError) }
+        : { provider, zones },
+    )
+  }
+  return chooseDns01Route(domain, candidates)
+}
+
+/**
+ * The server's DNS-01 flow through the zone's provider: publish the TXT
+ * record, wait until public resolvers see it, then finalize the order
+ * (which also removes the record).
+ */
+async function issueWithProvider(
+  domain: string,
+  domainId: number,
+  route: Extract<Dns01Route, { mode: 'provider' }>,
+): Promise<void> {
+  newline()
+  info(`${route.providerName} manages ${route.zone}: Temps publishes the challenge record itself.`)
+  const setup = await withSpinner(`Publishing the _acme-challenge record through ${route.providerName}...`, async () => {
+    const { data, error } = await setupDnsChallengeApi({
+      client,
+      path: { domain_id: domainId },
+      body: { dns_provider_id: route.providerId },
+    })
+    if (error) throw new Error(getErrorMessage(error))
+    return data
+  })
+  if (!setup?.success) {
+    warning(setup?.message ?? 'The DNS provider did not publish the challenge record.')
+    info(`Retry with "temps domains dns-challenge --domain-id ${domainId} --provider-id ${route.providerId}"`)
+    return
+  }
+  const name = `_acme-challenge.${wildcardBaseDomain(domain)}`
+  const values = setup.results.filter((r) => r.success).map((r) => r.value)
+  const visible = await withSpinner(`Waiting for ${name} to be visible to public resolvers...`, () =>
+    waitForTxt(name, values),
+  )
+  if (!visible) {
+    warning(`${name} is not visible yet, so the order was not finalized (Let's Encrypt validates once).`)
+    info(`Once it resolves, run "temps domains orders finalize --domain-id ${domainId}"`)
+    return
+  }
+  const finalized = await withSpinner('Asking Let\'s Encrypt to validate and issue...', async () => {
+    const { data, error } = await finalizeOrderApi({ client, path: { domain_id: domainId } })
+    if (error) throw new Error(getErrorMessage(error))
+    return data
+  })
+  newline()
+  if (finalized && isProvisionedStatus(finalized.status)) {
+    success(`Certificate issued for ${finalized.domain}`)
+  } else {
+    warning(`Order finalization returned status: ${finalized?.status ?? 'unknown'}`)
+    if (finalized?.last_error) warning(`Error: ${finalized.last_error}`)
   }
 }
 
@@ -599,7 +691,7 @@ async function showOrder(options: OrderShowOptions): Promise<void> {
     return
   }
 
-  const order = await withSpinner('Fetching ACME order...', async () => {
+  const lookup = await withSpinner('Fetching ACME order...', async () => {
     const { data, error } = await getDomainOrder({
       client,
       path: { domain_id: domainId },
@@ -608,8 +700,15 @@ async function showOrder(options: OrderShowOptions): Promise<void> {
     return data
   })
 
+  // `order` is null when the domain has none (e.g. its certificate is active);
+  // the API explains why in `reason`.
+  const order = lookup?.order
   if (!order) {
-    warning('No order found for this domain')
+    if (options.json) {
+      json({ order: null, reason: lookup?.reason ?? null })
+      return
+    }
+    warning(lookup?.reason ?? 'No order found for this domain')
     return
   }
 

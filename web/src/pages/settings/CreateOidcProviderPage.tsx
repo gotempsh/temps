@@ -12,9 +12,12 @@ import {
 import {
   createDefaultOidcProviderForm,
   getOidcRedirectUri,
-  isOidcFormValid,
+  OIDC_REQUIRED_FIELDS,
+  oidcFormFieldErrors,
+  type OidcFieldErrors,
   problemMessage,
 } from '@/components/settings/oidc-provider-constants'
+import { PageHeader } from '@/components/layout/PageContainer'
 import { Button } from '@/components/ui/button'
 import {
   Card,
@@ -50,7 +53,7 @@ function createFormToRequest(form: OidcProviderFormValues) {
 }
 
 export function CreateOidcProviderPage() {
-  usePageTitle('Add SSO Provider')
+  usePageTitle('Add SSO provider')
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const { setBreadcrumbs } = useBreadcrumbs()
@@ -73,6 +76,20 @@ export function CreateOidcProviderPage() {
       trust_idp_email: defaults.trust_idp_email ?? false,
     }
   })
+
+  const [fieldErrors, setFieldErrors] = useState<OidcFieldErrors>({})
+
+  // Editing a field withdraws only that field's message.
+  const handleFormChange = (next: OidcProviderFormValues) => {
+    setFieldErrors((current) => {
+      const remaining = { ...current }
+      for (const { field } of OIDC_REQUIRED_FIELDS) {
+        if (next[field] !== form[field]) delete remaining[field]
+      }
+      return remaining
+    })
+    setForm(next)
+  }
 
   const redirectUri = useMemo(() => getOidcRedirectUri(), [])
 
@@ -106,8 +123,11 @@ export function CreateOidcProviderPage() {
   }, [setBreadcrumbs])
 
   const handleSubmit = () => {
-    if (!isOidcFormValid(createFormToRequest(form))) {
-      toast.error('Fill in name, issuer URL, client ID, and client secret')
+    const errors = oidcFormFieldErrors(createFormToRequest(form))
+    setFieldErrors(errors)
+    const firstInvalid = OIDC_REQUIRED_FIELDS.find(({ field }) => errors[field])
+    if (firstInvalid) {
+      document.getElementById(firstInvalid.inputId)?.focus()
       return
     }
     createProvider.mutate({ body: createFormToRequest(form) })
@@ -125,15 +145,11 @@ export function CreateOidcProviderPage() {
         >
           <ArrowLeft className="h-4 w-4" />
         </Button>
-        <div className="space-y-1">
-          <h1 className="text-2xl font-semibold tracking-tight">
-            Add SSO Provider
-          </h1>
-          <p className="text-sm text-muted-foreground">
-            Connect an OpenID Connect provider, then choose how new users gain
-            access. Client secrets are encrypted at rest.
-          </p>
-        </div>
+        <PageHeader
+          className="min-w-0 flex-1"
+          title="Add SSO provider"
+          description="Connect an OpenID Connect provider, then choose how new users gain access. Client secrets are encrypted at rest."
+        />
       </div>
 
       <Card>
@@ -147,7 +163,8 @@ export function CreateOidcProviderPage() {
           <OidcProviderForm
             mode="create"
             value={form}
-            onChange={setForm}
+            onChange={handleFormChange}
+            errors={fieldErrors}
             redirectUri={redirectUri}
             onCancel={() => navigate('/settings/auth')}
             onSubmit={handleSubmit}

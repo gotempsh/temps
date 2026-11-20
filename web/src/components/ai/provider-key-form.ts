@@ -3,7 +3,10 @@
 
 import { z } from 'zod'
 import type { CreateProviderKeyRequest } from '@/api/client'
-import { isSelfHostedProvider } from '@/lib/ai-providers'
+import {
+  SELF_HOSTED_PROVIDER_ID,
+  isSelfHostedProvider,
+} from '@/lib/ai-providers'
 import {
   DEFAULT_SELF_HOSTED_CAPABILITIES,
   selfHostedDiscoverySignature,
@@ -19,11 +22,15 @@ const capabilitiesSchema = z.object({
 
 /** Models a self-hosted server listed, and the inputs they were listed for. */
 const discoverySchema = z
-  .object({ signature: z.string(), models: z.array(z.string()) })
+  .object({
+    signature: z.string(),
+    models: z.array(z.string()),
+    names: z.record(z.string(), z.string()).optional(),
+  })
   .nullable()
 
 /**
- * The add-provider-key form. Self-hosted (OpenAI-compatible) providers need
+ * The add-provider-key form. OpenAI-compatible providers need
  * a base URL and a default model picked from the server's own listing, and
  * may omit the API key; every other provider needs an API key.
  */
@@ -110,4 +117,122 @@ export function providerKeyFormToRequest(
     trust_private_address: values.trust_private_address,
     capabilities: values.capabilities,
   }
+}
+
+/** A provider as offered by the add-key dialog's provider choice. */
+export interface ProviderKeyChoice {
+  id: string
+  name: string
+}
+
+/**
+ * The display name pre-filled for a new key: the provider's name, numbered
+ * once the provider already has keys so rows stay distinguishable.
+ */
+export function defaultProviderKeyDisplayName(
+  providerName: string,
+  existingKeyCount: number
+): string {
+  return existingKeyCount > 0
+    ? `${providerName} (key ${existingKeyCount + 1})`
+    : providerName
+}
+
+/** The form state for adding a key to one specific, preselected provider. */
+export function providerKeyFormForProvider(
+  provider: ProviderKeyChoice,
+  existingKeyCount: number
+): ProviderKeyFormValues {
+  return {
+    ...EMPTY_PROVIDER_KEY_FORM,
+    provider: provider.id,
+    display_name: defaultProviderKeyDisplayName(
+      provider.name,
+      existingKeyCount
+    ),
+  }
+}
+
+/** Whether a display name is one the form pre-filled rather than the user. */
+function isPrefilledDisplayName(
+  displayName: string,
+  providerNames: readonly string[]
+): boolean {
+  const trimmed = displayName.trim()
+  if (!trimmed) return true
+  return providerNames.some(
+    (name) =>
+      trimmed === name ||
+      (trimmed.startsWith(`${name} (key `) && trimmed.endsWith(')'))
+  )
+}
+
+/**
+ * Apply a provider chosen inside the dialog. Everything specific to the
+ * previous provider (key, base URL, discovered models, trust) is dropped so
+ * it can never be submitted against the wrong provider; a display name the
+ * user typed is kept.
+ */
+export function selectProviderKeyFormProvider(
+  values: ProviderKeyFormValues,
+  provider: ProviderKeyChoice,
+  existingKeyCount: number,
+  knownProviderNames: readonly string[]
+): ProviderKeyFormValues {
+  if (values.provider === provider.id) return values
+  const keepName = !isPrefilledDisplayName(
+    values.display_name,
+    knownProviderNames
+  )
+  return {
+    ...EMPTY_PROVIDER_KEY_FORM,
+    provider: provider.id,
+    display_name: keepName
+      ? values.display_name
+      : defaultProviderKeyDisplayName(provider.name, existingKeyCount),
+  }
+}
+
+/**
+ * Whether a vendor provider (OpenAI, Anthropic, ...) was given a custom base
+ * URL. That field only fits a proxy serving the vendor's own models: the key
+ * is verified, and its catalog seeded, with that vendor's model names, so
+ * another vendor's OpenAI-protocol API (DeepSeek, Groq, ...) fails there and
+ * belongs on an OpenAI-compatible provider instead.
+ */
+export function vendorHasCustomBaseUrl(
+  values: Pick<ProviderKeyFormValues, 'provider' | 'base_url'>
+): boolean {
+  return (
+    values.provider.trim() !== '' &&
+    !isSelfHostedProvider(values.provider) &&
+    values.base_url.trim() !== ''
+  )
+}
+
+/**
+ * Move what was typed for a vendor provider over to an OpenAI-compatible
+ * provider: the API key and base URL carry over (they are exactly what an
+ * OpenAI-compatible server needs), so does a display name the user typed.
+ */
+export function switchToOpenAiCompatible(
+  values: ProviderKeyFormValues,
+  compatibleName: string,
+  existingKeyCount: number,
+  knownProviderNames: readonly string[]
+): ProviderKeyFormValues {
+  const switched = selectProviderKeyFormProvider(
+    values,
+    { id: SELF_HOSTED_PROVIDER_ID, name: compatibleName },
+    existingKeyCount,
+    knownProviderNames
+  )
+  return { ...switched, api_key: values.api_key, base_url: values.base_url }
+}
+
+/** Submitting needs a chosen provider; the schema reports the rest. */
+export function canSubmitProviderKeyForm(
+  values: Pick<ProviderKeyFormValues, 'provider'>
+): boolean {
+  return values.provider.trim() !== ''
 }

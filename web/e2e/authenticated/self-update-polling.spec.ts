@@ -38,6 +38,7 @@ for (const outcome of [
         channel: 'stable',
         channel_is_pinned: false,
         current_version: 'v0.1.0',
+        worker_install: { kind: 'release', tag: 'v0.1.0' },
         manual_command: 'temps upgrade',
         phase: started && !completed ? 'downloading' : 'idle',
         restart_mode:

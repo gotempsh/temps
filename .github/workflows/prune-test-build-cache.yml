@@ -1,0 +1,45 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+name: Prune Test Build Cache
+
+# Every push to `main` saves the whole test build dir (Build Test Binaries in
+# rust-tests.yml) under a key ending in its commit, so each one is a new
+# multi-GB entry. Delete the entries it supersedes, or they fill the
+# repository's cache pool and evict the musl build cache.
+#
+# A workflow of its own because deleting caches needs `actions: write`, which
+# no job that runs the workspace's build scripts should hold. This one checks
+# nothing out and uses no actions: it only runs `gh`.
+on:
+  workflow_run:
+    workflows: [Rust Tests]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  prune:
+    name: Delete superseded test-target entries
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      # Keeps the newest two, so an entry a concurrent run just saved
+      # survives.
+      - name: Delete superseded entries
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh cache list -R "$GITHUB_REPOSITORY" --ref refs/heads/main --key test-target-v1- \
+            --limit 100 --json id,createdAt --jq 'sort_by(.createdAt) | reverse | .[2:] | .[].id' |
+            while read -r id; do
+              gh cache delete "$id" -R "$GITHUB_REPOSITORY" && echo "Deleted cache entry $id"
+            done

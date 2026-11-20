@@ -7,7 +7,7 @@ Docker plumbing so containers on different hosts can reach each other by IP.
 
 Foundational — Phase 1+3 of the multi-host networking plan. Compiles on
 Linux and macOS; kernel data-plane is Linux-only. Not wired into
-`temps-agent` yet (next branch).
+`temps-node-agent` yet (next branch).
 
 ## Two-network model (zero-downtime upgrade)
 
@@ -201,7 +201,7 @@ will add:
 - Schema migration (`compute_cidr`, `underlay_address` columns on `nodes`)
 - Control-plane allocator (`ComputeNetworkAllocator`)
 - Server endpoint that broadcasts the peer list
-- `temps-agent` startup hook calling `NetworkManager::bootstrap`
+- `temps-node-agent` startup hook calling `NetworkManager::bootstrap`
 - `temps-deployer` **also** attaching new containers to `temps-overlay`
   (additive — existing `temps-app-network` attachment stays as primary)
 - `temps network status / peers / diag` CLI subcommands

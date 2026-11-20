@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { Settings2 } from 'lucide-react'
+import { PLATFORM_SETTINGS_INDEX } from '@/lib/project-settings-index'
 import { platformToolGroups } from '@/components/platform/platform-tools'
 import {
   settingsNavigationGroups,
@@ -51,6 +53,15 @@ export function indexSettingsNavigationGroups(
 
 export const settingsPageNavigationItems: IndexedNavigationItem[] =
   indexSettingsNavigationGroups(settingsNavigationGroups)
+
+/** Individual platform controls, linked to their setting anchor. */
+export const platformSettingNavigationItems: IndexedNavigationItem[] =
+  PLATFORM_SETTINGS_INDEX.map((entry) => ({
+    title: entry.title,
+    url: `${entry.page}#${entry.anchor}`,
+    icon: Settings2,
+    keywords: ['setting', 'settings', ...entry.keywords],
+  }))
 
 /**
  * Prefer purpose-written command labels while merging the canonical page

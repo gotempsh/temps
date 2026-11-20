@@ -13,6 +13,35 @@ Access real-time application logs, build logs, and deployment logs to debug issu
 
 ---
 
+## Structured telemetry from Sentry SDKs
+
+Open **Projects → your project → Telemetry logs** to search structured application logs sent by an official Sentry SDK. These are the same native telemetry records queried by Temps' OpenTelemetry APIs. They are separate from container stdout, build logs and rrweb replay console events; a replay console breadcrumb does not automatically create a telemetry log.
+
+For the verified Node 11.8.0 setup:
+
+```javascript
+import * as Sentry from '@sentry/node';
+
+Sentry.init({
+  dsn: process.env.TEMPS_SENTRY_DSN,
+  enableLogs: true,
+  dataCollection: { userInfo: false },
+  sendClientReports: false,
+});
+
+Sentry.logger.info('Import completed', {
+  'service.name': 'scheduled-worker',
+  records: 42,
+});
+await Sentry.flush(5000);
+```
+
+Use `Sentry.logger`, or explicitly configure the SDK's console logging integration. Plain `console.log` alone is not this structured-log signal. In a browser, use only the public Temps DSN, never a server OTLP token. Avoid logging credentials, personal input values or full request bodies.
+
+If no logs appear, confirm `enableLogs`, the selected project/time range and `service.name` filter, flush short-lived processes, then check the ingestion response and native log query. The [Sentry compatibility contract](/docs/error-tracking#sentry-compatibility) describes versions, typed-attribute preservation and partial-ingestion limits.
+
+---
+
 ## Types of Logs
 
 Temps provides several types of logs to help you understand what's happening with your application:

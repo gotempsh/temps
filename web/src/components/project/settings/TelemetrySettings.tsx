@@ -67,6 +67,7 @@ import {
 import { useEffect, useState } from 'react'
 import { Link } from 'react-router'
 import { toast } from 'sonner'
+import { PageHeader } from '@temps-sdk/ds'
 
 /** Poll while spans are failing or queued, so the alert tracks reality. */
 const DELIVERY_POLL_ACTIVE_MS = 15_000
@@ -84,13 +85,13 @@ const WRITE_MODE_COPY: Record<
   local: {
     title: 'Store spans on this instance',
     description:
-      'Spans are written to this instance’s span store first, then optionally mirrored to Temps Cloud. This is the default and what every project did before Cloud-primary writes existed.',
+      'Spans are written to this instance’s span store first, then optionally mirrored to Temps Cloud. This is the default and what every service did before Cloud-primary writes existed.',
     icon: HardDrive,
   },
   cloud: {
     title: 'Write spans to Temps Cloud',
     description:
-      'Spans go straight to this instance’s durable telemetry queue and are shipped to Temps Cloud. No span for this project is stored on this instance — which is how a local span store stops being necessary. Traces are then read back from Cloud.',
+      'Spans go straight to this instance’s durable telemetry queue and are shipped to Temps Cloud. No span for this service is stored on this instance — which is how a local span store stops being necessary. Traces are then read back from Cloud.',
     icon: CloudUpload,
   },
 }
@@ -330,8 +331,8 @@ export function TelemetrySettings({ project }: TelemetrySettingsProps) {
       })
       toast.success(
         updated.write_mode === 'cloud'
-          ? 'This project’s spans now go to Temps Cloud. They are no longer stored on this instance.'
-          : 'This project’s spans are stored on this instance.'
+          ? 'This service’s spans now go to Temps Cloud. They are no longer stored on this instance.'
+          : 'This service’s spans are stored on this instance.'
       )
     },
     onError: (mutationError) => {
@@ -341,7 +342,7 @@ export function TelemetrySettings({ project }: TelemetrySettingsProps) {
       toast.error(
         problemDetail(
           mutationError,
-          'Could not change this project’s telemetry storage.'
+          'Could not change this service’s telemetry storage.'
         ),
         {
           action: problemSetupPath(mutationError)
@@ -380,7 +381,7 @@ export function TelemetrySettings({ project }: TelemetrySettingsProps) {
             <p>
               {problemDetail(
                 error,
-                'This instance could not report where this project’s spans are stored.'
+                'This instance could not report where this service’s spans are stored.'
               )}
             </p>
             <Button size="sm" variant="outline" onClick={() => void refetch()}>
@@ -405,29 +406,22 @@ export function TelemetrySettings({ project }: TelemetrySettingsProps) {
   const downgradeBlocked = writeMode === 'cloud' && fidelity === 'metered'
 
   return (
-    <div className="w-full space-y-6 px-4 py-8 sm:px-6">
-      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-        <div>
-          <h2 className="text-2xl font-semibold tracking-tight">
-            Telemetry storage
-          </h2>
-          <p className="mt-1 text-sm text-muted-foreground">
-            Where {project.name}’s spans are stored, and how much of each span
-            may leave this instance.
-          </p>
-        </div>
-        <WriteModeBadge settings={settings} />
-      </div>
+    <div className="w-full space-y-6">
+      <PageHeader
+        title="Telemetry storage"
+        description={`Where ${project.name}’s spans are stored, and how much of each span may leave this instance.`}
+        actions={<WriteModeBadge settings={settings} />}
+      />
 
       {settings.effective_write_mode !== settings.write_mode && (
         <Alert variant="destructive">
           <AlertTriangle className="h-4 w-4" />
           <AlertTitle>
-            Spans are not going where this project’s settings say
+            Spans are not going where this service’s settings say
           </AlertTitle>
           <AlertDescription>
             {settings.effective_reason_message ??
-              'Temps Cloud is not accepting this project’s spans, so they are being stored on this instance instead.'}{' '}
+              'Temps Cloud is not accepting this service’s spans, so they are being stored on this instance instead.'}{' '}
             The setting below is unchanged and takes effect again automatically
             once Cloud accepts.
           </AlertDescription>
@@ -453,8 +447,9 @@ export function TelemetrySettings({ project }: TelemetrySettingsProps) {
 
       {/* ── Write mode ─────────────────────────────────────────────── */}
       <SettingsSection
+        id="setting-span-storage"
         title="Where spans are stored"
-        description="Choose whether this project's spans are stored locally or in Temps Cloud"
+        description="Choose whether this service's spans are stored locally or in Temps Cloud"
         icon={HardDrive}
       >
         <div className="space-y-4">
@@ -538,6 +533,7 @@ export function TelemetrySettings({ project }: TelemetrySettingsProps) {
 
       {/* ── Fidelity ───────────────────────────────────────────────── */}
       <SettingsSection
+        id="setting-span-fidelity"
         title="Span fidelity"
         defaultOpen={cloudAiMetadataMissing(settings)}
         description="Control how much of each span leaves this instance for Temps Cloud"
@@ -622,8 +618,8 @@ export function TelemetrySettings({ project }: TelemetrySettingsProps) {
               </AlertTitle>
               <AlertDescription>
                 Metered spans are pseudonymised placeholders that cannot be read
-                back, and a Cloud-primary project stores nothing here — this
-                project’s traces would exist nowhere. Choose “Store spans on
+                back, and a Cloud-primary service stores nothing here — this
+                service’s traces would exist nowhere. Choose “Store spans on
                 this instance”, or keep fidelity at Queryable.
               </AlertDescription>
             </Alert>
@@ -669,7 +665,7 @@ export function TelemetrySettings({ project }: TelemetrySettingsProps) {
           <CardHeader>
             <CardTitle className="text-base">Storage history</CardTitle>
             <CardDescription>
-              Where this project’s spans actually went, which is what decides
+              Where this service’s spans actually went, which is what decides
               which store answers a query for a given time range.
             </CardDescription>
           </CardHeader>

@@ -6,6 +6,14 @@
 //! These tests require a Docker-accessible TimescaleDB instance.
 //! They skip gracefully when Docker is unavailable (no `#[ignore]`).
 
+// Test-only helpers outside `#[test]` fns (fixtures, mock servers, setup):
+// a panic there is the test failure, which is what we want.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test helpers: panicking is how a test fails"
+)]
+
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, Duration, Timelike, Utc};
@@ -19,8 +27,8 @@ use temps_otel::types::*;
 ///
 /// Uses `TestDatabase::with_migrations()` which acquires a global lock to avoid
 /// concurrent extension creation conflicts on the shared container.
-async fn setup_storage() -> Option<(temps_database::test_utils::TestDatabase, TimescaleDbStorage)> {
-    let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+async fn setup_storage() -> Option<(temps_test_utils::TestDatabase, TimescaleDbStorage)> {
+    let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
         Ok(db) => db,
         Err(e) => {
             println!("Docker/TestDatabase not available, skipping test: {}", e);
@@ -38,8 +46,8 @@ async fn setup_storage() -> Option<(temps_database::test_utils::TestDatabase, Ti
 /// `facets` maps attribute key -> slot (1..=20).
 async fn setup_storage_with_facets(
     facets: &[(&str, u8)],
-) -> Option<(temps_database::test_utils::TestDatabase, TimescaleDbStorage)> {
-    let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+) -> Option<(temps_test_utils::TestDatabase, TimescaleDbStorage)> {
+    let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
         Ok(db) => db,
         Err(e) => {
             println!("Docker/TestDatabase not available, skipping test: {}", e);
@@ -83,6 +91,7 @@ fn sample_span(
 ) -> SpanRecord {
     let now = Utc::now();
     SpanRecord {
+        ingest_identity: None,
         project_id,
         deployment_id: None,
         resource: test_resource(),
@@ -125,6 +134,8 @@ fn sample_log(
     trace_id: Option<&str>,
 ) -> LogRecord {
     LogRecord {
+        ingest_identity: None,
+        attribute_types: Default::default(),
         project_id,
         deployment_id: None,
         resource: test_resource(),
@@ -853,8 +864,8 @@ async fn test_trace_summary_reconciliation_handles_out_of_order_commit() {
             .expect("lower-ID transaction commits after reconciliation starts");
     };
     let (reconciliation, competing_reconciliation, ()) = tokio::join!(
-        temps_database::reconcile_otel_trace_summaries(&reconcile_db),
-        temps_database::reconcile_otel_trace_summaries(&competing_db),
+        temps_schema::reconcile_otel_trace_summaries(&reconcile_db),
+        temps_schema::reconcile_otel_trace_summaries(&competing_db),
         release_held,
     );
     reconciliation.expect("reconciliation succeeds");
@@ -1522,6 +1533,7 @@ async fn test_full_trace_tree_db_roundtrip() {
     let now = Utc::now();
 
     let root = SpanRecord {
+        ingest_identity: None,
         project_id,
         deployment_id: None,
         resource: test_resource(),
@@ -1540,6 +1552,7 @@ async fn test_full_trace_tree_db_roundtrip() {
     };
 
     let child_db = SpanRecord {
+        ingest_identity: None,
         project_id,
         deployment_id: None,
         resource: test_resource(),
@@ -1558,6 +1571,7 @@ async fn test_full_trace_tree_db_roundtrip() {
     };
 
     let child_http = SpanRecord {
+        ingest_identity: None,
         project_id,
         deployment_id: None,
         resource: test_resource(),
@@ -1576,6 +1590,7 @@ async fn test_full_trace_tree_db_roundtrip() {
     };
 
     let grandchild = SpanRecord {
+        ingest_identity: None,
         project_id,
         deployment_id: None,
         resource: test_resource(),
@@ -2444,6 +2459,7 @@ fn stats_query(project_ids: Vec<i32>, start: DateTime<Utc>, end: DateTime<Utc>) 
         sort_order: SortOrder::default(),
         limit: None,
         offset: None,
+        apdex_threshold_ms: None,
     }
 }
 
@@ -2528,6 +2544,26 @@ async fn test_span_stats_aggregates_percentiles_and_ratios() {
     // steady one is not meaningfully faster on average.
     assert!(erratic.tail_ratio > steady.tail_ratio);
     assert!(erratic.coefficient_of_variation > steady.coefficient_of_variation);
+    assert_eq!(erratic.apdex, None, "no threshold asked for, no score");
+
+    // Apdex with T = 100ms: steady has one satisfied call (100ms) and 19
+    // tolerating ones; erratic has 18 satisfied and the two 2s calls
+    // frustrate.
+    let scored = storage
+        .query_span_stats(SpanStatsQuery {
+            apdex_threshold_ms: Some(100.0),
+            ..stats_query(vec![1], window_start, now)
+        })
+        .await
+        .expect("query span stats with apdex");
+    let steady = scored.iter().find(|r| r.span_name == "steady").unwrap();
+    assert_eq!(steady.satisfied_count, Some(1));
+    assert_eq!(steady.tolerating_count, Some(19));
+    assert_eq!(steady.apdex, Some(0.525));
+    let erratic = scored.iter().find(|r| r.span_name == "erratic").unwrap();
+    assert_eq!(erratic.satisfied_count, Some(18));
+    assert_eq!(erratic.frustrated_count, Some(2));
+    assert_eq!(erratic.apdex, Some(0.9));
 }
 
 #[tokio::test]
@@ -2958,5 +2994,317 @@ async fn test_record_ingest_error_truncates_long_sample_message_before_insert() 
         stored.chars().count() <= 501,
         "the raw DB column must already be truncated at insert time, got {} chars",
         stored.chars().count()
+    );
+}
+
+#[tokio::test]
+async fn native_typed_log_filters_preserve_precision_types_and_project_scope() {
+    let Some((_db, storage)) = setup_storage().await else {
+        return;
+    };
+    let make = |project, key_value: &str, ty: Option<LogAttributeType>, body: &str| {
+        let mut log = sample_log(project, LogSeverity::Info, body, None);
+        log.attributes.insert("count".into(), key_value.into());
+        if let Some(ty) = ty {
+            log.attribute_types.insert("count".into(), ty);
+        }
+        log
+    };
+    let rows = vec![
+        make(
+            1,
+            "9007199254740993",
+            Some(LogAttributeType::Integer),
+            "Synthetic int64",
+        ),
+        make(
+            1,
+            "9007199254740992",
+            Some(LogAttributeType::Integer),
+            "Synthetic smaller int64",
+        ),
+        make(
+            1,
+            "9007199254740993",
+            Some(LogAttributeType::String),
+            "Synthetic numeric string",
+        ),
+        make(
+            1,
+            "true",
+            Some(LogAttributeType::Boolean),
+            "Synthetic boolean",
+        ),
+        make(
+            1,
+            "0.1234567890123456789",
+            Some(LogAttributeType::Double),
+            "Synthetic precise decimal",
+        ),
+        make(
+            1,
+            "0.1234567890123456788",
+            Some(LogAttributeType::Double),
+            "Synthetic smaller decimal",
+        ),
+        make(
+            1,
+            "not a number",
+            Some(LogAttributeType::Double),
+            "Synthetic malformed numeric producer",
+        ),
+        make(
+            1,
+            "1e999999999",
+            Some(LogAttributeType::Double),
+            "Synthetic overflowing numeric producer",
+        ),
+        make(
+            2,
+            "9007199254740993",
+            Some(LogAttributeType::Integer),
+            "Synthetic other project",
+        ),
+        make(
+            1,
+            "9007199254740993",
+            None,
+            "Synthetic historical untyped log",
+        ),
+    ];
+    assert_eq!(storage.store_logs(rows).await.unwrap(), 10);
+    let query = |ty, op, value: &str| LogQuery {
+        project_id: 1,
+        attribute_filter: Some(LogAttributeFilter {
+            key: "count".into(),
+            ty,
+            operator: op,
+            value: value.into(),
+        }),
+        ..Default::default()
+    };
+    let exact = storage
+        .query_logs(query(
+            Some(LogAttributeType::Integer),
+            LogAttributeOperator::Eq,
+            "9007199254740993",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(exact.len(), 1);
+    assert_eq!(exact[0].body, "Synthetic int64");
+    assert_eq!(exact[0].attributes["count"], "9007199254740993");
+    assert_eq!(exact[0].attribute_types["count"], LogAttributeType::Integer);
+    let greater = storage
+        .query_logs(query(
+            Some(LogAttributeType::Integer),
+            LogAttributeOperator::Gt,
+            "9007199254740992",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(greater.len(), 1);
+    assert_eq!(greater[0].body, "Synthetic int64");
+    let text = storage
+        .query_logs(query(
+            Some(LogAttributeType::String),
+            LogAttributeOperator::Eq,
+            "9007199254740993",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(text.len(), 1);
+    assert_eq!(text[0].body, "Synthetic numeric string");
+    let untyped = storage
+        .query_logs(query(None, LogAttributeOperator::Eq, "9007199254740993"))
+        .await
+        .unwrap();
+    assert_eq!(untyped.len(), 3);
+    let boolean = storage
+        .query_logs(query(
+            Some(LogAttributeType::Boolean),
+            LogAttributeOperator::Eq,
+            "true",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(boolean.len(), 1);
+    assert_eq!(boolean[0].body, "Synthetic boolean");
+    let decimal = storage
+        .query_logs(query(
+            Some(LogAttributeType::Double),
+            LogAttributeOperator::Gt,
+            "0.12345678901234567885",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(decimal.len(), 1);
+    assert_eq!(decimal[0].body, "Synthetic precise decimal");
+    assert_eq!(decimal[0].attributes["count"], "0.1234567890123456789");
+    let mut injection = query(None, LogAttributeOperator::Eq, "9007199254740993");
+    injection.attribute_filter.as_mut().unwrap().key = "count' OR '1'='1".into();
+    assert!(storage.query_logs(injection).await.unwrap().is_empty());
+    let mut page = query(None, LogAttributeOperator::Eq, "9007199254740993");
+    page.limit = Some(1);
+    page.offset = Some(1);
+    assert_eq!(storage.query_logs(page).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn typed_log_column_default_preserves_compressed_history() {
+    use sea_orm::ConnectionTrait;
+    let Some((test_db, storage)) = setup_storage().await else {
+        return;
+    };
+    storage
+        .store_logs(vec![sample_log(
+            1,
+            LogSeverity::Info,
+            "Synthetic historical log",
+            None,
+        )])
+        .await
+        .unwrap();
+    // Reproduce the pre-migration shape, with an actual compressed historical
+    // chunk. Exercise the exact ADD COLUMN operation used by the migration.
+    test_db
+        .db
+        .execute_unprepared("ALTER TABLE otel_log_events DROP COLUMN attribute_types")
+        .await
+        .unwrap();
+    if test_db
+        .db
+        .execute_unprepared("SELECT compress_chunk(c) FROM show_chunks('otel_log_events') c")
+        .await
+        .is_err()
+    {
+        println!("Compression unavailable, skipping historical log DDL check");
+        return;
+    }
+    test_db
+        .db
+        .execute_unprepared(
+            "ALTER TABLE otel_log_events ADD COLUMN attribute_types JSONB NOT NULL DEFAULT '{}'",
+        )
+        .await
+        .expect("constant type metadata default must work on compressed log chunks");
+    let logs = storage
+        .query_logs(LogQuery {
+            project_id: 1,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0].body, "Synthetic historical log");
+    assert!(
+        logs[0].attribute_types.is_empty(),
+        "historical types must not be invented"
+    );
+}
+
+/// `http.target` carries the query string, so a page path matches it with or
+/// without one, and nothing that merely starts with the same characters,
+/// through the JSON attributes and through a facet column alike.
+#[tokio::test]
+async fn test_query_spans_matches_a_request_path_with_or_without_its_query() {
+    for faceted in [false, true] {
+        let setup = if faceted {
+            setup_storage_with_facets(&[("http.target", 2)]).await
+        } else {
+            setup_storage().await
+        };
+        let Some((_db, storage)) = setup else {
+            return;
+        };
+        let project_id = 31;
+        let targets = [
+            ("p001", "/products/42"),
+            ("p002", "/products/42?ref=home"),
+            ("p003", "/products/42#reviews"),
+            ("p004", "/products/420"),
+            ("p005", "/products/42/reviews"),
+        ];
+        let spans = targets
+            .iter()
+            .map(|(span_id, target)| {
+                let mut span = sample_span(
+                    project_id,
+                    &format!("trace_{span_id}"),
+                    span_id,
+                    None,
+                    "GET /products/:id",
+                    SpanKind::Server,
+                    SpanStatusCode::Ok,
+                    20.0,
+                );
+                span.attributes
+                    .insert("http.target".to_string(), target.to_string());
+                span
+            })
+            .collect();
+        storage.store_spans(spans).await.unwrap();
+
+        let mut found: Vec<String> = storage
+            .query_spans(TraceQuery {
+                project_id,
+                attribute_path: Some(AttributePath {
+                    key: "http.target".to_string(),
+                    path: "/products/42".to_string(),
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|span| span.span_id)
+            .collect();
+        found.sort();
+        assert_eq!(found, vec!["p001", "p002", "p003"], "faceted: {faceted}");
+    }
+}
+
+/// A bounded trace read returns the first spans by start time and no more.
+#[tokio::test]
+async fn test_get_trace_spans_reads_only_the_first_spans_of_a_trace() {
+    let Some((_db, storage)) = setup_storage().await else {
+        return;
+    };
+    let project_id = 32;
+    let base = Utc::now() - Duration::minutes(10);
+    let spans = (0..5)
+        .map(|index| {
+            let mut span = sample_span(
+                project_id,
+                "trace_bounded",
+                &format!("s{index}"),
+                None,
+                "SELECT row",
+                SpanKind::Client,
+                SpanStatusCode::Ok,
+                1.0,
+            );
+            span.start_time = base + Duration::seconds(index);
+            span.end_time = span.start_time + Duration::milliseconds(1);
+            span
+        })
+        .collect();
+    storage.store_spans(spans).await.unwrap();
+
+    let first: Vec<String> = storage
+        .get_trace_spans(project_id, "trace_bounded", 3)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|span| span.span_id)
+        .collect();
+    assert_eq!(first, vec!["s0", "s1", "s2"]);
+    assert_eq!(
+        storage
+            .get_trace(project_id, "trace_bounded")
+            .await
+            .unwrap()
+            .len(),
+        5
     );
 }

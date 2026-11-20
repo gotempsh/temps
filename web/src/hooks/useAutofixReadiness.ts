@@ -4,6 +4,8 @@
 import { useQuery } from '@tanstack/react-query'
 import { getSandboxStatusOptions } from '@/api/client/@tanstack/react-query.gen'
 import { aiProviderCatalogQueryOptions } from '@/lib/ai-provider-catalog-query'
+import { AUTOFIX_CREDENTIALS_PATH } from '@/pages/agent-sandbox/harness-onboarding'
+import { SANDBOX_SETTINGS_PATH } from '@/pages/sandbox-settings/sections'
 
 /**
  * A single prerequisite for running AI autofix. The onboarding dialog renders
@@ -97,13 +99,13 @@ export function useAutofixReadiness(opts?: {
   const steps: AutofixReadinessStep[] = [
     {
       key: 'provider',
-      title: 'Connect an AI provider',
+      title: 'Connect a coding agent',
       description:
-        'Save a credential for Claude or another provider so the agent can run.',
-      summary: 'an AI provider credential',
+        'Save a credential for Claude Code or another coding agent so autofix can run.',
+      summary: 'a coding agent credential',
       done: providerConfigured,
-      ctaLabel: 'Configure provider',
-      to: '/agent-sandbox/providers',
+      ctaLabel: 'Connect agent',
+      to: AUTOFIX_CREDENTIALS_PATH,
     },
     {
       key: 'sandbox',
@@ -113,7 +115,7 @@ export function useAutofixReadiness(opts?: {
       summary: 'a working sandbox',
       done: sandboxReady,
       ctaLabel: 'Open sandbox settings',
-      to: '/agent-sandbox/sandbox',
+      to: SANDBOX_SETTINGS_PATH,
     },
   ]
 

@@ -3,7 +3,6 @@
 
 use std::sync::Arc;
 
-use anyhow::Result as AnyResult;
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -120,8 +119,8 @@ impl AuditOperation for GitBindingAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> AnyResult<String> {
-        serde_json::to_string(self).map_err(Into::into)
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 

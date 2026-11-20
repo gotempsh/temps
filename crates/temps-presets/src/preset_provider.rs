@@ -8,6 +8,7 @@
 //!
 //! This system bridges the existing Preset enum (stored in database) with a modern provider architecture.
 
+use crate::stored_preset::StoredPresetExt;
 use crate::providers::app::App;
 use crate::providers::{
     AngularPresetProvider, AstroPresetProvider, DockerfilePresetProvider, DocusaurusPresetProvider,

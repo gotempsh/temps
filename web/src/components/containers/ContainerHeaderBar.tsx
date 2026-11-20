@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { containerWorkload } from './container-workload'
+import { ContainerRuntimeBadge } from './ContainerRuntime'
+import { Status } from '@temps-sdk/ds'
 import { ContainerInfoResponse } from '@/api/client'
 import { Button } from '@/components/ui/button'
 import {
@@ -29,6 +32,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { useContainerMetricsStream } from './useContainerMetricsStream'
 import { ContainerMetricHistory } from './ContainerMetricHistory'
 import { containerPublicUrls } from './container-public-urls'
+import { uptimeStart } from './container-uptime'
 import { displayUrl } from '@/lib/deployment-url'
 
 type ContainerStatus = string
@@ -83,6 +87,10 @@ export function ContainerHeaderBar({
     selectedContainer?.container_id ?? '',
     isRunning
   )
+  const uptimeFrom = uptimeStart(
+    selectedContainer?.status,
+    metrics?.started_at || selectedContainer?.created_at
+  )
 
   const navItems: {
     id: ContainerTab
@@ -119,19 +127,40 @@ export function ContainerHeaderBar({
                   </code>
                 </div>
               )}
+              {selectedContainer && (
+                <ContainerRuntimeBadge container={selectedContainer} />
+              )}
               {selectedContainer?.node_name && (
                 <div className="inline-flex items-center gap-1.5">
                   <ServerIcon className="size-3.5" aria-hidden="true" />
                   <span>{selectedContainer.node_name}</span>
                 </div>
               )}
-              {(metrics?.started_at || selectedContainer?.created_at) && (
-                <UptimeInline
-                  startedAt={
-                    metrics?.started_at || selectedContainer?.created_at || null
-                  }
-                />
-              )}
+              {selectedContainer &&
+                containerWorkload(selectedContainer) === 'worker' && (
+                  <div
+                    className="inline-flex items-center gap-2"
+                    title={
+                      selectedContainer.health_detail ??
+                      'Deploy-time health; runtime probing is not enabled'
+                    }
+                  >
+                    <span>Background worker</span>
+                    <Status
+                      tone={
+                        selectedContainer.health_state === 'healthy'
+                          ? 'ok'
+                          : selectedContainer.health_state === 'unhealthy'
+                            ? 'error'
+                            : 'idle'
+                      }
+                      label={selectedContainer.health_state || 'unknown'}
+                    />
+                    <span>at deploy</span>
+                  </div>
+                )}
+              {selectedContainer?.container_port != null &&
+                uptimeFrom != null && <UptimeInline startedAt={uptimeFrom} />}
               {(metrics?.restart_count ?? 0) > 0 && (
                 <RestartCountChip count={metrics?.restart_count ?? 0} />
               )}
@@ -252,7 +281,7 @@ export function ContainerHeaderBar({
                 className={`inline-flex items-center gap-2 whitespace-nowrap border-b-2 px-1 py-3 text-sm font-medium transition-colors ${
                   active
                     ? 'border-neutral-900 text-neutral-900 dark:border-white dark:text-white'
-                    : 'border-transparent text-neutral-500 hover:border-neutral-300 hover:text-neutral-800 dark:text-neutral-400 dark:hover:border-neutral-600 dark:hover:text-neutral-200'
+                    : 'border-transparent text-neutral-600 hover:border-neutral-300 hover:text-neutral-800 dark:text-neutral-400 dark:hover:border-neutral-600 dark:hover:text-neutral-200'
                 }`}
                 aria-current={active ? 'page' : undefined}
               >
@@ -330,23 +359,23 @@ function ContainerSwitcher({
               className={`flex-1 rounded-sm px-2 py-1 text-xs font-medium transition-colors ${
                 statusFilter === f.id
                   ? 'bg-neutral-100 text-neutral-900 dark:bg-white/10 dark:text-white'
-                  : 'text-neutral-500 hover:text-neutral-800 dark:text-neutral-400 dark:hover:text-neutral-200'
+                  : 'text-neutral-600 hover:text-neutral-800 dark:text-neutral-400 dark:hover:text-neutral-200'
               }`}
             >
               {f.label}
-              <span className="ml-1 text-neutral-400 dark:text-neutral-500 tabular-nums">
+              <span className="ml-1 text-neutral-600 dark:text-neutral-400 tabular-nums">
                 {f.count}
               </span>
             </button>
           ))}
         </div>
         <DropdownMenuSeparator />
-        <DropdownMenuLabel className="text-xs uppercase tracking-wide text-neutral-500 dark:text-neutral-400">
+        <DropdownMenuLabel className="text-xs uppercase tracking-wide text-neutral-600 dark:text-neutral-400">
           Containers
         </DropdownMenuLabel>
         <div className="max-h-80 overflow-y-auto">
           {containers.length === 0 ? (
-            <div className="px-2 py-4 text-center text-sm text-neutral-500 dark:text-neutral-400">
+            <div className="px-2 py-4 text-center text-sm text-neutral-600 dark:text-neutral-400">
               No containers match this filter
             </div>
           ) : (
@@ -377,7 +406,7 @@ function ContainerSwitcher({
                         {c.service_name || c.container_name}
                       </span>
                     </div>
-                    <span className="truncate font-mono text-xs text-neutral-500 dark:text-neutral-400 pl-3.5">
+                    <span className="truncate font-mono text-xs text-neutral-600 dark:text-neutral-400 pl-3.5">
                       {c.image_name}
                     </span>
                   </div>

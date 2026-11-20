@@ -1,0 +1,96 @@
+export const metadata = {
+  title: 'Share Variables Across Services',
+  description:
+    'Set a variable once on a Project and every service in it receives it. Learn which value wins, how environment scopes and previews work, and how to keep secrets off the command line.',
+  alternates: {
+    canonical: '/docs/share-variables-across-services',
+  },
+}
+
+export const sections = [
+  { title: 'Which value wins', id: 'which-value-wins' },
+  { title: 'Add a shared variable in the console', id: 'add-a-shared-variable-in-the-console' },
+  { title: 'Use the CLI', id: 'use-the-cli' },
+  { title: 'See what a service inherits', id: 'see-what-a-service-inherits' },
+  { title: 'Previews', id: 'previews' },
+]
+
+# Share Variables Across Services
+
+A Project's shared variables reach every service in it, so configuration such as `LOG_LEVEL`, an external API key or a shared database URL is set once instead of on each service. {{ className: 'lead' }}
+
+---
+
+## Which value wins {{ anchor: true, id: 'which-value-wins' }}
+
+For a deployment of a service, from highest to lowest priority:
+
+1. **Values Temps sets for the platform**, such as `SENTRY_DSN` and `TEMPS_API_URL`. A shared variable cannot replace them (`HOST` is the exception).
+2. **The service's own variables.** Where a service variable and a shared variable with the same name both apply, the service's value wins. Use this to override a shared value for one service.
+3. **The project's shared variables.** A shared variable scoped to one environment (for example `production`) wins over the all-environments one with the same name.
+4. **Defaults from linked databases**, such as `DATABASE_URL` from a linked PostgreSQL. A shared variable overrides them.
+
+Names are case-sensitive: `LOG_LEVEL` and `log_level` are two variables. Changes apply on each service's **next deployment**; running containers keep the values they started with. The full order is in the [environment variables reference](/docs/environment-variables#project-variables).
+
+---
+
+## Add a shared variable in the console {{ anchor: true, id: 'add-a-shared-variable-in-the-console' }}
+
+1. Open the project and go to the **Shared variables** tab.
+2. Click **Add variable**.
+3. Enter the **Name** and **Value**.
+4. Choose **Environments**: **All environments**, or only one environment slug such as `production`. The scope cannot be changed later; remove the variable and add it again instead.
+5. Turn on **Secret** for credentials. A secret is write-only: nobody can read the value back, including you. You can still replace it.
+6. For an all-environments variable, choose whether to **Include in previews** (see [Previews](#previews)).
+7. Click **Add variable**.
+
+To change a value, open the variable's menu and choose **Change value**. **Remove** stops services receiving it on their next deployment.
+
+---
+
+## Use the CLI {{ anchor: true, id: 'use-the-cli' }}
+
+```bash
+# Every service, every environment (previews excluded)
+bunx @temps-sdk/cli project-groups vars set acme-shop LOG_LEVEL info
+
+# Only production
+bunx @temps-sdk/cli project-groups vars set acme-shop API_BASE_URL https://api.example.com -e production
+
+# A secret: leave the value out and the CLI asks for it without echoing it
+bunx @temps-sdk/cli project-groups vars set acme-shop PAYMENTS_API_KEY --secret
+
+# Or pipe it, so it never appears in shell history
+cat payments.key | bunx @temps-sdk/cli project-groups vars set acme-shop PAYMENTS_API_KEY --secret --value-stdin
+
+# List (secret values are never shown) and remove
+bunx @temps-sdk/cli project-groups vars list acme-shop
+bunx @temps-sdk/cli project-groups vars unset acme-shop LOG_LEVEL
+```
+
+---
+
+## See what a service inherits {{ anchor: true, id: 'see-what-a-service-inherits' }}
+
+In the console, open the service's **Environment Variables** page. The **Inherited from project** panel lists the shared variables it receives, with a **Manage shared variables** link to the project.
+
+```bash
+bunx @temps-sdk/cli project-groups vars inherited web
+```
+
+Each row says whether the variable applies or is overridden by the service's own variable with the same name.
+
+---
+
+## Previews {{ anchor: true, id: 'previews' }}
+
+Preview environments do not receive all-environments shared variables unless you opt in, so a preview branch never picks up production credentials by accident:
+
+- In the console, turn on **Include in previews** for that variable.
+- In the CLI, pass `--preview` (and `--no-preview` to turn it off again):
+
+```bash
+bunx @temps-sdk/cli project-groups vars set acme-shop FEATURE_FLAGS beta --preview
+```
+
+A variable scoped to one environment slug applies only to environments with that slug. See [Set Up Preview Deployments](/docs/set-up-preview-deployments).

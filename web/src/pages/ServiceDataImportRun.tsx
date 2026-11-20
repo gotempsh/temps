@@ -140,7 +140,7 @@ export function ServiceDataImportRun() {
           aria-label="All imports into this service"
         >
           <ArrowLeft className="h-4 w-4 sm:mr-2" />
-          <span className="hidden sm:inline">All imports</span>
+          <span className="max-sm:sr-only">All imports</span>
         </Link>
       </Button>
       {run && isRunActive(run) && (
@@ -158,7 +158,7 @@ export function ServiceDataImportRun() {
           ) : (
             <XCircle className="h-4 w-4 sm:mr-2" />
           )}
-          <span className="hidden sm:inline">Cancel import</span>
+          <span className="max-sm:sr-only">Cancel import</span>
         </Button>
       )}
       {run && !isRunActive(run) && (
@@ -170,7 +170,7 @@ export function ServiceDataImportRun() {
           }
         >
           <RotateCcw className="h-4 w-4 sm:mr-2" />
-          <span className="hidden sm:inline">Import again</span>
+          <span className="max-sm:sr-only">Import again</span>
         </Button>
       )}
     </div>
@@ -301,7 +301,10 @@ function RunBody({
         </CardHeader>
         <CardContent>
           {run.helper_output ? (
-            <pre className="max-h-[480px] overflow-auto whitespace-pre-wrap rounded-md bg-muted p-4 font-mono text-xs">
+            <pre
+              tabIndex={0}
+              className="max-h-[480px] overflow-auto whitespace-pre-wrap rounded-md bg-muted p-4 font-mono text-xs"
+            >
               {run.helper_output}
             </pre>
           ) : (

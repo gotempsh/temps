@@ -38,17 +38,125 @@ pub enum EventsError {
 /// target it.
 const MAX_NEW_VISITORS_PER_PROJECT_PER_MINUTE: i32 = 120;
 
+/// `crawler_name` recorded on events excluded because their IP belongs to a
+/// hosting/cloud/VPS network. A fixed value (never the ASN organization) so the
+/// column keeps a small, bounded set of values.
+pub const DATACENTER_CRAWLER_NAME: &str = "datacenter";
+
+/// Network attributes of the client IP behind an ingested event, taken from
+/// the (memory-cached) geolocation lookup the ingest handler already does.
+/// Drives datacenter exclusion and the project's IP, network and country
+/// filters without any extra lookup per event.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClientNetwork {
+    pub ip: Option<std::net::IpAddr>,
+    pub asn_number: Option<u32>,
+    /// ISO 3166-1 alpha-2 code.
+    pub country_code: Option<String>,
+    /// Whether the IP is on a hosting/cloud/VPS network. `None` when unknown
+    /// (no ASN database); only `Some(true)` can exclude an event.
+    pub is_hosting_provider: Option<bool>,
+}
+
 pub struct AnalyticsEventsService {
     db: Arc<DatabaseConnection>,
     visitor_creation_limiter: temps_analytics::AnalyticsIngestRateLimiter,
+    traffic_settings: Arc<crate::traffic_settings::ProjectAnalyticsSettingsService>,
+    traffic_filters: Arc<crate::traffic_settings::TrafficFilterService>,
+    referrer_excluded_page_views: Arc<crate::traffic_settings::ReferrerExcludedPageViews>,
 }
 
 impl AnalyticsEventsService {
     pub fn new(db: Arc<DatabaseConnection>) -> Self {
+        let traffic_settings =
+            Arc::new(crate::traffic_settings::ProjectAnalyticsSettingsService::new(db.clone()));
+        let traffic_filters = Arc::new(crate::traffic_settings::TrafficFilterService::new(
+            db.clone(),
+        ));
+        Self::with_traffic_controls(
+            db,
+            traffic_settings,
+            traffic_filters,
+            Arc::new(crate::traffic_settings::ReferrerExcludedPageViews::new()),
+        )
+    }
+
+    /// Construct with shared traffic-settings and traffic-filter services, so
+    /// a change made through the console API invalidates the very caches
+    /// ingest reads.
+    pub fn with_traffic_controls(
+        db: Arc<DatabaseConnection>,
+        traffic_settings: Arc<crate::traffic_settings::ProjectAnalyticsSettingsService>,
+        traffic_filters: Arc<crate::traffic_settings::TrafficFilterService>,
+        referrer_excluded_page_views: Arc<crate::traffic_settings::ReferrerExcludedPageViews>,
+    ) -> Self {
         Self {
             db,
             visitor_creation_limiter: temps_analytics::AnalyticsIngestRateLimiter::new(),
+            traffic_settings,
+            traffic_filters,
+            referrer_excluded_page_views,
         }
+    }
+
+    /// Why an event that is not a user-agent bot should be kept out of the
+    /// project's analytics, as the `crawler_name` to store it with, or `None`
+    /// to count it.
+    ///
+    /// The project's own rules are checked first, then the bundled spam list,
+    /// then datacenter networks, so the recorded reason is the most specific
+    /// one. Every lookup is an in-memory cache read; the settings cache is
+    /// only consulted when the spam list or the hosting verdict could apply.
+    ///
+    /// Every event is checked, whatever its user agent: event reports keep
+    /// bot-classified events, so a bot or a script on a hosting network must
+    /// carry the filter reason to be left out. Server-side events sent through
+    /// the authenticated ingest API record no client network, so the network
+    /// checks never apply to them.
+    async fn traffic_exclusion(
+        &self,
+        project_id: i32,
+        referrer_host: Option<&str>,
+        client: Option<&ClientNetwork>,
+    ) -> Option<&'static str> {
+        // One canonical form for both the user's rules and the spam list, so a
+        // fully qualified `spam.example.` cannot slip past either.
+        let referrer_host = referrer_host.map(crate::traffic_settings::canonical_referrer_host);
+        let referrer_host = referrer_host.as_deref();
+        let filters = self.traffic_filters.compiled(project_id).await;
+        if !filters.is_empty() {
+            let traffic = crate::traffic_settings::TrafficAttributes {
+                referrer_host,
+                ip: client.and_then(|c| c.ip),
+                asn_number: client.and_then(|c| c.asn_number),
+                country_code: client.and_then(|c| c.country_code.as_deref()),
+            };
+            if let Some(kind) = filters.matching_kind(&traffic) {
+                return Some(kind.crawler_name());
+            }
+        }
+
+        if let Some(host) = referrer_host {
+            if crate::traffic_settings::is_spam_referrer(host)
+                && self
+                    .traffic_settings
+                    .exclude_spam_referrers(project_id)
+                    .await
+            {
+                return Some(crate::traffic_settings::SPAM_REFERRER_CRAWLER_NAME);
+            }
+        }
+
+        if client.and_then(|c| c.is_hosting_provider) == Some(true)
+            && self
+                .traffic_settings
+                .exclude_datacenter_traffic(project_id)
+                .await
+        {
+            return Some(DATACENTER_CRAWLER_NAME);
+        }
+
+        None
     }
 
     /// Get custom event counts with filtering and aggregation level
@@ -69,6 +177,10 @@ impl AnalyticsEventsService {
             "timestamp >= $2".to_string(),
             "timestamp <= $3".to_string(),
             "event_name IS NOT NULL".to_string(),
+            // Traffic-filter exclusions. Not every bot verdict: this report
+            // never left those out, and events sent without a user agent
+            // (server-side ingestion) are stored as the bot `unknown`.
+            temps_entities::events::not_excluded_by_traffic_filter(""),
         ];
         let mut values: Vec<sea_orm::Value> =
             vec![project_id.into(), start_date.into(), end_date.into()];
@@ -301,6 +413,10 @@ impl AnalyticsEventsService {
             "project_id = $1".to_string(),
             "timestamp >= $2".to_string(),
             "timestamp <= $3".to_string(),
+            // Traffic-filter exclusions. Not every bot verdict: this report
+            // never left those out, and events sent without a user agent
+            // (server-side ingestion) are stored as the bot `unknown`.
+            temps_entities::events::not_excluded_by_traffic_filter(""),
         ];
         let mut values: Vec<sea_orm::Value> =
             vec![project_id.into(), start_date.into(), end_date.into()];
@@ -392,6 +508,8 @@ impl AnalyticsEventsService {
             "project_id = $1".to_string(),
             "timestamp >= $2".to_string(),
             "timestamp <= $3".to_string(),
+            // The same population as the event counts beside it.
+            temps_entities::events::not_excluded_by_traffic_filter(""),
         ];
         let mut values: Vec<sea_orm::Value> =
             vec![project_id.into(), start_date.into(), end_date.into()];
@@ -950,6 +1068,7 @@ WHERE project_id = $1
             "timestamp >= $2".to_string(),
             "timestamp <= $3".to_string(),
             "event_type = 'page_view'".to_string(),
+            temps_entities::events::not_excluded_by_traffic_filter(""),
         ];
         let mut values: Vec<sea_orm::Value> =
             vec![project_id.into(), start_date.into(), end_date.into()];
@@ -1395,6 +1514,7 @@ WHERE project_id = $1
             "project_id = $1".to_string(),
             "timestamp >= $2::timestamp".to_string(),
             "timestamp <= $3::timestamp".to_string(),
+            temps_entities::events::not_excluded_by_traffic_filter(""),
         ];
         let mut values: Vec<sea_orm::Value> =
             vec![project_id.into(), start_date.into(), end_date.into()];
@@ -1495,6 +1615,10 @@ WHERE project_id = $1
         language: Option<String>,
         page_title: Option<String>,
         ip_geolocation_id: Option<i32>,
+        // Network attributes of the client IP (address, ASN, country, hosting
+        // verdict), for datacenter exclusion and the project's traffic
+        // filters. `None` when there is no client IP on this path.
+        client_network: Option<ClientNetwork>,
         user_agent: Option<String>,
         referrer: Option<String>,
         // Performance metrics (web vitals) - optional
@@ -1555,13 +1679,54 @@ WHERE project_id = $1
         // event row (so analytics read filters on `is_crawler` work).
         let parsed_ua =
             crate::services::user_agent::ParsedUserAgent::from_user_agent(user_agent.as_deref());
-        let is_crawler = parsed_ua.is_bot();
-        let crawler_name = parsed_ua.crawler_name();
+        let ua_is_crawler = parsed_ua.is_bot();
+        // Traffic the project filters out (its own rules, known spam
+        // referrers, datacenter networks) is flagged through the same
+        // `is_crawler` column the UA detector uses, so every analytics read on
+        // both the Postgres and ClickHouse backends excludes it with no query
+        // changes.
+        //
+        // The filters apply to bot-classified events too: reports that keep
+        // bot events (the event reports keep UA-less server-side events) leave
+        // out only filter reasons, so excluded traffic must be recorded as
+        // such whatever its user agent.
+        let exclusion = self
+            .traffic_exclusion(
+                project_id,
+                referrer_hostname.as_deref(),
+                client_network.as_ref(),
+            )
+            .await;
+        let is_crawler = ua_is_crawler || exclusion.is_some();
+        // Speed samples from SDKs that send no referrer follow the page view
+        // they measure; see `ReferrerExcludedPageViews`.
+        if event_name == "page_view" {
+            if let Some(session) = session_id.as_deref() {
+                let excluded_by_referrer = exclusion.is_some_and(|reason| {
+                    reason == crate::traffic_settings::TrafficFilterKind::Referrer.crawler_name()
+                        || reason == crate::traffic_settings::SPAM_REFERRER_CRAWLER_NAME
+                });
+                self.referrer_excluded_page_views
+                    .note_page_view(project_id, session, request_path, excluded_by_referrer)
+                    .await;
+            }
+        }
+        // The event records why it is left out: the filter reason, if any.
+        let crawler_name = exclusion
+            .map(str::to_string)
+            .or_else(|| parsed_ua.crawler_name());
+        // The visitor keeps a bot's own name: a filter reason on a visitor can
+        // be undone by a later counted event, which must not show a bot.
+        let visitor_crawler_name = if ua_is_crawler {
+            parsed_ua.crawler_name()
+        } else {
+            crawler_name.clone()
+        };
 
         // Get visitor from visitor_id from visitors table
         // Convert visitor_id (String) to Option<i32> by looking up the visitor in the database
         let visitor_id_i32 = if let Some(ref visitor_id) = visitor_id {
-            use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter};
+            use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
             use temps_entities::visitor;
 
             // `visitor` is uniquely keyed on (visitor_id, project_id) — the
@@ -1579,7 +1744,7 @@ WHERE project_id = $1
                 .await
                 .map_err(EventsError::Database)?;
 
-            match visitor_record {
+            let touched: Option<i32> = match visitor_record {
                 Some(v) => {
                     // Keep `visitor.last_seen` fresh on every ingested event so
                     // the "live visitors" list (which queries
@@ -1594,10 +1759,38 @@ WHERE project_id = $1
                     if !v.has_activity {
                         active_visitor.has_activity = sea_orm::ActiveValue::Set(true);
                     }
-                    // Flag the visitor as a crawler once any bot-UA event is seen.
-                    // Only escalate (false -> true), never clear it.
-                    if is_crawler && !v.is_crawler {
+                    // A bot user agent flags the visitor for good. Traffic
+                    // filters (datacenter, spam referrer, user rules) judge one
+                    // request: they hide a visitor only while it has no counted
+                    // activity, and a visitor hidden that way reappears with
+                    // its first counted event -- after the rule is removed, or
+                    // when it returns from an allowed network. The filtered
+                    // event itself stays excluded either way.
+                    //
+                    // Concurrent events for one visitor read the same row, so
+                    // the filter-driven writes below are conditional updates
+                    // checked against the stored row, never writes of this
+                    // event's snapshot: a bot verdict another event stored in
+                    // between must not be cleared, and a counted event must
+                    // not be hidden behind.
+                    let flagged_by_filter = v.is_crawler
+                        && crate::traffic_settings::FilteredTrafficReason::from_crawler_name(
+                            v.crawler_name.as_deref(),
+                        ) != crate::traffic_settings::FilteredTrafficReason::Bot;
+                    if ua_is_crawler && (!v.is_crawler || flagged_by_filter) {
+                        // Replacing a filter reason with the bot's name keeps a
+                        // later counted event from un-hiding a real bot.
                         active_visitor.is_crawler = sea_orm::ActiveValue::Set(true);
+                        active_visitor.crawler_name =
+                            sea_orm::ActiveValue::Set(visitor_crawler_name.clone());
+                    } else if let (Some(reason), false, false) =
+                        (exclusion, v.has_activity, v.is_crawler)
+                    {
+                        // A placeholder the proxy created before this first
+                        // event: no counted activity yet, so this is a first
+                        // visit like a lookup miss. Must run before the touch
+                        // below marks the row active.
+                        self.hide_inactive_visitor(v.id, reason).await;
                     }
                     // Backfill first-touch attribution left NULL by a writer
                     // that didn't have it -- specifically `session-replay/init`'s
@@ -1640,10 +1833,24 @@ WHERE project_id = $1
                                 sea_orm::ActiveValue::Set(Some(c.clone()));
                         }
                     }
-                    let _ = active_visitor.update(self.db.as_ref()).await;
-
-                    Some(v.id)
+                    // The retention sweep can delete a visitor between the
+                    // read above and this write; see `touch_visitor`.
+                    let touched = self
+                        .touch_visitor(active_visitor, v.id, visitor_id, project_id)
+                        .await;
+                    // A counted event brings back a filter-hidden visitor. Also
+                    // tried after a first event, which may race an excluded
+                    // one hiding the row.
+                    if touched.is_some() && !is_crawler && (flagged_by_filter || !v.has_activity) {
+                        self.recover_filtered_visitor(v.id).await;
+                    }
+                    touched
                 }
+                None => None,
+            };
+
+            match touched {
+                Some(id) => Some(id),
                 None if !self
                     .visitor_creation_limiter
                     .check(project_id, Some(MAX_NEW_VISITORS_PER_PROJECT_PER_MINUTE))
@@ -1682,8 +1889,13 @@ WHERE project_id = $1
                             environment_id.unwrap_or(0),
                             user_agent.clone(),
                             ip_geolocation_id,
+                            // A visitor whose first event is excluded (a bot,
+                            // or traffic a filter matched) starts out hidden
+                            // from visitor lists; a filter-hidden one
+                            // reappears with its first counted event (see
+                            // above).
                             is_crawler,
-                            crawler_name.clone(),
+                            visitor_crawler_name.clone(),
                             referrer.clone(),
                             referrer_hostname.clone(),
                             Some(channel.to_string()),
@@ -1762,7 +1974,23 @@ WHERE project_id = $1
                     );
                 }
                 Ok(Some(ref session)) if session.visitor_id.is_some() => {
-                    // Row exists with visitor_id already populated — nothing to do.
+                    // Row exists with visitor_id already populated. Keep its
+                    // last_accessed_at following the session's events: keyed
+                    // (SDK) sessions never pass through the proxy, so nothing
+                    // else moves it after the first event.
+                    let now = chrono::Utc::now();
+                    if session_last_access_is_stale(session.last_accessed_at, now) {
+                        if let Err(e) = self.refresh_session_last_access(session_id_str, now).await
+                        {
+                            tracing::warn!(
+                                session_id = %session_id_str,
+                                project_id,
+                                error = %e,
+                                "Failed to refresh request_sessions.last_accessed_at; \
+                                 the event still records"
+                            );
+                        }
+                    }
                 }
                 Ok(maybe_session) => {
                     // Row is missing (None) OR exists with visitor_id = NULL.
@@ -1901,12 +2129,132 @@ WHERE project_id = $1
         Ok(result)
     }
 
+    /// Write the refreshed visitor row for an event, returning its id, or
+    /// `None` when the row is gone.
+    ///
+    /// The retention sweep can delete a visitor between the read in
+    /// `record_event` and this write. Updating a row that is gone reports
+    /// `RecordNotUpdated`, and the event must not then be inserted under the
+    /// stale id: its foreign key would reject the insert and the event would be
+    /// lost. `None` makes the caller resolve the visitor again through the same
+    /// upsert a lookup miss uses, which re-creates the row.
+    ///
+    /// Any other failure (a timeout, a dropped connection) says nothing about
+    /// the row, which still exists: it keeps its id rather than being sent
+    /// through the new-visitor limit and possibly stored without a visitor.
+    async fn touch_visitor(
+        &self,
+        active_visitor: temps_entities::visitor::ActiveModel,
+        row_id: i32,
+        visitor_id: &str,
+        project_id: i32,
+    ) -> Option<i32> {
+        use sea_orm::ActiveModelTrait;
+
+        match active_visitor.update(self.db.as_ref()).await {
+            Ok(_) => Some(row_id),
+            Err(sea_orm::DbErr::RecordNotUpdated) => {
+                tracing::warn!(
+                    visitor_id = %visitor_id,
+                    project_id,
+                    visitor_row_id = row_id,
+                    "Visitor row was removed (retention) before the event could refresh it; \
+                     resolving it again"
+                );
+                None
+            }
+            Err(e) => {
+                tracing::warn!(
+                    visitor_id = %visitor_id,
+                    project_id,
+                    visitor_row_id = row_id,
+                    error = %e,
+                    "Could not refresh an existing visitor row; recording the event against it"
+                );
+                Some(row_id)
+            }
+        }
+    }
+
+    /// Hide a visitor that has no counted activity yet because its first event
+    /// was excluded. Conditional on the row still having no activity and no
+    /// verdict, so a counted event or a bot verdict stored meanwhile wins.
+    /// Failures are logged: the event itself is recorded either way.
+    async fn hide_inactive_visitor(&self, row_id: i32, reason: &'static str) {
+        use sea_orm::sea_query::Expr;
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+        use temps_entities::visitor;
+
+        let result = visitor::Entity::update_many()
+            .col_expr(visitor::Column::IsCrawler, Expr::value(true))
+            .col_expr(visitor::Column::CrawlerName, Expr::value(reason))
+            .filter(visitor::Column::Id.eq(row_id))
+            .filter(visitor::Column::HasActivity.eq(false))
+            .filter(visitor::Column::IsCrawler.eq(false))
+            .exec(self.db.as_ref())
+            .await;
+        if let Err(e) = result {
+            tracing::warn!(
+                visitor_row_id = row_id,
+                reason,
+                error = %e,
+                "Could not hide a visitor whose first event was excluded"
+            );
+        }
+    }
+
+    /// Show again a visitor hidden only by a traffic filter. Conditional on
+    /// the stored reason still being a filter reason, so a bot verdict stored
+    /// by a concurrent event is never cleared.
+    async fn recover_filtered_visitor(&self, row_id: i32) {
+        use sea_orm::sea_query::Expr;
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+        use temps_entities::visitor;
+
+        let result = visitor::Entity::update_many()
+            .col_expr(visitor::Column::IsCrawler, Expr::value(false))
+            .col_expr(
+                visitor::Column::CrawlerName,
+                Expr::value(Option::<String>::None),
+            )
+            .filter(visitor::Column::Id.eq(row_id))
+            .filter(visitor::Column::IsCrawler.eq(true))
+            .filter(
+                visitor::Column::CrawlerName.is_in(
+                    crate::traffic_settings::EXCLUSION_CRAWLER_NAMES
+                        .iter()
+                        .copied(),
+                ),
+            )
+            .exec(self.db.as_ref())
+            .await;
+        if let Err(e) = result {
+            tracing::warn!(
+                visitor_row_id = row_id,
+                error = %e,
+                "Could not show a visitor hidden by a traffic filter again"
+            );
+        }
+    }
+
     /// Upsert a visitor row when an ingested event's cookie doesn't yet have a
     /// matching row in the `visitor` table. Mirrors the proxy's own
     /// `ProxyLogBatchWriter::upsert_visitor` upsert exactly (same columns,
     /// same `ON CONFLICT (visitor_id, project_id)` key) so whichever async
     /// writer -- the proxy's batch flush or this event -- lands first creates
-    /// the canonical row; the other just bumps `last_seen`.
+    /// the canonical row; the other bumps `last_seen`.
+    ///
+    /// Two first events for one visitor can both miss the lookup. The conflict
+    /// branch then reconciles the filter verdict as the lookup-hit path does
+    /// (`recover_filtered_visitor`, `hide_inactive_visitor`), in the same
+    /// statement: a counted event shows again a row only a filter hid, and an
+    /// excluded event hides a placeholder with no activity yet. A bot event
+    /// stores its verdict over a counted row or a filter reason, as on a
+    /// lookup hit, so a later counted event cannot show a real bot again; a
+    /// bot verdict is never changed. Every event stamps `has_activity`, as on a lookup
+    /// hit; the `SET` expressions all read the row as it was before this
+    /// event, so a placeholder a counted event already touched can no longer
+    /// be hidden by a later excluded one.
     #[allow(clippy::too_many_arguments)]
     async fn upsert_visitor_on_miss(
         &self,
@@ -1940,7 +2288,33 @@ WHERE project_id = $1
                 $10, $11, $12, $13, $14, $15
             )
             ON CONFLICT (visitor_id, project_id) DO UPDATE SET
-                last_seen = EXCLUDED.last_seen
+                last_seen = EXCLUDED.last_seen,
+                has_activity = true,
+                is_crawler = CASE
+                    WHEN EXCLUDED.is_crawler
+                         AND NOT COALESCE(EXCLUDED.crawler_name = ANY($16), false)
+                         AND (NOT visitor.is_crawler
+                              OR COALESCE(visitor.crawler_name = ANY($16), false))
+                         THEN true
+                    WHEN NOT EXCLUDED.is_crawler AND visitor.is_crawler
+                         AND visitor.crawler_name = ANY($16) THEN false
+                    WHEN EXCLUDED.is_crawler AND EXCLUDED.crawler_name = ANY($16)
+                         AND NOT visitor.is_crawler AND NOT visitor.has_activity THEN true
+                    ELSE visitor.is_crawler
+                END,
+                crawler_name = CASE
+                    WHEN EXCLUDED.is_crawler
+                         AND NOT COALESCE(EXCLUDED.crawler_name = ANY($16), false)
+                         AND (NOT visitor.is_crawler
+                              OR COALESCE(visitor.crawler_name = ANY($16), false))
+                         THEN EXCLUDED.crawler_name
+                    WHEN NOT EXCLUDED.is_crawler AND visitor.is_crawler
+                         AND visitor.crawler_name = ANY($16) THEN NULL
+                    WHEN EXCLUDED.is_crawler AND EXCLUDED.crawler_name = ANY($16)
+                         AND NOT visitor.is_crawler AND NOT visitor.has_activity
+                         THEN EXCLUDED.crawler_name
+                    ELSE visitor.crawler_name
+                END
             RETURNING id"#,
             [
                 visitor_id.to_string().into(),
@@ -1958,6 +2332,10 @@ WHERE project_id = $1
                 utm_source.into(),
                 utm_medium.into(),
                 utm_campaign.into(),
+                crate::traffic_settings::EXCLUSION_CRAWLER_NAMES
+                    .map(String::from)
+                    .to_vec()
+                    .into(),
             ],
         );
 
@@ -2032,6 +2410,70 @@ WHERE project_id = $1
         self.db.execute(stmt).await.map_err(EventsError::Database)?;
         Ok(())
     }
+
+    /// Moves an existing session row's `last_accessed_at` forward to `now` if
+    /// the stored value is still older than the refresh interval, and returns
+    /// whether it did. The caller's check uses the value it read earlier;
+    /// repeating it in the `WHERE` keeps concurrent events of one stale session
+    /// to a single write per interval (the row lock makes the later ones
+    /// re-check the committed value), and never moves the value backwards.
+    async fn refresh_session_last_access(
+        &self,
+        session_id: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, EventsError> {
+        use sea_orm::ConnectionTrait;
+
+        let stmt = Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            r#"UPDATE request_sessions
+               SET last_accessed_at = $2
+               WHERE session_id = $1 AND last_accessed_at < $3"#,
+            [
+                session_id.to_string().into(),
+                now.into(),
+                session_last_access_refresh_threshold(now).into(),
+            ],
+        );
+
+        let result = self.db.execute(stmt).await.map_err(EventsError::Database)?;
+        Ok(result.rows_affected() > 0)
+    }
+}
+
+/// How stale an existing session row's `last_accessed_at` may get before an
+/// ingested event of that session moves it forward.
+///
+/// The proxy moves `last_accessed_at` on the document responses it tracks, but
+/// keyed (SDK) sessions are not proxied, so without this a continuously active
+/// keyed session would keep the time of its first event for days. Page-flow
+/// analytics bound their reads by the session's `[started_at,
+/// last_accessed_at]` plus a day of slack (`ANALYTICS_ROW_CLOCK_SLACK_HOURS` in
+/// `temps-analytics`), so this interval must stay far below a day. It also
+/// caps the write rate at one small `UPDATE` per active session per interval,
+/// instead of one per event.
+const SESSION_LAST_ACCESS_REFRESH_SECONDS: i64 = 5 * 60;
+
+/// The `last_accessed_at` below which an event ingested at `now` moves a
+/// session row forward (see [`SESSION_LAST_ACCESS_REFRESH_SECONDS`]),
+/// saturated at the minimum timestamp.
+fn session_last_access_refresh_threshold(
+    now: chrono::DateTime<chrono::Utc>,
+) -> chrono::DateTime<chrono::Utc> {
+    now.checked_sub_signed(chrono::Duration::seconds(
+        SESSION_LAST_ACCESS_REFRESH_SECONDS,
+    ))
+    .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC)
+}
+
+/// Whether an event ingested at `now` should move a session row's
+/// `last_accessed_at` forward. The same threshold is repeated in the `UPDATE`
+/// of [`AnalyticsEventsService::refresh_session_last_access`].
+fn session_last_access_is_stale(
+    last_accessed_at: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    last_accessed_at < session_last_access_refresh_threshold(now)
 }
 
 /// Computes the percentage change between two visitor counts for the dashboard
@@ -2318,6 +2760,99 @@ mod tests {
         Database::connect("sqlite::memory:").await
     }
 
+    // ── touch_visitor ────────────────────────────────────────────────────
+
+    fn visitor_row(id: i32) -> temps_entities::visitor::Model {
+        let now = Utc::now();
+        temps_entities::visitor::Model {
+            id,
+            visitor_id: "visitor-uuid".to_string(),
+            project_id: 7,
+            environment_id: 1,
+            first_seen: now,
+            last_seen: now,
+            user_agent: None,
+            ip_address_id: None,
+            is_crawler: false,
+            crawler_name: None,
+            custom_data: None,
+            has_activity: true,
+            first_referrer: None,
+            first_referrer_hostname: None,
+            first_channel: None,
+            first_utm_source: None,
+            first_utm_medium: None,
+            first_utm_campaign: None,
+        }
+    }
+
+    /// The retention sweep can delete a returning visitor between the read and
+    /// the `last_seen` write. The event must not keep the stale row id.
+    #[tokio::test]
+    async fn a_visitor_deleted_before_the_touch_is_not_returned() {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([Vec::<temps_entities::visitor::Model>::new()])
+                .into_connection(),
+        );
+        let service = AnalyticsEventsService::new(db);
+        let row = visitor_row(31);
+        let mut active: temps_entities::visitor::ActiveModel = row.clone().into();
+        active.last_seen = sea_orm::ActiveValue::Set(Utc::now());
+
+        let id = service
+            .touch_visitor(active, row.id, "visitor-uuid", 7)
+            .await;
+
+        assert_eq!(id, None, "a row that is gone must be resolved again");
+    }
+
+    /// A transient failure says nothing about the row: it must keep its id and
+    /// not be sent through the new-visitor limit.
+    #[tokio::test]
+    async fn a_failed_touch_that_is_not_a_missing_row_keeps_the_id() {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_errors([DbErr::Custom("connection reset".into())])
+                .into_connection(),
+        );
+        let service = AnalyticsEventsService::new(db);
+        let row = visitor_row(31);
+        let mut active: temps_entities::visitor::ActiveModel = row.clone().into();
+        active.last_seen = sea_orm::ActiveValue::Set(Utc::now());
+
+        let id = service
+            .touch_visitor(active, row.id, "visitor-uuid", 7)
+            .await;
+
+        assert_eq!(id, Some(31));
+    }
+
+    #[tokio::test]
+    async fn a_touched_visitor_keeps_its_id() {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+
+        let row = visitor_row(31);
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![row.clone()]])
+                .into_connection(),
+        );
+        let service = AnalyticsEventsService::new(db);
+        let mut active: temps_entities::visitor::ActiveModel = row.clone().into();
+        active.last_seen = sea_orm::ActiveValue::Set(Utc::now());
+
+        let id = service
+            .touch_visitor(active, row.id, "visitor-uuid", 7)
+            .await;
+
+        assert_eq!(id, Some(31));
+    }
+
     // ── resolve_site_hostname ────────────────────────────────────────────
 
     #[test]
@@ -2438,12 +2973,6 @@ mod tests {
             resolve_site_hostname(None, &serde_json::json!({ "domain": "192.168.1.5" })),
             "192.168.1.5"
         );
-    }
-
-    #[allow(dead_code)]
-    async fn create_test_events(_db: &DatabaseConnection) {
-        // This test would require the events table schema
-        // For now, this is a template for future tests
     }
 
     #[tokio::test]
@@ -2621,9 +3150,9 @@ mod tests {
     #[tokio::test]
     async fn test_ip_geolocation_integration() {
         use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
-        use temps_database::test_utils::TestDatabase;
         use temps_entities::ip_geolocations;
         use temps_geo::{GeoIpService, IpAddressService};
+        use temps_test_utils::TestDatabase;
 
         let test_db = match TestDatabase::with_migrations().await {
             Ok(db) => db,
@@ -2978,8 +3507,8 @@ mod tests {
     #[tokio::test]
     async fn test_hourly_visits_gap_filling() {
         use sea_orm::{ActiveModelTrait, ActiveValue::Set};
-        use temps_database::test_utils::TestDatabase;
         use temps_entities::{deployments, environments, events, projects, visitor};
+        use temps_test_utils::TestDatabase;
 
         let test_db = match TestDatabase::with_migrations().await {
             Ok(db) => db,
@@ -3198,8 +3727,8 @@ mod tests {
     #[tokio::test]
     async fn test_active_visitors_count_counts_identified_visitors_not_sessions() {
         use sea_orm::{ActiveModelTrait, ActiveValue::Set};
-        use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
         use temps_entities::{deployments, environments, events, projects, visitor};
+        use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
 
         let test_db = match TestDatabase::with_migrations().await {
             Ok(db) => db,
@@ -3363,14 +3892,384 @@ mod tests {
     /// Verifies that `record_event` persists the bot/crawler classification
     /// derived from the User-Agent: a bot UA sets `is_crawler = true` with a
     /// `crawler_name`, while a real browser UA leaves `is_crawler = false`.
+    /// Two first events for one visitor can both miss the lookup; the one
+    /// that loses the insert lands in the upsert's conflict branch. Seed the
+    /// row the winner wrote, run the loser's upsert, and check the verdict.
+    /// Traffic filters store excluded events with `is_crawler = true`; the
+    /// event-count report, the event-type breakdown and the timeline leave
+    /// them out like every other report.
+    #[tokio::test]
+    async fn test_get_events_count_leaves_out_excluded_events() {
+        use sea_orm::{ActiveModelTrait, Set};
+        use temps_entities::{
+            environments, events, projects, source_type::SourceType, upstream_config::UpstreamList,
+        };
+        use temps_test_utils::TestDatabase;
+
+        let test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let now = chrono::Utc::now();
+        let project = projects::ActiveModel {
+            name: Set("events-count".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set("/".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(temps_entities::preset::Preset::NextJs),
+            slug: Set("events-count".to_string()),
+            source_type: Set(SourceType::Git),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("Failed to insert test project");
+        let environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("production".to_string()),
+            slug: Set("production".to_string()),
+            subdomain: Set("events-count".to_string()),
+            host: Set(String::new()),
+            upstreams: Set(UpstreamList::new()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("Failed to insert test environment");
+
+        // A counted event, one an IP rule excluded, and one sent server-side
+        // through the API: no user agent, so stored as the bot `unknown`,
+        // which is not a filter exclusion and must still count.
+        for (session, crawler_name) in [
+            ("counted", None),
+            ("excluded", Some("rule:ip")),
+            ("server-side", Some("unknown")),
+        ] {
+            events::ActiveModel {
+                project_id: Set(project.id),
+                environment_id: Set(Some(environment.id)),
+                session_id: Set(Some(session.to_string())),
+                event_type: Set("custom".to_string()),
+                event_name: Set(Some("signup".to_string())),
+                page_path: Set("/".to_string()),
+                hostname: Set("site.example".to_string()),
+                pathname: Set("/".to_string()),
+                href: Set("https://site.example/".to_string()),
+                timestamp: Set(now),
+                is_crawler: Set(crawler_name.is_some()),
+                crawler_name: Set(crawler_name.map(str::to_string)),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await
+            .expect("Failed to insert test event");
+        }
+
+        // The same three cases as page views, for the visit reports.
+        for (session, crawler_name) in [
+            ("counted", None),
+            ("excluded", Some("rule:referrer")),
+            ("server-side", Some("unknown")),
+        ] {
+            events::ActiveModel {
+                project_id: Set(project.id),
+                environment_id: Set(Some(environment.id)),
+                session_id: Set(Some(session.to_string())),
+                event_type: Set("page_view".to_string()),
+                page_path: Set("/".to_string()),
+                hostname: Set("site.example".to_string()),
+                pathname: Set("/".to_string()),
+                href: Set("https://site.example/".to_string()),
+                timestamp: Set(now),
+                is_crawler: Set(crawler_name.is_some()),
+                crawler_name: Set(crawler_name.map(str::to_string)),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await
+            .expect("Failed to insert test page view");
+        }
+
+        let service = AnalyticsEventsService::new(db.clone());
+        let counts = service
+            .get_events_count(
+                now - chrono::Duration::minutes(1),
+                now + chrono::Duration::minutes(1),
+                project.id,
+                None,
+                None,
+                Some(true),
+                AggregationLevel::Events,
+            )
+            .await
+            .expect("get_events_count failed");
+        let signups: Vec<(i64, f64)> = counts
+            .iter()
+            .filter(|count| count.event_name == "signup")
+            .map(|count| (count.count, count.percentage))
+            .collect();
+        assert_eq!(
+            signups,
+            vec![(2, 100.0)],
+            "the excluded signup was counted, or the server-side one was not"
+        );
+
+        let breakdown = service
+            .get_event_type_breakdown(
+                now - chrono::Duration::minutes(1),
+                now + chrono::Duration::minutes(1),
+                project.id,
+                None,
+                AggregationLevel::Events,
+            )
+            .await
+            .expect("get_event_type_breakdown failed");
+        let customs: Vec<i64> = breakdown
+            .iter()
+            .filter(|row| row.event_type == "custom")
+            .map(|row| row.count)
+            .collect();
+        assert_eq!(
+            customs,
+            vec![2],
+            "the excluded event was in the breakdown, or the server-side one was not"
+        );
+
+        let timeline = service
+            .get_events_timeline(
+                now - chrono::Duration::minutes(1),
+                now + chrono::Duration::minutes(1),
+                project.id,
+                None,
+                Some("signup".to_string()),
+                Some("hour".to_string()),
+                AggregationLevel::Events,
+            )
+            .await
+            .expect("get_events_timeline failed");
+        assert_eq!(
+            timeline.iter().map(|bucket| bucket.count).sum::<i64>(),
+            2,
+            "the excluded signup was on the timeline, or the server-side one was not"
+        );
+
+        let hourly = service
+            .get_hourly_visits(
+                now - chrono::Duration::minutes(1),
+                now + chrono::Duration::minutes(1),
+                project.id,
+                None,
+                AggregationLevel::Events,
+            )
+            .await
+            .expect("get_hourly_visits failed");
+        assert_eq!(
+            hourly.iter().map(|bucket| bucket.count).sum::<i64>(),
+            2,
+            "the excluded page view was in the hourly visits"
+        );
+
+        let buckets = service
+            .get_aggregated_buckets(
+                now - chrono::Duration::minutes(1),
+                now + chrono::Duration::minutes(1),
+                project.id,
+                None,
+                None,
+                AggregationLevel::Events,
+                "1 hour".to_string(),
+            )
+            .await
+            .expect("get_aggregated_buckets failed");
+        assert_eq!(
+            buckets.total, 4,
+            "an excluded event was in the aggregated buckets"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_upsert_on_miss_reconciles_a_concurrent_first_events_verdict() {
+        use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+        use temps_entities::{
+            environments, projects, source_type::SourceType, upstream_config::UpstreamList, visitor,
+        };
+        use temps_test_utils::TestDatabase;
+
+        let test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let now = chrono::Utc::now();
+        let project = projects::ActiveModel {
+            name: Set("upsert-race".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set("/".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(temps_entities::preset::Preset::NextJs),
+            slug: Set("upsert-race".to_string()),
+            source_type: Set(SourceType::Git),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("Failed to insert test project");
+        let environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("production".to_string()),
+            slug: Set("production".to_string()),
+            subdomain: Set("upsert-race".to_string()),
+            host: Set(String::new()),
+            upstreams: Set(UpstreamList::new()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("Failed to insert test environment");
+        let service = AnalyticsEventsService::new(db.clone());
+
+        // (visitor, row the winner wrote, verdicts of the events that lost
+        // the insert, in order, expected verdict)
+        type Verdict = (bool, Option<&'static str>);
+        type Case = (&'static str, (Verdict, bool), &'static [Verdict], Verdict);
+        let cases: [Case; 8] = [
+            (
+                "race-filter-then-counted",
+                ((true, Some("rule:referrer")), true),
+                &[(false, None)],
+                (false, None),
+            ),
+            (
+                "race-bot-then-counted",
+                ((true, Some("Googlebot")), true),
+                &[(false, None)],
+                (true, Some("Googlebot")),
+            ),
+            (
+                "race-placeholder-then-excluded",
+                ((false, None), false),
+                &[(true, Some("rule:asn"))],
+                (true, Some("rule:asn")),
+            ),
+            (
+                "race-counted-then-excluded",
+                ((false, None), true),
+                &[(true, Some("rule:asn"))],
+                (false, None),
+            ),
+            // The proxy's placeholder lands between both lookups and both
+            // inserts: the counted event must mark it active, or the excluded
+            // event that follows would hide a visitor with counted activity.
+            (
+                "race-placeholder-then-counted-then-excluded",
+                ((false, None), false),
+                &[(false, None), (true, Some("rule:referrer"))],
+                (false, None),
+            ),
+            // A bot event replaces a filter reason, as on a lookup hit, so a
+            // counted event after it cannot show the bot again.
+            (
+                "race-filter-then-bot",
+                ((true, Some("rule:referrer")), true),
+                &[(true, Some("Googlebot"))],
+                (true, Some("Googlebot")),
+            ),
+            (
+                "race-filter-then-bot-then-counted",
+                ((true, Some("rule:ip")), true),
+                &[(true, Some("Googlebot")), (false, None)],
+                (true, Some("Googlebot")),
+            ),
+            (
+                "race-counted-then-bot",
+                ((false, None), true),
+                &[(true, Some("Googlebot"))],
+                (true, Some("Googlebot")),
+            ),
+        ];
+        for (visitor_id, ((is_crawler, crawler_name), has_activity), losers, expected) in cases {
+            let row = visitor::ActiveModel {
+                visitor_id: Set(visitor_id.to_string()),
+                project_id: Set(project.id),
+                environment_id: Set(environment.id),
+                first_seen: Set(now),
+                last_seen: Set(now),
+                is_crawler: Set(is_crawler),
+                crawler_name: Set(crawler_name.map(String::from)),
+                has_activity: Set(has_activity),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await
+            .expect("Failed to seed the winner's visitor row");
+
+            for (loser_is_crawler, loser_crawler_name) in losers {
+                let id = service
+                    .upsert_visitor_on_miss(
+                        visitor_id,
+                        project.id,
+                        environment.id,
+                        None,
+                        None,
+                        *loser_is_crawler,
+                        loser_crawler_name.map(String::from),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    .expect("the losing upsert must succeed");
+                assert_eq!(
+                    id, row.id,
+                    "{visitor_id}: the conflict returns the winner's row"
+                );
+            }
+
+            let stored = visitor::Entity::find_by_id(row.id)
+                .one(db.as_ref())
+                .await
+                .expect("visitor query")
+                .expect("visitor row");
+            assert_eq!(
+                (stored.is_crawler, stored.crawler_name.as_deref()),
+                expected,
+                "{visitor_id}"
+            );
+            assert!(
+                stored.has_activity,
+                "{visitor_id}: an event that lost the insert still marks activity"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_record_event_persists_crawler_flag() {
-        use sea_orm::{ActiveModelTrait, Set};
-        use temps_database::test_utils::TestDatabase;
+        use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
         use temps_entities::{
             deployments, environments, projects, source_type::SourceType,
             upstream_config::UpstreamList,
         };
+        use temps_test_utils::TestDatabase;
 
         let test_db: TestDatabase = match TestDatabase::with_migrations().await {
             Ok(db) => db,
@@ -3484,6 +4383,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 Some(bot_ua.to_string()),
                 None,
                 None,
@@ -3525,6 +4425,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 Some(human_ua.to_string()),
                 None,
                 None,
@@ -3546,6 +4447,687 @@ mod tests {
             "real browser UA should have no crawler name"
         );
 
+        // ── Datacenter traffic ──────────────────────────────────────────
+        // A real browser UA from a hosting-network IP is flagged through the
+        // same `is_crawler` column, with the fixed "datacenter" reason.
+        #[allow(clippy::too_many_arguments)]
+        async fn record(
+            service: &AnalyticsEventsService,
+            project_id: i32,
+            environment_id: i32,
+            deployment_id: i32,
+            session: &str,
+            user_agent: &str,
+            client_network: Option<ClientNetwork>,
+            referrer: Option<&str>,
+        ) -> temps_entities::events::Model {
+            service
+                .record_event(
+                    project_id,
+                    Some(environment_id),
+                    Some(deployment_id),
+                    Some(session.to_string()),
+                    None,
+                    "page_view",
+                    serde_json::json!({}),
+                    "/blog/datacenter-test",
+                    "",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    client_network,
+                    Some(user_agent.to_string()),
+                    referrer.map(str::to_string),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .expect("Failed to record datacenter test event")
+        }
+
+        let settings =
+            Arc::new(crate::traffic_settings::ProjectAnalyticsSettingsService::new(db.clone()));
+        let filters = Arc::new(crate::traffic_settings::TrafficFilterService::new(
+            db.clone(),
+        ));
+        let referrer_excluded_views =
+            Arc::new(crate::traffic_settings::ReferrerExcludedPageViews::new());
+        let service = AnalyticsEventsService::with_traffic_controls(
+            db.clone(),
+            settings.clone(),
+            filters.clone(),
+            referrer_excluded_views.clone(),
+        );
+        let (p, e, d) = (project.id, environment.id, deployment.id);
+        let hosting = |is_hosting: bool| {
+            Some(ClientNetwork {
+                is_hosting_provider: Some(is_hosting),
+                ..Default::default()
+            })
+        };
+
+        let dc = record(
+            &service,
+            p,
+            e,
+            d,
+            "dc-session",
+            human_ua,
+            hosting(true),
+            None,
+        )
+        .await;
+        assert!(dc.is_crawler, "hosting IP must be excluded by default");
+        assert_eq!(dc.crawler_name.as_deref(), Some(DATACENTER_CRAWLER_NAME));
+
+        let residential = record(
+            &service,
+            p,
+            e,
+            d,
+            "isp-session",
+            human_ua,
+            hosting(false),
+            None,
+        )
+        .await;
+        assert!(!residential.is_crawler, "a non-hosting IP is a visitor");
+
+        let unknown = record(&service, p, e, d, "unknown-session", human_ua, None, None).await;
+        assert!(
+            !unknown.is_crawler,
+            "an unknown hosting verdict (no ASN database) must not exclude"
+        );
+
+        let bot_on_dc = record(
+            &service,
+            p,
+            e,
+            d,
+            "bot-dc-session",
+            bot_ua,
+            hosting(true),
+            None,
+        )
+        .await;
+        assert_eq!(
+            bot_on_dc.crawler_name.as_deref(),
+            Some("datacenter"),
+            "a bot on a hosting network is left out of the event reports, \
+             which keep bot events, like any other datacenter traffic"
+        );
+        // Nor does it depend on there being a user agent: a script posting to
+        // the public endpoint from a hosting network is excluded too.
+        let script_on_dc = record(
+            &service,
+            p,
+            e,
+            d,
+            "script-on-dc-session",
+            "",
+            hosting(true),
+            None,
+        )
+        .await;
+        assert_eq!(script_on_dc.crawler_name.as_deref(), Some("datacenter"));
+
+        // The project opts out: datacenter traffic is counted again.
+        settings
+            .update(
+                p,
+                crate::traffic_settings::ProjectAnalyticsSettingsPatch {
+                    exclude_datacenter_traffic: Some(false),
+                    exclude_spam_referrers: None,
+                },
+            )
+            .await
+            .expect("Failed to opt the project out of datacenter exclusion");
+        let opted_out = record(
+            &service,
+            p,
+            e,
+            d,
+            "dc-optout-session",
+            human_ua,
+            hosting(true),
+            None,
+        )
+        .await;
+        assert!(
+            !opted_out.is_crawler,
+            "with exclusion off, hosting traffic is counted"
+        );
+
+        // ── Bundled referrer-spam list ──────────────────────────────────
+        // `0-0.fr` is on the bundled list; a subdomain matches too.
+        let spam = record(
+            &service,
+            p,
+            e,
+            d,
+            "spam-session",
+            human_ua,
+            None,
+            Some("https://www.0-0.fr/landing"),
+        )
+        .await;
+        assert!(
+            spam.is_crawler,
+            "a listed spam referrer is excluded by default"
+        );
+        assert_eq!(
+            spam.crawler_name.as_deref(),
+            Some(crate::traffic_settings::SPAM_REFERRER_CRAWLER_NAME)
+        );
+        let real_referral = record(
+            &service,
+            p,
+            e,
+            d,
+            "referral-session",
+            human_ua,
+            None,
+            Some("https://news.example-referrer.test/post"),
+        )
+        .await;
+        assert!(!real_referral.is_crawler, "an ordinary referrer is counted");
+
+        // ── Project rules ───────────────────────────────────────────────
+        use crate::traffic_settings::{NewTrafficFilter, TrafficFilterKind};
+        for (kind, value) in [
+            (TrafficFilterKind::Referrer, "example-referrer.test"),
+            (TrafficFilterKind::Ip, "203.0.113.0/24"),
+            (TrafficFilterKind::Asn, "64500"),
+        ] {
+            filters
+                .create(
+                    p,
+                    NewTrafficFilter {
+                        kind,
+                        value: value.to_string(),
+                        note: None,
+                    },
+                    None,
+                )
+                .await
+                .unwrap_or_else(|err| panic!("Failed to create {kind} rule {value}: {err}"));
+        }
+
+        let banned_referrer = record(
+            &service,
+            p,
+            e,
+            d,
+            "rule-referrer-session",
+            human_ua,
+            None,
+            Some("https://news.example-referrer.test/post"),
+        )
+        .await;
+        assert_eq!(
+            banned_referrer.crawler_name.as_deref(),
+            Some("rule:referrer"),
+            "a referrer rule covers subdomains and takes effect immediately"
+        );
+
+        let banned_ip = record(
+            &service,
+            p,
+            e,
+            d,
+            "rule-ip-session",
+            human_ua,
+            Some(ClientNetwork {
+                ip: Some("203.0.113.42".parse().expect("test IP")),
+                // A rule outranks the datacenter verdict as the reason.
+                is_hosting_provider: Some(true),
+                ..Default::default()
+            }),
+            None,
+        )
+        .await;
+        assert_eq!(banned_ip.crawler_name.as_deref(), Some("rule:ip"));
+
+        let banned_asn = record(
+            &service,
+            p,
+            e,
+            d,
+            "rule-asn-session",
+            human_ua,
+            Some(ClientNetwork {
+                asn_number: Some(64500),
+                ..Default::default()
+            }),
+            None,
+        )
+        .await;
+        assert_eq!(banned_asn.crawler_name.as_deref(), Some("rule:asn"));
+
+        let other_network = record(
+            &service,
+            p,
+            e,
+            d,
+            "other-asn-session",
+            human_ua,
+            Some(ClientNetwork {
+                ip: Some("198.51.100.1".parse().expect("test IP")),
+                asn_number: Some(64501),
+                ..Default::default()
+            }),
+            None,
+        )
+        .await;
+        assert!(
+            !other_network.is_crawler,
+            "traffic no rule matches is counted"
+        );
+
+        // The summary reflects what was just recorded.
+        let summary = filters
+            .filtered_traffic(p, 1)
+            .await
+            .expect("Failed to summarise filtered traffic");
+        let count = |reason| {
+            summary
+                .filtered
+                .iter()
+                .find(|c| c.reason == reason)
+                .map(|c| c.events)
+                .unwrap_or(0)
+        };
+        use crate::traffic_settings::FilteredTrafficReason as R;
+        assert!(count(R::Datacenter) >= 1);
+        assert_eq!(count(R::SpamReferrer), 1);
+        assert_eq!(count(R::ReferrerRule), 1);
+        assert_eq!(count(R::IpRule), 1);
+        assert_eq!(count(R::AsnRule), 1);
+        assert!(summary.counted_events >= 1);
+
+        // ── Rules apply whatever the user agent ─────────────────────────
+        // Event reports keep bot-classified events (UA-less server-side
+        // events are stored as the bot `unknown`) and leave out only filter
+        // reasons, so an excluded source must be recorded as such even when
+        // it sends no user agent or a bot's.
+        let banned_ip_without_ua = record(
+            &service,
+            p,
+            e,
+            d,
+            "rule-ip-no-ua-session",
+            "",
+            Some(ClientNetwork {
+                ip: Some("203.0.113.42".parse().expect("test IP")),
+                ..Default::default()
+            }),
+            None,
+        )
+        .await;
+        assert_eq!(
+            banned_ip_without_ua.crawler_name.as_deref(),
+            Some("rule:ip"),
+            "a UA-less event from an excluded IP must carry the rule"
+        );
+        let banned_asn_bot = record(
+            &service,
+            p,
+            e,
+            d,
+            "rule-asn-bot-session",
+            bot_ua,
+            Some(ClientNetwork {
+                asn_number: Some(64500),
+                ..Default::default()
+            }),
+            None,
+        )
+        .await;
+        assert_eq!(banned_asn_bot.crawler_name.as_deref(), Some("rule:asn"));
+        // Server-side events from the authenticated ingest API carry no client
+        // network, so they stay the counted bot `unknown`.
+        let server_side = record(&service, p, e, d, "server-side-session", "", None, None).await;
+        assert_eq!(server_side.crawler_name.as_deref(), Some("unknown"));
+        // The visitor of a bot from an excluded IP keeps the bot's name: a
+        // filter reason could be undone by a later counted event.
+        service
+            .record_event(
+                p,
+                Some(e),
+                Some(d),
+                Some("rule-ip-bot-visitor-session".to_string()),
+                Some("bot-from-banned-ip".to_string()),
+                "page_view",
+                serde_json::json!({}),
+                "/blog/datacenter-test",
+                "",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(ClientNetwork {
+                    ip: Some("203.0.113.43".parse().expect("test IP")),
+                    ..Default::default()
+                }),
+                Some(bot_ua.to_string()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("Failed to record a bot event from an excluded IP");
+        let bot_visitor = temps_entities::visitor::Entity::find()
+            .filter(temps_entities::visitor::Column::VisitorId.eq("bot-from-banned-ip"))
+            .one(db.as_ref())
+            .await
+            .expect("Failed to read the bot visitor")
+            .expect("the bot visitor must exist");
+        assert_eq!(
+            (bot_visitor.is_crawler, bot_visitor.crawler_name.as_deref()),
+            (true, Some("claudebot"))
+        );
+
+        // A page view a referrer rule excluded is noted for Speed samples
+        // from SDKs that send no referrer; the session's next counted view of
+        // the same page replaces it.
+        let from_excluded_referrer = record(
+            &service,
+            p,
+            e,
+            d,
+            "speed-follow-session",
+            human_ua,
+            None,
+            Some("https://news.example-referrer.test/post"),
+        )
+        .await;
+        assert_eq!(
+            from_excluded_referrer.crawler_name.as_deref(),
+            Some("rule:referrer")
+        );
+        assert!(referrer_excluded_views.contains(
+            p,
+            "speed-follow-session",
+            "/blog/datacenter-test"
+        ));
+        record(
+            &service,
+            p,
+            e,
+            d,
+            "speed-follow-session",
+            human_ua,
+            None,
+            Some("https://search.example/"),
+        )
+        .await;
+        assert!(!referrer_excluded_views.contains(
+            p,
+            "speed-follow-session",
+            "/blog/datacenter-test"
+        ));
+
+        // A fully qualified referrer host (trailing root dot) is the same
+        // host to the spam list.
+        let fqdn_spam = record(
+            &service,
+            p,
+            e,
+            d,
+            "fqdn-spam-session",
+            human_ua,
+            None,
+            Some("https://www.0-0.fr./landing"),
+        )
+        .await;
+        assert_eq!(
+            fqdn_spam.crawler_name.as_deref(),
+            Some(crate::traffic_settings::SPAM_REFERRER_CRAWLER_NAME)
+        );
+
+        // ── Filters never escalate an existing human visitor ────────────
+        // One request from an excluded network (a VPN, say) is excluded on
+        // its own, but must not hide the visitor from visitor lists for good.
+        let visit_as = |visitor: &'static str,
+                        session: &'static str,
+                        user_agent: &'static str,
+                        client: Option<ClientNetwork>| {
+            service.record_event(
+                p,
+                Some(e),
+                Some(d),
+                Some(session.to_string()),
+                Some(visitor.to_string()),
+                "page_view",
+                serde_json::json!({}),
+                "/blog/returning",
+                "",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                client,
+                Some(user_agent.to_string()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        };
+        let visit = |session: &'static str, client: Option<ClientNetwork>| {
+            visit_as("returning-visitor-0001", session, human_ua, client)
+        };
+        let load_visitor = |id: i32| {
+            let db = db.clone();
+            async move {
+                <temps_entities::visitor::Entity as sea_orm::EntityTrait>::find_by_id(id)
+                    .one(db.as_ref())
+                    .await
+                    .expect("Failed to load the visitor")
+                    .expect("the visitor exists")
+            }
+        };
+        let first = visit("returning-session-1", None)
+            .await
+            .expect("Failed to record the visitor's first event");
+        assert!(!first.is_crawler);
+        // Arrives once from the network the AS64500 rule excludes.
+        let over_vpn = visit(
+            "returning-session-2",
+            Some(ClientNetwork {
+                asn_number: Some(64500),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("Failed to record the visitor's filtered event");
+        assert_eq!(over_vpn.crawler_name.as_deref(), Some("rule:asn"));
+        assert_eq!(over_vpn.visitor_id, first.visitor_id);
+        let visitor_id = first.visitor_id.expect("the event has a visitor");
+        let visitor =
+            <temps_entities::visitor::Entity as sea_orm::EntityTrait>::find_by_id(visitor_id)
+                .one(db.as_ref())
+                .await
+                .expect("Failed to load the visitor")
+                .expect("the visitor exists");
+        assert!(
+            !visitor.is_crawler,
+            "a filtered event must not flag an existing human visitor"
+        );
+
+        // ── A visitor first seen through a filter recovers ──────────────
+        // Its first event comes from the excluded network, so the visitor
+        // row starts out hidden; its first counted event brings it back.
+        let excluded_network = || {
+            Some(ClientNetwork {
+                asn_number: Some(64500),
+                ..Default::default()
+            })
+        };
+        let filtered_first = visit_as(
+            "filtered-first-visitor",
+            "filtered-first-session-1",
+            human_ua,
+            excluded_network(),
+        )
+        .await
+        .expect("Failed to record the filtered first event");
+        let filtered_first_id = filtered_first.visitor_id.expect("the event has a visitor");
+        let hidden = load_visitor(filtered_first_id).await;
+        assert!(
+            hidden.is_crawler,
+            "a filtered first event hides the new visitor"
+        );
+        assert_eq!(hidden.crawler_name.as_deref(), Some("rule:asn"));
+        let counted = visit_as(
+            "filtered-first-visitor",
+            "filtered-first-session-2",
+            human_ua,
+            None,
+        )
+        .await
+        .expect("Failed to record the counted event");
+        assert!(!counted.is_crawler);
+        let recovered = load_visitor(filtered_first_id).await;
+        assert!(
+            !recovered.is_crawler,
+            "a counted event must bring back a visitor hidden only by a filter"
+        );
+        assert_eq!(recovered.crawler_name, None);
+
+        // ── ...but a bot stays hidden ───────────────────────────────────
+        // Filtered first, then seen with a bot user agent: the bot verdict
+        // replaces the filter reason, so a later browser-looking event from
+        // the same id does not un-hide it.
+        let bot_visitor = visit_as(
+            "filtered-then-bot-visitor",
+            "filtered-then-bot-session-1",
+            human_ua,
+            excluded_network(),
+        )
+        .await
+        .expect("Failed to record the filtered first event");
+        let bot_visitor_id = bot_visitor.visitor_id.expect("the event has a visitor");
+        visit_as(
+            "filtered-then-bot-visitor",
+            "filtered-then-bot-session-2",
+            bot_ua,
+            None,
+        )
+        .await
+        .expect("Failed to record the bot event");
+        visit_as(
+            "filtered-then-bot-visitor",
+            "filtered-then-bot-session-3",
+            human_ua,
+            None,
+        )
+        .await
+        .expect("Failed to record the browser-looking event");
+        let bot = load_visitor(bot_visitor_id).await;
+        assert!(bot.is_crawler, "a visitor seen as a bot stays hidden");
+        assert_eq!(bot.crawler_name.as_deref(), Some("claudebot"));
+
+        // ── Recovery never clears a bot verdict stored meanwhile ────────
+        // Two events for one filter-hidden visitor read the same row: a bot
+        // event stores its verdict, then the counted event's recovery runs
+        // with its stale snapshot. The conditional update must leave the bot.
+        let raced = visit_as(
+            "recovery-race-visitor",
+            "recovery-race-session-1",
+            human_ua,
+            excluded_network(),
+        )
+        .await
+        .expect("Failed to record the filtered first event");
+        let raced_id = raced.visitor_id.expect("the event has a visitor");
+        visit_as(
+            "recovery-race-visitor",
+            "recovery-race-session-2",
+            bot_ua,
+            None,
+        )
+        .await
+        .expect("Failed to record the bot event");
+        service.recover_filtered_visitor(raced_id).await;
+        let still_bot = load_visitor(raced_id).await;
+        assert!(
+            still_bot.is_crawler,
+            "a stale recovery must not un-hide a bot"
+        );
+        assert_eq!(still_bot.crawler_name.as_deref(), Some("claudebot"));
+
+        // ── A proxy placeholder is a first visit ────────────────────────
+        // The proxy can create the visitor row (no activity, no verdict)
+        // before the first ingested event. An excluded first event hides it
+        // like a lookup miss would; a counted event shows it again.
+        let placeholder = temps_entities::visitor::ActiveModel {
+            visitor_id: Set("proxy-placeholder-visitor".to_string()),
+            project_id: Set(p),
+            environment_id: Set(e),
+            first_seen: Set(chrono::Utc::now()),
+            last_seen: Set(chrono::Utc::now()),
+            user_agent: Set(Some(human_ua.to_string())),
+            is_crawler: Set(false),
+            has_activity: Set(false),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("Failed to insert the proxy placeholder");
+        let excluded_first = visit_as(
+            "proxy-placeholder-visitor",
+            "proxy-placeholder-session-1",
+            human_ua,
+            excluded_network(),
+        )
+        .await
+        .expect("Failed to record the excluded first event");
+        assert_eq!(excluded_first.visitor_id, Some(placeholder.id));
+        let hidden_placeholder = load_visitor(placeholder.id).await;
+        assert!(
+            hidden_placeholder.is_crawler,
+            "an excluded first event hides a placeholder with no activity"
+        );
+        assert_eq!(hidden_placeholder.crawler_name.as_deref(), Some("rule:asn"));
+        assert!(hidden_placeholder.has_activity);
+        visit_as(
+            "proxy-placeholder-visitor",
+            "proxy-placeholder-session-2",
+            human_ua,
+            None,
+        )
+        .await
+        .expect("Failed to record the counted event");
+        assert!(
+            !load_visitor(placeholder.id).await.is_crawler,
+            "a counted event shows the placeholder visitor again"
+        );
+
         println!("✅ record_event crawler-flag persistence test passed!");
     }
 
@@ -3560,11 +5142,11 @@ mod tests {
     #[tokio::test]
     async fn test_record_event_classifies_self_referral_as_direct() {
         use sea_orm::{ActiveModelTrait, Set};
-        use temps_database::test_utils::TestDatabase;
         use temps_entities::{
             deployments, environments, projects, source_type::SourceType,
             upstream_config::UpstreamList,
         };
+        use temps_test_utils::TestDatabase;
 
         let test_db: TestDatabase = match TestDatabase::with_migrations().await {
             Ok(db) => db,
@@ -3679,6 +5261,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 Some(
                     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
                         .to_string(),
@@ -3724,6 +5307,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 Some(
                     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
                         .to_string(),
@@ -3759,11 +5343,11 @@ mod tests {
     #[tokio::test]
     async fn test_record_event_creates_visitor_on_lookup_miss() {
         use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
-        use temps_database::test_utils::TestDatabase;
         use temps_entities::{
             deployments, environments, projects, source_type::SourceType,
             upstream_config::UpstreamList, visitor,
         };
+        use temps_test_utils::TestDatabase;
 
         let test_db: TestDatabase = match TestDatabase::with_migrations().await {
             Ok(db) => db,
@@ -3891,6 +5475,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 Some(human_ua.to_string()),
                 Some("https://news.ycombinator.com/".to_string()),
                 None,
@@ -3956,6 +5541,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 Some(human_ua.to_string()),
                 None,
                 None,
@@ -3984,10 +5570,10 @@ mod tests {
     #[tokio::test]
     async fn test_record_event_backfills_attribution_on_existing_null_visitor() {
         use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
-        use temps_database::test_utils::TestDatabase;
         use temps_entities::{
             environments, projects, source_type::SourceType, upstream_config::UpstreamList, visitor,
         };
+        use temps_test_utils::TestDatabase;
 
         let test_db: TestDatabase = match TestDatabase::with_migrations().await {
             Ok(db) => db,
@@ -4085,6 +5671,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 Some("Mozilla/5.0".to_string()),
                 Some("https://example-referrer.test/".to_string()),
                 None,
@@ -4146,6 +5733,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 Some("Mozilla/5.0".to_string()),
                 Some("https://example.com/other-referrer".to_string()),
                 None,
@@ -4187,10 +5775,10 @@ mod tests {
         use sea_orm::{
             ActiveModelTrait, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, Set,
         };
-        use temps_database::test_utils::TestDatabase;
         use temps_entities::{
             environments, projects, source_type::SourceType, upstream_config::UpstreamList, visitor,
         };
+        use temps_test_utils::TestDatabase;
 
         let test_db: TestDatabase = match TestDatabase::with_migrations().await {
             Ok(db) => db,
@@ -4283,6 +5871,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
                 )
                 .await
                 .expect("Failed to record event while under the cap");
@@ -4328,6 +5917,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .expect("Failed to record event over the cap");
@@ -4351,7 +5941,9 @@ mod tests {
     /// Regression test: `record_event` must self-heal the `request_sessions`
     /// table when the proxy's async `ProxyLogBatchWriter` hasn't flushed the
     /// session row yet (timing miss), or when it created one with
-    /// `visitor_id = NULL` due to a prior FK-cache failure.
+    /// `visitor_id = NULL` due to a prior FK-cache failure, and must keep an
+    /// existing row's `last_accessed_at` following the session's events
+    /// (throttled by `SESSION_LAST_ACCESS_REFRESH_SECONDS`).
     ///
     /// Without this fix:
     ///  - `get_visitor_sessions_by_id` (LEFT JOIN on rs.id, decoded into a
@@ -4360,11 +5952,11 @@ mod tests {
     #[tokio::test]
     async fn test_record_event_creates_session_on_lookup_miss() {
         use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
-        use temps_database::test_utils::TestDatabase;
         use temps_entities::{
             deployments, environments, projects, request_sessions, source_type::SourceType,
             upstream_config::UpstreamList,
         };
+        use temps_test_utils::TestDatabase;
 
         let test_db: TestDatabase = match TestDatabase::with_migrations().await {
             Ok(db) => db,
@@ -4494,6 +6086,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 Some("https://news.ycombinator.com/".to_string()),
                 None,
                 None,
@@ -4590,6 +6183,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .expect("record_event must succeed for a session with NULL visitor_id");
@@ -4615,7 +6209,177 @@ mod tests {
             "orphaned request_sessions.visitor_id must be backfilled by record_event"
         );
 
+        // ── Case (c): a complete row keeps following the session's events ────
+        // A keyed (SDK) session is never proxied, so only event ingest can move
+        // its last_accessed_at. Age the row created in case (a) by three days.
+        let aged = chrono::Utc::now() - chrono::Duration::days(3);
+        request_sessions::ActiveModel {
+            id: Set(created_session.id),
+            last_accessed_at: Set(aged),
+            ..Default::default()
+        }
+        .update(db.as_ref())
+        .await
+        .expect("Failed to age the request_sessions row");
+
+        let record_on_fresh_session = |path: &'static str| {
+            service.record_event(
+                project.id,
+                Some(environment.id),
+                Some(deployment.id),
+                Some(fresh_session_id.clone()),
+                Some(fresh_visitor_id.clone()),
+                "page_view",
+                serde_json::json!({}),
+                path,
+                "",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        };
+        let before_refresh = chrono::Utc::now();
+        record_on_fresh_session("/later")
+            .await
+            .expect("record_event must succeed for a session with a stale row");
+        let refreshed = request_sessions::Entity::find()
+            .filter(request_sessions::Column::SessionId.eq(fresh_session_id.clone()))
+            .one(db.as_ref())
+            .await
+            .expect("query refreshed session")
+            .expect("refreshed request_sessions row must still exist");
+        assert!(
+            refreshed.last_accessed_at >= before_refresh,
+            "a stale last_accessed_at ({aged}) must move to the event's time, got {}",
+            refreshed.last_accessed_at
+        );
+        assert_eq!(
+            refreshed.started_at, created_session.started_at,
+            "refreshing last_accessed_at must leave started_at alone"
+        );
+
+        // ── Case (d): a recently refreshed row is not written again ──────────
+        record_on_fresh_session("/later/again")
+            .await
+            .expect("record_event must succeed for a recently refreshed session");
+        let unchanged = request_sessions::Entity::find()
+            .filter(request_sessions::Column::SessionId.eq(fresh_session_id.clone()))
+            .one(db.as_ref())
+            .await
+            .expect("query recently refreshed session")
+            .expect("request_sessions row must still exist");
+        assert_eq!(
+            unchanged.last_accessed_at, refreshed.last_accessed_at,
+            "an event within the refresh interval must not rewrite last_accessed_at"
+        );
+
+        // ── Case (e): concurrent events of one stale session write once ──────
+        // Each of them read the stale row before any refresh landed, so each
+        // passed the caller's check; the UPDATE's own threshold must stop all
+        // but the first, whatever timestamps they carry.
+        request_sessions::ActiveModel {
+            id: Set(created_session.id),
+            last_accessed_at: Set(aged),
+            ..Default::default()
+        }
+        .update(db.as_ref())
+        .await
+        .expect("Failed to age the request_sessions row again");
+        let race_base = chrono::Utc::now();
+        assert!(session_last_access_is_stale(aged, race_base));
+        let racers = tokio::join!(
+            service.refresh_session_last_access(&fresh_session_id, race_base),
+            service.refresh_session_last_access(
+                &fresh_session_id,
+                race_base + chrono::Duration::milliseconds(1)
+            ),
+            service.refresh_session_last_access(
+                &fresh_session_id,
+                race_base + chrono::Duration::milliseconds(2)
+            ),
+            service.refresh_session_last_access(
+                &fresh_session_id,
+                race_base + chrono::Duration::milliseconds(3)
+            ),
+        );
+        let writes = [racers.0, racers.1, racers.2, racers.3]
+            .into_iter()
+            .map(|r| r.expect("concurrent refresh must not fail"))
+            .filter(|wrote| *wrote)
+            .count();
+        assert_eq!(
+            writes, 1,
+            "concurrent refreshes of one stale session must write exactly once"
+        );
+
+        // A later refresh still inside the interval of the stored value is a
+        // no-op even though its timestamp is newer; one past it writes again.
+        let stored = request_sessions::Entity::find()
+            .filter(request_sessions::Column::SessionId.eq(fresh_session_id.clone()))
+            .one(db.as_ref())
+            .await
+            .expect("query raced session")
+            .expect("request_sessions row must still exist")
+            .last_accessed_at;
+        let interval = chrono::Duration::seconds(SESSION_LAST_ACCESS_REFRESH_SECONDS);
+        assert!(
+            !service
+                .refresh_session_last_access(&fresh_session_id, stored + interval)
+                .await
+                .expect("refresh at the interval edge"),
+            "a refresh exactly one interval after the stored value must not write"
+        );
+        assert!(
+            service
+                .refresh_session_last_access(
+                    &fresh_session_id,
+                    stored + interval + chrono::Duration::seconds(1)
+                )
+                .await
+                .expect("refresh past the interval"),
+            "a refresh past the interval must write"
+        );
+
         println!("✅ record_event session-race regression test passed!");
+    }
+
+    #[test]
+    fn test_session_last_access_is_stale_boundaries() {
+        let now = chrono::Utc::now();
+        let interval = chrono::Duration::seconds(SESSION_LAST_ACCESS_REFRESH_SECONDS);
+        assert!(!session_last_access_is_stale(now, now));
+        assert!(!session_last_access_is_stale(now - interval, now));
+        assert!(session_last_access_is_stale(
+            now - interval - chrono::Duration::seconds(1),
+            now
+        ));
+        assert!(session_last_access_is_stale(
+            now - chrono::Duration::days(3),
+            now
+        ));
+        // A row stamped ahead of this node's clock is left alone.
+        assert!(!session_last_access_is_stale(
+            now + chrono::Duration::minutes(10),
+            now
+        ));
+        assert!(
+            interval < chrono::Duration::hours(1),
+            "the refresh interval must stay far below the analytics row clock slack (a day)"
+        );
     }
 
     /// Regression test for the dashboard "visitors in last 24h" trend badge showing
@@ -4631,8 +6395,8 @@ mod tests {
     async fn test_dashboard_projects_analytics_survives_empty_continuous_aggregate() {
         use chrono::Duration;
         use sea_orm::{ActiveModelTrait, ActiveValue::Set};
-        use temps_database::test_utils::TestDatabase;
         use temps_entities::{deployments, environments, events, projects, visitor};
+        use temps_test_utils::TestDatabase;
 
         let test_db: TestDatabase = match TestDatabase::with_migrations().await {
             Ok(db) => db,
@@ -4948,11 +6712,11 @@ mod tests {
     #[tokio::test]
     async fn test_property_breakdown_excludes_zero_visitor_referrers() {
         use sea_orm::{ActiveModelTrait, Set};
-        use temps_database::test_utils::TestDatabase;
         use temps_entities::{
             deployments, environments, projects, source_type::SourceType,
             upstream_config::UpstreamList, visitor,
         };
+        use temps_test_utils::TestDatabase;
 
         let test_db: TestDatabase = match TestDatabase::with_migrations().await {
             Ok(db) => db,
@@ -5080,6 +6844,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 Some(
                     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
                         .to_string(),
@@ -5110,6 +6875,7 @@ mod tests {
                 "/",
                 "",
                 None, // site_hostname
+                None,
                 None,
                 None,
                 None,
@@ -5172,11 +6938,11 @@ mod tests {
     #[tokio::test]
     async fn test_property_breakdown_excludes_crawlers() {
         use sea_orm::{ActiveModelTrait, Set};
-        use temps_database::test_utils::TestDatabase;
         use temps_entities::{
             deployments, environments, projects, source_type::SourceType,
             upstream_config::UpstreamList,
         };
+        use temps_test_utils::TestDatabase;
 
         let test_db: TestDatabase = match TestDatabase::with_migrations().await {
             Ok(db) => db,
@@ -5291,6 +7057,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 Some(
                     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
                         .to_string(),
@@ -5318,6 +7085,7 @@ mod tests {
                 "/",
                 "",
                 Some("temps.example"),
+                None,
                 None,
                 None,
                 None,
@@ -5353,6 +7121,7 @@ mod tests {
                 "/v1/orders",
                 "",
                 Some("temps.example"),
+                None,
                 None,
                 None,
                 None,

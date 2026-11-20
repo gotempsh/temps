@@ -5,6 +5,8 @@ import * as React from 'react'
 import { Check, ChevronsUpDown } from 'lucide-react'
 
 import { cn } from '@/lib/utils'
+import { useIsMobile } from '@/components/hooks/use-mobile'
+import { fieldValueName } from '@/components/ui/accessible-name'
 import { Button } from '@/components/ui/button'
 import {
   Command,
@@ -49,6 +51,13 @@ interface SearchableSelectProps {
   icon?: React.ReactNode
   /** Native title attribute on the trigger button (tooltip on hover). */
   title?: string
+  /**
+   * What the field is ("Project", "Event type"). A combobox button takes its
+   * accessible name from the author, never from its text, so without this the
+   * trigger can only be announced by its current value. The name keeps the
+   * visible text in it ("Project: All projects") so voice control still works.
+   */
+  label?: string
 }
 
 export function SearchableSelect({
@@ -64,8 +73,10 @@ export function SearchableSelect({
   searchMode = 'fuzzy',
   icon,
   title,
+  label,
 }: SearchableSelectProps) {
   const [open, setOpen] = React.useState(false)
+  const isMobile = useIsMobile()
 
   const selected = React.useMemo(
     () => options.find((o) => o.value === value),
@@ -91,6 +102,7 @@ export function SearchableSelect({
           variant="outline"
           role="combobox"
           aria-expanded={open}
+          aria-label={fieldValueName(label, selected?.label ?? placeholder)}
           disabled={disabled}
           title={title}
           className={cn(
@@ -108,10 +120,15 @@ export function SearchableSelect({
       </PopoverTrigger>
       <PopoverContent
         className={cn(
-          'w-[min(calc(100vw-2rem),360px)] min-w-[var(--radix-popover-trigger-width)] p-0',
+          'w-[min(calc(100vw-1rem),360px)] min-w-[min(var(--radix-popover-trigger-width),calc(100vw-1rem))] p-0',
           contentClassName
         )}
         align="start"
+        // On a phone, focusing the search box raises the keyboard over the
+        // list. Leave it to a tap on the box.
+        onOpenAutoFocus={(event) => {
+          if (isMobile) event.preventDefault()
+        }}
       >
         <Command
           filter={
@@ -124,7 +141,7 @@ export function SearchableSelect({
           }
         >
           <CommandInput placeholder={searchPlaceholder} />
-          <CommandList className="max-h-[320px]">
+          <CommandList className="max-h-[min(320px,calc(var(--radix-popover-content-available-height)-3.5rem))]">
             <CommandEmpty>{emptyText}</CommandEmpty>
             {grouped.map(([group, items]) => (
               <CommandGroup

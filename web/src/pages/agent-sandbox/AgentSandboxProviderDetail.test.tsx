@@ -235,6 +235,7 @@ const provider: ProviderCatalogDto = {
   max_turns_fix: null,
   max_turns_feedback: null,
   supports_max_turns: true,
+  login_supported: false,
   host_authenticated: true,
   host_auth_method: 'host_auth_store',
   host_version: '2.1.0',

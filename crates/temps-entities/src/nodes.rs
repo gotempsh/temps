@@ -13,9 +13,11 @@ pub struct Model {
     #[sea_orm(primary_key)]
     pub id: i32,
     pub name: String,
+    #[serde(skip_serializing)]
     pub token_hash: String,
     /// Encrypted plaintext token (AES-256-GCM via EncryptionService)
     /// Used by control plane to authenticate with the agent for remote deployments
+    #[serde(skip_serializing)]
     pub token_encrypted: Option<String>,
     /// Agent API address, e.g. "https://203.0.113.50:3100"
     pub address: String,
@@ -95,6 +97,12 @@ pub struct Model {
     /// heartbeat (from its last successful sync, or its on-disk snapshot if
     /// it hasn't synced yet). `None` means never reported.
     pub dns_resolver_record_count: Option<i32>,
+    /// Deployment ids with a container on this node that was created without
+    /// the node's cluster resolver, as of the last heartbeat: a JSON array of
+    /// integers. Those containers cannot resolve `*.temps.local` until they
+    /// are redeployed. `None` means never reported; read it through
+    /// [`Model::deployments_without_resolver`].
+    pub deployments_without_resolver: Option<Json>,
     /// When this node's workloads were failed over for the current outage.
     /// `None` means they have not been: the node is healthy, or it is offline
     /// but still inside the failover grace period (or a failover pass failed
@@ -102,6 +110,14 @@ pub struct Model {
     /// durably queued and cleared by the next heartbeat, so failover completes
     /// once per outage and survives a control-plane restart.
     pub failover_at: Option<DBDateTime>,
+    /// When an operator asked for this node to be drained; `None` when it isn't
+    /// being drained. It outlives the status, so a draining node that goes offline
+    /// goes back to `draining` on recovery instead of taking new work.
+    #[serde(default)]
+    pub drain_requested_at: Option<DBDateTime>,
+    /// Database-backed builder concurrency, queue wait and execution deadlines.
+    #[serde(default)]
+    pub build_limits: Option<Json>,
     /// Operator-controlled opt-in for serving public HTTP/HTTPS on this worker.
     pub public_ingress_enabled: bool,
     /// Last runtime state reported by an ingress-capable agent. `None` means
@@ -112,6 +128,29 @@ pub struct Model {
     pub public_ingress_route_count: Option<i32>,
     pub public_ingress_unsupported_route_count: Option<i32>,
     pub public_ingress_unsupported_reasons: Json,
+    /// IPv4 ranges this node already uses outside Temps (ADR 056): unicast
+    /// host routes on non-Temps devices and other Docker networks' subnets,
+    /// as `[{"cidr": "...", "owner": "..."}]`. The allocator steers compute
+    /// allocations around them. `None` means never reported (older agent).
+    #[serde(default)]
+    pub occupied_ranges: Option<Json>,
+    /// Cross-node overlay state from the last heartbeat that reported it:
+    /// `ready` or `unavailable`. `None` means never reported.
+    pub overlay_status: Option<String>,
+    /// Why the overlay is unavailable, as reported by the agent (truncated).
+    pub overlay_last_error: Option<String>,
+    /// The allocation this node last reported the overlay ready on. Equal to
+    /// `compute_cidr` means the allocation is in use and locks the pool.
+    pub overlay_ready_cidr: Option<String>,
+    /// The last automatic re-allocation of `compute_cidr` and why.
+    pub overlay_remediation: Option<String>,
+    /// This node's overlay network name when it differs from the cluster's
+    /// (`network_config.docker_network_name`), ADR 059. Set when the node
+    /// joined on a host that already had a network of the cluster's name.
+    pub overlay_network_name: Option<String>,
+    /// The VXLAN network ID this node's agent reports it follows (ADR 062).
+    /// `None`: never reported, an agent older than per-cluster network IDs.
+    pub overlay_vxlan_vni: Option<i32>,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
 }
@@ -136,6 +175,71 @@ impl Related<super::external_services::Entity> for Entity {
     }
 }
 
+/// Seconds since the last heartbeat after which a node is not placed on.
+pub const PLACEMENT_HEARTBEAT_THRESHOLD_SECS: i64 = 90;
+
+/// Whether one node label value satisfies one selector value: an array
+/// selector matches any of its elements, a single value matches exactly
+/// (see [`values_match`] for how non-string values compare).
+pub fn label_value_matches(
+    node_value: &serde_json::Value,
+    required_value: &serde_json::Value,
+) -> bool {
+    match required_value.as_array() {
+        Some(required_values) => required_values
+            .iter()
+            .any(|required| values_match(node_value, required)),
+        None => values_match(node_value, required_value),
+    }
+}
+
+/// Check if a node's labels match a label selector.
+///
+/// Matching rules:
+/// - **Same key, array value** → OR: node label must match any value in the array
+/// - **Same key, string value** → exact match
+/// - **Different keys** → AND: node must satisfy all keys in the selector
+///
+/// Example selector: `{"region": ["us", "asia"], "gpu": "true"}`
+/// Matches a node with `{"region": "us", "gpu": "true"}` (region=us OR region=asia, AND gpu=true)
+pub fn node_matches_labels(node_labels: &serde_json::Value, selector: &serde_json::Value) -> bool {
+    let selector_map = match selector.as_object() {
+        Some(m) => m,
+        None => return false, // Public scheduling entry points reject malformed selectors.
+    };
+
+    let node_map = match node_labels.as_object() {
+        Some(m) => m,
+        None => return selector_map.is_empty(), // No node labels → only matches empty selector
+    };
+
+    // Every key in the selector must be satisfied (AND across keys)
+    for (key, required_value) in selector_map {
+        let node_value = match node_map.get(key) {
+            Some(v) => v,
+            None => return false, // Node doesn't have this label key → no match
+        };
+
+        if !label_value_matches(node_value, required_value) {
+            return false;
+        }
+    }
+
+    true
+}
+
+/// Compare two JSON values for label matching.
+/// Compares as strings when possible for flexibility (e.g., `"true"` matches `"true"`).
+fn values_match(node_value: &serde_json::Value, required_value: &serde_json::Value) -> bool {
+    match (node_value, required_value) {
+        (serde_json::Value::String(a), serde_json::Value::String(b)) => a == b,
+        // Allow comparing string node labels against non-string selectors via to_string
+        _ => {
+            node_value.to_string().trim_matches('"') == required_value.to_string().trim_matches('"')
+        }
+    }
+}
+
 impl Model {
     /// Where the control plane reaches this node's workloads (published
     /// container ports, managed services, proxy upstreams, health checks).
@@ -155,6 +259,44 @@ impl Model {
             }
             _ => self.private_address.as_str(),
         }
+    }
+
+    /// Where the control plane opens connections to this node's agent API, and
+    /// the name the agent's certificate is verified for: its mesh address once
+    /// the agent reports it listens there, otherwise the registered address;
+    /// see `temps_core::node_address::node_agent_endpoint`.
+    pub fn agent_endpoint(&self) -> temps_core::node_address::NodeAgentEndpoint {
+        temps_core::node_address::node_agent_endpoint(
+            &self.address,
+            self.mesh_wg_address.as_deref(),
+            self.capacity
+                .get(temps_core::node_address::AGENT_MESH_LISTENER_KEY)
+                .and_then(serde_json::Value::as_str),
+        )
+    }
+
+    /// How values may be sent to this node's agent: sealed to its key, or
+    /// refused when it has none or is only reachable over plain `http://`.
+    pub fn request_sealing(&self) -> temps_core::sealed_request::NodeSealing {
+        temps_core::sealed_request::NodeSealing::for_agent(
+            &self.agent_endpoint().dial_url,
+            self.edge_public_key.as_deref(),
+        )
+    }
+
+    /// A Mac worker (ADR 090): it reports so in its heartbeat. It goes
+    /// offline while the Mac sleeps and reconnects on its own.
+    pub fn is_mac_worker(&self) -> bool {
+        temps_core::node_address::capacity_is_mac_worker(&self.capacity)
+    }
+
+    /// Deployment ids this node last reported running without its cluster
+    /// resolver; empty when it has not reported or the value is malformed.
+    pub fn deployments_without_resolver(&self) -> Vec<i64> {
+        self.deployments_without_resolver
+            .as_ref()
+            .and_then(|value| serde_json::from_value(value.clone()).ok())
+            .unwrap_or_default()
     }
 }
 
@@ -214,7 +356,10 @@ mod tests {
             dns_resolver_consecutive_failures: 0,
             dns_resolver_last_error: None,
             dns_resolver_record_count: None,
+            deployments_without_resolver: None,
             failover_at: None,
+            drain_requested_at: None,
+            build_limits: None,
             public_ingress_enabled: false,
             public_ingress_running: None,
             public_ingress_last_error: None,
@@ -222,9 +367,29 @@ mod tests {
             public_ingress_route_count: None,
             public_ingress_unsupported_route_count: None,
             public_ingress_unsupported_reasons: serde_json::json!([]),
+            occupied_ranges: None,
+            overlay_status: None,
+            overlay_last_error: None,
+            overlay_ready_cidr: None,
+            overlay_remediation: None,
+            overlay_network_name: None,
+            overlay_vxlan_vni: None,
             created_at: now,
             updated_at: now,
         }
+    }
+
+    #[test]
+    fn serializing_a_node_leaves_out_its_token_columns() {
+        let mut model = node("10.0.0.5", None);
+        model.token_hash = "stored-token-hash".into();
+        model.token_encrypted = Some("stored-token-ciphertext".into());
+
+        let json = serde_json::to_string(&model).expect("serializes");
+
+        assert!(!json.contains("stored-token-hash"), "{json}");
+        assert!(!json.contains("stored-token-ciphertext"), "{json}");
+        assert!(json.contains("worker-1"), "{json}");
     }
 
     #[test]
@@ -245,5 +410,32 @@ mod tests {
         );
         // Until it registers on the mesh there is nothing else to use.
         assert_eq!(node("203.0.113.10", None).data_address(), "203.0.113.10");
+    }
+
+    #[test]
+    fn the_agent_follows_the_data_address_once_it_listens_on_the_mesh() {
+        let mut public = node("203.0.113.10", Some("10.201.0.2"));
+        // An agent that has not reported a mesh listener is dialed directly.
+        assert_eq!(
+            public.agent_endpoint().dial_url,
+            "https://203.0.113.10:3100"
+        );
+        public.capacity = serde_json::json!({
+            "cpu_percent": 3.0,
+            temps_core::node_address::AGENT_MESH_LISTENER_KEY: "10.201.0.2:3100",
+        });
+        let endpoint = public.agent_endpoint();
+        assert_eq!(endpoint.dial_url, "https://10.201.0.2:3100");
+        assert_eq!(endpoint.server_name.as_deref(), Some("203.0.113.10"));
+
+        // A node on a private network is dialed on the mesh too once its agent
+        // listens there: a paired worker's agent does not serve on its private
+        // address at all.
+        let mut private = node("10.0.0.5", Some("10.201.0.2"));
+        private.address = "https://10.0.0.5:3100".into();
+        private.capacity = public.capacity.clone();
+        let endpoint = private.agent_endpoint();
+        assert_eq!(endpoint.dial_url, "https://10.201.0.2:3100");
+        assert_eq!(endpoint.server_name.as_deref(), Some("10.0.0.5"));
     }
 }

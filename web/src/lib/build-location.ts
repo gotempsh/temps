@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 /** Where a source deployment's image is built (`deployment_config.buildLocation`). */
-export type BuildLocation = 'control_plane' | 'node'
+import type { BuildLocation } from '@/api/client/types.gen'
+export type { BuildLocation } from '@/api/client/types.gen'
 
 /** Select value for the tri-state environment build location override. */
 export type BuildLocationSelect = 'inherit' | BuildLocation
@@ -10,6 +11,7 @@ export type BuildLocationSelect = 'inherit' | BuildLocation
 export const BUILD_LOCATION_LABELS: Record<BuildLocation, string> = {
   control_plane: 'Control plane',
   node: 'Worker node',
+  ci: 'CI (GitHub Actions)',
 }
 
 /**

@@ -385,13 +385,14 @@ impl NotificationRoutingService {
                     operation: "count",
                     source,
                 })?;
-        let routes = paginator.fetch_page(page - 1).await.map_err(|source| {
-            NotificationRouteError::Database {
+        let routes = paginator
+            .fetch_page(temps_core::config::page_index(page))
+            .await
+            .map_err(|source| NotificationRouteError::Database {
                 route_id: None,
                 operation: "list",
                 source,
-            }
-        })?;
+            })?;
         let route_ids: Vec<i32> = routes.iter().map(|route| route.id).collect();
         let mut provider_ids = Self::load_provider_ids(self.db.as_ref(), &route_ids, None).await?;
         Ok(NotificationRoutePage {
@@ -797,8 +798,8 @@ impl NotificationRoutingService {
 mod tests {
     use super::*;
     use sea_orm_migration::MigratorTrait;
-    use temps_database::test_utils::TestDatabase;
     use temps_migrations::Migrator;
+    use temps_test_utils::TestDatabase;
 
     macro_rules! routing_test_database_or_skip {
         () => {
@@ -806,7 +807,7 @@ mod tests {
                 Ok(test_db) => test_db,
                 Err(error) => {
                     let message = format!("{error:#}");
-                    if temps_database::test_utils::is_container_runtime_unavailable(&message)
+                    if temps_test_utils::is_container_runtime_unavailable(&message)
                         || message.contains("Docker Desktop is unable to start")
                     {
                         eprintln!("Skipping Docker-dependent routing test: {message}");

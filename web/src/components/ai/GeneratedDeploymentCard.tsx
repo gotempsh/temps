@@ -22,34 +22,17 @@ import { Link } from 'react-router'
 import {
   deploymentPollingInterval,
   deploymentReference,
+  deploymentStatusPresentation,
   isActiveDeploymentStatus,
   isFailedDeploymentStatus,
+  isReadyDeploymentStatus,
   matchingDeployment,
 } from './deployment-card-state'
 
-function statusPresentation(status: string) {
-  if (status === 'completed') {
-    return {
-      label: 'Ready',
-      className: 'text-green-600 dark:text-green-400',
-    }
-  }
-  if (isFailedDeploymentStatus(status)) {
-    return {
-      label: status === 'failed' ? 'Failed' : 'Cancelled',
-      className: 'text-destructive',
-    }
-  }
-  if (status === 'paused') {
-    return { label: 'Paused', className: 'text-amber-700 dark:text-amber-400' }
-  }
-  return {
-    label: status === 'running' ? 'Deploying' : 'Queued',
-    className: 'text-blue-600 dark:text-blue-400',
-  }
-}
+/** Kept under its old name for the chat panels that import it from here. */
+export const statusPresentation = deploymentStatusPresentation
 
-function JobStatusIcon({ status }: { status: string }) {
+export function JobStatusIcon({ status }: { status: string }) {
   if (status === 'success') {
     return (
       <CheckCircle2 className="size-3.5 text-green-600 dark:text-green-400" />
@@ -176,7 +159,7 @@ export function GeneratedDeploymentCard({
         <div className="min-w-0 flex-1">
           <div className="flex min-w-0 flex-wrap items-center gap-2">
             <h3 className="truncate text-base font-semibold sm:text-sm">
-              {deployment ? `Deployment #${deployment.id}` : 'Deploy project'}
+              {deployment ? `Deployment #${deployment.id}` : 'Deploy service'}
             </h3>
             {isLive && (
               <span className="ai-activity-shimmer bg-gradient-to-r from-muted-foreground via-foreground to-muted-foreground bg-[length:200%_100%] bg-clip-text text-[11px] font-medium text-transparent">
@@ -205,7 +188,7 @@ export function GeneratedDeploymentCard({
                   />
                 ))}
               </span>
-            ) : deployment?.status === 'completed' ? (
+            ) : isReadyDeploymentStatus(deployment?.status ?? '') ? (
               <CheckCircle2 className="size-4" />
             ) : isFailedDeploymentStatus(deployment?.status ?? '') ? (
               <XCircle className="size-4" />
@@ -259,7 +242,7 @@ export function GeneratedDeploymentCard({
 
       {actionStatus === 'executed' && !reference && (
         <p className="border-t px-3 py-2.5 text-xs text-muted-foreground sm:px-4">
-          The trigger completed, but its response did not include a project id,
+          The trigger completed, but its response did not include a service id,
           so live deployment progress is unavailable.
         </p>
       )}
@@ -272,7 +255,7 @@ export function GeneratedDeploymentCard({
               <ArrowRight aria-hidden="true" />
             </Link>
           </Button>
-          {deployment.status === 'completed' && deployment.url && (
+          {isReadyDeploymentStatus(deployment.status) && deployment.url && (
             <Button asChild size="sm" variant="ghost" className="h-8">
               <a
                 href={deployment.url}

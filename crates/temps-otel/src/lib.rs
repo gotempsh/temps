@@ -38,6 +38,7 @@ pub mod handlers;
 pub mod ingest;
 pub mod memory;
 pub mod plugin;
+pub mod project_metrics_sink;
 pub mod proto;
 pub mod relay;
 pub mod services;
@@ -50,7 +51,7 @@ pub use plugin::OtelPlugin;
 pub use services::OtelService;
 pub use storage::OtelStorage;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 
 /// Application state shared across OTel HTTP handlers.
@@ -107,6 +108,9 @@ pub struct OtelAppState {
     /// banner) and `GET /otel/global/traces/{trace_id}` (Phase 2 unified
     /// waterfall) query handlers.
     pub cross_project_service: std::sync::Arc<crate::services::CrossProjectTraceService>,
+    /// Per-operation hourly rollups, trends and regressions after a
+    /// deployment (ADR 111, D2).
+    pub operation_trends: std::sync::Arc<crate::services::OperationTrendService>,
     /// Bounded sender for fire-and-forget relay of decoded OTLP batches.
     ///
     /// After a successful decode in each `do_ingest_*` function, the handler
@@ -169,3 +173,5 @@ pub struct OtelAppState {
     /// forced to re-estimate by an unrelated restart.
     pub plan_signing_key: std::sync::Arc<[u8; 32]>,
 }
+
+pub mod log_attributes;

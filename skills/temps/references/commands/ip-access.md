@@ -6,7 +6,7 @@ Apply [the CLI runtime and safety contract](../cli-runtime.md) before executing 
 
 ## `ip-access` (alias: `ipa`)
 
-Manage IP access control rules
+Manage instance-wide IP access control rules, and per-project lists (ip-access project)
 
 **Subcommands:**
 
@@ -16,6 +16,7 @@ Manage IP access control rules
 - `update` - Update an IP access control rule
 - `remove` (`rm`) - Delete an IP access control rule
 - `check` - Check if an IP address is blocked
+- `project` - Allow or deny IP ranges for one project or environment
 
 ### `ip-access list` (alias: `ls`)
 
@@ -85,4 +86,68 @@ Check if an IP address is blocked
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--ip <ip>` | IP address to check | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `ip-access project`
+
+Allow or deny IP ranges for one project or environment
+
+**Subcommands:**
+
+- `show` - Show the IP access list
+- `set` - Replace the IP access list. A list that would lock out this machine needs --acknowledge-lockout
+- `clear` - Remove the list (an environment then follows the project list)
+- `test` - Check whether an address would be allowed
+
+#### `ip-access project show`
+
+Show the IP access list
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--environment-id <id>` | Environment ID (omit for the project-wide list) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ip-access project set`
+
+Replace the IP access list. A list that would lock out this machine needs --acknowledge-lockout
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--environment-id <id>` | Environment ID (omit for the project-wide list) | - | No |
+| `--mode <mode>` | disabled, allow (only listed) or deny (block listed) | - | Yes |
+| `--cidr <cidr>` | Address or CIDR range; repeat or comma-separate | `` | No |
+| `--tailscale` | Include the Tailscale ranges (100.64.0.0/10 and fd7a:115c:a1e0::/48) | - | No |
+| `--acknowledge-lockout` | Apply even if it would block the address you are calling from | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ip-access project clear`
+
+Remove the list (an environment then follows the project list)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--environment-id <id>` | Environment ID (omit for the project-wide list) | - | No |
+| `-y, --yes` | Skip confirmation | - | No |
+
+#### `ip-access project test`
+
+Check whether an address would be allowed
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--environment-id <id>` | Environment ID (omit for the project-wide list) | - | No |
+| `--ip <ip>` | Address to evaluate | - | Yes |
 | `--json` | Output in JSON format | - | No |

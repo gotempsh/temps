@@ -14,14 +14,13 @@
 //! path. A failed write is logged and dropped; the counters keep accumulating
 //! so the next successful cycle re-converges (with one wider delta).
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
 use tracing::{debug, warn};
 
-use temps_metrics::{MetricKind, MetricPoint, MetricsStore, SourceKind};
+use temps_metrics::{MetricPoint, MetricsStore};
 
 use crate::metrics::{MetricsSnapshot, ProxyMetrics};
 
@@ -116,7 +115,7 @@ pub async fn build_metrics_store(
     config: &temps_config::ServerConfig,
     db: Arc<temps_database::DbConnection>,
 ) -> Arc<dyn MetricsStore> {
-    use temps_core::MetricsStoreKind;
+    use temps_config::MetricsStoreKind;
     use temps_metrics::{ClickHouseMetricsConfig, ClickhouseMetricsStore, TimescaleMetricsStore};
 
     let kind = match config_service.get_settings().await {
@@ -130,12 +129,23 @@ pub async fn build_metrics_store(
     match kind {
         MetricsStoreKind::ClickHouse if config_service.is_clickhouse_enabled() => {
             // is_clickhouse_enabled() guarantees the fields are Some.
-            Arc::new(ClickhouseMetricsStore::new(ClickHouseMetricsConfig::new(
-                config.clickhouse_url.clone().unwrap_or_default(),
-                config.clickhouse_database.clone().unwrap_or_default(),
-                config.clickhouse_user.clone().unwrap_or_default(),
-                config.clickhouse_password.clone().unwrap_or_default(),
-            )))
+            // Buffered like the console's store: one insert per flush
+            // interval instead of one ClickHouse part per sample tick.
+            temps_metrics::BufferedMetricsStore::wrap(
+                Arc::new(ClickhouseMetricsStore::new(
+                    ClickHouseMetricsConfig::new(
+                        config.clickhouse_url.clone().unwrap_or_default(),
+                        config.clickhouse_database.clone().unwrap_or_default(),
+                        config.clickhouse_user.clone().unwrap_or_default(),
+                        config.clickhouse_password.clone().unwrap_or_default(),
+                    )
+                    // Same wire-compression mode as every other ClickHouse
+                    // client of this process (the stored
+                    // `clickhouse.compression` setting).
+                    .with_compression(config_service.clickhouse_compression()),
+                )),
+                temps_metrics::BufferConfig::default(),
+            )
         }
         MetricsStoreKind::ClickHouse | MetricsStoreKind::TimescaleDb => {
             Arc::new(TimescaleMetricsStore::new(db))
@@ -145,32 +155,14 @@ pub async fn build_metrics_store(
 
 /// Convert interval samples into store points for the control-plane node.
 fn build_points(samples: &[crate::metrics::ProxySample]) -> Vec<MetricPoint> {
-    let now = Utc::now();
-    samples
-        .iter()
-        .map(|s| MetricPoint {
-            time: now,
-            source_kind: SourceKind::Node,
-            source_id: CONTROL_PLANE_NODE_ID,
-            name: s.name.to_string(),
-            value: s.value,
-            kind: if s.is_counter {
-                MetricKind::Counter
-            } else {
-                MetricKind::Gauge
-            },
-            engine: Some("proxy".to_string()),
-            environment: None,
-            node_id: Some(CONTROL_PLANE_NODE_ID),
-            labels: HashMap::new(),
-        })
-        .collect()
+    crate::metrics::proxy_points(samples, CONTROL_PLANE_NODE_ID, Utc::now())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::metrics::{RequestDestination, METRIC_REQUESTS, METRIC_REQUESTS_5XX};
+    use temps_metrics::{MetricKind, SourceKind};
 
     #[test]
     fn test_build_points_maps_samples_to_node_points() {
@@ -216,8 +208,8 @@ mod tests {
     /// per the repo's Docker-test convention.
     #[tokio::test]
     async fn test_sampler_pipeline_end_to_end_against_real_store() {
-        use temps_database::test_utils::TestDatabase;
         use temps_metrics::{LatestQuery, TimescaleMetricsStore};
+        use temps_test_utils::TestDatabase;
 
         let test_db = match TestDatabase::with_migrations().await {
             Ok(db) => db,

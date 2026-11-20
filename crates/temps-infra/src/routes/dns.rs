@@ -10,7 +10,7 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use temps_auth::{permission_guard, RequireAuth};
+use temps_authz::{permission_guard, RequireAuth};
 use temps_core::problemdetails::Problem;
 use tracing::info;
 use utoipa::OpenApi;
@@ -103,7 +103,7 @@ mod tests {
     use axum::http::Request;
     use axum::middleware;
     use chrono::Utc;
-    use temps_auth::{AuthContext, Role};
+    use temps_authz::{AuthContext, Role};
     use temps_entities::users;
     use tower::ServiceExt;
 

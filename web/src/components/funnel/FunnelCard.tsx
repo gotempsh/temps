@@ -125,7 +125,7 @@ export function FunnelCard({
                 <TrendingUp className="h-4 w-4 text-muted-foreground" />
                 <div>
                   <p className="text-sm text-muted-foreground">
-                    Conversion Rate
+                    Conversion rate
                   </p>
                   <p className="text-lg font-semibold">
                     {metrics.overall_conversion_rate.toFixed(1)}%
@@ -145,7 +145,10 @@ export function FunnelCard({
               </div>
             </div>
             {metrics.step_conversions.length > 0 && (
-              <div className="flex items-center gap-1 overflow-x-auto">
+              <div
+                tabIndex={0}
+                className="flex items-center gap-1 overflow-x-auto"
+              >
                 {metrics.step_conversions
                   .sort((a, b) => a.step_order - b.step_order)
                   .map((step, index) => (

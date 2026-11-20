@@ -11,6 +11,7 @@ use crate::services::{
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+use temps_core::secret_string::SecretString;
 use temps_core::{AuditLogger, ProjectAccessChecker};
 use temps_dns::services::DnsProviderService;
 use utoipa::{IntoParams, ToSchema};
@@ -84,13 +85,13 @@ pub struct SesCredentialsRequest {
     #[schema(example = "AKIAIOSFODNN7EXAMPLE")]
     pub access_key_id: String,
     #[schema(example = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")]
-    pub secret_access_key: String,
+    pub secret_access_key: SecretString,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct ScalewayCredentialsRequest {
     #[schema(example = "scw-secret-key-12345")]
-    pub api_key: String,
+    pub api_key: SecretString,
     #[schema(example = "12345678-1234-1234-1234-123456789012")]
     pub project_id: String,
 }
@@ -137,7 +138,7 @@ pub struct SmtpCredentialsRequest {
     pub username: Option<String>,
     /// SMTP password / API token. Required when `username` is set.
     #[serde(default)]
-    pub password: Option<String>,
+    pub password: Option<SecretString>,
     /// TLS mode. Defaults to STARTTLS.
     #[serde(default)]
     pub encryption: SmtpEncryptionRoute,

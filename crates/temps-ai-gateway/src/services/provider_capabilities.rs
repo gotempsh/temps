@@ -125,19 +125,27 @@ pub fn gateway_provider_capabilities(
             }
         })
         .collect::<Vec<_>>();
-    let default_model_id =
-        default_model_id.or_else(|| models.first().map(|model| model.id.clone()));
+    let default_model_id = default_model_id
+        .or_else(|| preferred_default_model(provider, &models))
+        .or_else(|| models.first().map(|model| model.id.clone()));
     ProviderCapabilities {
         id,
         name,
         auth_source: ProviderAuthSource::ConfiguredKey,
         models,
         default_model_id,
-        permission_modes: vec![option(
-            "confirm-actions",
-            "Confirm actions",
-            "Require confirmation for write actions",
-        )],
+        permission_modes: vec![
+            option(
+                "confirm-actions",
+                "Ask before changes",
+                "Require confirmation for write actions",
+            ),
+            option(
+                "auto",
+                "Run changes automatically",
+                "Apply changes without asking; deletions still ask",
+            ),
+        ],
         default_permission_mode_id: Some("confirm-actions".to_string()),
         realtime: RealtimeCapabilities {
             text_streaming: true,
@@ -149,9 +157,79 @@ pub fn gateway_provider_capabilities(
     }
 }
 
+/// Models worth starting a new chat on when nobody has pinned one, best first.
+///
+/// Without this the fallback was the first id alphabetically, which on a
+/// catalogue of hundreds (OpenRouter) is an arbitrary model nobody chose. Only
+/// providers with such a catalogue need an entry; the rest keep the first id.
+fn preferred_default_model(provider: &str, models: &[ModelCapability]) -> Option<String> {
+    let preferred: &[&str] = match provider {
+        "openrouter" => &[
+            "anthropic/claude-sonnet-5",
+            "openai/gpt-4o",
+            "google/gemini-3.5-flash",
+            "openai/gpt-4o-mini",
+        ],
+        _ => &[],
+    };
+    preferred
+        .iter()
+        .find(|candidate| models.iter().any(|model| model.id == **candidate))
+        .map(|candidate| candidate.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unpinned_openrouter_key_starts_on_a_known_good_model_not_the_first_id() {
+        let capabilities = gateway_provider_capabilities(
+            "gateway_key:7".to_string(),
+            "OpenRouter".to_string(),
+            "openrouter",
+            None,
+            vec![
+                "aion-labs/aion-2.0".to_string(),
+                "openai/gpt-4o".to_string(),
+                "zeta/last".to_string(),
+            ],
+        );
+        assert_eq!(
+            capabilities.default_model_id.as_deref(),
+            Some("openai/gpt-4o")
+        );
+    }
+
+    #[test]
+    fn unpinned_default_falls_back_to_first_id_when_no_preferred_model_exists() {
+        let capabilities = gateway_provider_capabilities(
+            "gateway_key:7".to_string(),
+            "OpenRouter".to_string(),
+            "openrouter",
+            None,
+            vec!["b/two".to_string(), "a/one".to_string()],
+        );
+        assert_eq!(capabilities.default_model_id.as_deref(), Some("a/one"));
+    }
+
+    #[test]
+    fn a_pinned_default_always_wins_over_the_preferred_list() {
+        let capabilities = gateway_provider_capabilities(
+            "gateway_key:7".to_string(),
+            "OpenRouter".to_string(),
+            "openrouter",
+            Some("aion-labs/aion-2.0".to_string()),
+            vec![
+                "aion-labs/aion-2.0".to_string(),
+                "openai/gpt-4o".to_string(),
+            ],
+        );
+        assert_eq!(
+            capabilities.default_model_id.as_deref(),
+            Some("aion-labs/aion-2.0")
+        );
+    }
 
     #[test]
     fn custom_default_model_is_part_of_the_normalized_catalog() {
@@ -166,6 +244,24 @@ mod tests {
         assert_eq!(
             capabilities.default_model_id.as_deref(),
             Some("custom-model")
+        );
+    }
+
+    #[test]
+    fn gateway_providers_offer_both_confirming_and_automatic_writes() {
+        let capabilities = gateway_provider_capabilities(
+            "gateway_key:7".to_string(),
+            "OpenRouter".to_string(),
+            "openrouter",
+            None,
+            Vec::new(),
+        );
+        assert!(capabilities.permission_mode("confirm-actions").is_some());
+        assert!(capabilities.permission_mode("auto").is_some());
+        // Existing conversations and non-assistant chats keep asking by default.
+        assert_eq!(
+            capabilities.default_permission_mode_id.as_deref(),
+            Some("confirm-actions")
         );
     }
 

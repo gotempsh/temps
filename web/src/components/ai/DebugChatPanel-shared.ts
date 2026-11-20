@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import type { ChatDetailLevel } from './chat-detail-level'
+import type { OpeningAttachment } from './attachment-previews'
 import { type ConversationDetailResponse } from '@/api/client'
 import { type PermissionRequest } from '@/components/ai/PermissionCard'
 
@@ -96,6 +98,7 @@ export function mapConversationDetail(detail: {
     tools?: ChatMessage['tools'] | null
     parts?: ChatPart[] | null
     attachments?: ChatAttachment[] | null
+    next_steps?: string[] | null
   }> | null
   pending_permission?: PermissionRequest | null
   turn_status?: string | null
@@ -129,6 +132,7 @@ export function mapConversationDetail(detail: {
       tools: m.tools?.map(finishTool) ?? undefined,
       parts: rawParts && rawParts.length > 0 ? rawParts : undefined,
       attachments: m.attachments ?? undefined,
+      next_steps: m.next_steps ?? undefined,
     }
   })
   const pendingPermission = detail.pending_permission
@@ -320,6 +324,14 @@ export function clearResolvedPermissionParts(
   }))
 }
 
+/** Whether two ISO timestamps name the same instant, to the millisecond. */
+function sameInstant(a?: string, b?: string): boolean {
+  if (!a || !b) return false
+  const left = Date.parse(a)
+  const right = Date.parse(b)
+  return !Number.isNaN(left) && left === right
+}
+
 export function appendLiveUserTurn(
   messages: ChatMessage[],
   user: {
@@ -332,6 +344,21 @@ export function appendLiveUserTurn(
   if (
     user.turn_id &&
     messages.some((message) => message.client_turn_id === user.turn_id)
+  ) {
+    return messages
+  }
+  // A snapshot refresh can land before this echo and replace the optimistic
+  // turn with the stored one, which carries no turn id. The echo is stamped
+  // with the stored message's own creation time, so the same text at the same
+  // instant is that message, not a second send.
+  if (
+    messages.some(
+      (message) =>
+        message.role === 'user' &&
+        message.server_cursor !== undefined &&
+        message.content === user.content &&
+        sameInstant(message.created_at, user.created_at)
+    )
   ) {
     return messages
   }
@@ -783,6 +810,27 @@ export interface DebugChatPanelProps {
   readOnly?: boolean
   /** Prevent new turns without hiding saved history or the composer draft. */
   runtimeUpdateRequired?: boolean
+  /**
+   * Opening message for a user-owned thread the caller already created. Sent
+   * once after the empty thread loads; ignored if the thread has history.
+   */
+  initialMessage?: string
+  /**
+   * Text to put in the composer of a chat that has no saved draft, for the
+   * user to review and send. How a page hands a free-form project chat its
+   * prompt without sending it before a model is chosen.
+   */
+  initialDraft?: string
+  /**
+   * Files already uploaded to that thread, to go out with `initialMessage`.
+   * The panel makes their previews, so they are released with it.
+   */
+  initialAttachments?: OpeningAttachment[]
+  /**
+   * `simple` hides the model/reasoning pickers; `advanced` shows them and opens
+   * every tool call. Unset keeps the panel's original behaviour.
+   */
+  detailLevel?: ChatDetailLevel
 }
 
 export function chatApiPaths(userScoped: boolean, projectId?: number) {
@@ -793,7 +841,7 @@ export function chatApiPaths(userScoped: boolean, projectId?: number) {
     }
   }
   if (projectId == null) {
-    throw new Error('A project-scoped chat requires a project id.')
+    throw new Error('A service-scoped chat requires a service id.')
   }
   return {
     conversations: `/api/projects/${projectId}/ai/conversations`,

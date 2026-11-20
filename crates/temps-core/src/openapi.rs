@@ -25,6 +25,12 @@ use utoipa::openapi::OpenApi;
 /// use utoipa::OpenApi;
 /// use temps_core::openapi::merge_openapi_schemas;
 ///
+/// #[utoipa::path(get, path = "/mine", responses((status = 200)))]
+/// async fn my_handler() {}
+///
+/// #[utoipa::path(get, path = "/other", responses((status = 200)))]
+/// async fn other_handler() {}
+///
 /// #[derive(OpenApi)]
 /// #[openapi(paths(my_handler))]
 /// struct ApiDoc1;
@@ -37,6 +43,7 @@ use utoipa::openapi::OpenApi;
 ///     ApiDoc1::openapi(),
 ///     vec![ApiDoc2::openapi()]
 /// );
+/// assert_eq!(merged.paths.paths.len(), 2);
 /// ```
 pub fn merge_openapi_schemas(mut base: OpenApi, schemas: Vec<OpenApi>) -> OpenApi {
     for schema in schemas {

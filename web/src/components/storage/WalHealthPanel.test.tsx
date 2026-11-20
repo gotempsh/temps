@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { describe, expect, test } from 'bun:test'
+import { afterEach, describe, expect, test } from 'bun:test'
+import { cleanup, render, waitFor } from '@testing-library/react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { getExternalServiceBackupCapabilityQueryKey } from '@/api/client/@tanstack/react-query.gen'
@@ -9,7 +10,13 @@ import type {
   ExternalServiceBackupCapabilityResponse,
   PostgresWalHealth,
 } from '@/api/client/types.gen'
+import { collectRouteQueryFailures } from '@/lib/route-query-failures'
+import { installBrowserWindow } from '@/test/dom'
+import { jsonResponse, mockApi } from '@/test/fetch-mock'
+import { MemoryRouter } from 'react-router'
 import { WalHealthPanel } from './WalHealthPanel'
+
+installBrowserWindow()
 
 function renderPanel(settings: Partial<PostgresWalHealth>, isImported = false) {
   const client = new QueryClient({
@@ -42,14 +49,16 @@ function renderPanel(settings: Partial<PostgresWalHealth>, isImported = false) {
     capability
   )
   return renderToStaticMarkup(
-    <QueryClientProvider client={client}>
-      <WalHealthPanel
-        serviceId={7}
-        serviceType="postgres"
-        onBackup={() => {}}
-        isImported={isImported}
-      />
-    </QueryClientProvider>
+    <MemoryRouter>
+      <QueryClientProvider client={client}>
+        <WalHealthPanel
+          serviceId={7}
+          serviceType="postgres"
+          onBackup={() => {}}
+          isImported={isImported}
+        />
+      </QueryClientProvider>
+    </MemoryRouter>
   )
 }
 
@@ -87,5 +96,257 @@ describe('post-restore WAL archiving guidance', () => {
     expect(markup).toContain('archive_command is empty')
     expect(markup).toContain('can fill disk')
     expect(markup).not.toContain('discards WAL')
+  })
+})
+
+describe('continuous archiving status', () => {
+  test('archiving that works is shown, with the test action', () => {
+    const markup = renderPanel({
+      archive_command: 'wal-g wal-push %p',
+      warnings: [],
+      archiver_last_archived_at: '2026-01-01T00:00:00Z',
+    })
+    expect(markup).toContain('WAL archiving:')
+    expect(markup).toContain('Archiving')
+    expect(markup).toContain('Test archive target')
+  })
+
+  test('failing archiving is critical and names the segment', () => {
+    const markup = renderPanel({
+      archive_command: 'wal-g wal-push %p',
+      archiver_last_archived_at: '2026-01-01T00:00:00Z',
+      archiver_last_failed_at: '2026-01-01T01:00:00Z',
+      archiver_last_failed_wal: '000000010000000000000042',
+      warnings: [
+        {
+          kind: 'archive_failing',
+          last_failed_wal: '000000010000000000000042',
+          last_failed_at: '2026-01-01T01:00:00Z',
+          last_archived_at: '2026-01-01T00:00:00Z',
+        },
+      ],
+    })
+    expect(markup).toContain('WAL is filling disk')
+    expect(markup).toContain(
+      'WAL archiving is failing at segment 000000010000000000000042'
+    )
+    expect(markup).toContain('Failing')
+  })
+
+  test('a stalled archiver says so even before any attempt fails', () => {
+    const markup = renderPanel({
+      archive_command: 'wal-g wal-push %p',
+      archiver_last_archived_at: '2026-01-01T00:00:00Z',
+      archive_backlog: 5,
+      archive_oldest_ready_age_secs: 840,
+      warnings: [
+        {
+          kind: 'archive_failing',
+          last_failed_wal: null,
+          last_failed_at: null,
+          last_archived_at: '2026-01-01T00:00:00Z',
+          stalled_secs: 840,
+        },
+      ],
+    })
+    expect(markup).toContain(
+      'WAL archiving has stalled: a segment has waited 14 min'
+    )
+    expect(markup).toContain('retrying an endpoint it cannot reach')
+    expect(markup).toContain('5 segments')
+  })
+
+  test('a role that cannot list archive_status says stalls are invisible', () => {
+    const markup = renderPanel({
+      archive_command: 'wal-g wal-push %p',
+      archiver_last_archived_at: '2026-01-01T00:00:00Z',
+      archive_status_unreadable: true,
+      warnings: [{ kind: 'archive_stall_check_unavailable' }],
+    })
+    expect(markup).toContain('Stalled WAL archiving cannot be detected')
+    expect(markup).toContain('Grant pg_monitor')
+    expect(markup).toContain(
+      'Unknown: the database role may not list archive_status'
+    )
+    expect(markup).not.toContain('0 segments')
+  })
+
+  test('archiving off shows no archiving status', () => {
+    const markup = renderPanel({ archive_mode: 'off', warnings: [] })
+    expect(markup).not.toContain('Test archive target')
+  })
+})
+
+describe('a database whose WAL health is not checked', () => {
+  test('the panel says so and why, instead of showing nothing', () => {
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: Infinity } },
+    })
+    client.setQueryData(['wal-health', 7], {
+      wal_health: null,
+      not_checked: {
+        reason:
+          'WAL health is not checked for this database: the agent on node worker-3 (id 3) does not support the WAL probe; update the agent on node worker-3 to this release',
+        checked_at: '2026-01-01T00:00:00Z',
+      },
+    })
+    client.setQueryData(
+      getExternalServiceBackupCapabilityQueryKey({ path: { id: 7 } }),
+      {
+        cloud_backup_compatible: true,
+        artifact: 'walg_repository',
+        engine: 'postgres_walg',
+        verified: true,
+        wal_g_installed: true,
+      } satisfies ExternalServiceBackupCapabilityResponse
+    )
+    const markup = renderToStaticMarkup(
+      <QueryClientProvider client={client}>
+        <WalHealthPanel serviceId={7} serviceType="postgres" />
+      </QueryClientProvider>
+    )
+    expect(markup).toContain('WAL health is not being checked')
+    expect(markup).toContain('update the agent on node worker-3')
+  })
+})
+
+describe('Cloud backup compatibility', () => {
+  function renderCapability(
+    capability: ExternalServiceBackupCapabilityResponse
+  ): string {
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: Infinity } },
+    })
+    client.setQueryData(['wal-health', 7], { wal_health: null })
+    client.setQueryData(
+      getExternalServiceBackupCapabilityQueryKey({ path: { id: 7 } }),
+      capability
+    )
+    return renderToStaticMarkup(
+      <QueryClientProvider client={client}>
+        <WalHealthPanel
+          serviceId={7}
+          serviceType="postgres"
+          onUpgrade={() => {}}
+        />
+      </QueryClientProvider>
+    )
+  }
+
+  test('a local image without WAL-G offers the image upgrade', () => {
+    const markup = renderCapability({
+      cloud_backup_compatible: false,
+      artifact: 'logical_pg_dump',
+      engine: 'postgres_pgdump',
+      verified: true,
+      wal_g_installed: false,
+      reason: 'PostgreSQL WAL-G is not installed',
+      recommended_image: 'gotempsh/postgres-walg:18-bookworm',
+    })
+    expect(markup).toContain('Cloud backups need WAL-G')
+    expect(markup).toContain('Upgrade backup engine')
+  })
+
+  test('a service on a worker node is never sent to the image upgrade', () => {
+    const markup = renderCapability({
+      cloud_backup_compatible: false,
+      artifact: 'logical_pg_dumpall',
+      engine: 'postgres_job',
+      verified: true,
+      wal_g_installed: false,
+      reason: 'Service 7 runs on worker node 1',
+      recommended_image: null,
+    })
+    expect(markup).toContain('Service 7 runs on worker node 1')
+    expect(markup).not.toContain('Cloud backups need WAL-G')
+    expect(markup).not.toContain('Upgrade backup engine')
+  })
+})
+
+describe('backup compatibility check that cannot be answered', () => {
+  function renderUnanswered(status: number) {
+    const api = mockApi({
+      'GET /backups/external-services/7/capability': () =>
+        jsonResponse(
+          status === 403
+            ? {
+                type: 'about:blank',
+                title: 'Forbidden',
+                status,
+                detail:
+                  'You do not have access to the external service (7) involved in this backup',
+              }
+            : { title: 'Internal Server Error', status, detail: 'boom' },
+          status
+        ),
+    })
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    })
+    const view = render(
+      <QueryClientProvider client={client}>
+        <WalHealthPanel serviceId={7} serviceType="postgres" />
+      </QueryClientProvider>
+    )
+    return { api, client, view }
+  }
+
+  afterEach(cleanup)
+
+  test('a refusal shows nothing: no error alert, no internal id, no retry', async () => {
+    const { api, client, view } = renderUnanswered(403)
+    await waitFor(() =>
+      expect(
+        client
+          .getQueryCache()
+          .findAll()
+          .some((q) => q.state.status === 'error')
+      ).toBe(true)
+    )
+    expect(view.container.textContent).not.toContain(
+      'Backup compatibility unavailable'
+    )
+    expect(view.container.textContent).not.toContain('external service (7)')
+    expect(view.queryByRole('button', { name: 'Check again' })).toBeNull()
+    expect(collectRouteQueryFailures(client)).toEqual([])
+    api.restore()
+  })
+
+  test('a 403 whose body names no status or title is still treated as a refusal', async () => {
+    const api = mockApi({
+      'GET /backups/external-services/7/capability': () =>
+        new Response('Forbidden', { status: 403 }),
+    })
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    })
+    const view = render(
+      <QueryClientProvider client={client}>
+        <WalHealthPanel serviceId={7} serviceType="postgres" />
+      </QueryClientProvider>
+    )
+    await waitFor(() =>
+      expect(
+        client
+          .getQueryCache()
+          .findAll()
+          .some((q) => q.state.status === 'error')
+      ).toBe(true)
+    )
+    expect(view.container.textContent).not.toContain(
+      'Backup compatibility unavailable'
+    )
+    api.restore()
+  })
+
+  test('a real failure of the check is still reported, with a retry', async () => {
+    const { api, client, view } = renderUnanswered(500)
+    expect(
+      await view.findByText('Backup compatibility unavailable')
+    ).toBeTruthy()
+    expect(view.getByRole('button', { name: 'Check again' })).toBeTruthy()
+    // The panel explains it itself; the shell does not repeat it.
+    expect(collectRouteQueryFailures(client)).toEqual([])
+    api.restore()
   })
 })

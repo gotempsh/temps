@@ -73,6 +73,7 @@ import {
   readEntityRows,
 } from '@temps-sdk/api'
 import { makeClient, resolveConfig, unwrap } from '../lib/client.ts'
+import { confirmedFullBackup } from '../lib/backup-run.ts'
 import {
   createE2eProject,
   createE2eService,
@@ -296,7 +297,7 @@ export async function pitrScenarioCommand(opts: PitrScenarioOptions): Promise<vo
         await runExternalServiceBackup({
           client,
           path: { id: service.id },
-          body: { s3_source_id: source.id, backup_type: 'full' },
+          body: confirmedFullBackup(source.id),
         }),
         'runExternalServiceBackup',
       )

@@ -226,8 +226,15 @@ export const PHASES: ReadonlyArray<{ id: string; label: string }> = [
   // archives) download it here, before writing anything; it stays cancellable.
   { id: 'download', label: 'Download backup' },
   { id: 'provision', label: 'Provision' },
+  // A service on a worker node whose agent already runs its maximum of
+  // backups and restores: nothing has run yet, and it stays cancellable.
+  { id: 'waiting_for_node', label: 'Wait for the node' },
   { id: 'restore', label: 'Restore data' },
   { id: 'recover', label: 'Recover WAL' },
+  // A restore on a worker node whose outcome Temps cannot establish (the node
+  // is unreachable, or has no record of it): the run keeps the database held
+  // until the node answers or an operator releases it.
+  { id: 'outcome_unknown', label: 'Confirm the outcome with the node' },
   { id: 'verify', label: 'Verify' },
   { id: 'completed', label: 'Completed' },
 ]

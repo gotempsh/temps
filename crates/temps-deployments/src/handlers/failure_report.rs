@@ -15,7 +15,7 @@ use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
-use temps_auth::{permission_guard, project_access_guard, RequireAuth};
+use temps_auth::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
 use temps_core::{problemdetails, AuditContext, RequestMetadata};
 use tracing::error;
 
@@ -47,6 +47,7 @@ pub async fn get_failure_report_preview(
     Path((project_id, deployment_id, job_id)): Path<(i32, i32, String)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsRead);
+    project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
     let preview = state
@@ -73,6 +74,7 @@ pub async fn get_failure_report_preview(
     request_body = SendFailureReportRequest,
     responses(
         (status = 204, description = "Report sent"),
+        (status = 403, description = "Insufficient permissions, cross-project credential, or reporting disabled"),
         (status = 404, description = "Job not found"),
         (status = 422, description = "Report text is empty"),
         (status = 502, description = "Failed to reach the central reporting endpoint"),
@@ -87,7 +89,10 @@ pub async fn send_failure_report(
     Path((project_id, deployment_id, job_id)): Path<(i32, i32, String)>,
     Json(request): Json<SendFailureReportRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, DeploymentsRead);
+    // Sending composes and transmits an outbound report, so it is a write
+    // action, not a read: a read-only principal must not be able to trigger it.
+    permission_guard!(auth, DeploymentsWrite);
+    project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
     state
@@ -160,6 +165,15 @@ impl From<FailureReportError> for Problem {
                      the redacted trace.",
             ),
             FailureReportError::Deployment(deployment_error) => deployment_error.into(),
+            error @ FailureReportError::SecretsUnavailable { .. } => {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Failure Report Secrets Unavailable")
+                    .with_detail(format!(
+                        "{error}. No report was sent, because the text could not be checked for \
+                         those values. Check that this instance still has the encryption key \
+                         this deployment was created with."
+                    ))
+            }
         }
     }
 }

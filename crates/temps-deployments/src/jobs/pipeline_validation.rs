@@ -5,11 +5,14 @@
 //!
 //! This module provides synchronous validation of the complete deployment pipeline
 
+use crate::workflow::LogWriter;
+use crate::workflow::WorkflowBuilder;
+use crate::workflow::WorkflowError;
+use crate::workflow::WorkflowTask;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use temps_core::{LogWriter, WorkflowBuilder, WorkflowError, WorkflowTask};
 use temps_git::{GitProviderManagerError, GitProviderManagerTrait, PullRequest, RepositoryInfo};
 
 use crate::jobs::{
@@ -77,6 +80,7 @@ impl ImageBuilder for MockImageBuilder {
             tags: vec![image_name.to_string()],
             created: Some("2025-01-01T00:00:00Z".to_string()),
             working_dir: Some("/app".to_string()),
+            config: None,
         })
     }
 
@@ -94,6 +98,18 @@ struct MockContainerDeployer;
 
 #[async_trait]
 impl ContainerDeployer for MockContainerDeployer {
+    async fn exec_in_container(
+        &self,
+        container_id: &str,
+        _command: Vec<String>,
+        _timeout: std::time::Duration,
+    ) -> Result<temps_deployer::ExecResult, temps_deployer::DeployerError> {
+        Err(temps_deployer::DeployerError::ExecFailed {
+            container_id: container_id.to_string(),
+            reason: "exec is not scripted by this test deployer".to_string(),
+        })
+    }
+
     async fn deploy_container(
         &self,
         request: DeployRequest,
@@ -174,6 +190,8 @@ impl ContainerDeployer for MockContainerDeployer {
             memory_percent: Some(9.77),
             network_rx_bytes: 1024000,
             network_tx_bytes: 512000,
+            block_read_bytes: None,
+            block_write_bytes: None,
             timestamp: chrono::Utc::now(),
             ..Default::default()
         })

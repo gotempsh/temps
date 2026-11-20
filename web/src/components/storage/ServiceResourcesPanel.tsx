@@ -27,6 +27,13 @@ interface ServiceResourcesPanelProps {
   serviceName: string
 }
 
+const STATS_POLL_MS = 5_000
+// Longer than the poll interval, so a reading stays "live" from one poll to
+// the next on a working connection, and goes stale only after missed polls
+// (the tab in the background, where polling stops). A request that fails,
+// retries included, puts the query in error, which is not live either.
+const STATS_FRESH_MS = 2 * STATS_POLL_MS + 2_000
+
 /**
  * Compact runtime + live-stats panel for an external service.
  *
@@ -49,9 +56,9 @@ export function ServiceResourcesPanel({
 
   const statsQuery = useQuery({
     ...getServiceStatsOptions({ path: { id: serviceId } }),
-    refetchInterval: 5_000,
+    refetchInterval: STATS_POLL_MS,
     refetchIntervalInBackground: false,
-    staleTime: 4_000,
+    staleTime: STATS_FRESH_MS,
   })
 
   const firstMember = runtimeQuery.data?.members?.[0]
@@ -90,6 +97,7 @@ export function ServiceResourcesPanel({
                     member={member}
                     stats={stats}
                     isLive={isLive && idx === 0}
+                    statsFresh={isLive}
                     onEditLimits={
                       idx === 0 ? () => setDialogOpen(true) : undefined
                     }
@@ -121,11 +129,14 @@ function MemberRow({
   member,
   stats,
   isLive,
+  statsFresh,
   onEditLimits,
 }: {
   member: ContainerRuntimeInfo
   stats: ContainerStatsSample | undefined
   isLive: boolean
+  /** The stats query succeeded and is not stale: readings are current. */
+  statsFresh: boolean
   onEditLimits?: () => void
 }) {
   const restartCount = member.restart_count ?? 0
@@ -134,28 +145,47 @@ function MemberRow({
   const showRestartWarning = restartCount > 0
 
   return (
-    <li className="space-y-2 px-2 py-2.5">
-      <div className="flex flex-col gap-2 lg:flex-row lg:items-center lg:gap-4">
+    <li className="@container space-y-2 px-2 py-2.5">
+      <div className="relative flex flex-col gap-2 @3xl:flex-row @3xl:items-center @3xl:gap-4">
         {/* Identity: name • role • status • limits hint */}
-        <div className="flex min-w-0 flex-1 flex-wrap items-center gap-x-2 gap-y-1">
+        <div className="flex min-w-0 flex-1 flex-wrap items-center gap-x-2 gap-y-1 pr-8 @3xl:pr-0">
           <span className="truncate text-sm font-medium">
             {member.container_name}
           </span>
           <Badge variant="outline" className="h-5 px-1.5 text-[10px]">
             {member.role}
           </Badge>
-          <StatusDot status={status} live={isLive} />
+          <StatusDot
+            status={status}
+            live={isLive}
+            unknown={Boolean(member.unavailable_reason)}
+          />
           <LimitsInline limits={member.resource_limits} />
         </div>
 
-        {/* Live meters — sit on a single line above lg, stack tight below */}
-        <div className="grid flex-1 grid-cols-2 gap-3 sm:gap-6 lg:max-w-[420px] lg:flex-none lg:shrink-0 lg:basis-[420px]">
-          <CpuMeter sample={stats} limits={member.resource_limits} />
+        {/* Live meters — beside the identity when the panel has room for both,
+            below it otherwise. */}
+        <div className="grid flex-1 grid-cols-2 gap-3 sm:gap-6 @3xl:max-w-[420px] @3xl:flex-none @3xl:shrink-0 @3xl:basis-[420px]">
+          <CpuMeter
+            sample={stats}
+            limits={member.resource_limits}
+            fresh={statsFresh}
+          />
           <MemoryMeter sample={stats} limits={member.resource_limits} />
         </div>
 
-        {onEditLimits && <EditLimitsButton onClick={onEditLimits} />}
+        {/* Stays on the identity line when the meters drop below it. */}
+        {onEditLimits && (
+          <div className="absolute top-0 right-0 @3xl:static">
+            <EditLimitsButton onClick={onEditLimits} />
+          </div>
+        )}
       </div>
+
+      <UnavailableNote
+        runtimeReason={member.unavailable_reason}
+        statsReason={stats?.unavailable_reason}
+      />
 
       {/* Started + restart counter — third-tier metadata, only shown when
           there's a signal worth surfacing (started_at or non-zero restarts). */}
@@ -197,21 +227,61 @@ function MemberRow({
   )
 }
 
+/**
+ * Why the runtime state or the usage meters are empty, when the server could
+ * not read them: the container runs on a worker whose agent is unreachable or
+ * too old, or this server has no Docker daemon. Without it, an empty row
+ * reads as "container missing", which is wrong.
+ */
+export function UnavailableNote({
+  runtimeReason,
+  statsReason,
+}: {
+  runtimeReason?: string | null
+  statsReason?: string | null
+}) {
+  const reasons = [runtimeReason, statsReason].filter(
+    (reason, index, all): reason is string =>
+      Boolean(reason) && all.indexOf(reason) === index
+  )
+  if (reasons.length === 0) return null
+  return (
+    <Alert>
+      <AlertTriangle className="h-4 w-4" />
+      <AlertTitle>
+        {runtimeReason
+          ? 'Container state unavailable'
+          : 'Resource usage unavailable'}
+      </AlertTitle>
+      <AlertDescription>
+        {reasons.map((reason) => (
+          <p key={reason} className="text-xs">
+            {reason}
+          </p>
+        ))}
+      </AlertDescription>
+    </Alert>
+  )
+}
+
 // Tiny status pill — saves the horizontal space a full Badge eats. When
 // `live` is set on a running container the dot pulses, replacing the
 // separate "live" indicator the old card header used to show.
 function StatusDot({
   status,
   live = false,
+  unknown = false,
 }: {
   status: string | null
   live?: boolean
+  /** The state could not be read, so an empty status is not "missing". */
+  unknown?: boolean
 }) {
   if (!status) {
     return (
       <span className="inline-flex items-center gap-1 text-xs text-muted-foreground">
         <span className="size-1.5 rounded-full bg-muted-foreground/40" />
-        missing
+        {unknown ? 'unknown' : 'missing'}
       </span>
     )
   }
@@ -254,15 +324,19 @@ function EditLimitsButton({ onClick }: { onClick: () => void }) {
 // ---------------------------------------------------------------------------
 // CPU meter: inline value + thin bar. Value reads as cores used (and "/ cap"
 // when a CPU cap is configured) so a 2-core-pinned container says "2.00 / 2
-// cores" rather than the raw "200%" Docker reports. The bar fills against
-// the cap when set, otherwise against host cores.
+// cores" rather than the raw "200%" Docker reports — the same reading as the
+// Monitoring card's CPU tile, which averages over a longer window. The bar
+// fills against the cap when set, otherwise against host cores.
 // ---------------------------------------------------------------------------
 function CpuMeter({
   sample,
   limits,
+  fresh,
 }: {
   sample: ContainerStatsSample | undefined
   limits: ContainerRuntimeInfo['resource_limits']
+  /** Whether the stats query is current; "live" is shown only then. */
+  fresh: boolean
 }) {
   const hostCpuPercent = sample?.cpu_percent ?? null
   const onlineCpus = sample?.online_cpus ?? null
@@ -288,6 +362,11 @@ function CpuMeter({
     <Meter
       icon={<Cpu className="size-3.5" />}
       label="CPU"
+      // "live" only for a current reading: not for a missing sample, nor for
+      // the last value kept while the stats request fails or the tab is in
+      // the background.
+      hint={fresh && hostCpuPercent != null ? 'live' : undefined}
+      title={CPU_METER_TITLE}
       value={
         hostCpuPercent != null ? formatCpuUsage(hostCpuPercent, capCores) : '—'
       }
@@ -296,6 +375,11 @@ function CpuMeter({
     />
   )
 }
+
+const CPU_METER_TITLE =
+  'Cores used over a one-second sample, refreshed every 5 seconds. The ' +
+  "Monitoring card's CPU tile averages since the previous health check " +
+  '(about 30 seconds), so short bursts show here first.'
 
 function MemoryMeter({
   sample,
@@ -345,6 +429,7 @@ function Meter({
   barPercent,
   tone = 'normal',
   hint,
+  title,
 }: {
   icon: React.ReactNode
   label: string
@@ -352,6 +437,7 @@ function Meter({
   barPercent: number
   tone?: 'normal' | 'warn' | 'danger'
   hint?: string
+  title?: string
 }) {
   const barClass =
     tone === 'danger'
@@ -362,11 +448,14 @@ function Meter({
   return (
     <div className="min-w-0">
       <div className="flex items-baseline justify-between gap-2">
-        <div className="flex items-center gap-1 text-xs font-medium text-muted-foreground">
-          <span className="text-muted-foreground/80">{icon}</span>
+        <div
+          className="flex items-center gap-1 text-xs font-medium text-muted-foreground"
+          title={title}
+        >
+          <span className="text-muted-foreground">{icon}</span>
           {label}
           {hint && (
-            <span className="text-[10px] uppercase tracking-wide text-muted-foreground/60">
+            <span className="text-[10px] uppercase tracking-wide text-muted-foreground">
               {hint}
             </span>
           )}
@@ -405,7 +494,7 @@ function LimitsInline({
 
   if (memory == null && nano == null && shm == null) {
     return (
-      <span className="text-[10px] uppercase tracking-wide text-muted-foreground/60">
+      <span className="text-[10px] uppercase tracking-wide text-muted-foreground">
         Unlimited
       </span>
     )

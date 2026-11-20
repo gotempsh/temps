@@ -1,0 +1,1587 @@
+<!doctype html>
+<!-- SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+SPDX-License-Identifier: MIT OR Apache-2.0 -->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Sample Studio — Room for good work</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --ink: #212b27;
+        --muted: #6b736d;
+        --paper: #f8f8f1;
+        --line: #dedfd4;
+        --green: #385b41;
+        --lime: #d9eea5;
+        --orange: #e8a86e;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      html {
+        scroll-behavior: smooth;
+        scroll-padding-top: 100px;
+      }
+      body {
+        margin: 0;
+        background: var(--paper);
+        color: var(--ink);
+        font:
+          15px/1.55 system-ui,
+          sans-serif;
+      }
+      button,
+      input,
+      select {
+        font: inherit;
+      }
+      button,
+      a {
+        -webkit-tap-highlight-color: transparent;
+      }
+      button {
+        cursor: pointer;
+      }
+      button:focus-visible,
+      a:focus-visible,
+      input:focus-visible,
+      select:focus-visible {
+        outline: 3px solid var(--orange);
+        outline-offset: 4px;
+      }
+      a {
+        color: inherit;
+        text-decoration: none;
+      }
+      button {
+        border: 0;
+      }
+      h1,
+      h2,
+      h3,
+      p {
+        margin: 0;
+      }
+      h1 {
+        font-size: clamp(42px, 5.5vw, 72px);
+        line-height: 1.03;
+        letter-spacing: -3.8px;
+        font-weight: 650;
+      }
+      h2 {
+        font-size: 40px;
+        line-height: 1.15;
+        letter-spacing: -1.7px;
+        font-weight: 620;
+      }
+      h3 {
+        font-size: 21px;
+        letter-spacing: -0.5px;
+        font-weight: 620;
+      }
+      p {
+        color: var(--muted);
+      }
+      .wrap {
+        max-width: 1160px;
+        margin: auto;
+        padding: 0 36px;
+      }
+      .eyebrow {
+        display: block;
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 2px;
+        text-transform: uppercase;
+        margin-bottom: 18px;
+        color: var(--green);
+      }
+      .btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 18px;
+        padding: 13px 21px;
+        border: 1px solid var(--green);
+        border-radius: 7px;
+        background: var(--green);
+        color: white;
+        font-weight: 600;
+        font-size: 14px;
+        transition:
+          transform 0.18s,
+          background 0.18s;
+      }
+      .btn:hover {
+        transform: translateY(-2px);
+        background: #284630;
+      }
+      .btn.outline {
+        background: transparent;
+        color: var(--ink);
+        border-color: #c8cbbd;
+      }
+      .btn.light {
+        background: var(--lime);
+        color: var(--ink);
+        border-color: var(--lime);
+      }
+      .row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 24px;
+      }
+      .pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 5px 10px;
+        border-radius: 30px;
+        background: #eef0e6;
+        color: var(--green);
+        font-size: 11px;
+        font-weight: 650;
+      }
+      header {
+        position: sticky;
+        top: 0;
+        z-index: 5;
+        background: rgba(248, 248, 241, 0.96);
+        border-bottom: 1px solid var(--line);
+      }
+      .nav {
+        height: 78px;
+      }
+      .brand {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        font-weight: 750;
+        letter-spacing: -0.8px;
+        font-size: 21px;
+      }
+      .mark {
+        display: grid;
+        place-items: center;
+        height: 29px;
+        width: 29px;
+        background: var(--green);
+        color: var(--lime);
+        border-radius: 8px;
+        font-size: 23px;
+      }
+      .links {
+        display: flex;
+        align-items: center;
+        gap: 30px;
+        font-size: 13px;
+        color: #535f55;
+      }
+      .nav .btn {
+        padding: 10px 17px;
+      }
+      .hero {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 54px;
+        align-items: center;
+        padding-top: 76px;
+        padding-bottom: 72px;
+      }
+      .hero .lead {
+        margin: 24px 0 28px;
+        font-size: 17px;
+        max-width: 420px;
+      }
+      .hero h1 em {
+        font-family: Georgia, serif;
+        font-weight: 400;
+        color: var(--green);
+      }
+      .actions {
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        flex-wrap: wrap;
+      }
+      .fine {
+        font-size: 11px;
+        color: #7f877e;
+        margin-top: 17px;
+      }
+      .hero-art {
+        position: relative;
+        padding: 30px 0 30px 20px;
+      }
+      .hero-art:before {
+        content: "";
+        position: absolute;
+        inset: -20px -22px -20px 15px;
+        border-radius: 48% 46% 40% 43%;
+        background: #e6ead6;
+        transform: rotate(-8deg);
+      }
+      .window {
+        position: relative;
+        background: #fff;
+        border: 1px solid #d5dccc;
+        border-radius: 12px;
+        box-shadow: 0 22px 55px #283c2020;
+        overflow: hidden;
+      }
+      .window-bar {
+        height: 39px;
+        padding: 0 16px;
+        display: flex;
+        align-items: center;
+        gap: 5px;
+        background: #f4f5ef;
+        border-bottom: 1px solid #e5e8df;
+        font-size: 10px;
+        color: #89917f;
+      }
+      .dot {
+        width: 7px;
+        height: 7px;
+        background: #d4d9cb;
+        border-radius: 50%;
+      }
+      .window-title {
+        margin-left: 12px;
+      }
+      .workspace {
+        display: grid;
+        grid-template-columns: 112px minmax(0, 1fr);
+        min-height: 302px;
+      }
+      .mock-nav {
+        background: #f6f8f1;
+        padding: 20px 12px;
+        border-right: 1px solid #e7eadf;
+        font-size: 10px;
+        color: #7c8772;
+      }
+      .mock-nav b {
+        display: block;
+        font-size: 11px;
+        color: #30492e;
+        margin-bottom: 22px;
+      }
+      .mock-nav span {
+        display: block;
+        padding: 7px;
+        margin-bottom: 6px;
+        border-radius: 5px;
+      }
+      .mock-nav span:first-of-type {
+        color: #3c5c38;
+        background: #e4edd9;
+      }
+      .mock-main {
+        padding: 20px 18px;
+      }
+      .mock-main h3 {
+        font-size: 15px;
+        margin-bottom: 3px;
+      }
+      .mock-main p {
+        font-size: 9px;
+      }
+      .mock-stats {
+        display: flex;
+        gap: 9px;
+        margin: 17px 0;
+      }
+      .mock-stat {
+        flex: 1;
+        min-width: 0;
+        overflow-wrap: anywhere;
+        border: 1px solid #e5e8df;
+        border-radius: 6px;
+        padding: 10px;
+      }
+      .mock-stat span {
+        display: block;
+        font-size: 9px;
+        color: #7e8778;
+      }
+      .mock-stat b {
+        font-size: 22px;
+        font-weight: 600;
+      }
+      .task {
+        display: flex;
+        align-items: center;
+        gap: 9px;
+        padding: 10px 0;
+        border-top: 1px solid #edf0e8;
+        font-size: 10px;
+      }
+      .tick {
+        height: 15px;
+        width: 15px;
+        border-radius: 4px;
+        border: 1px solid #cad5c0;
+        color: #3f6845;
+        display: grid;
+        place-items: center;
+        background: #eef4e6;
+        font-size: 10px;
+      }
+      .task small {
+        margin-left: auto;
+        background: #fbf0df;
+        border-radius: 4px;
+        padding: 2px 6px;
+        font-size: 8px;
+        color: #97693c;
+      }
+      .floating {
+        position: absolute;
+        bottom: 0;
+        right: -16px;
+        padding: 13px 18px;
+        background: #fff;
+        border: 1px solid #d5dccc;
+        border-radius: 9px;
+        box-shadow: 0 8px 20px #26321c12;
+        font-size: 11px;
+        display: flex;
+        gap: 12px;
+        align-items: center;
+      }
+      .avatar {
+        display: grid;
+        place-items: center;
+        height: 30px;
+        width: 30px;
+        border-radius: 50%;
+        background: var(--lime);
+        color: var(--green);
+        font-weight: 650;
+      }
+      .audience {
+        padding: 20px 0 37px;
+        border-bottom: 1px solid var(--line);
+        text-align: center;
+      }
+      .audience p {
+        font-size: 11px;
+        margin-bottom: 20px;
+      }
+      .team-types {
+        display: flex;
+        justify-content: center;
+        gap: 57px;
+        color: #6e776a;
+        font-size: 15px;
+        font-weight: 650;
+        letter-spacing: -0.4px;
+      }
+      section {
+        padding: 72px 0;
+      }
+      .section-head {
+        max-width: 570px;
+        margin-bottom: 34px;
+      }
+      .section-head p {
+        margin-top: 16px;
+      }
+      .tabs {
+        display: flex;
+        gap: 8px;
+        margin-bottom: 22px;
+      }
+      .tab {
+        background: transparent;
+        border: 1px solid #d8ddcf;
+        border-radius: 7px;
+        padding: 10px 22px;
+        color: #6c7965;
+      }
+      .tab[aria-selected="true"] {
+        color: white;
+        background: var(--green);
+        border-color: var(--green);
+      }
+      .product-preview {
+        display: grid;
+        grid-template-columns: 1fr 1.15fr;
+        gap: 35px;
+        padding: 34px;
+        background: #e9eddf;
+        border: 1px solid #dce2d1;
+        border-radius: 15px;
+        align-items: center;
+      }
+      .product-preview h3 {
+        font-size: 27px;
+        margin-bottom: 15px;
+      }
+      .product-preview p {
+        margin-bottom: 24px;
+        max-width: 320px;
+      }
+      .mini-board {
+        background: white;
+        padding: 22px;
+        border-radius: 9px;
+        border: 1px solid #d8e0ce;
+      }
+      .board-title {
+        font-size: 11px;
+        font-weight: 650;
+        color: var(--green);
+        margin-bottom: 10px;
+      }
+      .progress {
+        height: 6px;
+        background: #edf0e5;
+        margin-top: 18px;
+        border-radius: 8px;
+        overflow: hidden;
+      }
+      .progress span {
+        display: block;
+        height: 100%;
+        background: #9fb477;
+        width: 65%;
+      }
+      .features {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 18px;
+        margin-top: 24px;
+      }
+      .feature {
+        padding: 25px 23px;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+      }
+      .feature-icon {
+        display: block;
+        font-size: 27px;
+        color: #6d8258;
+        margin-bottom: 15px;
+      }
+      .feature h3 {
+        font-size: 17px;
+        margin-bottom: 9px;
+      }
+      .feature p {
+        font-size: 13px;
+      }
+      .quote {
+        background: #e9e9dc;
+        border-radius: 15px;
+        padding: 42px;
+        display: grid;
+        grid-template-columns: 1.5fr 1fr;
+        gap: 40px;
+      }
+      .quote blockquote {
+        margin: 0;
+        font:
+          27px/1.35 Georgia,
+          serif;
+        letter-spacing: -0.5px;
+      }
+      .quote p {
+        margin-top: 19px;
+        font-size: 12px;
+      }
+      .quote-number {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        flex-direction: column;
+        border-left: 1px solid #d2d5c3;
+      }
+      .quote-number b {
+        font-size: 56px;
+        font-weight: 500;
+        line-height: 1.1;
+        letter-spacing: -2px;
+      }
+      .quote-number span {
+        font-size: 12px;
+        color: #6d7764;
+        margin-top: 8px;
+      }
+      .pricing-head {
+        display: flex;
+        justify-content: space-between;
+        align-items: flex-end;
+        gap: 35px;
+        margin-bottom: 32px;
+      }
+      .billing {
+        display: inline-flex;
+        border: 1px solid #d1d7c5;
+        padding: 4px;
+        border-radius: 8px;
+        gap: 4px;
+      }
+      .billing button {
+        background: transparent;
+        border-radius: 5px;
+        padding: 8px 14px;
+        color: #6c7863;
+        font-size: 12px;
+      }
+      .billing button[aria-pressed="true"] {
+        color: white;
+        background: var(--green);
+      }
+      .plans {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 18px;
+      }
+      .plan {
+        padding: 28px;
+        border: 1px solid #d7ddcb;
+        border-radius: 12px;
+        position: relative;
+      }
+      .plan.featured {
+        background: #eef2e5;
+        border-color: #6c8554;
+      }
+      .plan p {
+        font-size: 12px;
+        margin: 10px 0 20px;
+      }
+      .price {
+        font-size: 44px;
+        font-weight: 600;
+        line-height: 1.1;
+        letter-spacing: -2px;
+        margin: 22px 0 8px;
+      }
+      .price small {
+        font-size: 12px;
+        font-weight: 400;
+        color: #79836f;
+        letter-spacing: 0;
+      }
+      .plan .btn {
+        width: 100%;
+        margin: 20px 0 10px;
+      }
+      .plan ul {
+        padding: 0;
+        list-style: none;
+        font-size: 12px;
+        color: #59684f;
+        line-height: 2.4;
+      }
+      .plan li:before {
+        content: "✓";
+        padding-right: 9px;
+        color: #72935d;
+      }
+      .popular {
+        position: absolute;
+        right: 20px;
+        top: 20px;
+        font-size: 10px;
+        color: var(--green);
+        font-weight: 650;
+      }
+      .calculator {
+        display: grid;
+        grid-template-columns: 1fr 1.2fr auto;
+        align-items: center;
+        gap: 30px;
+        margin-top: 22px;
+        padding: 22px 28px;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+      }
+      .calculator p {
+        font-size: 11px;
+      }
+      input[type="range"] {
+        width: 100%;
+        accent-color: var(--green);
+      }
+      .estimate {
+        text-align: right;
+        font-size: 22px;
+        font-weight: 600;
+      }
+      .estimate small {
+        display: block;
+        font-size: 10px;
+        color: var(--muted);
+        font-weight: 400;
+      }
+      .faq-layout {
+        display: grid;
+        grid-template-columns: 1fr 1.25fr;
+        gap: 85px;
+      }
+      .faq-layout p {
+        margin-top: 18px;
+      }
+      details {
+        padding: 19px 0;
+        border-bottom: 1px solid var(--line);
+      }
+      details:first-child {
+        border-top: 1px solid var(--line);
+      }
+      summary {
+        cursor: pointer;
+        font-size: 14px;
+        font-weight: 600;
+        list-style: none;
+        display: flex;
+        justify-content: space-between;
+        gap: 20px;
+      }
+      summary:after {
+        content: "+";
+        color: #7b896e;
+        font-size: 18px;
+      }
+      details[open] summary:after {
+        content: "−";
+      }
+      details p {
+        margin-top: 12px;
+        font-size: 13px;
+      }
+      .cta {
+        padding: 49px 45px;
+        background: var(--green);
+        color: white;
+        border-radius: 14px;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 30px;
+      }
+      .cta h2 {
+        font-size: 34px;
+      }
+      .cta p {
+        color: #c1d1b8;
+        margin-top: 12px;
+      }
+      footer {
+        padding: 35px 0;
+        border-top: 1px solid var(--line);
+        color: #7f8778;
+        font-size: 11px;
+      }
+      .footer-row {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 20px;
+      }
+      .footer-row .brand {
+        font-size: 16px;
+        color: var(--ink);
+      }
+      [hidden] {
+        display: none !important;
+      }
+      .modal {
+        position: fixed;
+        inset: 0;
+        width: 100vw;
+        height: 100dvh;
+        z-index: 20;
+        background: #1c2b2290;
+        display: grid;
+        grid-template-columns: minmax(0, 1fr);
+        place-items: center;
+        padding: 24px;
+      }
+      .dialog {
+        width: 100%;
+        min-width: 0;
+        max-width: 500px;
+        max-height: 90vh;
+        overflow: auto;
+        padding: 34px;
+        border-radius: 15px;
+        background: var(--paper);
+        box-shadow: 0 30px 100px #101b2440;
+      }
+      .dialog h2 {
+        font-size: 29px;
+        margin-top: 15px;
+      }
+      .dialog .close {
+        flex-shrink: 0;
+        background: #eaeddf;
+        color: #697762;
+        border-radius: 50%;
+        width: 28px;
+        height: 28px;
+        font-size: 18px;
+      }
+      .dialog p {
+        font-size: 13px;
+        margin-top: 12px;
+      }
+      label {
+        display: block;
+        font-size: 12px;
+        font-weight: 600;
+        margin: 18px 0 7px;
+      }
+      input:not([type="range"]),
+      select {
+        width: 100%;
+        border: 1px solid #cfd6c4;
+        border-radius: 7px;
+        padding: 11px 12px;
+        background: white;
+        color: var(--ink);
+      }
+      .dialog .btn {
+        width: 100%;
+        margin-top: 24px;
+      }
+      .validation {
+        color: #a34f35 !important;
+        border-left: 3px solid #d6a386;
+        padding-left: 10px;
+      }
+      .template {
+        display: block;
+        padding: 15px;
+        margin-top: 12px;
+        border: 1px solid #cfd6c4;
+        border-radius: 8px;
+        cursor: pointer;
+        background: #fff;
+        font-size: 13px;
+      }
+      .template:has(input:checked) {
+        border-color: var(--green);
+        background: #eef2e5;
+      }
+      .template input {
+        width: auto !important;
+        margin-right: 12px;
+        accent-color: var(--green);
+      }
+      .welcome {
+        max-width: 760px;
+        margin: auto;
+        padding: 65px 36px 90px;
+      }
+      .welcome h1 {
+        font-size: 47px;
+        margin: 23px 0;
+      }
+      .welcome p {
+        margin-bottom: 26px;
+      }
+      .welcome-mark {
+        display: grid;
+        place-items: center;
+        width: 55px;
+        height: 55px;
+        border-radius: 15px;
+        font-size: 30px;
+        color: var(--green);
+        background: var(--lime);
+      }
+      .checklist {
+        padding: 8px 23px;
+        background: white;
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        margin: 28px 0;
+      }
+      .checklist button {
+        width: 100%;
+        display: flex;
+        align-items: center;
+        gap: 13px;
+        border-bottom: 1px solid #e6eadf;
+        background: white;
+        padding: 19px 0;
+        color: var(--ink);
+        text-align: left;
+      }
+      .checklist button:last-child {
+        border-bottom: 0;
+      }
+      .checklist button[aria-pressed="true"] .tick {
+        background: var(--green);
+        color: white;
+      }
+      .toast {
+        position: fixed;
+        right: 25px;
+        bottom: 24px;
+        z-index: 30;
+        padding: 15px 22px;
+        color: white;
+        background: var(--green);
+        border-radius: 10px;
+        box-shadow: 0 8px 25px #22311c25;
+        font-size: 13px;
+      }
+      @media (max-width: 800px) {
+        .nav .brand {
+          white-space: nowrap;
+          font-size: 17px;
+          gap: 7px;
+        }
+        .nav .mark {
+          flex-shrink: 0;
+        }
+        .nav .btn {
+          padding: 9px 10px;
+          font-size: 11px;
+          gap: 8px;
+        }
+        .dialog {
+          padding: 24px;
+        }
+        .wrap {
+          padding: 0 22px;
+        }
+        .hero {
+          grid-template-columns: minmax(0, 1fr);
+          gap: 35px;
+          padding-top: 45px;
+        }
+        .hero-art {
+          max-width: 480px;
+        }
+        .hero-art:before {
+          inset: 0;
+          transform: none;
+        }
+        .mock-stat {
+          padding: 7px;
+        }
+        .mock-stat b {
+          font-size: 18px;
+        }
+        .links {
+          gap: 15px;
+        }
+        .links a {
+          display: none;
+        }
+        h1 {
+          letter-spacing: -2px;
+        }
+        .team-types {
+          gap: 22px;
+          flex-wrap: wrap;
+        }
+        .product-preview,
+        .faq-layout {
+          grid-template-columns: 1fr;
+          gap: 25px;
+        }
+        .plans,
+        .features {
+          grid-template-columns: 1fr;
+        }
+        .pricing-head {
+          display: block;
+        }
+        .billing {
+          margin-top: 22px;
+        }
+        .calculator {
+          grid-template-columns: 1fr;
+        }
+        .estimate {
+          text-align: left;
+        }
+        .quote {
+          grid-template-columns: 1fr;
+        }
+        .quote-number {
+          border: 0;
+          align-items: flex-start;
+        }
+        .cta {
+          display: block;
+          padding: 32px;
+        }
+        .cta .btn {
+          margin-top: 25px;
+        }
+        .footer-row {
+          flex-wrap: wrap;
+        }
+        section {
+          padding: 48px 0;
+        }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        html {
+          scroll-behavior: auto;
+        }
+        .btn {
+          transition: none;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <header data-synthetic-public>
+      <div class="wrap row nav">
+        <a class="brand" href="#top"
+          ><span class="mark">✳</span>Sample Studio</a
+        >
+        <nav class="links" aria-label="Main navigation">
+          <a id="nav-product" href="#product">Product</a
+          ><a id="nav-pricing" href="#pricing">Pricing</a
+          ><a id="nav-faq" href="#faq">Questions</a>
+          <button class="btn" data-signup="Team" id="nav-signup">
+            Start a workspace <span>↗</span>
+          </button>
+        </nav>
+      </div>
+    </header>
+    <main id="main">
+      <div class="wrap">
+        <div class="hero" id="top" data-synthetic-public>
+          <div>
+            <span class="eyebrow"
+              >A little structure. A lot more possibility.</span
+            >
+            <h1>Less busywork.<br />More <em>good work.</em></h1>
+            <p class="lead">
+              Bring your plans, projects and people into one calm workspace.
+              Make progress without the noise.
+            </p>
+            <div class="actions">
+              <button class="btn" id="hero-signup" data-signup="Team">
+                Make room for your team <span>↗</span></button
+              ><a class="btn outline" id="explore" href="#product"
+                >Explore the workspace ↓</a
+              >
+            </div>
+            <p class="fine">
+              A synthetic product demo · No real accounts or payments
+            </p>
+          </div>
+          <div class="hero-art">
+            <div class="window">
+              <div class="window-bar">
+                <i class="dot"></i><i class="dot"></i><i class="dot"></i
+                ><span class="window-title"
+                  >Sample Studio / Your workspace</span
+                >
+              </div>
+              <div class="workspace">
+                <aside class="mock-nav">
+                  <b>✳ Studio space</b><span>◈ Overview</span
+                  ><span>▤ Projects</span><span>◷ Timeline</span
+                  ><span>◇ Team notes</span>
+                </aside>
+                <div class="mock-main">
+                  <div class="row">
+                    <h3>A fresh perspective.</h3>
+                    <span class="pill">This week</span>
+                  </div>
+                  <p>One shared space. Everything moving forward.</p>
+                  <div class="mock-stats">
+                    <div class="mock-stat">
+                      <span>In progress</span><b>12</b>
+                    </div>
+                    <div class="mock-stat"><span>Completed</span><b>28</b></div>
+                    <div class="mock-stat">
+                      <span>Team rhythm</span><b>↗ 18%</b>
+                    </div>
+                  </div>
+                  <div class="task">
+                    <span class="tick">✓</span>Shape the next idea
+                    <small>Design</small>
+                  </div>
+                  <div class="task">
+                    <span class="tick">✓</span>Review the little details
+                    <small>Review</small>
+                  </div>
+                  <div class="task">
+                    <span class="tick"></span>Make something worth sharing
+                    <small>In progress</small>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div class="floating">
+              <span class="avatar">✓</span>
+              <div>
+                <b>A little progress, every day.</b><br /><span
+                  style="color: #849079"
+                  >Your weekly plan is taking shape.</span
+                >
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="audience" data-synthetic-public>
+          <p>ROOM FOR EVERY KIND OF SMALL TEAM</p>
+          <div class="team-types">
+            <span>Independent studios</span><span>Product teams</span
+            ><span>Creative collectives</span><span>Everyday builders</span>
+          </div>
+        </div>
+        <section id="product" data-synthetic-public>
+          <div class="section-head">
+            <span class="eyebrow">Good things happen in a shared space</span>
+            <h2>From the first spark<br />to the final little detail.</h2>
+            <p>
+              A flexible workflow that leaves room for how your team actually
+              works.
+            </p>
+          </div>
+          <div class="tabs" role="tablist" aria-label="Workspace views">
+            <button
+              class="tab"
+              id="tab-plan"
+              role="tab"
+              aria-selected="true"
+              aria-controls="product-panel"
+              data-tab="plan"
+            >
+              01 · Plan</button
+            ><button
+              class="tab"
+              id="tab-create"
+              role="tab"
+              aria-selected="false"
+              aria-controls="product-panel"
+              data-tab="create"
+            >
+              02 · Create</button
+            ><button
+              class="tab"
+              id="tab-ship"
+              role="tab"
+              aria-selected="false"
+              aria-controls="product-panel"
+              data-tab="ship"
+            >
+              03 · Share
+            </button>
+          </div>
+          <div
+            class="product-preview"
+            id="product-panel"
+            role="tabpanel"
+            aria-labelledby="tab-plan"
+          ></div>
+          <div class="features">
+            <article class="feature">
+              <span class="feature-icon">⌁</span>
+              <h3>A clearer next step</h3>
+              <p>
+                Turn a big idea into small, manageable pieces. Know what matters
+                today.
+              </p>
+            </article>
+            <article class="feature">
+              <span class="feature-icon">◈</span>
+              <h3>Context, all together</h3>
+              <p>
+                Keep the decisions, discussions and details right beside the
+                work.
+              </p>
+            </article>
+            <article class="feature">
+              <span class="feature-icon">◷</span>
+              <h3>Space to focus</h3>
+              <p>
+                Thoughtful defaults and a quieter workflow. Less chasing, more
+                making.
+              </p>
+            </article>
+          </div>
+        </section>
+        <div class="quote" data-synthetic-public>
+          <div>
+            <span class="eyebrow">A different kind of workday</span>
+            <blockquote>
+              “A shared plan makes room for the work we actually want to do.”
+            </blockquote>
+            <p>
+              Illustrative feedback from a fictional team. All content is
+              synthetic.
+            </p>
+          </div>
+          <div class="quote-number">
+            <b>One space.</b><span>Plans, projects and people, together.</span>
+          </div>
+        </div>
+        <section id="pricing" data-synthetic-public>
+          <div class="pricing-head">
+            <div>
+              <span class="eyebrow">Simple plans, room to grow</span>
+              <h2>Start small. Build something good.</h2>
+            </div>
+            <div class="billing" role="group" aria-label="Billing cycle">
+              <button id="billing-monthly" aria-pressed="true">Monthly</button
+              ><button id="billing-yearly" aria-pressed="false">
+                Yearly · save 22%
+              </button>
+            </div>
+          </div>
+          <div class="plans">
+            <article class="plan">
+              <h3>Personal</h3>
+              <p>A little structure for your own ideas.</p>
+              <div class="price">$0 <small>/ forever</small></div>
+              <p>For one person, with room to explore.</p>
+              <button class="btn outline" data-signup="Personal">
+                Start something small
+              </button>
+              <ul>
+                <li>Three active projects</li>
+                <li>Notes and task lists</li>
+                <li>A calmer starting point</li>
+              </ul>
+            </article>
+            <article class="plan featured">
+              <span class="popular">A LITTLE MORE ROOM</span>
+              <h3>Team</h3>
+              <p>A shared space for good teamwork.</p>
+              <div class="price">
+                <span id="team-price">$18</span> <small>/ person / month</small>
+              </div>
+              <p id="billing-description">
+                Billed monthly. Change plans any time.
+              </p>
+              <button class="btn" id="choose-team" data-signup="Team">
+                Bring your team together ↗
+              </button>
+              <ul>
+                <li>Unlimited projects and notes</li>
+                <li>Shared plans and timelines</li>
+                <li>Flexible team workflows</li>
+              </ul>
+            </article>
+            <article class="plan">
+              <h3>Studio</h3>
+              <p>A bigger space for connected teams.</p>
+              <div class="price">$32 <small>/ person / month</small></div>
+              <p>For teams working across workspaces.</p>
+              <button class="btn outline" data-signup="Studio">
+                Explore more possibilities
+              </button>
+              <ul>
+                <li>Everything in Team</li>
+                <li>Multiple shared workspaces</li>
+                <li>Advanced project permissions</li>
+              </ul>
+            </article>
+          </div>
+          <div class="calculator">
+            <div>
+              <h3 style="font-size: 16px">Find your team's fit</h3>
+              <p>
+                <span id="seat-count">5</span> people, one shared workspace.
+              </p>
+            </div>
+            <input
+              id="seats"
+              type="range"
+              min="2"
+              max="25"
+              value="5"
+              aria-label="Team size"
+            />
+            <div class="estimate">
+              <span id="estimate">$90</span
+              ><small>per month · illustrative estimate</small>
+            </div>
+          </div>
+        </section>
+        <section id="faq" class="faq-layout" data-synthetic-public>
+          <div>
+            <span class="eyebrow">A few things you might wonder</span>
+            <h2>A little clarity<br />before you begin.</h2>
+            <p>Simple answers, so you can get back to making good things.</p>
+          </div>
+          <div>
+            <details id="faq-trial">
+              <summary>Can we try it before choosing a plan?</summary>
+              <p>
+                Of course. Start with a sample workspace, explore the workflow
+                and choose a plan when you're ready. This demo never creates a
+                real subscription.
+              </p>
+            </details>
+            <details id="faq-tools">
+              <summary>Do we have to change how we work?</summary>
+              <p>
+                Start with one project. Choose a template, adapt the steps and
+                keep the rhythm that already works for your team.
+              </p>
+            </details>
+            <details id="faq-privacy">
+              <summary>What happens to our information?</summary>
+              <p>
+                This is a synthetic test application. Signup inputs are masked
+                in the replay; no real accounts, invitations or payments are
+                created.
+              </p>
+            </details>
+            <details>
+              <summary>Can we change plans later?</summary>
+              <p>
+                Yes. A workspace can grow with the team. All plans and prices on
+                this page are illustrative test content.
+              </p>
+            </details>
+          </div>
+        </section>
+        <section style="padding-top: 0" data-synthetic-public>
+          <div class="cta">
+            <div>
+              <h2>Make a little room for better work.</h2>
+              <p>Your next good idea deserves a calmer place to begin.</p>
+            </div>
+            <button class="btn light" data-signup="Team">
+              Start your sample workspace ↗
+            </button>
+          </div>
+        </section>
+      </div>
+    </main>
+    <footer data-synthetic-public>
+      <div class="wrap footer-row">
+        <span class="brand">✳ Sample Studio</span
+        ><span>Made for a synthetic SDK compatibility test.</span
+        ><span>No real accounts · No external services · No payments</span>
+      </div>
+    </footer>
+    <div id="signup-modal" class="modal" hidden>
+      <div
+        class="dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="signup-title"
+      >
+        <div class="row" data-synthetic-public>
+          <span class="eyebrow" style="margin: 0"
+            >YOUR NEXT GOOD IDEA STARTS HERE</span
+          ><button class="close" id="close-signup" aria-label="Close signup">
+            ×
+          </button>
+        </div>
+        <h2 id="signup-title" data-synthetic-public>
+          Make room for your team.
+        </h2>
+        <p data-synthetic-public id="signup-plan">
+          Team plan · Monthly billing
+        </p>
+        <form id="signup-form" novalidate>
+          <div id="signup-step-one">
+            <label for="full-name" data-synthetic-public>Your name</label
+            ><input id="full-name" autocomplete="off" /><label
+              for="email"
+              data-synthetic-public
+              >Work email</label
+            ><input id="email" type="email" autocomplete="off" /><label
+              for="team-size"
+              data-synthetic-public
+              >Team size</label
+            ><select id="team-size">
+              <option value="small">2–5 people</option>
+              <option value="medium">6–15 people</option>
+              <option value="large">16–25 people</option>
+            </select>
+            <p
+              id="form-error"
+              class="validation"
+              data-synthetic-public
+              role="alert"
+              hidden
+            >
+              Enter your name and a valid email to continue.
+            </p>
+            <button class="btn" id="continue-signup" data-synthetic-public>
+              Continue to your workspace →
+            </button>
+            <p class="fine" data-synthetic-public>
+              Form values are masked. No signup email will be sent.
+            </p>
+          </div>
+          <div id="signup-step-two" hidden>
+            <p data-synthetic-public>
+              Choose a starting point. You can always make it your own.
+            </p>
+            <label class="template"
+              ><input
+                type="radio"
+                name="template"
+                value="project"
+                checked
+              /><span data-synthetic-public
+                >Project planning · A shared place to move work forward</span
+              ></label
+            ><label class="template"
+              ><input
+                type="radio"
+                name="template"
+                value="creative"
+                id="template-creative"
+              /><span data-synthetic-public
+                >Creative studio · Space for ideas, reviews and delivery</span
+              ></label
+            ><button class="btn" id="create-workspace" data-synthetic-public>
+              Create sample workspace ↗
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+    <div
+      class="toast"
+      id="toast"
+      role="status"
+      data-synthetic-public
+      hidden
+    ></div>
+    <script>
+      const content = {
+        plan: [
+          "A plan you can actually see.",
+          "Start with the big picture. Break it into thoughtful steps, give each one a home and make the next move clear.",
+          "YOUR WEEK, AT A GLANCE",
+          [
+            "Gather the possibilities",
+            "Choose a clear direction",
+            "Set a little time aside",
+          ],
+          "35%",
+        ],
+        create: [
+          "Good ideas need a little room.",
+          "Keep your drafts, decisions and discussions connected. Make space for feedback without losing the thread.",
+          "A SHARED SPACE TO CREATE",
+          [
+            "Explore the first concepts",
+            "Bring the team into the conversation",
+            "Refine the little details",
+          ],
+          "65%",
+        ],
+        ship: [
+          "Small steps. Something worth sharing.",
+          "Move from a thoughtful draft to a finished thing. Review the work together and celebrate the progress.",
+          "READY FOR THE NEXT CHAPTER",
+          [
+            "Finish the final review",
+            "Share what you have made",
+            "Make room for what comes next",
+          ],
+          "100%",
+        ],
+      };
+      let billing = "monthly",
+        plan = "Team",
+        step = 1,
+        lastFocus;
+      const modal = document.querySelector("#signup-modal");
+      const signal = (name) =>
+        window.dispatchEvent(
+          new CustomEvent("synthetic-action", { detail: name }),
+        );
+      function showProduct(tab) {
+        const [title, description, label, tasks, progress] = content[tab];
+        document
+          .querySelectorAll("[data-tab]")
+          .forEach((button) =>
+            button.setAttribute(
+              "aria-selected",
+              String(button.dataset.tab === tab),
+            ),
+          );
+        const panel = document.querySelector("#product-panel");
+        panel.setAttribute("aria-labelledby", "tab-" + tab);
+        panel.innerHTML =
+          "<div><h3>" +
+          title +
+          "</h3><p>" +
+          description +
+          '</p><span class="pill">A thoughtful workflow, your way ↗</span></div><div class="mini-board"><div class="board-title">' +
+          label +
+          "</div>" +
+          tasks
+            .map(
+              (task, index) =>
+                '<div class="task"><span class="tick">' +
+                (index < 2 ? "✓" : "") +
+                "</span>" +
+                task +
+                "<small>" +
+                (index < 2 ? "Done" : "Next up") +
+                "</small></div>",
+            )
+            .join("") +
+          '<div class="progress"><span style="width:' +
+          progress +
+          '"></span></div></div>';
+      }
+      document.querySelectorAll("[data-tab]").forEach(
+        (button) =>
+          (button.onclick = () => {
+            showProduct(button.dataset.tab);
+            signal("product." + button.dataset.tab);
+          }),
+      );
+      function updatePrice() {
+        const rate = billing === "yearly" ? 14 : 18;
+        document.querySelector("#team-price").textContent = "$" + rate;
+        document.querySelector("#billing-description").textContent =
+          billing === "yearly"
+            ? "Billed yearly. A little more room in the budget."
+            : "Billed monthly. Change plans any time.";
+        document.querySelector("#seat-count").textContent =
+          document.querySelector("#seats").value;
+        document.querySelector("#estimate").textContent =
+          "$" + rate * Number(document.querySelector("#seats").value);
+        for (const cycle of ["monthly", "yearly"])
+          document
+            .querySelector("#billing-" + cycle)
+            .setAttribute("aria-pressed", String(billing === cycle));
+      }
+      for (const cycle of ["monthly", "yearly"])
+        document.querySelector("#billing-" + cycle).onclick = () => {
+          billing = cycle;
+          updatePrice();
+          signal("pricing." + cycle);
+        };
+      document.querySelector("#seats").oninput = updatePrice;
+      document.querySelector("#seats").onchange = () =>
+        signal("pricing.team_size");
+      document.querySelectorAll("details").forEach((details) =>
+        details.addEventListener("toggle", () => {
+          if (details.open) signal("faq.opened");
+        }),
+      );
+      function closeSignup() {
+        modal.hidden = true;
+        document.body.style.overflow = "";
+        lastFocus?.focus();
+        signal("signup.closed");
+      }
+      document.querySelector("#close-signup").onclick = closeSignup;
+      modal.addEventListener("click", (event) => {
+        if (event.target === modal) closeSignup();
+      });
+      document.addEventListener("keydown", (event) => {
+        if (modal.hidden) return;
+        if (event.key === "Escape") closeSignup();
+        if (event.key === "Tab") {
+          const controls = [
+            ...modal.querySelectorAll("button,input,select"),
+          ].filter((node) => node.getClientRects().length);
+          const first = controls[0],
+            last = controls.at(-1);
+          if (event.shiftKey && document.activeElement === first) {
+            event.preventDefault();
+            last.focus();
+          } else if (!event.shiftKey && document.activeElement === last) {
+            event.preventDefault();
+            first.focus();
+          }
+        }
+      });
+      document.querySelectorAll("[data-signup]").forEach(
+        (button) =>
+          (button.onclick = () => {
+            lastFocus = button;
+            plan = button.dataset.signup;
+            step = 1;
+            document.querySelector("#signup-step-one").hidden = false;
+            document.querySelector("#signup-step-two").hidden = true;
+            document.querySelector("#form-error").hidden = true;
+            document.querySelector("#signup-title").textContent =
+              "Make room for your team.";
+            document.querySelector("#signup-plan").textContent =
+              plan +
+              " plan · " +
+              (billing === "yearly" ? "Yearly" : "Monthly") +
+              " billing";
+            modal.hidden = false;
+            document.body.style.overflow = "hidden";
+            document.querySelector("#full-name").focus();
+            signal("signup.opened");
+          }),
+      );
+      document.querySelector("#signup-form").onsubmit = (event) => {
+        event.preventDefault();
+        if (step === 1) {
+          const valid =
+            document.querySelector("#full-name").value.trim().length > 0 &&
+            document.querySelector("#email").validity.valid &&
+            document.querySelector("#email").value.length > 0;
+          document.querySelector("#form-error").hidden = valid;
+          if (!valid) {
+            signal("signup.validation");
+            return;
+          }
+          step = 2;
+          document.querySelector("#signup-step-one").hidden = true;
+          document.querySelector("#signup-step-two").hidden = false;
+          document.querySelector("#signup-title").textContent =
+            "Give your ideas a starting point.";
+          document.querySelector("#template-creative").focus();
+          signal("signup.template");
+          return;
+        }
+        modal.hidden = true;
+        document.body.style.overflow = "";
+        history.pushState({}, "", "/welcome");
+        document.title = "Sample Studio — Your workspace is ready";
+        document.querySelector("#main").innerHTML =
+          '<div class="welcome" data-synthetic-public><span class="welcome-mark">✓</span><span class="eyebrow" style="margin-top:27px">A LITTLE SPACE FOR SOMETHING GOOD</span><h1 id="workspace-ready">Your workspace is ready.</h1><p>No real account was created. This sample workspace completes the synthetic landing page journey.</p><span class="pill">' +
+          plan +
+          " plan · " +
+          billing +
+          ' · Creative studio</span><div class="checklist"><button id="check-project" aria-pressed="false"><span class="tick"></span><span>Create your first sample project</span></button><button id="check-plan" aria-pressed="false"><span class="tick"></span><span>Choose three thoughtful next steps</span></button><button id="check-review" aria-pressed="false"><span class="tick"></span><span>Make a little room for a review</span></button></div><p id="onboarding-progress">0 of 3 steps complete</p><div class="progress"><span id="onboarding-bar" style="width:0%"></span></div><p id="landing-finished" style="margin-top:24px" hidden>All set. A calmer workspace, ready for good work.</p></div>';
+        window.scrollTo({ top: 0, behavior: "instant" });
+        document.querySelectorAll(".checklist button").forEach(
+          (button) =>
+            (button.onclick = () => {
+              const checked = button.getAttribute("aria-pressed") !== "true";
+              button.setAttribute("aria-pressed", String(checked));
+              button.querySelector(".tick").textContent = checked ? "✓" : "";
+              const count = document.querySelectorAll(
+                '.checklist button[aria-pressed="true"]',
+              ).length;
+              document.querySelector("#onboarding-progress").textContent =
+                count + " of 3 steps complete";
+              document.querySelector("#onboarding-bar").style.width =
+                (count / 3) * 100 + "%";
+              document.querySelector("#landing-finished").hidden = count !== 3;
+              const toast = document.querySelector("#toast");
+              toast.textContent = "A little progress. One step closer.";
+              toast.hidden = false;
+              setTimeout(() => {
+                toast.hidden = true;
+              }, 2000);
+              signal("onboarding.checked");
+            }),
+        );
+        signal("signup.completed");
+      };
+      showProduct("plan");
+    </script>
+  </body>
+</html>

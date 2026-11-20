@@ -1,16 +1,22 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { summarizeActivity } from './UserDetail.activity'
 import {
   listAuditLogsOptions,
   listUsersOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { AuditLogItemRow } from '@/components/audit/AuditLogItem'
 import {
+  ResetMfaDialog,
+  ResetMfaTarget,
+} from '@/components/users/ResetMfaDialog'
+import {
   ResetPasswordDialog,
   ResetPasswordTarget,
 } from '@/components/users/ResetPasswordDialog'
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
+import { PageHeader } from '@/components/layout/PageContainer'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -44,13 +50,14 @@ import {
   MailWarning,
   ScrollText,
   Shield,
+  ShieldOff,
 } from 'lucide-react'
 import { ReactNode, useEffect, useMemo, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router'
 
 const ITEMS_PER_PAGE = 20
 const STATS_WINDOW_MS = 30 * 24 * 60 * 60 * 1000
-const STATS_BATCH_SIZE = 200
+const STATS_BATCH_SIZE = 100
 
 export function UserDetail() {
   const { userId } = useParams<{ userId: string }>()
@@ -61,6 +68,9 @@ export function UserDetail() {
   const canViewAuditLogs = useCanViewAuditLogs()
   const { user: currentUser } = useAuth()
   const [resetTarget, setResetTarget] = useState<ResetPasswordTarget | null>(
+    null
+  )
+  const [resetMfaTarget, setResetMfaTarget] = useState<ResetMfaTarget | null>(
     null
   )
 
@@ -89,9 +99,8 @@ export function UserDetail() {
     enabled: Number.isFinite(parsedId) && canViewAuditLogs,
   })
 
-  // Separate query for stats — pull a larger recent batch so we can
-  // compute "last login" / "failed logins" / "actions (30d)" without
-  // depending on the paginated view above.
+  // Separate query for stats — pull a recent batch so we can compute
+  // "actions (30d)" without depending on the paginated view above.
   const { data: statsLogs, dataUpdatedAt: statsUpdatedAt } = useQuery({
     ...listAuditLogsOptions({
       query: {
@@ -106,34 +115,51 @@ export function UserDetail() {
     enabled: Number.isFinite(parsedId) && canViewAuditLogs,
   })
 
+  // Logins get their own reads: a busy user's newest entries in the batch above
+  // can hold none of them, which would read as "Never" and no failed attempts.
+  const lastLoginQuery = useQuery({
+    ...listAuditLogsOptions({
+      query: {
+        limit: 1,
+        offset: 0,
+        user_id: parsedId,
+        operation_type: 'LOGIN_SUCCESS',
+        from: undefined,
+        to: undefined,
+      },
+    }),
+    enabled: Number.isFinite(parsedId) && canViewAuditLogs,
+  })
+
+  const failedLoginsQuery = useQuery({
+    ...listAuditLogsOptions({
+      query: {
+        limit: STATS_BATCH_SIZE,
+        offset: 0,
+        user_id: parsedId,
+        operation_type: 'LOGIN_FAILURE',
+        from: undefined,
+        to: undefined,
+      },
+    }),
+    enabled: Number.isFinite(parsedId) && canViewAuditLogs,
+  })
+
   const stats = useMemo(() => {
     if (!statsLogs) return null
     const cutoff = statsUpdatedAt - STATS_WINDOW_MS
-    let actions30d = 0
-    let failedLogins30d = 0
-    let lastLogin: { at: number; city?: string; country?: string } | undefined
-    let lastActivity: number | undefined
-    for (const log of statsLogs) {
-      if (lastActivity === undefined || log.audit_date > lastActivity) {
-        lastActivity = log.audit_date
-      }
-      if (log.audit_date >= cutoff) {
-        actions30d++
-        if (log.operation_type === 'LOGIN_FAILURE') failedLogins30d++
-      }
-      if (
-        log.operation_type === 'LOGIN_SUCCESS' &&
-        (!lastLogin || log.audit_date > lastLogin.at)
-      ) {
-        lastLogin = {
-          at: log.audit_date,
-          city: log.ip_address?.city ?? undefined,
-          country: log.ip_address?.country ?? undefined,
-        }
-      }
-    }
-    return { actions30d, failedLogins30d, lastLogin, lastActivity }
+    return summarizeActivity(statsLogs, cutoff, STATS_BATCH_SIZE)
   }, [statsLogs, statsUpdatedAt])
+
+  const lastLogin = lastLoginQuery.data?.[0]
+
+  // Newest first, so the count is exact unless the whole batch is in the window.
+  const failedLogins30d = useMemo(() => {
+    if (!failedLoginsQuery.data) return undefined
+    const cutoff = failedLoginsQuery.dataUpdatedAt - STATS_WINDOW_MS
+    return failedLoginsQuery.data.filter((log) => log.audit_date >= cutoff)
+      .length
+  }, [failedLoginsQuery.data, failedLoginsQuery.dataUpdatedAt])
 
   const userDisplayName = target?.user.name || target?.user.username || 'User'
 
@@ -198,8 +224,10 @@ export function UserDetail() {
     )
   }
 
-  const lastLoginLocation = stats?.lastLogin
-    ? [stats.lastLogin.city, stats.lastLogin.country].filter(Boolean).join(', ')
+  const lastLoginLocation = lastLogin
+    ? [lastLogin.ip_address?.city, lastLogin.ip_address?.country]
+        .filter(Boolean)
+        .join(', ')
     : ''
 
   return (
@@ -207,6 +235,10 @@ export function UserDetail() {
       <ResetPasswordDialog
         user={resetTarget}
         onClose={() => setResetTarget(null)}
+      />
+      <ResetMfaDialog
+        user={resetMfaTarget}
+        onClose={() => setResetMfaTarget(null)}
       />
       <div className="flex items-center gap-2">
         <Button
@@ -256,105 +288,140 @@ export function UserDetail() {
                     'U'}
                 </AvatarFallback>
               </Avatar>
-              <div className="min-w-0">
-                <div className="flex flex-wrap items-center gap-2">
-                  <h1 className="truncate text-2xl font-semibold tracking-tight">
-                    {target.user.name || target.user.username}
-                  </h1>
-                  {Array.from(
-                    new Map(target.roles.map((r) => [r.name, r])).values()
-                  ).map((role) => (
-                    <Badge
-                      key={role.id}
-                      variant="secondary"
-                      className="text-xs"
-                    >
-                      {role.name}
-                    </Badge>
-                  ))}
-                  {target.user.mfa_enabled && (
-                    <Badge
-                      variant="secondary"
-                      className="gap-1 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
-                    >
-                      <Shield className="h-3 w-3" />
-                      MFA
-                    </Badge>
-                  )}
-                  {target.user.email_verified ? (
-                    <Badge
-                      variant="secondary"
-                      className="gap-1 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
-                    >
-                      <MailCheck className="h-3 w-3" />
-                      Verified
-                    </Badge>
-                  ) : (
-                    <Badge
-                      variant="secondary"
-                      className="gap-1 bg-amber-500/10 text-amber-700 dark:text-amber-400"
-                    >
-                      <MailWarning className="h-3 w-3" />
-                      Unverified
-                    </Badge>
-                  )}
-                  {target.user.must_change_password && (
-                    <Badge
-                      variant="secondary"
-                      className="gap-1 bg-amber-500/10 text-amber-700 dark:text-amber-400"
-                    >
-                      <KeyRound className="h-3 w-3" />
-                      Must change password
-                    </Badge>
-                  )}
-                  {target.user.deleted_at && (
-                    <Badge variant="destructive" className="text-xs">
-                      Deleted
-                    </Badge>
-                  )}
-                </div>
-                <div className="mt-1 flex items-center gap-1.5 text-sm text-muted-foreground">
-                  <Mail className="h-3.5 w-3.5" />
-                  <span className="truncate">{target.user.email}</span>
-                </div>
-                {target.user.username &&
-                  target.user.username !== target.user.name && (
-                    <div className="mt-0.5 text-xs text-muted-foreground">
-                      @{target.user.username}
-                    </div>
-                  )}
-              </div>
-              <div className="ml-auto shrink-0">
-                {currentUser?.id === target.user.id ? (
-                  <Button variant="outline" size="sm" asChild>
-                    <Link to="/account">
-                      <KeyRound className="mr-2 h-4 w-4" />
-                      Change your password
-                    </Link>
-                  </Button>
-                ) : (
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    disabled={!!target.user.deleted_at}
-                    title={
-                      target.user.deleted_at
-                        ? 'Restore this user before resetting their password'
-                        : undefined
-                    }
-                    onClick={() =>
-                      setResetTarget({
-                        id: target.user.id,
-                        name: target.user.name || target.user.username || '',
-                        email: target.user.email || '',
-                      })
-                    }
-                  >
-                    <KeyRound className="mr-2 h-4 w-4" />
-                    Reset password
-                  </Button>
-                )}
-              </div>
+              <PageHeader
+                className="min-w-0 flex-1"
+                title={target.user.name || target.user.username}
+                verdict={
+                  <>
+                    {Array.from(
+                      new Map(target.roles.map((r) => [r.name, r])).values()
+                    ).map((role) => (
+                      <Badge
+                        key={role.id}
+                        variant="secondary"
+                        className="text-xs"
+                      >
+                        {role.name}
+                      </Badge>
+                    ))}
+                    {target.user.mfa_enabled && (
+                      <Badge
+                        variant="secondary"
+                        className="gap-1 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400"
+                      >
+                        <Shield className="h-3 w-3" />
+                        MFA
+                      </Badge>
+                    )}
+                    {target.user.email_verified ? (
+                      <Badge
+                        variant="secondary"
+                        className="gap-1 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400"
+                      >
+                        <MailCheck className="h-3 w-3" />
+                        Verified
+                      </Badge>
+                    ) : (
+                      <Badge
+                        variant="secondary"
+                        className="gap-1 bg-amber-500/10 text-amber-700 dark:text-amber-400"
+                      >
+                        <MailWarning className="h-3 w-3" />
+                        Unverified
+                      </Badge>
+                    )}
+                    {target.user.must_change_password && (
+                      <Badge
+                        variant="secondary"
+                        className="gap-1 bg-amber-500/10 text-amber-700 dark:text-amber-400"
+                      >
+                        <KeyRound className="h-3 w-3" />
+                        Must change password
+                      </Badge>
+                    )}
+                    {target.user.deleted_at && (
+                      <Badge variant="destructive" className="text-xs">
+                        Deleted
+                      </Badge>
+                    )}
+                  </>
+                }
+                description={
+                  <>
+                    <span className="flex items-center gap-1.5">
+                      <Mail className="h-3.5 w-3.5" />
+                      <span className="truncate">{target.user.email}</span>
+                    </span>
+                    {target.user.username &&
+                      target.user.username !== target.user.name && (
+                        <span className="mt-0.5 block text-xs">
+                          @{target.user.username}
+                        </span>
+                      )}
+                  </>
+                }
+                actions={
+                  <>
+                    {currentUser?.id === target.user.id ? (
+                      <Button variant="outline" size="sm" asChild>
+                        <Link to="/account">
+                          <KeyRound className="mr-2 h-4 w-4" />
+                          Change your password
+                        </Link>
+                      </Button>
+                    ) : (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        disabled={!!target.user.deleted_at}
+                        title={
+                          target.user.deleted_at
+                            ? 'Restore this user before resetting their password'
+                            : undefined
+                        }
+                        onClick={() =>
+                          setResetTarget({
+                            id: target.user.id,
+                            name:
+                              target.user.name || target.user.username || '',
+                            email: target.user.email || '',
+                          })
+                        }
+                      >
+                        <KeyRound className="mr-2 h-4 w-4" />
+                        Reset password
+                      </Button>
+                    )}
+                    {currentUser?.id !== target.user.id && (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        disabled={
+                          !target.user.mfa_enabled || !!target.user.deleted_at
+                        }
+                        title={
+                          target.user.deleted_at
+                            ? 'Restore this user before resetting their MFA'
+                            : !target.user.mfa_enabled
+                              ? 'This user has no MFA enrolled'
+                              : 'Remove MFA for a user who lost their authenticator and recovery codes'
+                        }
+                        onClick={() =>
+                          setResetMfaTarget({
+                            id: target.user.id,
+                            name:
+                              target.user.name || target.user.username || '',
+                            email: target.user.email || '',
+                          })
+                        }
+                      >
+                        <ShieldOff className="mr-2 h-4 w-4" />
+                        Reset MFA
+                      </Button>
+                    )}
+                  </>
+                }
+              />
             </div>
           )}
         </CardContent>
@@ -381,29 +448,29 @@ export function UserDetail() {
               icon={<LogIn className="h-4 w-4" />}
               label="Last login"
               value={
-                stats?.lastLogin
-                  ? formatDistanceToNow(new Date(stats.lastLogin.at), {
+                lastLogin
+                  ? formatDistanceToNow(new Date(lastLogin.audit_date), {
                       addSuffix: true,
                     })
-                  : statsLogs
+                  : lastLoginQuery.data
                     ? 'Never'
                     : undefined
               }
               hint={
-                stats?.lastLogin
+                lastLogin
                   ? lastLoginLocation ||
-                    format(new Date(stats.lastLogin.at), 'PP p')
+                    format(new Date(lastLogin.audit_date), 'PP p')
                   : undefined
               }
-              loading={!statsLogs}
+              loading={lastLoginQuery.isPending}
             />
             <StatCard
               icon={<Activity className="h-4 w-4" />}
               label="Actions (30d)"
               value={
                 stats
-                  ? stats.actions30d >= STATS_BATCH_SIZE
-                    ? `${STATS_BATCH_SIZE}+`
+                  ? stats.actionsIncomplete
+                    ? `${stats.actions30d}+`
                     : String(stats.actions30d)
                   : undefined
               }
@@ -418,21 +485,23 @@ export function UserDetail() {
             />
             <StatCard
               icon={
-                stats && stats.failedLogins30d > 0 ? (
+                failedLogins30d ? (
                   <AlertTriangle className="h-4 w-4 text-amber-500" />
                 ) : (
                   <Clock className="h-4 w-4" />
                 )
               }
               label="Failed logins (30d)"
-              value={stats ? String(stats.failedLogins30d) : undefined}
-              hint={
-                stats && stats.failedLogins30d === 0
-                  ? 'No failed attempts'
-                  : undefined
+              value={
+                failedLogins30d === undefined
+                  ? undefined
+                  : failedLogins30d >= STATS_BATCH_SIZE
+                    ? `${STATS_BATCH_SIZE}+`
+                    : String(failedLogins30d)
               }
-              tone={stats && stats.failedLogins30d > 0 ? 'warning' : undefined}
-              loading={!statsLogs}
+              hint={failedLogins30d === 0 ? 'No failed attempts' : undefined}
+              tone={failedLogins30d ? 'warning' : undefined}
+              loading={failedLoginsQuery.isPending}
             />
           </>
         )}

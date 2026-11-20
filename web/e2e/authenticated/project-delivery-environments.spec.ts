@@ -125,15 +125,17 @@ async function mockDelivery(
 async function openDeliverySettings(page: Page) {
   await page.goto(`/projects/${project.slug}/domains`)
   // Delivery lives in the collapsed "DNS and CDN settings" section, below
-  // the project's domains.
+  // the project's domains. The page also lists each environment's
+  // reachability, so environment names are looked up inside the section.
   await page.getByRole('button', { name: 'DNS and CDN settings' }).click()
+  return page.getByRole('region', { name: 'DNS and CDN settings' })
 }
 
 test('one environment inherits the project default without an override control', async ({
   page,
 }) => {
   await mockDelivery(page, 1)
-  await openDeliverySettings(page)
+  const delivery = await openDeliverySettings(page)
 
   await expect(page.getByText('Project default', { exact: true })).toBeVisible()
   await expect(
@@ -142,26 +144,26 @@ test('one environment inherits the project default without an override control',
   await expect(
     page.getByText('Environment overrides', { exact: true })
   ).toHaveCount(0)
-  await expect(page.getByText('production', { exact: true })).toHaveCount(0)
+  await expect(delivery.getByText('production', { exact: true })).toHaveCount(0)
 })
 
 test('multiple environments have a separate override section', async ({
   page,
 }) => {
   await mockDelivery(page, 2)
-  await openDeliverySettings(page)
+  const delivery = await openDeliverySettings(page)
 
   await expect(page.getByText('Project default', { exact: true })).toBeVisible()
   const overrides = page.getByRole('button', { name: /Environment overrides/ })
   await expect(overrides).toHaveAttribute('aria-expanded', 'false')
   await expect(overrides).toContainText('1 configured')
-  await expect(page.getByText('production', { exact: true })).toHaveCount(0)
+  await expect(delivery.getByText('production', { exact: true })).toHaveCount(0)
   await overrides.click()
   await expect(overrides).toHaveAttribute('aria-expanded', 'true')
-  await expect(page.getByText('production', { exact: true })).toBeVisible()
-  await expect(page.getByText('staging', { exact: true })).toBeVisible()
+  await expect(delivery.getByText('production', { exact: true })).toBeVisible()
+  await expect(delivery.getByText('staging', { exact: true })).toBeVisible()
   await overrides.click()
-  await expect(page.getByText('production', { exact: true })).toHaveCount(0)
+  await expect(delivery.getByText('production', { exact: true })).toHaveCount(0)
 })
 
 test('changing the project provider preserves distinct environment overrides', async ({

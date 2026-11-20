@@ -28,7 +28,7 @@ export default function EmptyStateStorage() {
         <h1 className="mb-2 text-2xl font-semibold">Create a database</h1>
         <p className="max-w-prose text-base text-muted-foreground sm:text-sm">
           Pick a provider to spin up a managed database or store you can connect
-          to your team&apos;s projects.
+          to your team&apos;s services.
         </p>
       </div>
 

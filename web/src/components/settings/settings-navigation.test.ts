@@ -23,6 +23,13 @@ describe('settingsNavigationGroups', () => {
     expect(urls).not.toContain(WORKER_NODES_URL)
   })
 
+  it('does not list Plugins — it belongs to the main navigation', () => {
+    const urls = settingsNavigationGroups.flatMap((g) =>
+      g.items.map((i) => i.url)
+    )
+    expect(urls).not.toContain('/settings/plugins')
+  })
+
   it('lists the on-demand TLS page the Certificates empty state links to', () => {
     const item = settingsNavigationGroups
       .flatMap((g) => g.items)

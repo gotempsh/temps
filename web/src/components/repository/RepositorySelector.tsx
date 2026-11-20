@@ -246,7 +246,10 @@ export function RepositorySelector({
                         </CardDescription>
                       </div>
                     </div>
-                    <RadioGroupItem value={repo.id?.toString() || ''} />
+                    <RadioGroupItem
+                      value={repo.id?.toString() || ''}
+                      aria-label={repo.full_name ?? repo.name}
+                    />
                   </div>
                 </CardHeader>
               </Card>

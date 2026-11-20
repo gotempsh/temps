@@ -28,7 +28,10 @@ import {
   RELEASE_REPO,
   StartError,
   binaryPath,
+  cosignVerifyArgs,
   databaseUrl,
+  ghAttestationArgs,
+  manualVerifyCommands,
   isLocalServerCommand,
   isLocalState,
   localUrls,
@@ -37,6 +40,7 @@ import {
   parseLocalServerPids,
   pickRelease,
   releaseAssetUrl,
+  releaseIdentity,
   skillTargets,
   type Channel,
   type LocalPaths,
@@ -374,6 +378,207 @@ async function sha256File(path: string): Promise<string> {
 }
 
 /**
+ * How the origin of a downloaded archive was established. A checksum from
+ * the same release proves integrity only: whoever can replace the archive
+ * can replace its checksum too.
+ */
+export type OriginCheck =
+  /** The Sigstore bundle verified with cosign, or the build attestation with gh. */
+  | { kind: 'cosign' | 'gh'; identity: string }
+  /** Signed, but neither cosign nor an authenticated gh is installed to check it. */
+  | { kind: 'unverified'; identity: string }
+  /** No signature published, accepted because of --allow-unsigned. */
+  | { kind: 'unsigned' }
+
+/**
+ * The warning to print when the archive just installed was not checked for
+ * origin, or null when it was. It goes to stderr whatever the output mode,
+ * so `--json` and quiet runs cannot hide it, and names the digest that was
+ * installed so the manual check can be tied to it.
+ */
+export function originWarning(
+  version: string,
+  target: string,
+  origin: OriginCheck | undefined,
+  sha256: string | undefined,
+): string | null {
+  const digest = sha256 ? ` (SHA-256 ${sha256})` : ''
+  if (origin?.kind === 'unsigned') {
+    return (
+      `Warning: Temps ${version} publishes no Sigstore signature; it was installed${digest} on its checksum alone ` +
+      'because --allow-unsigned was passed. Its origin was NOT verified.'
+    )
+  }
+  if (origin?.kind !== 'unverified') return null
+  return [
+    `Warning: the origin of Temps ${version} was NOT verified; only its checksum was${digest}. ` +
+      'Neither cosign nor a signed-in gh was available to check its signature.',
+    'Verify it yourself; the last command must print the same SHA-256:',
+    ...manualVerifyCommands(version, target).map((command) => `  ${command}`),
+  ].join('\n')
+}
+
+export interface OriginDeps {
+  /** The bundle body, or null when the release does not publish one (404). */
+  fetchBundle(url: string): Promise<string | null>
+  /** Run a tool; resolves null when it is not installed. */
+  runTool(command: string, args: readonly string[]): Promise<RunResult | null>
+}
+
+export interface BundleFetchOptions {
+  /** Attempts in total; transient failures (network, 408, 429, 5xx) are retried. */
+  attempts?: number
+  /** First pause between attempts, doubled each retry. */
+  baseDelayMs?: number
+  /** Deadline for each attempt, body included. */
+  timeoutMs?: number
+  /** A bundle larger than this is refused rather than buffered. */
+  maxBytes?: number
+}
+
+/** A bundle is about 10 KB; anything near this is not a Sigstore bundle. */
+export const MAX_BUNDLE_BYTES = 1024 * 1024
+
+/**
+ * Download a Sigstore bundle: null on 404 (the release publishes none),
+ * otherwise its body, read in chunks and refused past `maxBytes`. Network
+ * errors, timeouts and HTTP 408/429/5xx are retried with exponential
+ * backoff; any other status, or an oversized body, fails at once.
+ */
+export async function fetchSigstoreBundle(url: string, options: BundleFetchOptions = {}): Promise<string | null> {
+  const { attempts = 3, baseDelayMs = 1000, timeoutMs = 30_000, maxBytes = MAX_BUNDLE_BYTES } = options
+  let failure: StartError | undefined
+  for (let attempt = 0; attempt < Math.max(1, attempts); attempt++) {
+    if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, baseDelayMs * 2 ** (attempt - 1)))
+    let response: Response
+    try {
+      response = await fetch(url, {
+        headers: { 'User-Agent': 'temps-cli' },
+        signal: AbortSignal.timeout(timeoutMs),
+        redirect: 'follow',
+      })
+    } catch (error) {
+      failure = new StartError('download', 'network', `Could not reach ${url}: ${(error as Error).message}`)
+      continue
+    }
+    if (response.status === 404) return null
+    if (!response.ok) {
+      const error = new StartError('download', 'http_error', `GET ${url} returned HTTP ${response.status}.`)
+      if (response.status >= 500 || response.status === 408 || response.status === 429) {
+        failure = error
+        continue
+      }
+      throw error
+    }
+    try {
+      return await readBounded(response, url, maxBytes)
+    } catch (error) {
+      if (error instanceof StartError) throw error
+      failure = new StartError('download', 'network', `Could not read ${url}: ${(error as Error).message}`)
+    }
+  }
+  throw new StartError(
+    'download',
+    failure?.reason ?? 'network',
+    `${failure?.message ?? `Could not download ${url}.`} Gave up after ${Math.max(1, attempts)} attempts.`,
+  )
+}
+
+async function readBounded(response: Response, url: string, maxBytes: number): Promise<string> {
+  const chunks: Uint8Array[] = []
+  let size = 0
+  if (response.body) {
+    const reader = response.body.getReader()
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      size += value.byteLength
+      if (size > maxBytes) {
+        await reader.cancel()
+        throw new StartError('download', 'bundle_too_large', `${url} is larger than ${maxBytes} bytes; refusing it as a signature bundle.`)
+      }
+      chunks.push(value)
+    }
+  }
+  return Buffer.concat(chunks).toString('utf8')
+}
+
+const originDeps: OriginDeps = {
+  fetchBundle: (url) => fetchSigstoreBundle(url),
+  async runTool(command, args) {
+    try {
+      return await run(command, args, { timeoutMs: 120_000 })
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
+      throw error
+    }
+  },
+}
+
+/**
+ * Check who published `archive`, the same way install.sh does. The release
+ * must publish a Sigstore bundle unless `allowUnsigned` (only releases from
+ * before signing lack one). cosign verifies it with the identity pinned to
+ * the release workflow at `version`; without cosign an authenticated `gh`
+ * verifies the build attestation; with neither, the result says the origin
+ * was not verified. Any check that runs and fails throws, `allowUnsigned`
+ * or not.
+ */
+export async function verifyArchiveOrigin(
+  archive: string,
+  version: string,
+  target: string,
+  allowUnsigned: boolean,
+  deps: OriginDeps = originDeps,
+): Promise<OriginCheck> {
+  const asset = `${target}.tar.gz`
+  const identity = releaseIdentity(version)
+  const bundleText = await deps.fetchBundle(releaseAssetUrl(version, target, '.tar.gz.sigstore.json'))
+  if (bundleText === null) {
+    if (allowUnsigned) return { kind: 'unsigned' }
+    throw new StartError(
+      'download',
+      'unsigned_release',
+      `Release ${version} publishes no Sigstore signature for ${asset} (no ${asset}.sigstore.json asset), ` +
+        'so its origin cannot be verified. Nothing was installed. Releases published before signing was ' +
+        `introduced have none; to run one anyway on its checksum alone: temps start --runtime-version ${version} --allow-unsigned`,
+    )
+  }
+  const bundle = `${archive}.sigstore.json`
+  await writeFile(bundle, bundleText, { mode: 0o600 })
+  try {
+    const cosign = await deps.runTool('cosign', cosignVerifyArgs(archive, bundle, version))
+    if (cosign) {
+      if (cosign.code !== 0) {
+        throw new StartError(
+          'download',
+          'signature_failed',
+          `The ${asset} archive for ${version} is not signed by ${identity}; it may have been tampered with. ` +
+            `Nothing was installed. cosign said: ${lastLines(cosign.stderr || cosign.stdout, 4)}`,
+        )
+      }
+      return { kind: 'cosign', identity }
+    }
+  } finally {
+    await rm(bundle, { force: true })
+  }
+  const auth = await deps.runTool('gh', ['auth', 'status'])
+  if (auth && auth.code === 0) {
+    const gh = await deps.runTool('gh', ghAttestationArgs(archive, version))
+    if (!gh || gh.code !== 0) {
+      throw new StartError(
+        'download',
+        'signature_failed',
+        `The ${asset} archive for ${version} has no build attestation from ${identity}; it may have been ` +
+          `tampered with. Nothing was installed. gh said: ${lastLines(gh?.stderr || gh?.stdout || '', 4)}`,
+      )
+    }
+    return { kind: 'gh', identity }
+  }
+  return { kind: 'unverified', identity }
+}
+
+/**
  * Download, verify and unpack the server binary for `version`. A version
  * already on disk is reused, so later starts need no network.
  */
@@ -381,7 +586,8 @@ export async function ensureBinary(
   paths: LocalPaths,
   version: string,
   target: string,
-): Promise<{ path: string; downloaded: boolean; bytes: number }> {
+  allowUnsigned = false,
+): Promise<{ path: string; downloaded: boolean; bytes: number; origin?: OriginCheck; sha256?: string }> {
   const bin = binaryPath(paths, version)
   if (existsSync(bin)) return { path: bin, downloaded: false, bytes: 0 }
 
@@ -407,6 +613,7 @@ export async function ensureBinary(
         `The ${target} archive for ${version} failed its checksum (expected ${expected}, got ${actual}). Nothing was installed.`,
       )
     }
+    const origin = await verifyArchiveOrigin(archive, version, target, allowUnsigned)
     const untar = await run('tar', ['-xzf', archive, '-C', staging], { timeoutMs: 120_000 })
     if (untar.code !== 0) {
       throw new StartError('download', 'extract_failed', `Could not unpack ${archive}: ${lastLines(untar.stderr, 3)}`)
@@ -418,7 +625,7 @@ export async function ensureBinary(
     await chmod(join(staging, 'temps'), 0o755)
     await rm(dir, { recursive: true, force: true })
     await rename(staging, dir)
-    return { path: bin, downloaded: true, bytes: statSync(bin).size }
+    return { path: bin, downloaded: true, bytes: statSync(bin).size, origin, sha256: actual }
   } catch (error) {
     await rm(staging, { recursive: true, force: true })
     throw error

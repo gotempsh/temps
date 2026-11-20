@@ -47,15 +47,16 @@ import {
 } from './preview-gateway-errors'
 import { containerNameToSave } from './preview-gateway-settings'
 import {
+  gatewaySetupProblem,
   gatewayStatusSummary,
   reloadGatewayStateAfterFailure,
   type GatewayStatusTone,
 } from './preview-gateway-status'
 
 const STATUS_TONE_CLASS: Record<GatewayStatusTone, string> = {
-  ok: 'text-green-500',
-  warning: 'text-amber-500',
-  error: 'text-red-500',
+  ok: 'text-green-700 dark:text-green-500',
+  warning: 'text-amber-700 dark:text-amber-500',
+  error: 'text-red-700 dark:text-red-500',
   muted: 'text-muted-foreground',
 }
 
@@ -95,6 +96,23 @@ export function PreviewGatewayDisabledNotice() {
         to create it again.
       </AlertDescription>
     </Alert>
+  )
+}
+
+/** Why the server could not set the gateway up, and when it tries again. */
+function GatewaySetupProblem({ status }: { status: GatewayStatus }) {
+  const problem = gatewaySetupProblem(status)
+  if (!problem) return null
+  return (
+    <div className="rounded-md border border-red-500/30 bg-red-500/5 p-3 space-y-1">
+      <p className="text-xs font-medium text-red-700 dark:text-red-500">
+        Temps could not set the gateway up
+      </p>
+      <p className="text-xs font-mono break-all text-muted-foreground">
+        {problem.error}
+      </p>
+      <p className="text-xs text-muted-foreground">{problem.retry}</p>
+    </div>
   )
 }
 
@@ -340,7 +358,7 @@ export function PreviewGatewayCard() {
       <CardHeader>
         <CardTitle className="flex items-center gap-2">
           <Globe className="h-5 w-5" />
-          Workspace Preview Gateway
+          Workspace preview gateway
         </CardTitle>
         <CardDescription>
           Routes preview URLs (
@@ -386,12 +404,13 @@ export function PreviewGatewayCard() {
                 )}
                 <span>{statusSummary.label}</span>
                 {status.drift && (
-                  <span className="ml-2 inline-flex items-center gap-1 rounded bg-amber-500/10 px-2 py-0.5 text-xs text-amber-500">
+                  <span className="ml-2 inline-flex items-center gap-1 rounded bg-amber-500/10 px-2 py-0.5 text-xs text-amber-700 dark:text-amber-500">
                     <AlertTriangle className="h-3 w-3" />
                     Image drift
                   </span>
                 )}
               </div>
+              <GatewaySetupProblem status={status} />
               {status.image && (
                 <p className="text-xs text-muted-foreground font-mono break-all">
                   Image: {status.image}
@@ -408,7 +427,7 @@ export function PreviewGatewayCard() {
                 </p>
               )}
               {status.restart_count != null && status.restart_count > 0 && (
-                <p className="text-xs text-amber-500">
+                <p className="text-xs text-amber-700 dark:text-amber-500">
                   Docker has restarted this container {status.restart_count}{' '}
                   time(s)
                 </p>
@@ -620,7 +639,10 @@ export function PreviewGatewayCard() {
                 Fetch last 200 lines
               </Button>
               {logs && logs.length > 0 && (
-                <pre className="bg-muted rounded p-2 text-xs overflow-x-auto max-h-80 font-mono whitespace-pre-wrap">
+                <pre
+                  tabIndex={0}
+                  className="bg-muted rounded p-2 text-xs overflow-x-auto max-h-80 font-mono whitespace-pre-wrap"
+                >
                   {logs.join('\n')}
                 </pre>
               )}

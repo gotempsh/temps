@@ -42,8 +42,8 @@ pub fn configure_public_routes() -> Router<Arc<AppState>> {
 
 // ── Token verification helpers ─────────────────────────────────────────────
 
-/// Pure guard: returns `false` (reject) when a project has no stored signing
-/// token, `true` when one is present and signature verification should proceed.
+/// Pure guard: returns the stored (encrypted) signing token when one is
+/// present, `None` (reject) when it is absent.
 ///
 /// Extracted as a pure sync function so the security decision is directly
 /// unit-testable without needing a live `AppState`.
@@ -55,20 +55,29 @@ pub fn configure_public_routes() -> Router<Arc<AppState>> {
 /// erased. Accepting unsigned payloads would let any internet actor forge
 /// GitLab push events and trigger arbitrary deployments. Operators must
 /// re-enroll by recreating the webhook in GitLab, which issues a fresh token.
+///
+/// An empty or whitespace-only stored value is treated exactly like `NULL`:
+/// it can never be a real `whsec_` secret, and letting it through would
+/// leave the decision to an HMAC computed under whatever key an empty value
+/// decrypts/derives to.
+pub(crate) fn stored_signing_token(stored_token: Option<&str>) -> Option<&str> {
+    stored_token.filter(|t| !t.trim().is_empty())
+}
+
 #[cfg(test)]
 pub(crate) fn project_has_signing_token(stored_token: Option<&str>) -> bool {
-    // SECURITY: projects with no stored signing token are rejected — do not
-    // accept unsigned payloads. Operators must re-enroll legacy projects by
-    // recreating the GitLab webhook so a fresh token is issued.
-    stored_token.is_some()
+    stored_signing_token(stored_token).is_some()
 }
 
 /// Verify that an incoming GitLab webhook request is signed with the token
 /// stored for `project`.
 ///
-/// Returns `false` immediately when no signing token is stored (see
-/// `project_has_signing_token` in the test module), then decrypts and
-/// HMAC-validates for the `Some` branch.
+/// Returns `false` immediately when no usable signing token is stored (see
+/// [`stored_signing_token`]), then decrypts and HMAC-validates. A token that
+/// decrypts to an empty / whitespace-only plaintext is rejected as absent.
+///
+/// Timestamp freshness (replay protection) is checked by the caller once per
+/// delivery, before any per-project work.
 pub(crate) async fn verify_gitlab_webhook_token(
     project: &temps_entities::projects::Model,
     body: &[u8],
@@ -77,50 +86,65 @@ pub(crate) async fn verify_gitlab_webhook_token(
     webhook_timestamp: &str,
     state: &AppState,
 ) -> bool {
-    match project.gitlab_webhook_signing_token.as_deref() {
-        Some(encrypted) => {
-            match state.git_provider_manager.decrypt_token(encrypted).await {
-                Ok(plaintext) => {
-                    if let Some(sig) = webhook_signature {
-                        // Standard-Webhooks HMAC: signs
-                        // "{webhook-id}.{timestamp}.{body}" with the
-                        // 32-byte key derived from the whsec_ token.
-                        crate::services::gitlab_webhook::verify_gitlab_signature(
-                            body,
-                            sig,
-                            webhook_id,
-                            webhook_timestamp,
-                            &plaintext,
-                        )
-                    } else {
-                        // No webhook-signature header — reject. Legacy
-                        // X-Gitlab-Token is intentionally not supported.
-                        false
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to decrypt signing token for project {}: {}",
-                        project.id, e
-                    );
-                    false
-                }
-            }
-        }
-        None => {
-            // SECURITY: reject webhooks for projects with no stored signing
-            // token. Operators must re-enroll legacy projects by recreating
-            // the GitLab webhook (which will trigger token issuance) before
-            // automatic deployments will resume. We will NOT accept unsigned
-            // payloads — anyone on the internet could forge push events.
+    let Some(encrypted) = stored_signing_token(project.gitlab_webhook_signing_token.as_deref())
+    else {
+        // SECURITY: reject webhooks for projects with no stored signing
+        // token. Operators must re-enroll legacy projects by recreating
+        // the GitLab webhook (which will trigger token issuance) before
+        // automatic deployments will resume. We will NOT accept unsigned
+        // payloads — anyone on the internet could forge push events.
+        warn!(
+            "GitLab project {} has no stored signing token — webhook rejected. \
+             Re-enroll the webhook in GitLab to issue a signing token.",
+            project.id
+        );
+        return false;
+    };
+
+    let plaintext = match state.git_provider_manager.decrypt_token(encrypted).await {
+        Ok(plaintext) => plaintext,
+        Err(e) => {
             warn!(
-                "GitLab project {} has no stored signing token — webhook rejected. \
-                 Re-enroll the webhook in GitLab to issue a signing token.",
-                project.id
+                "Failed to decrypt signing token for project {}: {}",
+                project.id, e
             );
-            false
+            return false;
         }
+    };
+
+    if plaintext.trim().is_empty() {
+        warn!(
+            "GitLab project {} has an empty signing token — webhook rejected. \
+             Re-enroll the webhook in GitLab to issue a signing token.",
+            project.id
+        );
+        return false;
     }
+
+    match webhook_signature {
+        // Standard-Webhooks HMAC: signs "{webhook-id}.{timestamp}.{body}"
+        // with the 32-byte key derived from the whsec_ token.
+        Some(sig) => crate::services::gitlab_webhook::verify_gitlab_signature(
+            body,
+            sig,
+            webhook_id,
+            webhook_timestamp,
+            &plaintext,
+        ),
+        // No webhook-signature header — reject. Legacy X-Gitlab-Token is
+        // intentionally not supported.
+        None => false,
+    }
+}
+
+/// Current Unix time in seconds, or `None` if the system clock is before the
+/// epoch (in which case freshness cannot be established and the delivery is
+/// rejected).
+fn unix_now_secs() -> Option<i64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_secs()).ok())
 }
 
 // ── GitLab webhook event receiver ─────────────────────────────────────────
@@ -176,6 +200,30 @@ async fn gitlab_webhook_events(
 
     info!("Received GitLab webhook event: {}", event_type);
 
+    // Replay protection: the timestamp is part of the signed message, so a
+    // fresh timestamp plus a valid signature proves the delivery was signed
+    // recently. Reject stale/missing/malformed values before any DB or HMAC
+    // work — a captured delivery must not be replayable to re-trigger deploys.
+    let timestamp_fresh = unix_now_secs().is_some_and(|now| {
+        crate::services::gitlab_webhook::webhook_timestamp_within_tolerance(
+            webhook_timestamp_header,
+            now,
+        )
+    });
+    if !timestamp_fresh {
+        warn!(
+            "GitLab webhook rejected: webhook-timestamp {:?} is missing, malformed, \
+             or more than {}s from the server clock (event: {}, webhook-id: {:?})",
+            webhook_timestamp_header,
+            crate::services::gitlab_webhook::GITLAB_WEBHOOK_TIMESTAMP_TOLERANCE_SECS,
+            event_type,
+            webhook_id_header
+        );
+        return Ok(axum::Json(GitLabWebhookResponse {
+            message: "Stale or missing webhook timestamp".to_string(),
+        }));
+    }
+
     // Parse the payload to get project owner / name and the pushed ref.
     let payload: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
@@ -208,31 +256,11 @@ async fn gitlab_webhook_events(
 
     let git_ref = payload.get("ref").and_then(|v| v.as_str()).unwrap_or("");
 
-    let branch = if git_ref.starts_with("refs/heads/") {
-        Some(git_ref.replace("refs/heads/", ""))
-    } else {
-        None
-    };
+    let branch = super::branch_from_ref(git_ref, false);
 
-    let tag = if git_ref.starts_with("refs/tags/") {
-        Some(git_ref.replace("refs/tags/", ""))
-    } else {
-        None
-    };
+    let tag = git_ref.strip_prefix("refs/tags/").map(str::to_owned);
 
-    let commit = payload
-        .get("checkout_sha")
-        .and_then(|v| v.as_str())
-        .or_else(|| {
-            payload
-                .get("commits")
-                .and_then(|cs| cs.as_array())
-                .and_then(|arr| arr.first())
-                .and_then(|c| c.get("id"))
-                .and_then(|v| v.as_str())
-        })
-        .unwrap_or("")
-        .to_string();
+    let commit = pushed_commit(&payload);
 
     // Find all Temps projects matching this repo.
     let matching_projects = match projects::Entity::find()
@@ -260,16 +288,17 @@ async fn gitlab_webhook_events(
         }));
     }
 
-    // Validate the signing token against each project.  We need at least one
-    // project to authenticate the request before dispatching the push event.
-    // `handle_push_event` internally re-queries all matching projects, so we
-    // call it only once (not per project) to avoid duplicate queue entries.
-    let mut any_valid = false;
+    // Validate the signing token against EACH project and keep only those
+    // whose own token validated. A project's signing token authorises
+    // deliveries for that project alone: several Temps projects may point at
+    // the same GitLab path (each with its own webhook + token), and a valid
+    // signature under one project's token must not trigger deployments of
+    // the others.
+    let mut authorized_projects: Vec<projects::Model> = Vec::new();
 
-    for project in &matching_projects {
-        // Verify the signing token for this project.
+    for project in matching_projects {
         let token_valid = verify_gitlab_webhook_token(
-            project,
+            &project,
             &body,
             webhook_signature_header,
             webhook_id_header,
@@ -279,8 +308,7 @@ async fn gitlab_webhook_events(
         .await;
 
         if token_valid {
-            any_valid = true;
-            break;
+            authorized_projects.push(project);
         } else {
             warn!(
                 "GitLab webhook signature mismatch for project {}, skipping",
@@ -289,7 +317,7 @@ async fn gitlab_webhook_events(
         }
     }
 
-    if !any_valid {
+    if authorized_projects.is_empty() {
         warn!(
             "No matching GitLab project with valid signature for {}/{}, ignoring",
             repo_owner, repo_name
@@ -299,31 +327,54 @@ async fn gitlab_webhook_events(
         }));
     }
 
-    // Dispatch through the existing push-event machinery (handles all projects
-    // for this repo in a single call).
-    let triggered = if let Err(e) = state
+    let authorized_ids: Vec<i32> = authorized_projects.iter().map(|p| p.id).collect();
+
+    if event_type == "Merge Request Hook" {
+        let queued = match closed_merge_request(&payload) {
+            Some((branch, reason)) => state
+                .git_provider_manager
+                .handle_branch_closed_for_projects(branch, reason, authorized_projects)
+                .await
+                .unwrap_or_else(|e| {
+                    error!(
+                        "Failed to queue preview teardown for GitLab merge request on {}/{} (projects {:?}): {:?}",
+                        repo_owner, repo_name, authorized_ids, e
+                    );
+                    0
+                }),
+            None => 0,
+        };
+        return Ok(axum::Json(GitLabWebhookResponse {
+            message: format!("Queued preview teardown for {queued} project(s)"),
+        }));
+    }
+
+    // Dispatch only to the projects that authenticated this delivery. Do NOT
+    // use `handle_push_event(owner, repo, ..)`, which re-queries and deploys
+    // every project sharing the repository path.
+    let triggered = match state
         .git_provider_manager
-        .handle_push_event(
-            repo_owner.to_string(),
-            repo_name.to_string(),
+        .handle_push_event_for_projects(
             branch.clone(),
             tag.clone(),
             commit.clone(),
+            authorized_projects,
         )
         .await
     {
-        error!(
-            "Failed to handle GitLab push event for {}/{}: {:?}",
-            repo_owner, repo_name, e
-        );
-        0
-    } else {
-        matching_projects.len()
+        Ok(n) => n,
+        Err(e) => {
+            error!(
+                "Failed to handle GitLab push event for {}/{} (projects {:?}): {:?}",
+                repo_owner, repo_name, authorized_ids, e
+            );
+            0
+        }
     };
 
     info!(
-        "GitLab webhook event processed: {} project(s) queued for {}/{}",
-        triggered, repo_owner, repo_name
+        "GitLab webhook event processed: {} project(s) queued for {}/{} (authorized projects {:?})",
+        triggered, repo_owner, repo_name, authorized_ids
     );
 
     Ok(axum::Json(GitLabWebhookResponse {
@@ -336,6 +387,17 @@ async fn gitlab_oauth_callback(
     State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Redirect, Problem> {
+    if let Some(url) = state
+        .git_provider_manager
+        .reauthorization_redirect(
+            params.get("state").map(String::as_str).unwrap_or_default(),
+            None,
+            params.get("code").map(String::as_str),
+        )
+        .await?
+    {
+        return Ok(Redirect::to(&url));
+    }
     // Extract OAuth parameters
     let code = params
         .get("code")
@@ -351,11 +413,6 @@ async fn gitlab_oauth_callback(
             .with_title("Missing OAuth State")
             .with_detail("The 'state' parameter is required for GitLab OAuth callback")
     })?;
-
-    info!(
-        "GitLab OAuth callback received - code: {}, state: {}",
-        code, oauth_state
-    );
 
     // Recover the user + provider that started this flow. This replaces the
     // RequireAuth extractor we'd use on a normal endpoint.
@@ -403,12 +460,83 @@ async fn gitlab_oauth_callback(
     Ok(Redirect::to(&redirect_url))
 }
 
+/// The commit a push delivery names. A deleted branch or tag has a null
+/// `checkout_sha` and no commits; its `after` is then the all-zeros SHA,
+/// which marks the deletion downstream. Any other `after` is not used: a tag
+/// whose target is not a commit also has a null `checkout_sha`, and its
+/// non-zero `after` names nothing to deploy.
+fn pushed_commit(payload: &serde_json::Value) -> String {
+    let field = |name: &str| payload.get(name).and_then(|v| v.as_str());
+    field("checkout_sha")
+        .or_else(|| {
+            payload
+                .get("commits")
+                .and_then(|cs| cs.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|c| c.get("id"))
+                .and_then(|v| v.as_str())
+        })
+        .or_else(|| {
+            field("after").filter(|sha| {
+                crate::services::git_provider_manager::GitProviderManager::is_ref_deletion(sha)
+            })
+        })
+        .unwrap_or("")
+        .to_string()
+}
+
+/// The source branch of a merge request this delivery reports as closed or
+/// merged, and which of the two. `None` for any other event, and for a merge
+/// request from a fork: its branch lives in another project, so a same-named
+/// preview here belongs to a branch of this project, not to it.
+fn closed_merge_request(
+    payload: &serde_json::Value,
+) -> Option<(String, temps_core::PreviewBranchCloseReason)> {
+    let attributes = payload.get("object_attributes")?;
+    let source_project = attributes.get("source_project_id")?.as_i64()?;
+    let target_project = attributes.get("target_project_id")?.as_i64()?;
+    if source_project != target_project {
+        return None;
+    }
+
+    let number = attributes.get("iid")?.as_i64()?;
+    let reason = match attributes.get("action")?.as_str()? {
+        "close" => temps_core::PreviewBranchCloseReason::PullRequestClosed { number },
+        "merge" => temps_core::PreviewBranchCloseReason::PullRequestMerged { number },
+        _ => return None,
+    };
+    let branch = attributes.get("source_branch")?.as_str()?;
+    Some((branch.to_string(), reason))
+}
+
 #[cfg(test)]
 mod tests {
-    //! Smoke-tests for the helpers from the handler perspective. Detailed
-    //! crypto edge-cases live in `services::gitlab_webhook::tests`.
+    #[test]
+    fn branch_refs_preserve_embedded_prefixes() {
+        for (input, expected) in [
+            (
+                "refs/heads/feat/refs/heads/victim",
+                Some("feat/refs/heads/victim"),
+            ),
+            ("refs/heads/x", Some("x")),
+            ("refs/heads/feat/topic", Some("feat/topic")),
+            ("refs/tags/release", None),
+        ] {
+            assert_eq!(
+                super::super::branch_from_ref(input, false).as_deref(),
+                expected
+            );
+        }
+        assert_eq!(
+            super::super::branch_from_ref("feat/topic", false).as_deref(),
+            None
+        );
+    }
 
-    use super::project_has_signing_token;
+    // Smoke-tests for the helpers from the handler perspective. Detailed
+    // crypto edge-cases live in `services::gitlab_webhook::tests`.
+
+    use super::{project_has_signing_token, stored_signing_token};
 
     /// Build a valid `v1,{base64}` Standard-Webhooks signature for a given
     /// payload + headers + signing token.
@@ -459,15 +587,24 @@ mod tests {
         );
     }
 
-    /// Empty string token value also passes the guard — the HMAC step
-    /// (not this guard) is responsible for rejecting malformed tokens.
+    /// An empty or whitespace-only stored token is treated as absent: it can
+    /// never be a real `whsec_` secret, so it must not reach the HMAC step.
     #[test]
-    fn test_empty_string_token_passes_guard() {
-        assert!(
-            project_has_signing_token(Some("")),
-            "empty string is Some, so the presence guard passes; \
-             the subsequent HMAC step rejects it"
-        );
+    fn test_empty_or_whitespace_token_is_rejected() {
+        for blank in ["", " ", "\t", "\n  \r"] {
+            assert!(
+                !project_has_signing_token(Some(blank)),
+                "blank stored token {:?} must be treated as absent",
+                blank
+            );
+            assert_eq!(stored_signing_token(Some(blank)), None);
+        }
+    }
+
+    #[test]
+    fn test_stored_signing_token_returns_real_value_unchanged() {
+        assert_eq!(stored_signing_token(Some("enc:abc")), Some("enc:abc"));
+        assert_eq!(stored_signing_token(None), None);
     }
 
     // ── HMAC verification (existing tests, unchanged) ─────────────────────
@@ -505,5 +642,84 @@ mod tests {
             .decode(tok.strip_prefix("whsec_").unwrap())
             .expect("valid base64");
         assert_eq!(decoded.len(), 32);
+    }
+
+    fn merge_request_hook(action: &str, source_project_id: i64) -> serde_json::Value {
+        serde_json::json!({
+            "object_kind": "merge_request",
+            "object_attributes": {
+                "iid": 8,
+                "action": action,
+                "source_branch": "feature/login",
+                "target_branch": "main",
+                "source_project_id": source_project_id,
+                "target_project_id": 100
+            }
+        })
+    }
+
+    #[test]
+    fn closed_and_merged_merge_requests_retire_their_branch() {
+        assert_eq!(
+            super::closed_merge_request(&merge_request_hook("close", 100)),
+            Some((
+                "feature/login".to_string(),
+                temps_core::PreviewBranchCloseReason::PullRequestClosed { number: 8 }
+            ))
+        );
+        assert_eq!(
+            super::closed_merge_request(&merge_request_hook("merge", 100)),
+            Some((
+                "feature/login".to_string(),
+                temps_core::PreviewBranchCloseReason::PullRequestMerged { number: 8 }
+            ))
+        );
+    }
+
+    #[test]
+    fn other_merge_request_actions_and_forks_retire_nothing() {
+        for action in ["open", "update", "reopen", "approved"] {
+            assert_eq!(
+                super::closed_merge_request(&merge_request_hook(action, 100)),
+                None
+            );
+        }
+        assert_eq!(
+            super::closed_merge_request(&merge_request_hook("merge", 200)),
+            None
+        );
+        assert_eq!(super::closed_merge_request(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn a_deleted_branch_push_reports_the_null_sha() {
+        let deletion = serde_json::json!({
+            "ref": "refs/heads/feature/login",
+            "before": "abc123",
+            "after": "0000000000000000000000000000000000000000",
+            "checkout_sha": null,
+            "commits": []
+        });
+        assert_eq!(
+            super::pushed_commit(&deletion),
+            "0000000000000000000000000000000000000000"
+        );
+
+        let push = serde_json::json!({
+            "after": "def456",
+            "checkout_sha": "def456",
+            "commits": [{ "id": "def456" }]
+        });
+        assert_eq!(super::pushed_commit(&push), "def456");
+
+        // A tag on a non-commit object: no checkout_sha, a non-zero `after`.
+        let annotated = serde_json::json!({
+            "ref": "refs/tags/v1.0.0",
+            "after": "abc999",
+            "checkout_sha": null,
+            "commits": []
+        });
+        assert_eq!(super::pushed_commit(&annotated), "");
+        assert_eq!(super::pushed_commit(&serde_json::json!({})), "");
     }
 }

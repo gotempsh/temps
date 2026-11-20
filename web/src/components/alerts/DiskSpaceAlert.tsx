@@ -39,7 +39,7 @@ export function DiskSpaceAlert({ dismissible = true }: DiskSpaceAlertProps) {
     ? {
         border: 'border-red-200 dark:border-red-900/50',
         bg: 'bg-red-50/60 dark:bg-red-950/20',
-        icon: 'text-red-600 dark:text-red-400',
+        icon: 'text-red-700 dark:text-red-400',
         text: 'text-red-800 dark:text-red-200',
         link: 'text-red-700 hover:text-red-900 dark:text-red-300 dark:hover:text-red-100',
         dismiss:
@@ -48,7 +48,7 @@ export function DiskSpaceAlert({ dismissible = true }: DiskSpaceAlertProps) {
     : {
         border: 'border-orange-200 dark:border-orange-900/50',
         bg: 'bg-orange-50/60 dark:bg-orange-950/20',
-        icon: 'text-orange-600 dark:text-orange-400',
+        icon: 'text-orange-700 dark:text-orange-400',
         text: 'text-orange-800 dark:text-orange-200',
         link: 'text-orange-700 hover:text-orange-900 dark:text-orange-300 dark:hover:text-orange-100',
         dismiss:

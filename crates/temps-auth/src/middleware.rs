@@ -75,7 +75,6 @@ pub async fn auth_middleware(
     } else {
         "http"
     };
-    let is_secure = scheme == "https";
     // `base_url` keeps the port so generated links point back at the same
     // listener the client reached us on. `host` is port-stripped so it can be
     // used directly as a route-table key (the proxy normalizes the same way).
@@ -89,6 +88,19 @@ pub async fn auth_middleware(
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|c| c.0);
+    // Cookie `Secure` must come from trusted server-side state, never from the
+    // client-controllable `X-Forwarded-Proto` alone (F-013).
+    let is_secure = temps_core::secure_cookie_for_request(
+        temps_core::declared_console_scheme(),
+        req.headers(),
+        peer,
+    );
+
+    if let Some(auth) = &auth_context {
+        if let Err(problem) = temps_authz::enforce_api_key_path(auth, req.uri().path()) {
+            return Ok(axum::response::IntoResponse::into_response(problem));
+        }
+    }
 
     // Create RequestMetadata
     let metadata = RequestMetadata {
@@ -120,6 +132,10 @@ pub async fn auth_middleware(
     Ok(next.run(req).await)
 }
 
+fn credential_prefix_for_log(token: &str) -> String {
+    token.chars().take(8).collect()
+}
+
 pub async fn extract_auth_from_request(
     req: &axum::extract::Request,
     auth_state: &Arc<AuthState>,
@@ -137,17 +153,9 @@ pub async fn extract_auth_from_request(
                 let token = auth_str.trim_start_matches("Bearer ");
 
                 // Try API key first (they have a specific format: tk_...)
-                if token.starts_with("tk_") {
-                    match api_key_service.validate_api_key(token).await {
-                        Ok((user, role, permissions, key_name, key_id)) => {
-                            return Ok(AuthContext::new_api_key(
-                                user,
-                                role,
-                                permissions,
-                                key_name,
-                                key_id,
-                            ));
-                        }
+                if token.starts_with("tk_") || token.starts_with("tkp_") {
+                    match api_key_service.validate_api_key_with_scope(token).await {
+                        Ok(validated) => return Ok(validated.into_auth_context()),
                         Err(e) => {
                             // Logged so operators can tell `tk_` rejections from
                             // `dt_` rejections in /tmp/temps-serve.log. We log
@@ -156,7 +164,7 @@ pub async fn extract_auth_from_request(
                             // and what shows up in DB rows), never the full
                             // plaintext.
                             warn!(
-                                token_prefix = %&token[..token.len().min(8)],
+                                token_prefix = %credential_prefix_for_log(token),
                                 "API key auth failed: {}",
                                 e
                             );
@@ -186,7 +194,7 @@ pub async fn extract_auth_from_request(
                             // prefix is non-sensitive (already stored in the
                             // DB and shown in the UI).
                             warn!(
-                                token_prefix = %&token[..token.len().min(8)],
+                                token_prefix = %credential_prefix_for_log(token),
                                 "Deployment token auth failed: {}",
                                 e
                             );
@@ -321,18 +329,16 @@ pub fn extract_session_id_cookie(req: &Request, crypto: &CookieCrypto) -> Option
     None
 }
 
+/// Fresh per request (see [`crate::user_service::current_session_role`]);
+/// a lookup failure degrades to the least-privileged session role.
 async fn determine_user_role(
     user: &temps_entities::users::Model,
     user_service: &UserService,
 ) -> Result<Role, AuthError> {
-    // Check if user is admin
-    if user_service.is_admin(user.id).await.unwrap_or(false) {
-        return Ok(Role::Admin);
-    }
-
-    // For now, return User as default
-    // In the future, you might want to check the user_roles table
-    Ok(Role::User)
+    Ok(user_service
+        .current_session_role(user.id)
+        .await
+        .unwrap_or(Role::User))
 }
 
 #[derive(Debug)]
@@ -364,6 +370,13 @@ impl From<crate::apikey_service::ApiKeyServiceError> for AuthError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credential_log_prefix_handles_unicode_without_slicing_a_character() {
+        assert_eq!(credential_prefix_for_log("tkp_123érest"), "tkp_123é");
+        assert_eq!(credential_prefix_for_log("tk_1234érest"), "tk_1234é");
+        assert_eq!(credential_prefix_for_log("tkp_"), "tkp_");
+    }
 
     /// Test that the middleware correctly identifies deployment token prefix
     #[test]

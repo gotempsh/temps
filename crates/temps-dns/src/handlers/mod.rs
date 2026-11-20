@@ -24,8 +24,9 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use temps_auth::{permission_check, Permission, RequireAuth};
+use temps_authz::{permission_check, Permission, RequireAuth};
 use temps_core::problemdetails::{self, Problem};
+use temps_core::secret_string::SecretString;
 use temps_core::{AuditContext, AuditOperation, ForceRouteReloadJob, Job, RequestMetadata};
 use utoipa::{OpenApi, ToSchema};
 
@@ -42,6 +43,31 @@ use crate::services::{
     AddManagedDomainRequest, CreateProviderRequest, DnsProviderService, DnsRecordService,
     UpdateManagedDomainRequest, UpdateProviderRequest,
 };
+
+/// The DNS observability service's errors (ADR-095) as problem details,
+/// for the handlers that serve them (in `temps-nodes`).
+impl From<crate::services::observability::DnsObservabilityError> for Problem {
+    fn from(error: crate::services::observability::DnsObservabilityError) -> Self {
+        use crate::services::observability::DnsObservabilityError;
+        match &error {
+            DnsObservabilityError::InvalidFilter { .. } => {
+                problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_title("Invalid filter")
+                    .with_detail(error.to_string())
+            }
+            DnsObservabilityError::Database { .. } => {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("DNS observability database error")
+                    .with_detail(error.to_string())
+            }
+            DnsObservabilityError::Metrics { .. } => {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("DNS traffic unavailable")
+                    .with_detail(error.to_string())
+            }
+        }
+    }
+}
 
 /// Audit record for managed-domain write operations.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -66,9 +92,8 @@ impl AuditOperation for DnsGovernanceAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -170,18 +195,18 @@ pub struct UpdateDnsProviderRequest {
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum DnsProviderCredentials {
     Bunny {
-        api_key: String,
+        api_key: SecretString,
     },
     Cloudflare {
         #[schema(example = "your-api-token")]
-        api_token: String,
+        api_token: SecretString,
         account_id: Option<String>,
     },
     Namecheap {
         #[schema(example = "your-username")]
         api_user: String,
         #[schema(example = "your-api-key")]
-        api_key: String,
+        api_key: SecretString,
         client_ip: Option<String>,
         #[serde(default)]
         sandbox: bool,
@@ -190,21 +215,21 @@ pub enum DnsProviderCredentials {
         #[schema(example = "AKIAIOSFODNN7EXAMPLE")]
         access_key_id: String,
         #[schema(example = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")]
-        secret_access_key: String,
-        session_token: Option<String>,
+        secret_access_key: SecretString,
+        session_token: Option<SecretString>,
         #[schema(example = "us-east-1")]
         region: Option<String>,
     },
     #[serde(rename = "digitalocean")]
     DigitalOcean {
         #[schema(example = "dop_v1_your-token")]
-        api_token: String,
+        api_token: SecretString,
     },
     Gcp {
         #[schema(example = "dns-admin@myproject.iam.gserviceaccount.com")]
         service_account_email: String,
         #[schema(example = "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----")]
-        private_key: String,
+        private_key: SecretString,
         #[schema(example = "my-gcp-project")]
         project_id: String,
     },
@@ -213,7 +238,7 @@ pub enum DnsProviderCredentials {
         tenant_id: String,
         #[schema(example = "00000000-0000-0000-0000-000000000000")]
         client_id: String,
-        client_secret: String,
+        client_secret: SecretString,
         #[schema(example = "00000000-0000-0000-0000-000000000000")]
         subscription_id: String,
         #[schema(example = "my-resource-group")]
@@ -236,13 +261,15 @@ impl From<DnsProviderCredentials> for ProviderCredentials {
     fn from(creds: DnsProviderCredentials) -> Self {
         match creds {
             DnsProviderCredentials::Bunny { api_key } => {
-                ProviderCredentials::Bunny(BunnyCredentials { api_key })
+                ProviderCredentials::Bunny(BunnyCredentials {
+                    api_key: api_key.into_exposed(),
+                })
             }
             DnsProviderCredentials::Cloudflare {
                 api_token,
                 account_id,
             } => ProviderCredentials::Cloudflare(CloudflareCredentials {
-                api_token,
+                api_token: api_token.into_exposed(),
                 account_id,
             }),
             DnsProviderCredentials::Namecheap {
@@ -252,7 +279,7 @@ impl From<DnsProviderCredentials> for ProviderCredentials {
                 sandbox,
             } => ProviderCredentials::Namecheap(NamecheapCredentials {
                 api_user,
-                api_key,
+                api_key: api_key.into_exposed(),
                 client_ip,
                 sandbox,
             }),
@@ -263,12 +290,14 @@ impl From<DnsProviderCredentials> for ProviderCredentials {
                 region,
             } => ProviderCredentials::Route53(Route53Credentials {
                 access_key_id,
-                secret_access_key,
-                session_token,
+                secret_access_key: secret_access_key.into_exposed(),
+                session_token: session_token.map(SecretString::into_exposed),
                 region,
             }),
             DnsProviderCredentials::DigitalOcean { api_token } => {
-                ProviderCredentials::DigitalOcean(DigitalOceanCredentials { api_token })
+                ProviderCredentials::DigitalOcean(DigitalOceanCredentials {
+                    api_token: api_token.into_exposed(),
+                })
             }
             DnsProviderCredentials::Gcp {
                 service_account_email,
@@ -276,7 +305,7 @@ impl From<DnsProviderCredentials> for ProviderCredentials {
                 project_id,
             } => ProviderCredentials::Gcp(GcpCredentials {
                 service_account_email,
-                private_key,
+                private_key: private_key.into_exposed(),
                 project_id,
             }),
             DnsProviderCredentials::Azure {
@@ -288,7 +317,7 @@ impl From<DnsProviderCredentials> for ProviderCredentials {
             } => ProviderCredentials::Azure(AzureCredentials {
                 tenant_id,
                 client_id,
-                client_secret,
+                client_secret: client_secret.into_exposed(),
                 subscription_id,
                 resource_group,
             }),
@@ -800,6 +829,7 @@ async fn create_dns_provider(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<DnsAppState>>,
     Extension(metadata): Extension<RequestMetadata>,
+    ai_call: Option<Extension<temps_core::ai_tool_call::AiToolCall>>,
     Json(request): Json<CreateDnsProviderRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_check!(auth, Permission::DnsProvidersWrite);
@@ -850,10 +880,12 @@ async fn create_dns_provider(
         provider.id,
         "",
         "DNS_PROVIDER_CREATED",
-        serde_json::json!({
-            "provider_name": provider.name,
-            "provider_type": provider.provider_type,
-        }),
+        provider_write_audit_details(
+            &provider.name,
+            &provider.provider_type,
+            ai_call.is_some(),
+            None,
+        ),
     )
     .await;
 
@@ -930,6 +962,7 @@ async fn update_provider(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<DnsAppState>>,
     Extension(metadata): Extension<RequestMetadata>,
+    ai_call: Option<Extension<temps_core::ai_tool_call::AiToolCall>>,
     Path(id): Path<i32>,
     Json(request): Json<UpdateDnsProviderRequest>,
 ) -> Result<impl IntoResponse, Problem> {
@@ -992,7 +1025,12 @@ async fn update_provider(
         provider.id,
         "",
         "DNS_PROVIDER_UPDATED",
-        changed_fields,
+        provider_write_audit_details(
+            &response.name,
+            &response.provider_type,
+            ai_call.is_some(),
+            Some(changed_fields),
+        ),
     )
     .await;
 
@@ -1580,9 +1618,30 @@ fn hostname_mode_failure_audit_details(
     })
 }
 
+/// What a DNS provider create or update records: which provider, whether the
+/// AI assistant issued it (its user agent says so too, but a field can be
+/// filtered on), and for an update which fields changed. Never a credential:
+/// `changed` holds booleans only.
+fn provider_write_audit_details(
+    provider_name: &str,
+    provider_type: &str,
+    via_ai_assistant: bool,
+    changed: Option<serde_json::Value>,
+) -> serde_json::Value {
+    let mut details = serde_json::json!({
+        "provider_name": provider_name,
+        "provider_type": provider_type,
+        "via_ai_assistant": via_ai_assistant,
+    });
+    if let Some(changed) = changed {
+        details["changed_fields"] = changed;
+    }
+    details
+}
+
 async fn log_dns_governance_audit(
     state: &Arc<DnsAppState>,
-    auth: &temps_auth::AuthContext,
+    auth: &temps_authz::AuthContext,
     metadata: &RequestMetadata,
     provider_id: i32,
     domain: &str,
@@ -1700,7 +1759,7 @@ pub fn configure_routes() -> Router<Arc<DnsAppState>> {
 /// Configure internal DNS sync routes (ADR-011).
 ///
 /// These are *not* user-facing — they're polled by the per-node Hickory
-/// resolver running inside `temps-agent`. Auth is per-node bearer token,
+/// resolver running inside `temps-node-agent`. Auth is per-node bearer token,
 /// not the user JWT used by [`configure_routes`].
 pub fn configure_internal_routes() -> Router<Arc<dns_sync::DnsSyncAppState>> {
     Router::new()
@@ -1815,6 +1874,7 @@ pub struct DnsApiDoc;
 #[cfg(test)]
 mod tests {
     use super::managed_domain_automation_enabled;
+    use super::{provider_write_audit_details, CreateDnsProviderRequest};
     use crate::errors::DnsError;
     use axum::http::StatusCode;
     use temps_core::problemdetails::Problem;
@@ -2167,6 +2227,28 @@ mod tests {
         assert!(detail.contains("zone 'example.com'"), "{detail}");
         assert!(detail.contains("DNS provider 7"), "{detail}");
         assert!(detail.contains("retry"), "{detail}");
+    }
+
+    #[test]
+    fn provider_write_audit_names_the_provider_and_the_assistant_never_the_secret() {
+        let request: CreateDnsProviderRequest = serde_json::from_value(serde_json::json!({
+            "name": "Edge zone",
+            "provider_type": "cloudflare",
+            "credentials": {"type": "cloudflare", "api_token": "fixture-token-value"},
+        }))
+        .expect("request parses");
+        let details = provider_write_audit_details(&request.name, "cloudflare", true, None);
+        assert_eq!(details["provider_name"], "Edge zone");
+        assert_eq!(details["provider_type"], "cloudflare");
+        assert_eq!(details["via_ai_assistant"], true);
+        assert!(!details.to_string().contains("fixture-token-value"));
+        assert!(!format!("{request:?}").contains("fixture-token-value"));
+
+        let changed = serde_json::json!({"credentials": true, "name": false});
+        let details =
+            provider_write_audit_details("Edge zone", "cloudflare", false, Some(changed.clone()));
+        assert_eq!(details["via_ai_assistant"], false);
+        assert_eq!(details["changed_fields"], changed);
     }
 
     #[test]

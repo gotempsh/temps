@@ -38,12 +38,13 @@ export function IntegrationBadge({
       <Tooltip>
         <TooltipTrigger asChild>
           <span
+            role="img"
             aria-label={tooltipLabel}
             className={cn(
               'inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-[4px] border',
               overridden
                 ? 'border-border bg-muted text-muted-foreground'
-                : 'border-emerald-500/30 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400',
+                : 'border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400',
               className
             )}
           >

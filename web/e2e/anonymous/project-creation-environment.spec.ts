@@ -89,7 +89,9 @@ test('renders backend-managed and selected-database variables without a false em
   })
 
   await page.goto('/projects/new?source=manual')
-  await expect(page.getByRole('heading', { name: 'New Project' })).toBeVisible()
+  await expect(
+    page.getByRole('heading', { name: 'New service', exact: true })
+  ).toBeVisible()
   try {
     await expect(page.getByLabel('Loading databases')).toBeVisible()
     await expect(page.getByText('No databases configured yet')).toHaveCount(0)
@@ -109,7 +111,7 @@ test('renders backend-managed and selected-database variables without a false em
   await expect(page.getByText('SENTRY_DSN', { exact: true })).toBeVisible()
   await expect(page.getByText('POSTGRES_URL', { exact: true })).toBeVisible()
 
-  await page.getByRole('button', { name: 'Add Variable' }).click()
+  await page.getByRole('button', { name: 'Add variable' }).click()
   await page.getByPlaceholder('DATABASE_URL').fill('SENTRY_DSN')
   await expect(page.getByRole('status')).toContainText(
     'Temps will override this value'

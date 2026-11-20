@@ -1,0 +1,111 @@
+export const metadata = {
+  title: 'Import Services from a Monorepo',
+  description:
+    'Connect one repository to a Project and add each app in it as a service that builds from its own directory and follows the project’s branch.',
+  alternates: {
+    canonical: '/docs/import-services-from-a-monorepo',
+  },
+}
+
+export const sections = [
+  { title: 'How it works', id: 'how-it-works' },
+  { title: 'Connect the repository', id: 'connect-the-repository' },
+  { title: 'Import the apps', id: 'import-the-apps' },
+  { title: 'Use the CLI', id: 'use-the-cli' },
+  { title: 'If the import stops', id: 'if-the-import-stops' },
+  { title: 'Change the branch or stop following', id: 'change-the-branch-or-stop-following' },
+]
+
+# Import Services from a Monorepo
+
+When one repository holds several apps (for example `apps/web`, `apps/api` and `services/worker`), give the whole repository to a Project and import each app as a service. Every service builds from its own directory and follows the project's repository and branch. {{ className: 'lead' }}
+
+---
+
+## How it works {{ anchor: true, id: 'how-it-works' }}
+
+- The **project** holds the repository and branch: a connected repository (through a git connection) or a public GitHub or GitLab repository.
+- Temps scans the branch and lists the apps it detects, with their directory and build preset.
+- Each app you pick becomes a **service** in the project that **follows** the repository: changing the project's repository or branch updates every service that follows it.
+- Each service keeps its own directory, preset, environments, domains and variables.
+- Apps that already have a service (same repository and directory) are marked as already deployed, so importing twice does not create duplicates.
+
+<Note>
+A public repository is read without a git connection, so pushes to it cannot trigger deploys. Deploy each service when you want it updated, or connect the repository through a git connection instead.
+</Note>
+
+---
+
+## Connect the repository {{ anchor: true, id: 'connect-the-repository' }}
+
+1. Create a project (see [Create a Project and Add Services](/docs/create-a-project-and-add-services)) and open it.
+2. On the **Overview** tab, find **Deploy several services from one repository** and click **Connect repository**.
+3. Choose a source:
+   - **Git connection**: pick the connection (when you have more than one), the repository and the **Branch**. Pushes to this branch deploy the project's services.
+   - **Public repository**: paste the **Repository URL** (for example `https://github.com/owner/repository`) and the **Branch**.
+4. Click **Save repository**.
+
+No git connection yet? The dialog offers **Connect a git provider**. See [Connect a Git Provider](/docs/connect-git-provider).
+
+---
+
+## Import the apps {{ anchor: true, id: 'import-the-apps' }}
+
+1. Click **Add services from repository** (or **Add services** > **From the repository**).
+2. Review the detected apps: each row shows its directory, preset and the service name it will get. Rename a service if you want.
+3. Tick the apps to import and click **Add N services**.
+
+The import runs on the server, one step at a time. You can click **Keep running in background** and come back later; the project page shows imports that have not finished.
+
+---
+
+## Use the CLI {{ anchor: true, id: 'use-the-cli' }}
+
+```bash
+# 1. Point the project at the repository and branch
+bunx @temps-sdk/cli project-groups repo set acme-shop --connection 3 --repo acme/shop --branch main
+#    or a public repository, without a connection:
+bunx @temps-sdk/cli project-groups repo set acme-shop --repo https://github.com/acme/shop --branch main
+
+# 2. See what would be created
+bunx @temps-sdk/cli project-groups import acme-shop --dry-run
+
+# 3. Import every app that has no service yet (or only some, with --path)
+bunx @temps-sdk/cli project-groups import acme-shop
+bunx @temps-sdk/cli project-groups import acme-shop --path apps/web --path apps/api
+```
+
+`repo set` exits with a non-zero status when any service could not be updated, and lists which ones, so scripts can stop there.
+
+---
+
+## If the import stops {{ anchor: true, id: 'if-the-import-stops' }}
+
+An import is recorded with an id and resumes from the step that failed; steps that finished are never repeated, so retrying does not create duplicate services. Do not start the import again; continue the one you have:
+
+```bash
+# Imports and template creations you started, newest first
+bunx @temps-sdk/cli instantiations list --group acme-shop
+
+# Follow one until it finishes
+bunx @temps-sdk/cli instantiations show 42 --wait
+
+# Continue from the step that failed
+bunx @temps-sdk/cli instantiations retry 42
+```
+
+The CLI prints the id when the import starts. If it stops waiting (after 30 minutes by default, or `--timeout` minutes), the import keeps running on the server and the CLI tells you the command to follow it.
+
+---
+
+## Change the branch or stop following {{ anchor: true, id: 'change-the-branch-or-stop-following' }}
+
+- **Change repository or branch**: in the console, open the repository panel's menu and choose **Change repository or branch…**; in the CLI, run `repo set` again. Every service that follows the project is updated.
+- **Stop following** keeps a service's current repository, branch and directory, and stops it following later changes. **Follow project** makes it follow again.
+- **Disconnect repository** removes the project's repository; services keep their current settings.
+
+```bash
+bunx @temps-sdk/cli project-groups unfollow acme-shop worker
+bunx @temps-sdk/cli project-groups follow acme-shop worker
+bunx @temps-sdk/cli project-groups repo unset acme-shop
+```

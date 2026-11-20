@@ -60,7 +60,7 @@ pub struct KamalRoleDetail {
     pub env: Option<KamalEnv>,
     /// A role with `proxy: false` is not web-facing
     #[serde(default)]
-    pub proxy: Option<serde_yaml::Value>,
+    pub proxy: Option<yaml_serde::Value>,
 }
 
 impl KamalRole {
@@ -91,8 +91,8 @@ impl KamalRole {
         match self {
             KamalRole::Hosts(_) => role_name == "web",
             KamalRole::Detailed(detail) => match &detail.proxy {
-                Some(serde_yaml::Value::Bool(enabled)) => *enabled,
-                Some(serde_yaml::Value::Null) | None => role_name == "web",
+                Some(yaml_serde::Value::Bool(enabled)) => *enabled,
+                Some(yaml_serde::Value::Null) | None => role_name == "web",
                 Some(_) => true, // a proxy config object means proxied
             },
         }
@@ -130,16 +130,16 @@ pub struct KamalRegistry {
     #[serde(default)]
     pub server: Option<String>,
     #[serde(default)]
-    pub username: Option<serde_yaml::Value>,
+    pub username: Option<yaml_serde::Value>,
     /// Usually `[SECRET_NAME]` — a reference, never a literal
     #[serde(default)]
-    pub password: Option<serde_yaml::Value>,
+    pub password: Option<yaml_serde::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct KamalBuilder {
     #[serde(default)]
-    pub arch: Option<serde_yaml::Value>,
+    pub arch: Option<yaml_serde::Value>,
     #[serde(default)]
     pub dockerfile: Option<String>,
     #[serde(default)]
@@ -147,14 +147,14 @@ pub struct KamalBuilder {
     #[serde(default)]
     pub target: Option<String>,
     #[serde(default)]
-    pub args: BTreeMap<String, serde_yaml::Value>,
+    pub args: BTreeMap<String, yaml_serde::Value>,
 }
 
 /// `env:` — literal values plus the *names* of secrets
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct KamalEnv {
     #[serde(default)]
-    pub clear: BTreeMap<String, serde_yaml::Value>,
+    pub clear: BTreeMap<String, yaml_serde::Value>,
     /// Secret names only; values live in `.kamal/secrets`, never in the config
     #[serde(default)]
     pub secret: Vec<String>,
@@ -182,7 +182,7 @@ pub struct KamalAccessory {
     pub hosts: Vec<String>,
     /// Published port; Kamal accepts `3306` or `"127.0.0.1:3306:3306"`
     #[serde(default)]
-    pub port: Option<serde_yaml::Value>,
+    pub port: Option<yaml_serde::Value>,
     #[serde(default)]
     pub env: Option<KamalEnv>,
     /// `data:/var/lib/mysql` — presence means the accessory holds state
@@ -205,8 +205,8 @@ impl KamalAccessory {
     /// The published host port, parsed from either form
     pub fn host_port(&self) -> Option<u16> {
         match self.port.as_ref()? {
-            serde_yaml::Value::Number(n) => n.as_u64().and_then(|p| u16::try_from(p).ok()),
-            serde_yaml::Value::String(s) => {
+            yaml_serde::Value::Number(n) => n.as_u64().and_then(|p| u16::try_from(p).ok()),
+            yaml_serde::Value::String(s) => {
                 // "3306", "127.0.0.1:3306:3306" — the published port is the
                 // second-to-last field when colons are present.
                 let parts: Vec<&str> = s.split(':').collect();
@@ -232,17 +232,17 @@ pub struct KamalSsh {
     #[serde(default)]
     pub user: Option<String>,
     #[serde(default)]
-    pub port: Option<serde_yaml::Value>,
+    pub port: Option<yaml_serde::Value>,
 }
 
 /// Stringify a YAML scalar the way Kamal passes it to Docker
-pub fn scalar_to_string(value: &serde_yaml::Value) -> String {
+pub fn scalar_to_string(value: &yaml_serde::Value) -> String {
     match value {
-        serde_yaml::Value::String(s) => s.clone(),
-        serde_yaml::Value::Bool(b) => b.to_string(),
-        serde_yaml::Value::Number(n) => n.to_string(),
-        serde_yaml::Value::Null => String::new(),
-        other => serde_yaml::to_string(other)
+        yaml_serde::Value::String(s) => s.clone(),
+        yaml_serde::Value::Bool(b) => b.to_string(),
+        yaml_serde::Value::Number(n) => n.to_string(),
+        yaml_serde::Value::Null => String::new(),
+        other => yaml_serde::to_string(other)
             .unwrap_or_default()
             .trim()
             .to_string(),
@@ -271,7 +271,7 @@ impl KamalConfig {
                 field: line.chars().take(60).collect(),
             });
         }
-        let config: KamalConfig = serde_yaml::from_str(yaml).map_err(|e| {
+        let config: KamalConfig = yaml_serde::from_str(yaml).map_err(|e| {
             let reason = e.to_string();
             // serde reports a missing required field as "missing field `x`"
             if reason.contains("missing field `service`") {

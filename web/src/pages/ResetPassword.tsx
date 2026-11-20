@@ -146,9 +146,9 @@ export const ResetPassword = () => {
                                 className={cn(
                                   'flex items-center gap-1.5 text-xs transition-colors',
                                   met
-                                    ? 'text-emerald-600 dark:text-emerald-400 font-medium'
+                                    ? 'text-emerald-700 dark:text-emerald-400 font-medium'
                                     : passwordStarted
-                                      ? 'text-rose-500 font-medium'
+                                      ? 'text-rose-700 dark:text-rose-500 font-medium'
                                       : 'text-muted-foreground'
                                 )}
                               >

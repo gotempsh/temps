@@ -97,14 +97,39 @@ impl StaticFileMatch {
     }
 }
 
-/// `Location` for a [`StaticFileMatch::CanonicalRedirect`]: the raw request
-/// path without its trailing slash, plus the original query string.
+/// Public path prefix a path-routed static target is mounted under: the
+/// route's prefix when the proxy strips it before the file lookup, otherwise
+/// empty (non-routed requests, and routes that keep the prefix, whose request
+/// path already carries it).
+///
+/// A stripping route (`/docs` -> `/`) resolves files against `/guide/` while
+/// the client asked for `/docs/guide/`; anything the static layer echoes back
+/// as an absolute path must re-apply this prefix or the client leaves the
+/// route. Borrowed from the route, so a non-routed request allocates nothing.
+pub(crate) fn static_mount_prefix(route: Option<&temps_routes::PathRoute>) -> &str {
+    match route {
+        // Route prefixes are normalized without a trailing slash and are
+        // never `/`; trimming keeps a hand-built `/` from becoming `//`.
+        Some(route) if route.strip_prefix => route.prefix.trim_end_matches('/'),
+        Some(_) | None => "",
+    }
+}
+
+/// `Location` for a [`StaticFileMatch::CanonicalRedirect`]: the request path
+/// the static layer resolved, without its trailing slash and under
+/// `mount_prefix` (see [`static_mount_prefix`]; empty when not path-routed),
+/// plus the original query string.
+///
+/// `raw_request_path` is the path as the static layer saw it, i.e. with the
+/// route prefix already stripped. `/guide/` under `/docs` yields
+/// `/docs/guide`.
 ///
 /// Returns `None` unless the result is a plain same-origin path. The request
 /// path has already passed `normalize_static_request_path`, which rejects
 /// `//host` and `\` forms, so this is a second line of defence against
 /// building a protocol-relative (open) redirect.
 pub(crate) fn canonical_redirect_location(
+    mount_prefix: &str,
     raw_request_path: &str,
     query_string: Option<&str>,
 ) -> Option<String> {
@@ -112,10 +137,27 @@ pub(crate) fn canonical_redirect_location(
     if !path.starts_with('/') || path.starts_with("//") || path.contains('\\') {
         return None;
     }
-    Some(match query_string.filter(|query| !query.is_empty()) {
-        Some(query) => format!("{path}?{query}"),
-        None => path.to_owned(),
-    })
+    // The prefix is joined in front of an absolute path, so it must itself be
+    // empty or a plain absolute path: `//host` would turn into an open redirect.
+    if !mount_prefix.is_empty()
+        && (!mount_prefix.starts_with('/')
+            || mount_prefix.starts_with("//")
+            || mount_prefix.ends_with('/')
+            || mount_prefix.contains('\\'))
+    {
+        return None;
+    }
+    let query = query_string.filter(|query| !query.is_empty());
+    let mut location = String::with_capacity(
+        mount_prefix.len() + path.len() + query.map_or(0, |query| query.len() + 1),
+    );
+    location.push_str(mount_prefix);
+    location.push_str(path);
+    if let Some(query) = query {
+        location.push('?');
+        location.push_str(query);
+    }
+    Some(location)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1331,17 +1373,56 @@ mod tests {
     #[test]
     fn canonical_redirect_location_drops_the_slash_and_keeps_the_query() {
         assert_eq!(
-            canonical_redirect_location("/about/", None).as_deref(),
+            canonical_redirect_location("", "/about/", None).as_deref(),
             Some("/about")
         );
         assert_eq!(
-            canonical_redirect_location("/blog/first-post/", Some("ref=home&x=1")).as_deref(),
+            canonical_redirect_location("", "/blog/first-post/", Some("ref=home&x=1")).as_deref(),
             Some("/blog/first-post?ref=home&x=1")
         );
         assert_eq!(
-            canonical_redirect_location("/about/", Some("")).as_deref(),
+            canonical_redirect_location("", "/about/", Some("")).as_deref(),
             Some("/about")
         );
+    }
+
+    #[test]
+    fn canonical_redirect_location_reapplies_the_mount_prefix() {
+        // A route mounted at `/docs` resolves `/docs/guide/` as `/guide/`.
+        assert_eq!(
+            canonical_redirect_location("/docs", "/guide/", None).as_deref(),
+            Some("/docs/guide")
+        );
+        assert_eq!(
+            canonical_redirect_location("/docs", "/guide/", Some("ref=home&x=1")).as_deref(),
+            Some("/docs/guide?ref=home&x=1")
+        );
+        assert_eq!(
+            canonical_redirect_location("/docs", "/guide/", Some("")).as_deref(),
+            Some("/docs/guide")
+        );
+        assert_eq!(
+            canonical_redirect_location("/docs", "/a/b/c/", None).as_deref(),
+            Some("/docs/a/b/c")
+        );
+        assert_eq!(
+            canonical_redirect_location("/docs/v2", "/guide/", None).as_deref(),
+            Some("/docs/v2/guide")
+        );
+    }
+
+    #[test]
+    fn canonical_redirect_location_never_redirects_the_mount_root() {
+        // `/docs` and `/docs/` both resolve `/`: the root page is never a
+        // canonical redirect, and an empty remainder must not become a
+        // Location of the bare prefix.
+        for prefix in ["", "/docs"] {
+            assert_eq!(
+                canonical_redirect_location(prefix, "/", None),
+                None,
+                "{prefix}"
+            );
+        }
     }
 
     #[test]
@@ -1353,8 +1434,104 @@ mod tests {
             "about/",
             "/about",
         ] {
-            assert_eq!(canonical_redirect_location(raw, None), None, "{raw}");
+            for prefix in ["", "/docs"] {
+                assert_eq!(
+                    canonical_redirect_location(prefix, raw, None),
+                    None,
+                    "{prefix}{raw}"
+                );
+            }
         }
+        // A malformed mount prefix is refused rather than joined in front.
+        for prefix in ["//evil.example", "docs", "/docs/", "/\\evil.example"] {
+            assert_eq!(
+                canonical_redirect_location(prefix, "/guide/", None),
+                None,
+                "{prefix}"
+            );
+        }
+    }
+
+    fn path_route(prefix: &str, strip_prefix: bool) -> temps_routes::PathRoute {
+        temps_routes::PathRoute {
+            prefix: prefix.to_owned(),
+            strip_prefix,
+            target_service: "docs".to_owned(),
+            target: None,
+            sleeping_environment_id: None,
+        }
+    }
+
+    #[test]
+    fn static_mount_prefix_is_the_route_prefix_only_when_it_is_stripped() {
+        assert_eq!(static_mount_prefix(None), "");
+        assert_eq!(
+            static_mount_prefix(Some(&path_route("/docs", true))),
+            "/docs"
+        );
+        // The request path keeps the prefix, so nothing is re-applied.
+        assert_eq!(static_mount_prefix(Some(&path_route("/docs", false))), "");
+        // `/` is never a valid stored prefix; if one appears it must not
+        // become a leading `//`.
+        assert_eq!(static_mount_prefix(Some(&path_route("/", true))), "");
+        assert_eq!(
+            canonical_redirect_location(
+                static_mount_prefix(Some(&path_route("/", true))),
+                "/guide/",
+                None
+            )
+            .as_deref(),
+            Some("/guide")
+        );
+    }
+
+    #[tokio::test]
+    async fn stripped_path_route_redirect_goes_back_under_the_mount() {
+        let (root, deployment) = deployment().await;
+        fs::write(deployment.join("guide.html"), b"guide")
+            .await
+            .expect("write html page");
+        let route = path_route("/docs", true);
+
+        // The proxy hands the static layer the route-relative `/guide/`.
+        let stripped = route.upstream_path("/docs/guide/");
+        assert_eq!(stripped, "/guide/");
+        assert_eq!(
+            open_matched(&root, &stripped).await,
+            ("guide".to_owned(), StaticFileMatch::CanonicalRedirect)
+        );
+        assert_eq!(
+            canonical_redirect_location(
+                static_mount_prefix(Some(&route)),
+                &stripped,
+                Some("ref=home"),
+            )
+            .as_deref(),
+            Some("/docs/guide?ref=home")
+        );
+
+        // The mount root and its slash form resolve the root page, not a redirect.
+        for requested in ["/docs", "/docs/"] {
+            assert_eq!(
+                open_matched(&root, &route.upstream_path(requested)).await,
+                ("spa".to_owned(), StaticFileMatch::Requested),
+                "{requested}"
+            );
+        }
+
+        // A route that keeps its prefix looks the file up under it and needs
+        // no re-application: the request path is already the public one.
+        let keeping = path_route("/docs", false);
+        assert_eq!(static_mount_prefix(Some(&keeping)), "");
+        assert_eq!(
+            canonical_redirect_location(
+                static_mount_prefix(Some(&keeping)),
+                &keeping.upstream_path("/docs/guide/"),
+                None,
+            )
+            .as_deref(),
+            Some("/docs/guide")
+        );
     }
 
     #[test]

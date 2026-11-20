@@ -564,6 +564,28 @@ impl OtelStorage for CloudRoutedOtelStorage {
         }
     }
 
+    async fn get_trace_spans(
+        &self,
+        project_id: i32,
+        trace_id: &str,
+        max_spans: usize,
+    ) -> StorageResult<Vec<SpanRecord>> {
+        let resolution = self.resolve(project_id, None, None).await;
+        match resolution.source {
+            CloudTelemetryWriteMode::Local => {
+                self.local
+                    .get_trace_spans(project_id, trace_id, max_spans)
+                    .await
+            }
+            // The Cloud reader already bounds a trace read by its row cap.
+            CloudTelemetryWriteMode::Cloud => {
+                let mut spans = self.cloud.get_trace(project_id, trace_id).await?;
+                spans.truncate(max_spans);
+                Ok(spans)
+            }
+        }
+    }
+
     async fn get_trace_in_window(
         &self,
         project_id: i32,
@@ -620,6 +642,11 @@ impl OtelStorage for CloudRoutedOtelStorage {
         // project's trace. Routing it to Cloud would remove cross-project
         // linking for exactly the projects that need it most.
         self.local.record_trace_refs(trace_ids, project_id).await
+    }
+
+    async fn record_trace_refs_batch(&self, refs: &[(i32, Vec<String>)]) -> StorageResult<u64> {
+        // Local for the same reason as `record_trace_refs`.
+        self.local.record_trace_refs_batch(refs).await
     }
 
     async fn get_trace_ref_projects(&self, trace_id: &str) -> StorageResult<Vec<TraceRefProject>> {

@@ -87,7 +87,10 @@ export function ServiceReadinessPanel({
               <p className="font-medium text-foreground">
                 From the container logs
               </p>
-              <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-all rounded-md bg-muted p-2 font-mono text-xs text-foreground">
+              <pre
+                tabIndex={0}
+                className="max-h-48 overflow-auto whitespace-pre-wrap break-all rounded-md bg-muted p-2 font-mono text-xs text-foreground"
+              >
                 {failure.log_excerpt.join('\n')}
               </pre>
             </div>

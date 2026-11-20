@@ -63,12 +63,12 @@ export const JOB_STATUS_LABELS: Record<BulkJobStatus, string> = {
  */
 export const JOB_STATUS_DETAIL: Record<BulkJobStatus, string> = {
   pending: 'Queued. The activation starts as soon as the worker picks it up.',
-  running: 'Switching projects to Temps Cloud and shipping their history.',
-  completed: 'Every project in this activation is on Temps Cloud.',
+  running: 'Switching services to Temps Cloud and shipping their history.',
+  completed: 'Every service in this activation is on Temps Cloud.',
   completed_with_failures:
-    'The activation ran to the end, but some projects did not finish. Each one is listed below with its reason.',
+    'The activation ran to the end, but some services did not finish. Each one is listed below with its reason.',
   aborted:
-    'An instance-wide condition stopped this activation. Projects it never reached are still queued, so resuming picks up where it left off — nothing already paid for is sent twice.',
+    'An instance-wide condition stopped this activation. Services it never reached are still queued, so resuming picks up where it left off — nothing already paid for is sent twice.',
   cancelled:
     'Someone asked this activation to stop. Progress is durable: resuming re-sends nothing that already reached Cloud.',
 }
@@ -94,15 +94,15 @@ export const PROJECT_STATUS_LABELS: Record<BulkJobProjectStatus, string> = {
  * which of the two it is stuck in.
  */
 export const PROJECT_STATUS_HINTS: Record<BulkJobProjectStatus, string> = {
-  pending: 'Not started yet — nothing has been sent for this project.',
+  pending: 'Not started yet — nothing has been sent for this service.',
   switching:
     'Pointing new spans at Temps Cloud. Instant, and it sends no history.',
   backfilling:
-    'Sending this project’s existing history. This is the part that ' +
+    'Sending this service’s existing history. This is the part that ' +
     'takes time and costs egress.',
   done: 'Switched, and its history has been shipped.',
   failed:
-    'History backfill failed. New spans are still going to Temps Cloud — the switch is never rolled back — so this is a recorded hole in history, not a broken project.',
+    'History backfill failed. New spans are still going to Temps Cloud — the switch is never rolled back — so this is a recorded hole in history, not a broken service.',
   skipped: 'Not eligible, so nothing was switched and nothing was sent.',
 }
 
@@ -131,7 +131,7 @@ export function skipReasonText(
 ): string {
   if (project.skip_detail) return project.skip_detail
   if (project.skip_reason) return project.skip_reason
-  return 'The instance recorded no reason for skipping this project.'
+  return 'The instance recorded no reason for skipping this service.'
 }
 
 /**

@@ -40,7 +40,10 @@ function deployment(
   } as DeploymentResponse
 }
 
-function render(lastDeployment: DeploymentResponse): string {
+function render(
+  lastDeployment: DeploymentResponse | null,
+  answers = 1
+): string {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   })
@@ -48,10 +51,50 @@ function render(lastDeployment: DeploymentResponse): string {
     getProjectBySlugQueryKey({ path: { slug: project.slug } }),
     project
   )
-  client.setQueryData(
-    getLastDeploymentQueryKey({ path: { id: project.id } }),
-    lastDeployment
+  // Each stored answer counts as one poll of the "wait for a first deployment"
+  // budget, like a refetch would.
+  for (let i = 0; i < answers; i++) {
+    client.setQueryData(
+      getLastDeploymentQueryKey({ path: { id: project.id } }),
+      { deployment: lastDeployment }
+    )
+  }
+  const markup = renderToStaticMarkup(
+    <QueryClientProvider client={client}>
+      <MemoryRouter>
+        <SampleDeployTracker projectSlug={project.slug} />
+      </MemoryRouter>
+    </QueryClientProvider>
   )
+  client.clear()
+  return markup
+}
+
+/** Render with the last-deployment read failed `errorCount` times. */
+function renderFailedRead(errorCount: number): string {
+  // `retryOnMount: false` keeps a cached failure from being reported as a
+  // fresh pending fetch in the (non-fetching) server render.
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false, retryOnMount: false } },
+  })
+  client.setQueryData(
+    getProjectBySlugQueryKey({ path: { slug: project.slug } }),
+    project
+  )
+  const queryKey = getLastDeploymentQueryKey({ path: { id: project.id } })
+  client
+    .getQueryCache()
+    .build(client, {
+      queryKey,
+      queryFn: () => Promise.reject(new Error('unreachable')),
+    })
+    .setState({
+      status: 'error',
+      fetchStatus: 'idle',
+      error: new Error('unreachable'),
+      errorUpdateCount: errorCount,
+      errorUpdatedAt: Date.now(),
+    })
   const markup = renderToStaticMarkup(
     <QueryClientProvider client={client}>
       <MemoryRouter>
@@ -64,6 +107,25 @@ function render(lastDeployment: DeploymentResponse): string {
 }
 
 describe('SampleDeployTracker', () => {
+  test('a failed deployment read ends the wait with a visible error and a retry', () => {
+    const markup = renderFailedRead(1)
+    expect(markup).toContain('Could not read the deployment status')
+    expect(markup).toContain('Check again')
+    expect(markup).toContain('Deploy the sample image')
+  })
+
+  test('keeps waiting while a just-started deployment is not visible yet', () => {
+    const markup = render(null)
+    expect(markup).not.toContain('No deployment has started yet')
+    expect(markup).not.toContain('Deploy the sample image')
+  })
+
+  test('explains an empty project once the bounded wait is over', () => {
+    const markup = render(null, 5)
+    expect(markup).toContain('No deployment has started yet')
+    expect(markup).toContain('Deploy the sample image')
+  })
+
   test('shows a stopped deployment with a retry instead of indefinite progress', () => {
     const markup = render(deployment({ status: 'stopped' }))
     expect(markup).toContain('Stopped')

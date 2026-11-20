@@ -11,10 +11,10 @@
 
 use moka::future::Cache;
 use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement};
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use temps_core::crypto::sha256_hex;
 use tracing::warn;
 
 use crate::error::{db_err_kind, OtelError, StorageErrorKind};
@@ -234,7 +234,7 @@ impl OtelAuthService {
             return Err(OtelError::InvalidApiKey);
         }
 
-        let key_hash = hash_token(token);
+        let key_hash = sha256_hex(token);
         let cache_key = AuthCacheKey::ServiceToken {
             key_hash: key_hash.clone(),
         };
@@ -364,7 +364,7 @@ impl OtelAuthService {
                     .into(),
         })?;
 
-        let key_hash = hash_token(api_key);
+        let key_hash = sha256_hex(api_key);
         let cache_key = AuthCacheKey::ApiKey {
             key_hash: key_hash.clone(),
             project_id,
@@ -407,7 +407,13 @@ impl OtelAuthService {
         // mirroring `project_access_guard!` (admin bypass, fail-closed on
         // infrastructure errors, allow when no checker is registered).
         let sql = r#"
-            SELECT ak.id AS key_id, ak.user_id, ak.role_type, p.name AS project_name
+            SELECT ak.id AS key_id, ak.user_id, ak.role_type, p.name AS project_name,
+                   EXISTS (
+                       SELECT 1
+                       FROM user_roles ur
+                       JOIN roles r ON r.id = ur.role_id
+                       WHERE ur.user_id = ak.user_id AND r.name = 'admin'
+                   ) AS owner_is_admin
             FROM api_keys ak
             JOIN projects p ON p.id = $2
             WHERE ak.key_hash = $1
@@ -451,8 +457,13 @@ impl OtelAuthService {
                         .map_err(|_| OtelError::AuthFailed {
                             reason: "Failed to parse project name".into(),
                         })?;
+                let owner_is_admin: bool =
+                    row.try_get("", "owner_is_admin")
+                        .map_err(|_| OtelError::AuthFailed {
+                            reason: "Failed to parse auth result".into(),
+                        })?;
 
-                self.check_project_access(user_id, &role_type, project_id)
+                self.check_project_access(user_id, &role_type, owner_is_admin, project_id)
                     .await?;
 
                 Ok(ProjectAuth {
@@ -472,7 +483,10 @@ impl OtelAuthService {
     /// Enforce ADR-028 team-based project access for a `tk_` key's user,
     /// mirroring `project_access_guard!` semantics exactly:
     ///
-    /// - Instance `admin` / `platform_admin` roles bypass the check.
+    /// - Instance `admin` / `platform_admin` keys bypass the check, but only
+    ///   while the key's owner still holds the `admin` role. The key row keeps
+    ///   its creation-time role after the owner is demoted, so the stored role
+    ///   alone must never grant the bypass.
     /// - No checker registered (plain OSS binary) → allow.
     /// - `Ok(false)` → deny.
     /// - `Err` → deny (**fail-closed**): a broken check must never silently
@@ -484,14 +498,16 @@ impl OtelAuthService {
         &self,
         user_id: i32,
         role_type: &str,
+        owner_is_admin: bool,
         project_id: i32,
     ) -> Result<(), OtelError> {
-        use temps_auth::permissions::Role;
+        use temps_authz::permissions::Role;
 
-        let is_instance_admin = matches!(
-            Role::from_str(role_type),
-            Some(Role::Admin) | Some(Role::PlatformAdmin)
-        );
+        let is_instance_admin = owner_is_admin
+            && matches!(
+                Role::from_str(role_type),
+                Some(Role::Admin) | Some(Role::PlatformAdmin)
+            );
         if is_instance_admin {
             return Ok(());
         }
@@ -529,7 +545,7 @@ impl OtelAuthService {
             return Err(OtelError::InvalidApiKey);
         }
 
-        let token_hash = hash_token(token);
+        let token_hash = sha256_hex(token);
         let cache_key = AuthCacheKey::DeploymentToken {
             token_hash: token_hash.clone(),
         };
@@ -661,12 +677,6 @@ impl OtelAuthService {
     }
 }
 
-fn hash_token(token: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(token.as_bytes());
-    hex::encode(hasher.finalize())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -788,15 +798,15 @@ mod tests {
             sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
         );
         let svc = OtelAuthService::new(db);
-        assert!(svc.check_project_access(1, "user", 42).await.is_ok());
+        assert!(svc.check_project_access(1, "user", true, 42).await.is_ok());
     }
 
     #[tokio::test]
     async fn admin_roles_bypass_checker() {
         let (svc, checker) = service_with_checker(Some(false)); // would deny
-        assert!(svc.check_project_access(1, "admin", 42).await.is_ok());
+        assert!(svc.check_project_access(1, "admin", true, 42).await.is_ok());
         assert!(svc
-            .check_project_access(1, "platform_admin", 42)
+            .check_project_access(1, "platform_admin", true, 42)
             .await
             .is_ok());
         assert_eq!(
@@ -807,26 +817,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admin_key_of_a_demoted_owner_does_not_bypass_checker() {
+        // The key row still says "admin", but its owner no longer holds the
+        // admin role: the checker must decide, and here it denies.
+        let (svc, checker) = service_with_checker(Some(false));
+        assert!(matches!(
+            svc.check_project_access(1, "admin", false, 42).await,
+            Err(OtelError::AuthFailed { .. })
+        ));
+        assert!(svc
+            .check_project_access(1, "platform_admin", false, 42)
+            .await
+            .is_err());
+        assert_eq!(checker.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
     async fn checker_verdict_is_enforced_for_non_admins() {
         let (svc, _) = service_with_checker(Some(true));
-        assert!(svc.check_project_access(1, "user", 42).await.is_ok());
+        assert!(svc.check_project_access(1, "user", true, 42).await.is_ok());
 
         let (svc, _) = service_with_checker(Some(false));
         assert!(matches!(
-            svc.check_project_access(1, "user", 42).await,
+            svc.check_project_access(1, "user", true, 42).await,
             Err(OtelError::AuthFailed { .. })
         ));
 
         // Unknown/custom role strings get no bypass either.
         let (svc, _) = service_with_checker(Some(false));
-        assert!(svc.check_project_access(1, "custom", 42).await.is_err());
+        assert!(svc
+            .check_project_access(1, "custom", true, 42)
+            .await
+            .is_err());
     }
 
     #[tokio::test]
     async fn checker_infrastructure_failure_is_fail_closed() {
         let (svc, _) = service_with_checker(None); // simulates Err from checker
         assert!(matches!(
-            svc.check_project_access(1, "user", 42).await,
+            svc.check_project_access(1, "user", true, 42).await,
             Err(OtelError::AuthFailed { .. })
         ));
     }
@@ -958,6 +987,7 @@ mod tests {
             row.insert("user_id", 19_i32.into());
             row.insert("role_type", "user".into());
             row.insert("project_name", project_name.into());
+            row.insert("owner_is_admin", false.into());
             row
         }
 

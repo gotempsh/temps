@@ -104,8 +104,26 @@ fn expected_sdk_paths() -> Vec<&'static str> {
         // Multi-node placement (ADR-048): which nodes may run sandboxes, the
         // operator's per-node view, and clearing a node before removal.
         "/v1/sandboxes/placement",
+        // Effective resource limits for the console's selected placement.
+        "/v1/sandboxes/resource-defaults",
         "/v1/sandboxes/placement/nodes/{node}",
         "/v1/sandboxes/placement/nodes/{node}/evict",
+        // Changing a sandbox's egress policy after it was created (temps
+        // extension, ADR-055).
+        "/v1/sandboxes/{id}/egress-policy",
+        // Directory listing and preview access checks (temps extensions).
+        "/v1/sandboxes/{id}/fs/list",
+        "/v1/sandboxes/{id}/preview-access",
+        // A create's ordered steps, read while `POST /v1/sandboxes` runs
+        // (by the client's `creation_id`) or afterwards by sandbox (temps
+        // extension).
+        "/v1/sandboxes/creations/{creation_id}",
+        "/v1/sandboxes/{id}/creation",
+        // Pulling the default sandbox image on each host ahead of the first
+        // create, and the per-host policy that keeps it pulled (temps
+        // extension).
+        "/v1/sandboxes/image-preparation",
+        "/v1/sandboxes/image-preparation/nodes/{node_id}",
     ]
 }
 
@@ -131,16 +149,19 @@ fn openapi_covers_every_sdk_path() {
 fn openapi_does_not_advertise_unknown_paths() {
     let api = SandboxApiDoc::openapi();
     let expected: std::collections::HashSet<_> = expected_sdk_paths().into_iter().collect();
-    let got = &api.paths.paths;
+    let mut unknown: Vec<_> = api
+        .paths
+        .paths
+        .keys()
+        .filter(|path| !expected.contains(path.as_str()))
+        .collect();
+    unknown.sort();
 
-    for path in got.keys() {
-        assert!(
-            expected.contains(path.as_str()),
-            "OpenAPI doc exposes path '{}' not in the Vercel SDK surface — \
-             add it to `expected_sdk_paths` with a comment, or remove it from `SandboxApiDoc::paths`.",
-            path
-        );
-    }
+    assert!(
+        unknown.is_empty(),
+        "OpenAPI doc exposes paths not in the Vercel SDK surface: {unknown:?} — \
+         add them to `expected_sdk_paths` with a comment, or remove them from `SandboxApiDoc::paths`.",
+    );
 }
 
 // ── DTO shape: request bodies the SDK sends ─────────────────────────────────
@@ -378,9 +399,11 @@ fn cmd_response_serializes_finished_with_exit_code() {
 fn sandbox_response_matches_sdk_envelope() {
     let r = SandboxResponse {
         sandbox: SandboxInner {
+            allow_docker: false,
             id: "sbx_abc".into(),
             node_id: None,
             node_name: "control-plane".into(),
+            egress_policy: Default::default(),
             memory: 2048,
             vcpus: 2.0,
             region: "local".into(),
@@ -397,6 +420,8 @@ fn sandbox_response_matches_sdk_envelope() {
             disk_size_mb: None,
             preview_url_template: String::new(),
             preview_password_hint: None,
+            preview_access: Default::default(),
+            preview_allowed_cidrs: Vec::new(),
             agent_run_id: None,
             lifecycle: "ephemeral".to_string(),
             project_id: None,
@@ -458,9 +483,11 @@ fn sandbox_status_uses_sdk_enum_values() {
     for status in valid {
         let r = SandboxResponse {
             sandbox: SandboxInner {
+                allow_docker: false,
                 id: "x".into(),
                 node_id: None,
                 node_name: "control-plane".into(),
+                egress_policy: Default::default(),
                 memory: 0,
                 vcpus: 0.0,
                 region: "local".into(),
@@ -477,6 +504,8 @@ fn sandbox_status_uses_sdk_enum_values() {
                 disk_size_mb: None,
                 preview_url_template: String::new(),
                 preview_password_hint: None,
+                preview_access: Default::default(),
+                preview_allowed_cidrs: Vec::new(),
                 agent_run_id: None,
                 lifecycle: "ephemeral".to_string(),
                 project_id: None,

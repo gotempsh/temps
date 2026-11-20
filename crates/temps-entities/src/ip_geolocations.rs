@@ -26,8 +26,25 @@ pub struct Model {
     #[sea_orm(column_name = "asn")]
     pub asn_org: Option<String>,
     pub is_hosting_provider: Option<bool>,
+    /// Autonomous system number the IP is announced from. `None` when no ASN
+    /// database was loaded when the row was resolved, or it had no entry.
+    pub asn_number: Option<i32>,
+    /// Version of the hosting-classification rules that produced
+    /// `is_hosting_provider` (`temps_geo::HOSTING_CLASSIFIER_VERSION`). `None`
+    /// when no ASN database was loaded. A row with an older version is
+    /// re-resolved on its next lookup.
+    pub hosting_classifier_version: Option<i16>,
     pub created_at: DBDateTime,
+    /// When the geolocation was last verified against the GeoIP database.
     pub updated_at: DBDateTime,
+    /// When a writer last resolved this row's id for use as a reference.
+    ///
+    /// Distinct from `updated_at`, which only advances once per
+    /// `geo.stale_lookup_days`. Retention deletes an address only once this is
+    /// older than its window, so an id a writer is about to store (or holds in
+    /// its cache) is never one the cleanup is entitled to remove. `NULL` on
+    /// rows written before the column existed: read as `updated_at`.
+    pub last_used_at: Option<DBDateTime>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

@@ -91,6 +91,8 @@ Ask the release API for the newest version on this channel now
 
 Show or set the release channel: stable, beta, nightly, or "auto" to follow the installed version
 
+**Usage:** `platform update channel [channel] [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -132,6 +134,8 @@ List the alert rules watching this node (proxy health, socket exhaustion)
 #### `platform alert-rules set`
 
 Retune, enable, or disable an alert rule on this node
+
+**Usage:** `platform alert-rules set <rule-id> [options]`
 
 **Options:**
 

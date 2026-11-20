@@ -18,9 +18,12 @@
 #      through the proxy).
 #   3. A plain restart of NEW_BIN, still with the flag, must not take another
 #      backup.
-#   4. With an unknown "future" migration recorded, NEW_BIN must refuse to
-#      start (schema guard) and leave the database untouched.
-#   5. OLD_BIN must refuse the upgraded database.
+#   4. With an unknown "future" migration recorded, NEW_BIN must start with a
+#      warning naming it (schema guard), leave it recorded, take no backup and
+#      still serve the seeded data.
+#   5. OLD_BIN on the upgraded database must either start with that same
+#      warning (releases with the warn-and-continue guard) or refuse to start
+#      (earlier releases), and must not change the migration ledger.
 #   6. The pre-migration backup is restored into a fresh database, and OLD_BIN
 #      must start on it and serve the seeded data again (rollback).
 #   7. NEW_BIN without the flag (the default) upgrades that rolled-back
@@ -194,6 +197,36 @@ expect_start_refused() {
   if [ -n "$pattern" ] && ! grep -q "$pattern" "$logfile"; then
     fail "$bin refused to start, but its log does not explain why ('$pattern' not found in $logfile)"
   fi
+}
+
+# Start `temps serve` against a database a newer release migrated. Releases
+# with the warn-and-continue schema guard start and log PATTERN; earlier
+# releases refuse to start. Sets NEWER_SCHEMA_OUTCOME to "started" (the server
+# is left running) or "refused".
+# Usage: start_on_newer_schema BIN DB_URL LOG PATTERN [extra args]
+start_on_newer_schema() {
+  local bin=$1 db_url=$2 logfile=$3 pattern=$4
+  shift 4
+  start_server "$bin" "$db_url" "$logfile" "$@"
+  local pid=$SERVER_PID
+  for _ in $(seq 1 120); do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      local code=0
+      wait "$pid" || code=$?
+      SERVER_PID=""
+      [ "$code" -ne 0 ] || fail "$bin exited 0 on a newer schema without serving (see $logfile)"
+      NEWER_SCHEMA_OUTCOME=refused
+      return 0
+    fi
+    if curl -fsS -o /dev/null -m 3 "http://127.0.0.1:${CONSOLE_PORT}/readyz" 2>/dev/null; then
+      grep -q "$pattern" "$logfile" ||
+        fail "$bin started on a newer schema without warning about it ('$pattern' not found in $logfile)"
+      NEWER_SCHEMA_OUTCOME=started
+      return 0
+    fi
+    sleep 2
+  done
+  fail "$bin neither became ready nor exited within 240s on a newer schema (see $logfile)"
 }
 
 api() {
@@ -399,25 +432,32 @@ fi
 stop_server
 
 # ---------------------------------------------------------------------------
-log "4. Schema guard refuses a database migrated by a newer release"
+log "4. Schema guard warns about a database migrated by a newer release and starts"
 FUTURE_MIGRATION="m29991231_000001_upgrade_test_future_release"
 psql_db "$DB_NAME" -c "INSERT INTO seaql_migrations (version, applied_at) VALUES ('$FUTURE_MIGRATION', 0)"
-LEDGER_BEFORE=$(psql_db "$DB_NAME" -tA -c "SELECT count(*) FROM seaql_migrations")
-expect_start_refused "$NEW_BIN" "$DATABASE_URL" "$LOG_DIR/4-new-guard.log" \
+LEDGER_BEFORE=$(psql_db "$DB_NAME" -tA -c "SELECT string_agg(version, ',' ORDER BY version) FROM seaql_migrations")
+start_on_newer_schema "$NEW_BIN" "$DATABASE_URL" "$LOG_DIR/4-new-guard.log" \
   "newer than this Temps binary" --pre-migration-backup
-grep -q "$FUTURE_MIGRATION" "$LOG_DIR/4-new-guard.log" || fail "the guard error does not name the unknown migration"
-LEDGER_AFTER=$(psql_db "$DB_NAME" -tA -c "SELECT count(*) FROM seaql_migrations")
-[ "$LEDGER_BEFORE" = "$LEDGER_AFTER" ] || fail "the refused start changed the migration ledger"
-[ "$(count_backups)" = "$EXPECTED_BACKUPS" ] || fail "the refused start took a backup"
+[ "$NEWER_SCHEMA_OUTCOME" = started ] ||
+  fail "the candidate refused a database migrated by a newer release (see $LOG_DIR/4-new-guard.log)"
+grep -q "$FUTURE_MIGRATION" "$LOG_DIR/4-new-guard.log" || fail "the guard warning does not name the unknown migration"
+verify_data "candidate, on a newer schema"
+stop_server
+LEDGER_AFTER=$(psql_db "$DB_NAME" -tA -c "SELECT string_agg(version, ',' ORDER BY version) FROM seaql_migrations")
+[ "$LEDGER_BEFORE" = "$LEDGER_AFTER" ] || fail "starting on a newer schema changed the migration ledger"
+[ "$(count_backups)" = "$EXPECTED_BACKUPS" ] || fail "starting on a newer schema took a backup"
 psql_db "$DB_NAME" -c "DELETE FROM seaql_migrations WHERE version = '$FUTURE_MIGRATION'"
 
 # ---------------------------------------------------------------------------
 if [ "$HAS_PENDING" = 1 ]; then
-log "5. The previous release refuses the upgraded database"
-LEDGER_BEFORE=$(psql_db "$DB_NAME" -tA -c "SELECT count(*) FROM seaql_migrations")
-expect_start_refused "$OLD_BIN" "$DATABASE_URL" "$LOG_DIR/5-old-on-upgraded.log"
-LEDGER_AFTER=$(psql_db "$DB_NAME" -tA -c "SELECT count(*) FROM seaql_migrations")
-[ "$LEDGER_BEFORE" = "$LEDGER_AFTER" ] || fail "refused old release changed the migration ledger"
+log "5. The previous release warns about (or refuses) the upgraded database"
+LEDGER_BEFORE=$(psql_db "$DB_NAME" -tA -c "SELECT string_agg(version, ',' ORDER BY version) FROM seaql_migrations")
+start_on_newer_schema "$OLD_BIN" "$DATABASE_URL" "$LOG_DIR/5-old-on-upgraded.log" \
+  "newer than this Temps binary"
+echo "previous release on the upgraded database: $NEWER_SCHEMA_OUTCOME"
+if [ "$NEWER_SCHEMA_OUTCOME" = started ]; then stop_server; fi
+LEDGER_AFTER=$(psql_db "$DB_NAME" -tA -c "SELECT string_agg(version, ',' ORDER BY version) FROM seaql_migrations")
+[ "$LEDGER_BEFORE" = "$LEDGER_AFTER" ] || fail "the previous release changed the upgraded database's migration ledger"
 else
   log "5. The previous release remains compatible when no migrations changed"
   start_server "$OLD_BIN" "$DATABASE_URL" "$LOG_DIR/5-old-compatible.log"

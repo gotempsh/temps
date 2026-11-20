@@ -66,6 +66,60 @@ pub(crate) fn normalize_user_email(email: &str) -> Option<String> {
     Some(normalized)
 }
 
+/// Result of [`clear_mfa_enrollment`].
+#[derive(Debug, Clone)]
+pub struct ClearedMfaEnrollment {
+    /// The user row as it stands after the reset.
+    pub user: temps_entities::users::Model,
+    /// Number of sessions (signed-in, pending sign-in challenges and
+    /// step-up grants) that were revoked.
+    pub sessions_revoked: u64,
+}
+
+/// Remove a user's second factor entirely so they can sign in with their
+/// password alone and enroll again.
+///
+/// Clears the TOTP secret (including one from an unfinished enrollment), the
+/// recovery codes and `mfa_enabled`, drops the user's second-factor guard
+/// state (replay watermark, failure counter and any lockout, all of which
+/// describe the removed factor), and deletes every session of the user:
+/// signed-in sessions, sign-in challenges still waiting for a code, and with
+/// them any step-up grant.
+///
+/// This is the recovery path for a user who lost both their authenticator
+/// and their recovery codes. It deliberately does not take a code: callers
+/// are an administrator acting on another account (`UserService::admin_reset_mfa`)
+/// or an operator with database access (`temps reset-admin-password --clear-mfa`).
+/// The caller must run it inside a transaction holding the `users` row lock
+/// (`SELECT ... FOR UPDATE`), the same lock every second-factor check takes.
+pub async fn clear_mfa_enrollment<C: sea_orm::ConnectionTrait>(
+    conn: &C,
+    user: temps_entities::users::Model,
+) -> Result<ClearedMfaEnrollment, sea_orm::DbErr> {
+    let user_id = user.id;
+    let mut user_update: temps_entities::users::ActiveModel = user.into();
+    user_update.mfa_secret = Set(None);
+    user_update.mfa_enabled = Set(false);
+    user_update.mfa_recovery_codes = Set(None);
+    user_update.updated_at = Set(Utc::now());
+    let user = user_update.update(conn).await?;
+
+    temps_entities::user_mfa_guards::Entity::delete_many()
+        .filter(temps_entities::user_mfa_guards::Column::UserId.eq(user_id))
+        .exec(conn)
+        .await?;
+
+    let sessions = temps_entities::sessions::Entity::delete_many()
+        .filter(temps_entities::sessions::Column::UserId.eq(user_id))
+        .exec(conn)
+        .await?;
+
+    Ok(ClearedMfaEnrollment {
+        user,
+        sessions_revoked: sessions.rows_affected,
+    })
+}
+
 // First add the custom error type at the top of the file
 #[derive(Error, Debug)]
 pub enum UserServiceError {
@@ -108,6 +162,9 @@ pub enum UserServiceError {
     #[error("Validation error: {0}")]
     Validation(String),
 
+    #[error("A user with email {email} already exists")]
+    EmailTaken { email: String },
+
     #[error("Encryption error: {0}")]
     Encryption(String),
 
@@ -126,6 +183,29 @@ pub enum UserServiceError {
     #[error("Cannot reset the password of deleted user {user_id}")]
     PasswordResetOnDeletedUser { user_id: i32 },
 
+    #[error("Cannot reset the MFA of deleted user {user_id}")]
+    MfaResetOnDeletedUser { user_id: i32 },
+
+    #[error("User {user_id} has no MFA enrolled, so there is nothing to reset")]
+    MfaNotEnrolled { user_id: i32 },
+
+    #[error(
+        "Second-factor verification for user {user_id} is locked for {retry_after_seconds}s after repeated failures"
+    )]
+    MfaLocked {
+        user_id: i32,
+        retry_after_seconds: i64,
+    },
+
+    #[error(
+        "Failed to revoke the ingress login grants of user {user_id} while {operation}: {reason}"
+    )]
+    IngressGrantRevocation {
+        user_id: i32,
+        operation: &'static str,
+        reason: String,
+    },
+
     #[error("Internal error: {0}")]
     Internal(String),
 }
@@ -141,6 +221,54 @@ impl From<sea_orm::DbErr> for UserServiceError {
             },
         }
     }
+}
+
+impl From<crate::mfa_guard::MfaGuardError> for UserServiceError {
+    fn from(error: crate::mfa_guard::MfaGuardError) -> Self {
+        match error {
+            crate::mfa_guard::MfaGuardError::Database { .. } => UserServiceError::Database {
+                reason: error.to_string(),
+            },
+            crate::mfa_guard::MfaGuardError::InvalidSecret { .. }
+            | crate::mfa_guard::MfaGuardError::InvalidRecoveryCodes { .. } => {
+                UserServiceError::Mfa(error.to_string())
+            }
+            crate::mfa_guard::MfaGuardError::VerifierUnavailable { .. }
+            | crate::mfa_guard::MfaGuardError::SecretEncryption { .. } => {
+                UserServiceError::Internal(error.to_string())
+            }
+        }
+    }
+}
+
+/// The role a browser session for `user_id` is granted right now: `Admin`
+/// while the user holds the `admin` role, `User` otherwise.
+///
+/// This is the single definition of "what the owner currently holds". The
+/// session middleware uses it on every request, and API-key validation uses
+/// it as the ceiling a key's stored scope is intersected with, so a key can
+/// never grant more than a fresh sign-in by its owner would. Read from the
+/// database on every call; nothing caches it, so a role removal takes effect
+/// on the very next request.
+pub(crate) async fn current_session_role<C: sea_orm::ConnectionTrait>(
+    conn: &C,
+    user_id: i32,
+) -> Result<crate::permissions::Role, sea_orm::DbErr> {
+    use sea_orm::{JoinType, PaginatorTrait, RelationTrait};
+    let admin_grants = temps_entities::user_roles::Entity::find()
+        .join(
+            JoinType::InnerJoin,
+            temps_entities::user_roles::Relation::Role.def(),
+        )
+        .filter(temps_entities::user_roles::Column::UserId.eq(user_id))
+        .filter(temps_entities::roles::Column::Name.eq(RoleType::Admin.as_str()))
+        .count(conn)
+        .await?;
+    Ok(if admin_grants > 0 {
+        crate::permissions::Role::Admin
+    } else {
+        crate::permissions::Role::User
+    })
 }
 
 // Add a new struct for MFA setup data
@@ -200,16 +328,15 @@ fn generate_mfa_setup_candidate(email: &str) -> Result<MfaSetupCandidate, UserSe
 
     let secret: Vec<u8> = (0..20).map(|_| rand::rng().random::<u8>()).collect();
     let secret_key = base32::encode(base32::Alphabet::Rfc4648 { padding: true }, &secret);
-    let recovery_codes: Vec<String> = (0..8)
-        .map(|_| {
-            (0..6)
-                .map(|_| rand::rng().random_range(0..10).to_string())
-                .collect()
-        })
-        .collect();
+    // Each code is shown grouped (`XXXXX-XXXXX`) but hashed in canonical
+    // form, which is what `mfa_guard::normalize_recovery_code` reduces the
+    // typed code to before comparing.
+    let (recovery_codes, canonical_codes): (Vec<String>, Vec<String>) = (0..8)
+        .map(|_| crate::mfa_guard::generate_recovery_code())
+        .unzip();
 
     let argon2 = Argon2::default();
-    let hashed_recovery_codes = recovery_codes
+    let hashed_recovery_codes = canonical_codes
         .iter()
         .map(|code| {
             argon2
@@ -319,6 +446,7 @@ impl From<temps_entities::roles::Model> for ServiceRole {
 
 pub struct UserService {
     db: Arc<DatabaseConnection>,
+    encryption_service: Arc<temps_core::EncryptionService>,
     mfa_setup_global: Arc<Semaphore>,
     mfa_setup_users: Arc<Mutex<HashMap<i32, Arc<Mutex<()>>>>>,
 }
@@ -344,10 +472,52 @@ where
     Ok((permit, result?))
 }
 
+/// What [`revoke_sessions_except`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RevokedAccess {
+    /// Console sessions (full or pending) deleted.
+    pub sessions: u64,
+    /// Temps-login ingress grants revoked.
+    pub ingress_grants: u64,
+}
+
+/// Delete every session (full or pending) for `user_id` except `keep`, and
+/// revoke every live Temps-login ingress grant the user holds.
+///
+/// The grants go too because each was minted from one of those console
+/// sessions and is honoured by the proxy for hours without consulting the
+/// session again: a sweep that left them in place would let a session it
+/// just ended keep opening protected environments. A grant records no link
+/// to the session that minted it, so the one belonging to `keep` cannot be
+/// spared; that browser signs in to the environment again through the same
+/// redirect. Run it inside the caller's transaction so the sweep and the
+/// change that warranted it commit together.
+pub(crate) async fn revoke_sessions_except<C: sea_orm::ConnectionTrait>(
+    conn: &C,
+    user_id: i32,
+    keep: Option<i32>,
+) -> Result<RevokedAccess, sea_orm::DbErr> {
+    let mut query = temps_entities::sessions::Entity::delete_many()
+        .filter(temps_entities::sessions::Column::UserId.eq(user_id));
+    if let Some(keep) = keep {
+        query = query.filter(temps_entities::sessions::Column::Id.ne(keep));
+    }
+    let sessions = query.exec(conn).await?.rows_affected;
+    let ingress_grants = crate::ingress_grants::revoke_for_user(conn, user_id).await?;
+    Ok(RevokedAccess {
+        sessions,
+        ingress_grants,
+    })
+}
+
 impl UserService {
-    pub fn new(db: Arc<DatabaseConnection>) -> Self {
+    pub fn new(
+        db: Arc<DatabaseConnection>,
+        encryption_service: Arc<temps_core::EncryptionService>,
+    ) -> Self {
         Self {
             db,
+            encryption_service,
             mfa_setup_global: Arc::new(Semaphore::new(MAX_CONCURRENT_MFA_SETUPS)),
             mfa_setup_users: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -447,6 +617,14 @@ impl UserService {
 
     pub async fn is_admin(&self, user_id: i32) -> Result<bool, UserServiceError> {
         self.has_role(user_id, RoleType::Admin).await
+    }
+
+    /// See [`current_session_role`].
+    pub async fn current_session_role(
+        &self,
+        user_id: i32,
+    ) -> Result<crate::permissions::Role, UserServiceError> {
+        Ok(current_session_role(self.db.as_ref(), user_id).await?)
     }
 
     pub async fn get_user_with_roles(
@@ -733,7 +911,10 @@ impl UserService {
             ..Default::default()
         };
 
-        let user = new_user.insert(&transaction).await?;
+        let user = new_user
+            .insert(&transaction)
+            .await
+            .map_err(|error| email_taken_or(error, &email))?;
 
         // Build the response from the records already resolved inside this
         // transaction. Once commit succeeds there must be no fallible read
@@ -789,11 +970,23 @@ impl UserService {
         user_update.deleted_at = Set(Some(now));
         user_update.email = Set(deleted_email);
 
-        let deleted_user = user_update.update(self.db.as_ref()).await?;
+        // The soft delete and the revocation of the user's Temps-login
+        // ingress grants commit together: a deleted user must not keep
+        // opening protected environments on a cookie minted earlier.
+        let transaction = self.db.begin().await?;
+        let deleted_user = user_update.update(&transaction).await?;
+        let revoked = crate::ingress_grants::revoke_for_user(&transaction, user_id)
+            .await
+            .map_err(|e| UserServiceError::IngressGrantRevocation {
+                user_id,
+                operation: "deleting the user",
+                reason: e.to_string(),
+            })?;
+        transaction.commit().await?;
 
         info!(
-            "Soft deleted user with id: {}, email changed to prevent duplicates",
-            user_id
+            "Soft deleted user with id: {}, email changed to prevent duplicates; revoked {} ingress login grant(s)",
+            user_id, revoked
         );
         Ok(deleted_user)
     }
@@ -812,11 +1005,14 @@ impl UserService {
                 UserServiceError::RoleNotFound(format!("Role {} not found", role_type.as_str()))
             })?;
 
-        // Delete the user_role entry
+        // Delete the user_role entry. Losing a role can take away the
+        // permission a Temps-login ingress grant was minted on, so the
+        // user's grants are revoked in the same transaction.
+        let transaction = self.db.begin().await?;
         let delete_result = temps_entities::user_roles::Entity::delete_many()
             .filter(temps_entities::user_roles::Column::UserId.eq(user_id_val))
             .filter(temps_entities::user_roles::Column::RoleId.eq(role.id))
-            .exec(self.db.as_ref())
+            .exec(&transaction)
             .await?;
 
         if delete_result.rows_affected == 0 {
@@ -827,10 +1023,20 @@ impl UserService {
             )));
         }
 
+        let revoked = crate::ingress_grants::revoke_for_user(&transaction, user_id_val)
+            .await
+            .map_err(|e| UserServiceError::IngressGrantRevocation {
+                user_id: user_id_val,
+                operation: "removing a role",
+                reason: e.to_string(),
+            })?;
+        transaction.commit().await?;
+
         info!(
-            "Removed role {} from user {}",
+            "Removed role {} from user {}; revoked {} ingress login grant(s)",
             role_type.as_str(),
-            user_id_val
+            user_id_val,
+            revoked
         );
         Ok(())
     }
@@ -915,14 +1121,62 @@ impl UserService {
             .filter(temps_entities::sessions::Column::UserId.eq(user_id))
             .exec(&transaction)
             .await?;
+        // Ingress login grants are minted from those sessions; a reset that
+        // assumes the old credentials are compromised ends them too.
+        crate::ingress_grants::revoke_for_user(&transaction, user_id)
+            .await
+            .map_err(|e| UserServiceError::IngressGrantRevocation {
+                user_id,
+                operation: "resetting the password",
+                reason: e.to_string(),
+            })?;
 
         transaction.commit().await?;
 
         info!(
-            "Temporary password issued for user {}; existing sessions revoked",
+            "Temporary password issued for user {}; existing sessions and ingress login grants revoked",
             user_id
         );
         Ok((updated_user, temporary_password))
+    }
+
+    /// Remove another user's second factor (admin recovery for a user who
+    /// lost both their authenticator and their recovery codes).
+    ///
+    /// See [`clear_mfa_enrollment`] for exactly what is cleared. Every session
+    /// of the user is revoked, so nothing signed in or half-way through a
+    /// sign-in challenge under the old factor keeps working. The password is
+    /// left alone: the user signs in with it and can enroll again.
+    ///
+    /// Refuses a deleted user (restore them first) and a user with no
+    /// factor at all, so an administrator who picked the wrong account is
+    /// told so instead of silently signing that user out everywhere.
+    pub async fn admin_reset_mfa(
+        &self,
+        user_id: i32,
+    ) -> Result<ClearedMfaEnrollment, UserServiceError> {
+        let transaction = self.db.begin().await?;
+        let user = temps_entities::users::Entity::find_by_id(user_id)
+            .lock_exclusive()
+            .one(&transaction)
+            .await?
+            .ok_or_else(|| UserServiceError::NotFound(format!("User {} not found", user_id)))?;
+
+        if user.deleted_at.is_some() {
+            return Err(UserServiceError::MfaResetOnDeletedUser { user_id });
+        }
+        if !user.mfa_enabled {
+            return Err(UserServiceError::MfaNotEnrolled { user_id });
+        }
+
+        let cleared = clear_mfa_enrollment(&transaction, user).await?;
+        transaction.commit().await?;
+
+        info!(
+            "MFA removed from user {}; {} session(s) revoked",
+            user_id, cleared.sessions_revoked
+        );
+        Ok(cleared)
     }
 
     pub async fn restore_user(&self, user_id: i32) -> Result<UserWithRoles, UserServiceError> {
@@ -1023,14 +1277,24 @@ impl UserService {
             return Err(UserServiceError::MfaAlreadyEnabled(user_id));
         }
 
+        // Only the encrypted seed is persisted; the plaintext goes back to the
+        // caller once, for the authenticator QR code / manual entry.
+        let sealed_secret = crate::mfa_guard::seal_mfa_secret(
+            &self.encryption_service,
+            user_id,
+            &candidate.secret_key,
+        )?;
         let mut user_update: temps_entities::users::ActiveModel = user.into();
-        user_update.mfa_secret = Set(Some(candidate.secret_key.clone()));
+        user_update.mfa_secret = Set(Some(sealed_secret));
         user_update.mfa_enabled = Set(false);
         user_update.mfa_recovery_codes = Set(Some(
             serde_json::to_string(&candidate.hashed_recovery_codes)
                 .map_err(UserServiceError::Serialization)?,
         ));
         user_update.update(&transaction).await?;
+        // The accepted-step watermark belongs to the secret being replaced;
+        // carried over, it would reject the new authenticator's first codes.
+        crate::mfa_guard::forget_totp_step(&transaction, user_id).await?;
         transaction.commit().await?;
 
         Ok(MfaSetupData {
@@ -1040,46 +1304,81 @@ impl UserService {
         })
     }
 
+    /// Confirm a pending enrolment with a TOTP code and turn MFA on.
+    ///
+    /// Every other session for the user is revoked in the same transaction:
+    /// a session established before the second factor existed must not keep
+    /// working as if it had passed it. `current_session_id` (the caller's
+    /// own session) is kept so the enrolling tab stays signed in; `None`
+    /// revokes everything.
+    ///
+    /// The confirming code is subject to the same single-use rule as every
+    /// other TOTP check. Wrong codes here are not counted towards the
+    /// per-user lockout: the caller is choosing their own secret, so there is
+    /// nothing to brute-force, and counting would only let a typo lock the
+    /// user out of the factor they are setting up. That exemption only holds
+    /// while the secret is still pending, so an account whose factor is
+    /// already enabled is refused here: its codes go through the counted,
+    /// lockout-aware paths instead.
     pub async fn verify_and_enable_mfa(
         &self,
         user_id: i32,
         code: &str,
+        current_session_id: Option<i32>,
     ) -> Result<(), UserServiceError> {
+        let transaction = self.db.begin().await?;
         let user = temps_entities::users::Entity::find_by_id(user_id)
-            .one(self.db.as_ref())
+            .filter(temps_entities::users::Column::DeletedAt.is_null())
+            .lock_exclusive()
+            .one(&transaction)
             .await?
             .ok_or_else(|| UserServiceError::NotFound(format!("User {} not found", user_id)))?;
 
-        let secret = user
-            .mfa_secret
-            .clone()
-            .ok_or(UserServiceError::MfaNotSetup(user_id))?;
-
-        // Verify TOTP code. In totp-rs 6.0.0: Secret is a struct (From<Vec<u8>>),
-        // Builder replaces TOTP::new, and check_current returns Option<u64> not
-        // Result<bool, _>. The enrolled params (SHA1 / 6 digits / skew 1 / 30s) must
-        // match what generate_mfa_setup_candidate used.
-        let decoded = base32::decode(base32::Alphabet::Rfc4648 { padding: true }, &secret)
-            .ok_or_else(|| UserServiceError::Mfa("Invalid MFA secret encoding".to_string()))?;
-        let totp = Builder::new()
-            .with_algorithm(Algorithm::SHA1)
-            .with_digits(6)
-            .with_skew(1)
-            .with_step_duration(30)
-            .with_secret(decoded)
-            .build()
-            .map_err(|e| UserServiceError::Mfa(format!("Failed to create TOTP: {}", e)))?;
-
-        if totp.check_current(code).is_some() {
-            // Enable MFA
-            let mut user_update: temps_entities::users::ActiveModel = user.into();
-            user_update.mfa_enabled = Set(true);
-            user_update.update(self.db.as_ref()).await?;
-
-            Ok(())
-        } else {
-            Err(UserServiceError::InvalidMfaCode)
+        if user.mfa_enabled {
+            return Err(UserServiceError::MfaAlreadyEnabled(user_id));
         }
+        if user.mfa_secret.is_none() {
+            return Err(UserServiceError::MfaNotSetup(user_id));
+        }
+
+        let now = Utc::now();
+        let guard = crate::mfa_guard::load_guard(&transaction, user_id).await?;
+        let Some(factor) = crate::mfa_guard::check_factor(
+            &self.encryption_service,
+            &user,
+            guard.last_totp_step,
+            code,
+            false,
+            now,
+        )
+        .await?
+        else {
+            return Err(UserServiceError::InvalidMfaCode);
+        };
+        let user = crate::mfa_guard::record_success(
+            &transaction,
+            &self.encryption_service,
+            user,
+            &guard,
+            &factor,
+            now,
+        )
+        .await?;
+
+        let mut user_update: temps_entities::users::ActiveModel = user.into();
+        user_update.mfa_enabled = Set(true);
+        user_update.update(&transaction).await?;
+
+        let revoked = revoke_sessions_except(&transaction, user_id, current_session_id).await?;
+        transaction.commit().await?;
+
+        info!(
+            user_id,
+            revoked_sessions = revoked.sessions,
+            revoked_ingress_grants = revoked.ingress_grants,
+            "MFA enabled; other sessions and ingress login grants revoked"
+        );
+        Ok(())
     }
 
     pub async fn verify_mfa_code(
@@ -1098,14 +1397,22 @@ impl UserService {
     /// Verify MFA while keeping the user row locked in the caller's
     /// transaction. Step-up authorization uses this to make recovery-code
     /// consumption and session elevation one atomic state transition.
+    ///
+    /// Accepts a TOTP code whose step is newer than any accepted before, or
+    /// an unused recovery code (consumed here). Returns `Ok(false)` for a
+    /// wrong code **after recording the failure in `transaction`**: callers
+    /// must commit on `Ok(false)` too, or the failure is rolled back and the
+    /// per-user throttle never engages. Returns
+    /// [`UserServiceError::MfaLocked`] without evaluating the code while the
+    /// user is locked out.
     pub(crate) async fn verify_mfa_code_in_transaction(
         &self,
         transaction: &DatabaseTransaction,
         user_id: i32,
         code: &str,
     ) -> Result<bool, UserServiceError> {
-        // Recovery codes are single-use credentials, so checking and
-        // consuming one must remain under this exclusive row lock.
+        // Every check-and-write below (TOTP step, recovery-code burn,
+        // failure counter) relies on this exclusive row lock.
         let user = temps_entities::users::Entity::find_by_id(user_id)
             .filter(temps_entities::users::Column::DeletedAt.is_null())
             .lock_exclusive()
@@ -1113,69 +1420,46 @@ impl UserService {
             .await?
             .ok_or_else(|| UserServiceError::NotFound(format!("User {} not found", user_id)))?;
 
-        if !user.mfa_enabled {
+        if !user.mfa_enabled || user.mfa_secret.is_none() {
             return Err(UserServiceError::MfaNotSetup(user_id));
         }
 
-        let secret = user
-            .mfa_secret
-            .clone()
-            .ok_or(UserServiceError::MfaNotSetup(user_id))?;
-
-        // Check if it's a recovery code
-        if let Some(recovery_codes) = user.mfa_recovery_codes.clone() {
-            let hashed_codes: Vec<String> =
-                serde_json::from_str(&recovery_codes).map_err(UserServiceError::Serialization)?;
-
-            // Clone hashed_codes for later use
-            let hashed_codes_clone = hashed_codes.clone();
-
-            // First check if the code matches any recovery code using Argon2id
-            use argon2::{Argon2, PasswordHash, PasswordVerifier};
-
-            let argon2 = Argon2::default();
-            for hashed_code in hashed_codes {
-                let parsed_hash = PasswordHash::new(&hashed_code).map_err(|e| {
-                    UserServiceError::Encryption(format!(
-                        "Failed to parse recovery code hash: {}",
-                        e
-                    ))
-                })?;
-
-                if argon2
-                    .verify_password(code.as_bytes(), &parsed_hash)
-                    .is_ok()
-                {
-                    // Remove used recovery code using the cloned vector
-                    let new_codes: Vec<String> = hashed_codes_clone
-                        .into_iter()
-                        .filter(|c| c != &hashed_code)
-                        .collect();
-
-                    let mut user_update: temps_entities::users::ActiveModel = user.clone().into();
-                    user_update.mfa_recovery_codes = Set(Some(serde_json::to_string(&new_codes)?));
-                    user_update.update(transaction).await?;
-
-                    return Ok(true);
-                }
-            }
+        let now = Utc::now();
+        let guard = crate::mfa_guard::load_guard(transaction, user_id).await?;
+        if let Some(retry_after_seconds) = guard.lockout_remaining_seconds(now) {
+            return Err(UserServiceError::MfaLocked {
+                user_id,
+                retry_after_seconds,
+            });
         }
 
-        // Verify TOTP code. In totp-rs 6.0.0: Secret is a struct (From<Vec<u8>>),
-        // Builder replaces TOTP::new, and check_current returns Option<u64> not
-        // Result<bool, _>. The enrolled params must match generate_mfa_setup_candidate.
-        let decoded = base32::decode(base32::Alphabet::Rfc4648 { padding: true }, &secret)
-            .ok_or_else(|| UserServiceError::Mfa("Invalid MFA secret encoding".to_string()))?;
-        let totp = Builder::new()
-            .with_algorithm(Algorithm::SHA1)
-            .with_digits(6)
-            .with_skew(1)
-            .with_step_duration(30)
-            .with_secret(decoded)
-            .build()
-            .map_err(|e| UserServiceError::Mfa(format!("Failed to create TOTP: {}", e)))?;
-
-        Ok(totp.check_current(code).is_some())
+        match crate::mfa_guard::check_factor(
+            &self.encryption_service,
+            &user,
+            guard.last_totp_step,
+            code,
+            true,
+            now,
+        )
+        .await?
+        {
+            Some(factor) => {
+                crate::mfa_guard::record_success(
+                    transaction,
+                    &self.encryption_service,
+                    user,
+                    &guard,
+                    &factor,
+                    now,
+                )
+                .await?;
+                Ok(true)
+            }
+            None => {
+                crate::mfa_guard::record_failure(transaction, user_id, &guard, now).await?;
+                Ok(false)
+            }
+        }
     }
 
     async fn disable_mfa(&self, user_id: i32) -> Result<(), UserServiceError> {
@@ -1223,9 +1507,45 @@ impl UserService {
     }
 }
 
+/// A duplicate email on insert is the caller's to fix, not a database
+/// failure: `users.email` carries the unique index `idx_users_email_unique`.
+/// Matched by that name so a collision on another unique column keeps its own
+/// error.
+fn email_taken_or(error: sea_orm::DbErr, email: &str) -> UserServiceError {
+    if error.to_string().contains("idx_users_email_unique") {
+        UserServiceError::EmailTaken {
+            email: email.to_string(),
+        }
+    } else {
+        error.into()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_taken_email_is_reported_as_taken_not_as_a_database_error() {
+        let duplicate = sea_orm::DbErr::Custom(
+            "error returned from database: duplicate key value violates unique constraint \"idx_users_email_unique\"".to_string(),
+        );
+        let error = email_taken_or(duplicate, "ops@example.com");
+        assert!(
+            matches!(&error, UserServiceError::EmailTaken { email } if email == "ops@example.com"),
+            "{error:?}"
+        );
+        assert_eq!(
+            error.to_string(),
+            "A user with email ops@example.com already exists"
+        );
+
+        let other = sea_orm::DbErr::Custom("connection reset by peer".to_string());
+        assert!(!matches!(
+            email_taken_or(other, "ops@example.com"),
+            UserServiceError::EmailTaken { .. }
+        ));
+    }
     use argon2::PasswordHasher;
     use sea_orm::{DatabaseBackend, DbErr, MockDatabase, MockExecResult};
 
@@ -1279,9 +1599,10 @@ mod tests {
 
     #[tokio::test]
     async fn create_user_rejects_invalid_identity_before_database_writes() {
-        let service = UserService::new(Arc::new(
-            MockDatabase::new(DatabaseBackend::Postgres).into_connection(),
-        ));
+        let service = UserService::new(
+            Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection()),
+            crate::mfa_guard::test_support::encryption(),
+        );
 
         let blank_name = service
             .create_user(
@@ -1311,9 +1632,10 @@ mod tests {
 
     #[tokio::test]
     async fn create_user_requires_at_least_one_role() {
-        let service = UserService::new(Arc::new(
-            MockDatabase::new(DatabaseBackend::Postgres).into_connection(),
-        ));
+        let service = UserService::new(
+            Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection()),
+            crate::mfa_guard::test_support::encryption(),
+        );
 
         let result = service
             .create_user(
@@ -1330,9 +1652,10 @@ mod tests {
 
     #[tokio::test]
     async fn create_user_rejects_duplicate_roles() {
-        let service = UserService::new(Arc::new(
-            MockDatabase::new(DatabaseBackend::Postgres).into_connection(),
-        ));
+        let service = UserService::new(
+            Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection()),
+            crate::mfa_guard::test_support::encryption(),
+        );
 
         let result = service
             .create_user(
@@ -1354,7 +1677,7 @@ mod tests {
                 .append_query_results([Vec::<temps_entities::roles::Model>::new()])
                 .into_connection(),
         );
-        let service = UserService::new(db.clone());
+        let service = UserService::new(db.clone(), crate::mfa_guard::test_support::encryption());
 
         let result = service
             .create_user(
@@ -1395,7 +1718,7 @@ mod tests {
                 )])
                 .into_connection(),
         );
-        let service = UserService::new(db.clone());
+        let service = UserService::new(db.clone(), crate::mfa_guard::test_support::encryption());
 
         let result = service
             .create_user(
@@ -1442,7 +1765,7 @@ mod tests {
                 }]])
                 .into_connection(),
         );
-        let service = UserService::new(db.clone());
+        let service = UserService::new(db.clone(), crate::mfa_guard::test_support::encryption());
 
         let created = service
             .create_user(
@@ -1483,7 +1806,7 @@ mod tests {
                 .append_query_results([vec![user(false, None)]])
                 .into_connection(),
         );
-        let service = UserService::new(db);
+        let service = UserService::new(db, crate::mfa_guard::test_support::encryption());
 
         let result = service.verify_mfa_code(7, "anything").await;
         assert!(matches!(result, Err(UserServiceError::MfaNotSetup(7))));
@@ -1493,9 +1816,10 @@ mod tests {
     async fn mfa_setup_limits_parallel_work_globally_and_per_user() {
         use std::time::Duration;
 
-        let service = UserService::new(Arc::new(
-            MockDatabase::new(DatabaseBackend::Postgres).into_connection(),
-        ));
+        let service = UserService::new(
+            Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection()),
+            crate::mfa_guard::test_support::encryption(),
+        );
         let first_user = service
             .acquire_mfa_setup_permit(7)
             .await
@@ -1538,9 +1862,10 @@ mod tests {
         use std::sync::mpsc;
         use std::time::Duration;
 
-        let service = Arc::new(UserService::new(Arc::new(
-            MockDatabase::new(DatabaseBackend::Postgres).into_connection(),
-        )));
+        let service = Arc::new(UserService::new(
+            Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection()),
+            crate::mfa_guard::test_support::encryption(),
+        ));
         let first = service
             .acquire_mfa_setup_permit(7)
             .await
@@ -1606,9 +1931,13 @@ mod tests {
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
                 .append_query_results([vec![pending.clone()], vec![pending], vec![updated]])
+                .append_exec_results([sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 0,
+                }])
                 .into_connection(),
         );
-        let service = UserService::new(db.clone());
+        let service = UserService::new(db.clone(), crate::mfa_guard::test_support::encryption());
 
         let setup = service
             .setup_mfa(7, None)
@@ -1617,9 +1946,15 @@ mod tests {
 
         assert_ne!(setup.secret_key, "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP");
         assert_eq!(setup.recovery_codes.len(), 8);
-        assert!(setup.recovery_codes.iter().all(
-            |code| code.len() == 6 && code.chars().all(|character| character.is_ascii_digit())
-        ));
+        // F-012: ten symbols from the unambiguous alphabet, shown grouped.
+        assert!(setup.recovery_codes.iter().all(|code| {
+            let canonical = crate::mfa_guard::normalize_recovery_code(code);
+            code.len() == crate::mfa_guard::RECOVERY_CODE_LENGTH + 1
+                && canonical.len() == crate::mfa_guard::RECOVERY_CODE_LENGTH
+                && canonical
+                    .bytes()
+                    .all(|b| crate::mfa_guard::RECOVERY_CODE_ALPHABET.contains(&b))
+        }));
         let encoded_png = setup
             .qr_code
             .strip_prefix("data:image/png;base64,")
@@ -1666,9 +2001,15 @@ mod tests {
         assert!(statements
             .iter()
             .any(|statement| statement.sql.contains("FOR UPDATE")));
-        assert!(statements
+        let user_update = statements
             .iter()
-            .any(|statement| statement.sql.starts_with("UPDATE \"users\"")));
+            .find(|statement| statement.sql.starts_with("UPDATE \"users\""))
+            .expect("setup must write the new credential bundle");
+        // F-008: the seed is persisted encrypted, never as the plaintext
+        // value handed back for the QR code.
+        let written = format!("{:?}", user_update.values);
+        assert!(written.contains(crate::mfa_guard::MFA_SECRET_ENCRYPTED_PREFIX));
+        assert!(!written.contains(&setup.secret_key));
     }
 
     #[tokio::test]
@@ -1681,7 +2022,7 @@ mod tests {
                 .append_query_results([vec![pending], vec![enabled]])
                 .into_connection(),
         );
-        let service = UserService::new(db.clone());
+        let service = UserService::new(db.clone(), crate::mfa_guard::test_support::encryption());
 
         let result = service.setup_mfa(7, None).await;
 
@@ -1708,9 +2049,10 @@ mod tests {
 
     #[tokio::test]
     async fn recovery_code_is_consumed_under_an_exclusive_row_lock() {
-        let recovery_code = "RECOVERY-CODE";
+        // Typed with a separator and in lower case; stored in canonical form.
+        let recovery_code = "abcde-fgh23";
         let hash = argon2::Argon2::default()
-            .hash_password(recovery_code.as_bytes())
+            .hash_password(b"ABCDEFGH23")
             .expect("test recovery code hashes")
             .to_string();
         let original = user(
@@ -1720,10 +2062,16 @@ mod tests {
         let consumed = user(true, Some("[]".to_string()));
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
-                .append_query_results([vec![original], vec![consumed]])
+                .append_query_results([vec![original]])
+                .append_query_results([Vec::<temps_entities::user_mfa_guards::Model>::new()])
+                .append_query_results([vec![consumed]])
+                .append_exec_results([sea_orm::MockExecResult {
+                    last_insert_id: 7,
+                    rows_affected: 1,
+                }])
                 .into_connection(),
         );
-        let service = UserService::new(db.clone());
+        let service = UserService::new(db.clone(), crate::mfa_guard::test_support::encryption());
 
         assert!(service
             .verify_mfa_code(7, recovery_code)
@@ -1778,7 +2126,7 @@ mod tests {
                 .append_query_results([vec![deleted]])
                 .into_connection(),
         );
-        let service = UserService::new(db.clone());
+        let service = UserService::new(db.clone(), crate::mfa_guard::test_support::encryption());
 
         let result = service.admin_reset_password(7).await;
         assert!(matches!(
@@ -1810,7 +2158,7 @@ mod tests {
                 }])
                 .into_connection(),
         );
-        let service = UserService::new(db.clone());
+        let service = UserService::new(db.clone(), crate::mfa_guard::test_support::encryption());
 
         service
             .disable_mfa(7)
@@ -1829,5 +2177,260 @@ mod tests {
             statement.sql.starts_with("UPDATE \"sessions\"")
                 && statement.sql.contains("step_up_expires_at")
         }));
+    }
+
+    #[tokio::test]
+    async fn enabling_mfa_revokes_every_other_session_and_keeps_the_current_one() {
+        let db = match temps_test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error)
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+            {
+                println!("Docker not available, skipping test: {error}");
+                return;
+            }
+            Err(error) => panic!("test database setup failed: {error}"),
+        };
+        let secret = crate::mfa_guard::test_support::new_secret();
+        let user = temps_entities::users::ActiveModel {
+            email: Set("enable@example.com".to_string()),
+            name: Set("Enable".to_string()),
+            email_verified: Set(true),
+            mfa_enabled: Set(false),
+            mfa_secret: Set(Some(secret.clone())),
+            ..Default::default()
+        }
+        .insert(db.db.as_ref())
+        .await
+        .unwrap();
+        let mut ids = Vec::new();
+        for token in ["enrolling-tab", "other-device"] {
+            let session = temps_entities::sessions::ActiveModel {
+                user_id: Set(user.id),
+                session_token: Set(token.to_string()),
+                expires_at: Set(Utc::now() + chrono::Duration::days(1)),
+                mfa_pending: Set(false),
+                ..Default::default()
+            }
+            .insert(db.db.as_ref())
+            .await
+            .unwrap();
+            ids.push(session.id);
+        }
+        let grant = crate::ingress_grants::test_support::live_grant(&db.db, user.id).await;
+
+        let service = UserService::new(db.db.clone(), crate::mfa_guard::test_support::encryption());
+        let code = crate::mfa_guard::test_support::code_at(&secret, Utc::now());
+        service
+            .verify_and_enable_mfa(user.id, &code, Some(ids[0]))
+            .await
+            .expect("valid enrolment code enables MFA");
+        assert!(
+            crate::ingress_grants::test_support::is_revoked(&db.db, grant).await,
+            "an ingress grant minted before enrolment must not outlive the session sweep"
+        );
+
+        let remaining: Vec<i32> = temps_entities::sessions::Entity::find()
+            .filter(temps_entities::sessions::Column::UserId.eq(user.id))
+            .all(db.db.as_ref())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|session| session.id)
+            .collect();
+        assert_eq!(
+            remaining,
+            vec![ids[0]],
+            "only the enrolling session survives"
+        );
+
+        // The confirming code is now spent: it cannot also pass step-up.
+        let transaction = db.db.begin().await.unwrap();
+        assert!(!service
+            .verify_mfa_code_in_transaction(&transaction, user.id, &code)
+            .await
+            .unwrap());
+    }
+
+    async fn mfa_db() -> Option<temps_test_utils::TestDatabase> {
+        match temps_test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => Some(db),
+            Err(error)
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+            {
+                println!("Docker not available, skipping test: {error}");
+                None
+            }
+            Err(error) => panic!("test database setup failed: {error}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn enrolment_confirmation_refuses_an_already_enabled_factor() {
+        let Some(db) = mfa_db().await else {
+            return;
+        };
+        let secret = crate::mfa_guard::test_support::new_secret();
+        let user = temps_entities::users::ActiveModel {
+            email: Set("enrolled@example.com".to_string()),
+            name: Set("Enrolled".to_string()),
+            email_verified: Set(true),
+            mfa_enabled: Set(true),
+            mfa_secret: Set(Some(secret.clone())),
+            ..Default::default()
+        }
+        .insert(db.db.as_ref())
+        .await
+        .unwrap();
+        let locked_until = Utc::now() + chrono::Duration::minutes(5);
+        temps_entities::user_mfa_guards::ActiveModel {
+            user_id: Set(user.id),
+            last_totp_step: Set(None),
+            failed_attempts: Set(crate::mfa_guard::USER_LOCKOUT_THRESHOLD),
+            locked_until: Set(Some(locked_until)),
+            updated_at: Set(Utc::now()),
+        }
+        .insert(db.db.as_ref())
+        .await
+        .unwrap();
+        let other = temps_entities::sessions::ActiveModel {
+            user_id: Set(user.id),
+            session_token: Set("other-device".to_string()),
+            expires_at: Set(Utc::now() + chrono::Duration::days(1)),
+            mfa_pending: Set(false),
+            ..Default::default()
+        }
+        .insert(db.db.as_ref())
+        .await
+        .unwrap();
+
+        let service = UserService::new(db.db.clone(), crate::mfa_guard::test_support::encryption());
+        let code = crate::mfa_guard::test_support::code_at(&secret, Utc::now());
+        let result = service.verify_and_enable_mfa(user.id, &code, None).await;
+        assert!(
+            matches!(result, Err(UserServiceError::MfaAlreadyEnabled(id)) if id == user.id),
+            "an enabled factor must not be re-confirmed through enrolment: {result:?}"
+        );
+
+        let guard = temps_entities::user_mfa_guards::Entity::find_by_id(user.id)
+            .one(db.db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            guard.failed_attempts,
+            crate::mfa_guard::USER_LOCKOUT_THRESHOLD,
+            "the lockout must not be cleared"
+        );
+        assert!(guard.locked_until.is_some_and(|until| until > Utc::now()));
+        assert_eq!(guard.last_totp_step, None, "the code must not be spent");
+        assert!(temps_entities::sessions::Entity::find_by_id(other.id)
+            .one(db.db.as_ref())
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn re_enrolment_accepts_the_new_secret_right_after_disabling() {
+        let Some(db) = mfa_db().await else {
+            return;
+        };
+        let old_secret = crate::mfa_guard::test_support::new_secret();
+        let user = temps_entities::users::ActiveModel {
+            email: Set("re-enrol@example.com".to_string()),
+            name: Set("Re-enrol".to_string()),
+            email_verified: Set(true),
+            mfa_enabled: Set(true),
+            mfa_secret: Set(Some(old_secret.clone())),
+            ..Default::default()
+        }
+        .insert(db.db.as_ref())
+        .await
+        .unwrap();
+        let service = UserService::new(db.db.clone(), crate::mfa_guard::test_support::encryption());
+
+        // Disabling spends the old authenticator's code one step ahead, the
+        // furthest the skew window accepts.
+        let ahead = crate::mfa_guard::test_support::code_at(
+            &old_secret,
+            Utc::now() + chrono::Duration::seconds(30),
+        );
+        service
+            .verify_and_disable_mfa(user.id, &ahead)
+            .await
+            .expect("disable with a valid code");
+
+        let setup = service
+            .setup_mfa(user.id, None)
+            .await
+            .expect("start a new enrolment");
+        let code = crate::mfa_guard::test_support::code_at(&setup.secret_key, Utc::now());
+        service
+            .verify_and_enable_mfa(user.id, &code, None)
+            .await
+            .expect("the new secret's current code must be accepted");
+    }
+
+    #[tokio::test]
+    async fn legacy_plaintext_mfa_secret_is_encrypted_after_a_successful_verification() {
+        let db = match temps_test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error)
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+            {
+                println!("Docker not available, skipping test: {error}");
+                return;
+            }
+            Err(error) => panic!("test database setup failed: {error}"),
+        };
+        // A row enrolled before at-rest encryption: the bare base32 seed.
+        let secret = crate::mfa_guard::test_support::new_secret();
+        let user = temps_entities::users::ActiveModel {
+            email: Set("legacy-seed@example.com".to_string()),
+            name: Set("Legacy Seed".to_string()),
+            email_verified: Set(true),
+            mfa_enabled: Set(true),
+            mfa_secret: Set(Some(secret.clone())),
+            ..Default::default()
+        }
+        .insert(db.db.as_ref())
+        .await
+        .unwrap();
+        let encryption = crate::mfa_guard::test_support::encryption();
+        let service = UserService::new(db.db.clone(), encryption.clone());
+
+        let now = Utc::now();
+        assert!(service
+            .verify_mfa_code(
+                user.id,
+                &crate::mfa_guard::test_support::code_at(&secret, now)
+            )
+            .await
+            .expect("legacy plaintext seed must keep verifying"));
+
+        let stored = temps_entities::users::Entity::find_by_id(user.id)
+            .one(db.db.as_ref())
+            .await
+            .unwrap()
+            .unwrap()
+            .mfa_secret
+            .expect("seed must still be present");
+        assert!(stored.starts_with(crate::mfa_guard::MFA_SECRET_ENCRYPTED_PREFIX));
+        assert!(!stored.contains(&secret));
+        assert_eq!(
+            crate::mfa_guard::open_mfa_secret(&encryption, user.id, &stored).unwrap(),
+            secret
+        );
+
+        // The authenticator keeps working against the re-encrypted row.
+        let later = now + chrono::Duration::seconds(30);
+        assert!(service
+            .verify_mfa_code(
+                user.id,
+                &crate::mfa_guard::test_support::code_at(&secret, later)
+            )
+            .await
+            .expect("encrypted seed must verify"));
     }
 }

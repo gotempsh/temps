@@ -50,15 +50,48 @@ describe('DataTable', () => {
   })
 
   test('renders complete shared pagination metadata and controls', () => {
-    const markup = renderToStaticMarkup(<DataTable columns={columns} rows={[]}
-      rowKey={(row) => row.name} pagination={{page: 2, pageSize: 10, total: 25,
-        totalPages: 3, onPageChange: () => {}, onPageSizeChange: () => {},
-        pageSizeOptions: [10, 25]}} />)
+    const markup = renderToStaticMarkup(
+      <DataTable
+        columns={columns}
+        rows={[]}
+        rowKey={(row) => row.name}
+        pagination={{
+          page: 2,
+          pageSize: 10,
+          total: 25,
+          totalPages: 3,
+          onPageChange: () => {},
+          onPageSizeChange: () => {},
+          pageSizeOptions: [10, 25],
+        }}
+      />
+    )
     expect(markup).toContain('Showing 11–20 of 25')
     expect(markup).toContain('aria-label="Items per page"')
     expect(markup).toContain('aria-label="Go to last page"')
     expect(markup).toContain('aria-label="Page number"')
   })
+})
+
+test('the table is a query container, so container column classes resolve', () => {
+  const markup = renderToStaticMarkup(
+    <DataTable
+      columns={[
+        ...columns,
+        {
+          key: 'owner',
+          header: 'Owner',
+          className: 'hidden @xl:table-cell',
+          render: () => 'ops',
+        },
+      ]}
+      rows={[{ name: 'nightly' }]}
+      rowKey={(row) => row.name}
+    />
+  )
+  // The container wraps the table itself, so `@xl` measures this table.
+  expect(markup).toMatch(/class="@container [^"]*"><div[^>]*><table/)
+  expect(markup).toContain('hidden @xl:table-cell')
 })
 
 test('custom rows retain expansion rows inside the shared table', () => {

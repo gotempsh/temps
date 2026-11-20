@@ -5,6 +5,7 @@
 name = "temps-analytics-session-replay"
 version.workspace = true
 edition.workspace = true
+description = "Session replay: record, store and play back visitor browser sessions for user interaction analysis"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -13,9 +14,8 @@ homepage.workspace = true
 [dependencies]
 # Core dependencies
 temps-core = { path = "../temps-core" }
-temps-database = { path = "../temps-database" }
 temps-entities = { path = "../temps-entities" }
-temps-auth = { path = "../temps-auth" }
+temps-authz = { path = "../temps-authz" }
 temps-routes = { path = "../temps-routes" }
 # ADR-040 analytics ingest keys. Downward-only: temps-analytics depends on
 # neither temps-routes nor this crate, so there is no cycle.
@@ -23,9 +23,6 @@ temps-analytics = { path = "../temps-analytics" }
 # Web framework
 axum = { workspace = true }
 utoipa = { workspace = true }
-# CORS on the public ingest routes (ADR-040): the browser blocks a
-# cross-origin POST before it leaves the page without it.
-tower-http = { workspace = true }
 
 # Database
 sea-orm = { workspace = true }
@@ -35,7 +32,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 
 # Async
-tokio = { version = "1", features = ["full"] }
+tokio = { workspace = true }
 async-trait = { workspace = true }
 
 # Logging
@@ -54,12 +51,13 @@ chrono = { workspace = true }
 
 # Sharded bounded map for the visitor-creation IP limiter (no shared-lock
 # contention on the ingest hot path). Matches temps-proxy's precedent.
-dashmap = "6"
-
-
+dashmap = { workspace = true }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["full", "test-util"] }
-axum-test = "21.0.0"
+temps-test-utils = { path = "../temps-test-utils" }
+tokio = { workspace = true, features = ["test-util"] }
 # Schema-backed ingest tests (ADR-040 keyed ingest + no-key regression).
-tower = { version = "0.5", features = ["util"] }
+tower = { workspace = true }
+
+[lints]
+workspace = true

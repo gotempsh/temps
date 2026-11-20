@@ -5,9 +5,13 @@ use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection,
     EntityTrait, QueryFilter, QuerySelect, Set, TransactionError, TransactionTrait,
 };
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use temps_config::{
+    domain_ownership::{generated_address_conflicts, GeneratedAddress},
+    AppSettings,
+};
 use temps_core::url_validation;
-use temps_core::AppSettings;
 use temps_entities::{
     domain_delivery_bindings, domains, environments, project_custom_domains, settings,
 };
@@ -46,6 +50,8 @@ pub enum CustomDomainError {
         hostname: String,
         binding_id: i32,
     },
+    #[error("Invalid redirect status code {code}: expected 301, 302, 303, 307 or 308")]
+    InvalidRedirectStatusCode { code: i32 },
     #[error("Invalid redirect URL: {0}")]
     InvalidRedirectUrl(String),
     #[error(
@@ -161,6 +167,53 @@ impl CustomDomainService {
         Ok(())
     }
 
+    /// Check the currently stored addresses under the same lock used to publish
+    /// tunnel hosts. Route assembly independently enforces generated precedence.
+    async fn ensure_not_environment_address<C: ConnectionTrait>(
+        conn: &C,
+        domain: &str,
+        preview_domain: &str,
+    ) -> Result<(), CustomDomainError> {
+        let host = domain.trim_end_matches('.').to_ascii_lowercase();
+        let conflicts =
+            generated_address_conflicts(conn, &HashSet::from([host.clone()]), preview_domain)
+                .await?;
+        if let Some(owner) = conflicts.get(&host) {
+            let reason = match owner {
+                GeneratedAddress::Environment => {
+                    "already an environment's address; remove it there first"
+                }
+                GeneratedAddress::Tunnel => "published by a tunnel as an environment's address",
+                GeneratedAddress::Deployment => "already a deployment's address",
+            };
+            return Err(CustomDomainError::DuplicateDomain(format!(
+                "'{domain}' is {reason}"
+            )));
+        }
+        // A stored deployment can be promoted again. Reserve its slug on
+        // assignment, even when its fallback is absent from the current table.
+        let base = temps_core::public_hostname::base_domain(preview_domain);
+        if let Some(slug) = host.strip_suffix(&format!(".{base}")) {
+            if temps_entities::deployments::Entity::find()
+                .select_only()
+                .column(temps_entities::deployments::Column::Id)
+                .filter(sea_orm::sea_query::Expr::cust_with_values(
+                    "LOWER(slug) = $1",
+                    [slug],
+                ))
+                .into_tuple::<i32>()
+                .one(conn)
+                .await?
+                .is_some()
+            {
+                return Err(CustomDomainError::DuplicateDomain(format!(
+                    "'{domain}' is a stored deployment's address"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Rejects an `environment_id` that does not belong to `project_id`.
     ///
     /// The caller is authorized against `project_id`, but `environment_id`
@@ -197,21 +250,35 @@ impl CustomDomainService {
     /// preview-domain apex hijacks the proxy route for the control plane, and
     /// the only way back in is the server's public IP — so the assignment is
     /// refused up front instead of being made and then undone.
-    async fn ensure_domain_not_reserved(&self, domain: &str) -> Result<(), CustomDomainError> {
+    ///
+    /// Exact names inside the preview zone can be assigned. Wildcards there
+    /// would cover generated addresses. Return the zone for the ownership check.
+    async fn ensure_domain_not_reserved(&self, domain: &str) -> Result<String, CustomDomainError> {
         let settings = settings::Entity::find()
             .one(self.db.as_ref())
             .await?
             .map(|s| AppSettings::from_json(s.data))
             .unwrap_or_default();
 
-        if settings.is_reserved_hostname(domain) {
+        if settings.is_reserved_project_domain(domain) {
             return Err(CustomDomainError::InvalidDomain(format!(
-                "'{}' is reserved by Temps itself (console or preview domain) and cannot be assigned to a project",
+                "'{}' is reserved by Temps itself (control-plane hostname, preview apex or preview wildcard) and cannot be assigned to a project",
                 domain
             )));
         }
 
-        Ok(())
+        // A hostname attached to a status page (#1412) is reserved for that
+        // page; the proxy would never route it to the project anyway.
+        if temps_entities::status_page_domains::attached_hostname_conflict(self.db.as_ref(), domain)
+            .await?
+        {
+            return Err(CustomDomainError::DuplicateDomain(format!(
+                "'{}' is attached to a status page; remove it there first",
+                domain
+            )));
+        }
+
+        Ok(settings.preview_domain)
     }
 
     /// Normalizes a redirect URL by adding https:// scheme if missing
@@ -380,12 +447,69 @@ impl CustomDomainService {
         branch: Option<String>,
         service_name: Option<String>,
     ) -> Result<project_custom_domains::Model, CustomDomainError> {
+        self.create_custom_domain_with(
+            project_id,
+            environment_id,
+            domain,
+            redirect_to,
+            status_code,
+            branch,
+            service_name,
+            |_| {},
+        )
+        .await
+    }
+
+    /// [`Self::create_custom_domain`] for a plain domain whose row `shape`
+    /// completes before it is inserted, in the same transaction. A caller
+    /// that attaches an address with its gate already set (ADR 065) then
+    /// never has it served open, not even between two writes.
+    pub async fn create_custom_domain_shaped(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+        domain: String,
+        shape: impl FnOnce(&mut project_custom_domains::ActiveModel) + Send,
+    ) -> Result<project_custom_domains::Model, CustomDomainError> {
+        self.create_custom_domain_with(
+            project_id,
+            environment_id,
+            domain,
+            None,
+            None,
+            None,
+            None,
+            shape,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_custom_domain_with(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+        domain: String,
+        redirect_to: Option<String>,
+        status_code: Option<i32>,
+        branch: Option<String>,
+        service_name: Option<String>,
+        shape: impl FnOnce(&mut project_custom_domains::ActiveModel) + Send,
+    ) -> Result<project_custom_domains::Model, CustomDomainError> {
         info!(
             "Creating custom domain: {} for project: {}",
             domain, project_id
         );
 
+        if let Some(code) = status_code {
+            validate_redirect_status_code(code)?;
+        }
+
         // Must be a hostname at all before anything else looks at it.
+        let domain = domain
+            .strip_suffix('.')
+            .unwrap_or(&domain)
+            .to_ascii_lowercase();
         Self::ensure_domain_is_wellformed(&domain)?;
 
         // The caller is authorized against `project_id`; `environment_id` comes
@@ -393,8 +517,8 @@ impl CustomDomainService {
         self.ensure_environment_in_project(environment_id, project_id)
             .await?;
 
-        // Refuse hostnames the platform serves itself (console, preview apex)
-        self.ensure_domain_not_reserved(&domain).await?;
+        // Protect control-plane hostnames and preview wildcards.
+        let preview_domain = self.ensure_domain_not_reserved(&domain).await?;
 
         // Check if domain already exists
         if let Some(_existing) = project_custom_domains::Entity::find()
@@ -422,7 +546,7 @@ impl CustomDomainService {
             None
         };
 
-        let new_custom_domain = project_custom_domains::ActiveModel {
+        let mut new_custom_domain = project_custom_domains::ActiveModel {
             project_id: Set(project_id),
             environment_id: Set(environment_id),
             domain: Set(domain.clone()),
@@ -435,8 +559,44 @@ impl CustomDomainService {
             service_name: Set(service_name),
             ..Default::default()
         };
+        shape(&mut new_custom_domain);
 
-        let custom_domain = new_custom_domain.insert(self.db.as_ref()).await?;
+        // Claim under the shared hostname lock so a status page cannot attach
+        // the same name between the checks above and this insert (#1412).
+        let txn = self.db.begin().await?;
+        let inserted = async {
+            temps_entities::status_page_domains::lock_hostname_claim(&txn, &domain).await?;
+            if temps_entities::status_page_domains::attached_hostname_conflict(&txn, &domain)
+                .await?
+            {
+                return Err(CustomDomainError::DuplicateDomain(format!(
+                    "'{}' is attached to a status page; remove it there first",
+                    domain
+                )));
+            }
+            // Under the hostname lock tunnel environment hosts are generated
+            // under too, so neither side can claim the name in between.
+            Self::ensure_not_environment_address(&txn, &domain, &preview_domain).await?;
+            // The check before this transaction only catches a sequential
+            // duplicate. Concurrent creates all pass it, so look again now the
+            // lock is held; the unique index backs this up.
+            ensure_hostname_unclaimed(&txn, &domain, None).await?;
+            new_custom_domain
+                .insert(&txn)
+                .await
+                .map_err(|e| duplicate_on_unique_violation(&domain, e))
+        }
+        .await;
+        let custom_domain = match inserted {
+            Ok(custom_domain) => {
+                txn.commit().await?;
+                custom_domain
+            }
+            Err(e) => {
+                let _ = txn.rollback().await;
+                return Err(e);
+            }
+        };
 
         debug!(
             "Custom domain created successfully: {} with ID: {}",
@@ -503,37 +663,93 @@ impl CustomDomainService {
         &self,
         custom_domain: project_custom_domains::Model,
     ) -> Result<CustomDomainEnrichment, CustomDomainError> {
-        let certificate = if let Some(certificate_id) = custom_domain.certificate_id {
-            domains::Entity::find_by_id(certificate_id)
-                .one(self.db.as_ref())
-                .await
-                .map_err(|source| CustomDomainError::EnrichmentDatabase {
-                    operation: "load certificate metadata",
-                    domain_id: custom_domain.id,
-                    certificate_id: custom_domain.certificate_id,
-                    environment_id: custom_domain.environment_id,
-                    source,
-                })?
-        } else {
-            None
-        };
+        let id = custom_domain.id;
+        let mut result = self.domains_with_info(vec![custom_domain]).await?;
+        result.pop().ok_or_else(|| {
+            CustomDomainError::NotFound(format!(
+                "Custom domain {} disappeared during enrichment",
+                id
+            ))
+        })
+    }
 
-        let environment = environments::Entity::find_by_id(custom_domain.environment_id)
+    /// Batch ownership, certificate and environment lookups for a response page.
+    pub async fn domains_with_info(
+        &self,
+        rows: Vec<project_custom_domains::Model>,
+    ) -> Result<Vec<CustomDomainEnrichment>, CustomDomainError> {
+        let Some(first) = rows.first() else {
+            return Ok(Vec::new());
+        };
+        let metadata_error = |operation, source| CustomDomainError::EnrichmentDatabase {
+            operation,
+            domain_id: first.id,
+            environment_id: first.environment_id,
+            certificate_id: first.certificate_id,
+            source,
+        };
+        let settings = settings::Entity::find()
             .one(self.db.as_ref())
             .await
-            .map_err(|source| CustomDomainError::EnrichmentDatabase {
-                operation: "load environment metadata",
-                domain_id: custom_domain.id,
-                certificate_id: custom_domain.certificate_id,
-                environment_id: custom_domain.environment_id,
-                source,
-            })?;
-
-        Ok(CustomDomainEnrichment {
-            custom_domain,
-            certificate,
-            environment,
-        })
+            .map_err(|e| metadata_error("load hostname settings", e))?
+            .map(|s| AppSettings::from_json(s.data))
+            .unwrap_or_default();
+        let hosts = rows
+            .iter()
+            .map(|row| row.domain.trim_end_matches('.').to_ascii_lowercase())
+            .collect();
+        let conflicts =
+            generated_address_conflicts(self.db.as_ref(), &hosts, &settings.preview_domain)
+                .await
+                .map_err(|e| metadata_error("check generated addresses", e))?;
+        let certificates: HashMap<_, _> = domains::Entity::find()
+            .filter(domains::Column::Id.is_in(rows.iter().filter_map(|r| r.certificate_id)))
+            .all(self.db.as_ref())
+            .await
+            .map_err(|e| metadata_error("load certificate metadata", e))?
+            .into_iter()
+            .map(|c| (c.id, c))
+            .collect();
+        let environments: HashMap<_, _> = environments::Entity::find()
+            .filter(environments::Column::Id.is_in(rows.iter().map(|r| r.environment_id)))
+            .all(self.db.as_ref())
+            .await
+            .map_err(|e| metadata_error("load environment metadata", e))?
+            .into_iter()
+            .map(|e| (e.id, e))
+            .collect();
+        let mut enriched = Vec::with_capacity(rows.len());
+        for mut custom_domain in rows {
+            let host = custom_domain
+                .domain
+                .trim_end_matches('.')
+                .to_ascii_lowercase();
+            let reason = if settings.is_reserved_project_domain(&host) {
+                Some("Temps reserves this hostname.")
+            } else {
+                conflicts.get(&host).map(|owner| match owner {
+                    GeneratedAddress::Environment => "An environment owns this hostname.",
+                    GeneratedAddress::Tunnel => {
+                        "A tunnel publishes an environment on this hostname."
+                    }
+                    GeneratedAddress::Deployment => "A deployment owns this hostname.",
+                })
+            };
+            if let Some(reason) = reason {
+                custom_domain.status = "hostname_conflict".into();
+                custom_domain.message = Some(format!(
+                    "Domain not served. {reason} Rename or delete this domain."
+                ));
+            }
+            enriched.push(CustomDomainEnrichment {
+                certificate: custom_domain
+                    .certificate_id
+                    .and_then(|id| certificates.get(&id).cloned()),
+                environment: environments.get(&custom_domain.environment_id).cloned(),
+                custom_domain,
+            });
+        }
+        Ok(enriched)
     }
 
     /// Confirm that both sides of a requested reassignment are in the caller's
@@ -748,13 +964,19 @@ impl CustomDomainService {
 
         let mut active_model: project_custom_domains::ActiveModel = custom_domain.clone().into();
 
+        // Set when the request renames the domain; used by the environment-address
+        // check inside the transaction below.
+        let mut preview_domain = String::new();
+
+        let domain =
+            domain.map(|host| host.strip_suffix('.').unwrap_or(&host).to_ascii_lowercase());
         // Determine the final domain name for validation
         let final_domain = if let Some(ref new_domain) = domain {
             // Must be a hostname at all before anything else looks at it.
             Self::ensure_domain_is_wellformed(new_domain)?;
 
-            // Refuse hostnames the platform serves itself (console, preview apex)
-            self.ensure_domain_not_reserved(new_domain).await?;
+            // Apply the same ownership policy as create.
+            preview_domain = self.ensure_domain_not_reserved(new_domain).await?;
 
             // Check if new domain already exists (for a different record)
             if let Some(existing) = project_custom_domains::Entity::find()
@@ -799,6 +1021,7 @@ impl CustomDomainService {
             if code == 0 {
                 active_model.status_code = Set(None);
             } else {
+                validate_redirect_status_code(code)?;
                 active_model.status_code = Set(Some(code));
             }
         }
@@ -851,6 +1074,37 @@ impl CustomDomainService {
                         });
                     }
 
+                    // A new name is claimed under the hostname lock, as on
+                    // create, so a tunnel environment host or a status page
+                    // cannot take it between this check and the update.
+                    if let Some(new_domain) = requested_domain
+                        .as_deref()
+                        .filter(|new_domain| !new_domain.eq_ignore_ascii_case(&locked.domain))
+                    {
+                        temps_entities::status_page_domains::lock_hostname_claim(
+                            transaction,
+                            new_domain,
+                        )
+                        .await?;
+                        if temps_entities::status_page_domains::attached_hostname_conflict(
+                            transaction,
+                            new_domain,
+                        )
+                        .await?
+                        {
+                            return Err(CustomDomainError::DuplicateDomain(format!(
+                                "'{new_domain}' is attached to a status page; remove it there first"
+                            )));
+                        }
+                        Self::ensure_not_environment_address(
+                            transaction,
+                            new_domain,
+                            &preview_domain,
+                        )
+                        .await?;
+                        ensure_hostname_unclaimed(transaction, new_domain, Some(id)).await?;
+                    }
+
                     let renames = requested_domain
                         .as_deref()
                         .is_some_and(|new_domain| new_domain != locked.domain);
@@ -871,7 +1125,11 @@ impl CustomDomainService {
                         }
                     }
 
-                    Ok(active_model.update(transaction).await?)
+                    let hostname = requested_domain.as_deref().unwrap_or(&locked.domain);
+                    active_model
+                        .update(transaction)
+                        .await
+                        .map_err(|e| duplicate_on_unique_violation(hostname, e))
                 })
             })
             .await
@@ -1020,6 +1278,73 @@ impl CustomDomainService {
     }
 }
 
+/// The redirect codes a custom domain can use. Anything else either isn't a
+/// redirect at all or isn't an HTTP status, and only shows up once a visitor is
+/// served it.
+const REDIRECT_STATUS_CODES: [i32; 5] = [301, 302, 303, 307, 308];
+
+fn validate_redirect_status_code(code: i32) -> Result<(), CustomDomainError> {
+    if REDIRECT_STATUS_CODES.contains(&code) {
+        return Ok(());
+    }
+    Err(CustomDomainError::InvalidRedirectStatusCode { code })
+}
+
+/// Refuses a hostname another row holds. Call it under the hostname lock.
+async fn ensure_hostname_unclaimed<C: ConnectionTrait>(
+    conn: &C,
+    domain: &str,
+    own_id: Option<i32>,
+) -> Result<(), CustomDomainError> {
+    let mut holder = project_custom_domains::Entity::find().filter(
+        sea_orm::sea_query::Expr::cust_with_values("LOWER(RTRIM(domain, '.')) = $1", [domain]),
+    );
+    if let Some(own_id) = own_id {
+        holder = holder.filter(project_custom_domains::Column::Id.ne(own_id));
+    }
+    if holder.one(conn).await?.is_some() {
+        return Err(CustomDomainError::DuplicateDomain(format!(
+            "Domain {domain} already exists"
+        )));
+    }
+    Ok(())
+}
+
+/// Losing the race for the unique index is the same refusal as losing the check.
+fn duplicate_on_unique_violation(domain: &str, error: sea_orm::DbErr) -> CustomDomainError {
+    match error.sql_err() {
+        Some(sea_orm::SqlErr::UniqueConstraintViolation(_)) => {
+            CustomDomainError::DuplicateDomain(format!("Domain {domain} already exists"))
+        }
+        _ => CustomDomainError::Database(error),
+    }
+}
+
+#[cfg(test)]
+mod redirect_status_code_tests {
+    use super::*;
+
+    #[test]
+    fn only_redirect_codes_are_accepted() {
+        for code in REDIRECT_STATUS_CODES {
+            assert!(validate_redirect_status_code(code).is_ok(), "{code}");
+        }
+        for code in [i32::MIN, -1, 0, 200, 300, 304, 404, 1000, i32::MAX] {
+            let error = validate_redirect_status_code(code).unwrap_err();
+            assert!(error.to_string().contains(&code.to_string()), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_database_failure_is_not_reported_as_a_duplicate() {
+        let error = duplicate_on_unique_violation(
+            "app.example.test",
+            sea_orm::DbErr::Custom("connection lost".to_string()),
+        );
+        assert!(matches!(error, CustomDomainError::Database(_)));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1027,13 +1352,11 @@ mod tests {
     use temps_entities::{domains, environments, projects, upstream_config::UpstreamList};
     use temps_presets::PresetType;
 
-    async fn test_database() -> Option<temps_database::test_utils::TestDatabase> {
-        match temps_database::test_utils::TestDatabase::with_migrations().await {
+    async fn test_database() -> Option<temps_test_utils::TestDatabase> {
+        match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(database) => Some(database),
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 println!("Docker not available, skipping");
                 None
@@ -1177,7 +1500,7 @@ mod tests {
     /// a domain of their choosing to another project's environment.
     #[tokio::test]
     async fn create_rejects_an_environment_from_another_project() {
-        let test_db = temps_database::test_utils::TestDatabase::with_migrations()
+        let test_db = temps_test_utils::TestDatabase::with_migrations()
             .await
             .unwrap();
         let service = CustomDomainService::new(test_db.db.clone());
@@ -1233,9 +1556,77 @@ mod tests {
         );
     }
 
+    /// The same, end to end across two projects, on create and on rename.
+    #[tokio::test]
+    async fn another_projects_environment_address_is_refused_as_a_custom_domain() {
+        let Some(test_db) = test_database().await else {
+            return;
+        };
+        let service = CustomDomainService::new(test_db.db.clone());
+        let (_, victim_env) = insert_project_environment(&test_db.db, "Victim Shop").await;
+        let (attacker, attacker_env) =
+            insert_project_environment(&test_db.db, "Attacker Shop").await;
+        temps_entities::environment_domains::ActiveModel {
+            environment_id: Set(victim_env.id),
+            domain: Set("shop-staging.tunnel.example.com".to_string()),
+            created_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(test_db.db.as_ref())
+        .await
+        .unwrap();
+
+        let created = service
+            .create_custom_domain(
+                attacker.id,
+                attacker_env.id,
+                "shop-staging.tunnel.example.com".to_string(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+        assert!(
+            matches!(created, Err(CustomDomainError::DuplicateDomain(_))),
+            "got {created:?}"
+        );
+
+        let own = service
+            .create_custom_domain(
+                attacker.id,
+                attacker_env.id,
+                "attacker.example.org".to_string(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let renamed = service
+            .update_custom_domain(
+                own.id,
+                Some("SHOP-STAGING.tunnel.example.com".to_string()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+        assert!(
+            matches!(renamed, Err(CustomDomainError::DuplicateDomain(_))),
+            "got {renamed:?}"
+        );
+    }
+
     #[tokio::test]
     async fn create_rejects_a_malformed_domain() {
-        let test_db = temps_database::test_utils::TestDatabase::with_migrations()
+        let test_db = temps_test_utils::TestDatabase::with_migrations()
             .await
             .unwrap();
         let service = CustomDomainService::new(test_db.db.clone());
@@ -1261,7 +1652,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_custom_domain() {
-        let test_db = temps_database::test_utils::TestDatabase::with_migrations()
+        let test_db = temps_test_utils::TestDatabase::with_migrations()
             .await
             .unwrap();
         let service = CustomDomainService::new(test_db.db.clone());
@@ -1291,7 +1682,7 @@ mod tests {
     /// back in. Create and update must both refuse it.
     #[tokio::test]
     async fn test_console_domain_is_rejected() {
-        let test_db = temps_database::test_utils::TestDatabase::with_migrations()
+        let test_db = temps_test_utils::TestDatabase::with_migrations()
             .await
             .unwrap();
         let service = CustomDomainService::new(test_db.db.clone());
@@ -1377,8 +1768,163 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn friendly_preview_names_route_until_a_generated_address_claims_them() {
+        let Some(test_db) = test_database().await else {
+            return;
+        };
+        let service = CustomDomainService::new(test_db.db.clone());
+        let (project_id, env_id) = setup_test_data(&test_db.db).await;
+
+        let app_settings = AppSettings {
+            preview_domain: "apps.example.com".to_string(),
+            ..Default::default()
+        };
+        settings::Entity::insert(settings::ActiveModel {
+            id: Set(1),
+            data: Set(app_settings.to_json()),
+            ..sea_orm::ActiveModelBehavior::new()
+        })
+        .on_conflict(
+            sea_orm::sea_query::OnConflict::column(settings::Column::Id)
+                .update_column(settings::Column::Data)
+                .to_owned(),
+        )
+        .exec(test_db.db.as_ref())
+        .await
+        .unwrap();
+
+        for below in [
+            "apps.example.com",
+            "*.sub.apps.example.com",
+            "*.apps.example.com",
+        ] {
+            let result = service
+                .create_custom_domain(
+                    project_id,
+                    env_id,
+                    below.to_string(),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await;
+            assert!(
+                matches!(&result, Err(CustomDomainError::InvalidDomain(msg)) if msg.contains("reserved")),
+                "'{below}' must be refused on create: {result:?}"
+            );
+        }
+
+        let db = test_db.db.as_ref();
+        let connector = temps_entities::ingress_connectors::ActiveModel {
+            name: Set("test-tunnel".into()),
+            provider: Set("cloudflare_tunnel".into()),
+            domain: Set("example.org".into()),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .unwrap();
+        for (stored, connector) in [
+            ("Stored", None),
+            ("Full.Apps.Example.com.", None),
+            ("Environment.Tunnel.Example.org.", Some(connector.id)),
+        ] {
+            temps_entities::environment_domains::ActiveModel {
+                domain: Set(stored.into()),
+                environment_id: Set(env_id),
+                generated_by_connector_id: Set(connector),
+                ..Default::default()
+            }
+            .insert(db)
+            .await
+            .unwrap();
+        }
+        let dep = temps_entities::deployments::ActiveModel {
+            project_id: Set(project_id),
+            environment_id: Set(env_id),
+            slug: Set("current-build".into()),
+            state: Set("completed".into()),
+            metadata: Set(Some(Default::default())),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .unwrap();
+        environments::ActiveModel {
+            id: Set(env_id),
+            current_deployment_id: Set(Some(dep.id)),
+            ..Default::default()
+        }
+        .update(db)
+        .await
+        .unwrap();
+        for host in [
+            "stored.apps.example.com",
+            "FULL.apps.example.com.",
+            "environment.tunnel.example.org",
+            "current-build.apps.example.com",
+        ] {
+            let result = service
+                .create_custom_domain(project_id, env_id, host.into(), None, None, None, None)
+                .await;
+            assert!(
+                matches!(result, Err(CustomDomainError::DuplicateDomain(_))),
+                "{host}: {result:?}"
+            );
+        }
+        // A later generated address takes priority without deleting the row.
+        let created = service
+            .create_custom_domain(
+                project_id,
+                env_id,
+                "Api.Apps.Example.com.".to_string(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.domain, "api.apps.example.com");
+        temps_entities::environment_domains::ActiveModel {
+            domain: Set("API".into()),
+            environment_id: Set(env_id),
+            ..Default::default()
+        }
+        .insert(test_db.db.as_ref())
+        .await
+        .unwrap();
+        let info = service.get_domain_with_info(created.clone()).await.unwrap();
+        assert_eq!(info.custom_domain.status, "hostname_conflict");
+        assert!(info
+            .custom_domain
+            .message
+            .as_deref()
+            .is_some_and(|m| m.contains("Rename or delete")));
+        let result = service
+            .update_custom_domain(
+                created.id,
+                Some("test-project.apps.example.com".to_string()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+        assert!(
+            matches!(result, Err(CustomDomainError::DuplicateDomain(_))),
+            "renaming onto a generated name must be refused: {result:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_create_duplicate_domain_fails() {
-        let test_db = temps_database::test_utils::TestDatabase::with_migrations()
+        let test_db = temps_test_utils::TestDatabase::with_migrations()
             .await
             .unwrap();
         let service = CustomDomainService::new(test_db.db.clone());
@@ -1420,7 +1966,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_custom_domain() {
-        let test_db = temps_database::test_utils::TestDatabase::with_migrations()
+        let test_db = temps_test_utils::TestDatabase::with_migrations()
             .await
             .unwrap();
         let service = CustomDomainService::new(test_db.db.clone());
@@ -1451,7 +1997,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_custom_domain_by_domain() {
-        let test_db = temps_database::test_utils::TestDatabase::with_migrations()
+        let test_db = temps_test_utils::TestDatabase::with_migrations()
             .await
             .unwrap();
         let service = CustomDomainService::new(test_db.db.clone());
@@ -1842,7 +2388,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_custom_domains_for_project() {
-        let test_db = temps_database::test_utils::TestDatabase::with_migrations()
+        let test_db = temps_test_utils::TestDatabase::with_migrations()
             .await
             .unwrap();
         let service = CustomDomainService::new(test_db.db.clone());
@@ -1885,7 +2431,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_custom_domains_for_environment() {
-        let test_db = temps_database::test_utils::TestDatabase::with_migrations()
+        let test_db = temps_test_utils::TestDatabase::with_migrations()
             .await
             .unwrap();
         let service = CustomDomainService::new(test_db.db.clone());
@@ -1915,7 +2461,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_custom_domain() {
-        let test_db = temps_database::test_utils::TestDatabase::with_migrations()
+        let test_db = temps_test_utils::TestDatabase::with_migrations()
             .await
             .unwrap();
         let service = CustomDomainService::new(test_db.db.clone());
@@ -1961,7 +2507,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_domain_to_duplicate_fails() {
-        let test_db = temps_database::test_utils::TestDatabase::with_migrations()
+        let test_db = temps_test_utils::TestDatabase::with_migrations()
             .await
             .unwrap();
         let service = CustomDomainService::new(test_db.db.clone());
@@ -2019,7 +2565,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_custom_domain_status() {
-        let test_db = temps_database::test_utils::TestDatabase::with_migrations()
+        let test_db = temps_test_utils::TestDatabase::with_migrations()
             .await
             .unwrap();
         let service = CustomDomainService::new(test_db.db.clone());
@@ -2056,7 +2602,7 @@ mod tests {
         // Note: This test would require creating a domain in the domains table first
         // which is outside the scope of this service's tests.
         // The link_certificate method is tested via integration tests instead.
-        let test_db = temps_database::test_utils::TestDatabase::with_migrations()
+        let test_db = temps_test_utils::TestDatabase::with_migrations()
             .await
             .unwrap();
         let service = CustomDomainService::new(test_db.db.clone());
@@ -2082,7 +2628,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_delete_custom_domain() {
-        let test_db = temps_database::test_utils::TestDatabase::with_migrations()
+        let test_db = temps_test_utils::TestDatabase::with_migrations()
             .await
             .unwrap();
         let service = CustomDomainService::new(test_db.db.clone());
@@ -2109,7 +2655,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_delete_nonexistent_domain_fails() {
-        let test_db = temps_database::test_utils::TestDatabase::with_migrations()
+        let test_db = temps_test_utils::TestDatabase::with_migrations()
             .await
             .unwrap();
         let service = CustomDomainService::new(test_db.db.clone());
@@ -2127,7 +2673,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_domain_with_valid_redirect() {
-        let test_db = temps_database::test_utils::TestDatabase::with_migrations()
+        let test_db = temps_test_utils::TestDatabase::with_migrations()
             .await
             .unwrap();
         let service = CustomDomainService::new(test_db.db.clone());
@@ -2157,7 +2703,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_domain_with_redirect_without_scheme_normalizes_to_https() {
-        let test_db = temps_database::test_utils::TestDatabase::with_migrations()
+        let test_db = temps_test_utils::TestDatabase::with_migrations()
             .await
             .unwrap();
         let service = CustomDomainService::new(test_db.db.clone());
@@ -2218,7 +2764,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_domain_with_self_redirect_fails() {
-        let test_db = temps_database::test_utils::TestDatabase::with_migrations()
+        let test_db = temps_test_utils::TestDatabase::with_migrations()
             .await
             .unwrap();
         let service = CustomDomainService::new(test_db.db.clone());
@@ -2248,7 +2794,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_domain_with_circular_redirect_fails() {
-        let test_db = temps_database::test_utils::TestDatabase::with_migrations()
+        let test_db = temps_test_utils::TestDatabase::with_migrations()
             .await
             .unwrap();
         let service = CustomDomainService::new(test_db.db.clone());
@@ -2292,7 +2838,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_domain_with_three_hop_circular_redirect_fails() {
-        let test_db = temps_database::test_utils::TestDatabase::with_migrations()
+        let test_db = temps_test_utils::TestDatabase::with_migrations()
             .await
             .unwrap();
         let service = CustomDomainService::new(test_db.db.clone());
@@ -2349,7 +2895,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_domain_with_private_ip_redirect_fails() {
-        let test_db = temps_database::test_utils::TestDatabase::with_migrations()
+        let test_db = temps_test_utils::TestDatabase::with_migrations()
             .await
             .unwrap();
         let service = CustomDomainService::new(test_db.db.clone());
@@ -2379,7 +2925,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_domain_with_localhost_redirect_fails() {
-        let test_db = temps_database::test_utils::TestDatabase::with_migrations()
+        let test_db = temps_test_utils::TestDatabase::with_migrations()
             .await
             .unwrap();
         let service = CustomDomainService::new(test_db.db.clone());
@@ -2409,7 +2955,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_domain_with_cloud_metadata_redirect_fails() {
-        let test_db = temps_database::test_utils::TestDatabase::with_migrations()
+        let test_db = temps_test_utils::TestDatabase::with_migrations()
             .await
             .unwrap();
         let service = CustomDomainService::new(test_db.db.clone());
@@ -2439,7 +2985,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_domain_with_invalid_scheme_redirect_fails() {
-        let test_db = temps_database::test_utils::TestDatabase::with_migrations()
+        let test_db = temps_test_utils::TestDatabase::with_migrations()
             .await
             .unwrap();
         let service = CustomDomainService::new(test_db.db.clone());
@@ -2469,7 +3015,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_domain_redirect_to_circular_fails() {
-        let test_db = temps_database::test_utils::TestDatabase::with_migrations()
+        let test_db = temps_test_utils::TestDatabase::with_migrations()
             .await
             .unwrap();
         let service = CustomDomainService::new(test_db.db.clone());
@@ -2529,7 +3075,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_domain_redirect_to_valid_succeeds() {
-        let test_db = temps_database::test_utils::TestDatabase::with_migrations()
+        let test_db = temps_test_utils::TestDatabase::with_migrations()
             .await
             .unwrap();
         let service = CustomDomainService::new(test_db.db.clone());
@@ -2575,7 +3121,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_redirect_chain_max_depth_prevents_loops() {
-        let test_db = temps_database::test_utils::TestDatabase::with_migrations()
+        let test_db = temps_test_utils::TestDatabase::with_migrations()
             .await
             .unwrap();
         let service = CustomDomainService::new(test_db.db.clone());

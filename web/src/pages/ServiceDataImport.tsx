@@ -84,7 +84,7 @@ export function ServiceDataImport() {
           <Button variant="outline" size="sm" asChild>
             <Link to={`/storage/${serviceId}`} aria-label="Back to the service">
               <ArrowLeft className="h-4 w-4 sm:mr-2" />
-              <span className="hidden sm:inline">Back to service</span>
+              <span className="max-sm:sr-only">Back to service</span>
             </Link>
           </Button>
         }

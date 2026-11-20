@@ -7,6 +7,54 @@ use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
 use temps_core::DBDateTime;
 
+/// Every `crawler_name` a project traffic filter stores on an event it
+/// excludes (as opposed to the bot name a user-agent match stores). Shared
+/// here because both the ingest path that writes these values and every
+/// report that leaves them out depend on this crate.
+pub const TRAFFIC_FILTER_CRAWLER_NAMES: [&str; 6] = [
+    "datacenter",
+    "spam-referrer",
+    "rule:referrer",
+    "rule:ip",
+    "rule:asn",
+    "rule:country",
+];
+
+/// PostgreSQL predicate, true for an event a traffic filter did **not**
+/// exclude. `alias` is the events table alias (`"e"`), or `""` for an
+/// unqualified query; it is a compile-time constant, never user input.
+///
+/// Reports that predate traffic filters and never left bot rows out use
+/// this rather than `is_crawler = false`: events sent without a user agent
+/// (server-side ingestion through the API) are stored as the bot
+/// `unknown`, and must keep counting.
+pub fn not_excluded_by_traffic_filter(alias: &str) -> String {
+    let column = |name: &str| {
+        if alias.is_empty() {
+            name.to_string()
+        } else {
+            format!("{alias}.{name}")
+        }
+    };
+    format!(
+        "NOT ({} AND COALESCE({}, '') IN ({}))",
+        column("is_crawler"),
+        column("crawler_name"),
+        quoted_traffic_filter_names()
+    )
+}
+
+/// [`TRAFFIC_FILTER_CRAWLER_NAMES`] as a SQL list (`'datacenter', ...`), for
+/// both PostgreSQL and ClickHouse. The names are fixed literals without
+/// quotes, so the list needs no escaping.
+pub fn quoted_traffic_filter_names() -> String {
+    TRAFFIC_FILTER_CRAWLER_NAMES
+        .iter()
+        .map(|name| format!("'{name}'"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "events")]
 pub struct Model {
@@ -164,3 +212,29 @@ impl Related<super::ip_geolocations::Entity> for Entity {
 }
 
 impl ActiveModelBehavior for ActiveModel {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_predicate_keeps_bots_and_server_side_events_and_drops_filtered_ones() {
+        assert_eq!(
+            not_excluded_by_traffic_filter("e"),
+            "NOT (e.is_crawler AND COALESCE(e.crawler_name, '') IN ('datacenter', \
+             'spam-referrer', 'rule:referrer', 'rule:ip', 'rule:asn', 'rule:country'))"
+        );
+        assert!(not_excluded_by_traffic_filter("").starts_with("NOT (is_crawler AND"));
+    }
+
+    #[test]
+    fn filter_names_need_no_sql_escaping() {
+        for name in TRAFFIC_FILTER_CRAWLER_NAMES {
+            assert!(
+                name.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == ':' || c == '-'),
+                "{name}"
+            );
+        }
+    }
+}

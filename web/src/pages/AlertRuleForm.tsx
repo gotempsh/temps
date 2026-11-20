@@ -25,6 +25,7 @@ import {
   FormMessage,
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
+import { NumberInput } from '@/components/ui/number-input'
 import {
   Select,
   SelectContent,
@@ -52,11 +53,18 @@ import {
 } from '@/lib/form-draft'
 import { errorRulePrioritySeverity } from '@/lib/notification-severity'
 import { isReturnFromSetup } from '@/lib/safe-return-to'
+import {
+  needsTriggerConfig,
+  refineTriggerConfig,
+  triggerConfigForRequest,
+  triggerConfigFromRule,
+  triggerConfigSchema,
+} from './alert-rule-trigger-config'
 
 const TRIGGER_TYPES = [
   {
     value: 'new_issue',
-    label: 'New Issue',
+    label: 'New issue',
     description:
       'Fires once when a new error group is first created. Does not fire again for subsequent events in the same group.',
   },
@@ -74,19 +82,19 @@ const TRIGGER_TYPES = [
   },
   {
     value: 'new_user',
-    label: 'New User Affected',
+    label: 'New user affected',
     description:
       'Fires when the first event with user context (user ID, email, or visitor ID) is added to an error group.',
   },
   {
     value: 'user_count',
-    label: 'User Count',
+    label: 'User count',
     description:
       'Fires when the number of unique users affected by an error group reaches the configured threshold.',
   },
   {
     value: 'status_change',
-    label: 'Status Change',
+    label: 'Status change',
     description:
       'Fires when an error group status is manually changed (e.g. resolved, assigned, ignored).',
   },
@@ -99,28 +107,22 @@ const PRIORITIES = [
   { value: 'Critical', label: 'Critical' },
 ] as const
 
-const alertRuleSchema = z.object({
-  name: z.string().min(1, 'Name is required'),
-  trigger_type: z.string().min(1, 'Trigger type is required'),
-  trigger_config: z
-    .object({
-      count: z.number().min(1).optional(),
-      window_minutes: z.number().min(1).optional(),
-      threshold: z.number().min(1).optional(),
-    })
-    .optional(),
-  cooldown_minutes: z.number().min(0),
-  notification_priority: z.string(),
-  environment_filter: z.number().nullable().optional(),
-  error_level_filter: z.string().nullable().optional(),
-  enabled: z.boolean(),
-})
+const alertRuleSchema = z
+  .object({
+    name: z.string().min(1, 'Name is required'),
+    trigger_type: z.string().min(1, 'Trigger type is required'),
+    trigger_config: triggerConfigSchema,
+    cooldown_minutes: z
+      .number({ message: 'Cooldown must be a number' })
+      .min(0, 'Cooldown cannot be negative'),
+    notification_priority: z.string(),
+    environment_filter: z.number().nullable().optional(),
+    error_level_filter: z.string().nullable().optional(),
+    enabled: z.boolean(),
+  })
+  .superRefine(refineTriggerConfig)
 
 type AlertRuleFormData = z.infer<typeof alertRuleSchema>
-
-function needsConfig(triggerType: string): boolean {
-  return ['frequency', 'user_count'].includes(triggerType)
-}
 
 interface AlertRuleFormProps {
   projectId: number
@@ -170,19 +172,14 @@ export function AlertRuleForm({ projectId, projectName }: AlertRuleFormProps) {
 
   const defaultValues = useMemo<AlertRuleFormData>(() => {
     if (existingRule) {
-      const config = (existingRule.trigger_config ?? {}) as Record<
-        string,
-        unknown
-      >
       return mergeFormDraft<AlertRuleFormData>(
         {
           name: existingRule.name,
           trigger_type: existingRule.trigger_type,
-          trigger_config: {
-            count: (config.count as number) ?? undefined,
-            window_minutes: (config.window_minutes as number) ?? undefined,
-            threshold: (config.threshold as number) ?? undefined,
-          },
+          trigger_config: triggerConfigFromRule(
+            existingRule.trigger_type,
+            existingRule.trigger_config as Record<string, unknown> | null
+          ),
           cooldown_minutes: existingRule.cooldown_minutes,
           notification_priority: existingRule.notification_priority,
           environment_filter: existingRule.environment_filter ?? null,
@@ -243,13 +240,14 @@ export function AlertRuleForm({ projectId, projectName }: AlertRuleFormProps) {
 
   const isMutating = createMutation.isPending || updateMutation.isPending
 
-  const onSubmit = async (data: AlertRuleFormData) => {
-    const triggerConfig = needsConfig(data.trigger_type)
-      ? data.trigger_config
-      : undefined
+  const onSubmit = (data: AlertRuleFormData) => {
+    const triggerConfig = triggerConfigForRequest(
+      data.trigger_type,
+      data.trigger_config
+    )
 
     if (isEditing) {
-      await updateMutation.mutateAsync({
+      updateMutation.mutate({
         path: { project_id: projectId, rule_id: Number(ruleId) },
         body: {
           name: data.name,
@@ -263,7 +261,7 @@ export function AlertRuleForm({ projectId, projectName }: AlertRuleFormProps) {
         },
       })
     } else {
-      await createMutation.mutateAsync({
+      createMutation.mutate({
         path: { project_id: projectId },
         body: {
           name: data.name,
@@ -327,7 +325,7 @@ export function AlertRuleForm({ projectId, projectName }: AlertRuleFormProps) {
 
       <Card>
         <CardHeader>
-          <CardTitle>Rule Configuration</CardTitle>
+          <CardTitle>Rule configuration</CardTitle>
           <CardDescription>
             Define when and how this alert should fire.
           </CardDescription>
@@ -361,7 +359,7 @@ export function AlertRuleForm({ projectId, projectName }: AlertRuleFormProps) {
                 name="trigger_type"
                 render={({ field }) => (
                   <FormItem>
-                    <FormLabel>Trigger Type</FormLabel>
+                    <FormLabel>Trigger type</FormLabel>
                     <Select onValueChange={field.onChange} value={field.value}>
                       <FormControl>
                         <SelectTrigger>
@@ -387,7 +385,7 @@ export function AlertRuleForm({ projectId, projectName }: AlertRuleFormProps) {
                 )}
               />
 
-              {needsConfig(watchedTriggerType) && (
+              {needsTriggerConfig(watchedTriggerType) && (
                 <div className="space-y-4 rounded-md border p-4">
                   <p className="text-sm font-medium">Trigger Configuration</p>
                   {watchedTriggerType === 'frequency' && (
@@ -397,7 +395,7 @@ export function AlertRuleForm({ projectId, projectName }: AlertRuleFormProps) {
                         name="trigger_config.count"
                         render={({ field }) => (
                           <FormItem>
-                            <FormLabel>Event Count</FormLabel>
+                            <FormLabel>Event count</FormLabel>
                             <FormControl>
                               <Input
                                 type="number"
@@ -451,7 +449,7 @@ export function AlertRuleForm({ projectId, projectName }: AlertRuleFormProps) {
                       name="trigger_config.threshold"
                       render={({ field }) => (
                         <FormItem>
-                          <FormLabel>User Threshold</FormLabel>
+                          <FormLabel>User threshold</FormLabel>
                           <FormControl>
                             <Input
                               type="number"
@@ -514,10 +512,16 @@ export function AlertRuleForm({ projectId, projectName }: AlertRuleFormProps) {
                   <FormItem>
                     <FormLabel>Cooldown (minutes)</FormLabel>
                     <FormControl>
-                      <Input
-                        type="number"
-                        {...field}
-                        onChange={(e) => field.onChange(Number(e.target.value))}
+                      <NumberInput
+                        min={0}
+                        step={1}
+                        name={field.name}
+                        ref={field.ref}
+                        onBlur={field.onBlur}
+                        value={field.value}
+                        onValueChange={(value) =>
+                          field.onChange(value ?? Number.NaN)
+                        }
                       />
                     </FormControl>
                     <FormDescription>
@@ -536,7 +540,7 @@ export function AlertRuleForm({ projectId, projectName }: AlertRuleFormProps) {
                 name="error_level_filter"
                 render={({ field }) => (
                   <FormItem>
-                    <FormLabel>Error Level Filter</FormLabel>
+                    <FormLabel>Error level filter</FormLabel>
                     <Select
                       onValueChange={(v) =>
                         field.onChange(v === 'all' ? null : v)

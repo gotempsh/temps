@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useCallback, useEffect, useMemo } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { useDashboardAnalytics } from '@/hooks/useDashboardAnalytics'
 import { useDashboardHealth } from '@/hooks/useDashboardHealth'
@@ -10,8 +10,9 @@ import { useLatestDeploymentMedia } from '@/hooks/useLatestDeploymentMedia'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { FirstProjectOnboarding } from '@/components/dashboard/FirstProjectOnboarding'
 import { SIMULATE_EMPTY_INSTALL } from '@/lib/devSimulate'
+import { markReadFailureHandled } from '@/lib/route-query-failures'
 import { ProjectCard } from '@/components/dashboard/ProjectCard'
-import { OnboardingNextStepCard } from '@/components/dashboard/OnboardingNextStepCard'
+import { PROJECT_GRID_CLASS } from '@/components/dashboard/project-grid'
 import { WorkerNodeRequiredBanner } from '@/components/nodes/WorkerNodeRequiredBanner'
 import { ProjectCardSkeleton } from '@/components/skeletons/ProjectCardSkeleton'
 import { Button } from '@/components/ui/button'
@@ -23,50 +24,114 @@ import { PageContainer, PageHeader } from '@/components/layout/PageContainer'
 import { getProjectsOptions } from '@/api/client/@tanstack/react-query.gen'
 import { useQuery } from '@tanstack/react-query'
 import { subDays } from 'date-fns'
-import { ArrowRight, RefreshCw } from 'lucide-react'
-import { Link, useSearchParams } from 'react-router'
+import {
+  AlertTriangle,
+  ArrowRight,
+  Boxes,
+  Download,
+  RefreshCw,
+} from 'lucide-react'
+import { Link } from 'react-router'
+import { useComposedSearchParams } from '@temps-sdk/ds'
 import { SourceLogo } from '@/components/imports/SourceLogo'
 import {
   TOP_MIGRATION_SOURCES,
   importHref,
 } from '@/components/imports/migration-sources'
+import { CreateProjectGroupDialog } from '@/components/project-groups/CreateProjectGroupDialog'
+import { ProjectGroupCard } from '@/components/project-groups/ProjectGroupCard'
+import { projectListItems } from '@/components/project-groups/project-list-items'
+import { useProjectGroups } from '@/components/project-groups/useProjectGroups'
+import { groupServiceLive } from '@/components/project-groups/group-service-live'
+import type { ProjectGroupResponse, ProjectResponse } from '@/api/client'
 import {
   PROJECT_PAGE_SIZE_OPTIONS,
   projectPageCount,
   readProjectPagination,
+  showsProjectPagination,
   withProjectPagination,
   withProjectSearch,
 } from '@/lib/project-list-pagination'
+import { serviceCount } from '@/lib/terminology'
 
-const SEARCH_CATALOG_LIMIT = 50
+/** `/projects?new=project` opens the new-project dialog (command palette). */
+const CREATE_PARAM = 'new'
+
+function groupMatches(group: ProjectGroupResponse, needle: string): boolean {
+  return (
+    group.name.toLowerCase().includes(needle) ||
+    group.slug.toLowerCase().includes(needle) ||
+    group.projects.some(
+      (member) =>
+        member.name.toLowerCase().includes(needle) ||
+        member.slug.toLowerCase().includes(needle)
+    )
+  )
+}
 
 export function Projects() {
   const { setBreadcrumbs } = useBreadcrumbs()
-  const [searchParams, setSearchParams] = useSearchParams()
+  const [searchParams, updateSearchParams] = useComposedSearchParams()
   const { page, pageSize } = readProjectPagination(searchParams)
   const projectSearch = searchParams.get('q') ?? ''
   const setProjectSearch = (value: string) => {
-    setSearchParams((current) => withProjectSearch(current, value), {
-      replace: true,
-    })
+    updateSearchParams((current) => withProjectSearch(current, value))
   }
   const normalizedProjectSearch = projectSearch.trim().toLowerCase()
+  const [creatingGroup, setCreatingGroup] = useState(false)
+
+  // Opened from elsewhere (the command palette's "New project"): the request
+  // lives in the URL, so the dialog is open while it is there and the
+  // parameter is dropped when the dialog closes.
+  const createRequested = searchParams.get(CREATE_PARAM) === 'project'
+  const createDialogOpen = creatingGroup || createRequested
+  const setCreateDialogOpen = (open: boolean) => {
+    setCreatingGroup(open)
+    if (open || !createRequested) return
+    updateSearchParams(
+      (current) => {
+        const next = new URLSearchParams(current)
+        next.delete(CREATE_PARAM)
+        return next
+      },
+      { replace: true }
+    )
+  }
+
+  const groupsQuery = useProjectGroups()
+  const groupsLoaded = groupsQuery.isSuccess
+  const groups = groupsQuery.groups
+  const visibleAllGroups = useMemo(
+    () => (SIMULATE_EMPTY_INSTALL ? [] : groups),
+    [groups]
+  )
+  // With at least one project (group), its services show inside its card
+  // and only the rest are listed (and paged) on their own.
+  const grouped = groupsLoaded && groups.length > 0
 
   const {
     data: rawProjectsData,
-    isLoading,
+    isLoading: servicesLoading,
     isError,
+    error: servicesError,
     isFetching,
     refetch,
   } = useQuery({
     ...getProjectsOptions({
       query: {
-        page: normalizedProjectSearch ? 1 : page,
-        // The list endpoint has no text filter, so search a deliberately
-        // bounded catalogue, with the scope disclosed beside the filter.
-        per_page: normalizedProjectSearch ? SEARCH_CATALOG_LIMIT : pageSize,
+        page,
+        per_page: pageSize,
+        search: normalizedProjectSearch || undefined,
+        ungrouped: grouped ? true : undefined,
       },
     }),
+    // Which list to ask for depends on the groups: wait for them rather than
+    // render one layout and swap it for another. If they fail, every
+    // service is listed, with the failure said above it. Once they have
+    // failed a first time they are being retried, so the list is asked for
+    // alongside the retries instead of after them: the two outages are one
+    // wait, not two.
+    enabled: !groupsQuery.isLoading || groupsQuery.failureCount > 0,
   })
 
   // TEMP: force an empty (brand-new install) dashboard while iterating on the
@@ -74,15 +139,13 @@ export function Projects() {
   const projectsData = SIMULATE_EMPTY_INSTALL
     ? ({ ...rawProjectsData, projects: [], total: 0 } as typeof rawProjectsData)
     : rawProjectsData
-  const totalPages = projectPageCount(projectsData?.total ?? 0, pageSize)
-  const isPageOutOfRange =
-    !normalizedProjectSearch &&
-    Boolean(projectsData?.total) &&
-    page > totalPages
+  const standaloneTotal = projectsData?.total ?? 0
+  const totalPages = projectPageCount(standaloneTotal, pageSize)
+  const isPageOutOfRange = Boolean(standaloneTotal) && page > totalPages
 
   const setPagination = useCallback(
     (nextPage: number, nextPageSize = pageSize, replace = false) => {
-      setSearchParams(
+      updateSearchParams(
         (current) =>
           withProjectPagination(current, {
             page: nextPage,
@@ -91,7 +154,7 @@ export function Projects() {
         { replace }
       )
     },
-    [pageSize, setSearchParams]
+    [pageSize, updateSearchParams]
   )
 
   useEffect(() => {
@@ -108,15 +171,56 @@ export function Projects() {
     if (isPageOutOfRange) setPagination(totalPages, pageSize, true)
   }, [isPageOutOfRange, pageSize, setPagination, totalPages])
 
-  const visibleProjects = useMemo(() => {
-    const projects = projectsData?.projects ?? []
-    if (!normalizedProjectSearch) return projects
-    return projects.filter(
-      (project) =>
-        project.name.toLowerCase().includes(normalizedProjectSearch) ||
-        project.slug.toLowerCase().includes(normalizedProjectSearch)
-    )
-  }, [normalizedProjectSearch, projectsData?.projects])
+  // Both lists explain their own failure below, with their own Retry, so the
+  // route-level report has nothing to add.
+  const groupsError = groupsQuery.isError ? groupsQuery.error : null
+  useEffect(() => {
+    markReadFailureHandled(groupsError)
+  }, [groupsError])
+  const servicesFailure = isError ? servicesError : null
+  useEffect(() => {
+    markReadFailureHandled(servicesFailure)
+  }, [servicesFailure])
+
+  // The server filters services; projects are filtered here by their own
+  // name or any of their services' names.
+  const visibleGroups = useMemo(
+    () =>
+      visibleAllGroups.filter(
+        (group) =>
+          !normalizedProjectSearch ||
+          groupMatches(group, normalizedProjectSearch)
+      ),
+    [normalizedProjectSearch, visibleAllGroups]
+  )
+  const standaloneProjects = useMemo(
+    () => projectsData?.projects ?? [],
+    [projectsData?.projects]
+  )
+  // Projects sit on the first page, ordered among its services.
+  const listItems = useMemo(
+    () =>
+      projectListItems(
+        grouped && page === 1 ? visibleGroups : [],
+        standaloneProjects
+      ),
+    [grouped, page, standaloneProjects, visibleGroups]
+  )
+
+  const memberTotal = useMemo(
+    () => visibleAllGroups.reduce((n, g) => n + g.projects.length, 0),
+    [visibleAllGroups]
+  )
+  // Every service the caller can see (without a filter, which is when it
+  // decides between onboarding and the list).
+  const serviceTotal = standaloneTotal + (grouped ? memberTotal : 0)
+  // A failed projects request must not hide first-run onboarding: with no
+  // services and no way to learn about projects, the page would otherwise
+  // be an alert above a blank list. The failure is still said above it.
+  const isEmptyInstall =
+    !normalizedProjectSearch &&
+    projectsData?.total === 0 &&
+    (groupsQuery.isError || (groupsLoaded && visibleAllGroups.length === 0))
 
   useEffect(() => {
     setBreadcrumbs([{ label: 'Projects' }])
@@ -124,7 +228,7 @@ export function Projects() {
 
   usePageTitle('Projects')
 
-  // Batch fetch analytics for all visible projects
+  // Batch fetch analytics for the services shown as their own card.
   const { startDate, endDate } = useMemo(() => {
     return {
       startDate: subDays(new Date(), 1).toISOString(),
@@ -132,9 +236,20 @@ export function Projects() {
     }
   }, [])
 
+  // Services inside the projects on this page are read in the same batches,
+  // so a project card shows each service's health and traffic too.
+  const shownGroupMembers = useMemo(
+    () =>
+      grouped && page === 1 ? visibleGroups.flatMap((g) => g.projects) : [],
+    [grouped, page, visibleGroups]
+  )
+
   const projectIds = useMemo(
-    () => visibleProjects.map((project) => project.id),
-    [visibleProjects]
+    () => [
+      ...standaloneProjects.map((project) => project.id),
+      ...shownGroupMembers.map((service) => service.id),
+    ],
+    [standaloneProjects, shownGroupMembers]
   )
 
   const dashboardAnalytics = useDashboardAnalytics(
@@ -143,86 +258,178 @@ export function Projects() {
     endDate
   )
 
-  const hostedProjectIds = visibleProjects
-    .filter((project) => project.source_type !== 'external')
-    .map((project) => project.id)
+  // External (telemetry-only) projects have no deployments to report on.
+  const hostedProjectIds = useMemo(
+    () => [
+      ...standaloneProjects
+        .filter((project) => project.source_type !== 'external')
+        .map((project) => project.id),
+      ...shownGroupMembers
+        .filter((service) => service.source_type !== 'external')
+        .map((service) => service.id),
+    ],
+    [standaloneProjects, shownGroupMembers]
+  )
   const dashboardHealth = useDashboardHealth(
     hostedProjectIds,
     startDate,
     endDate
   )
-  // Uptime monitors answer for projects that simply had no visitors, which
+  // Uptime monitors answer for services that simply had no visitors, which
   // traffic-derived health cannot. See project-card-health.ts.
   const monitorHealth = useProjectsMonitorHealth(projectIds)
   const latestDeploymentMedia = useLatestDeploymentMedia(hostedProjectIds)
 
-  const renderProjectCards = () =>
-    visibleProjects.map((project) => (
-      <ProjectCard
-        key={project.id}
-        project={project}
-        layout="compact"
-        analytics={dashboardAnalytics.data?.projects?.[String(project.id)]}
-        analyticsLoading={dashboardAnalytics.isLoading}
-        analyticsError={dashboardAnalytics.isError}
-        healthLoading={dashboardHealth.isLoading}
-        healthError={dashboardHealth.isError}
-        health={dashboardHealth.data?.projects?.[String(project.id)]}
-        monitorHealth={monitorHealth.data?.projects?.[String(project.id)]}
-        latestDeploymentMedia={
-          latestDeploymentMedia.data?.projects?.[String(project.id)]
-        }
-        latestDeploymentMediaLoading={latestDeploymentMedia.isLoading}
-        latestDeploymentMediaError={
-          latestDeploymentMedia.isError && !latestDeploymentMedia.data
-        }
-      />
-    ))
+  const groupLive = useMemo(() => {
+    const sources = {
+      analytics: dashboardAnalytics.data?.projects,
+      health: dashboardHealth.data?.projects,
+      monitors: monitorHealth.data?.projects,
+      healthLoading: dashboardHealth.isLoading,
+      healthError: dashboardHealth.isError,
+    }
+    return Object.fromEntries(
+      shownGroupMembers.map((service) => [
+        service.id,
+        groupServiceLive(service.id, sources),
+      ])
+    )
+  }, [
+    shownGroupMembers,
+    dashboardAnalytics.data?.projects,
+    dashboardHealth.data?.projects,
+    dashboardHealth.isLoading,
+    dashboardHealth.isError,
+    monitorHealth.data?.projects,
+  ])
+
+  const renderProjectCard = (project: ProjectResponse) => (
+    <ProjectCard
+      key={project.id}
+      project={project}
+      layout="compact"
+      analytics={dashboardAnalytics.data?.projects?.[String(project.id)]}
+      analyticsLoading={dashboardAnalytics.isLoading}
+      analyticsError={dashboardAnalytics.isError}
+      healthLoading={dashboardHealth.isLoading}
+      healthError={dashboardHealth.isError}
+      health={dashboardHealth.data?.projects?.[String(project.id)]}
+      monitorHealth={monitorHealth.data?.projects?.[String(project.id)]}
+      latestDeploymentMedia={
+        latestDeploymentMedia.data?.projects?.[String(project.id)]
+      }
+      latestDeploymentMediaLoading={latestDeploymentMedia.isLoading}
+      latestDeploymentMediaError={
+        latestDeploymentMedia.isError && !latestDeploymentMedia.data
+      }
+    />
+  )
+
+  const summary = listSummary({
+    loaded: Boolean(projectsData),
+    failed: isError,
+    searching: Boolean(normalizedProjectSearch),
+    grouped,
+    groupCount: grouped ? visibleGroups.length : 0,
+    standaloneTotal,
+    serviceTotal,
+  })
+
+  const isLoading = groupsQuery.isLoading || servicesLoading || isPageOutOfRange
+  const firstProject = !isLoading && !isError && isEmptyInstall
 
   return (
-    <PageContainer innerClassName="space-y-6">
+    <PageContainer
+      className="max-sm:py-4"
+      innerClassName="@container flex flex-col gap-4 space-y-0 sm:gap-6"
+    >
       {/* Header */}
       <ProjectsHeader
-        firstProject={!isLoading && !isError && projectsData?.total === 0}
+        firstProject={firstProject}
         actions={
           <>
-            {Boolean(projectsData?.total) && <PlatformStrip />}
-            <CreateActionButton to="/projects/new" label="Create project" />
+            {serviceTotal > 0 && <PlatformStrip />}
+            {/* A project groups services, so on an install with none there
+                is nothing to put in one yet; the page below is about the
+                first service. */}
+            {!firstProject && (
+              <Button
+                variant="outline"
+                className="max-sm:flex-1"
+                onClick={() => setCreatingGroup(true)}
+              >
+                <Boxes className="size-4" />
+                New project
+              </Button>
+            )}
+            <CreateActionButton
+              to="/projects/new"
+              label="Create service"
+              className="max-sm:flex-1"
+            />
+            {serviceTotal > 0 && <PlatformMenuLink />}
           </>
         }
+      />
+      <CreateProjectGroupDialog
+        open={createDialogOpen}
+        onOpenChange={setCreateDialogOpen}
       />
 
       {/* Nothing here can be built or deployed until something can run it. */}
       <WorkerNodeRequiredBanner />
 
-      {(projectsData?.total ?? 0) > 0 && <OnboardingNextStepCard />}
+      {groupsQuery.isError && (
+        <div
+          role="alert"
+          className="flex flex-col gap-2 rounded-lg border border-destructive/40 px-4 py-3 text-sm sm:flex-row sm:items-center"
+        >
+          <AlertTriangle className="size-4 shrink-0 text-destructive" />
+          <p className="flex-1">
+            Projects could not be loaded, so every service is listed on its own
+            below.
+          </p>
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={groupsQuery.isFetching}
+            onClick={() => void groupsQuery.refetch()}
+          >
+            <RefreshCw
+              className={
+                groupsQuery.isFetching ? 'size-4 animate-spin' : 'size-4'
+              }
+            />
+            Retry
+          </Button>
+        </div>
+      )}
 
-      {((projectsData?.total ?? 0) > 0 || Boolean(projectSearch)) && (
+      {(serviceTotal > 0 || visibleAllGroups.length > 0 || projectSearch) && (
         <ListToolbar
-          searchLabel="Filter projects by name or slug"
-          placeholder="Filter projects…"
+          searchLabel="Filter projects and services by name or slug"
+          placeholder="Filter projects and services…"
           value={projectSearch}
           onChange={setProjectSearch}
-          summary={
-            !projectsData
-              ? isError
-                ? 'Project count unavailable'
-                : 'Loading projects…'
-              : normalizedProjectSearch
-                ? `${visibleProjects.length} matching ${visibleProjects.length === 1 ? 'project' : 'projects'} · searching ${projectsData.projects.length} of ${projectsData.total}`
-                : `${projectsData.total} ${projectsData.total === 1 ? 'project' : 'projects'}`
-          }
+          summary={summary}
         />
+      )}
+
+      {groupsQuery.truncated && (
+        <p className="text-xs text-muted-foreground">
+          Showing the first {groups.length} of {groupsQuery.data?.total}{' '}
+          projects.
+        </p>
       )}
 
       {isError && (
         <Alert variant="destructive">
-          <AlertTitle>Projects could not be loaded</AlertTitle>
+          <AlertTitle>Services could not be loaded</AlertTitle>
           <AlertDescription>
             <p>
               {projectsData
-                ? 'Showing previously loaded projects. Refresh to get the latest status.'
-                : 'Check your connection and retry loading your projects.'}
+                ? 'Showing previously loaded services. Refresh to get the latest status.'
+                : 'Check your connection and retry loading your services.'}
             </p>
             <Button
               variant="outline"
@@ -234,60 +441,75 @@ export function Projects() {
               <RefreshCw
                 className={isFetching ? 'size-4 animate-spin' : 'size-4'}
               />
-              {isFetching ? 'Retrying…' : 'Retry loading projects'}
+              {isFetching ? 'Retrying…' : 'Retry loading services'}
             </Button>
           </AlertDescription>
         </Alert>
       )}
 
-      {isLoading || isPageOutOfRange ? (
+      {isLoading ? (
         <div
-          className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3"
-          aria-label="Loading projects"
+          role="status"
+          className={PROJECT_GRID_CLASS}
+          aria-label="Loading projects and services"
           aria-busy="true"
         >
           {Array.from({ length: pageSize }).map((_, i) => (
             <ProjectCardSkeleton key={i} layout="compact" />
           ))}
         </div>
-      ) : isError && !projectsData ? null : projectsData?.total === 0 ? (
-        // First-run entry point: choose a deployment or migration before
-        // asking for credentials. The creation flow owns configuration.
+      ) : isError && !projectsData ? null : isEmptyInstall ? (
+        // First-run entry point: no services and no projects. Choose a
+        // deployment or migration before asking for credentials. The creation
+        // flow owns configuration. An empty project still shows as a card.
         <FirstProjectOnboarding />
-      ) : visibleProjects.length === 0 ? (
-        <div className="rounded-xl border border-dashed px-6 py-12 text-center">
-          <p className="font-medium">No matching projects</p>
-          <p className="mt-1 text-sm text-muted-foreground">
-            No project name or slug contains “{projectSearch.trim()}”.
-          </p>
-          <Button
-            variant="outline"
-            size="sm"
-            className="mt-4"
-            onClick={() => setProjectSearch('')}
-          >
-            Clear filter
-          </Button>
-        </div>
+      ) : listItems.length === 0 ? (
+        normalizedProjectSearch ? (
+          <div className="rounded-xl border border-dashed px-6 py-12 text-center">
+            <p className="font-medium">No matching projects or services</p>
+            <p className="mt-1 text-sm text-muted-foreground">
+              No project or service name contains “{projectSearch.trim()}”.
+            </p>
+            <Button
+              variant="outline"
+              size="sm"
+              className="mt-4"
+              onClick={() => setProjectSearch('')}
+            >
+              Clear filter
+            </Button>
+          </div>
+        ) : null
       ) : (
-        <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
-          {renderProjectCards()}
-        </div>
+        <>
+          <div className={PROJECT_GRID_CLASS}>
+            {listItems.map((item) =>
+              item.kind === 'group' ? (
+                <ProjectGroupCard
+                  key={item.key}
+                  group={item.group}
+                  live={groupLive}
+                />
+              ) : (
+                renderProjectCard(item.project)
+              )
+            )}
+          </div>
+        </>
       )}
 
-      {/* Pagination - Only show if there are projects */}
+      {/* Pagination of the services listed on their own. */}
       {projectsData &&
-        projectsData.total > 0 &&
-        !normalizedProjectSearch &&
+        showsProjectPagination(standaloneTotal, page) &&
         !isPageOutOfRange && (
           <ResponsivePagination
             page={page}
             pageSize={pageSize}
-            total={projectsData.total}
+            total={standaloneTotal}
             totalPages={totalPages}
             pageSizeOptions={PROJECT_PAGE_SIZE_OPTIONS}
-            ariaLabel="Project list pagination"
-            pageSizeAriaLabel="Projects per page"
+            ariaLabel="Service list pagination"
+            pageSizeAriaLabel="Services per page"
             className="pt-2"
             onPageChange={(nextPage) => setPagination(nextPage)}
             onPageSizeChange={(nextPageSize) => setPagination(1, nextPageSize)}
@@ -295,6 +517,36 @@ export function Projects() {
         )}
     </PageContainer>
   )
+}
+
+function listSummary({
+  loaded,
+  failed,
+  searching,
+  grouped,
+  groupCount,
+  standaloneTotal,
+  serviceTotal,
+}: {
+  loaded: boolean
+  failed: boolean
+  searching: boolean
+  grouped: boolean
+  groupCount: number
+  standaloneTotal: number
+  serviceTotal: number
+}): string {
+  if (!loaded) return failed ? 'Service count unavailable' : 'Loading services…'
+  const projects = `${groupCount} ${groupCount === 1 ? 'project' : 'projects'}`
+  if (searching) {
+    return grouped
+      ? `${groupCount} matching ${groupCount === 1 ? 'project' : 'projects'} · ${standaloneTotal} matching ${standaloneTotal === 1 ? 'service' : 'services'} outside them`
+      : `${standaloneTotal} matching ${standaloneTotal === 1 ? 'service' : 'services'}`
+  }
+  if (grouped) {
+    return `${projects} · ${serviceCount(serviceTotal)}, ${standaloneTotal} not in a project`
+  }
+  return serviceCount(standaloneTotal)
 }
 
 /**
@@ -310,11 +562,13 @@ function ProjectsHeader({
 }) {
   return (
     <PageHeader
+      // The description can wrap; the actions stay on one row beside it.
+      className="sm:[&>:last-child]:shrink-0"
       title={firstProject ? 'Deploy your first application' : 'Projects'}
       description={
         firstProject
           ? 'Bring your code. Add a database if you need one. Get a working URL.'
-          : 'Deploy and manage your applications.'
+          : 'Your services, grouped into the projects they ship as'
       }
       actions={actions}
     />
@@ -329,13 +583,8 @@ function ProjectsHeader({
  */
 function PlatformStrip() {
   return (
-    <div className="flex items-center gap-1 rounded-md border p-1">
-      {/* The label is the first thing to go when the header wraps on mobile —
-          the brand marks still carry the meaning, and every one of them has an
-          accessible name. */}
-      <span className="hidden px-1.5 text-xs text-muted-foreground sm:inline">
-        Migrate from
-      </span>
+    <div className="hidden items-center gap-1 rounded-md border p-1 @4xl:flex">
+      <span className="px-1.5 text-xs text-muted-foreground">Migrate from</span>
       {TOP_MIGRATION_SOURCES.map((p) => (
         <Link
           key={p.source}
@@ -356,5 +605,30 @@ function PlatformStrip() {
         <ArrowRight className="h-4 w-4" />
       </Link>
     </div>
+  )
+}
+
+/**
+ * Narrow form of {@link PlatformStrip}: five brand marks plus a label would
+ * take a row of the header on their own, so on a narrow page the migration
+ * entry point is one icon button on the same row as the create actions. It
+ * opens the import wizard, which lists every platform.
+ */
+function PlatformMenuLink() {
+  return (
+    <Button
+      variant="outline"
+      size="icon"
+      className="@4xl:hidden"
+      asChild
+      title="Migrate from another platform"
+    >
+      <Link
+        to="/projects/import-wizard"
+        aria-label="Migrate from another platform"
+      >
+        <Download className="size-4" />
+      </Link>
+    </Button>
   )
 }

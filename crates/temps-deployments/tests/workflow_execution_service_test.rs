@@ -14,15 +14,15 @@ use chrono::Utc;
 use sea_orm::{ActiveModelTrait, Set};
 use std::path::PathBuf;
 use std::sync::Arc;
-use temps_database::test_utils::TestDatabase;
 use temps_deployer::{docker::DockerRuntime, ContainerDeployer, ImageBuilder};
+use temps_deployment_logs::LogService;
 use temps_deployments::services::{WorkflowExecutionService, WorkflowPlanner};
 use temps_deployments::CronConfigService;
 use temps_entities::upstream_config::UpstreamList;
 use temps_entities::{deployment_containers, deployments, environments, preset::Preset, projects};
 use temps_git::{GitProviderManagerError, GitProviderManagerTrait, RepositoryInfo};
-use temps_logs::LogService;
 use temps_screenshots::ScreenshotService;
+use temps_test_utils::TestDatabase;
 
 /// Mock GitProviderManager that copies from local fixture directory
 struct LocalFixtureGitProvider {
@@ -394,6 +394,8 @@ async fn test_workflow_execution_service_with_real_jobs() {
                 file_count: 10,
                 total_size_bytes: 1024,
                 deployed_at: Utc::now(),
+                skipped_count: 0,
+                skipped_paths: Vec::new(),
             })
         }
 

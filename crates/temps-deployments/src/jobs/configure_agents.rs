@@ -6,23 +6,27 @@
 //! Syncs agent definitions from .temps/agents/*.yaml files after deployment.
 //! Follows the same pattern as ConfigureCronsJob.
 
+use crate::workflow::JobResult;
+use crate::workflow::WorkflowContext;
+use crate::workflow::WorkflowError;
+use crate::workflow::WorkflowTask;
 use async_trait::async_trait;
 use sea_orm::EntityTrait;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 use temps_core::{
-    AgentTriggers, AgentYamlConfig, DeployTrigger, ErrorTrigger, JobResult, MonitoringTrigger,
-    ScheduleTrigger, WorkflowContext, WorkflowError, WorkflowTask, WorkflowYamlConfig,
+    AgentTriggers, AgentYamlConfig, DeployTrigger, ErrorTrigger, MonitoringTrigger,
+    ScheduleTrigger, WorkflowYamlConfig,
 };
 use temps_database::DbConnection;
+use temps_deployment_logs::{LogLevel, LogService};
 use temps_entities::projects;
-use temps_logs::{LogLevel, LogService};
 use tracing::{debug, info, warn};
 
 use crate::jobs::RepositoryOutput;
 
-/// Service interface for agent sync — implemented by temps-agents crate
+/// Service interface for agent sync — implemented by temps-ai-agents crate
 #[async_trait]
 pub trait AgentSyncService: Send + Sync {
     async fn sync_agents_from_yaml(
@@ -132,7 +136,7 @@ impl ConfigureAgentsJob {
             }
 
             match fs::read_to_string(&path) {
-                Ok(contents) => match serde_yaml::from_str::<AgentYamlConfig>(&contents) {
+                Ok(contents) => match yaml_serde::from_str::<AgentYamlConfig>(&contents) {
                     Ok(agent) => {
                         info!("Loaded agent '{}' from {:?}", agent.name, path);
                         agents.push(agent);
@@ -181,7 +185,7 @@ impl ConfigureAgentsJob {
             }
 
             match fs::read_to_string(&path) {
-                Ok(contents) => match serde_yaml::from_str::<WorkflowYamlConfig>(&contents) {
+                Ok(contents) => match yaml_serde::from_str::<WorkflowYamlConfig>(&contents) {
                     Ok(workflow) => {
                         info!("Loaded workflow '{}' from {:?}", workflow.name, path);
                         workflows.push(workflow_to_agent(workflow));

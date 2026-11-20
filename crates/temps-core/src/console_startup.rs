@@ -261,13 +261,21 @@ fn redact_key_values(text: &str) -> String {
             break;
         };
         let key_end = key_start + key.len();
-        // Must be a whole word, not e.g. "tokenizer".
-        let starts_word = key_start == 0 || !is_word_byte(bytes[key_start - 1]);
+        // Must be a whole word, not e.g. "tokenizer", or the last segment of
+        // an underscore-separated name such as `AWS_SECRET_ACCESS_KEY`.
+        let starts_word =
+            key_start == 0 || !is_word_byte(bytes[key_start - 1]) || bytes[key_start - 1] == b'_';
         let mut value_start = key_end;
-        // JSON/debug output may quote the key as well as the value.
-        if key_start > 0
-            && matches!(bytes[key_start - 1], b'\'' | b'"')
-            && bytes.get(value_start) == Some(&bytes[key_start - 1])
+        // JSON/debug output may quote the key as well as the value; the
+        // quote opens before the whole name (`"AWS_SECRET_ACCESS_KEY"`), not
+        // before the secret word inside it.
+        let mut name_start = key_start;
+        while name_start > 0 && is_word_byte(bytes[name_start - 1]) {
+            name_start -= 1;
+        }
+        if name_start > 0
+            && matches!(bytes[name_start - 1], b'\'' | b'"')
+            && bytes.get(value_start) == Some(&bytes[name_start - 1])
         {
             value_start += 1;
         }
@@ -439,6 +447,29 @@ mod tests {
         assert_eq!(
             redact_secrets(r#"token="escaped \" secret" retrying"#),
             r#"token="***" retrying"#
+        );
+    }
+
+    /// Environment-style names end in the secret word: a `walg.env` or a
+    /// container environment printed into an error.
+    #[test]
+    fn redacts_prefixed_environment_names() {
+        assert_eq!(
+            redact_secrets(
+                "export AWS_SECRET_ACCESS_KEY='hidden'\nAWS_SESSION_TOKEN=also-hidden\n\
+                 AWS_ACCESS_KEY_ID=AKIDEXAMPLE AWS_REGION=us-east-1"
+            ),
+            "export AWS_SECRET_ACCESS_KEY='***'\nAWS_SESSION_TOKEN=***\n\
+             AWS_ACCESS_KEY_ID=AKIDEXAMPLE AWS_REGION=us-east-1"
+        );
+        assert_eq!(redact_secrets("DB_PASSWORD=x"), "DB_PASSWORD=***");
+        assert_eq!(
+            redact_secrets(r#"{"AWS_SECRET_ACCESS_KEY": "hidden", "AWS_REGION": "us-east-1"}"#),
+            r#"{"AWS_SECRET_ACCESS_KEY": "***", "AWS_REGION": "us-east-1"}"#
+        );
+        assert_eq!(
+            redact_secrets("'AWS_SESSION_TOKEN': 'hidden'"),
+            "'AWS_SESSION_TOKEN': '***'"
         );
     }
 

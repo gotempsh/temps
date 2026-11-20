@@ -7,15 +7,17 @@ import {
   deployFromImageMutation,
   deployFromStaticMutation,
   getDeploymentOptions,
+  getDeploymentQueryKey,
   getFailureReportPreviewOptions,
   getDeploymentJobsOptions,
-  getSettingsOptions,
+  getDeploymentJobsQueryKey,
   pauseDeploymentMutation,
   resumeDeploymentMutation,
   rollbackToDeploymentMutation,
   sendFailureReportMutation,
   triggerProjectPipelineMutation,
 } from '@/api/client/@tanstack/react-query.gen'
+import { ComposeCheckAction } from '@/components/deployments/ComposeCheckAction'
 import { DeploymentContainerLogs } from '@/components/deployments/DeploymentContainerLogs'
 import { DeploymentStages } from '@/components/deployments/DeploymentStages'
 import { RedeploymentModal } from '@/components/deployments/RedeploymentModal'
@@ -24,6 +26,7 @@ import { RollbackToLastSuccessful } from '@/components/deployments/RollbackToLas
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
+import { RefreshButton } from '@/components/ui/refresh-button'
 import { CopyButton } from '@/components/ui/copy-button'
 import {
   Dialog,
@@ -57,6 +60,10 @@ import {
 } from '@/lib/deployment-failure-guidance'
 import { deploymentFailureSummary } from '@/lib/deployment-failure-summary'
 import {
+  canRollbackTo,
+  deploymentMenuHasActions,
+} from '@/lib/deployment-rollback'
+import {
   deploymentRedeployPlan,
   resolveDeploymentSourceType,
 } from '@/lib/deployment-source-summary'
@@ -66,6 +73,7 @@ import GithubIcon from '@/icons/Github'
 import { useAssistantPageContext } from '@/components/ai/AiAssistantContext'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import { useScreenshotsEnabled } from '@/hooks/useScreenshotsEnabled'
 import { writeToClipboard } from '@/lib/clipboard'
 import { formatMicrocores } from '@/lib/cpu-format'
 import {
@@ -99,6 +107,7 @@ import { useEffect, useState, type ReactNode } from 'react'
 import { Link, useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
 import { announceOperation } from '@/components/operations/operations-tray-store'
+import { ReachabilityWarningBanner } from '@/components/reachability/ReachabilityWarningBanner'
 
 type BadgeVariant =
   'default' | 'secondary' | 'destructive' | 'success' | 'warning' | 'outline'
@@ -221,7 +230,12 @@ function Field({
   return (
     <div className="space-y-0.5">
       <dt className="text-sm font-medium text-foreground">{label}</dt>
-      <dd className={cn('text-sm text-muted-foreground', mono && 'font-mono')}>
+      <dd
+        className={cn(
+          'break-words text-sm text-muted-foreground',
+          mono && 'font-mono'
+        )}
+      >
         {value}
       </dd>
     </div>
@@ -308,6 +322,11 @@ function commitWebUrls(
       ? `${base}${treeSeg}${encodeURIComponent(deployment.branch)}`
       : null,
   }
+}
+
+function isComposeProject(project: ProjectResponse): boolean {
+  const preset = project.preset ?? ''
+  return preset === 'docker-compose' || preset === 'dockercompose'
 }
 
 interface OverviewActions {
@@ -411,14 +430,12 @@ function SecondaryActions({
   deployment: DeploymentResponse
   actions: OverviewActions
 }) {
-  const showMenu = ['completed', 'paused', 'running', 'pending'].includes(
-    deployment.status
-  )
+  const showMenu = deploymentMenuHasActions(deployment)
   return (
     <>
       <Button variant="outline" onClick={actions.onRedeploy} title="Redeploy">
         <RotateCw className="h-4 w-4" />
-        <span className="hidden sm:inline">Redeploy</span>
+        <span className="max-sm:sr-only">Redeploy</span>
       </Button>
       {showMenu && (
         <DropdownMenu>
@@ -435,7 +452,7 @@ function SecondaryActions({
                 disabled={actions.cancelPending}
               >
                 <X className="mr-2 h-4 w-4" />
-                Cancel Deployment
+                Cancel deployment
               </DropdownMenuItem>
             )}
             {deployment.status === 'completed' && (
@@ -444,10 +461,10 @@ function SecondaryActions({
                 disabled={actions.pausePending}
               >
                 <Pause className="mr-2 h-4 w-4" />
-                Pause Deployment
+                Pause deployment
               </DropdownMenuItem>
             )}
-            {deployment.status === 'completed' && (
+            {canRollbackTo(deployment) && (
               <DropdownMenuItem
                 onClick={actions.onRollback}
                 disabled={actions.rollbackPending}
@@ -462,7 +479,7 @@ function SecondaryActions({
                 disabled={actions.resumePending}
               >
                 <Play className="mr-2 h-4 w-4" />
-                Resume Deployment
+                Resume deployment
               </DropdownMenuItem>
             )}
           </DropdownMenuContent>
@@ -476,7 +493,7 @@ function SecondaryActions({
 // deployments that didn't succeed. Failed deployments also carry a server-side
 // classification (stage, code, concrete fix and the settings page that fixes
 // it), which leads the banner; the raw error stays one click away.
-function CancelledReason({
+export function CancelledReason({
   deployment,
   projectSlug,
   onEditImage,
@@ -486,7 +503,21 @@ function CancelledReason({
   /** Opens the redeploy dialog, where a registry image can be edited. */
   onEditImage?: () => void
 }) {
-  const [isExpanded, setIsExpanded] = useState(false)
+  // The user's choice belongs to the deployment it was made on: opening a
+  // different deployment falls back to that failure's own default, while
+  // refreshes of the same deployment keep the choice.
+  const [expandedChoice, setExpandedChoice] = useState<{
+    deploymentId: number
+    expanded: boolean
+  }>()
+  const expandedByUser =
+    expandedChoice?.deploymentId === deployment.id
+      ? expandedChoice.expanded
+      : undefined
+  const isExpanded =
+    expandedByUser ??
+    (deployment.failure?.code === 'container_exited' ||
+      deployment.failure?.code === 'out_of_memory')
   if (!deployment.cancelled_reason) return null
   const isCancelled = deployment.status === 'cancelled'
   const failureReason = deploymentFailureSummary(deployment.cancelled_reason)
@@ -524,7 +555,9 @@ function CancelledReason({
             </Badge>
           )}
           {failure && failure.code !== 'unknown' && (
-            <code className="rounded bg-destructive/10 px-1.5 py-0.5 text-xs text-destructive/80">
+            // Opaque surface, not another destructive/10 tint: the banner it sits
+            // in is already tinted, and stacked tints measured 4.35:1.
+            <code className="rounded border border-destructive/30 bg-background px-1.5 py-0.5 text-xs text-destructive">
               {failure.code}
             </code>
           )}
@@ -591,7 +624,7 @@ function CancelledReason({
           {failure && (
             <p className="text-xs font-medium text-muted-foreground">Error</p>
           )}
-          <p className="whitespace-pre-wrap break-words text-sm text-destructive/80">
+          <p className="whitespace-pre-wrap break-words text-sm text-destructive">
             {isExpanded ? failureReason.fullReason : failureReason.summary}
           </p>
           {failureReason.hasMore && (
@@ -601,7 +634,12 @@ function CancelledReason({
               size="sm"
               className="mt-1 h-auto p-0 text-xs text-destructive underline-offset-4"
               aria-expanded={isExpanded}
-              onClick={() => setIsExpanded((expanded) => !expanded)}
+              onClick={() =>
+                setExpandedChoice({
+                  deploymentId: deployment.id,
+                  expanded: !isExpanded,
+                })
+              }
             >
               {isExpanded ? 'Collapse error' : 'Show full error'}
             </Button>
@@ -716,7 +754,7 @@ function DeployFailureReport({
                 )}
               </Tooltip>
             </TooltipProvider>
-            <DialogContent className="max-w-2xl">
+            <DialogContent className="max-h-[90dvh] max-w-2xl overflow-y-auto">
               <DialogHeader>
                 <DialogTitle>Send failure report</DialogTitle>
                 <DialogDescription>
@@ -729,6 +767,7 @@ function DeployFailureReport({
                 <Skeleton className="h-64 w-full" />
               ) : (
                 <Textarea
+                  aria-label="Failure report"
                   value={reportText}
                   onChange={(e) => setEditedText(e.target.value)}
                   className="h-64 font-mono text-xs"
@@ -833,9 +872,9 @@ function BrowserFrameScreenshot({
     <Card className="overflow-hidden">
       <div className="flex items-center gap-2 bg-muted/40 px-3 py-2">
         <div className="hidden shrink-0 items-center gap-1.5 sm:flex">
-          <span className="h-2.5 w-2.5 rounded-full bg-gray-950/15" />
-          <span className="h-2.5 w-2.5 rounded-full bg-gray-950/15" />
-          <span className="h-2.5 w-2.5 rounded-full bg-gray-950/15" />
+          <span className="h-2.5 w-2.5 rounded-full bg-foreground/20" />
+          <span className="h-2.5 w-2.5 rounded-full bg-foreground/20" />
+          <span className="h-2.5 w-2.5 rounded-full bg-foreground/20" />
         </div>
         {activeUrl && entries.length > 1 ? (
           <>
@@ -844,12 +883,12 @@ function BrowserFrameScreenshot({
                 <button
                   type="button"
                   aria-label={`Deployment URL: ${display}. ${entries.length} URLs available`}
-                  className="flex min-w-0 flex-1 items-center gap-2 rounded-md border border-gray-950/5 bg-background px-2.5 py-1 text-left text-xs text-muted-foreground transition-colors hover:text-foreground"
+                  className="flex min-w-0 flex-1 items-center gap-2 rounded-md border border-gray-950/5 dark:border-white/5 bg-background px-2.5 py-1 text-left text-xs text-muted-foreground transition-colors hover:text-foreground"
                 >
                   <Globe className="h-3.5 w-3.5 shrink-0" />
                   <span className="truncate">{display}</span>
                   {selected && (
-                    <span className="shrink-0 rounded border border-gray-950/10 px-1.5 font-mono text-[10px] leading-4">
+                    <span className="shrink-0 rounded border border-gray-950/10 dark:border-white/10 px-1.5 font-mono text-[10px] leading-4 max-sm:hidden">
                       {urlEntryLabel(selected)}
                     </span>
                   )}
@@ -876,7 +915,7 @@ function BrowserFrameScreenshot({
                       )}
                     />
                     <span className="truncate">{entry.display}</span>
-                    <span className="ml-auto shrink-0 rounded border border-gray-950/10 px-1.5 font-mono text-[10px] leading-4 text-muted-foreground">
+                    <span className="ml-auto shrink-0 rounded border border-gray-950/10 dark:border-white/10 px-1.5 font-mono text-[10px] leading-4 text-muted-foreground">
                       {urlEntryLabel(entry)}
                     </span>
                   </DropdownMenuItem>
@@ -899,14 +938,14 @@ function BrowserFrameScreenshot({
             href={activeUrl}
             target="_blank"
             rel="noreferrer"
-            className="flex min-w-0 flex-1 items-center gap-2 rounded-md border border-gray-950/5 bg-background px-2.5 py-1 text-xs text-muted-foreground transition-colors hover:text-foreground"
+            className="flex min-w-0 flex-1 items-center gap-2 rounded-md border border-gray-950/5 dark:border-white/5 bg-background px-2.5 py-1 text-xs text-muted-foreground transition-colors hover:text-foreground"
           >
             <Globe className="h-3.5 w-3.5 shrink-0" />
             <span className="truncate">{display}</span>
             <ExternalLink className="ml-auto h-3 w-3 shrink-0" />
           </a>
         ) : (
-          <div className="flex min-w-0 flex-1 items-center gap-2 rounded-md border border-gray-950/5 bg-background px-2.5 py-1 text-xs text-muted-foreground">
+          <div className="flex min-w-0 flex-1 items-center gap-2 rounded-md border border-gray-950/5 dark:border-white/5 bg-background px-2.5 py-1 text-xs text-muted-foreground">
             <Globe className="h-3.5 w-3.5 shrink-0" />
             <span className="truncate">{display}</span>
           </div>
@@ -925,7 +964,7 @@ function BrowserFrameScreenshot({
             href={url}
             target="_blank"
             rel="noreferrer"
-            className="group relative block border-t border-gray-950/5"
+            className="group relative block border-t border-gray-950/5 dark:border-white/5"
           >
             {body}
             {showsOtherUrl && url && (
@@ -936,7 +975,9 @@ function BrowserFrameScreenshot({
             <span className="pointer-events-none absolute inset-0 bg-foreground/0 transition-colors group-hover:bg-foreground/5" />
           </a>
         ) : (
-          <div className="border-t border-gray-950/5">{body}</div>
+          <div className="border-t border-gray-950/5 dark:border-white/5">
+            {body}
+          </div>
         ))}
     </Card>
   )
@@ -969,8 +1010,12 @@ function DeploymentHeader({
   const shortHash = deployment.commit_hash?.slice(0, 7)
   const firstLine = deployment.commit_message?.split('\n')[0]
   const hasCommit = Boolean(shortHash || firstLine || deployment.branch)
+  const deploymentPath = {
+    project_id: project.id,
+    deployment_id: deployment.id,
+  }
   return (
-    <div className="flex flex-col gap-3 border-b border-gray-950/10 pb-5 sm:flex-row sm:items-center sm:justify-between">
+    <div className="flex flex-col gap-3 border-b border-gray-950/10 dark:border-white/10 pb-5 sm:flex-row sm:items-center sm:justify-between">
       <div className="flex min-w-0 flex-1 flex-wrap items-center gap-x-3 gap-y-2 sm:flex-nowrap">
         <Button
           variant="ghost"
@@ -984,16 +1029,16 @@ function DeploymentHeader({
           </Link>
         </Button>
         <span
-          className="hidden h-5 w-px shrink-0 bg-gray-950/10 sm:block"
+          className="hidden h-5 w-px shrink-0 bg-gray-950/10 dark:bg-white/10 sm:block"
           aria-hidden="true"
         />
-        <div className="shrink-0">
+        <div className="min-w-0 sm:shrink-0">
           <StatusBadges deployment={deployment} isLive={isLive} />
         </div>
         {hasCommit && (
           <>
             <span
-              className="hidden h-5 w-px shrink-0 bg-gray-950/10 sm:block"
+              className="hidden h-5 w-px shrink-0 bg-gray-950/10 dark:bg-white/10 sm:block"
               aria-hidden="true"
             />
             <GitCommitHorizontal className="hidden h-4 w-4 shrink-0 text-muted-foreground sm:block" />
@@ -1003,12 +1048,12 @@ function DeploymentHeader({
                   href={commitUrls.commit}
                   target="_blank"
                   rel="noreferrer"
-                  className="hidden shrink-0 font-mono text-sm font-medium text-foreground hover:underline sm:inline"
+                  className="shrink-0 font-mono text-sm font-medium text-foreground hover:underline"
                 >
                   {shortHash}
                 </a>
               ) : (
-                <span className="hidden shrink-0 font-mono text-sm font-medium text-foreground sm:inline">
+                <span className="shrink-0 font-mono text-sm font-medium text-foreground">
                   {shortHash}
                 </span>
               ))}
@@ -1030,7 +1075,7 @@ function DeploymentHeader({
             <Clock className="h-3.5 w-3.5" />
             {buildStats.map((stat, i) => (
               <span key={stat.label} className="inline-flex items-center gap-1">
-                {i > 0 && <span className="text-muted-foreground/40">·</span>}
+                {i > 0 && <span className="text-muted-foreground">·</span>}
                 <span>{stat.label}</span>
                 <span className="font-medium tabular-nums text-foreground">
                   {stat.value}
@@ -1041,6 +1086,12 @@ function DeploymentHeader({
         )}
       </div>
       <div className="flex shrink-0 items-center gap-2">
+        <RefreshButton
+          queryKeys={[
+            getDeploymentQueryKey({ path: deploymentPath }),
+            getDeploymentJobsQueryKey({ path: deploymentPath }),
+          ]}
+        />
         {wasDeployed && primaryUrl && <VisitButton url={primaryUrl} />}
         <SecondaryActions deployment={deployment} actions={actions} />
       </div>
@@ -1110,13 +1161,8 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
     },
   })
 
-  // Fetch platform settings to check if screenshots are enabled
-  const { data: settings } = useQuery({
-    ...getSettingsOptions(),
-    retry: false,
-  })
-
-  const screenshotsEnabled = settings?.screenshots?.enabled ?? false
+  // Whether the platform captures screenshots; off for roles that can't read it
+  const screenshotsEnabled = useScreenshotsEnabled()
 
   const createDeployment = useMutation({
     ...triggerProjectPipelineMutation(),
@@ -1328,7 +1374,7 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
   const assistantContext = deployment
     ? [
         'The user is viewing a deployment in the Temps console.',
-        `Project: "${project.name}" (slug: ${project.slug}, id: ${project.id}).`,
+        `Service: "${project.name}" (project slug: ${project.slug}, project id: ${project.id}).`,
         `Deployment #${deployment.id} — status: ${deployment.status ?? 'unknown'}${deployment.environment ? `, environment: ${deployment.environment}` : ''}.`,
         deployment.branch ? `Branch: ${deployment.branch}.` : '',
         deployment.commit_hash
@@ -1375,7 +1421,7 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
             <Button variant="outline" size="sm" asChild>
               <Link to={`/projects/${project.slug}/deployments`}>
                 <ArrowLeft className="mr-2 h-4 w-4" />
-                Back to Deployments
+                Back to deployments
               </Link>
             </Button>
           </div>
@@ -1402,7 +1448,7 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
               <Button variant="outline" size="sm" asChild>
                 <Link to={`/projects/${project.slug}/deployments`}>
                   <ArrowLeft className="mr-2 h-4 w-4" />
-                  Back to Deployments
+                  Back to deployments
                 </Link>
               </Button>
               <Skeleton className="h-6 w-24" />
@@ -1550,9 +1596,26 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
           environmentId={deployment.environment_id}
           deploymentId={deployment.id}
           deploymentStatus={deployment.status}
+          showLogsInitially={
+            deployment.failure?.code === 'container_exited' ||
+            deployment.failure?.code === 'out_of_memory'
+          }
         />
 
         <DeployFailureReport project={project} deployment={deployment} />
+
+        <ReachabilityWarningBanner
+          warning={deployment.reachability_warning}
+          projectId={project.id}
+          projectSlug={project.slug}
+        />
+
+        {isComposeProject(project) && (
+          <ComposeCheckAction
+            projectId={deployment.project_id}
+            deploymentId={deployment.id}
+          />
+        )}
 
         {resourceBadges.length > 0 && (
           <div className="flex flex-wrap items-center gap-2">
@@ -1565,7 +1628,7 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
         )}
 
         {md?.isRollback && (
-          <div className="flex items-center gap-2 rounded-md border border-gray-950/5 bg-muted/40 px-3 py-2 text-sm">
+          <div className="flex items-center gap-2 rounded-md border border-gray-950/5 dark:border-white/5 bg-muted/40 px-3 py-2 text-sm">
             <RotateCcw className="h-4 w-4 shrink-0 text-muted-foreground" />
             <span className="text-muted-foreground">
               This is a rollback deployment

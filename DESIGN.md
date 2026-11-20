@@ -38,31 +38,93 @@ provider alternatives, use buttons or a segmented choice group instead of
 three cards inside a larger settings card. Apply this rule to loading, empty,
 and error states as well as populated content.
 
-## 1. Page layout: full width, one padding owner
+## 1. Page layout: two widths, one padding owner
 
-Every sidebar destination uses the available content width, including settings,
-users, teams, API keys, notifications, and their create/edit/detail routes.
+Settings read badly when stretched; tables, charts and logs read badly when
+squeezed. The page shell picks one of two widths per route.
+
+| Width | About | For |
+|---|---|---|
+| `form` | 1024px (`mx-auto max-w-5xl`), centered with its header | Settings and other forms: Configure pages that are forms, environment settings |
+| `full` | the whole content area, inside the gutters | Everything else: overview, deployments, environments, errors, analytics, monitoring, logs, traces, session replay, environment variables, secrets, tokens, scans |
+
+A `full` page starts at the same left edge as the project/environment bar
+above it, so lists and dashboards line up with the header instead of floating
+in a narrower column.
 
 - Use [PageContainer and PageHeader](web/src/components/layout/PageContainer.tsx).
-  `PageContainer` is always full width; it has no width variant.
-- The route layout owns page gutters: `px-4 py-6 sm:px-6 lg:px-8`.
-  Do not repeat those gutters inside the page.
+  `PageContainer` takes `width="form" | "full"` (default `full`).
+- The route shell owns the width and the gutters (`px-4 py-6 sm:px-6 lg:px-8`),
+  not the page. In a project each section declares its width in
+  `web/src/lib/project-navigation.ts`, and a tab can override it. Pages do
+  not add their own `max-w-*`, `container` or `mx-auto` wrappers, so the width
+  is decided in one place.
+- The page header and section tabs sit inside the same column as the content,
+  so the title, tabs and body share one left edge. App chrome above the page
+  (the project/environment bar) stays full width so it does not move as you
+  switch pages, and uses the same horizontal gutters as `PageContainer`, so
+  its left and right edges line up with the page below.
 - Settings routes inherit the container from their parent layout. Their root
-  should be `w-full min-w-0 space-y-6`, not another `PageContainer`.
-- Do not center sidebar pages inside `container`, `max-w-7xl`, `max-w-3xl`,
-  or `mx-auto`. Do not reintroduce narrow page-shell variants.
-- Constrain explanatory text where it improves reading, not the entire page,
-  form, table, or resource surface.
+  should be `w-full min-w-0 space-y-6`, not another `PageContainer`. A page
+  template (`Ledger`, `CardGrid`, `Detail`) rendered inside a shell that
+  already has one adds no second gutter: only the outermost `PageContainer`
+  pads. Never put `p-4`/`p-6` on a page's root either; the shell owns it.
+- Use `PageHeader` for every page title, never a hand-rolled `h1`/`h2`. When
+  a section's tab strip already names the page (the "Metrics" tab on the
+  Metrics page), the title stays for screen readers only and the description
+  and actions keep their place. One row of tabs per page: a page inside a
+  tabbed section does not add its own tab strip for the same pages.
+- Tabs that switch between sections of a page, or between choices in a
+  form, carry an icon before the label through `TabsTrigger`'s `icon` prop
+  (never a hand-drawn icon in the children), every tab in the strip or none.
+  Reuse the icon the sidebar or project navigation already gives the same
+  concept. Counts go in the `count` prop, not in brackets in the label. Leave
+  icons off code-language switchers, compact metric pickers beside a chart,
+  strips that show brand logos, and strips where each tab is a record.
+- Every group of settings is saved the same way: `SaveRow` from
+  `@temps-sdk/ds`, a rule with a hint on the left and Save on the right,
+  always mounted and disabled until something changed. A page saved as one
+  form uses one sticky `SaveRow`; a group that saves on its own ends in one
+  (a console `Card` on a settings surface renders its `CardFooter` as the same
+  row). Headings, labels and navigation entries are sentence case, and a
+  group never repeats the page title or a group title inside it.
+- Every setting can be found from ⌘K and linked to directly. Give its group,
+  card or row a DOM id (`setting-<name>`), add it to
+  `web/src/lib/project-settings-index.ts` with the words people use for it,
+  and the palette entry opens the page scrolled to that setting.
+- Constrain explanatory text where it improves reading, beyond the page width.
 - Align the heading, toolbar, collection, and footer to the same content edges.
   Use `min-w-0` for flex/grid children containing long names or URLs.
 - Use `space-y-6` between major sections, `gap-4` within groups, and
   `gap-2` between related controls.
 
-A page header has one `h1`, a short description, and its primary action.
+A page header has one `h1`, its primary action, and usually nothing else.
 Use `PageHeader` instead of hand-written variants. The title is
-`text-2xl font-semibold tracking-tight`; the description is
+`text-2xl font-semibold tracking-tight`; an optional description is
 `text-sm text-muted-foreground`. Actions wrap below the title on small screens.
 No large hero, oversized title, or decorative introduction before useful content.
+
+### Pages don't explain themselves
+
+People open a page to do something, not to read about it. A page or section
+title is not followed by a paragraph saying what the page is, how the feature
+works, or why it is safe. Users skip that text, and it pushes the content down.
+
+- **No description by default.** `PageHeader` and section headings carry a
+  description only when it states something the user must know to act and the
+  page can't show any other way, in one short line ("Use in a service as
+  `{{NAME}}`."). Never a definition of the noun in the title, a tour of the
+  feature, or how it works inside.
+- **Data, not prose.** A record's own description or scope may sit under its
+  title. A placeholder like "No description" is noise; render nothing.
+- **Say it where it applies.** A constraint goes next to the control it
+  affects: "can't be read back once saved" belongs on the secret field, a
+  consequence in the confirm dialog, a requirement in the empty or not-set-up
+  state. Longer background goes in a `HelpPopover`, `Disclosure` or the docs.
+- **A setting gets one line** saying what it controls when its title doesn't.
+  Not the reasoning behind it.
+- **Instructions are the command, not the story.** A "connect a client" or
+  "run this" section shows the snippet with at most a one-line caption.
 
 ## 2. Canonical resource-list structure
 
@@ -71,7 +133,8 @@ Do not copy its oversized empty panel or Authentication's nested dashed box.
 
 The order is:
 
-1. Page heading, description, and primary create/add action.
+1. Page heading and primary create/add action (no explanatory description;
+   see "Pages don't explain themselves").
 2. Search, filters, and optional bulk actions when applicable.
 3. One full-width, solid-bordered collection surface.
 4. Shared pagination when needed.
@@ -149,14 +212,24 @@ administrative resources. Do not invent a different row component per page.
 
 - Use `TableHeader`, `TableBody`, `TableRow`, `TableHead`, and
   `TableCell`. Preserve their shared padding and typography.
-- The first meaningful column identifies the resource. Make its name a real
-  [RecordLink](web/packages/ds/src/record-link.tsx) when a detail page exists.
-  It is visibly underlined with a persistent right arrow. Secondary metadata is muted.
+- The first meaningful column identifies the resource. When a detail page
+  exists, make its name a real [RecordLink](web/packages/ds/src/record-link.tsx)
+  inside a `RecordRow`: the name reads as plain text (no underline, no arrow)
+  and the whole row opens the record. Secondary metadata is muted.
+- Show only the columns needed to scan and act: the name, its state, and one
+  time. Identifiers, serials, keys, certificates, full timestamps and
+  instance-wide settings belong in the record's detail view, not the table.
+- Times are compact: relative within a day ("3 hours ago"), then the date
+  alone, with the exact time in a tooltip and on the detail view.
 - Put status in a text-labeled badge; color alone never carries the meaning.
-- Right-align row actions in the last column. Give icon-only actions an
-  accessible name that identifies the resource.
-- Keep links, menus, and selection independently operable. Table rows never
-  navigate: no row `onClick`, link overlay, or `role="button"`.
+- Right-align row actions in the last column. A row shows at most one inline
+  action (or a state such as a switch); everything else goes in one "…" row
+  menu with labelled items, destructive items last after a separator, and
+  disabled items saying why. Give icon-only actions an accessible name that
+  identifies the resource.
+- Keep links, menus, and selection independently operable. A row navigates
+  only through `RecordRow`, which follows its `RecordLink`; never a hand-written
+  row `onClick`, link overlay, or `role="button"`.
 - Use monospace only for identifiers, hashes, commands, and code. Truncate
   long values intentionally, with a way to inspect or copy the full value.
 - Sorting uses a real button in the header and exposes its sort state.
@@ -184,41 +257,78 @@ Never include secret values. Keep full-width page content below the shared heade
 
 ### Resource-detail navigation decision
 
-Use **one `RecordLink` in the identity column** for a record's primary detail
-route. Its name is underlined and its arrow remains visible before hover, on
-touch screens, and in both themes. This is the canonical detail affordance;
-do not alternate between plain text links, a separate "View" button, and
-clickable rows. The record name is the link text; use `aria-label` when context
-is needed (for example, "View GITHUB_TOKEN details").
+Use **one `RecordLink` in the identity column, inside a `RecordRow`**, for a
+record's primary detail route. The name is styled as the record's name, not as
+a link: no underline, no arrow, not even on hover. The row is the affordance:
+it shows the pointer and the shared row hover, and clicking anywhere on it
+opens the record. This is the canonical detail affordance; do not alternate
+between visible text links, a separate "View" button, and hand-made clickable
+rows. The record name is the link text; use `aria-label` when context is needed
+(for example, "View GITHUB_TOKEN details").
 
-Navigation is a real router link: Enter, modifier-click, middle-click, copy link,
-and open in a new tab work normally. Clicking row whitespace does nothing.
-Checkboxes, copy/reveal, status popovers, menus, Edit, and Delete remain separate
-controls; they never open details. Do not add a second primary-detail link in
-the Actions column. Links to related resources are allowed in their own columns.
-Rows without a detail route render plain identity text, without an arrow.
+The name stays a real router link, so Tab, Enter, copy link and the browser's
+link menu work, and screen readers announce it. `RecordRow` follows that link:
+a click opens it, Cmd/Ctrl-click and middle-click open a new tab, and selecting
+text never navigates. The row itself gets no `tabIndex` or role, so it keeps
+its table semantics. Checkboxes, copy/reveal, status popovers, menus, Edit, and
+Delete remain separate controls; a click on them, or in a menu or dialog they
+open, never opens details. A row holds exactly one `RecordLink`: links to other
+places (counts, related resources) are ordinary router links styled
+`text-primary`, and a row with two record links does not navigate at all. A
+`<ul role="list">` of records uses `RecordListItem`, which behaves the same. Do not add a second primary-detail link in the
+Actions column. Links to related resources in their own columns are real
+controls and keep their own destination. Rows without a detail route render
+plain identity text and do not respond to clicks.
 
 Details and their configuration have stable URLs, not modal-only entry points.
 Their facts, checks, forms, and history fill the parent content width. A detail
 layout reserves an aside column only when an aside is actually present; never
 cap the whole page with `max-w-*`. Paragraphs may have a reading-width limit.
 
-Enforcement: `@temps-sdk/ds` exports `RecordLink`; `DataTable` and `Ledger` do
-not expose row-click navigation. The sandbox `/ledger` and the environment
+Enforcement: `@temps-sdk/ds` exports `RecordLink` and `RecordRow`; `DataTable`
+and `Ledger` render every row as a `RecordRow`, so a `RecordLink` in a column is
+all a row needs, and they expose no other row-click navigation. The sandbox `/ledger` and the environment
 variables table are reference implementations. Existing screens are migrated
 when their tables are touched; this decision does not claim all legacy tables
 have already been converted. Preserve row expansion/selection as explicit,
 separately labeled controls during migration.
 
-The shared Table already owns a horizontal overflow wrapper. On narrow screens,
-scroll the table rather than the entire page. Keep identity and primary actions
-reachable; if columns are hidden, essential information must remain available
-through a detail view or an accessible compact presentation.
-
 Cards are appropriate for discovery surfaces such as the plugin catalog, where
 logos, descriptions, and categories help people choose. They are not a second
 default for administrative lists. Use a responsive grid with consistent card
-anatomy and the same state rules above.
+anatomy and the same state rules above. Cards need room: where fewer than three
+fit side by side (under about 56rem of content, measured with a container
+query), show the same entries as a list of rows (logo, name, one line of
+description, then category or host as width allows) rather than one or two
+cramped cards per row.
+
+### No horizontal scrolling
+
+Nothing scrolls sideways: not the page, not a table, not a tab strip. A layout
+that needs it is a bug at that width, fixed by changing the layout.
+
+- A table gives each column a priority and shows it by the width the table has,
+  with container queries (`hidden @xl:table-cell`), so the sidebar and side
+  panels count. The viewport is the wrong measure: the same table is narrower
+  with the sidebar open. `DataTable` is a query container already; wrap a
+  hand-built shared `Table` in `<div className="@container">` directly around
+  it, since without a container the `@` classes never match.
+- A narrow table keeps the record's name, its state and its actions. What a
+  hidden column says that is needed to act moves under the name as muted text
+  (a bundle's "no services" warning, a rule's credential); the rest stays on
+  the detail view.
+- Long identifiers, hosts and commands break (`overflow-wrap: anywhere`)
+  rather than widening their column. Truncate only with a way to see the full
+  value.
+- Cells pad less in a narrow table; tabs wrap to a second line; header actions
+  keep their width and the description wraps beside or under them.
+- Check every changed screen from 320px up, in the content area after the
+  sidebar. The overflow wrappers around the shared Table and tab strips are a
+  safety net, never the layout.
+
+Existing tables and `ScrollableTabsList` still scroll where they were built to;
+convert a table to column priorities when touching it, and do not add new
+scrolling surfaces.
 
 ### Pagination
 
@@ -256,6 +366,16 @@ with native lookalikes or locally styled forks.
   `htmlFor`, or a correctly wrapping label. A placeholder is not a label.
 - **Forms:** use existing React Hook Form, Zod, and shared form patterns.
   Put validation next to the field; retain user input after failures.
+  A form beyond a few fields (several steps, a catalogue then configuration
+  then a secret) is a routed page with its own URL, never a modal or a chain of
+  modals. A form that stays in a modal is one column: no side-by-side fields,
+  one choice card per row.
+- **Predictable failures:** catch them before Save. Check what the client can
+  know (a name already used in the same scope, a missing dependency) next to
+  the field, suggest a value that works ("GitHub 2"), and hold Save until it is
+  fixed. Never show a raw database or constraint error; a server conflict is a
+  sentence naming the record and its scope. Show a save error next to the
+  buttons, where the user is when they press Save.
 - **Async actions:** show progress and prevent duplicate submission. Keep
   readable contrast while pending; communicate the result and recovery action.
 - **Destructive actions:** require confirmation that identifies the target
@@ -276,6 +396,10 @@ Do not load a different font for an individual console page.
 - Supporting copy: `text-sm text-muted-foreground`.
 - Small metadata: `text-xs text-muted-foreground`, never the only place for
   information needed to complete an action.
+- Links never gain an underline on hover. Standalone links and `variant="link"`
+  buttons use `text-primary` and darken on hover; a link inside a sentence keeps
+  a permanent underline, since that is its only cue. Record names in tables are
+  not styled as links at all (see section 4).
 - Use semantic pairs: `bg-background text-foreground`,
   `bg-card text-card-foreground`, `bg-primary text-primary-foreground`,
   and `border-border`.
@@ -295,12 +419,20 @@ selected text after its hover background becomes light.
 
 ## 7. Responsive, accessible, and functional
 
-- Check at 390px, 768px, and a wide desktop width. Full width means the available
-  content area after the sidebar, not the entire viewport.
+- Check at 320px, 390px, 768px, and a wide desktop width. Widths are measured in the
+  content area after the sidebar, not the entire viewport; on a wide screen a
+  `form` page is a centered, capped column including its header, and a
+  `full` page fills it.
 - Verify both light and dark mode, including hover, selected, pending, and
   disabled controls.
-- No document-level horizontal overflow, clipped actions, or inaccessible
+- No horizontal scrolling at any width, in the document or in any surface
+  (see "No horizontal scrolling" in section 4), no clipped actions, and no
   fixed-width forms. Let toolbars wrap and long labels break sensibly.
+- Pages say when something is wrong or needs the user: a banner at the top
+  naming the problem, its consequence and the fix (a button or the exact
+  command), and a signal visible from elsewhere, such as a dot on the sidebar
+  item. Status stays current by polling or live updates; it never freezes at
+  page load.
 - Keep visible focus indicators and a logical keyboard order. Test checkbox
   labels and Space, menus, dialogs, and table links.
 - Preserve heading hierarchy: one page `h1`, then section headings.
@@ -317,15 +449,17 @@ selected text after its hover background becomes light.
 
 Before handing off a changed screen:
 
-- [ ] Full-width layout, one padding owner, shared page header.
-- [ ] Primary content appears promptly below the heading.
+- [ ] The route's width (`form` or `full`), one padding owner, shared page header.
+- [ ] Primary content appears promptly below the heading: no paragraph
+      explaining the page or a section under its title.
 - [ ] One collection surface; no nested dashed empty panel or decorative shadow.
 - [ ] Compact EmptyState explicitly selected; loading, empty, filtered, error,
       and unconfigured states are distinguished.
 - [ ] Shared table and pagination, or a justified discovery-card layout.
 - [ ] Shared Checkbox/Switch and properly associated labels; no native lookalikes.
 - [ ] Permission-aware actions, useful failures, and working retry/setup links.
-- [ ] Keyboard, mobile, wide-screen, light, and dark behavior checked.
+- [ ] Keyboard, mobile, wide-screen, light, and dark behavior checked; nothing
+      scrolls sideways from 320px up.
 - [ ] Regression tests cover the changed behavior and important failure states.
 - [ ] Documentation and shared components agree, or the remaining legacy gap
       is explicitly identified rather than presented as complete.
@@ -342,7 +476,7 @@ the shared implementation rather than creating a competing design guide.
 
 Plugins inherit the resolved Temps light/dark theme and follow live changes. They do not expose an independent theme toggle or persist a separate theme preference. Standalone previews may follow the OS preference.
 
-The host owns plugin identity. Inside the plugin, use a compact view title rather than repeating the plugin name and description. Multi-view plugins use an internal sidebar with Lucide icons and text labels; on narrow screens it becomes a horizontally scrollable navigation strip.
+The host owns plugin identity. Inside the plugin, use a compact view title rather than repeating the plugin name and description. Multi-view plugins use an internal sidebar with Lucide icons and text labels; on narrow screens it becomes a navigation strip that wraps.
 
 Separate history lists from record details using addressable routes. Paginate history and result collections with shared responsive pagination, clamp pages after filtering or deletion, and preserve keyboard navigation. Starting a job opens its detail view; returning to history must not cancel it.
 
@@ -366,13 +500,21 @@ Use the shared `Tabs`, `TabsList`, `TabsTrigger`, and `TabsContent` exported by
 `@temps-sdk/ds` (and `@temps-sdk/ui`) for peer page views. The default is a
 transparent, full-width strip with a bottom divider and an underline on the
 active tab. No pill container, selected-card background, shadow, or page-local
-styling overrides. Keep labels text-first, with constant font weight.
+styling overrides. Labels keep a constant font weight. Lead each label with a
+Lucide icon through `TabsTrigger icon={Icon}` (`size-4`, hidden from assistive
+technology), so a strip can be scanned by shape as well as by word. The icon
+never replaces the label, on any screen size; below `sm` the trigger drops the
+icon and keeps the label, so a phone fits more of the strip. Give every tab in a strip an
+icon or none, keep icons distinct within a strip, and let a section's landing
+tab share the icon its section has in the menu. Add icons to a strip when
+touching it.
 
 Use `TabsTrigger count={number}` for optional counts, including zero. Omit a
 count until it is known; never invent totals or show the current page's item
 count as the total. Counts stay visible on inactive tabs. Keep Radix keyboard
-navigation, focus indicators, disabled states, and panel semantics; let long
-strips scroll horizontally. Meaningful detail views keep their selection in
+navigation, focus indicators, disabled states, and panel semantics; long
+strips wrap to a second line rather than scroll (the shared scrolling strip is a
+legacy gap, see section 4). Meaningful detail views keep their selection in
 the URL. Use a segmented toggle only for a local value choice (such as chart
 interval or list/grid display), not for navigating content sections.
 
@@ -417,3 +559,20 @@ Official sources: [GitHub brand toolkit](https://brand.github.com/foundations/lo
 [Anthropic's company site](https://www.anthropic.com/) (compact company symbol;
 vector pinned to [Simple Icons 13.0.0](https://github.com/simple-icons/simple-icons/blob/13.0.0/icons/anthropic.svg)).
 The company marks remain the property of their respective owners.
+
+
+The left/right heading-and-controls layout is reserved for full settings forms.
+Never use `SettingsSection` or `SettingsGroup` as a wrapper for a read-only
+record, resource list, grant table, or operational panel. Detail and collection
+pages keep one consistent full-width content layout; link to a dedicated
+settings route for extensive editing. Small inline forms use `Field` and
+`FormErrors` in the surrounding layout without introducing settings columns.
+Vault owns Services, Access bundles, and Sessions. Services hold provider
+configuration and credentials; bundles define reusable service selections and
+access limits; sessions authorize identified consumers for a bounded lifetime.
+Session details expose the allowed consumers, effective restrictions, expiry,
+and revocation state. Sandbox detail pages show only that sandbox's access and
+link to the owning Vault sessions; a sandbox picker is not a Vault navigation tab.
+Keep session records distinct from individual grants and internal proxy tokens.
+Creation and editing use dedicated form pages; operational details use the
+full-width record layout.

@@ -3,27 +3,45 @@
 
 pub mod acme_accounts;
 pub mod acme_orders;
+pub mod address_tailnet_principals;
 pub mod ai_application_git_bindings;
 pub mod ai_application_projects;
 pub mod ai_application_workspaces;
 pub mod ai_applications;
+pub mod ai_blueprint_versions;
+pub mod ai_blueprints;
+pub mod ai_chat_attachments;
+pub mod ai_chat_operations;
 pub mod ai_conversations;
 pub mod ai_gateway_config;
 pub mod ai_gateway_objects;
+pub mod ai_goals;
 pub mod ai_messages;
 pub mod ai_pending_actions;
 pub mod ai_provider_keys;
 pub mod ai_provider_models;
+pub mod ai_secret_slots;
 pub mod ai_thread_artifacts;
 pub mod ai_usage_logs;
+pub mod ai_user_preferences;
 pub mod alarms;
 pub mod analytics_ingest_keys;
+pub mod analytics_traffic_filters;
+pub mod audience;
+// Signed-in addresses (ADR 065 D8).
+pub mod autofix_incident_events;
+pub mod autofix_incidents;
 pub mod cross_project_trace_refs;
+pub mod gate_codes;
+pub mod gate_keys;
+pub mod gate_sessions;
 // Agent entities (renamed from autopilot)
 pub mod agent_run_logs;
 pub mod agent_runs;
 pub mod agent_secrets;
+pub mod image_ownership_identity;
 pub mod project_agents;
+pub mod project_autofix_settings;
 pub mod project_mcp_definitions;
 pub mod project_secrets;
 pub mod project_skill_definitions;
@@ -48,9 +66,11 @@ pub mod cloud_telemetry_bulk_jobs;
 pub mod cloud_telemetry_fidelity;
 pub mod cloud_telemetry_outbox;
 pub mod cloud_telemetry_write_mode;
+pub mod cloudflare_access_providers;
 pub mod cron_executions;
 pub mod crons;
 pub mod custom_routes;
+pub mod deleted_project_images;
 pub mod delivery_profiles;
 pub mod deployment_config;
 pub mod deployment_container_logs;
@@ -62,8 +82,13 @@ pub mod deployments;
 pub mod dns_instance_identity;
 pub mod dns_managed_domains;
 pub mod dns_managed_record_states;
+pub mod dns_name_claims;
+pub mod dns_name_conflicts;
 pub mod dns_providers;
+pub mod dns_query_log;
 pub mod dns_reconciliation_runs;
+pub mod dns_resolver_reports;
+pub mod domain_certificate_settings;
 pub mod domain_delivery_bindings;
 pub mod domain_delivery_previews;
 pub mod domains;
@@ -84,6 +109,7 @@ pub mod environments;
 pub mod external_images;
 pub mod external_service_backups;
 pub mod external_service_health_checks;
+pub mod external_service_tls;
 pub mod external_services;
 pub mod feature_flag_environments;
 pub mod feature_flags;
@@ -91,14 +117,23 @@ pub mod funnel_steps;
 pub mod funnels;
 pub mod git_provider_connections;
 pub mod git_providers;
+pub mod github_manifest_states;
+pub mod ingress_connector_nodes;
+pub mod ingress_connectors;
+pub mod ingress_hostname_choices;
+pub mod ingress_publications;
+pub mod internal_access_grants;
+pub mod internal_access_sandbox_grants;
 pub mod ip_access_control;
 pub mod ip_geolocations;
+pub mod managed_service_certificate_authorities;
 pub mod mesh_links;
 pub mod network_config;
 pub mod node_dns_state;
 pub mod node_enrollment_tokens;
 pub mod node_mesh_reports;
 pub mod node_pairings;
+pub mod node_public_ingress;
 pub mod node_route_state;
 pub mod node_ssh_enrollments;
 pub mod nodes;
@@ -115,12 +150,19 @@ pub mod on_demand_cert_attempts;
 pub mod performance_metrics;
 pub mod postgres_major_upgrades;
 pub mod preset;
+pub mod project_analytics_settings;
 pub mod project_custom_domains;
+pub mod project_data_purges;
 pub mod project_delivery_settings;
+pub mod project_deployment_counters;
+pub mod project_edge_rules;
+pub mod project_ip_access_rules;
 pub mod project_services;
 pub mod project_telemetry_write_intervals;
 pub mod projects;
 pub mod proxy_logs;
+pub mod reachability_plans;
+pub mod reachability_runs;
 pub mod renewal_attempts;
 pub mod repositories;
 pub mod request_sessions;
@@ -135,17 +177,28 @@ pub mod service_data_imports;
 pub mod service_endpoints;
 pub mod service_members;
 pub mod sessions;
+pub mod shield_bypass_tokens;
+pub mod shield_events;
+pub mod shield_observed;
+pub mod shield_operator_entries;
+pub mod shield_snapshots;
+pub mod shield_sources;
 pub mod source_bundles;
 pub mod source_type;
 pub mod stateless_control_plane;
 pub mod static_asset_cache;
 pub mod static_bundles;
 pub mod suppressed_recipients;
+pub mod tailnet_serve_entries;
+pub mod tailnet_serve_refs;
+pub mod template_instantiations;
 pub mod tls_acme_certificates;
 pub mod traefik_discovered_routes;
 pub mod traefik_route_certificates;
 pub mod types;
 pub mod upstream_config;
+pub mod user_login_guards;
+pub mod user_mfa_guards;
 pub mod user_roles;
 pub mod users;
 
@@ -172,16 +225,22 @@ pub mod error_alert_fires;
 pub mod error_alert_rules;
 pub mod error_events;
 pub mod error_groups;
+pub mod error_inbound_filters;
+pub mod error_releases;
 pub mod project_dsns;
+pub mod project_group_env_vars;
+pub mod project_group_members;
+pub mod project_group_routes;
+pub mod project_groups;
 pub mod source_files;
 pub mod source_maps;
-pub mod tokenizer;
 
 // Status page entities
 pub mod status_checks;
 pub mod status_incident_updates;
 pub mod status_incidents;
 pub mod status_monitors;
+pub mod status_page_domains;
 pub mod status_page_monitors;
 pub mod status_pages;
 
@@ -216,18 +275,40 @@ pub mod log_chunks;
 pub mod log_events;
 
 // Standalone sandbox API (Vercel-compatible)
+pub mod sandbox_access_authorities;
+pub mod sandbox_access_authorizations;
+pub mod sandbox_access_delivery;
+pub mod sandbox_access_runtimes;
+pub mod sandbox_access_services;
 pub mod sandbox_events;
+pub mod sandbox_image_preparations;
+pub mod sandbox_service_assignments;
+pub mod sandbox_service_grants;
+pub mod sandbox_services;
 pub mod sandbox_snapshots;
 pub mod sandboxes;
 
 // Workflow memory
+pub mod workflow_blob_cleanup;
+pub mod workflow_child_cleanup_cursor;
+pub mod workflow_credentials;
+pub mod workflow_environment_settings;
+pub mod workflow_events;
+pub mod workflow_journal_cleanup;
+pub mod workflow_managed_runs;
 pub mod workflow_memory;
+pub mod workflow_prepared_child_inputs;
+pub mod workflow_project_keys;
+pub mod workflow_runs;
+pub mod workflow_steps;
 
 pub mod prelude;
 
+pub mod compose_placements;
 pub mod compose_security;
 pub mod compose_security_policies;
 pub mod compose_security_policy_changes;
+pub mod compose_validation_reports;
 
 pub mod compose_security_legacy_migrations;
 
@@ -235,3 +316,46 @@ pub mod http_checks;
 
 pub mod env_var_history;
 pub mod secret_history;
+
+pub mod workload_events;
+pub mod workload_instances;
+pub mod workloads;
+// ADR-055 Phase 8: ingress endpoints and access policies
+pub mod control_plane_node_settings;
+pub mod ingress_access_policies;
+pub mod ingress_endpoints;
+pub mod ingress_login_grants;
+pub mod ingress_mode;
+pub mod network_policy_profiles;
+pub mod network_policy_rules;
+pub mod network_policy_state;
+pub mod node_network_policy_modes;
+// ADR-055 Phase 5: deployment workload mode and node resource settings
+pub mod environment_workload_mode;
+pub mod node_resource_settings;
+
+// ADR-055 Phase 4: databases onto the workload plane
+pub mod external_service_workload_mode;
+
+// ADR-055 Phase 9: volumes for deployments; backups as jobs
+pub mod workload_volume_attachments;
+pub mod workload_volumes;
+// ADR-055 Phase 10: functions
+pub mod functions;
+// ADR-055 Phase 10: Firecracker for deployments
+pub mod environment_workload_isolation;
+
+pub mod access_bundles;
+pub mod access_service_audit_scopes;
+pub mod access_sessions;
+pub mod access_vault_links;
+pub mod access_vault_service_history;
+pub mod access_vaults;
+pub mod external_plugin_actors;
+
+pub mod workflow_grants;
+
+pub mod workflow_deployment_drains;
+
+pub mod workflow_dev_requests;
+pub mod workflow_dev_sessions;

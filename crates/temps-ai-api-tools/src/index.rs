@@ -38,7 +38,12 @@
 //! | Object required      | `obj.required: Vec<String>`                               |
 //! | $ref location        | `Ref::ref_location: String`                               |
 
-use std::collections::BTreeMap;
+mod plugin;
+pub use plugin::{PluginTool, PluginToolAccess, PluginToolsError, PluginToolsIndex};
+
+use std::collections::{BTreeMap, HashMap};
+
+use crate::secrets::{secret_paths_for_request_body, SecretPath};
 
 use serde::{Deserialize, Serialize};
 use utoipa::openapi::{
@@ -180,6 +185,9 @@ impl ObjectShape {
 /// Compact description of a single parameter, extracted from the utoipa schema.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParamSpec {
+    /// Plugin query wire format. None preserves the curated core API behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_serialization: Option<crate::QuerySerialization>,
     /// Parameter name as it appears in the path template, query string, or
     /// request body JSON object.
     pub name: String,
@@ -188,10 +196,19 @@ pub struct ParamSpec {
     /// Whether the parameter must be supplied (path params are always required).
     pub required: bool,
     /// JSON Schema type as a short string ("string", "integer", "number",
-    /// "boolean", "array", "object", or "any").  Derived from the utoipa
+    /// "boolean", "array", "object", "any", or "json" for composite plugin
+    /// inputs requiring explicit JSON encoding). Derived from the utoipa
     /// `SchemaType`; defaults to "string" when the schema is absent or
     /// is a `$ref` (the full schema is not resolved here — Phase 2).
     pub ty: String,
+    /// Item type of an `"array"` body parameter (same vocabulary as `ty`:
+    /// "string", "integer", "number", "boolean", "array", "object", or "any").
+    /// `None` for non-arrays and for arrays whose item schema is unknown.
+    /// Request bodies are the only place arrays are modelled: a CLI token has
+    /// no intrinsic type, so without this `--environment_ids 15` was sent as
+    /// the scalar `15` (or the string `"15"`) where the API wants `[15]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_ty: Option<String>,
     /// Enum variants if the parameter schema declares them.  Empty when the
     /// parameter accepts any value.
     pub enum_values: Vec<String>,
@@ -207,6 +224,12 @@ pub struct ParamSpec {
 /// A single operation kept in the index (GET *or* an allowlisted write method).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiOperation {
+    /// Plugin JSON body metadata, including schemas with no flattened fields.
+    #[serde(default)]
+    pub has_json_body: bool,
+    /// Host-owned plugin consent; never inferred from untrusted descriptions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_enabled: Option<bool>,
     /// Stable identifier for this operation, used as the tool call name.
     pub operation_id: String,
     /// URL path template, e.g. `/projects/{project_id}/deployments/{id}`.
@@ -232,6 +255,9 @@ pub struct ApiOperation {
 /// Compact view returned by [`ReadOnlyApiIndex::search`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OperationSummary {
+    pub source_plugin: Option<String>,
+    pub enabled: bool,
+    pub setup_path: Option<String>,
     pub operation_id: String,
     pub method: String,
     pub path: String,
@@ -242,7 +268,17 @@ pub struct OperationSummary {
 
 impl From<&ApiOperation> for OperationSummary {
     fn from(op: &ApiOperation) -> Self {
+        let source_plugin = op
+            .operation_id
+            .strip_prefix("plugin.")
+            .and_then(|id| id.split_once('.'))
+            .map(|(name, _)| name.to_owned());
         Self {
+            setup_path: source_plugin
+                .as_ref()
+                .map(|name| format!("/plugins/{name}")),
+            source_plugin,
+            enabled: op.plugin_enabled.unwrap_or(true),
             operation_id: op.operation_id.clone(),
             method: op.method.clone(),
             path: op.path.clone(),
@@ -308,6 +344,24 @@ pub struct ReadOnlyApiIndex {
     /// `tags`. Used to describe CLI sections in `--help`. Empty when the
     /// document declares no tag descriptions.
     tag_descriptions: BTreeMap<String, String>,
+    /// `operation_id` → where in its request body a credential goes (fields the
+    /// API flagged `x-temps-secret`). Only operations that have such fields are
+    /// present. Computed once, at construction, from the OpenAPI document.
+    secret_paths: HashMap<String, Vec<SecretPath>>,
+}
+
+/// The document's `components`, serialized once so request-body schemas can be
+/// walked as JSON. `Null` when the document has none.
+fn components_json(openapi: &utoipa::openapi::OpenApi) -> serde_json::Value {
+    serde_json::to_value(&openapi.components).unwrap_or(serde_json::Value::Null)
+}
+
+/// The credential paths for `op`'s request body, keyed for [`ReadOnlyApiIndex`].
+fn secret_paths_of(op: &Operation, components: &serde_json::Value) -> Vec<SecretPath> {
+    match op.request_body.as_ref().map(serde_json::to_value) {
+        Some(Ok(body)) => secret_paths_for_request_body(&body, components),
+        _ => Vec::new(),
+    }
 }
 
 /// Extract `tag name → description` from the OpenAPI document's top-level tags.
@@ -351,6 +405,7 @@ impl ReadOnlyApiIndex {
         Self {
             operations,
             tag_descriptions: extract_tag_descriptions(openapi),
+            secret_paths: HashMap::new(),
         }
     }
 
@@ -381,6 +436,7 @@ impl ReadOnlyApiIndex {
         Self {
             operations,
             tag_descriptions: extract_tag_descriptions(openapi),
+            secret_paths: HashMap::new(),
         }
     }
 
@@ -422,6 +478,7 @@ impl ReadOnlyApiIndex {
         safe_posts: &[&str],
     ) -> Self {
         let mut index = Self::from_openapi_allowlist(openapi, allowlist);
+        let components = components_json(openapi);
 
         for (path, path_item) in &openapi.paths.paths {
             let Some(op) = path_item.post.as_ref() else {
@@ -434,6 +491,10 @@ impl ReadOnlyApiIndex {
                 continue;
             }
             let body_params = resolve_body_params(op, openapi);
+            let credential_paths = secret_paths_of(op, &components);
+            if !credential_paths.is_empty() {
+                index.secret_paths.insert(op_id.clone(), credential_paths);
+            }
             index.operations.push(build_api_operation(
                 op_id.clone(),
                 path.clone(),
@@ -467,6 +528,8 @@ impl ReadOnlyApiIndex {
         allowlist: &[&str],
     ) -> Self {
         let mut operations = Vec::new();
+        let mut secret_paths = HashMap::new();
+        let components = components_json(openapi);
 
         // Pre-build a slice of (method-string, Option<Operation>) pairs from
         // each path_item so we can iterate uniformly.
@@ -498,6 +561,10 @@ impl ReadOnlyApiIndex {
                     &body_params,
                     openapi,
                 );
+                let credential_paths = secret_paths_of(op, &components);
+                if !credential_paths.is_empty() {
+                    secret_paths.insert(op_id.clone(), credential_paths);
+                }
                 operations.push(api_op);
             }
         }
@@ -505,12 +572,22 @@ impl ReadOnlyApiIndex {
         Self {
             operations,
             tag_descriptions: extract_tag_descriptions(openapi),
+            secret_paths,
         }
     }
 
     /// All indexed operations, in document order.
     pub fn operations(&self) -> &[ApiOperation] {
         &self.operations
+    }
+
+    /// Where in `operation_id`'s request body a credential goes, i.e. the fields
+    /// the API declared `x-temps-secret`. Empty for operations that take none.
+    pub fn secret_fields(&self, operation_id: &str) -> &[SecretPath] {
+        self.secret_paths
+            .get(operation_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 
     /// Human description for a tag/section, from the OpenAPI top-level tags.
@@ -674,6 +751,8 @@ fn build_api_operation(
     params.extend_from_slice(extra_params);
 
     ApiOperation {
+        has_json_body: false,
+        plugin_enabled: None,
         operation_id,
         path,
         method: method.to_string(),
@@ -758,10 +837,19 @@ fn resolve_body_params(op: &Operation, openapi: &utoipa::openapi::OpenApi) -> Ve
         // them before extracting their type; treating a string enum as an opaque
         // object makes the CLI tell the model to JSON-encode a value that the API
         // actually expects as a plain string.
-        let (mut ty, enum_values) = match deref_schema(prop_schema, openapi) {
+        let resolved_prop = deref_schema(prop_schema, openapi);
+        let (mut ty, enum_values) = match resolved_prop {
             Some(schema) => extract_schema_type_and_enum(schema),
             None => ("string".to_string(), vec![]),
         };
+        // `Vec<T>` / `Option<Vec<T>>` fields are `Schema::Array`, which the
+        // generic extractor above does not understand (it reports "string").
+        // Typing them as arrays is what lets the CLI wrap a bare `15` into
+        // `[15]` and coerce each item to the declared item type.
+        let item_ty = resolved_prop.and_then(|schema| array_item_type(schema, openapi));
+        if item_ty.is_some() {
+            ty = "array".to_string();
+        }
         let object_shape =
             resolve_object_shape(prop_schema, openapi).filter(ObjectShape::is_informative);
         // A resolved object shape is authoritative even when utoipa encodes it
@@ -771,6 +859,10 @@ fn resolve_body_params(op: &Operation, openapi: &utoipa::openapi::OpenApi) -> Ve
         if object_shape.is_some() {
             ty = "object".to_string();
         }
+
+        // An array of objects: say what one element looks like. The model
+        // cannot guess `{service_id, version}` from "<json array of objects>".
+        let item_shape = resolved_prop.and_then(|schema| array_item_shape(schema, openapi));
 
         // Description from the property schema.
         //
@@ -786,17 +878,67 @@ fn resolve_body_params(op: &Operation, openapi: &utoipa::openapi::OpenApi) -> Ve
             _ => None,
         };
 
+        let description = match (description, item_shape) {
+            (description, Some(shape)) => {
+                let items = format!("each item is an {}", shape.describe());
+                Some(match description {
+                    Some(text) => format!("{text} ({items})"),
+                    None => items,
+                })
+            }
+            (description, None) => description,
+        };
+
         params.push(ParamSpec {
+            query_serialization: None,
             name: prop_name.clone(),
             location: ParamLocation::Body,
             required,
             ty,
+            item_ty,
             enum_values,
             description,
             object_shape,
         });
     }
     params
+}
+
+/// When `schema` is an array — or a nullable wrapper around exactly one array,
+/// which is how `Option<Vec<T>>` may be encoded — return the item type in the
+/// short vocabulary of [`ParamSpec::ty`]. `None` for anything that is not an
+/// array.
+fn array_item_type(schema: &Schema, openapi: &utoipa::openapi::OpenApi) -> Option<String> {
+    use utoipa::openapi::schema::ArrayItems;
+    match schema {
+        Schema::Array(array) => Some(match &array.items {
+            ArrayItems::RefOrSchema(item) => match deref_schema(item, openapi) {
+                Some(Schema::Array(_)) => "array".to_string(),
+                Some(item_schema) => match extract_schema_type_and_enum(item_schema).0.as_str() {
+                    // An item that does not resolve to a typed scalar/object.
+                    "null" => "any".to_string(),
+                    ty => ty.to_string(),
+                },
+                None => "any".to_string(),
+            },
+            ArrayItems::False => "any".to_string(),
+        }),
+        Schema::OneOf(one_of) => {
+            let mut non_null = one_of.items.iter().filter(|item| {
+                !matches!(
+                    deref_schema(item, openapi),
+                    Some(Schema::Object(o)) if schema_type_to_string(&o.schema_type) == "null"
+                )
+            });
+            match (non_null.next(), non_null.next()) {
+                (Some(only), None) => {
+                    deref_schema(only, openapi).and_then(|inner| array_item_type(inner, openapi))
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 /// Resolve a body property's schema into an [`ObjectShape`], if it names one.
@@ -905,15 +1047,25 @@ fn variant_shape(
     item: &RefOr<Schema>,
     openapi: &utoipa::openapi::OpenApi,
 ) -> Option<(String, String, Vec<ObjectField>)> {
-    let Schema::AllOf(all_of) = deref_schema(item, openapi)? else {
-        return None;
+    // A newtype variant is an `allOf` of the payload `$ref` and the tag object.
+    // A struct variant (`Sandbox { sandbox_id }`) is one plain object that
+    // carries the tag next to its own fields.
+    let resolved = deref_schema(item, openapi)?;
+    let members: Vec<&Schema> = match resolved {
+        Schema::AllOf(all_of) => all_of
+            .items
+            .iter()
+            .filter_map(|member| deref_schema(member, openapi))
+            .collect(),
+        Schema::Object(_) => vec![resolved],
+        _ => return None,
     };
 
     let mut fields: Vec<ObjectField> = Vec::new();
     let mut tag: Option<(String, String)> = None;
 
-    for member in &all_of.items {
-        let Some(Schema::Object(o)) = deref_schema(member, openapi) else {
+    for member in members {
+        let Schema::Object(o) = member else {
             continue;
         };
         for field in object_fields(o, openapi) {
@@ -939,6 +1091,19 @@ fn variant_shape(
     Some((tag_prop, tag_value, fields))
 }
 
+/// The shape of each item of an array of objects, so `--services` can say what
+/// one element looks like instead of only "a json array of objects".
+fn array_item_shape(schema: &Schema, openapi: &utoipa::openapi::OpenApi) -> Option<ObjectShape> {
+    use utoipa::openapi::schema::ArrayItems;
+    let Schema::Array(array) = schema else {
+        return None;
+    };
+    let ArrayItems::RefOrSchema(item) = &array.items else {
+        return None;
+    };
+    resolve_object_shape(item, openapi).filter(ObjectShape::is_informative)
+}
+
 /// Convert a single utoipa [`Parameter`] into a [`ParamSpec`].
 ///
 /// Returns `None` for Header and Cookie parameters (not modelled by this crate).
@@ -955,10 +1120,12 @@ fn build_param_spec(param: &utoipa::openapi::path::Parameter) -> Option<ParamSpe
     let (ty, enum_values) = extract_type_and_enum(param.schema.as_ref());
 
     Some(ParamSpec {
+        query_serialization: None,
         name: param.name.clone(),
         location,
         required,
         ty,
+        item_ty: None,
         enum_values,
         description: param.description.clone(),
         // Path/query params are scalars in this API; only body fields carry
@@ -981,8 +1148,14 @@ pub(crate) fn extract_type_and_enum(schema: Option<&RefOr<Schema>>) -> (String, 
 }
 
 fn extract_schema_type_and_enum(schema: &Schema) -> (String, Vec<String>) {
-    let Schema::Object(obj) = schema else {
-        return ("string".to_string(), vec![]);
+    let obj = match schema {
+        Schema::Object(obj) => obj,
+        // A list field (`Vec<T>`) is its own schema kind, not an object.
+        // Reporting it as a string made the CLI keep `--files '[...]'` as
+        // opaque text, which the validator accepted and the API then refused
+        // ("invalid type: string ..., expected a sequence").
+        Schema::Array(_) => return ("array".to_string(), vec![]),
+        _ => return ("string".to_string(), vec![]),
     };
 
     let ty = schema_type_to_string(&obj.schema_type);
@@ -1646,6 +1819,87 @@ mod tests {
         assert_eq!(service_type.enum_values, vec!["postgres", "redis"]);
     }
 
+    /// A list-of-objects body field (`files` of `commit_repository_files`) must
+    /// be typed `array`. Typed `string`, the CLI kept the model's JSON as text
+    /// and the API rejected it as "expected a sequence".
+    #[test]
+    fn write_allowlist_types_a_list_body_field_as_an_array() {
+        use utoipa::openapi::{
+            path::{HttpMethod, OperationBuilder, PathItem, PathsBuilder},
+            request_body::RequestBodyBuilder,
+            schema::{ArrayBuilder, ComponentsBuilder},
+            ContentBuilder, OpenApiBuilder,
+        };
+
+        let file = ObjectBuilder::new()
+            .property(
+                "path",
+                ObjectBuilder::new().schema_type(SchemaType::Type(Type::String)),
+            )
+            .required("path")
+            .build();
+        let request = ObjectBuilder::new()
+            .property(
+                "files",
+                ArrayBuilder::new().items(RefOr::Ref(utoipa::openapi::Ref::from_schema_name(
+                    "CommitFile",
+                ))),
+            )
+            .required("files")
+            .property(
+                "message",
+                ObjectBuilder::new().schema_type(SchemaType::Type(Type::String)),
+            )
+            .build();
+        let api = OpenApiBuilder::new()
+            .paths(
+                PathsBuilder::new()
+                    .path(
+                        "/commits",
+                        PathItem::new(
+                            HttpMethod::Post,
+                            OperationBuilder::new()
+                                .operation_id(Some("commit_files"))
+                                .request_body(Some(
+                                    RequestBodyBuilder::new()
+                                        .content(
+                                            "application/json",
+                                            ContentBuilder::new()
+                                                .schema(Some(RefOr::Ref(
+                                                    utoipa::openapi::Ref::from_schema_name(
+                                                        "CommitRequest",
+                                                    ),
+                                                )))
+                                                .build(),
+                                        )
+                                        .build(),
+                                ))
+                                .build(),
+                        ),
+                    )
+                    .build(),
+            )
+            .components(Some(
+                ComponentsBuilder::new()
+                    .schema("CommitFile", file)
+                    .schema("CommitRequest", request)
+                    .build(),
+            ))
+            .build();
+
+        let index = ReadOnlyApiIndex::from_openapi_write_allowlist(&api, &["commit_files"]);
+        let op = index.get("commit_files").expect("commit_files");
+        let files = op.params.iter().find(|p| p.name == "files").expect("files");
+        assert_eq!(files.ty, "array");
+        assert!(files.required);
+        let message = op
+            .params
+            .iter()
+            .find(|p| p.name == "message")
+            .expect("message");
+        assert_eq!(message.ty, "string");
+    }
+
     #[test]
     fn write_allowlist_resolves_inline_body_with_enum() {
         // update_project body is an inline object with `status` (required, enum).
@@ -1956,6 +2210,103 @@ mod tests {
         );
     }
 
+    /// Found against a live model: `create_access_session_general` takes a
+    /// `consumer` that is an internally tagged enum whose variant is a struct
+    /// (`Sandbox { sandbox_id }`), which utoipa emits as a plain object, not an
+    /// `allOf`. The shape resolver only knew the `allOf` form, so `--help` showed
+    /// a bare string flag and the model sent `sandbox:sbx_x` and a quoted JSON
+    /// string; both were rejected with HTTP 422. The services list is an array
+    /// of objects whose element shape was equally invisible.
+    #[test]
+    fn struct_variant_union_and_array_items_are_described_for_the_model() {
+        // The schemas as utoipa emits them for the real request types.
+        let api: utoipa::openapi::OpenApi = serde_json::from_value(serde_json::json!({
+            "openapi": "3.1.0",
+            "info": {"title": "Test API", "version": "1.0.0"},
+            "paths": {
+                "/access-sessions": {
+                    "post": {
+                        "operationId": "create_access_session_general",
+                        "requestBody": {
+                            "required": true,
+                            "content": {"application/json": {"schema": {
+                                "$ref": "#/components/schemas/CreateAccessSession"
+                            }}}
+                        },
+                        "responses": {"201": {"description": "created"}}
+                    }
+                }
+            },
+            "components": {"schemas": {
+                "CreateAccessSession": {
+                    "type": "object",
+                    "required": ["bundle_id", "consumer", "services"],
+                    "properties": {
+                        "bundle_id": {"type": "string"},
+                        "consumer": {"$ref": "#/components/schemas/AccessSessionConsumer"},
+                        "services": {
+                            "type": "array",
+                            "description": "Exact policies the operator reviewed.",
+                            "items": {"$ref": "#/components/schemas/SessionServiceVersion"}
+                        }
+                    }
+                },
+                "AccessSessionConsumer": {
+                    "oneOf": [{
+                        "type": "object",
+                        "required": ["sandbox_id", "kind"],
+                        "properties": {
+                            "kind": {"type": "string", "enum": ["sandbox"]},
+                            "sandbox_id": {"type": "string"}
+                        }
+                    }]
+                },
+                "SessionServiceVersion": {
+                    "type": "object",
+                    "required": ["service_id", "version"],
+                    "properties": {
+                        "service_id": {"type": "string"},
+                        "version": {"type": "integer", "format": "int32"}
+                    }
+                }
+            }}
+        }))
+        .expect("the fragment parses");
+        let index = ReadOnlyApiIndex::from_openapi_write_allowlist(
+            &api,
+            &["create_access_session_general"],
+        );
+        let op = index
+            .get("create_access_session_general")
+            .expect("the operation is in the committed spec");
+
+        let consumer = op
+            .params
+            .iter()
+            .find(|p| p.name == "consumer")
+            .expect("consumer flag");
+        assert_eq!(consumer.ty, "object", "a quoted JSON flag must be decoded");
+        let shape = consumer
+            .object_shape
+            .as_ref()
+            .expect("the struct-variant union resolves");
+        assert_eq!(shape.discriminator.as_deref(), Some("kind"));
+        assert!(shape
+            .describe()
+            .contains("{\"kind\": \"sandbox\", \"sandbox_id\": <string>}"));
+
+        let services = op
+            .params
+            .iter()
+            .find(|p| p.name == "services")
+            .expect("services flag");
+        let description = services.description.as_deref().unwrap_or_default();
+        assert!(
+            description.contains("service_id") && description.contains("version"),
+            "{description}"
+        );
+    }
+
     /// `Option<T>` must report `T`, not "array".
     ///
     /// utoipa encodes a nullable field as `type: ["string", "null"]`, which is
@@ -2051,5 +2402,105 @@ mod tests {
             0,
             "PATCH/DELETE must be structurally unreachable from the read index"
         );
+    }
+
+    fn array_body_openapi() -> utoipa::openapi::OpenApi {
+        serde_json::from_value(serde_json::json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {
+                "/projects/{project_id}/env-vars": {
+                    "post": {
+                        "operationId": "create_environment_variable",
+                        "tags": ["Projects"],
+                        "parameters": [{
+                            "name": "project_id", "in": "path", "required": true,
+                            "schema": { "type": "integer", "format": "int32" }
+                        }],
+                        "requestBody": {
+                            "required": true,
+                            "content": { "application/json": { "schema": {
+                                "$ref": "#/components/schemas/CreateEnvVarRequest"
+                            }}}
+                        },
+                        "responses": { "201": { "description": "created" } }
+                    }
+                }
+            },
+            "components": { "schemas": {
+                "LogLevel": { "type": "string", "enum": ["info", "error"] },
+                "CreateEnvVarRequest": {
+                    "type": "object",
+                    "required": ["key", "environment_ids"],
+                    "properties": {
+                        "key": { "type": "string" },
+                        "environment_ids": {
+                            "type": "array",
+                            "items": { "type": "integer", "format": "int32" }
+                        },
+                        "labels": {
+                            "type": ["array", "null"],
+                            "items": { "type": "string" }
+                        },
+                        "levels": {
+                            "type": "array",
+                            "items": { "$ref": "#/components/schemas/LogLevel" }
+                        },
+                        "nullable_ids": {
+                            "oneOf": [
+                                { "type": "null" },
+                                { "type": "array", "items": { "type": "integer" } }
+                            ]
+                        },
+                        "matrix": {
+                            "type": "array",
+                            "items": { "type": "array", "items": { "type": "string" } }
+                        },
+                        "include_in_preview": { "type": "boolean" }
+                    }
+                }
+            }}
+        }))
+        .expect("test OpenAPI document parses")
+    }
+
+    #[test]
+    fn body_array_fields_are_typed_as_arrays_with_their_item_type() {
+        let api = array_body_openapi();
+        let index =
+            ReadOnlyApiIndex::from_openapi_write_allowlist(&api, &["create_environment_variable"]);
+        let op = index
+            .get("create_environment_variable")
+            .expect("operation is indexed");
+        let param = |name: &str| {
+            op.params
+                .iter()
+                .find(|p| p.name == name)
+                .unwrap_or_else(|| panic!("param {name} missing"))
+        };
+
+        let ids = param("environment_ids");
+        assert_eq!(ids.ty, "array");
+        assert_eq!(ids.item_ty.as_deref(), Some("integer"));
+        assert!(ids.required);
+
+        // `Option<Vec<String>>` encoded as a `["array", "null"]` type union.
+        assert_eq!(param("labels").ty, "array");
+        assert_eq!(param("labels").item_ty.as_deref(), Some("string"));
+
+        // A `$ref`'d string enum item is a string on the wire.
+        assert_eq!(param("levels").item_ty.as_deref(), Some("string"));
+
+        // `Option<Vec<T>>` encoded as `oneOf: [null, array]`.
+        assert_eq!(param("nullable_ids").ty, "array");
+        assert_eq!(param("nullable_ids").item_ty.as_deref(), Some("integer"));
+
+        assert_eq!(param("matrix").item_ty.as_deref(), Some("array"));
+
+        // Scalars are untouched.
+        assert_eq!(param("key").ty, "string");
+        assert_eq!(param("key").item_ty, None);
+        assert_eq!(param("include_in_preview").ty, "boolean");
+        assert_eq!(param("include_in_preview").item_ty, None);
     }
 }

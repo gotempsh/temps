@@ -55,3 +55,11 @@ test('an active turn disables recovery mutations', () => {
     /disabled=""/
   )
 })
+
+test('a gateway chat is sent to AI Gateway settings, never to a harness page', () => {
+  for (const provider of ['gateway', 'gateway_key:1']) {
+    const html = render('provider_quota_exhausted', provider)
+    expect(html).toContain('href="/ai-gateway"')
+    expect(html).not.toContain('/agent-sandbox/providers')
+  }
+})

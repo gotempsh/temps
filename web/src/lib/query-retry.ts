@@ -36,3 +36,16 @@ export function shouldRetryQuery(
   }
   return failureCount < MAX_QUERY_RETRIES
 }
+
+/**
+ * `refetchInterval` for a polled read: every `intervalMs`, except that a read
+ * the server has refused (401/403) is not asked again on a timer. The refusal
+ * is as deterministic as a 404, so repeating it for as long as a tab stays
+ * open only produces requests that cannot succeed.
+ */
+export function refetchUnlessRefused(intervalMs: number) {
+  return (query: { state: { error: unknown } }): number | false => {
+    const status = httpStatusOf(query.state.error)
+    return status === 401 || status === 403 ? false : intervalMs
+  }
+}

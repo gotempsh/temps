@@ -78,7 +78,7 @@ export function SecretPage({
       ) : (
         <SecretDetails
           key={secret.id}
-          projectId={project.id}
+          project={project}
           secret={secret}
           detailPath={detailPath}
         />

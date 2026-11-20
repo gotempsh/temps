@@ -8,6 +8,18 @@
 //! that the role records flip atomically. Skips gracefully when Docker
 //! isn't available.
 
+// Integration-test crate: clippy's `allow-*-in-tests` only covers `#[test]`
+// fns and `cfg(test)` modules, not the fixture helpers here, where a panic is
+// the intended failure.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test fixtures; a panic fails the test"
+)]
+#![allow(
+    clippy::disallowed_methods,
+    reason = "integration test: reads fixture configuration from the environment"
+)]
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -18,7 +30,12 @@ use temps_providers::externalsvc::postgres_role_reconciler::{drafts_for_snapshot
 use testcontainers::{runners::AsyncRunner, GenericImage, ImageExt};
 
 async fn boot_db() -> Option<Arc<sea_orm::DatabaseConnection>> {
-    if std::env::var("TEMPS_TEST_DATABASE_URL").is_ok() {
+    // CI's migrations group can only empty this variable, not unset it, so empty
+    // has to mean "not configured" or this test never reaches its checks.
+    if std::env::var("TEMPS_TEST_DATABASE_URL")
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
+    {
         eprintln!("⏭️  TEMPS_TEST_DATABASE_URL set — skipping reconciler integration test");
         return None;
     }
@@ -65,6 +82,8 @@ fn node(id: i64, host: &str, state: &str) -> MonitorNode {
         nodehost: host.into(),
         nodeport: 6001,
         reported_state: state.into(),
+        goal_state: state.into(),
+        health: 1,
     }
 }
 

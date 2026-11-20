@@ -181,11 +181,8 @@ pub fn parse_cidr(raw: &str) -> Result<IpNet, AdminGateConfigError> {
         return Ok(net);
     }
     if let Ok(ip) = trimmed.parse::<IpAddr>() {
-        let net = match ip {
-            IpAddr::V4(v4) => IpNet::V4(ipnet::Ipv4Net::new(v4, 32).unwrap()),
-            IpAddr::V6(v6) => IpNet::V6(ipnet::Ipv6Net::new(v6, 128).unwrap()),
-        };
-        return Ok(net);
+        // `From<IpAddr>` yields the host network (/32 for v4, /128 for v6).
+        return Ok(IpNet::from(ip));
     }
     Err(AdminGateConfigError::InvalidCidr {
         raw: trimmed.to_string(),

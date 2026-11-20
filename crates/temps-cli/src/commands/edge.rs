@@ -71,9 +71,15 @@ impl EdgeCommand {
             println!("Registering edge node with origin...");
             rt.block_on(temps_edge::server::register_with_origin(&mut config))?;
             config.save()?;
+            let node_id = config.node_id.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Edge registration with origin {} completed but returned no node id",
+                    config.origin_url
+                )
+            })?;
             println!(
                 "Registered as edge node #{} — config saved to {:?}",
-                config.node_id.unwrap(),
+                node_id,
                 temps_edge::EdgeConfig::config_path()
             );
             drop(rt);

@@ -1,51 +1,58 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { expect, test } from '@playwright/test'
+import { expect, test, type Page } from '@playwright/test'
+import {
+  PROJECT_GROUPS_LIST_API,
+  PROJECTS_LIST_API,
+  projectGroupsListBody,
+  serviceFixture,
+  servicesListBody,
+} from '../fixtures'
 
-const projects = ['Billing API', 'Documentation', 'Storefront'].map(
-  (name, index) => ({
-    id: 900001 + index,
-    name,
-    slug: name.toLowerCase().replace(/ /g, '-'),
-    source_type: 'git',
-    project_type: 'app',
-    main_branch: 'main',
-    directory: '.',
-    preset: 'nextjs',
-    created_at: 1788951600,
-    updated_at: 1788951600,
-    deployment_config: {},
-    last_deployment: null,
-  })
+const services = ['Billing API', 'Documentation', 'Storefront'].map(
+  (name, index) => serviceFixture(900001 + index, name)
 )
 
+/** No project groups: every service is listed on its own. */
+async function mockNoGroups(page: Page) {
+  await page.route(PROJECT_GROUPS_LIST_API, (route) =>
+    route.fulfill({ json: projectGroupsListBody([]) })
+  )
+}
+
 for (const width of [1440, 390]) {
-  test(`project search survives reload and clears at ${width}px`, async ({
+  test(`service search survives reload and clears at ${width}px`, async ({
     page,
   }) => {
     await page.setViewportSize({ width, height: 1000 })
     const errors: string[] = []
     page.on('pageerror', (error) => errors.push(error.message))
-    await page.route(/\/api\/projects(?:\?|$)/, (route) =>
-      route.fulfill({ json: { projects, total: 3 } })
-    )
+    const searches: (string | null)[] = []
+    await mockNoGroups(page)
+    await page.route(PROJECTS_LIST_API, (route) => {
+      const url = new URL(route.request().url())
+      searches.push(url.searchParams.get('search'))
+      return route.fulfill({ json: servicesListBody(url, services) })
+    })
     await page.goto('/projects')
     const search = page.getByRole('textbox', {
-      name: 'Filter projects by name or slug',
+      name: 'Filter projects and services by name or slug',
     })
     await expect(search).toBeVisible()
     await search.fill('billing')
     await expect(page).toHaveURL(/q=billing/)
+    // The filter is applied by the server, not by hiding cards client-side.
+    await expect.poll(() => searches).toContain('billing')
     await expect(page.getByRole('link', { name: /Billing API/ })).toBeVisible()
     await expect(page.getByRole('link', { name: /Documentation/ })).toHaveCount(
       0
     )
     await page.reload()
     await expect(search).toHaveValue('billing')
-    await search.fill('missing-project')
+    await search.fill('missing-service')
     await expect(
-      page.getByText('No matching projects', { exact: true })
+      page.getByText('No matching projects or services', { exact: true })
     ).toBeVisible()
     await page
       .getByRole('button', { name: 'Clear filter', exact: true })
@@ -68,27 +75,32 @@ for (const width of [1440, 390]) {
   })
 }
 
-test('project load failure offers retry instead of claiming no matching projects', async ({
+test('service load failure offers retry instead of claiming no matching services', async ({
   page,
 }) => {
   let fail = true
-  await page.route(/\/api\/projects(?:\?|$)/, (route) =>
+  await mockNoGroups(page)
+  await page.route(PROJECTS_LIST_API, (route) =>
     fail
-      ? route.fulfill({ status: 503, json: { title: 'Projects unavailable' } })
-      : route.fulfill({ json: { projects, total: 3 } })
+      ? route.fulfill({ status: 503, json: { title: 'Services unavailable' } })
+      : route.fulfill({
+          json: servicesListBody(new URL(route.request().url()), services),
+        })
   )
   await page.goto('/projects')
   await expect(
-    page.getByText('Projects could not be loaded', { exact: true })
+    page.getByText('Services could not be loaded', { exact: true })
   ).toBeVisible({ timeout: 30000 })
   await expect(
-    page.getByText('No matching projects', { exact: true })
+    page.getByText('No matching projects or services', { exact: true })
   ).toHaveCount(0)
+  // Groups loaded fine, so their own failure notice must not show.
+  await expect(page.getByText(/^Projects could not be loaded/)).toHaveCount(0)
   fail = false
-  await page.getByRole('button', { name: 'Retry loading projects' }).click()
+  await page.getByRole('button', { name: 'Retry loading services' }).click()
   await expect(page.getByRole('link', { name: /Billing API/ })).toBeVisible()
   await expect(
-    page.getByText('Projects could not be loaded', { exact: true })
+    page.getByText('Services could not be loaded', { exact: true })
   ).toHaveCount(0)
 })
 
@@ -100,13 +112,16 @@ test('loading keeps a responsive card grid before results arrive', async ({
   const held = new Promise<void>((resolve) => {
     release = resolve
   })
-  await page.route(/\/api\/projects(?:\?|$)/, async (route) => {
+  await mockNoGroups(page)
+  await page.route(PROJECTS_LIST_API, async (route) => {
     await held
-    await route.fulfill({ json: { projects, total: 3 } })
+    await route.fulfill({
+      json: servicesListBody(new URL(route.request().url()), services),
+    })
   })
   try {
     await page.goto('/projects')
-    const loading = page.locator('[aria-label="Loading projects"]')
+    const loading = page.locator('[aria-label="Loading projects and services"]')
     await expect(loading).toBeVisible()
     await expect(loading.locator(':scope > div')).toHaveCount(9)
     expect(
@@ -121,7 +136,9 @@ test('loading keeps a responsive card grid before results arrive', async ({
       localStorage.setItem('theme', 'dark')
     })
     await expect(
-      page.getByRole('textbox', { name: 'Filter projects by name or slug' })
+      page.getByRole('textbox', {
+        name: 'Filter projects and services by name or slug',
+      })
     ).toBeVisible()
     await page.reload()
     await expect(page.getByRole('link', { name: /Billing API/ })).toBeVisible()

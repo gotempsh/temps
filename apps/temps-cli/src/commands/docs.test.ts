@@ -35,6 +35,29 @@ describe('generateDocs', () => {
     }
   })
 
+  test('shows the positional arguments a command requires', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'temps-cli-docs-'))
+    tempDirs.push(directory)
+    const output = join(directory, 'COMMANDS.md')
+
+    await generateDocs({ format: 'markdown', output })
+
+    const markdown = await readFile(output, 'utf8')
+    const section = markdown.slice(markdown.indexOf('### `errors release`\n'))
+    // The heading stays the bare name; the argument is in the usage line.
+    expect(section.split('\n### ')[0]).toContain(
+      '**Usage:** `errors release <release> [options]`',
+    )
+    const { createProgram } = await import('../cli.js')
+    const { commandArguments } = await import('./docs.js')
+    const program = createProgram()
+    const errors = program.commands.find((command) => command.name() === 'errors')
+    const release = errors?.commands.find((command) => command.name() === 'release')
+    expect(release && commandArguments(release)).toBe('<release>')
+    const releases = errors?.commands.find((command) => command.name() === 'releases')
+    expect(releases && commandArguments(releases)).toBe('')
+  })
+
   test('hides unimplemented commands from help but keeps them runnable', async () => {
     const { createProgram } = await import('../cli.js')
     const program = createProgram()
@@ -73,23 +96,23 @@ describe('generateDocs', () => {
     expect(skill.split('\n').length).toBeLessThanOrEqual(500)
     expect(skill).toContain('[references/COMMANDS.md](references/COMMANDS.md)')
     expect(skill).toContain('[references/WORKFLOWS.md](references/WORKFLOWS.md)')
-    expect(skill).toContain('bunx @temps-sdk/cli@0.1.37')
+    expect(skill).toContain('bunx @temps-sdk/cli@latest')
     expect(skill).not.toContain('npm install --global')
     expect(commandReference).toContain('## Command index')
-    expect(commandReference).toContain('bunx @temps-sdk/cli@0.1.37 [command]')
+    expect(commandReference).toContain('bunx @temps-sdk/cli@latest [command]')
     expect(commandReference).toContain('[`backups`](#backups)')
     expect(commandReference).toContain('[`otel-forward`](#otel-forward)')
     expect(commandReference).toContain(
-      'bunx @temps-sdk/cli@0.1.37 --target-context production projects create --name my-app',
+      'bunx @temps-sdk/cli@latest --target-context production projects create --name my-app',
     )
     expect(commandReference).toContain(
-      'bunx @temps-sdk/cli@0.1.37 --target-context production environments vars set --project my-app DATABASE_URL --environments production',
+      'bunx @temps-sdk/cli@latest --target-context production environments vars set --project my-app DATABASE_URL --environments production',
     )
     expect(commandReference).toContain(
-      'bunx @temps-sdk/cli@0.1.37 --target-context production domains add --domain app.example.com',
+      'bunx @temps-sdk/cli@latest --target-context production domains add --domain app.example.com',
     )
     expect(commandReference).toContain(
-      'bunx @temps-sdk/cli@0.1.37 --target-context production domains remove --domain app.example.com',
+      'bunx @temps-sdk/cli@latest --target-context production domains remove --domain app.example.com',
     )
     expect(commandReference).toContain('| `-n, --limit <number>` | Limit results | `10` | No |')
   })
@@ -127,7 +150,7 @@ describe('generateDocs', () => {
     expect(skill.split('\n').length).toBeLessThanOrEqual(500)
     expect(skill).toContain('[references/commands/INDEX.md](references/commands/INDEX.md)')
     expect(skill).toContain('[howtos/observability-onboarding.md](howtos/observability-onboarding.md)')
-    expect(skill).toContain('bunx @temps-sdk/cli@0.1.37')
+    expect(skill).toContain('bunx @temps-sdk/cli@latest')
     expect(skill).not.toContain('npm install --global')
   })
 })

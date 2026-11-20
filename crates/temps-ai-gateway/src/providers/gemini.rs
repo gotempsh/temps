@@ -8,6 +8,7 @@ use std::pin::Pin;
 use std::time::Duration;
 use tokio_stream::Stream;
 
+use super::stream_text::{Utf8StreamDecoder, MAX_BUFFERED_STREAM_BYTES};
 use crate::error::AiGatewayError;
 use crate::providers::{AiProvider, ProviderCapability, ProviderHttpClient, ProviderInfo};
 use crate::types::*;
@@ -372,6 +373,7 @@ impl GeminiProvider {
             prompt_tokens: u.prompt_token_count,
             completion_tokens: u.candidates_token_count,
             total_tokens: u.total_token_count,
+            prompt_tokens_details: None,
         });
 
         let message_content = if text_content.is_empty() && !tool_calls.is_empty() {
@@ -511,6 +513,7 @@ impl GeminiProvider {
                     prompt_tokens: u.prompt_token_count,
                     completion_tokens: u.candidates_token_count,
                     total_tokens: u.total_token_count,
+                    prompt_tokens_details: None,
                 });
 
                 let chunk = ChatCompletionChunk {
@@ -623,14 +626,10 @@ impl AiProvider for GeminiProvider {
             });
         }
 
-        let gemini_response: GeminiResponse =
-            response
-                .json()
-                .await
-                .map_err(|e| AiGatewayError::TranslationError {
-                    provider: "gemini".to_string(),
-                    reason: format!("Failed to parse Gemini response: {}", e),
-                })?;
+        let gemini_response: GeminiResponse = response
+            .json()
+            .await
+            .map_err(|e| crate::error::response_body_error("gemini", "Gemini response", e))?;
 
         Self::translate_response(gemini_response, &request.model)
     }
@@ -680,12 +679,27 @@ impl AiProvider for GeminiProvider {
         let translated = async_stream::stream! {
             use tokio_stream::StreamExt;
             let mut stream = stream;
+            // Gemini marks the end of a reply with a candidate `finishReason`.
+            // A byte stream that closes without one was cut short, and must not
+            // be presented to the caller as a completed reply.
+            let mut saw_finish = false;
+            let mut transport_failed = false;
+            let mut decoder = Utf8StreamDecoder::default();
 
             while let Some(chunk_result) = stream.next().await {
                 match chunk_result {
                     Ok(chunk) => {
-                        let text = String::from_utf8_lossy(&chunk);
-                        buffer.push_str(&text);
+                        decoder.decode_into(&chunk, &mut buffer);
+                        if buffer.len() > MAX_BUFFERED_STREAM_BYTES {
+                            transport_failed = true;
+                            yield Err(AiGatewayError::StreamError {
+                                model: model.clone(),
+                                reason: format!(
+                                    "upstream sent over {MAX_BUFFERED_STREAM_BYTES} bytes without ending an event"
+                                ),
+                            });
+                            break;
+                        }
 
                         while let Some(data_start) = buffer.find("data: ") {
                             let data_content_start = data_start + 6;
@@ -718,6 +732,14 @@ impl AiProvider for GeminiProvider {
                                         }
                                     }
 
+                                    if gemini_chunk
+                                        .candidates
+                                        .iter()
+                                        .any(|candidate| candidate.finish_reason.is_some())
+                                    {
+                                        saw_finish = true;
+                                    }
+
                                     // Use the shared translation helper
                                     let events = GeminiProvider::translate_stream_chunk(
                                         &gemini_chunk, &model, &request_id,
@@ -732,6 +754,7 @@ impl AiProvider for GeminiProvider {
                         }
                     }
                     Err(e) => {
+                        transport_failed = true;
                         yield Err(AiGatewayError::StreamError {
                             model: model.clone(),
                             reason: e.to_string(),
@@ -740,8 +763,14 @@ impl AiProvider for GeminiProvider {
                 }
             }
 
-            // Send final DONE
-            yield Ok(Bytes::from("data: [DONE]\n\n"));
+            if saw_finish {
+                yield Ok(Bytes::from("data: [DONE]\n\n"));
+            } else if !transport_failed {
+                yield Err(AiGatewayError::StreamError {
+                    model: model.clone(),
+                    reason: "upstream stream ended without a finish reason".to_string(),
+                });
+            }
         };
 
         Ok(Box::pin(translated))
@@ -1228,11 +1257,13 @@ mod tests {
             content: Some(MessageContent::Parts(vec![
                 ContentPart {
                     r#type: "text".to_string(),
+                    cache_control: None,
                     text: Some("What's in this image?".to_string()),
                     image_url: None,
                 },
                 ContentPart {
                     r#type: "image_url".to_string(),
+                    cache_control: None,
                     text: None,
                     image_url: Some(serde_json::json!({
                         "url": "data:image/png;base64,iVBORw0KGgo="
@@ -1267,6 +1298,7 @@ mod tests {
             role: "user".to_string(),
             content: Some(MessageContent::Parts(vec![ContentPart {
                 r#type: "image_url".to_string(),
+                cache_control: None,
                 text: None,
                 image_url: Some(serde_json::json!({
                     "url": "https://example.com/photo.png"
@@ -1461,6 +1493,80 @@ mod tests {
         let last_event = String::from_utf8_lossy(&events[events.len() - 1]);
         // usage should not appear (skip_serializing_if = None)
         assert!(!last_event.contains("\"prompt_tokens\""));
+    }
+
+    /// Collect every item of a streamed Gemini reply served by a local mock.
+    async fn collect_stream(body: &str) -> Vec<Result<String, AiGatewayError>> {
+        use tokio_stream::StreamExt;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(body.to_string()),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = GeminiProvider::new();
+        let request = make_request(vec![ChatMessage {
+            role: "user".to_string(),
+            content: Some(MessageContent::Text("hi".to_string())),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }]);
+        let mut stream = provider
+            .chat_completion_stream("test-key", Some(&server.uri()), &request)
+            .await
+            .expect("stream opens");
+        let mut items = Vec::new();
+        while let Some(item) = stream.next().await {
+            items.push(item.map(|bytes| String::from_utf8_lossy(&bytes).into_owned()));
+        }
+        items
+    }
+
+    #[tokio::test]
+    async fn stream_without_a_finish_reason_is_reported_as_interrupted() {
+        let body = "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Based on the\"}]}}]}\n\n";
+        let items = collect_stream(body).await;
+
+        assert!(
+            items
+                .iter()
+                .any(|item| matches!(item, Ok(chunk) if chunk.contains("Based on the"))),
+            "the partial text is still delivered: {items:?}"
+        );
+        assert!(
+            !items
+                .iter()
+                .any(|item| matches!(item, Ok(chunk) if chunk.contains("[DONE]"))),
+            "a truncated reply must not be terminated with [DONE]: {items:?}"
+        );
+        assert!(
+            matches!(items.last(), Some(Err(AiGatewayError::StreamError { reason, .. }))
+                if reason.contains("finish reason")),
+            "a truncated reply ends with a stream error: {items:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_with_a_finish_reason_ends_with_done() {
+        let body = "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Done.\"}]},\"finishReason\":\"STOP\"}]}\n\n";
+        let items = collect_stream(body).await;
+
+        assert!(
+            items.iter().all(|item| item.is_ok()),
+            "a complete reply has no error: {items:?}"
+        );
+        assert!(
+            matches!(items.last(), Some(Ok(chunk)) if chunk.contains("[DONE]")),
+            "a complete reply is terminated with [DONE]: {items:?}"
+        );
     }
 
     #[test]

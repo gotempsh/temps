@@ -46,8 +46,11 @@ const ACTIVATION_SECTION_PATH =
  */
 export function CloudTelemetryBackfillCard({
   project,
+  bare = false,
 }: {
   project: ProjectResponse
+  /** Render only the status, for a page that supplies its own heading. */
+  bare?: boolean
 }) {
   const { data, isPending, isError, error, refetch } = useQuery(
     getCloudBackfillStatusOptions({ path: { project_id: project.id } })
@@ -69,19 +72,23 @@ export function CloudTelemetryBackfillCard({
     (row) => row.project_id === project?.id
   )
 
+  const body = (
+    <div className="space-y-4">
+      <BackfillBody
+        isPending={isPending}
+        isError={isError}
+        error={error}
+        data={data}
+        onRetry={() => void refetch()}
+        bulkJobId={bulkJobProject ? (bulkJob?.batch_id ?? null) : null}
+        bulkJobProject={bulkJobProject}
+      />
+    </div>
+  )
+  if (bare) return body
   return (
     <SettingsSection title="Cloud telemetry backfill" icon={Cloud}>
-      <div className="space-y-4">
-        <BackfillBody
-          isPending={isPending}
-          isError={isError}
-          error={error}
-          data={data}
-          onRetry={() => void refetch()}
-          bulkJobId={bulkJobProject ? (bulkJob?.batch_id ?? null) : null}
-          bulkJobProject={bulkJobProject}
-        />
-      </div>
+      {body}
     </SettingsSection>
   )
 }
@@ -176,7 +183,7 @@ function PartOfBulkActivation({
       <AlertTitle>Part of a bulk Cloud activation</AlertTitle>
       <AlertDescription className="space-y-3">
         <p>
-          This backfill was not started for this project on its own — it is one
+          This backfill was not started for this service on its own — it is one
           step of an instance-wide activation ({row.status}).{' '}
           {PROJECT_STATUS_HINTS[row.status]}
         </p>
@@ -219,7 +226,7 @@ function NotOptedIn({ status }: { status: CloudBackfillStatusResponse }) {
   return (
     <Alert>
       <AlertCircle className="h-4 w-4" aria-hidden="true" />
-      <AlertTitle>This project is not set up for Cloud read-back</AlertTitle>
+      <AlertTitle>This service is not set up for Cloud read-back</AlertTitle>
       <AlertDescription className="space-y-3">
         <p>
           Telemetry fidelity is <code className="font-mono">metered</code>, so
@@ -356,5 +363,5 @@ function CommandBlock({
 function errorMessage(error: unknown): string {
   if (error instanceof Error && error.message) return error.message
   if (typeof error === 'string' && error) return error
-  return 'The instance did not return a status for this project.'
+  return 'The instance did not return a status for this service.'
 }

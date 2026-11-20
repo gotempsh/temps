@@ -460,6 +460,7 @@ export function ConnectedRepository() {
                             )}
                           </p>
                           <div
+                            role="group"
                             className="mt-1 flex flex-wrap gap-1"
                             aria-label="Detected presets"
                           >

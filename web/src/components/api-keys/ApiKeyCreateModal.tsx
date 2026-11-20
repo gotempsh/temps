@@ -1,8 +1,11 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { ProjectSelect } from '@/components/project/ProjectSelect'
+import { useQuery } from '@tanstack/react-query'
+import { getEnvironmentsOptions } from '@/api/client/@tanstack/react-query.gen'
 import { useState, useEffect } from 'react'
-import { useForm } from 'react-hook-form'
+import { useForm, useWatch } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { z } from 'zod'
 import {
@@ -39,6 +42,8 @@ import type { CreateApiKeyRequest } from '@/api/client'
 import { useApiKeyPermissions } from './useApiKeyPermissions'
 
 const formSchema = z.object({
+  project_id: z.number().int().positive().nullable(),
+  environment_id: z.number().int().positive().nullable(),
   name: z.string().min(1, 'Name is required'),
   expires_at: z
     .string()
@@ -87,9 +92,17 @@ export function ApiKeyCreateModal({
   const form = useForm<FormValues>({
     resolver: zodResolver(formSchema),
     defaultValues: {
+      project_id: null,
+      environment_id: null,
       name: '',
       expires_at: '',
     },
+  })
+
+  const projectId = useWatch({ control: form.control, name: 'project_id' })
+  const environments = useQuery({
+    ...getEnvironmentsOptions({ path: { project_id: projectId ?? 0 } }),
+    enabled: projectId !== null && open,
   })
 
   const handleCopyKey = async () => {
@@ -102,6 +115,8 @@ export function ApiKeyCreateModal({
 
   const handleFormSubmit = (values: FormValues) => {
     const data: CreateApiKeyRequest = {
+      project_id: values.project_id,
+      environment_id: values.environment_id,
       name: values.name,
       role_type: useCustomPermissions ? 'custom' : selectedRole,
       permissions: useCustomPermissions
@@ -174,7 +189,7 @@ export function ApiKeyCreateModal({
         {newKeySecret ? (
           <>
             <DialogHeader>
-              <DialogTitle>API Key Created Successfully</DialogTitle>
+              <DialogTitle>API key created</DialogTitle>
               <DialogDescription>
                 Copy your API key now. You won&apos;t be able to see it again!
               </DialogDescription>
@@ -188,14 +203,20 @@ export function ApiKeyCreateModal({
                 </AlertDescription>
               </Alert>
               <div className="space-y-2">
-                <FormLabel>Your API Key</FormLabel>
+                <FormLabel>Your API key</FormLabel>
                 <div className="flex gap-2">
                   <Input
+                    aria-label="Your API key"
                     value={newKeySecret}
                     readOnly
                     className="font-mono text-sm"
                   />
-                  <Button size="sm" variant="outline" onClick={handleCopyKey}>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    aria-label="Copy API key"
+                    onClick={handleCopyKey}
+                  >
                     {copiedKey ? (
                       <Check className="h-4 w-4" />
                     ) : (
@@ -212,7 +233,7 @@ export function ApiKeyCreateModal({
         ) : (
           <>
             <DialogHeader>
-              <DialogTitle>Create API Key</DialogTitle>
+              <DialogTitle>Create API key</DialogTitle>
               <DialogDescription>
                 Create a new API key with specific roles and permissions.
               </DialogDescription>
@@ -227,12 +248,102 @@ export function ApiKeyCreateModal({
                       <FormItem>
                         <FormLabel>Name</FormLabel>
                         <FormControl>
-                          <Input placeholder="Production API Key" {...field} />
+                          <Input placeholder="Production API key" {...field} />
                         </FormControl>
                         <FormMessage />
                       </FormItem>
                     )}
                   />
+
+                  <FormField
+                    control={form.control}
+                    name="project_id"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>Deployment scope</FormLabel>
+                        <ProjectSelect
+                          ariaLabel="API key project scope"
+                          value={field.value}
+                          allLabel="Account-wide access"
+                          onValueChange={(id) => {
+                            field.onChange(id)
+                            form.setValue('environment_id', null)
+                          }}
+                        />
+                        <p className="text-xs text-muted-foreground">
+                          Choose a project to confine this key to its deployment
+                          and environment APIs. Instance settings and credential
+                          management are refused. Scope cannot be changed after
+                          creation.
+                        </p>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+                  {projectId !== null && (
+                    <FormField
+                      control={form.control}
+                      name="environment_id"
+                      render={({ field }) => (
+                        <FormItem>
+                          <FormLabel>Environment scope</FormLabel>
+                          <Select
+                            value={
+                              field.value === null ? 'all' : String(field.value)
+                            }
+                            onValueChange={(value) =>
+                              field.onChange(
+                                value === 'all' ? null : Number(value)
+                              )
+                            }
+                          >
+                            <FormControl>
+                              <SelectTrigger>
+                                <SelectValue placeholder="All environments" />
+                              </SelectTrigger>
+                            </FormControl>
+                            <SelectContent>
+                              <SelectItem value="all">
+                                All environments in this project
+                              </SelectItem>
+                              {environments.data?.map((env) => (
+                                <SelectItem key={env.id} value={String(env.id)}>
+                                  {env.name}
+                                </SelectItem>
+                              ))}
+                            </SelectContent>
+                          </Select>
+                          {environments.isError && (
+                            <p
+                              role="alert"
+                              className="text-xs text-destructive"
+                            >
+                              Could not load environments.
+                              <Button
+                                type="button"
+                                variant="link"
+                                size="sm"
+                                aria-disabled={environments.isFetching}
+                                onClick={() => {
+                                  if (!environments.isFetching)
+                                    void environments.refetch()
+                                }}
+                              >
+                                Retry
+                              </Button>
+                            </p>
+                          )}
+                          <p className="text-xs text-muted-foreground">
+                            An environment key can trigger this environment and
+                            use its explicit environment endpoints. It cannot
+                            list sibling environments or call deployment-by-ID
+                            endpoints.
+                          </p>
+                          <FormMessage />
+                        </FormItem>
+                      )}
+                    />
+                  )}
 
                   <Tabs
                     defaultValue="role"
@@ -241,13 +352,11 @@ export function ApiKeyCreateModal({
                     }
                   >
                     <TabsList className="grid w-full grid-cols-2">
-                      <TabsTrigger value="role">
-                        <Shield className="h-4 w-4 mr-2" />
-                        Predefined Role
+                      <TabsTrigger value="role" icon={Shield}>
+                        Predefined role
                       </TabsTrigger>
-                      <TabsTrigger value="custom">
-                        <Key className="h-4 w-4 mr-2" />
-                        Custom Permissions
+                      <TabsTrigger value="custom" icon={Key}>
+                        Custom permissions
                       </TabsTrigger>
                     </TabsList>
 

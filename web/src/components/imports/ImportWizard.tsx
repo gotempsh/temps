@@ -141,33 +141,33 @@ const SOURCE_CREDENTIALS: Record<
 
 const STEP_CONFIG = {
   'select-source': {
-    title: 'Select Import Source',
+    title: 'Select import source',
     description: 'Choose where to import your workload from',
     icon: Server,
   },
   'discover-workloads': {
-    title: 'Discover Workloads',
+    title: 'Discover workloads',
     description: 'Find and select a workload to import',
     icon: Container,
   },
   'select-repository': {
-    title: 'Select Repository',
+    title: 'Select repository',
     description: 'Link to an existing repository (optional)',
     icon: GitBranch,
   },
   'configure-project': {
-    title: 'Configure Project',
-    description: 'Set up project name, framework, and deployment settings',
+    title: 'Configure service',
+    description: 'Set up service name, framework, and deployment settings',
     icon: FileCode,
   },
   'review-plan': {
-    title: 'Review Import Plan',
+    title: 'Review import plan',
     description: 'Review the import configuration',
     icon: FileCode,
   },
   execute: {
-    title: 'Executing Import',
-    description: 'Creating your project',
+    title: 'Executing import',
+    description: 'Creating your service',
     icon: Package,
   },
 }
@@ -422,7 +422,7 @@ export function ImportWizard({
       // Import is synchronous, so we get the result immediately
       if (data.project_id) {
         toast.success('Import completed successfully!', {
-          description: 'Navigating to your new project...',
+          description: 'Navigating to your new service...',
         })
 
         try {
@@ -437,7 +437,7 @@ export function ImportWizard({
             navigate('/projects')
           }
         } catch {
-          toast.error('Failed to fetch project details', {
+          toast.error('Failed to fetch service details', {
             description: 'Redirecting to projects list...',
           })
           // Fallback: navigate to projects list if we can't get the project
@@ -893,7 +893,7 @@ export function ImportWizard({
                     <Card>
                       <CardHeader>
                         <CardTitle className="text-base">
-                          Advanced Filters
+                          Advanced filters
                         </CardTitle>
                       </CardHeader>
                       <CardContent className="space-y-3">
@@ -909,7 +909,7 @@ export function ImportWizard({
                               </SelectTrigger>
                               <SelectContent>
                                 <SelectItem value="all">
-                                  All Statuses
+                                  All statuses
                                 </SelectItem>
                                 {workloadFilters.statuses.map((status) => (
                                   <SelectItem key={status} value={status}>
@@ -954,7 +954,7 @@ export function ImportWizard({
                             className="w-full"
                           >
                             <X className="h-4 w-4 mr-2" />
-                            Clear Advanced Filters
+                            Clear advanced filters
                           </Button>
                         )}
                       </CardContent>
@@ -1061,7 +1061,7 @@ export function ImportWizard({
             <Alert>
               <AlertCircle className="h-4 w-4" />
               <AlertDescription>
-                Configure your project settings. The framework preset is
+                Configure your service settings. The framework preset is
                 auto-detected from your repository.
               </AlertDescription>
             </Alert>
@@ -1072,10 +1072,10 @@ export function ImportWizard({
                 {/* Project Name */}
                 <div className="space-y-2">
                   <Label className="text-base font-semibold">
-                    Project Name
+                    Service name
                   </Label>
                   <p className="text-sm text-muted-foreground">
-                    Enter a name for your project
+                    Enter a name for your service
                   </p>
                   <Input
                     value={projectName}
@@ -1114,10 +1114,10 @@ export function ImportWizard({
                 {/* Framework Preset */}
                 <div className="space-y-2">
                   <Label className="text-base font-semibold">
-                    Framework Preset
+                    Framework preset
                   </Label>
                   <p className="text-sm text-muted-foreground">
-                    Configure the project type based on the detected framework
+                    Configure the service type based on the detected framework
                   </p>
                   {!selectedBranch ? (
                     <Alert>
@@ -1137,7 +1137,7 @@ export function ImportWizard({
                       />
 
                       <div>
-                        <Label>Root Directory</Label>
+                        <Label>Root directory</Label>
                         <Input
                           value={rootDirectory}
                           onChange={(e) => setRootDirectory(e.target.value)}
@@ -1183,11 +1183,11 @@ export function ImportWizard({
 
                 <Card>
                   <CardHeader>
-                    <CardTitle>Project Configuration</CardTitle>
+                    <CardTitle>Service configuration</CardTitle>
                   </CardHeader>
                   <CardContent className="space-y-3">
                     <div className="grid grid-cols-2 gap-2 text-sm">
-                      <div className="text-muted-foreground">Project Name:</div>
+                      <div className="text-muted-foreground">Service Name:</div>
                       <div className="font-medium">{projectName}</div>
 
                       <div className="text-muted-foreground">
@@ -1210,7 +1210,7 @@ export function ImportWizard({
                       </div>
 
                       <div className="text-muted-foreground">
-                        Root Directory:
+                        Root directory:
                       </div>
                       <div className="font-medium">
                         <code className="px-2 py-1 bg-muted rounded text-xs">
@@ -1249,7 +1249,7 @@ export function ImportWizard({
                     0 && (
                     <Card>
                       <CardHeader>
-                        <CardTitle>Environment Variables</CardTitle>
+                        <CardTitle>Environment variables</CardTitle>
                         <CardDescription>
                           {
                             Object.keys(importPlan.plan.deployment.env_vars)
@@ -1322,7 +1322,7 @@ export function ImportWizard({
                   <Loader2 className="h-12 w-12 animate-spin text-primary mb-4" />
                   <p className="text-lg font-medium">Executing Import...</p>
                   <p className="text-sm text-muted-foreground">
-                    Please wait while we create your project...
+                    Please wait while we create your service...
                   </p>
                 </>
               ) : executeImportMut.isSuccess ? (
@@ -1330,7 +1330,7 @@ export function ImportWizard({
                   <CheckCircle2 className="h-12 w-12 text-green-500 mb-4" />
                   <p className="text-lg font-medium">Import Completed!</p>
                   <p className="text-sm text-muted-foreground">
-                    Redirecting to your project...
+                    Redirecting to your service...
                   </p>
                 </>
               ) : executeImportMut.isError ? (
@@ -1348,7 +1348,7 @@ export function ImportWizard({
             {executeImportMut.data && (
               <Card>
                 <CardHeader>
-                  <CardTitle>Import Results</CardTitle>
+                  <CardTitle>Import results</CardTitle>
                 </CardHeader>
                 <CardContent className="space-y-2">
                   <div className="grid grid-cols-2 gap-2 text-sm">
@@ -1359,7 +1359,7 @@ export function ImportWizard({
 
                     {executeImportMut.data.project_id && (
                       <>
-                        <div className="text-muted-foreground">Project ID:</div>
+                        <div className="text-muted-foreground">Service ID:</div>
                         <div className="font-medium">
                           {executeImportMut.data.project_id}
                         </div>
@@ -1478,7 +1478,7 @@ export function ImportWizard({
             >
               {currentStep === 'select-source' && 'Discover Workloads'}
               {currentStep === 'discover-workloads' && 'Continue'}
-              {currentStep === 'select-repository' && 'Configure Project'}
+              {currentStep === 'select-repository' && 'Configure Service'}
               {currentStep === 'configure-project' && 'Create Plan'}
               {currentStep === 'review-plan' && 'Execute Import'}
               <ArrowRight className="h-4 w-4 ml-2" />

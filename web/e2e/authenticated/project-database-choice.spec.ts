@@ -63,9 +63,13 @@ test('existing databases can be searched and linked, while creation keeps projec
   )
   await page.getByRole('button', { name: 'Link', exact: true }).click()
   await page.getByRole('button', { name: 'Link database', exact: true }).click()
-  await expect(
-    page.getByText('Failed to link service', { exact: true }).first()
-  ).toBeVisible()
+  // The shared mutation handler announces the failure once, with the
+  // mutation's title and the server's detail.
+  const failureToast = page.locator('[data-sonner-toast]', {
+    hasText: 'Failed to link database to service',
+  })
+  await expect(failureToast).toHaveCount(1)
+  await expect(failureToast).toContainText('Database link failed')
   await expect(
     page.getByRole('button', { name: 'Link database', exact: true })
   ).toBeEnabled()
@@ -119,7 +123,9 @@ test('empty databases offer all supported types and load errors do not look empt
     path: '/tmp/temps-databases-empty-cards.png',
     fullPage: true,
   })
-  await cards.getByRole('link', { name: 'Create mongodb', exact: true }).click()
+  // Each card is one link whose name is the type, its description and the
+  // "Create database" affordance, so match on the description.
+  await cards.getByRole('link', { name: /Create mongodb/ }).click()
   await expect(page).toHaveURL(new RegExp(`project_id=${project.id}`))
 })
 
@@ -149,7 +155,7 @@ for (const mode of ['project', 'custom'] as const) {
     await page.getByRole('button', { name: 'Link', exact: true }).click()
     await page
       .getByRole('radio', {
-        name: mode === 'custom' ? /Custom database/ : /Database per project/,
+        name: mode === 'custom' ? /Custom database/ : /Database per service/,
       })
       .click()
     if (mode === 'custom') {
@@ -179,7 +185,7 @@ for (const mode of ['project', 'custom'] as const) {
     })
     await expect(
       page
-        .getByText(mode === 'custom' ? /Custom database/ : /Per project/)
+        .getByText(mode === 'custom' ? /Custom database/ : /Per service/)
         .first()
     ).toBeVisible()
   })

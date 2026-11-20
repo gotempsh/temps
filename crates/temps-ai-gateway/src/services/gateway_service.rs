@@ -40,6 +40,14 @@ pub struct ByokOverride {
     pub system_key_id: Option<i32>,
 }
 
+impl ByokOverride {
+    /// The caller brought their own provider key, so the request spends their
+    /// provider credits and adds nothing to the operator's bill.
+    pub fn is_caller_funded(&self) -> bool {
+        self.api_key.is_some()
+    }
+}
+
 /// Provider and credentials resolved for one request.
 #[derive(Clone)]
 pub struct ResolvedCredentials {
@@ -346,11 +354,25 @@ impl GatewayService {
         &self,
         key_id: i32,
     ) -> Result<Vec<ModelInfo>, AiGatewayError> {
+        Ok(self
+            .discover_model_catalog_for_key(key_id)
+            .await?
+            .into_iter()
+            .map(|model| model.info)
+            .collect())
+    }
+
+    /// Like [`Self::discover_models_for_key`], keeping what the catalogue says
+    /// about each model (modalities, prices, context window, tool support).
+    pub async fn discover_model_catalog_for_key(
+        &self,
+        key_id: i32,
+    ) -> Result<Vec<DiscoveredModel>, AiGatewayError> {
         let key = self.provider_key_service.get_by_id(key_id).await?;
         let api_key = self
             .provider_key_service
             .decrypt_api_key(&key.api_key_encrypted)?;
-        self.discover_models(
+        self.discover_model_catalog(
             &key.provider,
             &api_key,
             key.base_url.as_deref(),
@@ -372,6 +394,23 @@ impl GatewayService {
         base_url: Option<&str>,
         key_trust: Option<KeyTrust>,
     ) -> Result<Vec<ModelInfo>, AiGatewayError> {
+        Ok(self
+            .discover_model_catalog(provider_id, api_key, base_url, key_trust)
+            .await?
+            .into_iter()
+            .map(|model| model.info)
+            .collect())
+    }
+
+    /// Like [`Self::discover_models`], keeping what the catalogue says about
+    /// each model (modalities, prices, context window, tool support).
+    pub async fn discover_model_catalog(
+        &self,
+        provider_id: &str,
+        api_key: &str,
+        base_url: Option<&str>,
+        key_trust: Option<KeyTrust>,
+    ) -> Result<Vec<DiscoveredModel>, AiGatewayError> {
         let provider = self.providers.get(provider_id).ok_or_else(|| {
             AiGatewayError::ProviderNotConfigured {
                 provider: provider_id.to_string(),
@@ -380,8 +419,9 @@ impl GatewayService {
         let self_hosted = is_self_hosted(provider_id);
         if self_hosted && base_url.is_none() {
             return Err(AiGatewayError::Validation {
-                message: "A base URL is required to discover models on a self-hosted provider"
-                    .to_string(),
+                message:
+                    "A base URL is required to discover models on an OpenAI-compatible provider"
+                        .to_string(),
             });
         }
         if let Some(base_url) = base_url {
@@ -455,7 +495,7 @@ impl GatewayService {
                 reason: format!("Failed to parse provider model catalog: {error}"),
             }
         })?;
-        parse_model_catalog(provider_id, &body, |id| {
+        parse_model_catalog_details(provider_id, &body, |id| {
             self_hosted || provider.supports_model(id)
         })
     }
@@ -472,18 +512,19 @@ impl GatewayService {
         key_trust: Option<KeyTrust>,
     ) -> Result<SelfHostedListing, AiGatewayError> {
         let models = self
-            .discover_models(OPENAI_COMPATIBLE, api_key, base_url, key_trust)
+            .discover_model_catalog(OPENAI_COMPATIBLE, api_key, base_url, key_trust)
             .await
             .map_err(|error| match error {
                 AiGatewayError::InvalidProviderUrl { .. } => error,
                 other => AiGatewayError::Validation {
                     message: format!(
-                        "Could not list models at the self-hosted server's /models endpoint: {}",
+                        "Could not list models at the OpenAI-compatible server's /models endpoint: {}",
                         other.summary()
                     ),
                 },
             })?;
-        let default_model = choose_self_hosted_default(&models, default_model)?;
+        let ids: Vec<ModelInfo> = models.iter().map(|model| model.info.clone()).collect();
+        let default_model = choose_self_hosted_default(&ids, default_model)?;
         Ok(SelfHostedListing {
             models,
             default_model,
@@ -607,7 +648,7 @@ impl GatewayService {
                     return Err(AiGatewayError::Validation {
                         message: format!(
                             "AI provider key {key_id} cannot serve model '{model}': it is hosted \
-                             by self-hosted provider key {}",
+                             by OpenAI-compatible provider key {}",
                             host.id
                         ),
                     });
@@ -692,7 +733,7 @@ impl GatewayService {
         if is_self_hosted(provider_id) && key_record.base_url.is_none() {
             return Err(AiGatewayError::InvalidProviderUrl {
                 reason: format!(
-                    "self-hosted provider key {} has no base URL configured",
+                    "OpenAI-compatible provider key {} has no base URL configured",
                     key_record.id
                 ),
             });
@@ -930,7 +971,8 @@ impl GatewayService {
             OPENAI_COMPATIBLE => {
                 if base_url.is_none() {
                     return Err(AiGatewayError::Validation {
-                        message: "A base URL is required for a self-hosted provider".to_string(),
+                        message: "A base URL is required for an OpenAI-compatible provider"
+                            .to_string(),
                     });
                 }
                 None
@@ -949,7 +991,7 @@ impl GatewayService {
             (None, Some(fallback)) => fallback,
             (None, None) => {
                 return Err(AiGatewayError::Validation {
-                    message: "Choose a default model from the models the self-hosted server \
+                    message: "Choose a default model from the models the server \
                               lists before verifying it"
                         .to_string(),
                 })
@@ -1014,7 +1056,9 @@ impl GatewayService {
 /// A self-hosted server's model listing and the default model chosen from it.
 #[derive(Debug, Clone)]
 pub struct SelfHostedListing {
-    pub models: Vec<ModelInfo>,
+    /// The listing with what the server said about each model (its name,
+    /// context window, modalities), so the new key's catalog keeps it.
+    pub models: Vec<DiscoveredModel>,
     pub default_model: String,
 }
 
@@ -1026,9 +1070,10 @@ pub(crate) fn choose_self_hosted_default(
 ) -> Result<String, AiGatewayError> {
     if models.is_empty() {
         return Err(AiGatewayError::Validation {
-            message: "The self-hosted server lists no models at /models; load a model on it and \
+            message:
+                "The OpenAI-compatible server lists no models at /models; load a model on it and \
                       try again"
-                .to_string(),
+                    .to_string(),
         });
     }
     let default_model = default_model
@@ -1036,7 +1081,7 @@ pub(crate) fn choose_self_hosted_default(
         .filter(|model| !model.is_empty())
         .ok_or_else(|| AiGatewayError::Validation {
             message: format!(
-                "Choose a default model from the {} models the self-hosted server lists; it is \
+                "Choose a default model from the {} models the server lists; it is \
                  used to verify the connection",
                 models.len()
             ),
@@ -1044,7 +1089,7 @@ pub(crate) fn choose_self_hosted_default(
     if !models.iter().any(|model| model.id == default_model) {
         return Err(AiGatewayError::Validation {
             message: format!(
-                "Model '{default_model}' is not among the {} models the self-hosted server lists",
+                "Model '{default_model}' is not among the {} models the server lists",
                 models.len()
             ),
         });
@@ -1067,15 +1112,31 @@ fn require_tools_capability(
     Ok(())
 }
 
-/// Turn a provider's model listing into catalog entries. `keep` decides which
-/// IDs are kept (vendor adapters filter by name; self-hosted keeps all).
-/// IDs that cannot be stored or routed (empty, over 255 bytes, control
-/// characters) are skipped, and the result is capped at 5,000 models.
+/// [`parse_model_catalog_details`] without the details, for tests that only
+/// look at which IDs were kept.
+#[cfg(test)]
 pub(crate) fn parse_model_catalog(
     provider_id: &str,
     body: &serde_json::Value,
     keep: impl Fn(&str) -> bool,
 ) -> Result<Vec<ModelInfo>, AiGatewayError> {
+    Ok(parse_model_catalog_details(provider_id, body, keep)?
+        .into_iter()
+        .map(|model| model.info)
+        .collect())
+}
+
+/// Turn a provider's model listing into catalog entries, keeping what each
+/// entry says about the model (modalities, prices, context window, tool
+/// support). `keep` decides which IDs are kept (vendor adapters filter by
+/// name; self-hosted keeps all). IDs that cannot be stored or routed (empty,
+/// over 255 bytes, control characters) are skipped, and the result is capped
+/// at 5,000 models.
+pub(crate) fn parse_model_catalog_details(
+    provider_id: &str,
+    body: &serde_json::Value,
+    keep: impl Fn(&str) -> bool,
+) -> Result<Vec<DiscoveredModel>, AiGatewayError> {
     let entries = if provider_id == "gemini" {
         body.get("models")
     } else {
@@ -1087,7 +1148,7 @@ pub(crate) fn parse_model_catalog(
         reason: "Provider model catalog did not contain a model array".to_string(),
     })?;
 
-    let mut models: Vec<ModelInfo> = entries
+    let mut models: Vec<DiscoveredModel> = entries
         .iter()
         .filter(|entry| {
             provider_id != "gemini"
@@ -1119,16 +1180,23 @@ pub(crate) fn parse_model_catalog(
                 .filter(|owner| owner.len() <= 255 && !owner.chars().any(char::is_control))
                 .unwrap_or(provider_id)
                 .to_string();
-            Some(ModelInfo {
-                id: id.to_string(),
-                object: "model".to_string(),
-                owned_by,
+            Some(DiscoveredModel {
+                details: if provider_id == "gemini" {
+                    ModelDetails::from_gemini_catalog_entry(entry)
+                } else {
+                    ModelDetails::from_catalog_entry(entry)
+                },
+                info: ModelInfo {
+                    id: id.to_string(),
+                    object: "model".to_string(),
+                    owned_by,
+                },
             })
         })
         .take(5_000)
         .collect();
-    models.sort_by(|left, right| left.id.cmp(&right.id));
-    models.dedup_by(|left, right| left.id == right.id);
+    models.sort_by(|left, right| left.info.id.cmp(&right.info.id));
+    models.dedup_by(|left, right| left.info.id == right.info.id);
     Ok(models)
 }
 
@@ -1813,6 +1881,25 @@ mod tests {
         let body = serde_json::json!({"models": [{"name": "models/gemini-3.1-pro"}]});
         let models = parse_model_catalog("gemini", &body, |_| true).unwrap();
         assert_eq!(models[0].id, "gemini-3.1-pro");
+    }
+
+    #[test]
+    fn gemini_discovery_never_names_a_model_by_its_resource_path() {
+        let body = serde_json::json!({"models": [
+            {"name": "models/gemini-3.1-pro", "displayName": "Gemini 3.1 Pro"},
+            {"name": "models/gemini-3.1-flash"}
+        ]});
+        let models = parse_model_catalog_details("gemini", &body, |_| true).unwrap();
+        let names: Vec<_> = models
+            .iter()
+            .map(|model| {
+                model
+                    .details
+                    .as_ref()
+                    .and_then(|details| details.name.as_deref())
+            })
+            .collect();
+        assert_eq!(names, vec![None, Some("Gemini 3.1 Pro")]);
     }
 
     #[test]

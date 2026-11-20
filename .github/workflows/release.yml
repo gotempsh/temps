@@ -70,14 +70,39 @@ jobs:
       channel: ${{ (inputs.dry_run == true || contains(github.ref_name, '-')) && 'beta' || 'stable' }}
       dry_run: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run == true }}
 
+  database-images:
+    # Managed-database images (Postgres, Redis, MongoDB, ...) the binary
+    # references by tag. Publishes only tags missing from GHCR -- a release
+    # must not move a tag under running databases -- then fails unless every
+    # required tag is anonymously pullable. Freshness is owned by the weekly
+    # schedule in database-images.yml, not by the release cadence.
+    needs: [validate-release-ref, require-tests]
+    uses: ./.github/workflows/database-images.yml
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    with:
+      ensure: true
+      dry_run: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run == true }}
+
   validate-release-ref:
     name: Validate Release Ref
+    outputs:
+      sdk_selected: ${{ steps.sdk.outputs.selected }}
+      sdk_channel: ${{ steps.sdk.outputs.channel }}
+      sdk_kinds: ${{ steps.sdk.outputs.kinds }}
+      sdk_all: ${{ steps.sdk.outputs.all }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
+      # Full history and tags: verifying the SDK selection re-derives it from commits.
       - name: Checkout release validation script
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
 
       - name: Reject unsafe publishing refs
         env:
@@ -86,8 +111,40 @@ jobs:
           REF_TYPE: ${{ github.ref_type }}
         run: .github/scripts/validate-release-ref.sh "$DRY_RUN" "$REF_TYPE" "$REF_NAME"
 
-  # The release runs no tests of its own, so it must not publish a commit the
-  # test workflow has not passed. Rather than re-running the whole suite here
+      - name: Plan SDK releases from committed manifests
+        id: sdk
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          python3 scripts/sdk_release.py validate
+          python3 - <<'PYTHON'
+          import json, os, sys
+          sys.path.insert(0, 'scripts')
+          import sdk_release as release
+          all_packages = os.environ['DRY_RUN'] == 'true' and os.environ['REF_TYPE'] != 'tag'
+          packages = release.catalog_packages() if all_packages else release.plan(os.environ['RELEASE_TAG'])
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              print('selected=' + str(bool(packages)).lower(), file=out)
+              print('all=' + str(all_packages).lower(), file=out)
+              print('channel=' + (packages[0]['channel'] if packages else 'stable'), file=out)
+              print('kinds=' + json.dumps(sorted({p['kind'] for p in packages})), file=out)
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as out:
+              out.write(release.notes(packages))
+          PYTHON
+
+      # prepared.json was derived before the tag; a commit that landed since can
+      # need other versions, and a published version cannot be replaced. Runs
+      # before every job that publishes, and reads only git and the registries.
+      - name: Verify the prepared SDK selection at the tag
+        if: github.ref_type == 'tag' && steps.sdk.outputs.selected == 'true' && steps.sdk.outputs.all != 'true'
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: python3 scripts/sdk_release.py prepare --tag "$RELEASE_TAG" --check --at-tag
+
+  # SDK packaging runs focused tests, but the platform suite must also have
+  # passed before publication. Rather than re-running the whole suite here
   # (hours of runner time, plus caches written to a tag scope nothing can
   # read -- see the note at the top of this file), ask GitHub whether
   # rust-tests.yml already succeeded for this exact SHA, waiting for an
@@ -169,9 +226,10 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch; version pinned below
         with:
-          toolchain: stable
+          # Keep in sync with rust-toolchain.toml.
+          toolchain: 1.99.1
 
       - name: Install Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
@@ -211,12 +269,129 @@ jobs:
           path: crates/temps-cli/dist
           retention-days: 1
 
+      # Reuse this runner and Rust setup; selected packages are tested before
+      # credentials are available. Branch dry-runs exercise every catalog entry.
+      - name: Install pinned SDK Bun
+        if: needs.validate-release-ref.outputs.sdk_selected == 'true'
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.2
+          no-cache: true
+      - name: Install Node for SDK packaging
+        if: needs.validate-release-ref.outputs.sdk_selected == 'true'
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Install uv for Python SDK packaging
+        if: contains(fromJSON(needs.validate-release-ref.outputs.sdk_kinds), 'pypi')
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          enable-cache: false
+      - name: Install Go for SDK packaging
+        if: contains(fromJSON(needs.validate-release-ref.outputs.sdk_kinds), 'go')
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: sdks/go/workflows/go.mod
+          cache: false
+      - name: Test and package SDK releases
+        if: needs.validate-release-ref.outputs.sdk_selected == 'true'
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          ALL_PACKAGES: ${{ needs.validate-release-ref.outputs.sdk_all }}
+        run: |
+          args=(--tag "$RELEASE_TAG")
+          if [[ "$ALL_PACKAGES" == true ]]; then args=(--all); fi
+          python3 scripts/sdk_release.py build "${args[@]}"
+      - name: Retain verified SDK artifacts for publication and retries
+        if: needs.validate-release-ref.outputs.sdk_selected == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: sdk-packages
+          path: sdk-artifacts/
+          if-no-files-found: error
+          retention-days: 30
+
+  # A separate runner isolates registry OIDC and tag-write permissions from
+  # unprivileged builds. All ecosystems share this job; no registry matrix.
+  publish-sdks:
+    name: Publish prepared SDK releases
+    needs: [validate-release-ref, require-tests, build-web-assets, create-release]
+    if: inputs.dry_run != true && needs.validate-release-ref.outputs.sdk_selected == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: sdk-${{ needs.validate-release-ref.outputs.sdk_channel }}
+    concurrency:
+      group: sdk-registry-publication
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      id-token: write
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: sdk-packages
+          path: sdk-artifacts/
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: contains(fromJSON(needs.validate-release-ref.outputs.sdk_kinds), 'npm')
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Check immutable package tags before any uploads
+        run: python3 scripts/sdk_release.py check-tags --tag "$RELEASE_TAG"
+      - name: Check registry versions and tested artifact hashes
+        id: registries
+        run: |
+          for kind in npm pypi crate; do
+            python3 scripts/sdk_release.py check --tag "$RELEASE_TAG" --kind "$kind"
+          done
+      - name: Publish npm artifacts with trusted publishing
+        if: contains(fromJSON(needs.validate-release-ref.outputs.sdk_kinds), 'npm')
+        run: python3 scripts/sdk_release.py publish --tag "$RELEASE_TAG" --kind npm
+      - name: Check whether Python uploads remain
+        id: pypi
+        run: |
+          if find sdk-artifacts/pending-pypi -type f | grep -q .; then
+            echo 'pending=true' >> "$GITHUB_OUTPUT"
+          fi
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # release/v1
+        if: steps.pypi.outputs.pending == 'true'
+        with:
+          packages-dir: sdk-artifacts/pending-pypi/
+          attestations: true
+      - name: Verify published Python artifacts
+        if: contains(fromJSON(needs.validate-release-ref.outputs.sdk_kinds), 'pypi')
+        run: python3 scripts/sdk_release.py verify --tag "$RELEASE_TAG" --kind pypi
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        if: steps.registries.outputs.crate_pending == 'true'
+        with:
+          toolchain: 1.99.1
+      - uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1
+        if: steps.registries.outputs.crate_pending == 'true'
+        id: crates-auth
+      - name: Publish verified Rust packages
+        if: steps.registries.outputs.crate_pending == 'true'
+        env:
+          CARGO_REGISTRIES_CRATES_IO_TOKEN: ${{ steps.crates-auth.outputs.token }}
+        run: python3 scripts/sdk_release.py publish --tag "$RELEASE_TAG" --kind crate
+      - name: Create immutable package tags after registry verification
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/sdk_release.py publish-tags --tag "$RELEASE_TAG"
+
   build-linux-amd64:
     name: Build Linux AMD64
     needs: [build-web-assets, runtime-image-manifest]
     # Pinned to 22.04 (glibc 2.35) so the released binary runs on Ubuntu 22.04+/Debian 12+.
-    # ubuntu-latest currently resolves to 24.04 (glibc 2.39), which broke the binary on
-    # older-but-still-common distros with a "GLIBC_2.38/2.39 not found" error.
+    # Building on a newer image links against a newer glibc: 24.04 (glibc 2.39) broke the
+    # binary on older-but-still-common distros with a "GLIBC_2.38/2.39 not found" error,
+    # and ubuntu-latest moves to 26.04 in November 2026. Keep this pin when other jobs
+    # move to newer images.
     runs-on: ubuntu-22.04
     permissions:
       contents: read
@@ -227,13 +402,16 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake pkg-config libssl-dev protobuf-compiler
+          sudo apt-get install -y cmake pkg-config libssl-dev protobuf-compiler musl-tools
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch; version pinned below
         with:
-          toolchain: stable
-          targets: x86_64-unknown-linux-gnu
+          # Keep in sync with rust-toolchain.toml.
+          toolchain: 1.99.1
+          # The musl target is for the Firecracker guest agent (temps-vm-agent),
+          # which must be fully static; the temps binary itself stays on gnu.
+          targets: x86_64-unknown-linux-gnu,x86_64-unknown-linux-musl
 
       - name: Cache dependencies
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
@@ -267,9 +445,45 @@ jobs:
       - name: Rename binary
         run: cp target/release/temps temps
 
+      # Guest-side agent for Firecracker sandboxes. It runs as PID 1 inside the
+      # microVM, so it has to be a fully static binary that works on any guest
+      # image. `temps firecracker setup` installs it from next to the `temps`
+      # executable, so it ships in the same tarball and always matches the
+      # host's wire protocol.
+      - name: Build Firecracker guest agent (static musl)
+        run: cargo build --release -p temps-vm-agent --bin temps-vm-agent --target x86_64-unknown-linux-musl
+        env:
+          CARGO_INCREMENTAL: 0
+
+      - name: Package Firecracker guest agent
+        run: |
+          strip target/x86_64-unknown-linux-musl/release/temps-vm-agent
+          cp target/x86_64-unknown-linux-musl/release/temps-vm-agent temps-vm-agent
+          file temps-vm-agent
+          file temps-vm-agent | grep -qE 'statically linked|static-pie linked' \
+            || { echo "::error::temps-vm-agent must be a static binary"; exit 1; }
+
+      # Guest-side terminal agent for the Firecracker and microsandbox
+      # backends. `temps firecracker setup` / `temps microsandbox setup` stage
+      # it from next to the `temps` executable, and a guest rejects anything
+      # that is not a static Linux ELF, so it is built the same way as the VM
+      # agent and ships in the same tarball.
+      - name: Build sandbox terminal agent (static musl)
+        run: cargo build --release -p temps-pty-agent --bin temps-pty-agent --target x86_64-unknown-linux-musl
+        env:
+          CARGO_INCREMENTAL: 0
+
+      - name: Package sandbox terminal agent
+        run: |
+          strip target/x86_64-unknown-linux-musl/release/temps-pty-agent
+          cp target/x86_64-unknown-linux-musl/release/temps-pty-agent temps-pty-agent
+          file temps-pty-agent
+          file temps-pty-agent | grep -qE 'statically linked|static-pie linked' \
+            || { echo "::error::temps-pty-agent must be a static binary"; exit 1; }
+
       - name: Create tarball
         run: |
-          tar -czf temps-linux-amd64.tar.gz temps LICENSE LICENSE-MIT NOTICE -C release-inputs runtime-images.json
+          tar -czf temps-linux-amd64.tar.gz temps temps-vm-agent temps-pty-agent LICENSE LICENSE-MIT NOTICE -C release-inputs runtime-images.json
           ls -lh temps-linux-amd64.tar.gz
 
       - name: Generate checksum
@@ -304,13 +518,15 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake pkg-config libssl-dev protobuf-compiler
+          sudo apt-get install -y cmake pkg-config libssl-dev protobuf-compiler musl-tools lld
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch; version pinned below
         with:
-          toolchain: stable
-          targets: aarch64-unknown-linux-gnu
+          # Keep in sync with rust-toolchain.toml.
+          toolchain: 1.99.1
+          # See build-linux-amd64: the musl target is for the static guest agent.
+          targets: aarch64-unknown-linux-gnu,aarch64-unknown-linux-musl
 
       - name: Cache dependencies
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
@@ -330,9 +546,36 @@ jobs:
           name: runtime-image-manifest
           path: release-inputs
 
+      # Since 2026-11-01 this step has stopped with "The runner has received a
+      # shutdown signal" (exit 137 or 143) on every attempt, each time soon
+      # after temps-domains starts compiling, while the amd64 job passes. With
+      # `codegen-units = 1`, each parallel rustc holds a whole crate in one LLVM
+      # module, so memory is the likely limit, though the runner reports no
+      # cause. Two parallel crates trade build time for a lower peak; the
+      # samples show the headroom if this ever needs tuning or fails again.
+      #
+      # It links with lld. The `.text` section is well over the 128 MB an
+      # AArch64 direct call (`R_AARCH64_CALL26`) can reach, so the linker must
+      # insert range-extension stubs; on 2026-11-05 GNU ld stopped managing it
+      # ("relocation truncated to fit" against `memcpy`), and lld places its
+      # thunks reliably. The `.comment` check fails the step if lld was not used.
       - name: Build release binary
-        run: cargo build --release --bin temps
+        run: |
+          while :; do
+            echo "runner-resources $(date -u +%H:%M:%S)" \
+              "mem_available_mb=$(awk '/^MemAvailable:/ {print int($2 / 1024)}' /proc/meminfo)" \
+              "swap_free_mb=$(awk '/^SwapFree:/ {print int($2 / 1024)}' /proc/meminfo)" \
+              "disk_free_mb=$(df -m --output=avail . | tail -n 1 | tr -d ' ')"
+            sleep 60
+          done &
+          sampler_pid=$!
+          trap 'kill "$sampler_pid"' EXIT
+          cargo build --release --bin temps
+          readelf -p .comment target/release/temps | grep -q 'LLD' \
+            || { echo "::error::target/release/temps was not linked with lld"; exit 1; }
         env:
+          CARGO_BUILD_JOBS: 2
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=lld
           TEMPS_RELEASE_IMAGE_MANIFEST: ${{ github.workspace }}/release-inputs/runtime-images.json
           SKIP_WEB_BUILD: 1
           CARGO_INCREMENTAL: 0
@@ -347,9 +590,41 @@ jobs:
       - name: Rename binary
         run: cp target/release/temps temps
 
+      # See build-linux-amd64: the static guest agent ships next to `temps`.
+      - name: Build Firecracker guest agent (static musl)
+        run: cargo build --release -p temps-vm-agent --bin temps-vm-agent --target aarch64-unknown-linux-musl
+        env:
+          CARGO_INCREMENTAL: 0
+
+      - name: Package Firecracker guest agent
+        run: |
+          strip target/aarch64-unknown-linux-musl/release/temps-vm-agent
+          cp target/aarch64-unknown-linux-musl/release/temps-vm-agent temps-vm-agent
+          file temps-vm-agent
+          file temps-vm-agent | grep -qE 'statically linked|static-pie linked' \
+            || { echo "::error::temps-vm-agent must be a static binary"; exit 1; }
+
+      # Guest-side terminal agent for the Firecracker and microsandbox
+      # backends. `temps firecracker setup` / `temps microsandbox setup` stage
+      # it from next to the `temps` executable, and a guest rejects anything
+      # that is not a static Linux ELF, so it is built the same way as the VM
+      # agent and ships in the same tarball.
+      - name: Build sandbox terminal agent (static musl)
+        run: cargo build --release -p temps-pty-agent --bin temps-pty-agent --target aarch64-unknown-linux-musl
+        env:
+          CARGO_INCREMENTAL: 0
+
+      - name: Package sandbox terminal agent
+        run: |
+          strip target/aarch64-unknown-linux-musl/release/temps-pty-agent
+          cp target/aarch64-unknown-linux-musl/release/temps-pty-agent temps-pty-agent
+          file temps-pty-agent
+          file temps-pty-agent | grep -qE 'statically linked|static-pie linked' \
+            || { echo "::error::temps-pty-agent must be a static binary"; exit 1; }
+
       - name: Create tarball
         run: |
-          tar -czf temps-linux-arm64.tar.gz temps LICENSE LICENSE-MIT NOTICE -C release-inputs runtime-images.json
+          tar -czf temps-linux-arm64.tar.gz temps temps-vm-agent temps-pty-agent LICENSE LICENSE-MIT NOTICE -C release-inputs runtime-images.json
           ls -lh temps-linux-arm64.tar.gz
 
       - name: Generate checksum
@@ -382,7 +657,11 @@ jobs:
     # workspace's native deps (openssl via openssl-src, jemalloc via cc-rs)
     # build from source per-target rather than linking a host-arch system
     # lib, so there's no arch-mismatch risk at link time.
-    runs-on: macos-14
+    # macos-26, the newest GA macOS image (Apple Silicon). Pin an explicit
+    # version rather than macos-latest so the Xcode/SDK only changes in a
+    # reviewed commit. GitHub retired macOS 14 on 2026-11-02, and a job that
+    # asks for a retired image is cancelled before it gets a runner.
+    runs-on: macos-26
     permissions:
       contents: read
     steps:
@@ -390,9 +669,10 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch; version pinned below
         with:
-          toolchain: stable
+          # Keep in sync with rust-toolchain.toml.
+          toolchain: 1.99.1
           targets: x86_64-apple-darwin
 
       - name: Cache dependencies
@@ -456,7 +736,7 @@ jobs:
   build-darwin-arm64:
     name: Build macOS ARM64
     needs: [build-web-assets, runtime-image-manifest]
-    runs-on: macos-14
+    runs-on: macos-26
     permissions:
       contents: read
     steps:
@@ -464,9 +744,10 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch; version pinned below
         with:
-          toolchain: stable
+          # Keep in sync with rust-toolchain.toml.
+          toolchain: 1.99.1
           targets: aarch64-apple-darwin
 
       - name: Install system dependencies
@@ -542,7 +823,7 @@ jobs:
       - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
         with:
           cache-binary: false
-      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
         if: github.event_name != 'workflow_dispatch' || inputs.dry_run != true
         with:
           registry: ghcr.io
@@ -585,7 +866,7 @@ jobs:
       - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
         with:
           cache-binary: false
-      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
         if: github.event_name != 'workflow_dispatch' || inputs.dry_run != true
         with:
           registry: ghcr.io
@@ -599,14 +880,15 @@ jobs:
           SANDBOX_VERSION: ${{ needs.prepare-sandbox-context.outputs.sandbox_image_version }}
           GATEWAY_VERSION: ${{ needs.prepare-sandbox-context.outputs.gateway_version }}
         run: |
-          DAEMON_VERSION=$(python3 -c 'import sys; from pathlib import Path; sys.path.insert(0, "tools/sandbox-runtime"); from image_metadata import image_version; print(image_version(Path("crates/temps-sandbox/src/services/sandbox_service.rs").read_text()))')
+          DAEMON_VERSION=$(python3 -c 'import sys; from pathlib import Path; sys.path.insert(0, "tools/sandbox-runtime"); from image_metadata import image_version; print(image_version(Path("crates/temps-sandbox/src/services/sandbox_service/application_workspace.rs").read_text()))')
           python3 .github/scripts/release_image_manifest.py promote --manifest runtime-images.json --revision "$IMAGE_REVISION" --channel "$IMAGE_CHANNEL" --daemon-version "$DAEMON_VERSION" --sandbox-version "$SANDBOX_VERSION" --gateway-version "$GATEWAY_VERSION"
 
   create-release:
     name: Create Release
-    # All image sets, embedded manifests and binaries must succeed before
-    # publication, and the commit must have passed rust-tests.yml.
-    needs: [require-tests, build-linux-amd64, build-linux-arm64, build-darwin-amd64, build-darwin-arm64, runtime-image-manifest, promote-runtime-images]
+    # All image sets (including the managed-database images), embedded
+    # manifests and binaries must succeed before publication, and the commit
+    # must have passed rust-tests.yml.
+    needs: [require-tests, build-linux-amd64, build-linux-arm64, build-darwin-amd64, build-darwin-arm64, runtime-image-manifest, promote-runtime-images, database-images]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -679,7 +961,7 @@ jobs:
       #   gh attestation verify temps-linux-amd64.tar.gz --repo gotempsh/temps
       - name: Set up Cosign for release tarballs
         if: inputs.dry_run != true
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
 
       - name: Sign and verify release tarballs
         if: inputs.dry_run != true
@@ -814,6 +1096,9 @@ jobs:
           OUTPUT: release/CHANGELOG.md
 
       - name: Create release notes file
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          DRY_RUN: ${{ inputs.dry_run }}
         run: |
           {
             echo "## Changes"
@@ -863,6 +1148,10 @@ jobs:
           # Move to PATH
           sudo mv temps /usr/local/bin/temps
 
+          # Firecracker sandboxes only: `temps firecracker setup` looks for the
+          # guest agent next to the temps binary
+          sudo mv temps-vm-agent /usr/local/bin/temps-vm-agent
+
           # Verify
           temps --version
           ```
@@ -877,6 +1166,10 @@ jobs:
 
           # Move to PATH
           sudo mv temps /usr/local/bin/temps
+
+          # Firecracker sandboxes only: `temps firecracker setup` looks for the
+          # guest agent next to the temps binary
+          sudo mv temps-vm-agent /usr/local/bin/temps-vm-agent
 
           # Verify
           temps --version
@@ -956,6 +1249,9 @@ jobs:
           } >> release/release-notes.md
 
           echo "Release notes created:"
+          if [[ "$DRY_RUN" != true ]]; then
+            python3 scripts/sdk_release.py notes --tag "$RELEASE_TAG" >> release/release-notes.md
+          fi
           cat release/release-notes.md
 
       - name: Create GitHub Release
@@ -1049,7 +1345,7 @@ jobs:
             artifact: temps-linux-amd64
             tarball: temps-linux-amd64.tar.gz
           - platform: linux/arm64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-26.04-arm
             artifact: temps-linux-arm64
             tarball: temps-linux-arm64.tar.gz
     steps:
@@ -1076,7 +1372,7 @@ jobs:
           cache-binary: false
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -1105,28 +1401,26 @@ jobs:
           echo "Platform tag: $PLATFORM_TAG"
 
       - name: Build and push Docker image
+        id: release_image
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
           file: ./Dockerfile.release
           platforms: ${{ matrix.platform }}
+          # Re-run apt even when the Dockerfile and base digest are unchanged:
+          # a cached upgrade layer cannot pick up new Debian security fixes.
+          pull: true
+          no-cache: true
           # BuildKit attaches SPDX SBOMs and provenance to each platform manifest.
           sbom: true
           provenance: mode=max
           # Dry-run: build but don't push. Same guard used by the sandbox
-          # and preview-gateway image jobs below — without it, every
-          # workflow_dispatch (dry-run or not) overwrites the real
-          # `:beta-<platform>` tags, which create-docker-manifest then
-          # merges into the `:beta` channel operators pin to.
+          # and preview-gateway image jobs below; manual test runs must not
+          # publish release candidates.
           push: ${{ github.event_name != 'workflow_dispatch' || inputs.dry_run != true }}
-          # Per-platform intermediate tags. The manifest-merge job below
-          # combines amd64+arm64 into the final multi-arch refs. The channel
-          # tag (`latest`, `beta` or `nightly`) keeps stable users from being
-          # upgraded by a beta, and beta users from being moved onto a
-          # nightly. An empty channel tag adds no floating tag at all (blank
-          # lines are ignored by build-push-action).
+          # Publish versioned candidates only. Channel refs are promoted by
+          # create-docker-manifest after BOTH architecture scans pass.
           tags: |
-            ${{ needs.create-release.outputs.channel_tag != '' && format('ghcr.io/{0}/temps:{1}-{2}', github.repository_owner, needs.create-release.outputs.channel_tag, steps.platform_tag.outputs.tag) || '' }}
             ghcr.io/${{ github.repository_owner }}/temps:${{ steps.version.outputs.version }}-${{ steps.platform_tag.outputs.tag }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
@@ -1134,17 +1428,52 @@ jobs:
             org.opencontainers.image.version=${{ steps.version.outputs.version }}
             org.opencontainers.image.title=Temps
             org.opencontainers.image.description=Open-source platform for deploying and managing applications
-          # Read-only on purpose — see the "Actions cache is read-only here" note
-          # at the top of this file. Publishing runs use tag refs whose cache
-          # scope nothing else can read; manual dry-runs follow the same policy.
-          cache-from: type=gha
+
+      - name: Reject vulnerable release image before channel promotion
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.dry_run != true }}
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          # Scan exactly this build, including on the native arm64 runner.
+          TRIVY_PLATFORM: ${{ matrix.platform }}
+          TRIVY_IMAGE_SRC: remote
+        with:
+          image-ref: ghcr.io/${{ github.repository_owner }}/temps@${{ steps.release_image.outputs.digest }}
+          scanners: vuln
+          format: table
+          severity: "CRITICAL,HIGH"
+          exit-code: "1"
+          ignore-unfixed: true
+          # Release workflows never save Actions caches under tag refs.
+          cache: false
+
+      - name: Record scanned server image digest
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.dry_run != true }}
+        env:
+          IMAGE_DIGEST: ${{ steps.release_image.outputs.digest }}
+          PLATFORM_TAG: ${{ steps.platform_tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Invalid scanned server image digest" >&2
+            exit 1
+          fi
+          mkdir -p scanned-images
+          printf '%s\n' "$IMAGE_DIGEST" > "scanned-images/$PLATFORM_TAG"
+
+      - name: Upload scanned server image digest
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.dry_run != true }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: scanned-server-${{ steps.platform_tag.outputs.tag }}
+          path: scanned-images/*
+          if-no-files-found: error
+          overwrite: true
 
   create-docker-manifest:
     name: Create Docker Manifest
     needs: [build-and-push-docker, create-release]
-    # Merges per-platform tags that build-and-push-docker only pushes on a
-    # real run. On a workflow_dispatch dry-run those source tags don't
-    # exist, so skip the merge too (would otherwise fail on a missing tag).
+    # Merge only the digests scanned by this run. Other runs may overwrite
+    # versioned architecture tags between scanning and promotion.
     if: ${{ github.event_name != 'workflow_dispatch' || inputs.dry_run != true }}
     runs-on: ubuntu-latest
     permissions:
@@ -1160,10 +1489,10 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Set up Cosign
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -1184,7 +1513,29 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Version: $VERSION"
 
-      # Merge per-platform tags into a multi-arch manifest under the channel
+      - name: Download scanned server image digests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: scanned-server-linux-*
+          merge-multiple: true
+          path: scanned-images
+
+      - name: Validate scanned server image references
+        id: scanned_images
+        env:
+          IMAGE_REPOSITORY: ghcr.io/${{ github.repository_owner }}/temps
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            digest=$(cat "scanned-images/linux-$arch")
+            if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::Invalid scanned server image digest for $arch" >&2
+              exit 1
+            fi
+            printf '%s_ref=%s@%s\n' "$arch" "$IMAGE_REPOSITORY" "$digest" >> "$GITHUB_OUTPUT"
+          done
+
+      # Merge scanned digests into a multi-arch manifest under the channel
       # ref (`:latest` for stable, `:beta` for betas/RCs, `:nightly` for
       # nightlies). Operators that pin to `:latest` never receive a
       # prerelease, and `:beta` never receives a nightly.
@@ -1192,16 +1543,19 @@ jobs:
         if: needs.create-release.outputs.channel_tag != ''
         env:
           CHANNEL: ${{ needs.create-release.outputs.channel_tag }}
+          AMD64_IMAGE: ${{ steps.scanned_images.outputs.amd64_ref }}
+          ARM64_IMAGE: ${{ steps.scanned_images.outputs.arm64_ref }}
         run: |
           docker buildx imagetools create -t "ghcr.io/${{ github.repository_owner }}/temps:${CHANNEL}" \
-            "ghcr.io/${{ github.repository_owner }}/temps:${CHANNEL}-linux-amd64" \
-            "ghcr.io/${{ github.repository_owner }}/temps:${CHANNEL}-linux-arm64"
+            "$AMD64_IMAGE" "$ARM64_IMAGE"
 
       - name: Create and push manifest for version
+        env:
+          AMD64_IMAGE: ${{ steps.scanned_images.outputs.amd64_ref }}
+          ARM64_IMAGE: ${{ steps.scanned_images.outputs.arm64_ref }}
         run: |
           docker buildx imagetools create -t ghcr.io/${{ github.repository_owner }}/temps:${{ steps.version.outputs.version }} \
-            ghcr.io/${{ github.repository_owner }}/temps:${{ steps.version.outputs.version }}-linux-amd64 \
-            ghcr.io/${{ github.repository_owner }}/temps:${{ steps.version.outputs.version }}-linux-arm64
+            "$AMD64_IMAGE" "$ARM64_IMAGE"
 
       - name: Sign published multi-platform images
         env:
@@ -1296,9 +1650,10 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch; version pinned below
         with:
-          toolchain: stable
+          # Keep in sync with rust-toolchain.toml.
+          toolchain: 1.99.1
 
       - name: Install build dependencies
         run: |
@@ -1320,16 +1675,16 @@ jobs:
           cargo build \
             --example print_dockerfile \
             --example print_bundle \
-            -p temps-agents
+            -p temps-sandbox-providers
 
       - name: Extract versions
         id: version
         run: |
           IMAGE_VERSION=$(grep -E '^pub const SANDBOX_IMAGE_VERSION' \
-            crates/temps-agents/src/sandbox/docker.rs \
+            crates/temps-sandbox-providers/src/docker/image.rs \
             | sed -E 's/.*"([^"]+)".*/\1/')
           if [ -z "$IMAGE_VERSION" ]; then
-            echo "::error::Failed to extract SANDBOX_IMAGE_VERSION from docker.rs"
+            echo "::error::Failed to extract SANDBOX_IMAGE_VERSION from docker/image.rs"
             exit 1
           fi
           echo "sandbox_image_version=$IMAGE_VERSION" >> "$GITHUB_OUTPUT"
@@ -1416,7 +1771,7 @@ jobs:
           cache-binary: false
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -1476,7 +1831,7 @@ jobs:
           retention-days: 1
       - name: Set up Cosign for runtime image
         if: ${{ github.event_name != 'workflow_dispatch' || inputs.dry_run != true }}
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
 
       - name: Sign published runtime image digest
         if: ${{ github.event_name != 'workflow_dispatch' || inputs.dry_run != true }}
@@ -1511,7 +1866,7 @@ jobs:
           cache-binary: false
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -1564,7 +1919,7 @@ jobs:
           retention-days: 1
       - name: Set up Cosign for runtime image
         if: ${{ github.event_name != 'workflow_dispatch' || inputs.dry_run != true }}
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
 
       - name: Sign published runtime image digest
         if: ${{ github.event_name != 'workflow_dispatch' || inputs.dry_run != true }}

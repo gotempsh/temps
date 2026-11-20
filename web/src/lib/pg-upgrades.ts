@@ -60,7 +60,9 @@ async function readJsonOrThrow<T>(response: Response): Promise<T> {
     } catch {
       // fall through with statusText
     }
-    throw new Error(detail)
+    // Carry the HTTP status so callers can tell "not found" from "could not
+    // load" and the query retry policy can skip deterministic 4xx answers.
+    throw Object.assign(new Error(detail), { status: response.status })
   }
   return (await response.json()) as T
 }

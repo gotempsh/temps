@@ -5,7 +5,9 @@ import { useEffect, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Check, Copy, Hash, WrapText } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { scrollableRegionProps, useScrollableRegion } from './scrollable-region'
 import type { HighlighterCore } from 'shiki/core'
+import { withReadableDarkComments } from './code-block-theme'
 
 /**
  * Languages this block can highlight.
@@ -97,7 +99,9 @@ async function getHighlighter(): Promise<HighlighterCore> {
       return createHighlighterCore({
         themes: [
           import('shiki/themes/github-light.mjs'),
-          import('shiki/themes/github-dark.mjs'),
+          import('shiki/themes/github-dark.mjs').then((module) =>
+            withReadableDarkComments(module.default)
+          ),
         ],
         langs: [],
         engine: createJavaScriptRegexEngine({ forgiving: true }),
@@ -153,8 +157,10 @@ export function CodeBlock({
   const [wrapLines, setWrapLines] = useState(defaultWrap)
   const [showLineNumbers, setShowLineNumbers] = useState(defaultShowLineNumbers)
 
-  const visibleButtonCount =
-    1 + (disableWrapToggle ? 0 : 1) + (showCopy ? 1 : 0)
+  // Long unwrapped lines scroll horizontally; make that scroller a tab stop
+  // (only while it overflows) so keyboard users can reach the rest of the line.
+  const { ref: scrollerRef, scrollable } = useScrollableRegion<HTMLDivElement>()
+  const scrollerProps = scrollableRegionProps(scrollable)
 
   const handleCopy = async () => {
     await navigator.clipboard.writeText(code)
@@ -183,39 +189,14 @@ export function CodeBlock({
       {/* The white/2.5 wash over zinc-900 is what gives the dark panel its
           slightly-lifted tone in the docs; without it the block reads as a
           flat hole in the page. */}
-      <div className="relative min-w-0 dark:bg-white/[0.025]">
-        <div
-          className={cn(
-            // w-0 min-w-full max-w-full is the trick: forces this element to
-            // parent width while letting its children overflow horizontally.
-            'w-0 min-w-full max-w-full py-4 pl-4',
-            visibleButtonCount === 3 && 'pr-28',
-            visibleButtonCount === 2 && 'pr-20',
-            visibleButtonCount === 1 && 'pr-12',
-            visibleButtonCount === 0 && 'pr-4',
-            wrapLines ? 'overflow-x-hidden' : 'overflow-x-auto'
-          )}
-        >
-          <pre
-            className={cn(
-              'm-0 font-mono text-[13px] leading-6 sm:text-xs',
-              wrapLines ? 'whitespace-pre-wrap break-all' : 'whitespace-pre'
-            )}
-          >
-            <HighlightedCode
-              code={code}
-              language={language}
-              showLineNumbers={showLineNumbers}
-            />
-          </pre>
-        </div>
-        <div className="absolute top-2 right-2 flex items-center gap-0.5 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity duration-200">
+      <div className="flex min-w-0 flex-col dark:bg-white/[0.025]">
+        <div className="mt-2 mr-2 flex shrink-0 self-end items-center gap-0.5 opacity-100">
           <Button
             size="icon"
             variant="ghost"
             className={cn(
               'size-7 rounded-md',
-              'text-muted-foreground/70 hover:text-foreground',
+              'text-muted-foreground hover:text-foreground',
               'hover:bg-zinc-200/70 dark:hover:bg-zinc-800/60'
             )}
             onClick={() => setShowLineNumbers(!showLineNumbers)}
@@ -237,7 +218,7 @@ export function CodeBlock({
               variant="ghost"
               className={cn(
                 'size-7 rounded-md',
-                'text-muted-foreground/70 hover:text-foreground',
+                'text-muted-foreground hover:text-foreground',
                 'hover:bg-zinc-200/70 dark:hover:bg-zinc-800/60'
               )}
               onClick={() => setWrapLines(!wrapLines)}
@@ -258,7 +239,7 @@ export function CodeBlock({
               variant="ghost"
               className={cn(
                 'size-7 rounded-md',
-                'text-muted-foreground/70 hover:text-foreground',
+                'text-muted-foreground hover:text-foreground',
                 'hover:bg-zinc-200/70 dark:hover:bg-zinc-800/60'
               )}
               onClick={handleCopy}
@@ -272,6 +253,29 @@ export function CodeBlock({
               )}
             </Button>
           )}
+        </div>
+        <div
+          ref={scrollerRef}
+          {...scrollerProps}
+          className={cn(
+            'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring',
+            // Keep the toolbar above the full-width code scroller.
+            'min-w-0 w-full px-4 pt-2 pb-4',
+            wrapLines ? 'overflow-x-hidden' : 'overflow-x-auto'
+          )}
+        >
+          <pre
+            className={cn(
+              'm-0 font-mono text-[13px] leading-6 sm:text-xs',
+              wrapLines ? 'whitespace-pre-wrap break-all' : 'whitespace-pre'
+            )}
+          >
+            <HighlightedCode
+              code={code}
+              language={language}
+              showLineNumbers={showLineNumbers}
+            />
+          </pre>
         </div>
       </div>
     </div>

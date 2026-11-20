@@ -80,7 +80,7 @@ export function AiChatLimitsCard() {
       // which is the whole reason it is a stored setting and not a constant.
       toast.success('Saved — applies to the next message')
     } catch {
-      toast.error('Failed to save the chat limit')
+      // useUpdateSettings already toasts this failure, with the server's reason.
     }
   }
 

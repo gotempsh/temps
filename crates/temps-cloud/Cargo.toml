@@ -16,7 +16,6 @@ temps-config = { path = "../temps-config" }
 temps-core = { path = "../temps-core" }
 temps-entities = { path = "../temps-entities" }
 
-anyhow.workspace = true
 async-trait.workspace = true
 aws-sdk-s3.workspace = true
 axum.workspace = true
@@ -24,16 +23,17 @@ chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 regex.workspace = true
-reqwest.workspace = true
 sea-orm.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
-tokio-util = { workspace = true, features = ["io"] }
 tracing.workspace = true
 utoipa.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+temps-test-utils = { path = "../temps-test-utils" }
 tempfile.workspace = true
-temps-database = { path = "../temps-database" }
+
+[lints]
+workspace = true

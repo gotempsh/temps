@@ -7,6 +7,8 @@ pub mod alert;
 pub mod alert_suggest;
 pub mod api_tools;
 pub mod application;
+pub mod assistant;
+pub mod console_links;
 pub mod deployment;
 pub mod global;
 pub mod project;

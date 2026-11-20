@@ -7,6 +7,12 @@ import { createContext, useContext } from 'react'
 export interface ProjectsContextType {
   projects: ProjectResponse[]
   isLoading: boolean
+  /**
+   * Why the list could not be read, when it could not. An empty `projects`
+   * with an `error` is an unreadable installation, not an empty one.
+   */
+  error?: unknown
+  refetch?: () => void
 }
 
 export const ProjectsContext = createContext<ProjectsContextType>({

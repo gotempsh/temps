@@ -47,8 +47,10 @@ export interface ProjectHealthInput {
 
 /** The slice of `ProjectMonitorHealth` this indicator reads. */
 export interface ProjectMonitorHealthInput {
-  /** `operational` | `degraded` | `down` | `not_deployed` | `no_monitors` */
+  /** `operational` | `degraded` | `down` | `not_deployed` | `no_address` | `no_monitors` */
   status: string
+  runtime_status?: string | null
+  runtime_reason?: string | null
 }
 
 export interface ProjectHealthIndicatorOptions {
@@ -92,6 +94,29 @@ function measuredDetail(
 function monitorIndicator(
   monitor: ProjectMonitorHealthInput
 ): ProjectHealthIndicator | null {
+  if (monitor.status === 'no_address' && monitor.runtime_status != null) {
+    if (monitor.runtime_status === 'healthy')
+      return {
+        tone: 'healthy',
+        label: 'Healthy',
+        detail:
+          'The worker reports fresh, passing container health checks. Public reachability is separate.',
+      }
+    if (monitor.runtime_status === 'unhealthy')
+      return {
+        tone: 'down',
+        label: 'Unhealthy',
+        detail:
+          monitor.runtime_reason ||
+          'The worker reports a failing container health check.',
+      }
+    return {
+      tone: 'idle',
+      label: 'Health unknown',
+      detail:
+        'No fresh supported worker health observation is available. Check the worker connection and runtime monitoring in Monitors.',
+    }
+  }
   switch (monitor.status) {
     case 'operational':
       return {
@@ -123,6 +148,15 @@ function monitorIndicator(
         detail:
           'Production has no deployment yet, so its uptime monitor has nothing to check. Uptime checks start with the first production deployment.',
       }
+    case 'no_address':
+      // ADR 068 D4: nobody can reach production yet, so the monitor does
+      // not probe. Grey, never down: nothing failed.
+      return {
+        tone: 'idle',
+        label: 'Nothing to check',
+        detail:
+          'Nothing to check: nobody can reach this environment yet. Uptime checks start once it has an address.',
+      }
     default:
       // 'no_monitors', or a status this build does not know about.
       return null
@@ -152,7 +186,7 @@ export function projectHealthIndicator({
       // rest, and is exposed to screen readers rather than hidden in a tooltip.
       label: 'Unavailable',
       detail:
-        'Temps could not load request health for this project. Reload the page to try again; if it persists, check that the proxy is running.',
+        'Temps could not load request health for this service. Reload the page to try again; if it persists, check that the proxy is running.',
     }
   }
 
@@ -169,7 +203,7 @@ export function projectHealthIndicator({
       tone: 'unavailable',
       label: 'No health data',
       detail:
-        'The health summary returned no entry for this project, so its status could not be determined.',
+        'The health summary returned no entry for this service, so its status could not be determined.',
     }
   }
 
@@ -180,7 +214,7 @@ export function projectHealthIndicator({
       tone: 'idle',
       label: 'No traffic',
       detail:
-        `No user requests reached this project in ${windowLabel(windowHours)}, so there is no traffic to measure. ` +
+        `No user requests reached this service in ${windowLabel(windowHours)}, so there is no traffic to measure. ` +
         'Add an uptime monitor to get a health signal that does not depend on visitors.',
     }
   }

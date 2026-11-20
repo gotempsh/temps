@@ -28,7 +28,7 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { focusedStartPrompt, suggestAlertsState } from './suggest-alerts-state'
 
 const START_PROMPT =
-  'Look at what this project already alerts on and what metrics it actually reports, then propose the alert rules worth adding. Ground every threshold in real values you queried, and backtest anomaly detectors before proposing them.'
+  'Look at what this service already alerts on and what metrics it actually reports, then propose the alert rules worth adding. Ground every threshold in real values you queried, and backtest anomaly detectors before proposing them.'
 
 /**
  * Opened from the explorer with a metric on screen, the question is narrower —

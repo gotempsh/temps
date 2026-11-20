@@ -6,12 +6,43 @@ import { buildPlatformSettingsUpdateBody } from './platformSettings'
 import type { PlatformSettings } from './platformSettings'
 
 describe('buildPlatformSettingsUpdateBody', () => {
+  test('round-trips both platform identity choices', () => {
+    for (const expose_platform_identity of [true, false]) {
+      const body = buildPlatformSettingsUpdateBody({
+        expose_platform_identity,
+      } as PlatformSettings)
+      expect(body.expose_platform_identity).toBe(expose_platform_identity)
+    }
+  })
+
   test('round-trips the admin proxy trust setting on unrelated saves', () => {
     const body = buildPlatformSettingsUpdateBody({
       trust_loopback_forwarded_ip: true,
     } as PlatformSettings)
 
     expect(body.trust_loopback_forwarded_ip).toBe(true)
+  })
+
+  test('only sends proxy CIDRs when explicitly changed, including clearing', () => {
+    const stored = { trusted_proxy_cidrs: ['10.20.0.0/16'] } as PlatformSettings
+    expect(
+      buildPlatformSettingsUpdateBody(stored, {}).trusted_proxy_cidrs
+    ).toBeUndefined()
+    expect(
+      buildPlatformSettingsUpdateBody(stored, { trusted_proxy_cidrs: [] })
+        .trusted_proxy_cidrs
+    ).toEqual([])
+    expect(buildPlatformSettingsUpdateBody(stored).trusted_proxy_cidrs).toEqual(
+      ['10.20.0.0/16']
+    )
+  })
+
+  test('round-trips the loopback JA4 header on unrelated saves', () => {
+    const body = buildPlatformSettingsUpdateBody({
+      loopback_ja4_header: 'x-ja4',
+    } as PlatformSettings)
+
+    expect(body.loopback_ja4_header).toBe('x-ja4')
   })
 
   test('sends the trusted private networks the Security page edits', () => {
@@ -69,6 +100,24 @@ describe('buildPlatformSettingsUpdateBody', () => {
   // Same `#[serde(default)]` trap: `container_logs` carries both the Docker
   // rotation options and the collected-log cache/head budgets (ADR-046), and
   // none of them survived an unrelated save before it was round-tripped.
+  // `null` is the explicit "keep this data" choice. Dropping the block would
+  // make serde restore the defaults, turning a configured "keep visitors
+  // forever" into a 30-day IP cleanup on the next unrelated save.
+  test('round-trips analytics retention including the keep (null) windows', () => {
+    const analyticsRetention = {
+      events_days: 365,
+      error_events_days: null,
+      visitor_days: 425,
+      unreferenced_ip_days: null,
+    }
+
+    const body = buildPlatformSettingsUpdateBody({
+      analytics_retention: analyticsRetention,
+    } as PlatformSettings)
+
+    expect(body.analytics_retention).toEqual(analyticsRetention)
+  })
+
   test('round-trips container log rotation and budgets', () => {
     const containerLogs = {
       max_size: '100m',

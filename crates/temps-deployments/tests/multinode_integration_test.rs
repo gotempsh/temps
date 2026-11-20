@@ -14,7 +14,7 @@
 
 use sea_orm::{DatabaseBackend, MockDatabase};
 use std::sync::Arc;
-use temps_entities::{deployment_containers, deployments, environments, nodes};
+use temps_entities::{compose_placements, deployment_containers, deployments, environments, nodes};
 
 use temps_deployments::services::node_scheduler::{NodeAssignment, NodeScheduler};
 use temps_deployments::services::node_service::{HeartbeatRequest, NodeService};
@@ -45,6 +45,7 @@ fn make_node(id: i32, name: &str, status: &str, heartbeat_age_secs: i64) -> node
         mesh_wg_endpoint: None,
         mesh_wg_address: None,
         failover_at: None,
+        drain_requested_at: None,
         last_heartbeat: Some(chrono::Utc::now() - chrono::Duration::seconds(heartbeat_age_secs)),
         dns_resolver_running: None,
         dns_resolver_tasks_alive: None,
@@ -52,6 +53,8 @@ fn make_node(id: i32, name: &str, status: &str, heartbeat_age_secs: i64) -> node
         dns_resolver_consecutive_failures: 0,
         dns_resolver_last_error: None,
         dns_resolver_record_count: None,
+        deployments_without_resolver: None,
+        build_limits: None,
         public_ingress_enabled: false,
         public_ingress_running: None,
         public_ingress_last_error: None,
@@ -59,6 +62,13 @@ fn make_node(id: i32, name: &str, status: &str, heartbeat_age_secs: i64) -> node
         public_ingress_route_count: None,
         public_ingress_unsupported_route_count: None,
         public_ingress_unsupported_reasons: serde_json::json!([]),
+        occupied_ranges: None,
+        overlay_status: None,
+        overlay_last_error: None,
+        overlay_ready_cidr: None,
+        overlay_remediation: None,
+        overlay_network_name: None,
+        overlay_vxlan_vni: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }
@@ -75,7 +85,10 @@ fn make_container(
         deployment_id,
         container_id: container_id.to_string(),
         container_name: format!("app-{}", id),
-        container_port: 8080,
+        container_port: Some(8080),
+        health_state: "unknown".to_string(),
+        health_checked_at: None,
+        health_detail: None,
         host_port: Some(30000 + id),
         image_name: Some("myapp:latest".to_string()),
         status: Some("running".to_string()),
@@ -152,8 +165,12 @@ fn make_environment(
         protected: false,
         sleeping: false,
         attack_mode: None,
+        shield_mode: None,
+        shield_exempt_paths: Default::default(),
         force_https: None,
         last_activity_at: None,
+        ingress_mode: Default::default(),
+        workload_mode: Default::default(),
     }
 }
 
@@ -380,13 +397,14 @@ async fn test_health_check_ignores_fresh_nodes() {
 #[tokio::test]
 async fn test_drain_complete_transitions_status() {
     let draining = make_node(1, "worker-1", "draining", 10);
-    let mut drained = draining.clone();
-    drained.status = "drained".to_string();
 
     let db = MockDatabase::new(DatabaseBackend::Postgres)
         .append_query_results(vec![vec![draining]])
         .append_query_results(vec![Vec::<deployment_containers::Model>::new()])
-        .append_query_results(vec![vec![drained]])
+        .append_exec_results(vec![sea_orm::MockExecResult {
+            last_insert_id: 0,
+            rows_affected: 1,
+        }])
         .into_connection();
 
     let service = NodeService::new(Arc::new(db));
@@ -435,11 +453,15 @@ async fn test_heartbeat_reactivates_offline_node() {
         .heartbeat(
             1,
             HeartbeatRequest {
+                deployments_without_resolver: None,
                 architecture: None,
                 capacity: serde_json::json!({"cpu_percent": 25}),
                 labels: None,
                 dns_resolver: None,
                 docker_socket_projects: None,
+                overlay: None,
+                occupied_ranges: None,
+                overlay_vxlan_vni: None,
                 public_ingress: None,
             },
         )
@@ -463,11 +485,15 @@ async fn test_heartbeat_preserves_draining_status() {
         .heartbeat(
             1,
             HeartbeatRequest {
+                deployments_without_resolver: None,
                 architecture: None,
                 capacity: serde_json::json!({"cpu_percent": 25}),
                 labels: None,
                 dns_resolver: None,
                 docker_socket_projects: None,
+                overlay: None,
+                occupied_ranges: None,
+                overlay_vxlan_vni: None,
                 public_ingress: None,
             },
         )
@@ -505,6 +531,8 @@ async fn test_affected_deployments_identifies_needs_redeploy() {
     let db = MockDatabase::new(DatabaseBackend::Postgres)
         .append_query_results(vec![vec![c1.clone(), c2.clone(), c3.clone()]])
         .append_query_results(vec![vec![d1, d2]])
+        // No Compose stack is pinned to node 5, so both may fail over.
+        .append_query_results(vec![Vec::<compose_placements::Model>::new()])
         .append_query_results(vec![vec![e1, e2]])
         .append_query_results(vec![vec![c1, c2, c3, c4, c5]])
         .into_connection();
@@ -547,11 +575,15 @@ async fn test_heartbeat_records_reported_architecture() {
         .heartbeat(
             1,
             HeartbeatRequest {
+                deployments_without_resolver: None,
                 architecture: Some("linux/arm64".to_string()),
                 capacity: serde_json::json!({"cpu_percent": 10}),
                 labels: None,
                 dns_resolver: None,
                 docker_socket_projects: None,
+                overlay: None,
+                occupied_ranges: None,
+                overlay_vxlan_vni: None,
                 public_ingress: None,
             },
         )
@@ -582,11 +614,15 @@ async fn test_heartbeat_without_architecture_keeps_the_stored_one() {
         .heartbeat(
             1,
             HeartbeatRequest {
+                deployments_without_resolver: None,
                 architecture: None,
                 capacity: serde_json::json!({"cpu_percent": 10}),
                 labels: None,
                 dns_resolver: None,
                 docker_socket_projects: None,
+                overlay: None,
+                occupied_ranges: None,
+                overlay_vxlan_vni: None,
                 public_ingress: None,
             },
         )

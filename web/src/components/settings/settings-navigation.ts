@@ -11,16 +11,18 @@ import {
   Clock,
   Cloud,
   Gauge,
+  Globe,
   HardDrive,
+  HeartPulse,
   Key,
   KeyRound,
   LockKeyhole,
-  Monitor,
-  Puzzle,
+  Network,
   RadioTower,
   Server,
   Settings2,
   Shield,
+  ShieldCheck,
   Users,
   UsersRound,
   Waypoints,
@@ -90,40 +92,58 @@ export const settingsNavigationGroups: SettingsNavigationGroup[] = [
         featureKey: 'teams',
       },
       { title: 'Authentication', url: '/settings/auth', icon: KeyRound },
-      { title: 'API Keys', url: '/settings/keys', icon: Key },
+      { title: 'API keys', url: '/settings/keys', icon: Key },
     ],
   },
   {
     label: 'Infrastructure',
     items: [
-      { title: 'Load Balancer', url: '/settings/load-balancer', icon: Server },
+      { title: 'Load balancer', url: '/settings/load-balancer', icon: Server },
       {
-        title: 'Docker Registry',
+        title: 'Docker registry',
         url: '/settings/docker-registry',
         icon: Boxes,
       },
-      { title: 'Build Limits', url: '/settings/build-limits', icon: Gauge },
+      { title: 'Build limits', url: '/settings/build-limits', icon: Gauge },
       {
-        title: 'Request Timeouts',
+        title: 'Request timeouts',
         url: '/settings/request-timeouts',
         icon: Clock,
       },
-      // Worker Nodes deliberately is NOT here: it is a main-navigation page
-      // under "Build & deliver" (see components/dashboard/Sidebar.tsx). It
-      // keeps the /settings/nodes URL, and the sidebar excludes that route
-      // from the settings swap so the page renders with the normal shell.
       {
-        title: 'Traefik Discovery',
+        title: 'Service health checks',
+        url: '/settings/service-healthchecks',
+        icon: HeartPulse,
+        keywords: [
+          'healthcheck',
+          'docker healthcheck',
+          'health check interval',
+          'database health',
+        ],
+      },
+      {
+        title: 'DNS',
+        url: '/settings/dns',
+        icon: Globe,
+        keywords: [
+          'cluster dns',
+          'resolver',
+          'temps.local',
+          'nxdomain',
+          'servfail',
+          'name resolution',
+        ],
+      },
+      // Worker Nodes and Plugins deliberately are NOT here: they are
+      // main-navigation pages (see components/dashboard/primary-navigation.ts).
+      // They keep their /settings/... URLs, and the sidebar excludes those
+      // routes from the settings swap so the pages render with the normal shell.
+      {
+        title: 'Traefik discovery',
         url: '/settings/traefik-discovery',
         icon: Waypoints,
       },
-      {
-        title: 'Plugins',
-        url: '/settings/plugins',
-        icon: Puzzle,
-        featureKey: 'plugin-system',
-      },
-      { title: 'MCP Server', url: '/settings/mcp-server', icon: Bot },
+      { title: 'MCP server', url: '/settings/mcp-server', icon: Bot },
     ],
   },
   {
@@ -131,24 +151,36 @@ export const settingsNavigationGroups: SettingsNavigationGroup[] = [
     items: [
       { title: 'Security', url: '/settings/security', icon: Shield },
       {
+        title: 'Shield proposals',
+        url: '/settings/shield-proposals',
+        icon: ShieldCheck,
+        keywords: ['learning', 'attackers', 'approve', 'block', 'review'],
+      },
+      {
         title: 'On-demand TLS',
         url: '/settings/on-demand-tls',
         icon: LockKeyhole,
         keywords: ['certificates', 'https', 'ssl', "let's encrypt", 'acme'],
       },
-      { title: 'Rate Limiting', url: '/settings/rate-limiting', icon: Monitor },
       {
-        title: 'Disk Monitoring',
+        title: 'Network policy',
+        url: '/settings/network-policy',
+        icon: Network,
+        keywords: ['egress', 'ingress', 'firewall', 'rules', 'isolation'],
+      },
+      { title: 'Rate limiting', url: '/settings/rate-limiting', icon: Gauge },
+      {
+        title: 'Disk monitoring',
         url: '/settings/disk-monitoring',
         icon: HardDrive,
       },
       {
-        title: 'Metrics Monitoring',
+        title: 'Metrics monitoring',
         url: '/settings/metrics-monitoring',
         icon: BarChart3,
       },
       {
-        title: 'OTel Pipeline',
+        title: 'OTel pipeline',
         url: '/settings/otel-pipeline',
         icon: Activity,
       },

@@ -11,6 +11,7 @@ import {
   uploadStaticBundle,
   type DropInspectionResponse,
   type EnvironmentResponse,
+  type ProjectGroupResponse,
   type ProjectResponse,
 } from '@/api/client'
 import { DropDeliveryRow } from '@/components/drop/DropDeliveryRow'
@@ -34,6 +35,7 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
+import { useJoinGroupAfterCreate } from '@/components/project-groups/useJoinGroupAfterCreate'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { usePlatformFeatures } from '@/hooks/usePlatformFeatures'
 import {
@@ -63,6 +65,7 @@ import {
 import type { DropDeliveryChoice } from '@/lib/drop-delivery'
 import { ensureDropProjectName } from '@/lib/drop-project-name'
 import { cn } from '@/lib/utils'
+import { toast } from 'sonner'
 import {
   ArrowRight,
   Check,
@@ -73,7 +76,7 @@ import {
   X,
 } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { Link, useNavigate } from 'react-router'
+import { Link } from 'react-router'
 
 type DropStage =
   | 'idle'
@@ -93,23 +96,22 @@ function stageLabel(
     case 'packing':
       return 'Packing files locally'
     case 'creating':
-      return 'Creating project'
+      return 'Creating service'
     case 'detecting':
       return 'Detecting preset'
     case 'uploading':
-      return 'Uploading project'
+      return 'Uploading files'
     case 'deploying':
       return 'Starting deployment'
     case 'done':
       return 'Deployment started'
     default:
       if (detectedLabel) return `Deploy ${detectedLabel}`
-      return hasFiles ? 'Retry preset detection' : 'Select project files'
+      return hasFiles ? 'Retry preset detection' : 'Select files'
   }
 }
 
 export function Drop({ embedded = false }: { embedded?: boolean }) {
-  const navigate = useNavigate()
   const platformFeatures = usePlatformFeatures()
   const sourceUploadsSupported = sourceArchiveUploadsSupported(
     platformFeatures.data
@@ -154,8 +156,17 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
   const [handedOffFiles] = useState(() => consumeDropFilesHandoff())
   const detectionRunRef = useRef(0)
   const detectionAbortRef = useRef<AbortController | null>(null)
+  // `/projects/new?group=<id>`: the new service joins that project, before
+  // anything is uploaded or deployed (the server resolves the project's
+  // shared variables while it plans a deployment).
+  const {
+    groupId: targetGroupId,
+    group: targetGroup,
+    addToGroup,
+    continueTo,
+  } = useJoinGroupAfterCreate()
 
-  usePageTitle(embedded ? 'New Project' : 'Drop')
+  usePageTitle(embedded ? 'New service' : 'Drop')
   useEffect(() => {
     if (embedded) return
     setBreadcrumbs([
@@ -333,7 +344,7 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
       }
 
       const candidate = detected.candidates[Number(selectedCandidateIndex)]
-      if (!candidate) throw new Error('Choose a detected project preset')
+      if (!candidate) throw new Error('Choose a detected preset')
 
       setStage('creating')
       const projectResult = await createProject({
@@ -357,7 +368,7 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
         },
       })
       createdProject = projectResult.data
-      if (!createdProject) throw new Error('Temps created no project record')
+      if (!createdProject) throw new Error('Temps created no service record')
 
       const environmentsResult = await getEnvironments({
         throwOnError: true,
@@ -369,7 +380,21 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
         environments.find((item) => !item.is_preview) ||
         environments[0]
       if (!targetEnvironment)
-        throw new Error('The project has no deployment environment')
+        throw new Error('The service has no deployment environment')
+
+      // Into the target project before any deployment is planned. A failure
+      // lands in the catch below: nothing was deployed, the incomplete
+      // service is removed and Deploy can simply be pressed again.
+      let joinedGroup: ProjectGroupResponse | null = null
+      if (targetGroupId !== null) {
+        const joined = await addToGroup(createdProject)
+        if (joined.status === 'failed') {
+          throw new Error(
+            `The service could not be added to ${targetGroup?.name ?? 'the project'}, so nothing was deployed. ${joined.message}`
+          )
+        }
+        joinedGroup = joined.group
+      }
 
       setStage('uploading')
       if (!candidate.isStatic) {
@@ -385,7 +410,10 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
         if (!sourceDeployment)
           throw new Error('Source deployment returned no result')
         deploymentAccepted = true
-        navigate(
+        if (joinedGroup) {
+          toast.success(`${createdProject.name} added to ${joinedGroup.name}`)
+        }
+        continueTo(
           `/projects/${createdProject.slug}/deployments/${sourceDeployment.id}`
         )
         return
@@ -408,6 +436,12 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
         body: { static_bundle_id: bundle.id },
       })
       deploymentAccepted = true
+      // Into a project: land on it.
+      if (joinedGroup) {
+        toast.success(`${createdProject.name} added to ${joinedGroup.name}`)
+        continueTo('')
+        return
+      }
       setProject(createdProject)
       setEnvironment(targetEnvironment)
       setStage('done')
@@ -419,7 +453,7 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
             throwOnError: true,
             path: { id: createdProject.id },
           })
-          message += ' The incomplete project was removed.'
+          message += ' The incomplete service was removed.'
         } catch (cleanupError) {
           message += ` Cleanup also failed: ${dropErrorMessage(cleanupError)}`
         }
@@ -437,14 +471,14 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
           <div className="mb-8 flex size-14 items-center justify-center rounded-2xl bg-emerald-500 text-white shadow-lg shadow-emerald-500/20">
             <Check className="size-7" />
           </div>
-          <p className="mb-3 font-mono text-xs uppercase tracking-[0.28em] text-emerald-600 dark:text-emerald-400">
+          <p className="mb-3 font-mono text-xs uppercase tracking-[0.28em] text-emerald-700 dark:text-emerald-400">
             Drop accepted
           </p>
           <h1 className="text-balance text-4xl font-semibold tracking-tight sm:text-6xl">
             {project.name} is on its way live.
           </h1>
           <p className="mt-5 max-w-2xl text-lg leading-8 text-muted-foreground">
-            Temps accepted the bundle and started the deployment. The project
+            Temps accepted the bundle and started the deployment. The service
             page has the live build log and final status.
           </p>
           <div className="mt-9 flex flex-wrap gap-3">
@@ -498,7 +532,7 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
             </h1>
             <p className="mt-4 max-w-2xl text-base leading-7 text-muted-foreground">
               Ship a static site or application without Git or a CLI. Temps
-              detects the preset, creates a project, and starts the right build
+              detects the preset, creates a service, and starts the right build
               pipeline in one pass.
             </p>
           </div>
@@ -551,7 +585,7 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
 
               <div className="flex-1 space-y-6 py-6">
                 <div className="space-y-2">
-                  <Label htmlFor="drop-name">Project name</Label>
+                  <Label htmlFor="drop-name">Service name</Label>
                   <Input
                     id="drop-name"
                     value={projectName}
@@ -611,7 +645,7 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
 
                 {inspection && inspection.candidates.length > 1 && (
                   <div className="space-y-2">
-                    <Label>Detected projects</Label>
+                    <Label>Detected apps</Label>
                     <DetectedPresetGrid
                       candidates={inspection.candidates}
                       selectedIndex={Number(selectedCandidateIndex)}

@@ -9,7 +9,7 @@ export function TemplateCatalogEmptyState({
   onUseGitUrl,
   onBrowseRepositories,
 }: {
-  kind: 'starter' | 'service'
+  kind: 'starter' | 'app'
   onUseGitUrl?: () => void
   onBrowseRepositories?: () => void
 }) {
@@ -17,7 +17,7 @@ export function TemplateCatalogEmptyState({
     <div className="flex flex-col items-center rounded-lg border border-dashed px-6 py-12 text-center">
       <LayoutTemplate className="mb-3 size-8 text-muted-foreground" />
       <p className="font-medium">
-        No {kind === 'service' ? 'services' : 'templates'} available
+        No {kind === 'app' ? 'services' : 'templates'} available
       </p>
       <p className="mt-1 max-w-sm text-sm text-muted-foreground">
         Start from your own source while the catalog is empty.

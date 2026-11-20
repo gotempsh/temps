@@ -79,7 +79,7 @@ export function ObserveRow({
           secondary={event.customer_ref ?? undefined}
           meta={
             event.amount_minor != null ? (
-              <span className="font-mono tabular-nums text-emerald-600 dark:text-emerald-400">
+              <span className="font-mono tabular-nums text-emerald-700 dark:text-emerald-400">
                 {formatAmount(event.amount_minor, event.currency)}
               </span>
             ) : null

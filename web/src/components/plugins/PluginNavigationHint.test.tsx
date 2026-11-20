@@ -21,7 +21,7 @@ test('explains a running plugin without navigation rather than implying install 
 test('points to contextual sidebars and does not warn for platform navigation', () => {
   expect(
     renderToStaticMarkup(<PluginNavigationHint nav={[entry('project')]} />)
-  ).toContain('Open a project')
+  ).toContain('Open a service')
   expect(
     renderToStaticMarkup(<PluginNavigationHint nav={[entry('settings')]} />)
   ).toContain('Settings sidebar')
