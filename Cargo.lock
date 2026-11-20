@@ -14175,6 +14175,7 @@ dependencies = [
  "sha1_smol",
  "sha2 0.11.1",
  "sourcemap",
+ "temps-analytics",
  "temps-analytics-session-replay",
  "temps-authz",
  "temps-config",
