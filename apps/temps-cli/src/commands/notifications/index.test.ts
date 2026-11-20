@@ -18,6 +18,8 @@ import {
   parseTopicId,
   buildTelegramConfigUpdate,
   KEEP_STORED_SECRET,
+  addTelegramProvider,
+  updateTelegramProviderAction,
 } from './index.js'
 
 describe('parseEnabledFlag', () => {
@@ -308,5 +310,30 @@ describe('telegram helpers', () => {
       chat_id: '-1001234567890',
       message_thread_id: null,
     })
+  })
+})
+
+describe('invalid --topic-id', () => {
+  // Rejecting (rather than warning and returning) is what makes the command
+  // exit nonzero, so automation can tell the provider was not written.
+  test('fails telegram add before anything is sent', async () => {
+    await expect(
+      addTelegramProvider({ yes: true, name: 'alerts', botToken: '123:AA', chatId: '-1001', topicId: 'abc' }),
+    ).rejects.toThrow('Invalid value for --topic-id')
+  })
+
+  test('fails telegram update before anything is sent', async () => {
+    const provider = {
+      id: 7,
+      name: 'alerts',
+      provider_type: 'telegram',
+      enabled: true,
+      created_at: 0,
+      updated_at: 0,
+      config: { bot_token: KEEP_STORED_SECRET, chat_id: '-1001', message_thread_id: null },
+    }
+    await expect(updateTelegramProviderAction(7, provider, { id: '7', topicId: '4.2' })).rejects.toThrow(
+      'Invalid value for --topic-id',
+    )
   })
 })

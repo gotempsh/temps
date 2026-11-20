@@ -811,11 +811,10 @@ async function addWebhookProvider(options: AddOptions): Promise<void> {
   info('Run: temps notifications test --id <id> to send a test notification')
 }
 
-async function addTelegramProvider(options: AddOptions): Promise<void> {
+export async function addTelegramProvider(options: AddOptions): Promise<void> {
   const parsedTopic = parseTopicId(options.topicId)
   if (parsedTopic === 'invalid') {
-    warning('Invalid value for --topic-id. Use the numeric forum topic ID, e.g. 42')
-    return
+    throw new Error('Invalid value for --topic-id. Use the numeric forum topic ID, e.g. 42')
   }
 
   let name: string
@@ -856,8 +855,7 @@ async function addTelegramProvider(options: AddOptions): Promise<void> {
       })
       const parsed = parseTopicId(topicInput)
       if (parsed === 'invalid') {
-        warning('Invalid forum topic ID. Use the numeric topic ID, e.g. 42')
-        return
+        throw new Error('Invalid forum topic ID. Use the numeric topic ID, e.g. 42')
       }
       topicId = parsed ?? null
     }
@@ -1072,7 +1070,7 @@ async function updateWebhookProviderAction(
   success(`Webhook provider "${updated?.name ?? provider.name}" updated successfully`)
 }
 
-async function updateTelegramProviderAction(
+export async function updateTelegramProviderAction(
   id: number,
   provider: NotificationProviderResponse,
   options: UpdateOptions,
@@ -1080,8 +1078,7 @@ async function updateTelegramProviderAction(
 ): Promise<void> {
   const topicId = parseTopicId(options.topicId)
   if (topicId === 'invalid') {
-    warning('Invalid value for --topic-id. Use the numeric forum topic ID, e.g. 42, or "" to clear it')
-    return
+    throw new Error('Invalid value for --topic-id. Use the numeric forum topic ID, e.g. 42, or "" to clear it')
   }
   const currentConfig = provider.config as CurrentTelegramConfig | null
 
