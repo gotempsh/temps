@@ -316,7 +316,7 @@ pub fn validated_container_name(submitted: &str) -> Result<String, InvalidContai
 
 /// Default host port the gateway publishes to. Bound on 127.0.0.1 only —
 /// the host-side Pingora reaches it via this port after authenticating.
-pub const DEFAULT_PREVIEW_GATEWAY_HOST_PORT: u16 = 8090;
+pub const DEFAULT_PREVIEW_GATEWAY_HOST_PORT: u16 = PreviewGatewaySettings::DEFAULT_HOST_PORT;
 
 /// Internal port the gateway listens on inside its container.
 const GATEWAY_CONTAINER_PORT: u16 = 8080;
@@ -422,16 +422,11 @@ impl PreviewGatewaySpec {
     /// `auto_upgrade` semantics — that's the caller's job.
     pub fn from_settings(settings: &PreviewGatewaySettings) -> Self {
         let image = resolved_gateway_image(&settings.image);
-        let host_port = if settings.host_port == 0 {
-            DEFAULT_PREVIEW_GATEWAY_HOST_PORT
-        } else {
-            settings.host_port
-        };
         Self {
             image,
             container_name: container_name(settings),
             network: PREVIEW_GATEWAY_NETWORK.to_string(),
-            host_port,
+            host_port: settings.effective_host_port(),
             shared_secret: settings.shared_secret.clone(),
         }
     }
@@ -440,22 +435,21 @@ impl PreviewGatewaySpec {
 /// Read the persisted `preview_gateway` settings from the DB. Falls back to
 /// defaults if the row or field is missing — never errors.
 pub async fn load_settings(db: &DatabaseConnection) -> PreviewGatewaySettings {
-    let row = match temps_entities::settings::Entity::find_by_id(1)
+    read_settings(db).await.unwrap_or_else(|error| {
+        warn!(%error, "failed to load preview gateway settings");
+        PreviewGatewaySettings::default()
+    })
+}
+
+/// A write must know the previous port and container before modifying Docker.
+pub(crate) async fn read_settings(db: &DatabaseConnection) -> Result<PreviewGatewaySettings> {
+    let row = temps_entities::settings::Entity::find_by_id(1)
         .one(db)
-        .await
-    {
-        Ok(Some(row)) => row,
-        Ok(None) => return PreviewGatewaySettings::default(),
-        Err(e) => {
-            warn!("failed to load preview gateway settings: {}", e);
-            return PreviewGatewaySettings::default();
-        }
-    };
-    row.data
-        .get("preview_gateway")
-        .cloned()
-        .and_then(|v| serde_json::from_value::<PreviewGatewaySettings>(v).ok())
-        .unwrap_or_default()
+        .await?;
+    match row.and_then(|row| row.data.get("preview_gateway").cloned()) {
+        Some(value) => Ok(serde_json::from_value(value)?),
+        None => Ok(PreviewGatewaySettings::default()),
+    }
 }
 
 fn should_reconcile(settings: &PreviewGatewaySettings) -> bool {
@@ -714,10 +708,6 @@ async fn reconcile_unrecorded(
         host_port = spec.host_port,
         "reconciling preview gateway"
     );
-    // Tell the in-process proxy where to dial before we touch Docker: even if
-    // the reconcile fails, the port it should be using is the configured one.
-    export_host_port(spec.host_port);
-
     refuse_another_instances_gateway(&docker, spec).await?;
     disable_unsafe_existing_gateway(&docker, &spec.container_name).await?;
     let legacy_owned_networks = owned_legacy_sandbox_networks(db).await?;
@@ -778,6 +768,40 @@ async fn reconcile_unrecorded(
         "preview gateway ready on 127.0.0.1:{} → {}:{}",
         spec.host_port, spec.container_name, GATEWAY_CONTAINER_PORT
     );
+    Ok(())
+}
+
+/// Capture the running image before moving its port. A port change should work
+/// with an unavailable registry and preserve a manually managed image.
+pub(crate) async fn running_spec(
+    docker: &Docker,
+    settings: &PreviewGatewaySettings,
+) -> PreviewGatewaySpec {
+    let mut spec = PreviewGatewaySpec::from_settings(settings);
+    if let Ok(Some(existing)) = inspect(docker, &spec.container_name).await {
+        if let Ok(image_id) = verified_gateway_image_id(docker, &existing.image_id).await {
+            spec.image = image_id;
+        }
+    }
+    spec
+}
+
+/// Undo the Docker side of a rejected settings change while the operation lock
+/// is still held. The proxy continues to use the previously committed port.
+pub async fn restore_after_failed_save(
+    held: &OperationsLock,
+    docker: Arc<Docker>,
+    db: &DatabaseConnection,
+    previous: &PreviewGatewaySettings,
+    requested: &PreviewGatewaySettings,
+    previous_spec: PreviewGatewaySpec,
+) -> Result<()> {
+    if !previous.enabled || container_name(previous) != container_name(requested) {
+        remove_own_gateway(&docker, requested, "its settings change failed").await?;
+    }
+    if previous.enabled {
+        reconcile(held, docker, db, previous_spec).await?;
+    }
     Ok(())
 }
 
@@ -1502,18 +1526,7 @@ async fn ingress_matches(
             && networks.contains_key(PREVIEW_GATEWAY_INGRESS_NETWORK)
             && networks.contains_key(&spec.network)
     });
-    let expected_host_port = spec.host_port.to_string();
-    let binding_matches = inspected
-        .host_config
-        .as_ref()
-        .and_then(|config| config.port_bindings.as_ref())
-        .and_then(|bindings| bindings.get(&format!("{GATEWAY_CONTAINER_PORT}/tcp")))
-        .and_then(|bindings| bindings.as_ref())
-        .and_then(|bindings| bindings.first())
-        .is_some_and(|binding| {
-            binding.host_ip.as_deref() == Some("127.0.0.1")
-                && binding.host_port.as_deref() == Some(expected_host_port.as_str())
-        });
+    let binding_matches = ingress_binds_port(&inspected, spec.host_port);
     let config = inspected.config.as_ref();
     let image_matches = config.and_then(|config| config.image.as_deref()) == Some(expected_image);
     let expected_command = ["-e", PREVIEW_GATEWAY_INGRESS_SCRIPT];
@@ -1540,6 +1553,21 @@ async fn ingress_matches(
         && networks_match
         && binding_matches
         && running)
+}
+
+fn ingress_binds_port(inspected: &bollard::models::ContainerInspectResponse, port: u16) -> bool {
+    let expected_host_port = port.to_string();
+    inspected
+        .host_config
+        .as_ref()
+        .and_then(|config| config.port_bindings.as_ref())
+        .and_then(|bindings| bindings.get(&format!("{GATEWAY_CONTAINER_PORT}/tcp")))
+        .and_then(|bindings| bindings.as_ref())
+        .and_then(|bindings| bindings.first())
+        .is_some_and(|binding| {
+            binding.host_ip.as_deref() == Some("127.0.0.1")
+                && binding.host_port.as_deref() == Some(expected_host_port.as_str())
+        })
 }
 
 async fn remove_if_present(docker: &Docker, name: &str) -> Result<(), PreviewGatewayError> {
@@ -1912,23 +1940,6 @@ fn export_env(secret: &str) {
     }
 }
 
-/// Publish the gateway's host port for the in-process Pingora to dial.
-///
-/// The proxy used to hardcode `127.0.0.1:8090` while the reconciler published
-/// the container on `settings.host_port`. So `host_port` was decorative:
-/// changing it moved the container and left the proxy talking to whatever
-/// still held 8090 — nothing, or on a multi-instance host, *another
-/// instance's* gateway, which rejects our token with "missing or invalid
-/// X-Temps-Preview-Token". Exported the same way the shared secret is, so
-/// both halves of this contract cross the crate boundary by the same
-/// mechanism.
-pub fn export_host_port(port: u16) {
-    #[allow(unused_unsafe)]
-    unsafe {
-        std::env::set_var("PREVIEW_GATEWAY_HOST_PORT", port.to_string());
-    }
-}
-
 /// Spawn the gateway's supervisor on the given runtime. Logs failures but
 /// never panics. Returns immediately — the supervisor runs in the background
 /// so the caller (the proxy server bootstrap) is never blocked.
@@ -2073,11 +2084,11 @@ async fn supervise_once(
     spec.shared_secret = shared_secret.to_string();
 
     if pass == SupervisorPass::HealthCheck {
-        match gateway_serves(docker, &spec.container_name).await {
+        match gateway_serves(docker, &spec).await {
             Ok(true) => return PassOutcome::Healthy,
             Ok(false) => warn!(
                 container = %spec.container_name,
-                "preview gateway is missing or stopped; setting it up again"
+                "preview gateway is missing, stopped or bound to a different port; setting it up again"
             ),
             Err(error) => {
                 let reason = format!(
@@ -2133,12 +2144,18 @@ async fn supervise_once(
 
 /// Whether both halves of the gateway named `name` serve (see
 /// [`container_serves`]).
-async fn gateway_serves(docker: &Docker, name: &str) -> Result<bool> {
-    for container in [name.to_string(), ingress_container_name(name)] {
+async fn gateway_serves(docker: &Docker, spec: &PreviewGatewaySpec) -> Result<bool> {
+    let ingress = ingress_container_name(&spec.container_name);
+    for container in [&spec.container_name, &ingress] {
         let state = match docker
-            .inspect_container(&container, None::<InspectContainerOptions>)
+            .inspect_container(container, None::<InspectContainerOptions>)
             .await
         {
+            Ok(inspected)
+                if container == &ingress && !ingress_binds_port(&inspected, spec.host_port) =>
+            {
+                return Ok(false)
+            }
             Ok(inspected) => inspected.state,
             Err(bollard::errors::Error::DockerResponseServerError {
                 status_code: 404, ..

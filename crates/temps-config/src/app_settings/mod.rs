@@ -1769,12 +1769,25 @@ fn default_preview_gateway_container() -> String {
     "temps-preview-gateway".to_string()
 }
 
+impl PreviewGatewaySettings {
+    pub const DEFAULT_HOST_PORT: u16 = 8090;
+
+    /// Older settings can carry zero to select the default loopback port.
+    pub fn effective_host_port(&self) -> u16 {
+        if self.host_port == 0 {
+            Self::DEFAULT_HOST_PORT
+        } else {
+            self.host_port
+        }
+    }
+}
+
 impl Default for PreviewGatewaySettings {
     fn default() -> Self {
         Self {
             enabled: true,
             image: String::new(),
-            host_port: 8090,
+            host_port: Self::DEFAULT_HOST_PORT,
             container_name: default_preview_gateway_container(),
             auto_upgrade: true,
             shared_secret: String::new(),

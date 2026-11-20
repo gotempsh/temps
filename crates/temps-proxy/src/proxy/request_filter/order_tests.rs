@@ -745,6 +745,40 @@ async fn preview_host_answers_before_the_gate_and_project_routing() {
     assert!(reply.ctx.project.is_none(), "project routing must not run");
 }
 
+/// A running proxy takes the local gateway address and credential from the
+/// same settings snapshot on each newly admitted preview request.
+#[tokio::test]
+async fn local_preview_follows_the_saved_gateway_port() {
+    let f = fixture();
+    let preview = "ws-7702c56bfb804b49-3000.localho.st";
+    let mut settings = temps_config::AppSettings::default();
+    settings.preview_gateway.shared_secret = "test-gateway-token".into();
+    let host = crate::preview_auth::parse_preview_host(preview, "localho.st").unwrap();
+    f.lb.sandbox_lookup_cache.seed_public_local(&host.hex).await;
+    for port in [8090, 18090] {
+        settings.preview_gateway.host_port = port;
+        let (mut client, server) = tokio::io::duplex(4096);
+        client
+            .write_all(get_on(preview, "/").as_bytes())
+            .await
+            .unwrap();
+        let mut session = Session::new_h1(Box::new(server) as pingora_core::protocols::Stream);
+        assert!(session.read_request().await.unwrap());
+        let mut ctx = f.lb.new_ctx();
+        assert!(!f
+            .lb
+            .handle_preview_request(&mut session, &mut ctx, host.clone(), &settings)
+            .await
+            .unwrap());
+        assert_eq!(
+            session.req_header().headers["X-Temps-Preview-Token"],
+            "test-gateway-token"
+        );
+        f.lb.upstream_peer(&mut session, &mut ctx).await.unwrap();
+        assert_eq!(ctx.upstream_host, Some(format!("127.0.0.1:{port}")));
+    }
+}
+
 /// A status page's hostname stays one, even shaped like a sandbox preview.
 #[tokio::test]
 async fn status_page_host_answers_before_a_preview_of_the_same_name() {

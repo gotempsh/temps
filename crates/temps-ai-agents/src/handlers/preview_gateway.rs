@@ -129,6 +129,26 @@ pub struct PatchSettingsRequest {
     pub container_name: Option<String>,
 }
 
+impl PatchSettingsRequest {
+    fn apply_to(&self, gateway: &mut PreviewGatewaySettings, container_name: Option<&str>) {
+        if let Some(enabled) = self.enabled {
+            gateway.enabled = enabled;
+        }
+        if let Some(image) = self.image.clone() {
+            gateway.image = image;
+        }
+        if let Some(host_port) = self.host_port {
+            gateway.host_port = host_port;
+        }
+        if let Some(auto_upgrade) = self.auto_upgrade {
+            gateway.auto_upgrade = auto_upgrade;
+        }
+        if let Some(name) = container_name {
+            gateway.container_name = name.to_string();
+        }
+    }
+}
+
 // ─── Handlers ───────────────────────────────────────────────────────────────
 
 #[utoipa::path(
@@ -358,11 +378,29 @@ pub async fn patch_preview_gateway_settings(
     // this save and the gateway being switched on or off.
     let held =
         wait_for_gateway_operations("save the preview gateway settings", OPERATION_WAIT).await?;
-    let previous = preview_gateway::load_settings(&state.db).await;
+    let previous = preview_gateway::read_settings(&state.db)
+        .await
+        .map_err(|e| {
+            internal(anyhow_detail(
+                "reading the previous preview gateway settings failed",
+                &e,
+                &[],
+            ))
+        })?;
+    let mut requested = previous.clone();
+    patch.apply_to(&mut requested, container_name.as_deref());
+    let effect = switch_effect(&previous, &requested);
     let current_name = preview_gateway::container_name(&previous);
     let renaming = container_name
         .as_deref()
         .is_some_and(|name| name != current_name);
+
+    let staged = effect == Some(SwitchEffect::Reconcile);
+    let previous_spec = if previous.enabled && (staged || renaming) {
+        preview_gateway::running_spec(&docker, &previous).await
+    } else {
+        PreviewGatewaySpec::from_settings(&previous)
+    };
 
     // The sandbox provider's copy of the name, held from the sandbox check
     // until the new name is set: a sandbox created meanwhile waits, then
@@ -403,32 +441,54 @@ pub async fn patch_preview_gateway_settings(
             })?;
     }
 
-    let settings = state
-        .platform_config_service
-        .update_preview_gateway_settings(|gateway| {
-            if let Some(enabled) = patch.enabled {
-                gateway.enabled = enabled;
+    // The proxy reads the committed port. Only publish a new destination
+    // after Docker has verified the gateway and bound its loopback ingress.
+    let save = async {
+        if staged {
+            let mut spec = PreviewGatewaySpec::from_settings(&requested);
+            if previous.enabled && requested.image == previous.image {
+                spec.image.clone_from(&previous_spec.image);
             }
-            if let Some(image) = patch.image.clone() {
-                gateway.image = image;
+            preview_gateway::reconcile(&held, docker.clone(), &state.db, spec)
+                .await
+                .map_err(|error| {
+                    format!("applying the preview gateway settings failed: {error:#}")
+                })?;
+        }
+        state
+            .platform_config_service
+            .update_preview_gateway_settings(|gateway| {
+                patch.apply_to(gateway, container_name.as_deref());
+            })
+            .await
+            .map_err(|error| format!("persisting the preview gateway settings failed: {error}"))
+    }
+    .await;
+    let settings = match save {
+        Ok(settings) => settings,
+        Err(mut detail) => {
+            if staged || renaming {
+                if let Err(error) = preview_gateway::restore_after_failed_save(
+                    &held,
+                    docker,
+                    &state.db,
+                    &previous,
+                    &requested,
+                    previous_spec,
+                )
+                .await
+                {
+                    detail.push_str(&format!(
+                        "; restoring the previous gateway failed: {error:#}"
+                    ));
+                }
             }
-            if let Some(host_port) = patch.host_port {
-                gateway.host_port = host_port;
-            }
-            if let Some(auto_upgrade) = patch.auto_upgrade {
-                gateway.auto_upgrade = auto_upgrade;
-            }
-            if let Some(name) = container_name {
-                gateway.container_name = name;
-            }
-        })
-        .await
-        .map_err(|e| {
-            internal(sanitize_gateway_diagnostic(
-                &format!("failed to persist settings: {e}"),
-                &[],
-            ))
-        })?;
+            return Err(internal(sanitize_gateway_diagnostic(
+                &detail,
+                &[&previous.shared_secret],
+            )));
+        }
+    };
     if let Some(mut name) = provider_name {
         *name = preview_gateway::container_name(&settings);
     }
@@ -454,8 +514,8 @@ pub async fn patch_preview_gateway_settings(
 
     // Apply the switch now rather than at the next server start: a disabled
     // gateway must stop serving previews at once.
-    match switch_effect(&previous, &settings) {
-        Some(SwitchEffect::Remove) => preview_gateway::disable(&held, &docker, &settings)
+    if effect == Some(SwitchEffect::Remove) {
+        preview_gateway::disable(&held, &docker, &settings)
             .await
             .map_err(|e| {
                 internal(gateway_error_detail(
@@ -463,22 +523,7 @@ pub async fn patch_preview_gateway_settings(
                     &e,
                     &[&settings.shared_secret],
                 ))
-            })?,
-        Some(SwitchEffect::Reconcile) => preview_gateway::reconcile(
-            &held,
-            docker.clone(),
-            &state.db,
-            PreviewGatewaySpec::from_settings(&settings),
-        )
-        .await
-        .map_err(|e| {
-            internal(anyhow_detail(
-                "the settings were saved, but starting the enabled gateway failed; restart it once the cause is fixed",
-                &e,
-                &[&settings.shared_secret],
-            ))
-        })?,
-        None => {}
+            })?;
     }
 
     Ok(Json(PreviewGatewaySettingsResponse::from(settings)))
@@ -490,7 +535,7 @@ enum SwitchEffect {
     /// Remove its containers. Repeated on every save while it is disabled,
     /// so a removal that failed is retried.
     Remove,
-    /// Create it again: it was disabled before this save, or it was renamed.
+    /// Apply the new container name or port, or start a previously disabled gateway.
     Reconcile,
 }
 
@@ -502,8 +547,9 @@ fn switch_effect(
         (_, false) => Some(SwitchEffect::Remove),
         (false, true) => Some(SwitchEffect::Reconcile),
         (true, true)
-            if preview_gateway::container_name(previous)
-                != preview_gateway::container_name(saved) =>
+            if previous.effective_host_port() != saved.effective_host_port()
+                || preview_gateway::container_name(previous)
+                    != preview_gateway::container_name(saved) =>
         {
             Some(SwitchEffect::Reconcile)
         }
@@ -834,6 +880,25 @@ mod tests {
         );
         // An enabled gateway is not recreated by every settings save.
         assert_eq!(switch_effect(&enabled, &enabled), None);
+    }
+
+    #[test]
+    fn saving_a_new_port_applies_the_binding_on_an_enabled_gateway() {
+        let current = PreviewGatewaySettings::default();
+        let mut requested = current.clone();
+        requested.host_port = 18090;
+        assert_eq!(
+            switch_effect(&current, &requested),
+            Some(SwitchEffect::Reconcile)
+        );
+        requested.enabled = false;
+        assert_eq!(
+            switch_effect(&current, &requested),
+            Some(SwitchEffect::Remove)
+        );
+        requested.enabled = true;
+        requested.host_port = 0;
+        assert_eq!(switch_effect(&current, &requested), None);
     }
 
     #[test]
