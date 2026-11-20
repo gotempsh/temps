@@ -1068,6 +1068,27 @@
             "description": "`status_changed`: resolved in the next release.",
             "type": "boolean"
           },
+          "issue_title": {
+            "description": "`issue_linked`, `issue_unlinked`: its title when linked.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "issue_url": {
+            "description": "`issue_linked`, `issue_unlinked`: the issue.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ownership_rule": {
+            "description": "`assigned`: the ownership rule pattern that assigned a new group.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "release": {
             "description": "`regressed`: the release of the event that reopened the group.",
             "type": [
@@ -1388,7 +1409,9 @@
           "assigned",
           "merged",
           "unmerged",
-          "split"
+          "split",
+          "issue_linked",
+          "issue_unlinked"
         ],
         "type": "string"
       },
@@ -18625,6 +18648,19 @@
           "ip_address",
           "action"
         ],
+        "type": "object"
+      },
+      "CreateIssueRequest": {
+        "description": "Open an issue for a group in the project's repository.",
+        "properties": {
+          "title": {
+            "description": "The issue's title; the group's title when absent.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
         "type": "object"
       },
       "CreateMcpRequest": {
@@ -43126,6 +43162,97 @@
         ],
         "type": "string"
       },
+      "IssueLinkList": {
+        "description": "The issues of a group.",
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/IssueLinkView"
+            },
+            "type": "array"
+          },
+          "failed_refreshes": {
+            "description": "After a refresh: how many issues could not be read (they keep their\nlast state).",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "data",
+          "failed_refreshes"
+        ],
+        "type": "object"
+      },
+      "IssueLinkView": {
+        "description": "An issue linked to an error group.",
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "created_by": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "group_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "number": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "provider": {
+            "description": "`github` or `gitlab` for an issue of the project's repository, whose\nstate Temps reads; `link` for any other URL.",
+            "type": "string"
+          },
+          "repository": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state": {
+            "description": "`open` or `closed` when last read; absent for plain links.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state_checked_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "title": {
+            "type": "string"
+          },
+          "url": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "group_id",
+          "provider",
+          "url",
+          "title",
+          "created_at"
+        ],
+        "type": "object"
+      },
       "IssuedWorkflowCredentialResponse": {
         "description": "A new workflow credential. `token` is shown this once.",
         "properties": {
@@ -43914,6 +44041,26 @@
         },
         "required": [
           "project_id"
+        ],
+        "type": "object"
+      },
+      "LinkIssueRequest": {
+        "description": "Link an existing issue by its URL.",
+        "properties": {
+          "title": {
+            "description": "What to call it; the issue's own title, or the URL, when absent.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "url": {
+            "description": "An http(s) URL: an issue of the project's GitHub or GitLab repository\n(its state is then read), or any other tracker's issue.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "url"
         ],
         "type": "object"
       },
@@ -52465,6 +52612,84 @@
           "unknown"
         ],
         "type": "string"
+      },
+      "OwnershipRuleList": {
+        "description": "The project's ownership rules, in order.",
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/OwnershipRuleView"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "type": "object"
+      },
+      "OwnershipRuleRequest": {
+        "description": "One rule as written.",
+        "properties": {
+          "owner_user_id": {
+            "description": "The member a matching new group is assigned to.",
+            "format": "int32",
+            "type": "integer"
+          },
+          "pattern": {
+            "description": "A repository path: `src/billing/` (everything under it), `*.py` (a\nfile name anywhere), `src/**/cart.ts`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "pattern",
+          "owner_user_id"
+        ],
+        "type": "object"
+      },
+      "OwnershipRuleView": {
+        "description": "An ownership rule.",
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "owner_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "owner_user_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "pattern": {
+            "type": "string"
+          },
+          "position": {
+            "description": "Rules are tried in this order.",
+            "format": "int32",
+            "type": "integer"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "position",
+          "pattern",
+          "owner_user_id",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
       },
       "PageActivityBucket": {
         "description": "Time bucket data point for page activity graph",
@@ -62938,6 +63163,22 @@
         },
         "required": [
           "rule_ids"
+        ],
+        "type": "object"
+      },
+      "ReplaceOwnershipRulesRequest": {
+        "description": "Replace every ownership rule of the project, in order.",
+        "properties": {
+          "rules": {
+            "description": "At most 50; the first match wins.",
+            "items": {
+              "$ref": "#/components/schemas/OwnershipRuleRequest"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "rules"
         ],
         "type": "object"
       },
@@ -74290,6 +74531,53 @@
           }
         ]
       },
+      "SourceControlStatusView": {
+        "description": "Whether the project's repository can be reached for issues and commits.",
+        "properties": {
+          "configured": {
+            "description": "Issues can be opened and commits read.",
+            "type": "boolean"
+          },
+          "provider": {
+            "description": "`github`, `gitlab`, or the provider that is not supported.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reason": {
+            "description": "What is missing, when not configured.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "repository": {
+            "description": "`owner/name`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "setup_path": {
+            "description": "The console page that fixes it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "web_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "configured"
+        ],
+        "type": "object"
+      },
       "SourceFileListResponse": {
         "properties": {
           "source_files": {
@@ -76600,6 +76888,87 @@
           "none"
         ],
         "type": "string"
+      },
+      "SuspectCommitView": {
+        "description": "A commit that touched the failing file.",
+        "properties": {
+          "author_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "authored_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sha": {
+            "type": "string"
+          },
+          "summary": {
+            "type": "string"
+          },
+          "url": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "sha",
+          "summary",
+          "url"
+        ],
+        "type": "object"
+      },
+      "SuspectCommitsView": {
+        "description": "The newest commits that touched the file of the latest event's\ninnermost application frame.",
+        "properties": {
+          "at": {
+            "description": "The deployed commit the history was read at; the default branch\nwhen absent.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "commits": {
+            "items": {
+              "$ref": "#/components/schemas/SuspectCommitView"
+            },
+            "type": "array"
+          },
+          "function": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "lineno": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "path": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reason": {
+            "description": "Why there are no commits, when there are none.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "commits"
+        ],
+        "type": "object"
       },
       "SyncedRepositoryListQuery": {
         "properties": {
@@ -163364,6 +163733,351 @@
         "x-maturity": "beta"
       }
     },
+    "/projects/{project_id}/error-groups/{group_id}/issues": {
+      "get": {
+        "operationId": "list_error_group_issues",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Error group ID",
+            "in": "path",
+            "name": "group_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IssueLinkList"
+                }
+              }
+            },
+            "description": "Linked issues, oldest first, with their last read state"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "No access to the project"
+          },
+          "404": {
+            "description": "No such group in the project"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "List the issues linked to an error group",
+        "tags": [
+          "error-tracking"
+        ],
+        "x-maturity": "beta"
+      },
+      "post": {
+        "operationId": "create_error_group_issue",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Error group ID",
+            "in": "path",
+            "name": "group_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateIssueRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IssueLinkView"
+                }
+              }
+            },
+            "description": "Issue opened and linked"
+          },
+          "400": {
+            "description": "Title too long"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Error tracking write permission required"
+          },
+          "404": {
+            "description": "No such group in the project"
+          },
+          "409": {
+            "description": "No repository connected, a provider that is not GitHub or GitLab, an issue already open for the group, or one being opened"
+          },
+          "500": {
+            "description": "Internal server error"
+          },
+          "502": {
+            "description": "The provider refused or failed the request"
+          },
+          "503": {
+            "description": "This server has no git provider integration"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Open an issue for an error group in the project's repository",
+        "tags": [
+          "error-tracking"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/projects/{project_id}/error-groups/{group_id}/issues/link": {
+      "post": {
+        "operationId": "link_error_group_issue",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Error group ID",
+            "in": "path",
+            "name": "group_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LinkIssueRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IssueLinkView"
+                }
+              }
+            },
+            "description": "Issue linked"
+          },
+          "400": {
+            "description": "Not an http(s) URL, or a title too long"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Error tracking write permission required"
+          },
+          "404": {
+            "description": "No such group in the project"
+          },
+          "409": {
+            "description": "Already linked, or the group has the maximum of 10 issues"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Link an existing issue to an error group by its URL",
+        "tags": [
+          "error-tracking"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/projects/{project_id}/error-groups/{group_id}/issues/refresh": {
+      "post": {
+        "description": "Reads each linked GitHub or GitLab issue once (at most 10) and stores\nwhat it says. It changes nothing in the repository or in the group, so\nit is not audited.",
+        "operationId": "refresh_error_group_issues",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Error group ID",
+            "in": "path",
+            "name": "group_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IssueLinkList"
+                }
+              }
+            },
+            "description": "Linked issues with their state as read now"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "No access to the project"
+          },
+          "404": {
+            "description": "No such group in the project"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Read again whether the group's issues are open or closed",
+        "tags": [
+          "error-tracking"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/projects/{project_id}/error-groups/{group_id}/issues/{link_id}": {
+      "delete": {
+        "operationId": "unlink_error_group_issue",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Error group ID",
+            "in": "path",
+            "name": "group_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Issue link ID",
+            "in": "path",
+            "name": "link_id",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Unlinked"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Error tracking write permission required"
+          },
+          "404": {
+            "description": "No such link on the group"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Unlink an issue from an error group; the issue itself is left as it is",
+        "tags": [
+          "error-tracking"
+        ],
+        "x-maturity": "beta"
+      }
+    },
     "/projects/{project_id}/error-groups/{group_id}/merge": {
       "post": {
         "description": "Stored events keep the group they were ingested into, so nothing is\nrewritten and unmerging restores both groups exactly.",
@@ -163513,6 +164227,67 @@
           }
         ],
         "summary": "Split named fingerprints out of this group into a new one, so their future\nevents are tracked separately. Stored events stay with this group.",
+        "tags": [
+          "error-tracking"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/projects/{project_id}/error-groups/{group_id}/suspect-commits": {
+      "get": {
+        "operationId": "get_error_group_suspect_commits",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Error group ID",
+            "in": "path",
+            "name": "group_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuspectCommitsView"
+                }
+              }
+            },
+            "description": "Up to 5 commits that touched the file of the latest event's innermost application frame, or why there are none"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "No access to the project"
+          },
+          "404": {
+            "description": "No such group in the project"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "The commits that last touched the code an error group fails in",
         "tags": [
           "error-tracking"
         ],
@@ -163813,6 +164588,114 @@
           }
         ],
         "summary": "Change an inbound filter's pattern or switch it on or off.",
+        "tags": [
+          "error-tracking"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/projects/{project_id}/error-ownership-rules": {
+      "get": {
+        "operationId": "list_error_ownership_rules",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OwnershipRuleList"
+                }
+              }
+            },
+            "description": "Rules in the order they are tried"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "No access to the project"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "List the project's ownership rules",
+        "tags": [
+          "error-tracking"
+        ],
+        "x-maturity": "beta"
+      },
+      "put": {
+        "description": "A new group is assigned to the owner of the first rule matching one of\nits frames, innermost first. Existing groups are not reassigned.",
+        "operationId": "replace_error_ownership_rules",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReplaceOwnershipRulesRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OwnershipRuleList"
+                }
+              }
+            },
+            "description": "The rules now in force"
+          },
+          "400": {
+            "description": "A pattern that is not a repository path, more than 50 rules, or an owner who is not a user or cannot open the project"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Error tracking write permission required"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Replace the project's ownership rules",
         "tags": [
           "error-tracking"
         ],
@@ -164254,6 +165137,54 @@
           }
         },
         "summary": "Get error time series data for charts",
+        "tags": [
+          "error-tracking"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/projects/{project_id}/error-tracking/source-control": {
+      "get": {
+        "operationId": "get_error_source_control",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SourceControlStatusView"
+                }
+              }
+            },
+            "description": "The repository, or what is missing"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "No access to the project"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Whether issues can be opened in the project's repository",
         "tags": [
           "error-tracking"
         ],
