@@ -16,6 +16,7 @@ pub mod types;
 pub mod feedback_handler;
 
 pub mod release_handler;
+pub mod release_health_handler;
 
 pub mod saved_search_handler;
 

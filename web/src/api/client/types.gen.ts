@@ -29329,6 +29329,102 @@ export type ReleaseCheckResult = {
     update_available: boolean;
 };
 
+/**
+ * The deployment a release was first shipped by, when Temps deployed it.
+ */
+export type ReleaseDeployment = {
+    commit_message?: string | null;
+    deployment_id: number;
+    environment_id: number;
+    environment_name?: string | null;
+    ready_at?: string | null;
+};
+
+export type ReleaseHealth = {
+    abnormal_sessions: number;
+    /**
+     * This release's share of the sessions started in the last 24 hours,
+     * in the same environment filter.
+     */
+    adoption?: number | null;
+    /**
+     * `1 - crashed / sessions`; absent without sessions.
+     */
+    crash_free_sessions?: number | null;
+    /**
+     * `1 - crashed users / users`; absent when no session named a user.
+     */
+    crash_free_users?: number | null;
+    crashed_sessions: number;
+    crashed_users: number;
+    deployment?: ReleaseDeployment | null;
+    /**
+     * Sessions with at least one error, crashes included (an estimate for
+     * single sessions, exact for aggregates).
+     */
+    errored_sessions: number;
+    first_session_hour: string;
+    last_session_hour: string;
+    release: string;
+    /**
+     * When Temps first saw or deployed this release (the order "resolve in
+     * the next release" uses).
+     */
+    released_at?: string | null;
+    sessions: number;
+    sessions_last_24h: number;
+    /**
+     * Distinct users, estimated (about 6.5% standard error).
+     */
+    users: number;
+};
+
+export type ReleaseHealthPage = {
+    end_time: string;
+    /**
+     * SDK environments with sessions in the window, for the filter.
+     */
+    environments: Array<string>;
+    items: Array<ReleaseHealth>;
+    page: number;
+    per_page: number;
+    start_time: string;
+    total: number;
+    tracking: ReleaseHealthTracking;
+};
+
+export type ReleaseHealthPoint = {
+    abnormal_sessions: number;
+    bucket_start: string;
+    crash_free_sessions?: number | null;
+    crashed_sessions: number;
+    errored_sessions: number;
+    sessions: number;
+};
+
+export type ReleaseHealthSeries = {
+    end_time: string;
+    environment?: string | null;
+    /**
+     * One point per hour with sessions, oldest first.
+     */
+    points: Array<ReleaseHealthPoint>;
+    release: string;
+    start_time: string;
+};
+
+/**
+ * Whether the project has sent any session, and what to do if not.
+ */
+export type ReleaseHealthTracking = {
+    configured: boolean;
+    reason?: string | null;
+    /**
+     * Project-relative console path that shows how to set it up.
+     */
+    setup_path?: string | null;
+};
+
 export type ReleaseListResponse = {
     releases: Array<string>;
 };
@@ -89796,6 +89892,110 @@ export type GetPerformanceIssueStatusResponses = {
 };
 
 export type GetPerformanceIssueStatusResponse = GetPerformanceIssueStatusResponses[keyof GetPerformanceIssueStatusResponses];
+
+export type ListReleaseHealthData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: {
+        /**
+         * SDK environment (as the SDK sent it); absent reads all of them.
+         */
+        environment?: string | null;
+        /**
+         * Window in days, 1 to 14; default 7.
+         */
+        days?: number | null;
+        page?: number | null;
+        /**
+         * 1 to 100; default 20.
+         */
+        per_page?: number | null;
+    };
+    url: '/projects/{project_id}/release-health';
+};
+
+export type ListReleaseHealthErrors = {
+    /**
+     * Invalid window, page or environment
+     */
+    400: unknown;
+    /**
+     * Authentication required
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Release health could not be read
+     */
+    500: unknown;
+};
+
+export type ListReleaseHealthResponses = {
+    /**
+     * Release health of the project
+     */
+    200: ReleaseHealthPage;
+};
+
+export type ListReleaseHealthResponse = ListReleaseHealthResponses[keyof ListReleaseHealthResponses];
+
+export type GetReleaseHealthSeriesData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query: {
+        /**
+         * The release, exactly as the SDK sent it.
+         */
+        release: string;
+        environment?: string | null;
+        /**
+         * Window in days, 1 to 14; default 7.
+         */
+        days?: number | null;
+    };
+    url: '/projects/{project_id}/release-health/series';
+};
+
+export type GetReleaseHealthSeriesErrors = {
+    /**
+     * Invalid release, window or environment
+     */
+    400: unknown;
+    /**
+     * Authentication required
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Release health could not be read
+     */
+    500: unknown;
+};
+
+export type GetReleaseHealthSeriesResponses = {
+    /**
+     * Hourly health of the release
+     */
+    200: ReleaseHealthSeries;
+};
+
+export type GetReleaseHealthSeriesResponse = GetReleaseHealthSeriesResponses[keyof GetReleaseHealthSeriesResponses];
 
 export type DeleteReleaseSourceFilesData = {
     body?: never;

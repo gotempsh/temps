@@ -9,7 +9,9 @@ D1.6 (assignment), D1.7 (comments and activity) and D1.8 (saved searches)
 have shipped, so D1 is complete. D2.1 (performance issues), D2.2 (trends
 and regressions after a deployment), D2.3 (Apdex), D2.4 (pages joined to
 backend requests) and D2.5 (breakdown inside an operation) have shipped, so
-D2 is complete. The questions they settled
+D2 is complete. D3.1 (session counters), D3.2 (the release page),
+D3.3 (the crash-free alert) and D3.4 (releases tied to deployments) have
+shipped, so D3 is complete; D4 to D7 are not scheduled. The questions they settled
 are recorded under "Settled while implementing".
 
 Related: ADR 016 (ClickHouse traces backend), ADR 027 (cross-project trace
@@ -197,7 +199,8 @@ deploys, which is web services. It comes last and may never be worth building.
   parallel one. One table gives one inbox; it also mixes two kinds of event
   with different detail views.
 - Whether D3 should wait until there is demand from mobile or desktop users,
-  given how little it adds for web services.
+  given how little it adds for web services. Settled: built small (see
+  D3.4 under "Settled while implementing").
 
 ## Settled while implementing
 
@@ -526,3 +529,82 @@ deploys, which is web services. It comes last and may never be worth building.
   values, the rest summed), which answers "which tenant, route or model is
   the slow one" without a new index.
 
+### D3.1 Session counters
+
+- **Counted as Relay counts them.** `session` updates and `sessions`
+  aggregates become hourly counters per project, SDK environment (the
+  string the SDK sends, empty when none), release and the hour the session
+  *started*, so every update of a session lands in the same row: `init`
+  starts a session; errors or an error status mark it errored, once per
+  session id; crashed and abnormal are counted as they arrive; every update
+  counts its user, and a crash its user as crashed. Aggregates add their
+  totals, errored exactly. The nil UUID is not a user.
+- **Estimates, not sets.** Distinct users, errored sessions and crashed
+  users are HyperLogLog sketches of 256 one-byte registers (about 6.5%
+  standard error), hashed with the first eight bytes of SHA-256 so they
+  merge across processes and Temps releases. A database function merges
+  them on upsert; reads stream the rows and merge in memory, so a read holds
+  three sketches per release whatever the window. No session or user id is
+  stored.
+- **Off the hot path.** The envelope handler queues one delta per session
+  with `try_send` into a bounded channel (10,000); a full queue drops and
+  counts, and the response says how many (`x-temps-sentry-sessions-queued`,
+  `-dropped`). One task sums the deltas in memory (at most 5,000 keys) and
+  writes them every 10 seconds as multi-row upserts of 200 keys. A failed
+  write is retried on the next two flushes, then given up and counted.
+  Counts of a project deleted since they were queued are dropped by the
+  statement itself. A process exit can lose the last 10 seconds.
+- **Counted only on acknowledgement.** Sessions carry no id to deduplicate
+  a retried envelope, so they are queued only when the envelope is answered
+  200; a 5xx and the SDK's retry cannot count them twice. Envelopes resolved
+  by host without a DSN leave them uncounted, as before.
+- **Bounds.** At most 100 session updates and 1,000 aggregate rows per
+  envelope; more, or a malformed session, is reported as unsupported and
+  never rejects the envelope's events. Sessions that started more than 5
+  days ago or over an hour in the future, releases over 250 characters and
+  environments over 64 are refused (counted as dropped). Counters are kept
+  90 days, deleted in batches of 5,000 rows; old releases are not rolled up
+  further, since one row per release, environment and hour is already
+  small.
+
+### D3.2 The release page
+
+- **On the existing releases page.** Errors → Releases opens with release
+  health: crash-free sessions (`1 − crashed / sessions`) and users,
+  adoption (the release's share of the sessions started in the last 24
+  hours, in the same environment filter), sessions, estimated users and the
+  deployment, for windows of 1, 7 or 14 days (`GET
+  /projects/{id}/release-health`, paginated 20, at most 100). A trend sheet
+  draws one release per hour (`/release-health/series`). With no session
+  ever received it says so and links to the SDK setup.
+- **Not built:** comparison with the previous release and the new and
+  regressed issues of a release. The error list already filters by
+  release, and a comparison needs an agreed "previous" across
+  environments; both are follow-ups.
+
+### D3.3 Crash-free alert
+
+- **Through metric alert rules, not a new rule type.** Every five minutes
+  the crash-free rates of releases with a session in the last hour are
+  published over the trailing 24 hours as project metrics
+  (`release.crash_free_sessions`, `release.crash_free_users`,
+  `release.sessions`, labelled `release` and `environment`; at most 1,000
+  releases per tick, the busiest first). A rate needs 20 sessions or users,
+  so one crash in three sessions does not page anyone. Static and anomaly
+  detectors, grouping by release, cooldowns and notifications are the
+  existing ones.
+- **Never created silently.** The page's "Alert on a crash-free drop"
+  opens the metric alert form prefilled (minimum over 15 minutes, below
+  99% for 10 minutes, one alert per release); the user saves it. Without
+  the metrics store nothing is published and startup logs why.
+
+### D3.4 Releases tied to deployments
+
+- A release seen in sessions is registered in `error_releases` like the
+  release of an event (once per process), so it is ordered for "resolve in
+  the next release" and linked to the first deployment whose commit SHA it
+  is, or the DSN's deployment. The page links that deployment, whose page
+  has the rollback. A release Temps did not deploy says so.
+- The open question whether D3 should wait for mobile or desktop demand was
+  settled by building it at this size: counters only, no new store and no
+  new alerting system.

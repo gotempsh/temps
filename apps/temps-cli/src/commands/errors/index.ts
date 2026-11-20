@@ -31,6 +31,7 @@ import { resolve, basename, join } from 'node:path'
 import { registerActivityCommands } from './activity.js'
 import { registerInboundFilterCommands } from './filters.js'
 import { checkIssueType, registerPerformanceCommands } from './performance.js'
+import { registerReleaseHealthCommands } from './release-health.js'
 import { applySavedSearch, loadSavedSearch, registerSavedSearchCommands } from './saved-searches.js'
 
 interface ListOptions {
@@ -539,6 +540,7 @@ export function registerErrorsCommands(program: Command): void {
   registerActivityCommands(errors)
   registerSavedSearchCommands(errors)
   registerPerformanceCommands(errors)
+  registerReleaseHealthCommands(errors)
 
   errors
     .command('events')

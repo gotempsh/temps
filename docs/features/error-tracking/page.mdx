@@ -121,13 +121,13 @@ These checks use synthetic applications, real HTTP endpoints, native storage que
 | Issue APIs and triage | Existing native error list, detail and resolution APIs/UI; native extension: bulk resolve/reopen/ignore by ID or filter (`POST /projects/{project_id}/error-groups/bulk`, `temps errors bulk`); [resolve in the next release](#resolve-next-release); [assignment to a user or team](#assign) with an assigned-to-me filter; ignore until a time, count or user count; server-side [inbound filters](#inbound-filters) that drop matching events before storage | Sentry issue APIs are not implemented. Bulk requests are capped at 1,000 groups and 50 status-change notifications each. |
 | Alert APIs and alerts | Existing Temps alert rules and alarms; cron health feeds native alarms | Sentry alert APIs are not implemented. Delivery requires a configured provider; external delivery was not verified in the synthetic run. |
 | Debug ID source maps and artifact bundles | Adapted: CLI artifact bundles imported into native source maps; exact Debug ID lookup without a release, including maps uploaded after an error | Full-access project build credential required; public DSNs cannot access artifacts. SYSB v2, stored/deflated ZIP entries, 50 MiB compressed/expanded bundle, 256 files, 128 maps. Symbolication loads at most 32 maps/50 MiB per event; staged chunks expire after one hour (64 MiB/project, 256 MiB globally). Indexed/Hermes/native debug artifacts are outside this contract. |
-| Releases | Native extension: correlate retained errors, logs, spans, metric points, feedback and check-ins by SDK release version | Errors → Releases shows exact counts and native example links in a bounded 1–31 day window. Deployment/finalization, commits and release health are separate workflows. |
+| Releases | Native extension: correlate retained errors, logs, spans, metric points, feedback and check-ins by SDK release version | Errors → Releases shows exact counts and native example links in a bounded 1–31 day window. Deployment/finalization and commits are separate workflows; [release health](#release-health) is shown above the table. |
 | Tracing | Adapted: transaction events and version-2 batched span items become native spans; native extension: [performance issues](#performance-issues) (N+1, slow query, consecutive HTTP, large payload), [Apdex](#apdex), [trends and regressions after a deployment](#operation-trends), a [breakdown inside an operation](#operation-breakdown) and [pages joined to their backend requests](#page-backend) | Other span versions are outstanding. Pages are joined to backend requests by path and time, not by trace id. |
 | Structured logs | Adapted: version-1/2 batched `log` items become native telemetry logs; native extension: typed attribute queries and UI | String, boolean, int64 and finite numeric comparisons preserve declared types. Historical rows without type metadata remain available through Any type. Version-2 opt-in IP/UA inference uses trusted request metadata. |
 | Metrics | Adapted: version-1/2 batched `trace_metric` and legacy SDK StatsD counters, gauges and distributions become native metric points | Modern counters are delta monotonic sums; legacy counters are delta up/down sums. Sets, `metric_buckets`, future versions and cumulative Sentry wire formats are unsupported. The current Sentry metrics protocol defines increments rather than cumulative counters. |
 | Replay | Adapted: paired web replay metadata and rrweb recording segments become native visitors and replays | No Temps analytics SDK required. Mobile/video replay is unsupported; technical timeline events are labeled as SDK breadcrumbs, performance measurements, recorder configuration or segment metadata. |
 | Cron monitoring | Native extension: SDK check-ins, interval/crontab schedules, missed-run and timeout detection, native management and run history | Temps observes the existing scheduler; it does not execute jobs. See [Cron monitoring](/docs/monitoring#cron-monitoring). |
-| Release health | Outstanding | Session/aggregate-session payloads, crash-free rates and adoption need separate product work. |
+| Release health | Native extension: `session` and `sessions` items become hourly counters; [crash-free sessions and users, adoption and the deploying release](#release-health) per release, published as metrics for alert rules | Counters only, never individual sessions. Distinct users are an estimate. Sessions on tunneled envelopes without a DSN, older than 5 days or with a release over 250 characters are not counted. |
 | Profiles | Outstanding | Profiling payloads, storage, aggregation and flamegraphs need separate product work. |
 | Feedback | Native extension: modern `feedback` and legacy `user_report` text submissions feed a project inbox with error/replay links, native queries, resolve/reopen/ignore and deletion | Verified Node 8/10/11 and browser 11 modern feedback, plus browser 7 legacy reports. Feedback attachments/screenshots and other SDK families are outside this contract. |
 | Attachments | Outstanding | Binary framing is supported; attachment storage and attachment APIs are not. |
@@ -1108,6 +1108,44 @@ const breakdown = await fetch(
 
 const page = await fetch(
   'https://your-temps-instance.com/api/otel/pages/backend?project_id=42&path=%2Fcheckout',
+  { headers: { 'Authorization': `Bearer ${API_KEY}` } }
+).then(r => r.json());
+```
+</CodeGroup>
+
+## Release Health {{ anchor: true, id: 'release-health' }}
+
+**Errors → Releases** opens with **Release health**: for each release with sessions in the last 1, 7 or 14 days, the crash-free sessions and users, its adoption (its share of the sessions started in the last 24 hours), its sessions and estimated users, and the Temps deployment that shipped it, linked to the deployment (and its rollback). The trend button draws the crash-free rate of the release per hour.
+
+Sentry SDKs send a session when the app starts and again when it ends or fails; browser and mobile SDKs do so by default, server SDKs when session tracking is on. Temps counts them the way Sentry's own ingestion does:
+
+- A session **starts** with its first update. It is **errored** when an update reports errors or ends errored, abnormal or crashed (counted once per session), **crashed** when it ends crashed, **abnormal** when it ends abnormally. Server SDKs that send pre-aggregated `sessions` items are counted from their totals.
+- **Crash-free sessions** is `1 − crashed / sessions`; **crash-free users** is `1 − crashed users / users`.
+- Only counters are stored, one row per project, SDK environment, release and the hour sessions started; no session is kept. Distinct users are an estimate (about 6.5% standard error), never more than the sessions counted.
+- Sessions are counted once the envelope is acknowledged, so a retried envelope is not counted twice. Counting never slows ingest: when the in-memory queue (10,000 updates, written every 10 seconds) is full, sessions are dropped and the response header `x-temps-sentry-sessions-dropped` says how many. Counters are kept for 90 days.
+- A release seen only in sessions is registered like the release of an error, so it is ordered for [resolve in the next release](#resolve-next-release) and tied to the deployment whose commit SHA it is.
+
+### Alert on a Crash-Free Drop
+
+Every five minutes Temps publishes, for each release with a session in the last hour, the gauges `release.crash_free_sessions`, `release.crash_free_users` (over the last 24 hours, once there are 20 sessions or users) and `release.sessions`, labelled `release` and `environment`. Any metric alert rule can use them. **Alert on a crash-free drop** opens a new metric alert prefilled with the lowest crash-free rate over 15 minutes below 99% for 10 minutes, one alert per release; change the threshold, severity and notifications before saving.
+
+<CodeGroup title="Release Health">
+```bash {{ title: 'CLI' }}
+# Crash-free rates, adoption and deployment of each release
+temps errors releases --project-id 42 --environment production
+
+# One release, hour by hour
+temps errors release my-app@1.4.0 --project-id 42 --days 2
+```
+
+```typescript {{ title: 'API' }}
+const health = await fetch(
+  'https://your-temps-instance.com/api/projects/42/release-health?environment=production&days=7',
+  { headers: { 'Authorization': `Bearer ${API_KEY}` } }
+).then(r => r.json());
+
+const series = await fetch(
+  'https://your-temps-instance.com/api/projects/42/release-health/series?release=my-app%401.4.0',
   { headers: { 'Authorization': `Bearer ${API_KEY}` } }
 ).then(r => r.json());
 ```

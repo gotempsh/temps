@@ -62302,6 +62302,295 @@
         ],
         "type": "object"
       },
+      "ReleaseDeployment": {
+        "description": "The deployment a release was first shipped by, when Temps deployed it.",
+        "properties": {
+          "commit_message": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "deployment_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "environment_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "environment_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ready_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "deployment_id",
+          "environment_id"
+        ],
+        "type": "object"
+      },
+      "ReleaseHealth": {
+        "properties": {
+          "abnormal_sessions": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "adoption": {
+            "description": "This release's share of the sessions started in the last 24 hours,\nin the same environment filter.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "crash_free_sessions": {
+            "description": "`1 - crashed / sessions`; absent without sessions.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "crash_free_users": {
+            "description": "`1 - crashed users / users`; absent when no session named a user.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "crashed_sessions": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "crashed_users": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "deployment": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ReleaseDeployment"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "errored_sessions": {
+            "description": "Sessions with at least one error, crashes included (an estimate for\nsingle sessions, exact for aggregates).",
+            "format": "int64",
+            "type": "integer"
+          },
+          "first_session_hour": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "last_session_hour": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "release": {
+            "type": "string"
+          },
+          "released_at": {
+            "description": "When Temps first saw or deployed this release (the order \"resolve in\nthe next release\" uses).",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sessions": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "sessions_last_24h": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "users": {
+            "description": "Distinct users, estimated (about 6.5% standard error).",
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "release",
+          "sessions",
+          "errored_sessions",
+          "crashed_sessions",
+          "abnormal_sessions",
+          "users",
+          "crashed_users",
+          "sessions_last_24h",
+          "first_session_hour",
+          "last_session_hour"
+        ],
+        "type": "object"
+      },
+      "ReleaseHealthPage": {
+        "properties": {
+          "end_time": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "environments": {
+            "description": "SDK environments with sessions in the window, for the filter.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/ReleaseHealth"
+            },
+            "type": "array"
+          },
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "per_page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "start_time": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "total": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "tracking": {
+            "$ref": "#/components/schemas/ReleaseHealthTracking"
+          }
+        },
+        "required": [
+          "items",
+          "total",
+          "page",
+          "per_page",
+          "environments",
+          "start_time",
+          "end_time",
+          "tracking"
+        ],
+        "type": "object"
+      },
+      "ReleaseHealthPoint": {
+        "properties": {
+          "abnormal_sessions": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "bucket_start": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "crash_free_sessions": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "crashed_sessions": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "errored_sessions": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "sessions": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "bucket_start",
+          "sessions",
+          "errored_sessions",
+          "crashed_sessions",
+          "abnormal_sessions"
+        ],
+        "type": "object"
+      },
+      "ReleaseHealthSeries": {
+        "properties": {
+          "end_time": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "environment": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "points": {
+            "description": "One point per hour with sessions, oldest first.",
+            "items": {
+              "$ref": "#/components/schemas/ReleaseHealthPoint"
+            },
+            "type": "array"
+          },
+          "release": {
+            "type": "string"
+          },
+          "start_time": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "release",
+          "points",
+          "start_time",
+          "end_time"
+        ],
+        "type": "object"
+      },
+      "ReleaseHealthTracking": {
+        "description": "Whether the project has sent any session, and what to do if not.",
+        "properties": {
+          "configured": {
+            "type": "boolean"
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "setup_path": {
+            "description": "Project-relative console path that shows how to set it up.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "configured"
+        ],
+        "type": "object"
+      },
       "ReleaseListResponse": {
         "properties": {
           "releases": {
@@ -168793,6 +169082,193 @@
         ]
       }
     },
+    "/projects/{project_id}/release-health": {
+      "get": {
+        "operationId": "list_release_health",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "SDK environment (as the SDK sent it); absent reads all of them.",
+            "in": "query",
+            "name": "environment",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Window in days, 1 to 14; default 7.",
+            "in": "query",
+            "name": "days",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "1 to 100; default 20.",
+            "in": "query",
+            "name": "per_page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReleaseHealthPage"
+                }
+              }
+            },
+            "description": "Release health of the project"
+          },
+          "400": {
+            "description": "Invalid window, page or environment"
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "description": "Release health could not be read"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Releases with sessions in the window, the most recently active first.",
+        "tags": [
+          "releases"
+        ]
+      }
+    },
+    "/projects/{project_id}/release-health/series": {
+      "get": {
+        "operationId": "get_release_health_series",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The release, exactly as the SDK sent it.",
+            "in": "query",
+            "name": "release",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "environment",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Window in days, 1 to 14; default 7.",
+            "in": "query",
+            "name": "days",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReleaseHealthSeries"
+                }
+              }
+            },
+            "description": "Hourly health of the release"
+          },
+          "400": {
+            "description": "Invalid release, window or environment"
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "description": "Release health could not be read"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "One release's sessions and crash-free rate per hour.",
+        "tags": [
+          "releases"
+        ]
+      }
+    },
     "/projects/{project_id}/releases/{release}/source-files": {
       "delete": {
         "operationId": "delete_release_source_files",
@@ -188540,6 +189016,10 @@
     },
     {
       "description": "Release correlation across native telemetry",
+      "name": "releases"
+    },
+    {
+      "description": "Release health from SDK sessions",
       "name": "releases"
     },
     {

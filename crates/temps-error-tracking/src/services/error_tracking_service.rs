@@ -40,6 +40,8 @@ pub struct ErrorTrackingService {
     pub feedback: super::feedback_service::FeedbackService,
     pub client_outcomes: super::client_outcome_service::ClientOutcomeService,
     pub releases: super::release_service::ReleaseService,
+    /// Crash-free sessions and users per release (ADR 111, D3).
+    pub release_health: Arc<super::release_health::ReleaseHealthService>,
     pub workflow: GroupWorkflowService,
     /// Inbound filter rules (ADR 111, D1.4).
     pub inbound_filters: super::inbound_filters::InboundFilterService,
@@ -65,6 +67,7 @@ impl ErrorTrackingService {
             feedback: super::feedback_service::FeedbackService::new(db.clone()),
             client_outcomes: super::client_outcome_service::ClientOutcomeService::new(db.clone()),
             releases: super::release_service::ReleaseService::new(db.clone()),
+            release_health: Arc::new(super::release_health::ReleaseHealthService::new(db.clone())),
             workflow: GroupWorkflowService::new(db.clone()),
             inbound_filters: super::inbound_filters::InboundFilterService::new(
                 db.clone(),

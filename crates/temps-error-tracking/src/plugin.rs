@@ -412,6 +412,20 @@ impl TempsPlugin for ErrorTrackingPlugin {
                     "AlarmService not available - error tracking alarms will not be persisted"
                 );
             }
+            // Release health (ADR 111, D3): the session flusher always runs;
+            // crash-free rates are published as project metrics, for metric
+            // alert rules, when the OTel metrics store is present.
+            let sink = context.get_service::<dyn temps_core::ProjectMetricsSink>();
+            if sink.is_none() {
+                tracing::warn!(
+                    "Project metrics sink not available - crash-free rates will not be \
+                     published for metric alert rules"
+                );
+            }
+            context
+                .require_service::<ErrorTrackingService>()
+                .release_health
+                .start(sink);
             // Performance issues (ADR 111, D2) read stored traces. Without
             // the OTel plugin there are no traces, so the scanner does not
             // start and the status endpoint says why.
@@ -540,6 +554,10 @@ impl TempsPlugin for ErrorTrackingPlugin {
         schema
             .merge(<crate::handlers::feedback_handler::FeedbackApiDoc as OpenApiTrait>::openapi());
         schema.merge(<crate::handlers::release_handler::ReleaseApiDoc as OpenApiTrait>::openapi());
+        schema.merge(
+            <crate::handlers::release_health_handler::ReleaseHealthApiDoc as OpenApiTrait>::openapi(
+            ),
+        );
         schema.merge(
             <crate::handlers::group_workflow_handler::GroupWorkflowApiDoc as OpenApiTrait>::openapi(
             ),

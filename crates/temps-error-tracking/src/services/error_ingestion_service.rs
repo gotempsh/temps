@@ -235,6 +235,19 @@ impl ErrorIngestionService {
         self.process_with_fingerprint(error_data, fingerprint).await
     }
 
+    /// Register a release seen outside an error event (in sessions), once
+    /// per process like the releases of events (ADR 111, D3).
+    pub async fn observe_release(
+        &self,
+        project_id: i32,
+        release: &str,
+        deployment_id: Option<i32>,
+    ) -> Result<(), ErrorTrackingError> {
+        self.releases
+            .observe(project_id, Some(release), deployment_id)
+            .await
+    }
+
     /// The orchestrator may capture submitted-frame identity before symbolication.
     pub(super) async fn process_with_fingerprint(
         &self,

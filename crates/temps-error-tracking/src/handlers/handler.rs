@@ -68,6 +68,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         .merge(super::performance_handler::routes())
         .merge(super::inbound_filter_handler::routes())
         .merge(super::release_handler::routes())
+        .merge(super::release_health_handler::routes())
         .merge(super::client_outcome_handler::routes())
         .route("/error-groups", get(list_global_error_groups))
         .route(

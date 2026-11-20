@@ -29,4 +29,7 @@ pub mod feedback_service;
 
 pub mod release_service;
 
+/// Release health from Sentry sessions (ADR 111, D3).
+pub mod release_health;
+
 pub mod client_outcome_service;
