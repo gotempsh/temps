@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use temps_core::{AuditLogger, ProjectAccessChecker};
 use temps_entities::{feature_flag_environments, feature_flags};
@@ -179,6 +180,12 @@ pub struct FlagEnvironmentResponse {
     pub updated_at: String,
 }
 
+/// ISO 8601 with a `Z` suffix and the stored precision, so a revision sent
+/// back as `expected_updated_at` compares equal.
+pub(crate) fn iso(timestamp: DateTime<Utc>) -> String {
+    timestamp.to_rfc3339_opts(SecondsFormat::AutoSi, true)
+}
+
 impl From<feature_flag_environments::Model> for FlagEnvironmentResponse {
     fn from(model: feature_flag_environments::Model) -> Self {
         let parsed = parse_rules(&model);
@@ -188,7 +195,7 @@ impl From<feature_flag_environments::Model> for FlagEnvironmentResponse {
             value: model.value,
             rules_valid: parsed.is_some(),
             rules: parsed.unwrap_or_default(),
-            updated_at: model.updated_at.to_rfc3339(),
+            updated_at: iso(model.updated_at),
         }
     }
 }
@@ -232,10 +239,10 @@ impl FlagResponse {
             default_value: flag.default_value,
             description: flag.description,
             client_visible: flag.client_visible,
-            archived_at: flag.archived_at.map(|t| t.to_rfc3339()),
-            last_evaluated_at: flag.last_evaluated_at.map(|t| t.to_rfc3339()),
-            created_at: flag.created_at.to_rfc3339(),
-            updated_at: flag.updated_at.to_rfc3339(),
+            archived_at: flag.archived_at.map(iso),
+            last_evaluated_at: flag.last_evaluated_at.map(iso),
+            created_at: iso(flag.created_at),
+            updated_at: iso(flag.updated_at),
             environments: environments.into_iter().map(Into::into).collect(),
         }
     }
@@ -288,6 +295,18 @@ pub struct ArchiveFlagResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timestamps_use_the_z_suffix_and_keep_their_precision() {
+        use chrono::TimeZone;
+        let timestamp = Utc
+            .timestamp_opt(1_763_640_000, 123_456_000)
+            .single()
+            .expect("a valid timestamp");
+        assert_eq!(iso(timestamp), "2025-11-20T12:00:00.123456Z");
+        let parsed = DateTime::parse_from_rfc3339(&iso(timestamp)).expect("parses back");
+        assert_eq!(parsed.with_timezone(&Utc), timestamp);
+    }
 
     // The tri-state distinction (absent vs explicit null vs value) is the
     // mechanism that has silently regressed in this codebase before: serde's

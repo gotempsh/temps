@@ -584,7 +584,7 @@ pub async fn archive_flag(
 
     Ok(Json(ArchiveFlagResponse {
         key: flag.key,
-        archived_at: flag.archived_at.map(|t| t.to_rfc3339()),
+        archived_at: flag.archived_at.map(super::types::iso),
     }))
 }
 
