@@ -31,6 +31,7 @@ import {
   mibToBytes,
   quotaFormSchema,
   quotaShare,
+  storeSavedUsage,
   STORAGE_SETUP_PATH,
   type QuotaFormData,
 } from './attachments'
@@ -119,19 +120,16 @@ export function QuotaForm({
   const save = useMutation({
     ...setErrorAttachmentQuotaMutation(),
     meta: { errorTitle: 'Failed to change the attachment quota' },
-    onSuccess: (next) => {
+    onSuccess: async (next) => {
       reset({ quota_mib: bytesToMib(next.quota_bytes) })
       toast.success(
         `Attachment quota set to ${formatBytesBinary(next.quota_bytes)}`
       )
-      queryClient.setQueryData(
-        getErrorAttachmentUsageQueryKey({ path: { project_id: projectId } }),
-        next
-      )
+      await storeSavedUsage(queryClient, projectId, next)
     },
-    // A failed save may still have been committed (the quota is written
-    // before usage is read back), so read the saved quota again. The edit
-    // stays in the form; the summary shows what the server holds.
+    // A failed save's outcome is unknown (its answer may have been lost
+    // after the commit), so read the saved quota again. The edit stays in
+    // the form; the summary shows what the server holds.
     onError: () => {
       void queryClient.invalidateQueries({
         queryKey: getErrorAttachmentUsageQueryKey({

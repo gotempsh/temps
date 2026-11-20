@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { describe, expect, test } from 'bun:test'
+import { QueryClient } from '@tanstack/react-query'
+import { getErrorAttachmentUsageQueryKey } from '@/api/client/@tanstack/react-query.gen'
+import type { AttachmentUsage } from '@/api/client/types.gen'
 import {
   attachmentContentUrl,
   bytesToMib,
@@ -14,6 +17,7 @@ import {
   EMPTY_LIST_POLLS,
   quotaFormSchema,
   quotaShare,
+  storeSavedUsage,
 } from './attachments'
 
 describe('attachments', () => {
@@ -92,5 +96,48 @@ describe('attachments', () => {
       quotaFormSchema.safeParse({ quota_mib: Number.NaN }).error?.issues[0]
         ?.message
     ).toBe('Enter the quota in MiB.')
+  })
+})
+
+describe('storeSavedUsage', () => {
+  const usage = (quota_bytes: number): AttachmentUsage => ({
+    configured: true,
+    reason: null,
+    setup_path: null,
+    used_bytes: 0,
+    files: 0,
+    quota_bytes,
+    max_attachment_bytes: 2_097_152,
+    max_event_attachment_bytes: 4_194_304,
+    max_attachments_per_event: 8,
+    dropped_over_quota: 0,
+    dropped_queue_full: 0,
+  })
+
+  test('a read that started before the save cannot bring the old quota back', async () => {
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    })
+    const queryKey = getErrorAttachmentUsageQueryKey({
+      path: { project_id: 3 },
+    })
+    let answerOldRead: (value: AttachmentUsage) => void = () => {}
+    const oldRead = queryClient
+      .fetchQuery({
+        queryKey,
+        queryFn: () =>
+          new Promise<AttachmentUsage>((resolve) => {
+            answerOldRead = resolve
+          }),
+      })
+      .catch(() => undefined)
+
+    await storeSavedUsage(queryClient, 3, usage(1024))
+    answerOldRead(usage(268_435_456))
+    await oldRead
+
+    expect(
+      queryClient.getQueryData<AttachmentUsage>(queryKey)?.quota_bytes
+    ).toBe(1024)
   })
 })

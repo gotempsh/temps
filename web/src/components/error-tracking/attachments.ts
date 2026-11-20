@@ -2,7 +2,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { z } from 'zod'
+import type { QueryClient } from '@tanstack/react-query'
+import { getErrorAttachmentUsageQueryKey } from '@/api/client/@tanstack/react-query.gen'
 import { client } from '@/api/client/client.gen'
+import type { AttachmentUsage } from '@/api/client/types.gen'
 
 /** The types the server serves inline; everything else is a download. */
 const INLINE_IMAGE_TYPES = new Set([
@@ -69,6 +72,23 @@ export function quotaShare(usedBytes: number, quotaBytes: number): number {
 
 export function bytesToMib(bytes: number): number {
   return Math.round(bytes / MIB)
+}
+
+/**
+ * Put the usage a successful quota save answered with in the cache. A read
+ * that started before the save committed would bring the old quota back
+ * after it, so reads still in flight are cancelled first.
+ */
+export async function storeSavedUsage(
+  queryClient: QueryClient,
+  projectId: number,
+  saved: AttachmentUsage
+): Promise<void> {
+  const queryKey = getErrorAttachmentUsageQueryKey({
+    path: { project_id: projectId },
+  })
+  await queryClient.cancelQueries({ queryKey })
+  queryClient.setQueryData(queryKey, saved)
 }
 
 /** Whether `bytes` shows exactly as a number of MiB in the quota form. */
