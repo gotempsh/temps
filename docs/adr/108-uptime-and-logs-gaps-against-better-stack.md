@@ -3,7 +3,9 @@
 ## Status
 
 Proposed — 2026-11-19. D1 implemented — 2026-11-19 (see *Settled while
-implementing D1*). D2 to D8 not started.
+implementing D1*). D2 email subscription implemented — 2026-11-20 (see
+*Settled while implementing D2*); its feed, webhooks, maintenance windows
+and page password are not started. D3 to D8 not started.
 
 Related: ADR 021 (multi-node log aggregation, humanized alert notifications),
 ADR 025 (unified alarm log), ADR 026 (metric alert label filters), ADR 045 to
@@ -207,6 +209,57 @@ No email subscription, no feed, no webhook, no announced maintenance window.
 - **Access control.** An optional password on a page, for a status page shared
   with customers only.
 
+### Settled while implementing D2
+
+The email subscription shipped first, on its own; the feed, webhooks,
+maintenance windows and page password follow separately.
+
+- **Whole page only.** A subscriber subscribes to a page, not to chosen
+  components (the open question below). A component filter needs a choice
+  in the form, which a page with no JavaScript can only offer as a long
+  list of checkboxes, and it is easy to add later without migrating
+  anything.
+- **What is announced, and from where.** Notices are derived from the
+  published snapshot, the same allowlisted data the page renders: one
+  notice per public update, plus one for the resolution of an incident with
+  none. Only updates published after subscriptions were switched on and
+  within the last 24 hours are announced, so switching on never mails out
+  the page's history and a long outage of the sender does not send a
+  backlog. A notice whose update stops being public (made private, page
+  unpublished, subscriptions off) before delivery finishes is cancelled.
+- **Double opt-in that a link scanner cannot complete.** Opening a
+  confirmation or unsubscribe link shows a button; only the POST acts. A
+  confirmation link is valid for 48 hours and works once; a repeated
+  request sends a new one at most every 10 minutes. An address that is
+  never confirmed is deleted 48 hours after its last request. The public
+  answer is the same for a new, pending or confirmed address.
+- **Tokens.** Only SHA-256 hashes are stored. The confirmation token is
+  random; the unsubscribe token is an HMAC of a per-subscriber nonce under
+  the server key, so every notice carries the link without the token being
+  stored.
+- **Limits.** 10,000 subscribers per page, at most 1,000 of them pending;
+  10 subscription requests per client per 10 minutes on the public routes.
+  The dispatcher runs every 20 seconds and sends at most 200 mails per run
+  across all pages, in batches of 50 recipients, walking a cursor over
+  subscriber ids so each recipient gets a notice at most once, across
+  restarts too. A recipient whose send fails three times is skipped.
+- **Switching on needs a working sender.** Subscriptions cannot be enabled
+  until an email provider exists, the sender address is at a verified
+  domain, and Temps knows a public URL for the links (a custom domain of the
+  page, or the external or public ingress URL). Each missing piece is shown
+  with a link to where it is fixed, and the capability endpoint reports it.
+- **Who sees addresses.** Listing, exporting and deleting subscribers need
+  `status_page:write`, not read. The export is CSV served with `no-store`,
+  with formula characters neutralised. Audit entries for settings changes,
+  deletions and exports never contain an address.
+- **Custom domains.** A verified page host additionally forwards
+  `POST /subscribe` and `GET`/`POST` on `/confirm/{token}` and
+  `/unsubscribe/{token}`, and its CSP gains `form-action 'self'`.
+- **Mail.** Sent through `crates/temps-email`, so its suppression list
+  applies, with open and click tracking off. No `List-Unsubscribe` header
+  yet: the email service only passes `X-Temps-*` headers through, so adding
+  it needs a change there first.
+
 ### D3. Check types
 
 **Missing.** One check exists: HTTP `GET`, 2xx or 3xx is up.
@@ -299,5 +352,6 @@ document.
   a hosted dependency that a self-hosted product otherwise avoids.
 - Whether log alerts (D1) should evaluate against the line index or the chunk
   store. The answer decides how far back a window can reach on a small host.
-- Whether subscribers (D2) may choose individual components of a page, or only
-  the whole page.
+- ~~Whether subscribers (D2) may choose individual components of a page, or
+  only the whole page.~~ Settled: the whole page (see *Settled while
+  implementing D2*).

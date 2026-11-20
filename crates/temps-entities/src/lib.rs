@@ -240,6 +240,8 @@ pub mod status_incidents;
 pub mod status_monitors;
 pub mod status_page_domains;
 pub mod status_page_monitors;
+pub mod status_page_notices;
+pub mod status_page_subscribers;
 pub mod status_pages;
 
 // Metrics alert rules

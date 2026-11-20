@@ -47,6 +47,7 @@ import {
   EyeOff,
   Globe,
   Home,
+  Mail,
   MoreVertical,
   Palette,
   RefreshCw,
@@ -66,6 +67,7 @@ import { StatusPageDomains } from './StatusPageDomains'
 import { PublicLinkSection } from './StatusPagePublicLink'
 import { StatusPageAppearanceForm } from './StatusPageAppearanceForm'
 import { StatusPageIncidents } from './StatusPageIncidents'
+import { StatusPageSubscribers } from './StatusPageSubscribers'
 import { StatusPagePreview } from './StatusPagePreview'
 import {
   formDefaults,
@@ -80,6 +82,7 @@ const DETAIL_TABS = [
   'components',
   'appearance',
   'incidents',
+  'subscribers',
   'domains',
 ] as const
 type DetailTab = (typeof DETAIL_TABS)[number]
@@ -529,6 +532,9 @@ export function StatusPageDetail() {
           <TabsTrigger value="incidents" icon={Siren}>
             Incidents
           </TabsTrigger>
+          <TabsTrigger value="subscribers" icon={Mail}>
+            Subscribers
+          </TabsTrigger>
           <TabsTrigger value="domains" icon={Globe}>
             Domains
           </TabsTrigger>
@@ -553,6 +559,9 @@ export function StatusPageDetail() {
           {/* Keyed by page: switching pages must never show (and let you
               act on) the previous page's incidents or page number. */}
           <StatusPageIncidents key={page.id} page={page} />
+        </TabsContent>
+        <TabsContent value="subscribers" className="pt-4">
+          <StatusPageSubscribers key={page.id} page={page} />
         </TabsContent>
         <TabsContent value="domains" className="pt-4">
           <StatusPageDomains page={page} />

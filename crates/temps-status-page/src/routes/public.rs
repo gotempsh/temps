@@ -302,15 +302,16 @@ pub async fn get_public_status_page(
 ) -> Response {
     // A slug that does not even decode gets the same 404 as any other miss.
     let slug = slug.map(|Path(slug)| slug).unwrap_or_default();
+    let host = custom_host(&headers);
     let snapshot = is_well_formed_slug(&slug)
         .then(|| state.cache.get(&slug))
         .flatten()
-        .filter(|snapshot| snapshot.serves_host(custom_host(&headers).as_deref()));
+        .filter(|snapshot| snapshot.serves_host(host.as_deref()));
     let mut response = match snapshot {
         Some(snapshot) => (
             StatusCode::OK,
             [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-            snapshot.html.clone(),
+            snapshot.html_for(host.as_deref()),
         )
             .into_response(),
         None => (

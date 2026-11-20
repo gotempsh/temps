@@ -7,6 +7,7 @@ pub mod incident_service;
 pub mod monitor_service;
 pub mod public_pages;
 pub mod status_page_service;
+pub mod subscribers;
 pub mod types;
 
 pub use health_check_service::HealthCheckService;

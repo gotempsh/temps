@@ -107,9 +107,62 @@ An incident appears on a page when it has at least one public update and it conc
 
 ---
 
+## Email subscribers
+
+Visitors can subscribe to a page by email and get a message for every public incident update and for the resolution. Nothing else is ever sent: a notice carries the incident's public heading, its public status, the public names of the affected components and the text of one public update, exactly as the page shows them. Private updates, internal titles, monitor names and errors never reach a subscriber.
+
+### Switching it on
+
+Open the status page, then **Subscribers**:
+
+1. Enter a **sender address** at one of your verified email domains, for example `status@example.com`.
+2. Switch **Email updates for visitors** on. The public page now ends with a subscribe form.
+
+If something is missing, the tab says what and links to where it is fixed: **No email provider is configured** (add one under **Email**), no verified email domain, or no public URL for the links in the mails (set the external URL or public ingress URL, or attach a custom domain to the page). Subscriptions cannot be switched on until mail can actually go out.
+
+Only updates published **after** subscriptions were switched on are announced, so switching them on never mails out the page's history.
+
+```bash
+temps status-pages subscriptions show --id 1
+temps status-pages subscriptions set --id 1 --sender status@example.com --enable
+temps status-pages subscriptions set --id 1 --disable
+```
+
+### What a visitor goes through
+
+1. They enter their address in the form. The answer is the same whether the address is new, waiting for confirmation or already subscribed.
+2. Temps sends a confirmation link (double opt-in). Opening it shows a **Confirm subscription** button; nothing is stored as confirmed until it is clicked, so mail scanners that open links cannot subscribe anyone. The link is valid for 48 hours and works once. A repeated request sends a new link at most every 10 minutes.
+3. Every notice ends with an **Unsubscribe** link. Following it and clicking **Unsubscribe** deletes the address from the page.
+
+Mail goes through the transactional email stack (**Email**), so its suppression list applies: an address that bounced or complained is not mailed. Mail is sent without open or click tracking.
+
+### Subscriber data
+
+Addresses are personal data:
+
+- They are stored per page, shown only to people who can change the page (`status_page:write`), and never to other subscribers.
+- You can delete one (**Subscribers** → the bin icon, or `temps status-pages subscribers delete --id 1 --subscriber-id 9`), export all of them as CSV (**Export CSV**, or `temps status-pages subscribers export --id 1 -o subscribers.csv`), and deleting the page deletes them all.
+- An address that is never confirmed is deleted 48 hours after its last request.
+- No token is stored in plaintext: only hashes of the confirmation and unsubscribe tokens are kept.
+- Changing the settings, deleting a subscriber and exporting are audit-logged (`STATUS_PAGE_SUBSCRIPTIONS_UPDATED`, `STATUS_PAGE_SUBSCRIBER_DELETED`, `STATUS_PAGE_SUBSCRIBERS_EXPORTED`), without the addresses.
+
+| Action | Endpoint |
+|---|---|
+| Settings | `GET /api/status-pages/{id}/subscriptions` |
+| Change settings | `PUT /api/status-pages/{id}/subscriptions` |
+| List subscribers | `GET /api/status-pages/{id}/subscribers` |
+| Export as CSV | `GET /api/status-pages/{id}/subscribers/export` |
+| Delete a subscriber | `DELETE /api/status-pages/{id}/subscribers/{subscriber_id}` |
+
+### How notices are sent
+
+A background task checks every 20 seconds. It queues one notice per public update published in the last 24 hours, sends pending confirmations, then delivers notices to confirmed subscribers in batches, at most 200 mails per run across all pages. A notice goes to the subscribers who had confirmed when it was queued, each at most once, also across restarts. If an update stops being public before its mail has gone out (made private, the page unpublished, subscriptions switched off), the rest of the delivery is cancelled.
+
+---
+
 ## Custom domains
 
-A page can also be served on your own hostname, such as `status.example.com`. The hostname serves **only** the page (`/`) and its JSON (`/summary.json`); every other path answers "not found", and the hostname never reaches the Temps console, its API, or any application.
+A page can also be served on your own hostname, such as `status.example.com`. The hostname serves **only** the page (`/`), its JSON (`/summary.json`) and, when subscriptions are on, the subscribe form (`/subscribe`) and the confirmation and unsubscribe links; every other path answers "not found", and the hostname never reaches the Temps console, its API, or any application.
 
 1. Open the status page and, under **Custom domains**, enter the hostname. Choose how to prove you control it:
    - **HTTP**: the hostname already points at this Temps instance.
@@ -162,7 +215,7 @@ Adding, verifying, renewing and removing custom domains needs `status_page:write
 
 ## How it is served
 
-- Public requests are answered from an in-memory snapshot. They never run a probe or a database query, so traffic to a status page — including someone guessing links — cannot slow Temps down.
+- Public requests are answered from an in-memory snapshot. Viewing a page never runs a probe or a database query, so traffic to a status page — including someone guessing links — cannot slow Temps down. Only the subscribe form, confirmation and unsubscribe posts write to the database, and only for a published page that accepts subscriptions; they are limited to 10 requests per client per 10 minutes.
 - Snapshots are rebuilt every minute, and immediately when you change or publish a page or an incident update's visibility.
 - The link contains 128 random bits; it cannot be guessed or derived from any ID. Unknown, unpublished, deleted and replaced links all receive the same "not found" response.
 - Requests are rate-limited per client (300 per minute per IPv4 address or IPv6 /64). Visitors that cannot be tracked individually during a flood share a separate budget, so a flood of addresses cannot lock out visitors already being served.
@@ -175,3 +228,4 @@ Adding, verifying, renewing and removing custom domains needs `status_page:write
 - Titles up to 120 characters, descriptions up to 1,000, public names and group names up to 80, incident update messages up to 5,000.
 - 30 custom-domain verifications or renewals per page per hour, and 60 across the instance.
 - Up to 5 custom domains per page.
+- 10,000 subscribers per page, of which at most 1,000 waiting for confirmation.

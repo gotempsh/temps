@@ -162,12 +162,29 @@ p.desc{color:var(--muted);margin:0 0 4px;white-space:pre-wrap}
 .day .none{color:var(--muted);font-size:14px;margin:0}
 .day .item{margin-top:6px}
 .day .item a,.day .item strong{font-weight:600}
+.sub{padding:18px 22px}
+.sub p{margin:0}
+.sub label{display:block;margin-bottom:10px}
+.sub .row{justify-content:flex-start;align-items:center}
+.sub input{flex:1 1 16em;min-width:0;font:inherit;padding:8px 12px;border:1px solid var(--border);border-radius:8px;background:var(--bg);color:var(--fg)}
+.sub button{font:inherit;font-weight:600;padding:8px 16px;border:0;border-radius:8px;background:var(--accent);color:#fff;cursor:pointer}
+.sub form+p,.sub p+form{margin-top:12px}
 footer{color:var(--muted);font-size:13px;margin-top:40px;display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
 @media (max-width:640px){.bar.o{display:none}.bar.nl .tip{left:-4px;transform:none}.n90{display:none}.n30{display:inline}.tip{width:220px}.banner{font-size:16px}.brand{font-size:19px}.brand img{max-height:32px;max-width:min(140px,100%)}}
 "#;
 
 /// Render the full HTML document for a public status page.
 pub fn render_public_page_html(page: &PublicStatusPageResponse) -> String {
+    render_public_page_html_with(page, None)
+}
+
+/// [`render_public_page_html`] with the subscribe form posting to
+/// `subscribe_action` when the page accepts email subscriptions (ADR 108 D2).
+/// The form is a plain HTML post: the page still runs no script.
+pub fn render_public_page_html_with(
+    page: &PublicStatusPageResponse,
+    subscribe_action: Option<&str>,
+) -> String {
     let mut html = String::with_capacity(32 * 1024);
     let title = escape_html(&page.title);
     let appearance = &page.appearance;
@@ -260,6 +277,10 @@ pub fn render_public_page_html(page: &PublicStatusPageResponse) -> String {
     html.push_str("</div>");
 
     render_past_incidents(&mut html, page);
+
+    if let Some(action) = subscribe_action {
+        render_subscribe_form(&mut html, action);
+    }
 
     let _ = write!(
         html,
@@ -559,6 +580,70 @@ fn render_incident(html: &mut String, incident: &PublicIncident) {
 
 /// The last [`PAST_INCIDENT_DAYS`] days, newest first, each with the incidents
 /// that started on it, or "No incidents reported."
+fn render_subscribe_form(html: &mut String, action: &str) {
+    let _ = write!(
+        html,
+        "<h2 id=\"subscribe\">Get updates by email</h2><div class=\"card sub\">\
+         <form method=\"post\" action=\"{}\">\
+         <label for=\"sub-email\">We email you when an incident is posted or updated here.</label>\
+         <div class=\"row\"><input id=\"sub-email\" type=\"email\" name=\"email\" required \
+         maxlength=\"254\" autocomplete=\"email\" placeholder=\"you@example.com\">\
+         <button type=\"submit\">Subscribe</button></div></form>\
+         <p class=\"meta\">We send a confirmation link first. Every email has a link to \
+         unsubscribe.</p></div>",
+        escape_html(action)
+    );
+}
+
+/// A small standalone page in the status page's look: the answer to a
+/// subscribe post and the pages behind the confirm and unsubscribe links.
+/// `form` is `(action, button label)` for a page that asks for a click
+/// (a link opened by a mail scanner must not confirm or unsubscribe anything).
+pub fn render_notice_page(
+    page_title: &str,
+    appearance: &super::types::StatusPageAppearance,
+    heading: &str,
+    body: &str,
+    form: Option<(&str, &str)>,
+    back_href: &str,
+) -> String {
+    let mut html = String::with_capacity(4 * 1024);
+    let theme = match appearance.theme {
+        StatusPageTheme::Auto => "auto",
+        StatusPageTheme::Light => "light",
+        StatusPageTheme::Dark => "dark",
+    };
+    let title = escape_html(page_title);
+    let _ = write!(
+        html,
+        "<!doctype html><html lang=\"en\" data-theme=\"{theme}\"><head><meta charset=\"utf-8\">\
+         <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
+         <meta name=\"robots\" content=\"noindex,nofollow\">\
+         <meta name=\"referrer\" content=\"no-referrer\">\
+         <title>{} · {title}</title><style>:root{{--accent:{}}}{STYLE}</style></head><body>\
+         <header class=\"top\"><div class=\"in\"><h1 class=\"brand\"><span>{title}</span></h1>\
+         </div></header><main><h2>{}</h2><div class=\"card sub\"><p>{}</p>",
+        escape_html(heading),
+        accent(appearance.accent_color.as_deref()),
+        escape_html(heading),
+        escape_html(body),
+    );
+    if let Some((action, label)) = form {
+        let _ = write!(
+            html,
+            "<form method=\"post\" action=\"{}\"><button type=\"submit\">{}</button></form>",
+            escape_html(action),
+            escape_html(label)
+        );
+    }
+    let _ = write!(
+        html,
+        "</div><p><a href=\"{}\">Back to the status page</a></p></main></body></html>",
+        escape_html(back_href)
+    );
+    html
+}
+
 fn render_past_incidents(html: &mut String, page: &PublicStatusPageResponse) {
     html.push_str("<h2>Past incidents</h2><div>");
     let today = page.generated_at.date_naive();
@@ -650,6 +735,33 @@ mod tests {
             history_days: 1,
             generated_at: now,
         }
+    }
+
+    #[test]
+    fn the_subscribe_form_appears_only_when_asked_for_and_posts_without_script() {
+        let page = page_with("API", "Investigating", "Status");
+        let without = render_public_page_html(&page);
+        assert!(!without.contains("<form"));
+        let with = render_public_page_html_with(&page, Some("/api/status/ab\"cd/subscribe"));
+        assert!(with.contains("<form method=\"post\" action=\"/api/status/ab&quot;cd/subscribe\">"));
+        assert!(with.contains("type=\"email\" name=\"email\" required"));
+        assert!(!with.contains("<script"));
+    }
+
+    #[test]
+    fn notice_pages_escape_text_and_post_to_their_own_path() {
+        let html = render_notice_page(
+            "Acme <Status>",
+            &StatusPageAppearance::default(),
+            "Confirm your subscription",
+            "Body & more",
+            Some(("/confirm/abc", "Confirm subscription")),
+            "/",
+        );
+        assert!(html.contains("Acme &lt;Status&gt;"));
+        assert!(html.contains("Body &amp; more"));
+        assert!(html.contains("<form method=\"post\" action=\"/confirm/abc\">"));
+        assert!(!html.contains("<script"));
     }
 
     #[test]

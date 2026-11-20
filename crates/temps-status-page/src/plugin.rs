@@ -13,8 +13,15 @@ use utoipa::openapi::OpenApi;
 use utoipa::OpenApi as OpenApiTrait;
 
 use crate::routes::public::{create_public_router, PublicStatusState};
+use crate::routes::public_subscriptions::{
+    create_public_subscription_router, PublicSubscriptionState,
+};
 use crate::routes::status_page::{create_router, StatusPageApiDoc, StatusPageAppState};
+use crate::routes::subscribers::{
+    create_subscriber_router, SubscriberApiDoc, SubscriberRoutesState,
+};
 use crate::services::public_pages::{DomainServiceCertificates, StatusPageDomainService};
+use crate::services::subscribers::{StatusPageSubscriberService, TempsEmailMailer};
 use crate::services::{
     HealthCheckService, MonitorService, PublicStatusPageService, StatusPageService,
     StatusSnapshotCache,
@@ -274,7 +281,25 @@ impl TempsPlugin for StatusPagePlugin {
             context.register_service(public_status_page_service.clone());
             temps_core::ProjectDeletionHooks::get_or_register(context)
                 .add(public_status_page_service.clone());
-            tokio::spawn(snapshot_cache.run_refresh_loop());
+            tokio::spawn(snapshot_cache.clone().run_refresh_loop());
+
+            // Email subscribers (ADR 108 D2): mail goes through the
+            // transactional email stack, which the email plugin registers
+            // before this one.
+            let mailer = Arc::new(TempsEmailMailer::new(
+                context.require_service::<temps_email::services::EmailService>(),
+                context.require_service::<temps_email::services::ProviderService>(),
+                context.require_service::<temps_email::services::DomainService>(),
+            ));
+            let subscriber_service = Arc::new(StatusPageSubscriberService::new(
+                db.clone(),
+                snapshot_cache.clone(),
+                context.require_service::<temps_core::EncryptionService>(),
+                mailer,
+                context.require_service::<temps_config::ConfigService>(),
+            ));
+            context.register_service(subscriber_service.clone());
+            tokio::spawn(subscriber_service.run_dispatcher());
 
             // Start the health check scheduler with job receiver for realtime monitor creation
             let scheduler_service = health_check_service.clone();
@@ -379,7 +404,15 @@ impl TempsPlugin for StatusPagePlugin {
             project_access_checker,
         });
 
-        let routes = create_router().with_state(app_state);
+        let subscriber_state = Arc::new(SubscriberRoutesState {
+            subscribers: context.require_service::<StatusPageSubscriberService>(),
+            pages: app_state.public_status_page_service.clone(),
+            audit: app_state.audit_service.clone(),
+            project_access_checker: app_state.project_access_checker.clone(),
+        });
+        let routes = create_router()
+            .with_state(app_state)
+            .merge(create_subscriber_router(subscriber_state));
         Some(PluginRoutes::new(routes))
     }
 
@@ -387,12 +420,20 @@ impl TempsPlugin for StatusPagePlugin {
     /// surface). Reads only the snapshot cache; see `routes::public`.
     fn configure_public_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
         let cache = context.require_service::<StatusSnapshotCache>();
+        let subscriptions = Arc::new(PublicSubscriptionState::new(
+            cache.clone(),
+            context.require_service::<StatusPageSubscriberService>(),
+        ));
         let state = Arc::new(PublicStatusState::new(cache));
-        Some(PluginRoutes::new(create_public_router(state)))
+        Some(PluginRoutes::new(
+            create_public_router(state).merge(create_public_subscription_router(subscriptions)),
+        ))
     }
 
     fn openapi_schema(&self) -> Option<OpenApi> {
-        Some(<StatusPageApiDoc as OpenApiTrait>::openapi())
+        let mut doc = <StatusPageApiDoc as OpenApiTrait>::openapi();
+        doc.merge(<SubscriberApiDoc as OpenApiTrait>::openapi());
+        Some(doc)
     }
 }
 

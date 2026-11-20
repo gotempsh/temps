@@ -1586,10 +1586,12 @@ impl LoadBalancer {
     /// Allowed, in order:
     /// 1. ACME HTTP-01 challenges for the hostname, so ownership can be proven
     ///    and the certificate renewed.
-    /// 2. `GET`/`HEAD` of `/` and `/summary.json` while the page is published
-    ///    and the hostname verified: an HTTPS upgrade on plain HTTP, otherwise
-    ///    a rewrite to the page's slug route, pinned to the public-only
-    ///    listener by `upstream_peer`.
+    /// 2. The paths and methods of `StatusHostPath` (`GET`/`HEAD` of `/`
+    ///    and `/summary.json`; the subscribe post and the confirm and
+    ///    unsubscribe links of ADR 108 D2) while the page is published and the
+    ///    hostname verified: an HTTPS upgrade on plain HTTP, otherwise a
+    ///    rewrite to the page's slug route, pinned to the public-only listener
+    ///    by `upstream_peer`.
     ///
     /// Everything else gets the status-page 404, byte-identical to the
     /// console's, whatever the reason.
@@ -1623,7 +1625,9 @@ impl LoadBalancer {
         }
 
         let view = StatusHostPath::parse(&ctx.path);
-        let method_allowed = matches!(ctx.method.as_str(), "GET" | "HEAD");
+        let method_allowed = view
+            .as_ref()
+            .is_some_and(|view| view.allows_method(ctx.method.as_str()));
         let (Some(view), true, Some(slug)) = (view, method_allowed, route.slug) else {
             return self
                 .write_status_page_not_found(session, ctx, ctx.path == "/summary.json")

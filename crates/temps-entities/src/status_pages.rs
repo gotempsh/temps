@@ -35,6 +35,14 @@ pub struct Model {
     pub website_url: Option<String>,
     pub show_uptime_percentage: bool,
     pub show_response_times: bool,
+    /// Visitors may subscribe by email (ADR 108 D2).
+    pub subscriptions_enabled: bool,
+    /// When subscriptions were last switched on. Only public updates
+    /// published after it are announced, so enabling them never mails out
+    /// the page's history.
+    pub subscriptions_enabled_at: Option<DBDateTime>,
+    /// From address of subscriber mail, at a verified email domain.
+    pub subscription_sender: Option<String>,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
 }

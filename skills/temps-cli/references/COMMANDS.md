@@ -7252,6 +7252,8 @@ Publish public status pages showing monitors from any of your projects
 - `rotate-url` - Replace the public URL; the old one stops working
 - `delete` (`rm`) - Delete a status page; its public URL returns 404 immediately
 - `domains` (`domain`) - Serve a status page on your own hostname
+- `subscriptions` - Let visitors subscribe to a status page by email
+- `subscribers` - List, export or delete the subscribers of a status page
 
 ### `status-pages list` (alias: `ls`)
 
@@ -7418,6 +7420,86 @@ Detach a hostname; it answers 404 immediately and its certificate is deleted
 |------|-------------|---------|----------|
 | `--id <id>` | Status page ID | - | Yes |
 | `--domain-id <id>` | Custom domain ID (see `domains list`) | - | Yes |
+| `-y, --yes` | Skip the confirmation prompt | - | No |
+
+### `status-pages subscriptions`
+
+Let visitors subscribe to a status page by email
+
+**Subcommands:**
+
+- `show` - Show whether visitors can subscribe, the sender and what is missing
+- `set` - Switch subscriptions on or off, or set the sender address
+
+#### `status-pages subscriptions show`
+
+Show whether visitors can subscribe, the sender and what is missing
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Status page ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `status-pages subscriptions set`
+
+Switch subscriptions on or off, or set the sender address
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Status page ID | - | Yes |
+| `--enable` | Show the subscribe form on the public page | - | No |
+| `--disable` | Hide the subscribe form and stop sending | - | No |
+| `--sender <address>` | From address at a verified email domain ("" clears it) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `status-pages subscribers`
+
+List, export or delete the subscribers of a status page
+
+**Subcommands:**
+
+- `list` (`ls`) - List subscribers, newest first
+- `export` - Export every subscriber as CSV (email,state,subscribed_at,confirmed_at)
+- `delete` (`rm`) - Delete a subscriber; the address gets no more mail
+
+#### `status-pages subscribers list` (alias: `ls`)
+
+List subscribers, newest first
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Status page ID | - | Yes |
+| `--page <n>` | Page number | `1` | No |
+| `--page-size <n>` | Items per page (max 100) | `20` | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `status-pages subscribers export`
+
+Export every subscriber as CSV (email,state,subscribed_at,confirmed_at)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Status page ID | - | Yes |
+| `-o, --output <file>` | Write to a file instead of standard output | - | No |
+
+#### `status-pages subscribers delete` (alias: `rm`)
+
+Delete a subscriber; the address gets no more mail
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Status page ID | - | Yes |
+| `--subscriber-id <id>` | Subscriber ID (see `subscribers list`) | - | Yes |
 | `-y, --yes` | Skip the confirmation prompt | - | No |
 
 ## `alarms` (alias: `alarm`)

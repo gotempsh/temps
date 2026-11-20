@@ -42,11 +42,14 @@ use temps_entities::{status_monitors, status_page_monitors, status_pages};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
-use super::render::render_public_page_html;
+use super::render::render_public_page_html_with;
 use super::types::{
     PublicComponentStatus, PublicDayStatus, PublicIncident, PublicIncidentSeverity,
     PublicIncidentStatus, PublicIncidentUpdate, PublicStatusComponent, PublicStatusPageResponse,
     PublicUptimeDay, StatusPageAppearance, PUBLIC_HISTORY_DAYS,
+};
+use crate::services::subscribers::notices::{
+    incident_notices, IncidentForNotice, PageNotice, NOTICE_WINDOW,
 };
 
 /// How often the background loop rebuilds every published snapshot.
@@ -74,11 +77,41 @@ pub struct PublishedSnapshot {
     /// the proxy with a hostname not in this set gets the 404, so removing a
     /// hostname takes effect here before the proxy's route table reloads.
     pub(crate) custom_hosts: HashSet<String>,
+    /// The page's public capability; internal, for building links in mail.
+    pub(crate) slug: String,
+    /// Heading and look of the page, for the small pages the subscription
+    /// links render (confirm, unsubscribe).
+    pub(crate) title: String,
+    pub(crate) appearance: StatusPageAppearance,
+    /// When subscriptions were switched on, `None` while they are off. Only
+    /// updates published after it are announced (ADR 108 D2).
+    pub(crate) subscriptions_since: Option<UtcDateTime>,
+    /// Announcements derived from this snapshot's public incidents, within
+    /// [`NOTICE_WINDOW`]. Empty while subscriptions are off.
+    pub(crate) notices: Vec<PageNotice>,
     pub json: Bytes,
     pub html: Bytes,
+    /// The same page for a custom hostname: identical except that the
+    /// subscribe form posts to the hostname's own path.
+    pub html_custom_host: Bytes,
 }
 
 impl PublishedSnapshot {
+    /// Whether the page shows the subscribe form.
+    pub fn accepts_subscriptions(&self) -> bool {
+        self.subscriptions_since.is_some()
+    }
+
+    /// The HTML to serve for a request, by whether it came through a custom
+    /// hostname.
+    pub fn html_for(&self, custom_host: Option<&str>) -> Bytes {
+        if custom_host.is_some() {
+            self.html_custom_host.clone()
+        } else {
+            self.html.clone()
+        }
+    }
+
     /// Whether this page may be served for a request tagged with
     /// `custom_host` (the proxy's `x-temps-status-host`), or for an untagged
     /// request to its slug URL.
@@ -181,6 +214,7 @@ pub(crate) struct IncidentRow {
 #[derive(Debug, Clone, FromQueryResult)]
 pub(crate) struct PublicUpdateRow {
     pub incident_id: i32,
+    pub id: i32,
     pub status: String,
     pub message: String,
     pub created_at: UtcDateTime,
@@ -242,6 +276,11 @@ impl StatusSnapshotCache {
     }
 
     /// Number of published pages currently served.
+    /// Every snapshot being served, for the subscriber dispatcher.
+    pub fn all(&self) -> Vec<Arc<PublishedSnapshot>> {
+        self.snapshots.load().values().cloned().collect()
+    }
+
     pub fn len(&self) -> usize {
         self.snapshots.load().len()
     }
@@ -409,7 +448,21 @@ impl StatusSnapshotCache {
                 continue;
             }
             let project_ids: HashSet<i32> = page_selections.iter().map(|s| s.project_id).collect();
-            let response = assemble_public_page(page, &page_selections, &data, now);
+            let AssembledPage { response, notices } =
+                assemble_page(page, &page_selections, &data, now);
+            let subscriptions_since = subscriptions_since(page);
+            let (html, html_custom_host) = if subscriptions_since.is_some() {
+                (
+                    Bytes::from(render_public_page_html_with(
+                        &response,
+                        Some(&format!("/api/status/{}/subscribe", page.slug)),
+                    )),
+                    Bytes::from(render_public_page_html_with(&response, Some("/subscribe"))),
+                )
+            } else {
+                let html = Bytes::from(render_public_page_html_with(&response, None));
+                (html.clone(), html)
+            };
             match serde_json::to_vec(&response) {
                 Ok(json) => built.push((
                     page.slug.clone(),
@@ -417,8 +470,14 @@ impl StatusSnapshotCache {
                         status_page_id: page.id,
                         project_ids,
                         custom_hosts: verified_hosts.remove(&page.id).unwrap_or_default(),
+                        slug: page.slug.clone(),
+                        title: response.title.clone(),
+                        appearance: response.appearance.clone(),
+                        subscriptions_since,
+                        notices,
                         json: Bytes::from(json),
-                        html: Bytes::from(render_public_page_html(&response)),
+                        html,
+                        html_custom_host,
                     }),
                 )),
                 Err(e) => error!(
@@ -739,7 +798,7 @@ async fn load_refresh_data(
         // never makes a refresh read its whole history.
         let sql = format!(
             r#"
-            SELECT incident_id, status, message, created_at
+            SELECT incident_id, id, status, message, created_at
             FROM (
                 SELECT incident_id, status, message, created_at, id,
                        ROW_NUMBER() OVER (
@@ -793,6 +852,19 @@ pub(crate) fn day_status(counts: DayCounts) -> PublicDayStatus {
     }
 }
 
+/// When subscriptions were switched on, if they are on. A page switched on
+/// without a recorded time announces nothing from before now.
+fn subscriptions_since(page: &status_pages::Model) -> Option<UtcDateTime> {
+    page.subscriptions_enabled
+        .then(|| page.subscriptions_enabled_at.unwrap_or_else(Utc::now))
+}
+
+/// The public view of a page and the announcements derived from it.
+pub(crate) struct AssembledPage {
+    pub response: PublicStatusPageResponse,
+    pub notices: Vec<PageNotice>,
+}
+
 /// Build the public view of one page from pre-fetched data. Pure: everything
 /// it can publish is passed in, so tests can assert what reaches the output.
 pub(crate) fn assemble_public_page(
@@ -801,6 +873,18 @@ pub(crate) fn assemble_public_page(
     data: &RefreshData,
     now: UtcDateTime,
 ) -> PublicStatusPageResponse {
+    assemble_page(page, selections, data, now).response
+}
+
+/// [`assemble_public_page`] plus the subscriber notices: built from the
+/// assembled public incidents, never from the rows behind them, so a notice
+/// can only say what the page says.
+pub(crate) fn assemble_page(
+    page: &status_pages::Model,
+    selections: &[SelectionRow],
+    data: &RefreshData,
+    now: UtcDateTime,
+) -> AssembledPage {
     let appearance = StatusPageAppearance::from_model(page);
     let today = now.date_naive();
     let first_day = today - chrono::Days::new(u64::from(PUBLIC_HISTORY_DAYS - 1));
@@ -867,6 +951,27 @@ pub(crate) fn assemble_public_page(
         })
         .collect();
 
+    let notices = match subscriptions_since(page) {
+        Some(since) => {
+            let since = since.max(now - NOTICE_WINDOW);
+            incidents
+                .iter()
+                .flat_map(|incident| {
+                    incident_notices(
+                        &page.title,
+                        &IncidentForNotice {
+                            incident_id: incident.incident_id,
+                            update_ids: &incident.update_ids,
+                            incident: &incident.public,
+                        },
+                        since,
+                        now,
+                    )
+                })
+                .collect()
+        }
+        None => Vec::new(),
+    };
     let incidents: Vec<PublicIncident> = incidents.into_iter().map(|i| i.public).collect();
 
     let mut status = components
@@ -888,15 +993,18 @@ pub(crate) fn assemble_public_page(
         status = status.max(floor);
     }
 
-    PublicStatusPageResponse {
-        title: page.title.clone(),
-        description: page.description.clone(),
-        appearance,
-        status,
-        components,
-        incidents,
-        history_days: PUBLIC_HISTORY_DAYS,
-        generated_at: now,
+    AssembledPage {
+        response: PublicStatusPageResponse {
+            title: page.title.clone(),
+            description: page.description.clone(),
+            appearance,
+            status,
+            components,
+            incidents,
+            history_days: PUBLIC_HISTORY_DAYS,
+            generated_at: now,
+        },
+        notices,
     }
 }
 
@@ -908,6 +1016,9 @@ fn clamp_count(count: i64) -> u32 {
 /// marking the days it covers on those components' bars.
 struct AssembledIncident {
     public: PublicIncident,
+    incident_id: i32,
+    /// Ids of `public.updates`, in the same order.
+    update_ids: Vec<i32>,
     /// `None` when the incident concerns every component of the page.
     monitor_ids: Option<HashSet<i32>>,
     started_on: NaiveDate,
@@ -990,9 +1101,9 @@ fn public_incidents(
                         }
                     }
                 };
-            let updates: Vec<PublicIncidentUpdate> = data
-                .updates
-                .get(&incident.id)?
+            let rows = data.updates.get(&incident.id)?;
+            let update_ids: Vec<i32> = rows.iter().map(|u| u.id).collect();
+            let updates: Vec<PublicIncidentUpdate> = rows
                 .iter()
                 .map(|u| PublicIncidentUpdate {
                     status: PublicIncidentStatus::from_internal(&u.status),
@@ -1024,6 +1135,8 @@ fn public_incidents(
                     resolved_at,
                     updates,
                 },
+                incident_id: incident.id,
+                update_ids,
                 monitor_ids,
                 started_on: incident.started_at.date_naive(),
                 // A resolved incident without a timestamp ends the day it
@@ -1067,6 +1180,9 @@ mod tests {
             website_url: None,
             show_uptime_percentage: true,
             show_response_times: true,
+            subscriptions_enabled: false,
+            subscriptions_enabled_at: None,
+            subscription_sender: None,
             created_at: now,
             updated_at: now,
         }
@@ -1107,6 +1223,7 @@ mod tests {
     fn update(incident_id: i32, message: &str) -> PublicUpdateRow {
         PublicUpdateRow {
             incident_id,
+            id: incident_id * 100,
             status: "identified".to_string(),
             message: message.to_string(),
             created_at: now(),

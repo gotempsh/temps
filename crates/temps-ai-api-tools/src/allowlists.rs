@@ -569,6 +569,9 @@ pub const AI_READ_ALLOWLIST: &[&str] = &[
     "list_saved_searches",
     "get_saved_search",
     "saved_search_series",
+    // Status page subscription settings (ADR 108 D2): whether mail can go
+    // out, what is missing and subscriber counts. No addresses, no secrets.
+    "get_status_page_subscriptions",
     // ── Platform info + update status ──
     // OS type, architecture, and supported platform strings — no secrets.
     "get_platform_info",

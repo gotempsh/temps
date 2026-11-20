@@ -32,6 +32,7 @@ import {
   newline, header, icons, json, colors, success, info, warning,
   keyValue, formatDate,
 } from '../../ui/output.js'
+import { registerSubscriberCommands } from './subscribers.js'
 
 interface ListOptions {
   projectId?: string
@@ -648,4 +649,5 @@ export function registerStatusPagesCommands(program: Command): void {
     })
 
   registerDomainCommands(pages)
+  registerSubscriberCommands(pages)
 }

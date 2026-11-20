@@ -166,6 +166,75 @@ impl AuditOperation for PublicStatusPageAudit {
     }
 }
 
+/// Actions on a status page's email subscriptions (ADR 108 D2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StatusPageSubscriberAction {
+    SettingsUpdated,
+    SubscriberDeleted,
+    SubscribersExported,
+}
+
+impl StatusPageSubscriberAction {
+    fn operation_type(self) -> &'static str {
+        match self {
+            Self::SettingsUpdated => "STATUS_PAGE_SUBSCRIPTIONS_UPDATED",
+            Self::SubscriberDeleted => "STATUS_PAGE_SUBSCRIBER_DELETED",
+            Self::SubscribersExported => "STATUS_PAGE_SUBSCRIBERS_EXPORTED",
+        }
+    }
+}
+
+/// Audit payload for subscription settings and subscriber data. The address
+/// itself is never recorded: it is personal data, and a deletion that left
+/// it in the audit log would not erase it.
+#[derive(Debug, Clone, Serialize)]
+pub struct StatusPageSubscriberAudit {
+    pub actor_user_id: Option<i32>,
+    pub ip_address: Option<String>,
+    pub user_agent: String,
+    pub action: StatusPageSubscriberAction,
+    pub project_ids: Vec<i32>,
+    pub status_page_id: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// The page's sender address (an operator-owned address, not a
+    /// subscriber's).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sender: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subscriber_id: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exported_count: Option<usize>,
+}
+
+impl AuditOperation for StatusPageSubscriberAudit {
+    fn operation_type(&self) -> String {
+        self.action.operation_type().to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        self.actor_user_id
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.user_agent
+    }
+
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        serde_json::to_string(self).map_err(|source| {
+            temps_core::AuditError::serialize(
+                format!("status page {} subscriptions", self.status_page_id),
+                source,
+            )
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

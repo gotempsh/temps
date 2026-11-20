@@ -34978,6 +34978,82 @@ export type SubmitLoginCodeRequest = {
     code: string;
 };
 
+export type SubscriberListResponse = {
+    items: Array<SubscriberResponse>;
+    page: number;
+    page_size: number;
+    total: number;
+};
+
+/**
+ * One subscriber, as the page's administrators see it. Never shown to
+ * anyone else.
+ */
+export type SubscriberResponse = {
+    confirmed_at?: string | null;
+    created_at: string;
+    email: string;
+    id: number;
+    state: SubscriberState;
+};
+
+export type SubscriberState = 'pending' | 'confirmed';
+
+/**
+ * Whether a prerequisite of subscriptions is in place, and if not, what is
+ * missing and where to fix it.
+ */
+export type SubscriptionCapability = {
+    configured: boolean;
+    /**
+     * What is missing, in words an operator can act on.
+     */
+    reason?: string | null;
+    /**
+     * Console path that fixes it; `None` when the fix is on the same form.
+     */
+    setup_path?: string | null;
+};
+
+/**
+ * Email subscription settings of one status page.
+ */
+export type SubscriptionSettingsResponse = {
+    confirmed_count: number;
+    /**
+     * Whether mail can be sent from `sender`.
+     */
+    email: SubscriptionCapability;
+    /**
+     * Visitors see a subscribe form on the public page.
+     */
+    enabled: boolean;
+    /**
+     * When subscriptions were last switched on; only updates published
+     * after it are announced.
+     */
+    enabled_at?: string | null;
+    /**
+     * Whether confirmation and unsubscribe links have an address people
+     * outside this network can open.
+     */
+    links: SubscriptionCapability;
+    /**
+     * Most subscribers a page can have, confirmed and pending together.
+     */
+    max_subscribers: number;
+    pending_count: number;
+    /**
+     * From address of subscriber mail.
+     */
+    sender?: string | null;
+    status_page_id: number;
+    /**
+     * Verified email domains with an active provider: valid sender domains.
+     */
+    verified_domains: Array<string>;
+};
+
 /**
  * Which answer to suggest next steps for.
  */
@@ -38391,6 +38467,21 @@ export type UpdateStatusResponse = {
      * on this install's channel.
      */
     update_available: boolean;
+};
+
+/**
+ * Change the email subscription settings of a status page. Absent fields are
+ * left as they are.
+ */
+export type UpdateSubscriptionSettingsRequest = {
+    /**
+     * Show the subscribe form. Switching on needs a working sender.
+     */
+    enabled?: boolean | null;
+    /**
+     * From address at a verified email domain; an empty string clears it.
+     */
+    sender?: string | null;
 };
 
 export type UpdateTeamRequest = {
@@ -96133,6 +96224,227 @@ export type RotateStatusPageUrlResponses = {
 
 export type RotateStatusPageUrlResponse = RotateStatusPageUrlResponses[keyof RotateStatusPageUrlResponses];
 
+export type ListStatusPageSubscribersData = {
+    body?: never;
+    path: {
+        /**
+         * Status page ID
+         */
+        status_page_id: number;
+    };
+    query?: {
+        /**
+         * Page number, starting at 1 (default 1).
+         */
+        page?: number | null;
+        /**
+         * Items per page (default 20, max 100).
+         */
+        page_size?: number | null;
+    };
+    url: '/status-pages/{status_page_id}/subscribers';
+};
+
+export type ListStatusPageSubscribersErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Status page not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListStatusPageSubscribersResponses = {
+    /**
+     * Subscribers, newest first
+     */
+    200: SubscriberListResponse;
+};
+
+export type ListStatusPageSubscribersResponse = ListStatusPageSubscribersResponses[keyof ListStatusPageSubscribersResponses];
+
+export type ExportStatusPageSubscribersData = {
+    body?: never;
+    path: {
+        /**
+         * Status page ID
+         */
+        status_page_id: number;
+    };
+    query?: never;
+    url: '/status-pages/{status_page_id}/subscribers/export';
+};
+
+export type ExportStatusPageSubscribersErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Status page not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ExportStatusPageSubscribersResponses = {
+    /**
+     * Subscribers as CSV
+     */
+    200: string;
+};
+
+export type ExportStatusPageSubscribersResponse = ExportStatusPageSubscribersResponses[keyof ExportStatusPageSubscribersResponses];
+
+export type DeleteStatusPageSubscriberData = {
+    body?: never;
+    path: {
+        /**
+         * Status page ID
+         */
+        status_page_id: number;
+        /**
+         * Subscriber ID
+         */
+        subscriber_id: number;
+    };
+    query?: never;
+    url: '/status-pages/{status_page_id}/subscribers/{subscriber_id}';
+};
+
+export type DeleteStatusPageSubscriberErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Status page or subscriber not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type DeleteStatusPageSubscriberResponses = {
+    /**
+     * Subscriber deleted
+     */
+    204: void;
+};
+
+export type DeleteStatusPageSubscriberResponse = DeleteStatusPageSubscriberResponses[keyof DeleteStatusPageSubscriberResponses];
+
+export type GetStatusPageSubscriptionsData = {
+    body?: never;
+    path: {
+        /**
+         * Status page ID
+         */
+        status_page_id: number;
+    };
+    query?: never;
+    url: '/status-pages/{status_page_id}/subscriptions';
+};
+
+export type GetStatusPageSubscriptionsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Status page not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetStatusPageSubscriptionsResponses = {
+    /**
+     * Subscription settings
+     */
+    200: SubscriptionSettingsResponse;
+};
+
+export type GetStatusPageSubscriptionsResponse = GetStatusPageSubscriptionsResponses[keyof GetStatusPageSubscriptionsResponses];
+
+export type UpdateStatusPageSubscriptionsData = {
+    body: UpdateSubscriptionSettingsRequest;
+    path: {
+        /**
+         * Status page ID
+         */
+        status_page_id: number;
+    };
+    query?: never;
+    url: '/status-pages/{status_page_id}/subscriptions';
+};
+
+export type UpdateStatusPageSubscriptionsErrors = {
+    /**
+     * Invalid sender address
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Status page not found
+     */
+    404: unknown;
+    /**
+     * Subscriptions cannot be switched on yet
+     */
+    409: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UpdateStatusPageSubscriptionsResponses = {
+    /**
+     * Settings saved
+     */
+    200: SubscriptionSettingsResponse;
+};
+
+export type UpdateStatusPageSubscriptionsResponse = UpdateStatusPageSubscriptionsResponses[keyof UpdateStatusPageSubscriptionsResponses];
+
 export type UnpublishStatusPageData = {
     body?: never;
     path: {
@@ -96203,6 +96515,111 @@ export type GetPublicStatusPageResponses = {
     200: unknown;
 };
 
+export type StatusPageConfirmFormData = {
+    body?: never;
+    path: {
+        /**
+         * Unguessable status page token
+         */
+        slug: string;
+        /**
+         * Confirmation token from the mail
+         */
+        token: string;
+    };
+    query?: never;
+    url: '/status/{slug}/confirm/{token}';
+};
+
+export type StatusPageConfirmFormErrors = {
+    /**
+     * Unknown page or malformed link
+     */
+    404: unknown;
+};
+
+export type StatusPageConfirmFormResponses = {
+    /**
+     * Page with a confirm button
+     */
+    200: unknown;
+};
+
+export type StatusPageConfirmData = {
+    body?: never;
+    path: {
+        /**
+         * Unguessable status page token
+         */
+        slug: string;
+        /**
+         * Confirmation token from the mail
+         */
+        token: string;
+    };
+    query?: never;
+    url: '/status/{slug}/confirm/{token}';
+};
+
+export type StatusPageConfirmErrors = {
+    /**
+     * Unknown page, or the link expired or was used
+     */
+    404: unknown;
+    /**
+     * Rate limited
+     */
+    429: unknown;
+};
+
+export type StatusPageConfirmResponses = {
+    /**
+     * Subscription confirmed
+     */
+    200: unknown;
+};
+
+export type StatusPageSubscribeData = {
+    /**
+     * `email=<address>`
+     */
+    body?: unknown;
+    path: {
+        /**
+         * Unguessable status page token
+         */
+        slug: string;
+    };
+    query?: never;
+    url: '/status/{slug}/subscribe';
+};
+
+export type StatusPageSubscribeErrors = {
+    /**
+     * Not an email address
+     */
+    400: unknown;
+    /**
+     * No published status page taking subscriptions at this URL
+     */
+    404: unknown;
+    /**
+     * Rate limited
+     */
+    429: unknown;
+    /**
+     * The page cannot take more subscriptions
+     */
+    503: unknown;
+};
+
+export type StatusPageSubscribeResponses = {
+    /**
+     * Request accepted; a confirmation link is sent
+     */
+    200: unknown;
+};
+
 export type GetPublicStatusPageJsonData = {
     body?: never;
     path: {
@@ -96234,6 +96651,70 @@ export type GetPublicStatusPageJsonResponses = {
 };
 
 export type GetPublicStatusPageJsonResponse = GetPublicStatusPageJsonResponses[keyof GetPublicStatusPageJsonResponses];
+
+export type StatusPageUnsubscribeFormData = {
+    body?: never;
+    path: {
+        /**
+         * Unguessable status page token
+         */
+        slug: string;
+        /**
+         * Unsubscribe token from a mail
+         */
+        token: string;
+    };
+    query?: never;
+    url: '/status/{slug}/unsubscribe/{token}';
+};
+
+export type StatusPageUnsubscribeFormErrors = {
+    /**
+     * Unknown page or malformed link
+     */
+    404: unknown;
+};
+
+export type StatusPageUnsubscribeFormResponses = {
+    /**
+     * Page with an unsubscribe button
+     */
+    200: unknown;
+};
+
+export type StatusPageUnsubscribeData = {
+    body?: never;
+    path: {
+        /**
+         * Unguessable status page token
+         */
+        slug: string;
+        /**
+         * Unsubscribe token from a mail
+         */
+        token: string;
+    };
+    query?: never;
+    url: '/status/{slug}/unsubscribe/{token}';
+};
+
+export type StatusPageUnsubscribeErrors = {
+    /**
+     * Unknown page or malformed link
+     */
+    404: unknown;
+    /**
+     * Rate limited
+     */
+    429: unknown;
+};
+
+export type StatusPageUnsubscribeResponses = {
+    /**
+     * Unsubscribed (also for a link already used)
+     */
+    200: unknown;
+};
 
 export type ListSystemAlarmsData = {
     body?: never;

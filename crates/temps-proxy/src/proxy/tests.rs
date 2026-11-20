@@ -2118,6 +2118,58 @@ pub(super) mod status_page_host_tests {
         Ok(())
     }
 
+    /// The subscription routes of ADR 108 D2: the subscribe form only posts,
+    /// a confirm or unsubscribe link answers GET (a button) and POST, and
+    /// nothing else reaches the console.
+    #[tokio::test]
+    async fn verified_host_forwards_the_subscription_routes_with_their_methods() -> Result<()> {
+        let Some(h) = harness(Some(INGRESS), true).await? else {
+            return Ok(());
+        };
+        h.route_table
+            .insert_status_page_host_for_test(HOST, Some(SLUG));
+        let token = "c".repeat(temps_core::public_status_page::SUBSCRIPTION_TOKEN_LEN);
+        let post = |path: &str| {
+            format!(
+                "POST {path} HTTP/1.1\r\nHost: {HOST}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 0\r\n\r\n"
+            )
+        };
+        for (request, expected) in [
+            (post("/subscribe"), format!("/api/status/{SLUG}/subscribe")),
+            (
+                get(&format!("/confirm/{token}"), HOST),
+                format!("/api/status/{SLUG}/confirm/{token}"),
+            ),
+            (
+                post(&format!("/confirm/{token}")),
+                format!("/api/status/{SLUG}/confirm/{token}"),
+            ),
+            (
+                post(&format!("/unsubscribe/{token}")),
+                format!("/api/status/{SLUG}/unsubscribe/{token}"),
+            ),
+        ] {
+            match send(&h, &request).await? {
+                Outcome::Forwarded {
+                    path, status_host, ..
+                } => {
+                    assert_eq!(path, expected);
+                    assert_eq!(status_host.as_deref(), Some(HOST));
+                }
+                Outcome::Answered { head, .. } => panic!("{expected} must be forwarded: {head}"),
+            }
+        }
+        for request in [
+            get("/subscribe", HOST),
+            format!("DELETE /confirm/{token} HTTP/1.1\r\nHost: {HOST}\r\n\r\n"),
+            post("/confirm/not-a-token"),
+            post(&format!("/api/status/{SLUG}/subscribe")),
+        ] {
+            assert_not_found(send(&h, &request).await?, false);
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn unverified_or_unpublished_host_answers_404_and_never_the_console() -> Result<()> {
         let Some(h) = harness(Some(INGRESS), true).await? else {
