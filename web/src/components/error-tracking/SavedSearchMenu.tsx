@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Bookmark, BookmarkCheck, Trash2, Users } from 'lucide-react'
 import {
@@ -13,6 +13,7 @@ import {
 import type { ErrorSavedSearchResponse } from '@/api/client/types.gen'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import {
   Dialog,
   DialogContent,
@@ -61,6 +62,10 @@ export function SavedSearchMenu({
   const [saving, setSaving] = useState(false)
   const [name, setName] = useState('')
   const [shared, setShared] = useState(false)
+  const [deleting, setDeleting] = useState<ErrorSavedSearchResponse | null>(
+    null
+  )
+  const triggerRef = useRef<HTMLButtonElement>(null)
   const path = { project_id: projectId }
 
   const searches = useQuery({
@@ -89,6 +94,7 @@ export function SavedSearchMenu({
     ...deleteErrorSavedSearchMutation(),
     meta: { errorTitle: 'Failed to delete the saved search' },
     onSuccess: refresh,
+    onSettled: () => setDeleting(null),
   })
 
   const list = searches.data?.data ?? []
@@ -123,9 +129,7 @@ export function SavedSearchMenu({
           aria-label={`Delete saved search ${search.name}`}
           onClick={(e) => {
             e.stopPropagation()
-            if (window.confirm(`Delete the saved search "${search.name}"?`)) {
-              remove.mutate({ path: { ...path, saved_search_id: search.id } })
-            }
+            setDeleting(search)
           }}
         >
           <Trash2 className="h-3.5 w-3.5" />
@@ -139,6 +143,7 @@ export function SavedSearchMenu({
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
           <Button
+            ref={triggerRef}
             variant="outline"
             size="sm"
             className="h-9 gap-2"
@@ -193,6 +198,27 @@ export function SavedSearchMenu({
           )}
         </DropdownMenuContent>
       </DropdownMenu>
+
+      <ConfirmDeleteDialog
+        open={deleting !== null}
+        onOpenChange={(open) => {
+          if (!open) setDeleting(null)
+        }}
+        resourceType="saved search"
+        resourceName={deleting?.name ?? ''}
+        consequences={
+          deleting?.shared
+            ? 'It is shared, so it disappears for everyone in the project. The issues it matched are not changed.'
+            : 'The issues it matched are not changed.'
+        }
+        isPending={remove.isPending}
+        returnFocusRef={triggerRef}
+        onConfirm={() => {
+          if (deleting) {
+            remove.mutate({ path: { ...path, saved_search_id: deleting.id } })
+          }
+        }}
+      />
 
       <Dialog open={saving} onOpenChange={setSaving}>
         <DialogContent>

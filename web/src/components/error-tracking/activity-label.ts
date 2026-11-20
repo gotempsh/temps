@@ -63,3 +63,14 @@ export function activityActor(
   if (entry.kind === 'regressed') return null
   return entry.actor_name ?? 'Someone'
 }
+
+/** How the delete confirmation names a comment: its author and opening words. */
+export function commentPreview(
+  body: string | null | undefined,
+  actor: string | null | undefined
+): string {
+  const text = (body ?? '').replace(/\s+/g, ' ').trim()
+  const words = text.length > 40 ? `${text.slice(0, 40).trimEnd()}…` : text
+  const quoted = words ? `"${words}"` : 'comment'
+  return actor ? `${actor}'s ${quoted}` : quoted
+}

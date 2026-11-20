@@ -59,8 +59,8 @@ import { Link, useSearchParams } from 'react-router'
 const ALL_ENVIRONMENTS = '__all__'
 
 const TONE_CLASS: Record<RateTone, string> = {
-  healthy: 'text-emerald-600 dark:text-emerald-400',
-  warning: 'text-amber-600 dark:text-amber-400',
+  healthy: 'text-emerald-700 dark:text-emerald-400',
+  warning: 'text-amber-700 dark:text-amber-400',
   critical: 'text-destructive',
   unknown: 'text-muted-foreground',
 }

@@ -15,11 +15,16 @@ import type { ErrorGroupActivityResponse } from '@/api/client/types.gen'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Textarea } from '@/components/ui/textarea'
 import { TimeAgo } from '@/components/utils/TimeAgo'
 import { queryKeyPrefix } from '@/lib/refresh'
-import { activityActor, describeActivity } from './activity-label'
+import {
+  activityActor,
+  commentPreview,
+  describeActivity,
+} from './activity-label'
 
 const PAGE_SIZE = 20
 const MAX_COMMENT_CHARS = 10_000
@@ -189,6 +194,7 @@ function ActivityRow({
 }) {
   const [editing, setEditing] = useState(false)
   const [text, setText] = useState(entry.body ?? '')
+  const [confirmingDelete, setConfirmingDelete] = useState(false)
   const path = {
     project_id: projectId,
     group_id: groupId,
@@ -207,6 +213,7 @@ function ActivityRow({
     ...deleteErrorGroupCommentMutation(),
     meta: { errorTitle: 'Failed to delete the comment' },
     onSuccess: onChanged,
+    onSettled: () => setConfirmingDelete(false),
   })
 
   const actor = activityActor(entry)
@@ -258,11 +265,7 @@ function ActivityRow({
                   className="h-7 w-7"
                   aria-label="Delete comment"
                   disabled={remove.isPending}
-                  onClick={() => {
-                    if (window.confirm('Delete this comment?')) {
-                      remove.mutate({ path })
-                    }
-                  }}
+                  onClick={() => setConfirmingDelete(true)}
                 >
                   <Trash2 className="h-3.5 w-3.5" />
                 </Button>
@@ -304,6 +307,14 @@ function ActivityRow({
           )}
         </CardContent>
       </Card>
+      <ConfirmDeleteDialog
+        open={confirmingDelete}
+        onOpenChange={setConfirmingDelete}
+        resourceType="comment"
+        resourceName={commentPreview(entry.body, actor)}
+        isPending={remove.isPending}
+        onConfirm={() => remove.mutate({ path })}
+      />
     </li>
   )
 }

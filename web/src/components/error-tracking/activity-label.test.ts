@@ -3,7 +3,11 @@
 
 import { describe, expect, it } from 'bun:test'
 import type { ErrorGroupActivityResponse } from '@/api/client/types.gen'
-import { activityActor, describeActivity } from './activity-label'
+import {
+  activityActor,
+  commentPreview,
+  describeActivity,
+} from './activity-label'
 
 function entry(
   overrides: Partial<ErrorGroupActivityResponse>
@@ -84,5 +88,22 @@ describe('describeActivity', () => {
       )
     ).toBe('assigned the group to Payments (team)')
     expect(activityActor(entry({ actor_name: null }))).toBe('Someone')
+  })
+})
+
+describe('commentPreview', () => {
+  it('names the author and the opening words of the comment', () => {
+    expect(commentPreview('Looks like a  retry\nloop', 'Ada')).toBe(
+      'Ada\'s "Looks like a retry loop"'
+    )
+  })
+
+  it('cuts a long comment at 40 characters', () => {
+    expect(commentPreview('x'.repeat(60), null)).toBe(`"${'x'.repeat(40)}…"`)
+  })
+
+  it('falls back to "comment" when the body is empty', () => {
+    expect(commentPreview('  ', 'Ada')).toBe("Ada's comment")
+    expect(commentPreview(null, null)).toBe('comment')
   })
 })
