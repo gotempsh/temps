@@ -12,6 +12,9 @@ use temps_core::{Job, JobQueue, JobReceiver};
 use utoipa::openapi::OpenApi;
 use utoipa::OpenApi as OpenApiTrait;
 
+use crate::routes::maintenance::{
+    create_maintenance_router, MaintenanceApiDoc, MaintenanceRoutesState,
+};
 use crate::routes::public::{create_public_router, PublicStatusState};
 use crate::routes::public_subscriptions::{
     create_public_subscription_router, PublicSubscriptionState,
@@ -20,6 +23,7 @@ use crate::routes::status_page::{create_router, StatusPageApiDoc, StatusPageAppS
 use crate::routes::subscribers::{
     create_subscriber_router, SubscriberApiDoc, SubscriberRoutesState,
 };
+use crate::services::maintenance::StatusPageMaintenanceService;
 use crate::services::public_pages::{DomainServiceCertificates, StatusPageDomainService};
 use crate::services::subscribers::{StatusPageSubscriberService, TempsEmailMailer};
 use crate::services::{
@@ -301,6 +305,12 @@ impl TempsPlugin for StatusPagePlugin {
             context.register_service(subscriber_service.clone());
             tokio::spawn(subscriber_service.run_dispatcher());
 
+            // Maintenance windows (ADR 108 D2).
+            context.register_service(Arc::new(StatusPageMaintenanceService::new(
+                db.clone(),
+                snapshot_cache.clone(),
+            )));
+
             // Start the health check scheduler with job receiver for realtime monitor creation
             let scheduler_service = health_check_service.clone();
             let scheduler_job_receiver = queue_service.subscribe();
@@ -410,9 +420,16 @@ impl TempsPlugin for StatusPagePlugin {
             audit: app_state.audit_service.clone(),
             project_access_checker: app_state.project_access_checker.clone(),
         });
+        let maintenance_state = Arc::new(MaintenanceRoutesState {
+            maintenance: context.require_service::<StatusPageMaintenanceService>(),
+            pages: app_state.public_status_page_service.clone(),
+            audit: app_state.audit_service.clone(),
+            project_access_checker: app_state.project_access_checker.clone(),
+        });
         let routes = create_router()
             .with_state(app_state)
-            .merge(create_subscriber_router(subscriber_state));
+            .merge(create_subscriber_router(subscriber_state))
+            .merge(create_maintenance_router(maintenance_state));
         Some(PluginRoutes::new(routes))
     }
 
@@ -433,6 +450,7 @@ impl TempsPlugin for StatusPagePlugin {
     fn openapi_schema(&self) -> Option<OpenApi> {
         let mut doc = <StatusPageApiDoc as OpenApiTrait>::openapi();
         doc.merge(<SubscriberApiDoc as OpenApiTrait>::openapi());
+        doc.merge(<MaintenanceApiDoc as OpenApiTrait>::openapi());
         Some(doc)
     }
 }

@@ -42,15 +42,20 @@ use temps_entities::{status_monitors, status_page_monitors, status_pages};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
-use super::events::{incident_events, newest_events, IncidentSource, PageEvent};
+use super::events::{
+    incident_events, maintenance_event, newest_events, IncidentSource, MaintenanceSource, PageEvent,
+};
 use super::feed::render_atom_feed;
 use super::render::{render_public_page_html_with, PageActions};
 use super::types::{
     PublicComponentStatus, PublicDayStatus, PublicIncident, PublicIncidentSeverity,
-    PublicIncidentStatus, PublicIncidentUpdate, PublicStatusComponent, PublicStatusPageResponse,
-    PublicUptimeDay, StatusPageAppearance, PUBLIC_HISTORY_DAYS,
+    PublicIncidentStatus, PublicIncidentUpdate, PublicMaintenance, PublicMaintenanceStatus,
+    PublicStatusComponent, PublicStatusPageResponse, PublicUptimeDay, StatusPageAppearance,
+    PUBLIC_HISTORY_DAYS,
 };
-use crate::services::subscribers::notices::{incident_notices, PageNotice, NOTICE_WINDOW};
+use crate::services::subscribers::notices::{
+    incident_notices, notice_for, PageNotice, NOTICE_WINDOW,
+};
 
 /// How often the background loop rebuilds every published snapshot.
 pub const REFRESH_INTERVAL: Duration = Duration::from_secs(60);
@@ -236,6 +241,31 @@ pub(crate) struct PublicUpdateRow {
     pub created_at: UtcDateTime,
 }
 
+/// A maintenance window in progress or scheduled, with the page's monitors
+/// it covers (only those still on the page).
+#[derive(Debug, Clone)]
+pub(crate) struct MaintenanceRow {
+    pub id: i32,
+    pub title: String,
+    pub description: Option<String>,
+    pub starts_at: UtcDateTime,
+    pub ends_at: UtcDateTime,
+    pub created_at: UtcDateTime,
+    pub monitor_ids: Vec<i32>,
+}
+
+#[derive(Debug, FromQueryResult)]
+struct MaintenanceMonitorRow {
+    status_page_id: i32,
+    id: i32,
+    title: String,
+    description: Option<String>,
+    starts_at: UtcDateTime,
+    ends_at: UtcDateTime,
+    created_at: UtcDateTime,
+    monitor_id: i32,
+}
+
 #[derive(Debug, FromQueryResult)]
 struct DayRow {
     monitor_id: i32,
@@ -265,6 +295,9 @@ pub(crate) struct RefreshData {
     pub incidents: HashMap<i32, Vec<IncidentRow>>,
     /// Public updates per incident, newest first.
     pub updates: HashMap<i32, Vec<PublicUpdateRow>>,
+    /// Maintenance windows in progress or scheduled per status page,
+    /// soonest first.
+    pub maintenances: HashMap<i32, Vec<MaintenanceRow>>,
 }
 
 pub struct StatusSnapshotCache {
@@ -319,6 +352,15 @@ impl StatusSnapshotCache {
     /// visibility).
     pub async fn refresh_project(&self, project_id: i32) -> Result<usize, DbErr> {
         self.rebuild(Scope::Project(project_id)).await
+    }
+
+    /// Drop the cached completed-day uptime of `monitor_ids`, so the next
+    /// rebuild recomputes it (a maintenance window changed what counts).
+    pub async fn forget_history(&self, monitor_ids: &[i32]) {
+        let mut state = self.writer.lock().await;
+        for monitor_id in monitor_ids {
+            state.history.remove(monitor_id);
+        }
     }
 
     /// Stop serving a page. Infallible: no database access.
@@ -609,10 +651,24 @@ async fn load_day_counts(
                        COUNT(response_time_ms) FILTER (
                            WHERE status NOT IN ('down', 'major_outage')
                        ) AS latency_samples
-                FROM status_checks
-                WHERE monitor_id IN ({})
-                  AND checked_at >= ${}
-                  AND checked_at < ${}
+                FROM status_checks c
+                WHERE c.monitor_id IN ({})
+                  AND c.checked_at >= ${}
+                  AND c.checked_at < ${}
+                  -- Checks taken during a maintenance window of a page that
+                  -- still shows the monitor are not counted (ADR 108 D2). A
+                  -- cancelled window counts until it was cancelled.
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM status_page_maintenance_monitors mm
+                      JOIN status_page_maintenances m ON m.id = mm.maintenance_id
+                      JOIN status_page_monitors spm
+                        ON spm.status_page_id = m.status_page_id
+                       AND spm.monitor_id = mm.monitor_id
+                      WHERE mm.monitor_id = c.monitor_id
+                        AND c.checked_at >= m.starts_at
+                        AND c.checked_at < LEAST(m.ends_at, COALESCE(m.cancelled_at, m.ends_at))
+                  )
                 GROUP BY monitor_id, bucket
             ) sub
             "#,
@@ -857,6 +913,52 @@ async fn load_refresh_data(
         }
     }
 
+    for chunk in page_ids.chunks(MAX_IDS_PER_QUERY) {
+        let n = chunk.len();
+        // At most `MAX_OPEN_PER_PAGE` windows per page, each over at most the
+        // page's monitors.
+        let sql = format!(
+            r#"
+            SELECT m.status_page_id, m.id, m.title, m.description, m.starts_at, m.ends_at,
+                   m.created_at, mm.monitor_id
+            FROM status_page_maintenances m
+            JOIN status_page_maintenance_monitors mm ON mm.maintenance_id = m.id
+            JOIN status_page_monitors spm
+              ON spm.status_page_id = m.status_page_id AND spm.monitor_id = mm.monitor_id
+            WHERE m.status_page_id IN ({})
+              AND m.cancelled_at IS NULL
+              AND m.ends_at > ${}
+            ORDER BY m.status_page_id, m.starts_at, m.id, mm.monitor_id
+            "#,
+            placeholders(1, n),
+            n + 1
+        );
+        let mut values = id_values(chunk);
+        values.push(now.into());
+        for row in MaintenanceMonitorRow::find_by_statement(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            &sql,
+            values,
+        ))
+        .all(db)
+        .await?
+        {
+            let windows = data.maintenances.entry(row.status_page_id).or_default();
+            match windows.last_mut() {
+                Some(window) if window.id == row.id => window.monitor_ids.push(row.monitor_id),
+                _ => windows.push(MaintenanceRow {
+                    id: row.id,
+                    title: row.title,
+                    description: row.description,
+                    starts_at: row.starts_at,
+                    ends_at: row.ends_at,
+                    created_at: row.created_at,
+                    monitor_ids: vec![row.monitor_id],
+                }),
+            }
+        }
+    }
+
     Ok(data)
 }
 
@@ -921,6 +1023,12 @@ pub(crate) fn assemble_page(
     let today = now.date_naive();
     let first_day = today - chrono::Days::new(u64::from(PUBLIC_HISTORY_DAYS - 1));
     let incidents = public_incidents(page.id, selections, data, now);
+    let maintenances = public_maintenances(page.id, selections, data, now);
+    let in_maintenance: HashSet<i32> = maintenances
+        .iter()
+        .filter(|m| m.public.status == PublicMaintenanceStatus::InProgress)
+        .flat_map(|m| m.monitor_ids.iter().copied())
+        .collect();
 
     let empty_days = HashMap::new();
     let components: Vec<PublicStatusComponent> = selections
@@ -963,7 +1071,9 @@ pub(crate) fn assemble_page(
                     }
                 })
                 .collect();
-            let status = if selection.is_active {
+            let status = if selection.is_active && in_maintenance.contains(&selection.monitor_id) {
+                PublicComponentStatus::Maintenance
+            } else if selection.is_active {
                 data.latest_status
                     .get(&selection.monitor_id)
                     .map(|s| PublicComponentStatus::from_check_status(s))
@@ -983,10 +1093,20 @@ pub(crate) fn assemble_page(
         })
         .collect();
 
+    let maintenance_events: Vec<PageEvent> = maintenances
+        .iter()
+        .map(|m| {
+            maintenance_event(&MaintenanceSource {
+                maintenance_id: m.id,
+                created_at: m.created_at,
+                maintenance: &m.public,
+            })
+        })
+        .collect();
     let notices = match subscriptions_since(page) {
         Some(since) => {
             let since = since.max(now - NOTICE_WINDOW);
-            incidents
+            let mut notices: Vec<PageNotice> = incidents
                 .iter()
                 .flat_map(|incident| {
                     incident_notices(
@@ -1000,7 +1120,14 @@ pub(crate) fn assemble_page(
                         now,
                     )
                 })
-                .collect()
+                .collect();
+            notices.extend(
+                maintenance_events
+                    .iter()
+                    .filter(|e| e.published_at >= since && e.published_at <= now)
+                    .map(|e| notice_for(&page.title, e.clone())),
+            );
+            notices
         }
         None => Vec::new(),
     };
@@ -1014,10 +1141,12 @@ pub(crate) fn assemble_page(
                     incident: &incident.public,
                 })
             })
+            .chain(maintenance_events)
             .collect(),
         FEED_ENTRIES,
     );
     let incidents: Vec<PublicIncident> = incidents.into_iter().map(|i| i.public).collect();
+    let maintenances: Vec<PublicMaintenance> = maintenances.into_iter().map(|m| m.public).collect();
 
     let mut status = components
         .iter()
@@ -1046,6 +1175,7 @@ pub(crate) fn assemble_page(
             status,
             components,
             incidents,
+            maintenances,
             history_days: PUBLIC_HISTORY_DAYS,
             generated_at: now,
         },
@@ -1081,6 +1211,64 @@ impl AssembledIncident {
     fn overlaps(&self, day: NaiveDate, today: NaiveDate) -> bool {
         self.started_on <= day && day <= self.resolved_on.unwrap_or(today)
     }
+}
+
+/// A public maintenance window plus the ids behind it.
+struct AssembledMaintenance {
+    public: PublicMaintenance,
+    id: i32,
+    created_at: UtcDateTime,
+    monitor_ids: Vec<i32>,
+}
+
+/// The page's open maintenance windows, soonest first, naming only the
+/// covered components this page shows. A window none of whose monitors is
+/// on the page any more is left out.
+fn public_maintenances(
+    status_page_id: i32,
+    selections: &[SelectionRow],
+    data: &RefreshData,
+    now: UtcDateTime,
+) -> Vec<AssembledMaintenance> {
+    let Some(windows) = data.maintenances.get(&status_page_id) else {
+        return Vec::new();
+    };
+    windows
+        .iter()
+        .filter(|window| window.ends_at > now)
+        .filter_map(|window| {
+            let covered: HashSet<i32> = window.monitor_ids.iter().copied().collect();
+            let mut affected: Vec<String> = Vec::new();
+            for selection in selections
+                .iter()
+                .filter(|s| covered.contains(&s.monitor_id))
+            {
+                if !affected.contains(&selection.display_name) {
+                    affected.push(selection.display_name.clone());
+                }
+            }
+            if affected.is_empty() {
+                return None;
+            }
+            Some(AssembledMaintenance {
+                public: PublicMaintenance {
+                    title: window.title.clone(),
+                    description: window.description.clone(),
+                    status: if window.starts_at <= now {
+                        PublicMaintenanceStatus::InProgress
+                    } else {
+                        PublicMaintenanceStatus::Scheduled
+                    },
+                    starts_at: window.starts_at,
+                    ends_at: window.ends_at,
+                    affected_components: affected,
+                },
+                id: window.id,
+                created_at: window.created_at,
+                monitor_ids: window.monitor_ids.clone(),
+            })
+        })
+        .collect()
 }
 
 /// Incidents selected for `status_page_id` that concern this page's selection

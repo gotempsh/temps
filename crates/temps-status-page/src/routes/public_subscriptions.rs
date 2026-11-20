@@ -198,8 +198,8 @@ fn outcome_page(
         PublicOutcome::Confirmed => (
             StatusCode::OK,
             "You are subscribed",
-            "You will get an email when an incident on this page is posted or updated. Every \
-             email has a link to unsubscribe.",
+            "You will get an email when an incident on this page is posted or updated, or \
+             maintenance is scheduled. Every email has a link to unsubscribe.",
         ),
         PublicOutcome::LinkInvalid => (
             StatusCode::NOT_FOUND,
@@ -344,7 +344,8 @@ pub async fn confirm_form(
         &slug,
         StatusCode::OK,
         "Confirm your subscription",
-        "Confirm to receive an email when an incident on this page is posted or updated.",
+        "Confirm to receive an email when an incident on this page is posted or updated, or \
+         maintenance is scheduled.",
         Some((&action, "Confirm subscription")),
     )
 }

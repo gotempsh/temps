@@ -91,6 +91,9 @@ pub fn render_atom_feed(
 
     for event in events {
         let mut content = format!("Status: {}\n", event.status.label());
+        if let Some(window) = event.window_line() {
+            let _ = writeln!(content, "{window}");
+        }
         if !event.affected_components.is_empty() {
             let _ = writeln!(
                 content,
@@ -137,10 +140,8 @@ pub fn render_atom_feed(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::public_pages::events::PageEventKind;
-    use crate::services::public_pages::types::{
-        PublicComponentStatus, PublicIncidentStatus, StatusPageAppearance,
-    };
+    use crate::services::public_pages::events::{PageEventKind, PageEventStatus};
+    use crate::services::public_pages::types::{PublicComponentStatus, StatusPageAppearance};
     use chrono::TimeZone;
 
     fn at(hour: u32) -> UtcDateTime {
@@ -158,6 +159,7 @@ mod tests {
             status: PublicComponentStatus::Operational,
             components: vec![],
             incidents: vec![],
+            maintenances: vec![],
             history_days: 90,
             generated_at: at(10),
         }
@@ -168,10 +170,11 @@ mod tests {
             key: key.to_string(),
             kind: PageEventKind::IncidentUpdate,
             title: "Elevated errors".to_string(),
-            status: PublicIncidentStatus::Identified,
+            status: PageEventStatus::Identified,
             message: Some("We found the cause <b>".to_string()),
             affected_components: vec!["API".to_string()],
             published_at: at(hour),
+            window: None,
         }
     }
 

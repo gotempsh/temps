@@ -15,7 +15,7 @@ use serde::Serialize;
 use temps_core::UtcDateTime;
 use utoipa::ToSchema;
 
-use super::types::{PublicIncident, PublicIncidentStatus};
+use super::types::{PublicIncident, PublicIncidentStatus, PublicMaintenance};
 
 /// What kind of thing an event announces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
@@ -25,31 +25,117 @@ pub enum PageEventKind {
     IncidentUpdate,
     /// An incident was resolved without a public "resolved" update.
     IncidentResolved,
+    /// A maintenance window was scheduled.
+    MaintenanceScheduled,
+}
+
+/// The public status an event reports: an incident's, or "scheduled" for a
+/// maintenance window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PageEventStatus {
+    Investigating,
+    Identified,
+    Monitoring,
+    Resolved,
+    Scheduled,
+}
+
+impl PageEventStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Investigating => "Investigating",
+            Self::Identified => "Identified",
+            Self::Monitoring => "Monitoring",
+            Self::Resolved => "Resolved",
+            Self::Scheduled => "Scheduled maintenance",
+        }
+    }
+}
+
+impl From<PublicIncidentStatus> for PageEventStatus {
+    fn from(status: PublicIncidentStatus) -> Self {
+        match status {
+            PublicIncidentStatus::Investigating => Self::Investigating,
+            PublicIncidentStatus::Identified => Self::Identified,
+            PublicIncidentStatus::Monitoring => Self::Monitoring,
+            PublicIncidentStatus::Resolved => Self::Resolved,
+        }
+    }
+}
+
+/// When a maintenance window runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EventWindow {
+    pub starts_at: UtcDateTime,
+    pub ends_at: UtcDateTime,
 }
 
 /// One public happening on a page.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PageEvent {
-    /// Stable and unique per page: `u{update id}` or `r{incident id}`. It
-    /// keys the delivery outbox and, hashed, the feed entry id; it is never
-    /// published as is.
+    /// Stable and unique per page: `u{update id}`, `r{incident id}` or
+    /// `m{maintenance id}`. It keys the delivery outbox and, hashed, the
+    /// feed entry id; it is never published as is.
     pub key: String,
     pub kind: PageEventKind,
-    /// The incident's public heading.
+    /// The incident's or maintenance window's public heading.
     pub title: String,
-    pub status: PublicIncidentStatus,
-    /// The public update's text; `None` for a resolution without one.
+    pub status: PageEventStatus,
+    /// The public update's text or the maintenance description; `None` for
+    /// a resolution without one.
     pub message: Option<String>,
     pub affected_components: Vec<String>,
     pub published_at: UtcDateTime,
+    /// When the window runs, for a maintenance event.
+    pub window: Option<EventWindow>,
 }
 
 impl PageEvent {
     /// The message to show, with the resolution's stock sentence.
     pub fn message_or_default(&self) -> &str {
-        self.message
-            .as_deref()
-            .unwrap_or("This incident has been resolved.")
+        match (self.message.as_deref(), self.kind) {
+            (Some(message), _) if !message.trim().is_empty() => message,
+            (_, PageEventKind::MaintenanceScheduled) => "Maintenance has been scheduled.",
+            _ => "This incident has been resolved.",
+        }
+    }
+
+    /// "Scheduled: <start> to <end> UTC" for a maintenance event.
+    pub fn window_line(&self) -> Option<String> {
+        self.window.map(|window| {
+            format!(
+                "Scheduled: {} to {}",
+                window.starts_at.format("%Y-%m-%d %H:%M UTC"),
+                window.ends_at.format("%Y-%m-%d %H:%M UTC")
+            )
+        })
+    }
+}
+
+/// A maintenance window together with the id its event key is built from.
+pub struct MaintenanceSource<'a> {
+    pub maintenance_id: i32,
+    pub created_at: UtcDateTime,
+    pub maintenance: &'a PublicMaintenance,
+}
+
+/// The one announcement of a maintenance window, published when it was
+/// scheduled. Later edits are shown on the page but not announced again.
+pub fn maintenance_event(source: &MaintenanceSource<'_>) -> PageEvent {
+    let maintenance = source.maintenance;
+    PageEvent {
+        key: format!("m{}", source.maintenance_id),
+        kind: PageEventKind::MaintenanceScheduled,
+        title: maintenance.title.clone(),
+        status: PageEventStatus::Scheduled,
+        message: maintenance.description.clone(),
+        affected_components: maintenance.affected_components.clone(),
+        published_at: source.created_at,
+        window: Some(EventWindow {
+            starts_at: maintenance.starts_at,
+            ends_at: maintenance.ends_at,
+        }),
     }
 }
 
@@ -77,10 +163,11 @@ pub fn incident_events(source: &IncidentSource<'_>) -> Vec<PageEvent> {
                 key: format!("r{}", source.incident_id),
                 kind: PageEventKind::IncidentResolved,
                 title: incident.title.clone(),
-                status: PublicIncidentStatus::Resolved,
+                status: PageEventStatus::Resolved,
                 message: None,
                 affected_components: incident.affected_components.clone(),
                 published_at: resolved_at,
+                window: None,
             });
         }
     }
@@ -93,10 +180,11 @@ pub fn incident_events(source: &IncidentSource<'_>) -> Vec<PageEvent> {
                 key: format!("u{id}"),
                 kind: PageEventKind::IncidentUpdate,
                 title: incident.title.clone(),
-                status: update.status,
+                status: update.status.into(),
                 message: Some(update.message.clone()),
                 affected_components: incident.affected_components.clone(),
                 published_at: update.created_at,
+                window: None,
             }),
     );
     events
@@ -203,6 +291,34 @@ mod tests {
             events.len(),
             1,
             "the public resolved update is the resolution"
+        );
+    }
+
+    #[test]
+    fn a_maintenance_window_is_one_event_published_when_scheduled() {
+        let maintenance = PublicMaintenance {
+            title: "Database upgrade".to_string(),
+            description: None,
+            status: crate::services::public_pages::types::PublicMaintenanceStatus::Scheduled,
+            starts_at: at(20),
+            ends_at: at(22),
+            affected_components: vec!["API".to_string()],
+        };
+        let event = maintenance_event(&MaintenanceSource {
+            maintenance_id: 4,
+            created_at: at(3),
+            maintenance: &maintenance,
+        });
+        assert_eq!(event.key, "m4");
+        assert_eq!(event.kind, PageEventKind::MaintenanceScheduled);
+        assert_eq!(event.published_at, at(3));
+        assert_eq!(
+            event.message_or_default(),
+            "Maintenance has been scheduled."
+        );
+        assert_eq!(
+            event.window_line().as_deref(),
+            Some("Scheduled: 2026-03-02 20:00 UTC to 2026-03-02 22:00 UTC")
         );
     }
 

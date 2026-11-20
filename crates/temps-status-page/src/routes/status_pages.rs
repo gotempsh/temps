@@ -1586,6 +1586,12 @@ mod tests {
             "total_checks",
             "failed_checks",
             "degraded_checks",
+            // Scheduled maintenance windows: admin-written public title and
+            // description, times, and the components' display names.
+            "maintenances",
+            "description",
+            "starts_at",
+            "ends_at",
         ]
         .iter()
         .map(|k| k.to_string())

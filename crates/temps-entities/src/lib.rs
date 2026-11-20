@@ -239,6 +239,8 @@ pub mod status_incident_updates;
 pub mod status_incidents;
 pub mod status_monitors;
 pub mod status_page_domains;
+pub mod status_page_maintenance_monitors;
+pub mod status_page_maintenances;
 pub mod status_page_monitors;
 pub mod status_page_notices;
 pub mod status_page_subscribers;

@@ -63,7 +63,11 @@ pub fn notice_for(page_title: &str, event: PageEvent) -> PageNotice {
         (!event.affected_components.is_empty()).then(|| event.affected_components.join(", "));
     let message = event.message_or_default();
 
+    let window = event.window_line();
     let mut body_text = format!("{}\nStatus: {label}\n", event.title);
+    if let Some(window) = &window {
+        let _ = writeln!(body_text, "{window}");
+    }
     if let Some(affected) = &affected {
         let _ = writeln!(body_text, "Affected: {affected}");
     }
@@ -74,6 +78,13 @@ pub fn notice_for(page_title: &str, event: PageEvent) -> PageNotice {
          <p style=\"margin:0;color:#52525b\">Status: <strong>{label}</strong></p>",
         escape_html(&event.title)
     );
+    if let Some(window) = &window {
+        let _ = write!(
+            body_html,
+            "<p style=\"margin:4px 0 0;color:#52525b\">{}</p>",
+            escape_html(window)
+        );
+    }
     if let Some(affected) = &affected {
         let _ = write!(
             body_html,

@@ -4,6 +4,7 @@
 mod db_retry;
 pub mod health_check_service;
 pub mod incident_service;
+pub mod maintenance;
 pub mod monitor_service;
 pub mod public_pages;
 pub mod status_page_service;

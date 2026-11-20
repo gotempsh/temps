@@ -235,6 +235,72 @@ impl AuditOperation for StatusPageSubscriberAudit {
     }
 }
 
+/// Actions on a status page's maintenance windows (ADR 108 D2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StatusPageMaintenanceAction {
+    Scheduled,
+    Updated,
+    Cancelled,
+}
+
+impl StatusPageMaintenanceAction {
+    fn operation_type(self) -> &'static str {
+        match self {
+            Self::Scheduled => "STATUS_PAGE_MAINTENANCE_SCHEDULED",
+            Self::Updated => "STATUS_PAGE_MAINTENANCE_UPDATED",
+            Self::Cancelled => "STATUS_PAGE_MAINTENANCE_CANCELLED",
+        }
+    }
+}
+
+/// Audit payload of a maintenance window change: what the window covers
+/// and when, so an audit reader can tell which checks it took out of uptime.
+#[derive(Debug, Clone, Serialize)]
+pub struct StatusPageMaintenanceAudit {
+    pub actor_user_id: Option<i32>,
+    pub ip_address: Option<String>,
+    pub user_agent: String,
+    pub action: StatusPageMaintenanceAction,
+    pub project_ids: Vec<i32>,
+    pub status_page_id: i32,
+    pub maintenance_id: i32,
+    pub title: String,
+    pub starts_at: temps_core::UtcDateTime,
+    pub ends_at: temps_core::UtcDateTime,
+    pub monitor_ids: Vec<i32>,
+}
+
+impl AuditOperation for StatusPageMaintenanceAudit {
+    fn operation_type(&self) -> String {
+        self.action.operation_type().to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        self.actor_user_id
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.user_agent
+    }
+
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        serde_json::to_string(self).map_err(|source| {
+            temps_core::AuditError::serialize(
+                format!(
+                    "status page {} maintenance window {}",
+                    self.status_page_id, self.maintenance_id
+                ),
+                source,
+            )
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

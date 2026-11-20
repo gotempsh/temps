@@ -41,12 +41,12 @@ use super::status_pages::{
 use crate::services::public_pages::{
     AddStatusPageDomainRequest, CreateStatusPageRequest, DnsRecordInstruction,
     PublicComponentStatus, PublicDayStatus, PublicIncident, PublicIncidentSeverity,
-    PublicIncidentStatus, PublicIncidentUpdate, PublicStatusComponent, PublicStatusPageResponse,
-    PublicUptimeDay, StatusPageAppearance, StatusPageAppearanceInput, StatusPageDomainResponse,
-    StatusPageDomainService, StatusPageDomainStatus, StatusPageListResponse,
-    StatusPageMonitorInput, StatusPageMonitorResponse, StatusPagePreviewResponse,
-    StatusPageProject, StatusPageResponse, StatusPageTheme, UpdateStatusPageRequest,
-    VerificationMethod,
+    PublicIncidentStatus, PublicIncidentUpdate, PublicMaintenance, PublicMaintenanceStatus,
+    PublicStatusComponent, PublicStatusPageResponse, PublicUptimeDay, StatusPageAppearance,
+    StatusPageAppearanceInput, StatusPageDomainResponse, StatusPageDomainService,
+    StatusPageDomainStatus, StatusPageListResponse, StatusPageMonitorInput,
+    StatusPageMonitorResponse, StatusPagePreviewResponse, StatusPageProject, StatusPageResponse,
+    StatusPageTheme, UpdateStatusPageRequest, VerificationMethod,
 };
 use crate::services::{
     CreateIncidentRequest, CreateMonitorRequest, CurrentStatusResponse, IncidentBucketedResponse,
@@ -148,6 +148,8 @@ pub trait StatusPageAppState: Send + Sync + 'static {
             PublicIncidentSeverity,
             PublicIncidentStatus,
             PublicIncidentUpdate,
+            PublicMaintenance,
+            PublicMaintenanceStatus,
             AddStatusPageDomainRequest,
             StatusPageDomainResponse,
             StatusPageDomainStatus,

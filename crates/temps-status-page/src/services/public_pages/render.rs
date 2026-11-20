@@ -17,8 +17,8 @@ use temps_core::UtcDateTime;
 
 use super::types::{
     PublicComponentStatus, PublicDayStatus, PublicIncident, PublicIncidentSeverity,
-    PublicIncidentStatus, PublicStatusComponent, PublicStatusPageResponse, PublicUptimeDay,
-    StatusPageTheme,
+    PublicIncidentStatus, PublicMaintenance, PublicMaintenanceStatus, PublicStatusComponent,
+    PublicStatusPageResponse, PublicUptimeDay, StatusPageTheme,
 };
 
 /// Seconds between browser auto-refreshes (`<meta http-equiv="refresh">`),
@@ -65,6 +65,7 @@ fn overall_label(status: PublicComponentStatus) -> &'static str {
         PublicComponentStatus::Degraded => "Some systems are degraded",
         PublicComponentStatus::Outage => "Some systems are down",
         PublicComponentStatus::Unknown => "Status not available yet",
+        PublicComponentStatus::Maintenance => "Scheduled maintenance in progress",
     }
 }
 
@@ -74,6 +75,7 @@ fn overall_icon(status: PublicComponentStatus) -> &'static str {
         PublicComponentStatus::Degraded => "!",
         PublicComponentStatus::Outage => "&#10005;",
         PublicComponentStatus::Unknown => "?",
+        PublicComponentStatus::Maintenance => "&#9881;",
     }
 }
 
@@ -95,7 +97,7 @@ fn severity_class(severity: PublicIncidentSeverity) -> &'static str {
 }
 
 const STYLE: &str = r#"
-:root{--bg:#f7f7f8;--fg:#18181b;--muted:#6b6b76;--card:#fff;--border:#e4e4e7;--ok:#16a34a;--warn:#e08a00;--down:#dc2626;--none:#d4d4d8;--tip:#fff;--shadow:0 8px 24px rgba(0,0,0,.12)}
+:root{--bg:#f7f7f8;--fg:#18181b;--muted:#6b6b76;--card:#fff;--border:#e4e4e7;--ok:#16a34a;--warn:#e08a00;--down:#dc2626;--none:#d4d4d8;--maint:#2563eb;--tip:#fff;--shadow:0 8px 24px rgba(0,0,0,.12)}
 html[data-theme=dark]{--bg:#09090b;--fg:#fafafa;--muted:#a1a1aa;--card:#151518;--border:#27272a;--none:#3f3f46;--tip:#1f1f23;--shadow:0 8px 24px rgba(0,0,0,.6)}
 @media (prefers-color-scheme:dark){html[data-theme=auto]{--bg:#09090b;--fg:#fafafa;--muted:#a1a1aa;--card:#151518;--border:#27272a;--none:#3f3f46;--tip:#1f1f23;--shadow:0 8px 24px rgba(0,0,0,.6)}}
 *{box-sizing:border-box}
@@ -113,7 +115,7 @@ h2{font-size:17px;margin:36px 0 12px}
 p.desc{color:var(--muted);margin:0 0 4px;white-space:pre-wrap}
 .banner{border-radius:12px;padding:18px 22px;font-weight:650;font-size:18px;color:#fff;margin:20px 0 8px;display:flex;align-items:center;gap:14px}
 .banner .ic{width:30px;height:30px;border-radius:50%;background:rgba(255,255,255,.25);display:inline-flex;align-items:center;justify-content:center;font-size:16px;flex:none}
-.s-operational{background:var(--ok)}.s-degraded{background:var(--warn)}.s-outage{background:var(--down)}.s-unknown{background:var(--muted)}
+.s-operational{background:var(--ok)}.s-degraded{background:var(--warn)}.s-outage{background:var(--down)}.s-unknown{background:var(--muted)}.s-maintenance{background:var(--maint)}
 .card{background:var(--card);border:1px solid var(--border);border-radius:12px}
 .comp{padding:18px 22px}
 .card>*+*,.members>*+*{border-top:1px solid var(--border)}
@@ -128,7 +130,7 @@ p.desc{color:var(--muted);margin:0 0 4px;white-space:pre-wrap}
 .row{display:flex;justify-content:space-between;align-items:baseline;gap:12px;flex-wrap:wrap}
 .name{font-weight:600}
 .pill{font-size:13px;font-weight:600}
-.t-operational{color:var(--ok)}.t-degraded{color:var(--warn)}.t-outage{color:var(--down)}.t-unknown{color:var(--muted)}
+.t-operational{color:var(--ok)}.t-degraded{color:var(--warn)}.t-outage{color:var(--down)}.t-unknown{color:var(--muted)}.t-maintenance{color:var(--maint)}
 .bars{display:flex;gap:2px;margin:12px 0 8px;height:34px}
 .bar{flex:1;min-width:2px;border-radius:2px;position:relative;cursor:default}
 .bar:hover{box-shadow:inset 0 0 0 40px rgba(255,255,255,.3)}
@@ -151,7 +153,7 @@ p.desc{color:var(--muted);margin:0 0 4px;white-space:pre-wrap}
 .rt polyline{fill:none;stroke:var(--accent);stroke-width:1.5;stroke-linejoin:round;stroke-linecap:round}
 .inc{padding:16px 20px;border-left:4px solid var(--warn);margin-bottom:12px}
 .inc.sev-critical{border-left-color:var(--down)}.inc.sev-minor{border-left-color:var(--warn)}.inc.sev-major{border-left-color:#ea580c}
-.inc.resolved{border-left-color:var(--ok)}
+.inc.resolved{border-left-color:var(--ok)}.inc.maint{border-left-color:var(--maint)}
 .inc h3{font-size:16px;margin:0}
 .upd{padding:8px 0 0}
 .upd+.upd{border-top:1px dashed var(--border);margin-top:8px}
@@ -276,6 +278,8 @@ pub fn render_public_page_html_with(
             render_incident(&mut html, incident);
         }
     }
+
+    render_maintenances(&mut html, &page.maintenances);
 
     let _ = write!(
         html,
@@ -603,6 +607,58 @@ fn render_incident(html: &mut String, incident: &PublicIncident) {
     html.push_str("</section>");
 }
 
+/// Maintenance in progress first, then what is scheduled (the snapshot
+/// already orders them soonest first).
+fn render_maintenances(html: &mut String, maintenances: &[PublicMaintenance]) {
+    if maintenances.is_empty() {
+        return;
+    }
+    html.push_str("<h2>Scheduled maintenance</h2>");
+    let ordered = maintenances
+        .iter()
+        .filter(|m| m.status == PublicMaintenanceStatus::InProgress)
+        .chain(
+            maintenances
+                .iter()
+                .filter(|m| m.status == PublicMaintenanceStatus::Scheduled),
+        );
+    for maintenance in ordered {
+        let affected = if maintenance.affected_components.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " · Affects {}",
+                maintenance
+                    .affected_components
+                    .iter()
+                    .map(|name| escape_html(name))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        let _ = write!(
+            html,
+            "<section class=\"card inc maint\"><h3>{}</h3><div class=\"meta\">{} · {} to {}{affected}</div>",
+            escape_html(&maintenance.title),
+            maintenance.status.label(),
+            format_time(&maintenance.starts_at),
+            format_time(&maintenance.ends_at),
+        );
+        if let Some(description) = maintenance
+            .description
+            .as_deref()
+            .filter(|d| !d.trim().is_empty())
+        {
+            let _ = write!(
+                html,
+                "<div class=\"upd\"><p>{}</p></div>",
+                escape_html(description)
+            );
+        }
+        html.push_str("</section>");
+    }
+}
+
 /// The last [`PAST_INCIDENT_DAYS`] days, newest first, each with the incidents
 /// that started on it, or "No incidents reported."
 fn render_subscribe_form(html: &mut String, action: &str) {
@@ -610,7 +666,7 @@ fn render_subscribe_form(html: &mut String, action: &str) {
         html,
         "<h2 id=\"subscribe\">Get updates by email</h2><div class=\"card sub\">\
          <form method=\"post\" action=\"{}\">\
-         <label for=\"sub-email\">We email you when an incident is posted or updated here.</label>\
+         <label for=\"sub-email\">We email you when an incident is posted or updated here, or maintenance is scheduled.</label>\
          <div class=\"row\"><input id=\"sub-email\" type=\"email\" name=\"email\" required \
          maxlength=\"254\" autocomplete=\"email\" placeholder=\"you@example.com\">\
          <button type=\"submit\">Subscribe</button></div></form>\
@@ -757,9 +813,38 @@ mod tests {
                     created_at: now,
                 }],
             }],
+            maintenances: vec![],
             history_days: 1,
             generated_at: now,
         }
+    }
+
+    #[test]
+    fn maintenance_windows_are_listed_in_progress_first_and_escaped() {
+        let mut page = page_with("API", "Investigating", "Status");
+        let now = Utc::now();
+        let window = |title: &str, status| PublicMaintenance {
+            title: title.to_string(),
+            description: Some("<script>x</script>".to_string()),
+            status,
+            starts_at: now,
+            ends_at: now + chrono::Duration::hours(1),
+            affected_components: vec!["API <b>".to_string()],
+        };
+        page.maintenances = vec![
+            window("Later work", PublicMaintenanceStatus::Scheduled),
+            window("Ongoing work", PublicMaintenanceStatus::InProgress),
+        ];
+        let html = render_public_page_html(&page);
+        assert!(html.contains("<h2>Scheduled maintenance</h2>"));
+        let ongoing = html.find("Ongoing work").expect("ongoing listed");
+        let later = html.find("Later work").expect("scheduled listed");
+        assert!(ongoing < later, "in-progress maintenance comes first");
+        assert!(html.contains("Affects API &lt;b&gt;"));
+        assert!(!html.contains("<script>"));
+
+        page.maintenances.clear();
+        assert!(!render_public_page_html(&page).contains("Scheduled maintenance"));
     }
 
     #[test]
