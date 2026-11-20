@@ -29,7 +29,8 @@ pub struct Model {
     pub enabled: bool,
     /// Environment-specific value. NULL means inherit `feature_flags.default_value`.
     pub value: Option<Json>,
-    /// Ordered targeting rules. Always `[]` in Phase 1.
+    /// Ordered targeting rules for this environment; first match wins. See
+    /// `temps_flags::FlagRule` for the shape. `[]` means no targeting.
     pub rules: Json,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,

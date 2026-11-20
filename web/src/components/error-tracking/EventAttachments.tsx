@@ -43,8 +43,48 @@ interface AttachmentItemsProps {
   items: AttachmentView[] | undefined
   isPending: boolean
   error: unknown
+  /** Whether a retry after `error` is under way. */
+  isRetrying?: boolean
+  onRetry?: () => void
   usage: AttachmentUsage | undefined
   onDelete: (attachment: AttachmentView) => void
+}
+
+/** Why the list could not be read, with a way to read it again. */
+function LoadFailure({
+  error,
+  hasCachedItems,
+  isRetrying,
+  onRetry,
+}: {
+  error: unknown
+  hasCachedItems: boolean
+  isRetrying: boolean
+  onRetry?: () => void
+}) {
+  const detail =
+    readFailureServerDetail(error) ??
+    (hasCachedItems
+      ? 'The attachments could not be refreshed; the list below may be out of date.'
+      : 'The attachments could not be loaded.')
+  return (
+    <Alert variant="destructive">
+      <AlertDescription className="space-y-2">
+        <p>{detail}</p>
+        {onRetry && (
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            disabled={isRetrying}
+            onClick={onRetry}
+          >
+            {isRetrying ? 'Retrying…' : 'Retry'}
+          </Button>
+        )}
+      </AlertDescription>
+    </Alert>
+  )
 }
 
 /** The onboarding state shown while blob storage is missing. */
@@ -128,10 +168,21 @@ export function AttachmentItems({
   items,
   isPending,
   error,
+  isRetrying = false,
+  onRetry,
   usage,
   onDelete,
 }: AttachmentItemsProps) {
   const list = items ?? []
+  // A failed refresh keeps the files already shown, under its error.
+  const failure = error ? (
+    <LoadFailure
+      error={error}
+      hasCachedItems={list.length > 0}
+      isRetrying={isRetrying}
+      onRetry={onRetry}
+    />
+  ) : null
   return (
     <section className="space-y-3" aria-label="Attachments">
       <h2 className="flex items-center gap-2 text-base font-semibold">
@@ -143,13 +194,8 @@ export function AttachmentItems({
         <div className="space-y-2">
           <Skeleton className="h-14 w-full" />
         </div>
-      ) : error ? (
-        <Alert variant="destructive">
-          <AlertDescription>
-            {readFailureServerDetail(error) ??
-              'The attachments could not be loaded. Retry.'}
-          </AlertDescription>
-        </Alert>
+      ) : failure && list.length === 0 ? (
+        failure
       ) : list.length === 0 ? (
         usage?.configured !== false && (
           <p className="text-sm text-muted-foreground">
@@ -158,16 +204,19 @@ export function AttachmentItems({
           </p>
         )
       ) : (
-        <ul className="space-y-2">
-          {list.map((attachment) => (
-            <AttachmentRow
-              key={attachment.id}
-              projectId={projectId}
-              attachment={attachment}
-              onDelete={onDelete}
-            />
-          ))}
-        </ul>
+        <>
+          {failure}
+          <ul className="space-y-2">
+            {list.map((attachment) => (
+              <AttachmentRow
+                key={attachment.id}
+                projectId={projectId}
+                attachment={attachment}
+                onDelete={onDelete}
+              />
+            ))}
+          </ul>
+        </>
       )}
     </section>
   )
@@ -248,6 +297,8 @@ export function EventAttachments({
         items={list.data?.data}
         isPending={list.isPending}
         error={list.error}
+        isRetrying={list.isFetching}
+        onRetry={() => void list.refetch()}
         usage={usage.data}
         onDelete={onDelete}
       />
@@ -282,6 +333,8 @@ export function FeedbackAttachments({
         items={list.data?.data}
         isPending={list.isPending}
         error={list.error}
+        isRetrying={list.isFetching}
+        onRetry={() => void list.refetch()}
         usage={usage.data}
         onDelete={onDelete}
       />

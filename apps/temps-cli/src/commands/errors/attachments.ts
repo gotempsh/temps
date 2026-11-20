@@ -5,6 +5,7 @@
 // kept in the project's blob storage (ADR 111, D4).
 
 import type { Command } from 'commander'
+import { writeFile } from 'node:fs/promises'
 import { basename } from 'node:path'
 import { requireAuth } from '../../config/store.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
@@ -58,9 +59,31 @@ export function parseOwner(options: { groupId?: string; eventId?: string; feedba
   }
 }
 
+/**
+ * Write a downloaded attachment to `path`. Without `force` the file is
+ * created only if it does not exist, in one step, so a file that appears
+ * meanwhile (another download of the same name) is never replaced: returns
+ * false then. With `force` an existing file is replaced.
+ */
+export async function saveDownload(path: string, bytes: Uint8Array, force: boolean): Promise<boolean> {
+  if (force) {
+    await Bun.write(path, bytes)
+    return true
+  }
+  try {
+    // Bun.write has no create-only mode; the `wx` flag is O_CREAT | O_EXCL.
+    await writeFile(path, bytes, { flag: 'wx' })
+    return true
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'EEXIST') return false
+    throw error
+  }
+}
+
 /** A `--mib` quota: a whole number of MiB from 0 to 100 GiB. */
 export function parseQuotaMib(raw: string): number {
-  const mib = Number(raw)
+  // `Number('')` and `Number(' ')` are 0: only digits are a quota.
+  const mib = /^\d+$/.test(raw) ? Number(raw) : Number.NaN
   if (!Number.isInteger(mib) || mib < 0 || mib > MAX_QUOTA_MIB) {
     throw new Error(`--mib must be a whole number from 0 to ${MAX_QUOTA_MIB} (100 GiB), got "${raw}"`)
   }
@@ -117,11 +140,11 @@ export function registerAttachmentCommands(errors: Command): void {
   attachments
     .command('list')
     .alias('ls')
-    .description('List the attachments of an error event or a feedback')
+    .description('List the attachments of an error event (--group-id with --event-id) or of a feedback (--feedback-id)')
     .requiredOption('--project-id <id>', 'Project ID')
-    .option('--group-id <id>', 'Error group of the event')
-    .option('--event-id <id>', 'Error event ID')
-    .option('--feedback-id <id>', 'Feedback ID')
+    .option('--group-id <id>', 'Error group of the event; give it with --event-id, not with --feedback-id')
+    .option('--event-id <id>', 'Error event ID; give it with --group-id, not with --feedback-id')
+    .option('--feedback-id <id>', 'Feedback ID; give it alone, instead of --group-id and --event-id')
     .option('--json', 'Output in JSON format')
     .action(listAction)
 
@@ -224,13 +247,10 @@ async function downloadAction(options: {
     }
   })
   const output = options.output ?? name
-  if (!options.force) {
-    if (await Bun.file(output).exists()) {
-      warning(`${output} exists; pass --force to overwrite it or --output to choose another file`)
-      return
-    }
+  if (!(await saveDownload(output, bytes, options.force ?? false))) {
+    warning(`${output} exists; pass --force to overwrite it or --output to choose another file`)
+    return
   }
-  await Bun.write(output, bytes)
   success(`Saved ${formatBytes(bytes.byteLength)} to ${output}`)
 }
 

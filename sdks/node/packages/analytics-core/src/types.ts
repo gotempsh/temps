@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import type { FeatureFlags, FeatureFlagsOptions } from "./FeatureFlags";
+
 export type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
 
@@ -116,6 +118,11 @@ export interface AnalyticsClientOptions {
 }
 
 export interface AnalyticsOptions extends AnalyticsClientOptions {
+  /**
+   * Feature-flag context and server-rendered bootstrap values. Flags are read
+   * lazily from `{basePath}/flags`; see `AnalyticsApi.flags`.
+   */
+  flags?: Pick<FeatureFlagsOptions, "key" | "attributes" | "bootstrap" | "onError">;
   /** Auto track pageviews on route changes. Defaults to true. */
   autoTrackPageviews?: boolean;
   /** Auto track page leave events. Defaults to true. */
@@ -139,6 +146,12 @@ export interface AnalyticsOptions extends AnalyticsClientOptions {
 }
 
 export interface AnalyticsApi {
+  /**
+   * Feature flags marked client-visible, evaluated by Temps for this visitor.
+   * `flags.get("checkout.v2", false)` is synchronous and returns the fallback
+   * until the flags arrive; nothing is fetched until the first read.
+   */
+  readonly flags: FeatureFlags;
   /** Whether analytics are currently enabled. */
   readonly enabled: boolean;
   /**

@@ -26,10 +26,12 @@ import { formatBytesBinary } from '@/lib/server-monitoring'
 import {
   ATTACHMENT_EXAMPLE,
   bytesToMib,
+  isWholeMib,
   MAX_QUOTA_MIB,
   mibToBytes,
   quotaFormSchema,
   quotaShare,
+  storeSavedUsage,
   STORAGE_SETUP_PATH,
   type QuotaFormData,
 } from './attachments'
@@ -91,12 +93,18 @@ export function AttachmentUsageSummary({ usage }: { usage: AttachmentUsage }) {
   )
 }
 
-function QuotaForm({
+export function QuotaForm({
   projectId,
   usage,
+  refreshing = false,
 }: {
   projectId: number
   usage: AttachmentUsage
+  /**
+   * The saved quota is being read again (after a failed save, which may
+   * have been committed): no new save until the server's value is in.
+   */
+  refreshing?: boolean
 }) {
   const queryClient = useQueryClient()
   const form = useForm<QuotaFormData>({
@@ -104,23 +112,34 @@ function QuotaForm({
     defaultValues: { quota_mib: bytesToMib(usage.quota_bytes) },
   })
   const { reset } = form
+  const { isDirty } = form.formState
+  // A refresh brings the saved quota in, but never over an unsaved edit.
   useEffect(() => {
-    reset({ quota_mib: bytesToMib(usage.quota_bytes) })
-  }, [reset, usage.quota_bytes])
+    if (!isDirty) reset({ quota_mib: bytesToMib(usage.quota_bytes) })
+  }, [reset, isDirty, usage.quota_bytes])
   const save = useMutation({
     ...setErrorAttachmentQuotaMutation(),
     meta: { errorTitle: 'Failed to change the attachment quota' },
-    onSuccess: (next) => {
+    onSuccess: async (next) => {
+      reset({ quota_mib: bytesToMib(next.quota_bytes) })
       toast.success(
         `Attachment quota set to ${formatBytesBinary(next.quota_bytes)}`
       )
-      queryClient.setQueryData(
-        getErrorAttachmentUsageQueryKey({ path: { project_id: projectId } }),
-        next
-      )
+      await storeSavedUsage(queryClient, projectId, next)
+    },
+    // A failed save's outcome is unknown (its answer may have been lost
+    // after the commit), so read the saved quota again. The edit stays in
+    // the form; the summary shows what the server holds.
+    onError: () => {
+      void queryClient.invalidateQueries({
+        queryKey: getErrorAttachmentUsageQueryKey({
+          path: { project_id: projectId },
+        }),
+      })
     },
   })
   const error = form.formState.errors.quota_mib?.message
+  const exact = isWholeMib(usage.quota_bytes)
   return (
     <form
       noValidate
@@ -143,12 +162,22 @@ function QuotaForm({
           className="w-full sm:w-40"
           aria-invalid={error ? true : undefined}
           aria-describedby={error ? 'attachment-quota-error' : undefined}
+          disabled={save.isPending}
           {...form.register('quota_mib', { valueAsNumber: true })}
         />
       </div>
-      <Button type="submit" disabled={save.isPending}>
+      <Button
+        type="submit"
+        disabled={save.isPending || refreshing || (exact && !isDirty)}
+      >
         {save.isPending ? 'Saving…' : 'Save quota'}
       </Button>
+      {!exact && (
+        <p className="text-xs text-muted-foreground sm:basis-full">
+          The current quota, {formatBytesBinary(usage.quota_bytes)}, is not a
+          whole number of MiB; saving replaces it with the value above.
+        </p>
+      )}
       {error && (
         <p
           id="attachment-quota-error"
@@ -158,6 +187,72 @@ function QuotaForm({
         </p>
       )}
     </form>
+  )
+}
+
+/**
+ * The usage and quota form, or why they cannot be shown. A failed refresh
+ * keeps the form mounted, with any unsaved edit, under its error: the
+ * error sits in its own slot so the form never changes position and
+ * remounts.
+ */
+export function AttachmentsSettingsBody({
+  projectId,
+  usage,
+  isPending,
+  error,
+  isRetrying,
+  onRetry,
+}: {
+  projectId: number
+  usage: AttachmentUsage | undefined
+  isPending: boolean
+  error: unknown
+  isRetrying: boolean
+  onRetry: () => void
+}) {
+  if (isPending) {
+    return (
+      <div className="space-y-3">
+        <Skeleton className="h-5 w-64" />
+        <Skeleton className="h-2 w-full" />
+        <Skeleton className="h-9 w-56" />
+      </div>
+    )
+  }
+  const failure = error ? (
+    <Alert variant="destructive">
+      <AlertDescription className="space-y-2">
+        <p>
+          {readFailureServerDetail(error) ??
+            (usage
+              ? 'Attachment usage could not be refreshed; the values below may be out of date.'
+              : 'Attachment usage could not be loaded.')}
+        </p>
+        <Button
+          type="button"
+          size="sm"
+          variant="outline"
+          disabled={isRetrying}
+          onClick={onRetry}
+        >
+          {isRetrying ? 'Retrying…' : 'Retry'}
+        </Button>
+      </AlertDescription>
+    </Alert>
+  ) : null
+  return (
+    <>
+      {failure}
+      {usage && <AttachmentUsageSummary usage={usage} />}
+      {usage && (
+        <QuotaForm
+          projectId={projectId}
+          usage={usage}
+          refreshing={isRetrying}
+        />
+      )}
+    </>
   )
 }
 
@@ -174,25 +269,14 @@ export function ErrorAttachmentsSettings({ projectId }: { projectId: number }) {
       <PageHeader title="Attachments" />
       <Card>
         <CardContent className="space-y-6 pt-6">
-          {usage.isPending ? (
-            <div className="space-y-3">
-              <Skeleton className="h-5 w-64" />
-              <Skeleton className="h-2 w-full" />
-              <Skeleton className="h-9 w-56" />
-            </div>
-          ) : usage.isError ? (
-            <Alert variant="destructive">
-              <AlertDescription>
-                {readFailureServerDetail(usage.error) ??
-                  'Attachment usage could not be loaded. Retry.'}
-              </AlertDescription>
-            </Alert>
-          ) : (
-            <>
-              <AttachmentUsageSummary usage={usage.data} />
-              <QuotaForm projectId={projectId} usage={usage.data} />
-            </>
-          )}
+          <AttachmentsSettingsBody
+            projectId={projectId}
+            usage={usage.data}
+            isPending={usage.isPending}
+            error={usage.error}
+            isRetrying={usage.isFetching}
+            onRetry={() => void usage.refetch()}
+          />
         </CardContent>
       </Card>
     </div>

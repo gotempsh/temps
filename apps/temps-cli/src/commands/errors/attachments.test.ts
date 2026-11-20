@@ -2,7 +2,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { describe, expect, test } from 'bun:test'
-import { filenameFromDisposition, MAX_QUOTA_MIB, parseOwner, parseQuotaMib } from './attachments.js'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { filenameFromDisposition, MAX_QUOTA_MIB, parseOwner, parseQuotaMib, saveDownload } from './attachments.js'
 
 describe('parseOwner', () => {
   test('an event needs its group, a feedback stands alone', () => {
@@ -25,7 +28,7 @@ describe('parseQuotaMib', () => {
   })
 
   test('refuses fractions, negatives, junk and too much, naming the flag', () => {
-    for (const bad of ['1.5', '-1', 'lots', String(MAX_QUOTA_MIB + 1)]) {
+    for (const bad of ['1.5', '-1', 'lots', '', ' ', '1e3', '0x10', String(MAX_QUOTA_MIB + 1)]) {
       expect(() => parseQuotaMib(bad)).toThrow('--mib')
     }
   })
@@ -50,5 +53,35 @@ describe('filenameFromDisposition', () => {
 
   test('a malformed encoding falls back to the quoted name', () => {
     expect(filenameFromDisposition("inline; filename=\"shot.png\"; filename*=UTF-8''%E0%A4%A", 'x')).toBe('shot.png')
+  })
+})
+
+describe('saveDownload', () => {
+  test('creates a new file, never replaces one without force, and replaces it with force', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'temps-attachment-'))
+    try {
+      const path = join(dir, 'app.log')
+      expect(await saveDownload(path, new TextEncoder().encode('first'), false)).toBe(true)
+      expect(await saveDownload(path, new TextEncoder().encode('second'), false)).toBe(false)
+      expect(await Bun.file(path).text()).toBe('first')
+      expect(await saveDownload(path, new TextEncoder().encode('third'), true)).toBe(true)
+      expect(await Bun.file(path).text()).toBe('third')
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('of two concurrent downloads to one name without force, exactly one writes', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'temps-attachment-'))
+    try {
+      const path = join(dir, 'app.log')
+      const results = await Promise.all(
+        ['a', 'b'].map((body) => saveDownload(path, new TextEncoder().encode(body), false)),
+      )
+      expect(results.filter(Boolean)).toHaveLength(1)
+      expect(['a', 'b']).toContain(await Bun.file(path).text())
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
   })
 })

@@ -4,10 +4,15 @@
 import { describe, expect, test } from 'bun:test'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { MemoryRouter } from 'react-router'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 
 import type { AttachmentUsage, AttachmentView } from '@/api/client/types.gen'
 import { AttachmentItems } from './EventAttachments'
-import { AttachmentUsageSummary } from './ErrorAttachmentsSettings'
+import {
+  AttachmentsSettingsBody,
+  AttachmentUsageSummary,
+  QuotaForm,
+} from './ErrorAttachmentsSettings'
 
 const usage = (overrides: Partial<AttachmentUsage> = {}): AttachmentUsage => ({
   configured: true,
@@ -40,6 +45,8 @@ const render = (props: {
   items?: AttachmentView[]
   usage?: AttachmentUsage
   isPending?: boolean
+  error?: unknown
+  isRetrying?: boolean
 }) =>
   renderToStaticMarkup(
     <MemoryRouter>
@@ -48,7 +55,9 @@ const render = (props: {
         ownerLabel="event"
         items={props.items}
         isPending={props.isPending ?? false}
-        error={null}
+        error={props.error ?? null}
+        isRetrying={props.isRetrying}
+        onRetry={() => {}}
         usage={props.usage}
         onDelete={() => {}}
       />
@@ -97,6 +106,33 @@ describe('AttachmentItems', () => {
     expect(html).toContain('aria-label="Delete screenshot.png"')
   })
 
+  test('a failed first load says so and offers a retry', () => {
+    const html = render({ error: new Error('offline'), usage: usage() })
+    expect(html).toContain('The attachments could not be loaded.')
+    expect(html).toContain('Retry')
+    expect(html).not.toContain('No files were sent')
+  })
+
+  test('a failed refresh keeps the files already shown under its error', () => {
+    const html = render({
+      items: [attachment({ id: 41 })],
+      error: new Error('offline'),
+      usage: usage(),
+    })
+    expect(html).toContain('could not be refreshed')
+    expect(html).toContain('app.log')
+    expect(html).toContain('Retry')
+  })
+
+  test('a retry under way disables its button', () => {
+    const html = render({
+      error: new Error('offline'),
+      isRetrying: true,
+      usage: usage(),
+    })
+    expect(html).toMatch(/<button[^>]*disabled=""[^>]*>Retrying…<\/button>/)
+  })
+
   test('with storage and no files it explains how an SDK sends one', () => {
     const html = render({ items: [], usage: usage() })
     expect(html).toContain('No files were sent with this event')
@@ -121,5 +157,69 @@ describe('AttachmentUsageSummary', () => {
     expect(html).toContain('3 files')
     expect(html).toContain('2 dropped over quota')
     expect(html).toContain('2.00 MiB per file')
+  })
+})
+
+describe('QuotaForm', () => {
+  const renderForm = (quota_bytes: number, refreshing = false) =>
+    renderToStaticMarkup(
+      <QueryClientProvider client={new QueryClient()}>
+        <QuotaForm
+          projectId={3}
+          usage={usage({ quota_bytes })}
+          refreshing={refreshing}
+        />
+      </QueryClientProvider>
+    )
+
+  test('offers Save only once the quota is changed', () => {
+    const html = renderForm(268_435_456)
+    expect(html).toMatch(/<button[^>]*disabled=""[^>]*>Save quota<\/button>/)
+    expect(html).not.toContain('not a whole number of MiB')
+  })
+
+  test('waits for the saved quota to be read again before another save', () => {
+    // Not a whole MiB, so Save would otherwise be enabled.
+    const html = renderForm(1, true)
+    expect(html).toMatch(/<button[^>]*disabled=""[^>]*>Save quota<\/button>/)
+  })
+
+  test('a quota that is not whole MiB says so and can be saved as shown', () => {
+    const html = renderForm(1)
+    expect(html).toContain('The current quota, 1 B, is not a whole number')
+    expect(html).not.toMatch(/<button[^>]*disabled=""[^>]*>Save quota/)
+  })
+})
+
+describe('AttachmentsSettingsBody', () => {
+  const renderBody = (props: { usage?: AttachmentUsage; error?: unknown }) =>
+    renderToStaticMarkup(
+      <QueryClientProvider client={new QueryClient()}>
+        <MemoryRouter>
+          <AttachmentsSettingsBody
+            projectId={3}
+            usage={props.usage}
+            isPending={false}
+            error={props.error ?? null}
+            isRetrying={false}
+            onRetry={() => {}}
+          />
+        </MemoryRouter>
+      </QueryClientProvider>
+    )
+
+  test('a failed refresh keeps the quota form under its error', () => {
+    const html = renderBody({ usage: usage(), error: new Error('offline') })
+    expect(html).toContain('could not be refreshed')
+    expect(html).toContain('Retry')
+    expect(html).toContain('id="attachment-quota"')
+    expect(html).toContain('of 256 MiB used')
+  })
+
+  test('a failed first load shows only the error and a retry', () => {
+    const html = renderBody({ error: new Error('offline') })
+    expect(html).toContain('Attachment usage could not be loaded.')
+    expect(html).toContain('Retry')
+    expect(html).not.toContain('id="attachment-quota"')
   })
 })

@@ -613,7 +613,8 @@ deploys, which is web services. It comes last and may never be worth building.
 ### D4 Attachments
 
 - **Plain files only.** An attachment item whose `attachment_type` is
-  `event.attachment` (the default) is kept. Minidumps, Apple crash reports and
+  `event.attachment` (the default) is kept; an `attachment_type` that is not a
+  string is unsupported. Minidumps, Apple crash reports and
   Unreal files belong to D7 and stay unsupported. An attachment never rejects
   its envelope: one that is too large, past the count, or has no event or
   feedback to belong to is reported unsupported, and the events are stored.
@@ -626,7 +627,14 @@ deploys, which is web services. It comes last and may never be worth building.
   nothing: new attachments are dropped until use falls under it.
 - **Off the hot path.** Attachments are queued only when the envelope is
   answered 200, after their event or feedback is stored, so an SDK retry after
-  a failure stores nothing twice (the row is unique per owner and position).
+  a failure stores nothing twice. A file's identity is its owner, name and
+  SHA-256, checked under the project's usage row lock before any limit, so a
+  resent file is a duplicate even once the quota is full (a resend of a write
+  that never finished completes it, charged once, and renews its reservation;
+  one the sweeper already claimed for removal, `removing_at`, is left to the
+  sweeper and is never marked stored), and a different file
+  sent later for the same owner is new; its display position is the owner's
+  next one.
   Ingest does one `try_send` into a queue bounded at 256 envelopes and 16 MiB;
   past either bound the batch is dropped and counted
   (`x-temps-sentry-attachments-dropped`). One task reserves each file against
@@ -635,14 +643,20 @@ deploys, which is web services. It comes last and may never be worth building.
   attachments.
 - **Owner.** The envelope's event id, else its only event, else its only
   feedback, resolved through `error_event_source_keys` or the feedback's
-  source id. The owner's timestamp is kept so the sweeper can find events that
+  source id, and only under the same environment and deployment as the DSN
+  that sent the file, so one DSN cannot attach files to another scope's event. The owner's timestamp is kept so the sweeper can find events that
   expired.
 - **Lifetime.** An attachment lives as long as what it came with. Every ten
   minutes a bounded sweeper deletes those whose event expired with its chunk,
   writes that never finished (after an hour), attachments of deleted feedback,
   and every attachment of a deleted project (soft-deleted counts). Deleting a
   feedback deletes its attachments. An object that cannot be deleted keeps its
-  row, so the next pass retries, and a pass stops when it can delete nothing.
+  row, so the next pass retries; each pass pages past such rows instead of
+  stopping at them, and deleted projects are visited a page per pass from
+  where the last pass stopped. Deleting rows takes the project's usage row
+  lock first, as a reservation does, so the two cannot deadlock. Rolling the
+  migration back refuses while any attachment is listed, since dropping the
+  rows would strand their objects.
   A write that failed or timed out deletes its object before its row, since a
   store may have kept a file it never acknowledged; until then the row counts
   against the quota and the sweeper retries it as an unfinished write. The

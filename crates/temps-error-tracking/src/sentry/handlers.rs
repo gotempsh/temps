@@ -1587,6 +1587,8 @@ async fn process_parsed_envelope(
             let offered = state.error_tracking_service.attachments.offer(
                 crate::services::attachments::AttachmentBatch {
                     project_id: auth.project_id,
+                    environment_id: auth.environment_id,
+                    deployment_id: auth.deployment_id,
                     sdk_event_id: attachments.sdk_event_id,
                     attachments: attachments.items,
                 },
