@@ -9,7 +9,10 @@ import type { MonitorResponse } from '../../api/types.gen.js'
 import {
   checkSpecFromOptions,
   locationLines,
+  MAX_HEADER_FILE_BYTES,
+  MAX_REQUEST_BODY_BYTES,
   parseHeaderLines,
+  readBounded,
   requestFromFiles,
 } from './targets.js'
 
@@ -67,6 +70,28 @@ describe('requestFromFiles', () => {
         body: '{"ping":true}',
       })
       expect(await requestFromFiles()).toBeNull()
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('refuses a file over the server limit without reading it whole', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'temps-monitor-request-'))
+    try {
+      const body = join(dir, 'body')
+      writeFileSync(body, 'x'.repeat(MAX_REQUEST_BODY_BYTES + 1))
+      await expect(requestFromFiles(undefined, body)).rejects.toThrow(
+        `The body file ${body} is larger than ${MAX_REQUEST_BODY_BYTES} bytes`,
+      )
+      const headers = join(dir, 'headers')
+      writeFileSync(headers, `X-Pad: ${'x'.repeat(MAX_HEADER_FILE_BYTES)}\n`)
+      await expect(requestFromFiles(headers)).rejects.toThrow('The header file')
+      // Exactly at the limit is read.
+      writeFileSync(body, 'x'.repeat(MAX_REQUEST_BODY_BYTES))
+      expect((await requestFromFiles(undefined, body))?.body?.length).toBe(MAX_REQUEST_BODY_BYTES)
+      // Multi-byte text is decoded whole across chunks.
+      writeFileSync(body, 'é'.repeat(1000))
+      expect(await readBounded(body, MAX_REQUEST_BODY_BYTES, 'The body file')).toBe('é'.repeat(1000))
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }

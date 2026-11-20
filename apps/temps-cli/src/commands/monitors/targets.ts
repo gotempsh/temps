@@ -134,17 +134,47 @@ export function parseHeaderLines(text: string): CheckRequest['headers'] | string
 
 /** The request read from --header-file and --body-file, `null` when neither is given. */
 /** The request of `--header-file` and `--body-file`, or null when neither is given. */
+/** The server's limits on a check's request (ADR 108 D3). */
+export const MAX_REQUEST_BODY_BYTES = 64 * 1024
+/** 20 headers of a 100-character name and a 4096-character value, one per line. */
+export const MAX_HEADER_FILE_BYTES = 20 * (100 + 2 + 4096 + 1)
+
+/**
+ * The text of `path`, read only up to `limit` bytes: a larger file is
+ * refused without being read whole, as the server would refuse it anyway.
+ */
+export async function readBounded(path: string, limit: number, what: string): Promise<string> {
+  const chunks: Uint8Array[] = []
+  let size = 0
+  try {
+    const reader = Bun.file(path).stream().getReader()
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      size += value.byteLength
+      if (size > limit) {
+        await reader.cancel()
+        throw new RangeError(`${what} ${path} is larger than ${limit} bytes`)
+      }
+      chunks.push(value)
+    }
+  } catch (error) {
+    if (error instanceof RangeError) throw new Error(error.message)
+    throw new Error(`could not read ${path}: ${(error as Error).message}`)
+  }
+  return new TextDecoder().decode(Buffer.concat(chunks))
+}
+
 export async function requestFromFiles(headerFile?: string, bodyFile?: string): Promise<CheckRequest | null> {
   if (!headerFile && !bodyFile) return null
-  const read = (path: string) =>
-    Bun.file(path)
-      .text()
-      .catch((error: Error) => {
-        throw new Error(`could not read ${path}: ${error.message}`)
-      })
-  const headers = headerFile ? parseHeaderLines(await read(headerFile)) : []
+  const headers = headerFile
+    ? parseHeaderLines(await readBounded(headerFile, MAX_HEADER_FILE_BYTES, 'The header file'))
+    : []
   if (typeof headers === 'string') throw new Error(headers)
-  return { headers, body: bodyFile ? await read(bodyFile) : null }
+  return {
+    headers,
+    body: bodyFile ? await readBounded(bodyFile, MAX_REQUEST_BODY_BYTES, 'The body file') : null,
+  }
 }
 
 const STATES: Record<string, string> = {
