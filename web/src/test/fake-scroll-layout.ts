@@ -10,19 +10,38 @@ import { afterEach, beforeEach } from 'bun:test'
  * - `data-top="N"`: the element's top, in px, within the content of its
  *   closest `[data-scroller]` ancestor (or of the viewport when there is none).
  *   A scroller is positioned the same way within its own scroller.
+ * - `data-height="N"`: the element's own height, in px (default 0).
+ * - An element that is `hidden`, or inside a `hidden` one, or `display:
+ *   none`, has no client rects, as in a browser.
  * - `data-scroller` plus `data-client-height` / `data-scroll-height`: a box
  *   with that visible height and content height. Its `scrollTop` is clamped
  *   to what it can scroll, like a browser's.
  *
- * `scrolls` records every `scrollTo` on an element or the window, in order.
+ * Elements a component renders itself, which a test cannot put attributes
+ * on, are placed with `place(selector, { top, height })` instead.
+ *
+ * `scrolls` records every `scrollTo` on an element or the window, in order,
+ * with its `behavior` when one was given. `intoView` records the id of every
+ * element `scrollIntoView` was called on, the call that moves the shell.
  */
 export function installFakeScrollLayout() {
-  const scrolls: { target: string; top: number }[] = []
+  const scrolls: { target: string; top: number; behavior?: ScrollBehavior }[] =
+    []
+  const intoView: string[] = []
   const positions = new WeakMap<Element, number>()
+  const placed = new Map<string, { top: number; height?: number }>()
   const restore: (() => void)[] = []
 
+  const placedValue = (element: Element, name: string) => {
+    let place: { top: number; height?: number } | undefined
+    for (const [selector, value] of placed)
+      if (element.matches(selector)) place = value
+    if (name === 'data-top') return place?.top
+    if (name === 'data-height') return place?.height
+    return undefined
+  }
   const number = (element: Element, name: string) =>
-    Number(element.getAttribute(name) ?? 0)
+    placedValue(element, name) ?? Number(element.getAttribute(name) ?? 0)
   const maxScroll = (element: Element) =>
     Math.max(
       0,
@@ -50,36 +69,62 @@ export function installFakeScrollLayout() {
     })
   }
 
+  // On `HTMLElement` as well as `Element`: happy-dom defines some of these
+  // (`clientHeight`) on `HTMLElement`, and a test elsewhere in the run that
+  // patched one there and restored it by assignment leaves an own copy that
+  // would hide an `Element`-level fake.
+  const overrideElement = (name: string, descriptor: PropertyDescriptor) => {
+    override(Element.prototype, name, descriptor)
+    override(HTMLElement.prototype, name, descriptor)
+  }
+
+  const record = (target: string, options: ScrollToOptions) =>
+    scrolls.push({
+      target,
+      top: options.top ?? 0,
+      ...(options.behavior ? { behavior: options.behavior } : {}),
+    })
+
   beforeEach(() => {
     scrolls.length = 0
-    const proto = Element.prototype
-    override(proto, 'getBoundingClientRect', {
+    intoView.length = 0
+    placed.clear()
+    overrideElement('getBoundingClientRect', {
       value(this: Element) {
         const y = top(this)
+        const height = number(this, 'data-height')
         return {
           top: y,
           y,
-          bottom: y,
+          bottom: y + height,
           left: 0,
           right: 0,
           x: 0,
           width: 0,
-          height: 0,
+          height,
         }
       },
     })
-    override(proto, 'scrollHeight', {
+    // No boxes for an element that is not rendered, as in a browser.
+    overrideElement('getClientRects', {
+      value(this: Element) {
+        const hidden =
+          this.closest('[hidden]') !== null ||
+          getComputedStyle(this).display === 'none'
+        return hidden ? [] : [this.getBoundingClientRect()]
+      },
+    })
+    overrideElement('scrollHeight', {
       get(this: Element) {
         return number(this, 'data-scroll-height')
       },
     })
-    // happy-dom defines this one on `HTMLElement`, below `Element`.
-    override(HTMLElement.prototype, 'clientHeight', {
+    overrideElement('clientHeight', {
       get(this: Element) {
         return number(this, 'data-client-height')
       },
     })
-    override(proto, 'scrollTop', {
+    overrideElement('scrollTop', {
       get(this: Element) {
         return positions.get(this) ?? 0
       },
@@ -87,15 +132,20 @@ export function installFakeScrollLayout() {
         positions.set(this, Math.min(Math.max(0, value), maxScroll(this)))
       },
     })
-    override(proto, 'scrollTo', {
+    overrideElement('scrollTo', {
       value(this: Element, options: ScrollToOptions) {
-        scrolls.push({ target: this.id, top: options.top ?? 0 })
+        record(this.id, options)
         ;(this as HTMLElement).scrollTop = options.top ?? 0
+      },
+    })
+    overrideElement('scrollIntoView', {
+      value(this: Element) {
+        intoView.push(this.id)
       },
     })
     override(window, 'scrollTo', {
       value(options: ScrollToOptions) {
-        scrolls.push({ target: 'window', top: options.top ?? 0 })
+        record('window', options)
         document.documentElement.scrollTop = options.top ?? 0
       },
     })
@@ -106,6 +156,10 @@ export function installFakeScrollLayout() {
 
   return {
     scrolls,
+    intoView,
     scrollTopOf: (element: Element) => positions.get(element) ?? 0,
+    place: (selector: string, place: { top: number; height?: number }) => {
+      placed.set(selector, place)
+    },
   }
 }

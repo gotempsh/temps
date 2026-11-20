@@ -31,6 +31,7 @@ import { useEffect, useState } from 'react'
 import { PluginGrantFields } from './PluginGrantFields'
 import { RepositoryInstallProgress } from './RepositoryInstallProgress'
 import { emptyPluginGrants } from '@/lib/plugin-grants'
+import { scrollToElementId } from '@/lib/scroll-to-element'
 
 export type { RepositorySelection } from '@/lib/plugin-repository'
 
@@ -69,9 +70,7 @@ export function RepositoryInstall({
   useEffect(() => {
     reset(repositorySelectionValues(selection))
     if (selection && !compact)
-      document
-        .getElementById('repository-install-title')
-        ?.scrollIntoView({ block: 'center' })
+      scrollToElementId('repository-install-title', { block: 'center' })
   }, [selection, reset, compact])
   const install = useMutation({
     mutationFn: async ({ values, id }: { values: Values; id: string }) => {

@@ -37,6 +37,24 @@ test('accepts the defaults and returns plain numbers', () => {
   })
 })
 
+test('resource settings reject values above the placement host capacity', () => {
+  const host = { maxCpu: 2, maxMemory: 2048 }
+  expect(validateSandboxLimits(VALID, host)).toEqual({
+    ok: false,
+    message: 'CPU cores must be between 0.5 and 2',
+  })
+  expect(validateSandboxLimits({ ...VALID, cpuLimit: 2 }, host)).toEqual({
+    ok: false,
+    message: 'Memory (MB) must be between 256 and 2048',
+  })
+  expect(
+    validateSandboxLimits(
+      { ...VALID, cpuLimit: 1.5, memoryLimitMb: 2048 },
+      host
+    ).ok
+  ).toBe(true)
+})
+
 test('an emptied box is a required-field error that names the field', () => {
   expect(validateSandboxLimits({ ...VALID, cpuLimit: undefined })).toEqual({
     ok: false,
