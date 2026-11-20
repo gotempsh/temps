@@ -195,6 +195,9 @@ function intervalForSpan(startDate?: Date, endDate?: Date): BucketInterval {
   return 'daily' // 30d / 90d / long custom ranges → one bucket per day
 }
 
+/** How often the monitor and its history refresh while the page is open. */
+export const MONITOR_REFRESH_MS = 30_000
+
 export function MonitorDetail({ project }: MonitorDetailProps) {
   const { monitorId } = useParams()
   const [activeFilter, setActiveFilter] = useState<QuickFilter>('24hours')
@@ -270,6 +273,9 @@ export function MonitorDetail({ project }: MonitorDetailProps) {
       },
     }),
     enabled: !!monitorId,
+    // The Locations card reads each worker's latest answer from the monitor,
+    // so it refreshes with the history below instead of going stale.
+    refetchInterval: MONITOR_REFRESH_MS,
   })
   const {
     data: currentMonitorStatus,
@@ -305,7 +311,7 @@ export function MonitorDetail({ project }: MonitorDetailProps) {
       },
     }),
     enabled: !!monitorId && !!startDate && !!endDate,
-    refetchInterval: 30000, // Refresh every 30 seconds
+    refetchInterval: MONITOR_REFRESH_MS,
   })
   // Calculate uptime stats from status data (filtered by date range)
   const uptimePercentage = currentMonitorStatus?.uptime_percentage ?? null
