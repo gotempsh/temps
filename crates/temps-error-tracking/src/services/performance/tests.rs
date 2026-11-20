@@ -108,7 +108,8 @@ async fn findings_become_performance_groups_and_a_reread_trace_counts_once() {
     let test_db = test_db!("performance scanner");
     let db = test_db.connection_arc();
     let project = create_project(db.as_ref()).await;
-    let now = Utc::now();
+    // Postgres keeps microseconds; Linux clocks have nanoseconds.
+    let now = chrono::SubsecRound::trunc_subsecs(Utc::now(), 6);
     let storage = Arc::new(MockOtelStorage::new());
     {
         let mut spans = storage.spans.lock().expect("spans");
