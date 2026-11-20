@@ -88,6 +88,11 @@ function SurveyEditorForm({
   const [draft, setDraft] = useState<SurveyDraft>(() =>
     survey ? draftFromSurvey(survey) : emptyDraft()
   )
+  // The revision the draft was made from. A refetch while the dialog is open
+  // updates `survey`, but the draft still holds the older state: saving it
+  // under the newer revision would silently replace someone else's edit,
+  // while the original one makes the server refuse it with 409.
+  const [baseRevision] = useState(() => survey?.updated_at)
   const [errors, setErrors] = useState<DraftErrors>({ question: {} })
 
   const onError = (error: unknown) =>
@@ -138,7 +143,7 @@ function SurveyEditorForm({
     if (survey) {
       update.mutate({
         path: { project_id: projectId, survey_id: survey.id },
-        body: { ...body, expected_updated_at: survey.updated_at },
+        body: { ...body, expected_updated_at: baseRevision },
       })
     } else {
       create.mutate({
