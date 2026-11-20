@@ -43,10 +43,15 @@ export function TempsSurveys({ pathname, visitorKey, attributes, onError }: Temp
   trackRef.current = trackEvent;
   const surveysRef = useRef<Surveys | null>(null);
   const openRef = useRef<(() => void) | null>(null);
+  // The subject and attributes as a value, so a new object with the same
+  // contents is not a change.
+  const context = JSON.stringify([visitorKey ?? null, attributes ?? {}]);
+  const appliedContextRef = useRef(context);
 
-  // One client per mounted component; the context is read once, like the
-  // flags client.
+  // One client per mounted component. A later change of `visitorKey` or
+  // `attributes` (a user signing in) is applied in the effect below.
   if (surveysRef.current === null && enabled) {
+    appliedContextRef.current = context;
     surveysRef.current = new Surveys({
       // The provider's path, so delivery and the answers' events agree.
       basePath,
@@ -67,10 +72,17 @@ export function TempsSurveys({ pathname, visitorKey, attributes, onError }: Temp
       openRef.current?.();
       return undefined;
     }
+    if (appliedContextRef.current !== context) {
+      // Sampling and flag conditions depend on the subject: drop what was
+      // fetched for the previous one and fetch again.
+      appliedContextRef.current = context;
+      surveys.setContext(visitorKey, attributes);
+    }
     let cancelled = false;
 
     const show = async (event?: string): Promise<void> => {
-      if (openRef.current) return;
+      // Loaded even while a survey is open, so a new context is fetched at
+      // once; `load()` is a no-op once loaded.
       await surveys.load();
       if (cancelled || openRef.current) return;
       const path = pathname ?? window.location.pathname;
@@ -107,7 +119,9 @@ export function TempsSurveys({ pathname, visitorKey, attributes, onError }: Temp
       window.removeEventListener(TRACK_EVENT, onTrack);
       window.removeEventListener("popstate", onPop);
     };
-  }, [pathname, enabled]);
+    // `context` stands for `visitorKey` and `attributes`, compared by value.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pathname, enabled, context]);
 
   // Close an open survey when the component goes away.
   useEffect(() => () => openRef.current?.(), []);

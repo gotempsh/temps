@@ -18,6 +18,9 @@ export interface SurveyDraft {
   pathPattern: string
   triggerEvent: string
   samplePercent: string
+  /** The saved rate, sent back unchanged while `samplePercent` still reads
+   * as it, so an edit elsewhere never moves the audience. */
+  storedSampleRate?: number
   oncePerVisitor: boolean
   flagKey: string
   flagValue: string
@@ -145,7 +148,8 @@ export function draftFromSurvey(survey: SurveyResponse): SurveyDraft {
     })),
     pathPattern: targeting.path_pattern ?? '',
     triggerEvent: targeting.trigger_event ?? '',
-    samplePercent: String(Math.round((targeting.sample_rate ?? 1) * 1000) / 10),
+    samplePercent: percentText(targeting.sample_rate ?? 1),
+    storedSampleRate: targeting.sample_rate ?? 1,
     oncePerVisitor: targeting.once_per_visitor ?? true,
     flagKey: targeting.flag?.key ?? '',
     flagValue:
@@ -247,6 +251,12 @@ export function hasErrors(errors: DraftErrors): boolean {
 }
 
 /** The request body fields for a draft. */
+/** A rate as an editable percentage with every stored digit (0.0001 is
+ * "0.01"), without binary noise such as "1.0000000000000002". */
+export function percentText(rate: number): string {
+  return String(Number((rate * 100).toPrecision(12)))
+}
+
 export function draftToBody(draft: SurveyDraft): {
   name: string
   description: string | null
@@ -276,7 +286,11 @@ export function draftToBody(draft: SurveyDraft): {
     targeting: {
       path_pattern: draft.pathPattern.trim() || null,
       trigger_event: draft.triggerEvent.trim() || null,
-      sample_rate: Number(draft.samplePercent) / 100,
+      sample_rate:
+        draft.storedSampleRate !== undefined &&
+        draft.samplePercent === percentText(draft.storedSampleRate)
+          ? draft.storedSampleRate
+          : Number(draft.samplePercent) / 100,
       once_per_visitor: draft.oncePerVisitor,
       flag: flagKey
         ? { key: flagKey, value: JSON.parse(draft.flagValue) as unknown }
@@ -293,7 +307,7 @@ export function describeTargeting(targeting: SurveyTargeting): string {
   )
   if (targeting.trigger_event) parts.push(`after "${targeting.trigger_event}"`)
   const rate = targeting.sample_rate ?? 1
-  if (rate < 1) parts.push(`${Math.round(rate * 1000) / 10}% of visitors`)
+  if (rate < 1) parts.push(`${percentText(rate)}% of visitors`)
   if (targeting.flag)
     parts.push(
       `where ${targeting.flag.key} = ${JSON.stringify(targeting.flag.value)}`
@@ -342,4 +356,13 @@ export function formatAnswer(value: unknown): string {
 /** Share of `part` in `whole` as a whole percentage, 0 when `whole` is 0. */
 export function percentOf(part: number, whole: number): number {
   return whole > 0 ? Math.round((part / whole) * 100) : 0
+}
+
+/** The last `days` days, ending at the moment of the request. */
+export function windowEndingNow(
+  days: number,
+  now: Date = new Date()
+): { start_date: string; end_date: string } {
+  const start = new Date(now.getTime() - days * 24 * 60 * 60 * 1000)
+  return { start_date: start.toISOString(), end_date: now.toISOString() }
 }

@@ -7,13 +7,12 @@ import type {
   SurveyResponse,
   SurveyStatus,
 } from '@/api/client'
+import { getSurveyResults, listSurveyResponses } from '@/api/client'
 import {
   deleteSurveyMutation,
   getSurveyOptions,
   getSurveyQueryKey,
-  getSurveyResultsOptions,
   getSurveyResultsQueryKey,
-  listSurveyResponsesOptions,
   listSurveyResponsesQueryKey,
   listSurveysQueryKey,
   updateSurveyMutation,
@@ -44,7 +43,7 @@ import {
 import { useGoBack } from '@/hooks/useGoBack'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ArrowLeft, Loader2, Pencil, Trash2 } from 'lucide-react'
-import { useMemo, useState } from 'react'
+import { useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
 import { SurveyEditorDialog } from './SurveyEditorDialog'
@@ -56,6 +55,7 @@ import {
   statusActions,
   statusVariant,
   surveyErrorMessage,
+  windowEndingNow,
 } from './survey-form'
 
 const WINDOWS = [7, 30, 90] as const
@@ -76,23 +76,38 @@ export function SurveyDetail({ project }: SurveyDetailProps) {
   const [deleteOpen, setDeleteOpen] = useState(false)
   const path = { project_id: project.id, survey_id: surveyId }
 
-  // Fixed per chosen window so the query key does not change every render.
-  const window = useMemo(() => {
-    const end = new Date()
-    const start = new Date(end.getTime() - days * 24 * 60 * 60 * 1000)
-    return { start_date: start.toISOString(), end_date: end.toISOString() }
-  }, [days])
-
   const surveyQuery = useQuery({
     ...getSurveyOptions({ path }),
     enabled: surveyId > 0,
   })
+  // The key names the window by its length; each fetch computes the dates,
+  // so a refetch (focus, invalidation, retry) includes answers that arrived
+  // since the page opened. The generated key stays the prefix, so the
+  // invalidation below still matches.
   const resultsQuery = useQuery({
-    ...getSurveyResultsOptions({ path, query: window }),
+    queryKey: [...getSurveyResultsQueryKey({ path }), { days }],
+    queryFn: async ({ signal }) => {
+      const { data } = await getSurveyResults({
+        path,
+        query: windowEndingNow(days),
+        signal,
+        throwOnError: true,
+      })
+      return data
+    },
     enabled: surveyId > 0,
   })
   const responsesQuery = useQuery({
-    ...listSurveyResponsesOptions({ path, query: { ...window, page } }),
+    queryKey: [...listSurveyResponsesQueryKey({ path }), { days, page }],
+    queryFn: async ({ signal }) => {
+      const { data } = await listSurveyResponses({
+        path,
+        query: { ...windowEndingNow(days), page },
+        signal,
+        throwOnError: true,
+      })
+      return data
+    },
     enabled: surveyId > 0,
   })
 
@@ -333,11 +348,16 @@ export function SurveyDetail({ project }: SurveyDetailProps) {
                           {survey.questions
                             .filter((q) => response.answers[q.id] !== undefined)
                             .map((q) => (
-                              <div key={q.id} className="flex gap-2">
-                                <dt className="shrink-0 text-muted-foreground">
+                              // Prompt above answer in a narrow table, side
+                              // by side once there is room; both wrap.
+                              <div
+                                key={q.id}
+                                className="flex flex-col @xl:flex-row @xl:gap-2"
+                              >
+                                <dt className="min-w-0 break-words text-muted-foreground @xl:max-w-[40%] @xl:shrink-0">
                                   {q.prompt}
                                 </dt>
-                                <dd className="break-words">
+                                <dd className="min-w-0 break-words">
                                   {formatAnswer(response.answers[q.id])}
                                 </dd>
                               </div>

@@ -127,4 +127,26 @@ describe("TempsSurveys", () => {
     await waitFor(() => expect(widget(1)).not.toBeNull());
     expect(fetch.mock.calls.some(([input]) => String(input) === "/custom/_temps/surveys")).toBe(true);
   });
+
+  it("fetches again for a new visitor key, and not for an equal attributes object", async () => {
+    const fetch = serve();
+    const tree = (key: string | undefined) => (
+      <TempsAnalyticsProvider ignoreLocalhost={false} autoTrackPageviews={false} autoTrackEngagement={false} autoTrackSpeedAnalytics={false}>
+        <TempsSurveys pathname="/" visitorKey={key} attributes={{ plan: "pro" }} />
+      </TempsAnalyticsProvider>
+    );
+    const surveyBodies = () =>
+      fetch.mock.calls
+        .filter(([input]) => String(input).endsWith("/surveys"))
+        .map(([, init]) => JSON.parse(String((init as RequestInit).body)) as { key?: string });
+    const view = render(tree(undefined));
+    await waitFor(() => expect(surveyBodies()).toHaveLength(1));
+    // Same contents in a new object: no new request.
+    view.rerender(tree(undefined));
+    // The user signs in.
+    view.rerender(tree("user-1"));
+    await waitFor(() => expect(surveyBodies()).toHaveLength(2));
+    expect(surveyBodies()[0]?.key).toBeUndefined();
+    expect(surveyBodies()[1]).toEqual({ key: "user-1", attributes: { plan: "pro" } });
+  });
 });

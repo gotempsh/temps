@@ -64,6 +64,16 @@ export const MAX_OPEN_TEXT_LENGTH = 2000;
 const SEEN_STORAGE_KEY = "temps_surveys_seen";
 /** Surveys remembered as seen; the oldest are forgotten first. */
 const MAX_SEEN = 200;
+/**
+ * Largest `survey_sent` event data, UTF-8 encoded. The event endpoint
+ * refuses bodies above 64 KiB; the rest of the body (event name, page path
+ * and query, domain, language) gets the remaining 16 KiB.
+ */
+export const MAX_SURVEY_EVENT_BYTES = 48 * 1024;
+/** First wait before a failed delivery request is retried; it doubles up to
+ * `MAX_RETRY_DELAY_MS`. */
+const FIRST_RETRY_DELAY_MS = 15_000;
+const MAX_RETRY_DELAY_MS = 5 * 60_000;
 
 export interface SurveysOptions {
   /** Same-origin API prefix. Defaults to `/api/_temps`. */
@@ -80,6 +90,7 @@ export interface SurveysOptions {
   /** Test seams. */
   fetch?: typeof fetch;
   storage?: Pick<Storage, "getItem" | "setItem"> | null;
+  now?: () => number;
 }
 
 interface SurveysResponseBody {
@@ -93,7 +104,12 @@ export class Surveys {
   private readonly fetchImpl?: typeof fetch;
   private readonly storage: Pick<Storage, "getItem" | "setItem"> | null;
   private readonly disabled: boolean;
-  private readonly context: { key?: string; attributes?: SurveysOptions["attributes"] };
+  private readonly now: () => number;
+  private context: { key?: string; attributes?: SurveysOptions["attributes"] };
+  /** Bumped by `setContext`, so a request for the old context is ignored. */
+  private generation = 0;
+  private failures = 0;
+  private retryAt = 0;
 
   private surveys: Survey[] = [];
   private inflight: Promise<void> | null = null;
@@ -116,6 +132,7 @@ export class Surveys {
     this.fetchImpl = options.fetch;
     this.storage = options.storage === undefined ? defaultStorage() : options.storage;
     this.disabled = options.disabled ?? false;
+    this.now = options.now ?? Date.now;
     this.context = { key: options.key, attributes: options.attributes };
   }
 
@@ -133,35 +150,76 @@ export class Surveys {
     return [...this.surveys];
   }
 
-  /** Fetch once; later calls return the same promise. */
+  /**
+   * Fetch once; later calls return the same promise. After a failure, a
+   * later call tries again, waiting 15 seconds after the first failure and
+   * twice as long after each further one, up to 5 minutes.
+   */
   load(): Promise<void> {
     if (this.inflight) return this.inflight;
     if (this.disabled) return Promise.resolve();
+    if (this.currentStatus === "error" && this.now() < this.retryAt) return Promise.resolve();
     const fetchImpl = this.fetchImpl ?? (typeof fetch === "function" ? fetch : undefined);
     if (!fetchImpl) {
       this.currentStatus = "error";
+      this.retryAt = Number.POSITIVE_INFINITY;
       return Promise.resolve();
     }
+    const generation = this.generation;
+    const context = this.context;
     this.currentStatus = "loading";
-    this.inflight = (async () => {
+    const request = (async () => {
+      let surveys: Survey[] | null = null;
+      let failure: Error | null = null;
       try {
         const response = await fetchImpl(`${this.basePath}/surveys`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           credentials: "same-origin",
-          body: JSON.stringify({ key: this.context.key, attributes: this.context.attributes ?? {} }),
+          body: JSON.stringify({ key: context.key, attributes: context.attributes ?? {} }),
         });
         if (!response.ok) throw new Error(`surveys request returned ${response.status}`);
         const parsed = (await response.json()) as SurveysResponseBody;
-        this.surveys = Array.isArray(parsed.surveys) ? parsed.surveys : [];
-        this.currentStatus = "ready";
+        surveys = Array.isArray(parsed.surveys) ? parsed.surveys : [];
       } catch (error) {
+        failure = error instanceof Error ? error : new Error(String(error));
+      }
+      // The context changed while this was in flight: its answer is for
+      // someone else, and the new context has its own request.
+      if (generation !== this.generation) return;
+      if (surveys) {
+        this.surveys = surveys;
+        this.currentStatus = "ready";
+        this.failures = 0;
+      } else {
         this.currentStatus = "error";
-        this.onError(error instanceof Error ? error : new Error(String(error)));
+        this.failures += 1;
+        const delay = Math.min(FIRST_RETRY_DELAY_MS * 2 ** (this.failures - 1), MAX_RETRY_DELAY_MS);
+        this.retryAt = this.now() + delay;
+        // Forget the failed request, so a later call can try again.
+        this.inflight = null;
+        if (failure) this.onError(failure);
       }
       this.notify();
     })();
-    return this.inflight;
+    this.inflight = request;
+    return request;
+  }
+
+  /**
+   * Replace the subject and attributes, e.g. once a user signs in. Surveys
+   * fetched for the previous context are dropped and the next `load()`
+   * fetches again. Surveys already shown on this page stay shown.
+   */
+  setContext(key: string | undefined, attributes: SurveysOptions["attributes"]): void {
+    this.generation += 1;
+    this.context = { key, attributes };
+    this.surveys = [];
+    this.inflight = null;
+    this.failures = 0;
+    this.retryAt = 0;
+    this.currentStatus = "idle";
+    this.notify();
   }
 
   /**
@@ -200,6 +258,12 @@ export class Surveys {
   submit(survey: Survey, answers: SurveyAnswers): { ok: true } | { ok: false; errors: Record<string, string> } {
     const checked = validateAnswers(survey, answers);
     if (!checked.ok) return checked;
+    const data = { survey_id: survey.id, survey_name: survey.name, responses: checked.responses };
+    if (encodedLength(JSON.stringify(data)) > MAX_SURVEY_EVENT_BYTES) {
+      // Sent anyway, the event endpoint would refuse it and the answers would
+      // be lost behind a "thanks". Keep the form open instead.
+      return { ok: false, errors: tooLongErrors(survey, checked.responses) };
+    }
     this.emit("survey_sent", survey, { responses: checked.responses });
     return { ok: true };
   }
@@ -249,6 +313,26 @@ export class Surveys {
       }
     }
   }
+}
+
+function encodedLength(text: string): number {
+  return new TextEncoder().encode(text).length;
+}
+
+/** Errors for an answer set too large to send: on each written answer, the
+ * only kind that can grow that large. The visitor's answers stay in the form. */
+function tooLongErrors(survey: Survey, responses: Record<string, JsonValue>): Record<string, string> {
+  const message = "These answers are too long to send together. Shorten this one and send again.";
+  const errors: Record<string, string> = {};
+  for (const question of survey.questions) {
+    const answer = responses[question.id];
+    if (question.kind === "open_text" && typeof answer === "string" && answer.length > 0) {
+      errors[question.id] = message;
+    }
+  }
+  const first = survey.questions[0];
+  if (Object.keys(errors).length === 0 && first) errors[first.id] = message;
+  return errors;
 }
 
 function defaultStorage(): Pick<Storage, "getItem" | "setItem"> | null {

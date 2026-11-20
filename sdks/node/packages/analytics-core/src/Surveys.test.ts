@@ -145,6 +145,77 @@ describe("Surveys", () => {
     expect(onError).toHaveBeenCalledOnce();
   });
 
+  it("tries again after a failure, waiting longer each time", async () => {
+    let now = 1_000_000;
+    let status = 503;
+    const fetch = vi.fn(async () =>
+      new Response(JSON.stringify({ surveys: [nps] }), { status, headers: { "Content-Type": "application/json" } })
+    );
+    const surveys = new Surveys({ fetch, onEvent: () => undefined, onError: () => undefined, storage: memoryStorage(), now: () => now });
+    await surveys.load();
+    expect(surveys.status).toBe("error");
+    // Inside the first 15 seconds a navigation does not hit the endpoint again.
+    now += 14_000;
+    await surveys.load();
+    expect(fetch).toHaveBeenCalledTimes(1);
+    now += 1_000;
+    await surveys.load();
+    expect(fetch).toHaveBeenCalledTimes(2);
+    // The second failure waits 30 seconds.
+    now += 29_000;
+    await surveys.load();
+    expect(fetch).toHaveBeenCalledTimes(2);
+    status = 200;
+    now += 1_000;
+    await surveys.load();
+    expect(fetch).toHaveBeenCalledTimes(3);
+    expect(surveys.status).toBe("ready");
+    expect(surveys.eligible("/").map((s) => s.id)).toEqual([1]);
+  });
+
+  it("drops surveys fetched for a previous context", async () => {
+    let release: (() => void) | undefined;
+    const bodies: unknown[] = [];
+    const fetch = vi.fn(async (_url: string, init?: RequestInit) => {
+      const body = JSON.parse(init?.body as string) as { key?: string };
+      bodies.push(body);
+      if (body.key === undefined) await new Promise<void>((resolve) => (release = resolve));
+      const list = body.key === undefined ? [nps] : [checkout];
+      return new Response(JSON.stringify({ surveys: list }), { status: 200, headers: { "Content-Type": "application/json" } });
+    });
+    const surveys = new Surveys({ fetch: fetch as unknown as typeof globalThis.fetch, onEvent: () => undefined, storage: memoryStorage() });
+    const anonymous = surveys.load();
+    await vi.waitFor(() => expect(release).toBeDefined());
+    surveys.setContext("user-1", { plan: "pro" });
+    await surveys.load();
+    release?.();
+    await anonymous;
+    // The anonymous answer arrived last but is for someone else.
+    expect(surveys.all().map((s) => s.id)).toEqual([2]);
+    expect(bodies[1]).toEqual({ key: "user-1", attributes: { plan: "pro" } });
+  });
+
+  it("keeps the form open when the answers are too large to send", () => {
+    const onEvent = vi.fn();
+    const long: Survey = {
+      id: 3,
+      name: "Long",
+      questions: Array.from({ length: 12 }, (_, i) => ({ id: `q${i}`, kind: "open_text" as const, prompt: `Q${i}` })),
+      display: { once_per_visitor: false },
+    };
+    const surveys = new Surveys({ fetch: served([]), onEvent, storage: memoryStorage() });
+    // 2,000 three-byte characters per answer: about 72 KB, over the limit.
+    const answers = Object.fromEntries(long.questions.map((q) => [q.id, "调".repeat(2000)]));
+    const result = surveys.submit(long, answers);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(Object.keys(result.errors)).toHaveLength(12);
+    expect(onEvent).not.toHaveBeenCalled();
+    // Shortened, it is sent.
+    const shorter = Object.fromEntries(long.questions.map((q) => [q.id, "调".repeat(1000)]));
+    expect(surveys.submit(long, shorter)).toEqual({ ok: true });
+    expect(onEvent).toHaveBeenCalledOnce();
+  });
+
   it("never fetches when disabled", async () => {
     const fetch = served([nps]);
     const surveys = new Surveys({ fetch, onEvent: () => undefined, disabled: true });

@@ -13,8 +13,10 @@ import {
   hasErrors,
   nextQuestionId,
   percentOf,
+  percentText,
   statusActions,
   validateDraft,
+  windowEndingNow,
 } from './survey-form'
 
 describe('survey form', () => {
@@ -157,6 +159,30 @@ describe('survey form', () => {
       'On /checkout/*, after "checkout_completed", 25% of visitors, where beta = "test"'
     )
   })
+
+  test('a tiny sample rate survives an unrelated edit', () => {
+    const draft = {
+      ...emptyDraft(),
+      name: 'Renamed',
+      samplePercent: percentText(0.0001),
+      storedSampleRate: 0.0001,
+    }
+    expect(draft.samplePercent).toBe('0.01')
+    expect(draftToBody(draft).targeting.sample_rate).toBe(0.0001)
+    // A rate that does not divide neatly is still sent back as stored.
+    const third = {
+      ...emptyDraft(),
+      name: 'Third',
+      samplePercent: percentText(1 / 3),
+      storedSampleRate: 1 / 3,
+    }
+    expect(draftToBody(third).targeting.sample_rate).toBe(1 / 3)
+    // Once the operator types a new value, that value is sent.
+    expect(
+      draftToBody({ ...draft, samplePercent: '5' }).targeting.sample_rate
+    ).toBe(0.05)
+    expect(percentText(0.07)).toBe('7')
+  })
 })
 
 describe('survey results helpers', () => {
@@ -166,6 +192,14 @@ describe('survey results helpers', () => {
       expect(actions.length).toBeGreaterThan(0)
       expect(actions.some((a) => a.to === status)).toBe(false)
     }
+  })
+
+  test('the results window ends when it is requested', () => {
+    const now = new Date('2026-11-20T12:00:00Z')
+    expect(windowEndingNow(7, now)).toEqual({
+      start_date: '2026-11-13T12:00:00.000Z',
+      end_date: '2026-11-20T12:00:00.000Z',
+    })
   })
 
   test('formats answers and percentages', () => {

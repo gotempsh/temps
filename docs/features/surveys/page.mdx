@@ -109,7 +109,7 @@ export function Providers({ children }: { children: React.ReactNode }) {
 }
 ```
 
-Pass your router's path so a survey for `/checkout/*` appears on client-side navigation. A survey with a `trigger_event` opens when you call `trackEvent` with that name. `visitorKey` (for example a signed-in user id) and `attributes` feed sampling and the flag condition.
+Pass your router's path so a survey for `/checkout/*` appears on client-side navigation. A survey with a `trigger_event` opens when you call `trackEvent` with that name. `visitorKey` (for example a signed-in user id) and `attributes` feed sampling and the flag condition. When either changes, for example when a user signs in, the surveys are fetched again for the new subject.
 
 ### Any page
 
@@ -132,7 +132,12 @@ if (survey) {
   const result = analytics.surveys.submit(survey, { nps: 9, why: 'Fast checkout' })
   if (!result.ok) console.log(result.errors) // per question id
 }
+
+// After sign-in: drop what was fetched for the anonymous visitor.
+analytics.surveys.setContext(user.id, { plan: user.plan })
 ```
+
+`submit` also refuses a set of answers too large for the event endpoint (48 KiB of answers), with an error on each written answer, so the visitor can shorten one and send again instead of losing them. If the surveys request fails, nothing is shown and a later `load()` tries again, 15 seconds after the first failure and up to 5 minutes apart after repeated ones.
 
 ---
 
