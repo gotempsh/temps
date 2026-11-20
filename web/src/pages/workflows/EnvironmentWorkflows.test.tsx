@@ -95,6 +95,25 @@ test('an environment without workflows shows how to connect an app, step by step
   expect(html).not.toContain('Copy the credential now')
 })
 
+test('a configured credential and a reachable app are marked done in the guide', () => {
+  const html = renderToStaticMarkup(
+    <MemoryRouter>
+      <QueryClientProvider
+        client={clientWith({
+          executor: { replicas: 1, configured: true },
+          credential: { configured: true, prefix: 'twf_abc' },
+          workflows: [],
+        })}
+      >
+        <WorkflowEnvironment projectId={1} environmentId={2} />
+      </QueryClientProvider>
+    </MemoryRouter>
+  )
+  expect(html).toContain('Rotate credential')
+  expect(html).toContain('Temps can reach your workflows.')
+  expect(html.match(/\(done\)/g)?.length).toBe(2)
+})
+
 test('workflows are listed with their state and counts and open their runs', () => {
   const html = renderToStaticMarkup(
     <MemoryRouter>

@@ -30,6 +30,7 @@ import { FixErrorWithAgentButton } from '@/components/ai/FixErrorWithAgentButton
 import { offersFixInList } from '@/components/ai/fix-error-with-agent'
 import { useGlobalPageInRange } from '@/hooks/useGlobalView'
 import { useWindowQuery } from '@/hooks/useWindowQuery'
+import { ObservabilitySetupGuide } from '@/components/observability/ObservabilitySetupGuide'
 
 export default function GlobalErrors() {
   const view = useGlobalView()
@@ -90,6 +91,11 @@ export default function GlobalErrors() {
         error={query.error}
         empty={!query.data?.data.length}
         retry={() => void query.refetch()}
+        setup={
+          !view.search && status === 'all' ? (
+            <ObservabilitySetupGuide kind="errors" projectId={view.projectId} />
+          ) : undefined
+        }
       >
         <div className="rounded-lg border">
           <Table>
