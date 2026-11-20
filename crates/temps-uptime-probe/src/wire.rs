@@ -117,7 +117,10 @@ mod tests {
         assert_eq!(outcome.status, ProbeStatus::Down);
         assert_eq!(outcome.response_time_ms, Some(2_000));
         let message = outcome.message.unwrap();
-        assert!(message.contains("db.example.com:5432") && message.contains("2000 ms"), "{message}");
+        assert!(
+            message.contains("db.example.com:5432") && message.contains("2000 ms"),
+            "{message}"
+        );
     }
 
     #[test]
