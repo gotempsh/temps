@@ -887,8 +887,10 @@ impl OperationTrendService {
         }
         let mut builder = BreakdownBuilder::new(service_name, span_name, attribute);
         for trace_id in &trace_ids {
-            let mut spans = self.storage.get_trace(project_id, trace_id).await?;
-            spans.truncate(BREAKDOWN_SPANS_PER_TRACE);
+            let spans = self
+                .storage
+                .get_trace_spans(project_id, trace_id, BREAKDOWN_SPANS_PER_TRACE)
+                .await?;
             builder.add_trace(&spans);
         }
         result.breakdown = builder.finish();

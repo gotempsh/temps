@@ -3263,3 +3263,48 @@ async fn test_query_spans_matches_a_request_path_with_or_without_its_query() {
         assert_eq!(found, vec!["p001", "p002", "p003"], "faceted: {faceted}");
     }
 }
+
+/// A bounded trace read returns the first spans by start time and no more.
+#[tokio::test]
+async fn test_get_trace_spans_reads_only_the_first_spans_of_a_trace() {
+    let Some((_db, storage)) = setup_storage().await else {
+        return;
+    };
+    let project_id = 32;
+    let base = Utc::now() - Duration::minutes(10);
+    let spans = (0..5)
+        .map(|index| {
+            let mut span = sample_span(
+                project_id,
+                "trace_bounded",
+                &format!("s{index}"),
+                None,
+                "SELECT row",
+                SpanKind::Client,
+                SpanStatusCode::Ok,
+                1.0,
+            );
+            span.start_time = base + Duration::seconds(index);
+            span.end_time = span.start_time + Duration::milliseconds(1);
+            span
+        })
+        .collect();
+    storage.store_spans(spans).await.unwrap();
+
+    let first: Vec<String> = storage
+        .get_trace_spans(project_id, "trace_bounded", 3)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|span| span.span_id)
+        .collect();
+    assert_eq!(first, vec!["s0", "s1", "s2"]);
+    assert_eq!(
+        storage
+            .get_trace(project_id, "trace_bounded")
+            .await
+            .unwrap()
+            .len(),
+        5
+    );
+}

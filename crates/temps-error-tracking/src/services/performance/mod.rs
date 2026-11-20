@@ -222,12 +222,11 @@ impl PerformanceScanner {
             .map_err(|error| format!("listing traces failed: {error}"))?;
         let (mut traces, mut findings, mut stored) = (0, 0, 0);
         for summary in summaries.into_iter().take(budget) {
-            let mut spans = self
+            let spans = self
                 .storage
-                .get_trace(project_id, &summary.trace_id)
+                .get_trace_spans(project_id, &summary.trace_id, MAX_SPANS_PER_TRACE)
                 .await
                 .map_err(|error| format!("reading trace {} failed: {error}", summary.trace_id))?;
-            spans.truncate(MAX_SPANS_PER_TRACE);
             traces += 1;
             let deployment_id = spans.iter().find_map(|span| span.deployment_id);
             let release = spans

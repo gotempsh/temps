@@ -1118,3 +1118,40 @@ async fn query_spans_matches_a_request_path_with_or_without_its_query() {
     found.sort();
     assert_eq!(found, vec!["p001", "p002", "p003"]);
 }
+
+/// A bounded trace read returns the first spans by start time and no more.
+#[tokio::test]
+async fn get_trace_spans_reads_only_the_first_spans_of_a_trace() {
+    let Some((storage, _probe, _c)) = setup().await else {
+        return;
+    };
+    let spans = (0..5)
+        .map(|index| {
+            span(
+                PROJECT,
+                "ffff5555",
+                &format!("s{index}"),
+                None,
+                "SELECT row",
+                "storefront",
+                SpanStatusCode::Ok,
+                10 - index,
+                1.0,
+                None,
+                &[],
+            )
+        })
+        .collect();
+    storage.store_spans(spans).await.expect("store spans");
+
+    let first = storage
+        .get_trace_spans(PROJECT, "ffff5555", 3)
+        .await
+        .expect("bounded read");
+    assert_eq!(ids(&first), vec!["s0", "s1", "s2"]);
+    let all = storage
+        .get_trace(PROJECT, "ffff5555")
+        .await
+        .expect("whole trace");
+    assert_eq!(all.len(), 5);
+}
