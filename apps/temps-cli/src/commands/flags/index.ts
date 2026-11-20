@@ -16,6 +16,7 @@ import {
   setFlagRules,
   reshuffleFlag,
   evaluateFlag,
+  getProject,
   getProjectBySlug,
   getEnvironments,
 } from '../../api/sdk.gen.js'
@@ -199,17 +200,26 @@ export function registerFlagsCommands(program: Command): void {
 // Helpers
 // ============================================================================
 
+/** `--project` accepts a slug or a numeric id, as its help says. */
+export function projectLookup(reference: string): { id: number } | { slug: string } {
+  return /^\d+$/.test(reference) ? { id: Number.parseInt(reference, 10) } : { slug: reference }
+}
+
 async function resolveProject(projectOption?: string): Promise<{ slug: string; id: number }> {
   const resolved = await requireProjectSlug(projectOption)
   if (resolved.source !== 'flag') {
     info(`Using project ${colors.bold(resolved.slug)} (from ${resolved.source})`)
   }
 
-  const { data, error } = await getProjectBySlug({ client, path: { slug: resolved.slug } })
+  const lookup = projectLookup(resolved.slug)
+  const { data, error } =
+    'id' in lookup
+      ? await getProject({ client, path: { id: lookup.id } })
+      : await getProjectBySlug({ client, path: { slug: lookup.slug } })
   if (error || !data) {
     throw new Error(`Project "${resolved.slug}" not found`)
   }
-  return { slug: resolved.slug, id: data.id }
+  return { slug: data.slug, id: data.id }
 }
 
 async function resolveEnvironmentId(projectId: number, nameOrSlug: string): Promise<number> {

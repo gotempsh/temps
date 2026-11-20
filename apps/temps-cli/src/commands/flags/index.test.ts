@@ -4,6 +4,7 @@
 import { test, expect, describe } from 'bun:test'
 import {
   parseValue,
+  projectLookup,
   assertValueType,
   formatValue,
   effectiveValue,
@@ -257,5 +258,12 @@ describe('describeReason', () => {
   test('numbers rules from one', () => {
     expect(describeReason({ kind: 'PERCENTAGE_ROLLOUT', index: 1 })).toContain('rule 2')
     expect(describeReason({ kind: 'DEFAULT' })).toContain('default')
+  })
+})
+
+describe('project lookup', () => {
+  test('--project takes a numeric id or a slug', () => {
+    expect(projectLookup('42')).toEqual({ id: 42 })
+    expect(projectLookup('shop-2')).toEqual({ slug: 'shop-2' })
   })
 })
