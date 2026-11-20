@@ -27,3 +27,13 @@ export {
 } from "./AutoTracking";
 export { enableCookielessIdentity, isCookielessIdentity } from "./identity";
 export { createAnalytics } from "./Analytics";
+export {
+  FeatureFlags,
+  exposureEventData,
+  type FeatureFlagsOptions,
+  type FlagContext,
+  type FlagEvaluation,
+  type FlagExposure,
+  type FlagReason,
+  type FlagsStatus,
+} from "./FeatureFlags";

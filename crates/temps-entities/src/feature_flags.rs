@@ -22,7 +22,7 @@ use sea_orm::{ActiveValue::Set, ConnectionTrait, DbErr};
 use serde::{Deserialize, Serialize};
 use temps_core::DBDateTime;
 
-#[derive(Clone, Debug, PartialEq, DeriveEntityModel, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "feature_flags")]
 pub struct Model {
     #[sea_orm(primary_key)]
@@ -61,6 +61,13 @@ pub struct Model {
     /// carries every flag in the environment, so stamping on fetch would make
     /// unreferenced flags look freshly used and defeat the whole point.
     pub last_evaluated_at: Option<DBDateTime>,
+    /// Named values targeting rules may serve (`[{key, value, description?}]`).
+    /// `[]` for a flag without variants.
+    pub variants: Json,
+    /// Share of subjects, `0..=1`, whose browser records a `flag_exposure`
+    /// event on reading this flag. `0` means off, the default: exposure is
+    /// high volume and opt-in per flag.
+    pub exposure_sample_rate: f64,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
 }

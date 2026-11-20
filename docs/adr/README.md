@@ -54,7 +54,7 @@ the number of the ADR they belong to; they do not take a number of their own.
 | [031](./031-managed-dns-records-and-cloudflare-proxied-mode.md) | Managed DNS Records and Cloudflare Proxied Mode | Accepted |  |
 | [032](./032-postgres-datasource-tls-trust.md) | PostgreSQL Datasource TLS Trust and Downgrade Prevention | Proposed |  |
 | [033](./033-release-identity-for-symbolication.md) | Release identity invariant for error-tracking symbolication | Proposed |  |
-| [034](./034-feature-flags.md) | Feature Flags | Phase 1 implemented |  |
+| [034](./034-feature-flags.md) | Feature Flags | Phase 1 implemented | amended by [110](./110-product-analytics-gaps-against-posthog.md) |
 | [036](./036-persistent-workspace-sandboxes.md) | Persistent Workspace Sandboxes | Proposed |  |
 | [037](./037-subscription-agent-cli-providers.md) | Subscription-Backed Agent CLI Providers for Temps AI Workloads | Accepted |  |
 | [038](./038-interactive-tool-bridging-cli-chat.md) | Interactive Tool Bridging for Subscription-CLI AI Chat | Accepted |  |
@@ -127,6 +127,7 @@ the number of the ADR they belong to; they do not take a number of their own.
 | [106](./106-durable-workflows.md) | Durable workflows orchestrated by Temps | Proposed |  |
 | [107](./107-control-plane-tunnel-connectors.md) | The control plane runs tunnel connectors for the apps it serves | Proposed | amends [058](./058-ingress-modes-and-a-shared-app-domain.md) |
 | [109](./109-web-analytics-gaps-against-plausible.md) | What web analytics is missing to match Plausible | Proposed |  |
+| [110](./110-product-analytics-gaps-against-posthog.md) | What product analytics is missing to match PostHog | Accepted | amends [034](./034-feature-flags.md) |
 | [111](./111-error-tracking-gaps-against-sentry.md) | What error tracking and performance are missing to match Sentry | Proposed |  |
 
 ## Supporting documents

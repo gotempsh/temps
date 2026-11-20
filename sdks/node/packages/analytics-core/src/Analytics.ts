@@ -19,6 +19,7 @@ import {
   setupLinkTracking,
 } from "./AutoTracking";
 import { enableCookielessIdentity, isCookielessIdentity, onCookielessIdentity } from "./identity";
+import { exposureEventData, FeatureFlags } from "./FeatureFlags";
 
 interface InternalCleanup {
   (): void;
@@ -50,6 +51,7 @@ export function createAnalytics(options: AnalyticsOptions = {}): AnalyticsApi {
     fileDownloadExtensions,
     autoTrackNotFound = true,
     cookieless = false,
+    flags: flagOptions = {},
   } = options;
 
   const cleanups: InternalCleanup[] = [];
@@ -118,6 +120,18 @@ export function createAnalytics(options: AnalyticsOptions = {}): AnalyticsApi {
     );
     notFoundWatcher?.afterPageview();
   };
+
+  // Flags work wherever the page is served by Temps, including when
+  // analytics is off for localhost; only `disabled` turns them off. Exposure
+  // events need analytics, so they are only sent when it is on.
+  const flags = new FeatureFlags({
+    ...flagOptions,
+    basePath,
+    disabled,
+    onExposure: (exposure) => {
+      if (enabled) void trackEvent("flag_exposure", exposureEventData(exposure));
+    },
+  });
 
   const identify: AnalyticsApi["identify"] = async () => {
     // Placeholder for SDK parity; implement when identity endpoint is available.
@@ -204,6 +218,7 @@ export function createAnalytics(options: AnalyticsOptions = {}): AnalyticsApi {
       return enabled;
     },
     ingestKey,
+    flags,
     trackEvent,
     trackPageview,
     trackNotFound,

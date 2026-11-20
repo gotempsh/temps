@@ -51,6 +51,7 @@ import {
   flagErrorMessage,
   formatFlagValue,
   resolveEffectiveValue,
+  type ValueSource,
 } from './flag-value'
 
 interface ProjectFeatureFlagsProps {
@@ -396,10 +397,28 @@ function FlagRow({
                 Archived
               </Badge>
             )}
+            {enabled && (override?.rules?.length ?? 0) > 0 && (
+              <Badge
+                variant="outline"
+                className="shrink-0"
+                title="Some users get a different value: the value shown is for users who match no rule"
+              >
+                {override?.rules?.length === 1
+                  ? '1 rule'
+                  : `${override?.rules?.length} rules`}
+              </Badge>
+            )}
           </div>
           {flag.description && (
             <span className="truncate text-xs text-muted-foreground">
               {flag.description}
+            </span>
+          )}
+          {/* The Source column is hidden below sm; this warning is needed to
+              act, so it moves under the name there. */}
+          {effective.source === 'invalid-rules' && (
+            <span className="text-xs text-destructive sm:hidden">
+              Rules unreadable: the default value is served
             </span>
           )}
         </div>
@@ -473,11 +492,18 @@ function FlagRow({
   )
 }
 
-function SourceBadge({
-  source,
-}: {
-  source: 'override' | 'default' | 'disabled'
-}) {
+function SourceBadge({ source }: { source: ValueSource }) {
+  if (source === 'invalid-rules') {
+    return (
+      <Badge
+        variant="outline"
+        className="text-destructive"
+        title="This environment's stored rules cannot be read — the default value is served until they are replaced"
+      >
+        Rules unreadable
+      </Badge>
+    )
+  }
   if (source === 'disabled') {
     return (
       <Badge

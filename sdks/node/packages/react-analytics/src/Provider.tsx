@@ -12,9 +12,11 @@ import { SessionRecorder } from "./SessionRecorder";
 import { SessionRecordingProvider, useSessionRecordingControl } from "./useSessionRecording";
 import { DEFAULT_BASE_PATH } from "./constants";
 import {
+  FeatureFlags,
   NOT_FOUND_EVENT,
   NotFoundMarkerWatcher,
   enableCookielessIdentity,
+  exposureEventData,
   isCookielessIdentity,
   notFoundEventData,
   setupLinkTracking,
@@ -43,6 +45,7 @@ export function TempsAnalyticsProvider({
   fileDownloadExtensions,
   autoTrackNotFound = true,
   cookieless = false,
+  flags: flagOptions,
   children,
 }: TempsAnalyticsProviderProps): ReactElement {
   // Cookieless mode (ADR 109 D3) is switched on during render, not in an
@@ -297,9 +300,42 @@ export function TempsAnalyticsProvider({
   // Session recording control
   const { isEnabled: isRecordingEnabled } = useSessionRecordingControl(enableSessionRecording);
 
+  // One flags client for the provider's lifetime. Exposure events go
+  // through the latest `trackEvent`, so they respect `enabled` as it changes.
+  const trackEventRef = useRef(trackEvent);
+  trackEventRef.current = trackEvent;
+  const flagsRef = useRef<FeatureFlags | null>(null);
+  if (flagsRef.current === null) {
+    flagsRef.current = new FeatureFlags({
+      ...flagOptions,
+      basePath,
+      disabled,
+      onExposure: (exposure) => {
+        void trackEventRef.current("flag_exposure", exposureEventData(exposure));
+      },
+    });
+  }
+  const flags = flagsRef.current;
+
+  // The client is created once, so later prop changes are applied to it: a
+  // provider that starts disabled can be enabled, and a sign-in that changes
+  // `flags={{ key, attributes }}` re-evaluates with the new context.
+  useEffect(() => {
+    flags.setDisabled(disabled);
+  }, [flags, disabled]);
+  const flagContext = JSON.stringify({ key: flagOptions?.key, attributes: flagOptions?.attributes });
+  const appliedContext = useRef(flagContext);
+  useEffect(() => {
+    if (appliedContext.current === flagContext) return;
+    appliedContext.current = flagContext;
+    flags.setContext({ key: flagOptions?.key, attributes: flagOptions?.attributes });
+    // `flagContext` is the serialized form of the two options read here.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [flags, flagContext]);
+
   const value = useMemo<AnalyticsContextValue>(
-    () => ({ trackEvent, identify, trackPageview, trackNotFound, enabled }),
-    [trackEvent, identify, trackPageview, trackNotFound, enabled]
+    () => ({ trackEvent, identify, trackPageview, trackNotFound, enabled, flags }),
+    [trackEvent, identify, trackPageview, trackNotFound, enabled, flags]
   );
 
   return (
