@@ -1361,6 +1361,22 @@ mod tests {
             .await;
         assert_eq!(bad_line.status_code(), StatusCode::BAD_REQUEST);
 
+        // Every slot taken: refused at once with a retry hint, body unread.
+        {
+            let service = ctx.app_state.ingest_service.clone();
+            let held: Vec<_> = (0..crate::ingest::service::MAX_CONCURRENT_INGEST_REQUESTS)
+                .map(|_| service.try_admit_request().expect("a free slot"))
+                .collect();
+            let busy = collector
+                .post("/logs/ingest")
+                .add_header("authorization", format!("Bearer {key}"))
+                .text("{\"msg\":\"x\"}")
+                .await;
+            assert_eq!(busy.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(busy.header("retry-after").to_str().ok(), Some("1"));
+            drop(held);
+        }
+
         let now = Utc::now();
         let body = format!(
             "{{\"timestamp\":\"{}\",\"level\":\"error\",\"message\":\"payment failed\",\"service\":\"checkout\"}}\n\

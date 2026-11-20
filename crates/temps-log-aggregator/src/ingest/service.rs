@@ -119,7 +119,16 @@ pub struct LogIngestService {
     last_used: Mutex<HashMap<i32, tokio::time::Instant>>,
     /// The revocation gates; see [`GateRegistry`].
     gates: Mutex<GateRegistry>,
+    /// Requests allowed to hold a body at once; see
+    /// [`MAX_CONCURRENT_INGEST_REQUESTS`].
+    requests: tokio::sync::Semaphore,
 }
+
+/// Ingest requests that may read and hold a body at the same time. Each
+/// holds at most [`ndjson::MAX_BODY_BYTES`] of input plus its parsed lines,
+/// so this bounds the receiver's memory on a small host; a request beyond
+/// it is refused at once with a retryable `503` rather than queued.
+pub const MAX_CONCURRENT_INGEST_REQUESTS: usize = 4;
 
 /// How long a key may send nothing before its streams are closed and its
 /// limiter and service names forgotten. The next batch reopens them.
@@ -216,6 +225,7 @@ impl LogIngestService {
             services: Mutex::new(HashMap::new()),
             last_used: Mutex::new(HashMap::new()),
             gates: Mutex::new(GateRegistry::new(Instant::now())),
+            requests: tokio::sync::Semaphore::new(MAX_CONCURRENT_INGEST_REQUESTS),
         }
     }
 
@@ -319,6 +329,20 @@ impl LogIngestService {
                 Err(authentication_timed_out())
             }
         }
+    }
+
+    /// Whether `presented` is an active key, before the request's body is
+    /// read, so an unauthenticated caller never makes the receiver buffer
+    /// a body. [`Self::ingest`] checks again; the second check is a cache hit.
+    pub async fn check_key(&self, presented: &str) -> Result<(), LogAggregatorError> {
+        self.authenticate(presented).await.map(|_| ())
+    }
+
+    /// A slot to read and ingest one body, or `None` when
+    /// [`MAX_CONCURRENT_INGEST_REQUESTS`] are already in flight. Hold it
+    /// until the body has been stored.
+    pub fn try_admit_request(&self) -> Option<tokio::sync::SemaphorePermit<'_>> {
+        self.requests.try_acquire().ok()
     }
 
     /// Ingest one request body sent with `presented` as its key.
@@ -691,6 +715,27 @@ mod tests {
         tokio::time::advance(IDLE_KEY_RETIREMENT / 2).await;
         assert_eq!(service.retire_idle_keys(IDLE_KEY_RETIREMENT).await, 0);
         assert!(writer.1.lock().expect("closed lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn requests_beyond_the_limit_are_refused_until_one_finishes() {
+        let (service, _writer) = service(IngestLimits::UNLIMITED);
+        let held: Vec<_> = (0..MAX_CONCURRENT_INGEST_REQUESTS)
+            .map(|_| service.try_admit_request().expect("a free slot"))
+            .collect();
+        assert!(service.try_admit_request().is_none(), "the limit holds");
+        drop(held);
+        assert!(service.try_admit_request().is_some(), "a slot frees up");
+    }
+
+    #[tokio::test]
+    async fn a_key_is_checked_without_a_body() {
+        let (service, _writer) = service(IngestLimits::UNLIMITED);
+        service.check_key("good").await.expect("an active key");
+        assert!(matches!(
+            service.check_key("bad").await,
+            Err(LogAggregatorError::IngestKeyRejected)
+        ));
     }
 
     #[tokio::test]

@@ -66736,6 +66736,10 @@ export type IngestLogsErrors = {
      * Internal server error
      */
     500: ProblemDetails;
+    /**
+     * Too many ingest requests in flight; retry after the Retry-After delay
+     */
+    503: ProblemDetails;
 };
 
 export type IngestLogsError = IngestLogsErrors[keyof IngestLogsErrors];

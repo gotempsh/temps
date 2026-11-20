@@ -14,7 +14,7 @@
 use std::sync::Arc;
 
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, Path, Query, State};
+use axum::extract::{DefaultBodyLimit, FromRequest, Path, Query, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -34,6 +34,7 @@ use temps_entities::log_ingest_keys::Model as KeyModel;
 use crate::error::LogAggregatorError;
 use crate::handlers::types::LogAggregatorAppState;
 use crate::ingest::ndjson::MAX_BODY_BYTES;
+use crate::ingest::service::MAX_CONCURRENT_INGEST_REQUESTS;
 use crate::ingest::{LogIngestService, NewLogIngestKey};
 
 /// Header a collector may use instead of `Authorization: Bearer`.
@@ -243,15 +244,16 @@ fn presented_key(headers: &HeaderMap) -> Option<&str> {
         (status = 413, description = "Body too large", body = ProblemDetails),
         (status = 415, description = "Compressed body", body = ProblemDetails),
         (status = 429, description = "The project's log ingestion budget is exhausted", body = ProblemDetails),
+        (status = 503, description = "Too many ingest requests in flight; retry after the Retry-After delay", body = ProblemDetails),
         (status = 500, description = "Internal server error", body = ProblemDetails)
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn ingest_logs(
     State(ingest_service): State<Arc<LogIngestService>>,
-    headers: HeaderMap,
-    body: Bytes,
+    request: Request,
 ) -> Response {
+    let headers = request.headers().clone();
     let Some(key) = presented_key(&headers) else {
         return Problem::from(LogAggregatorError::IngestKeyRejected).into_response();
     };
@@ -269,6 +271,31 @@ pub async fn ingest_logs(
                 .into_response();
         }
     }
+    // The key is checked and a slot taken before the body is read, so a
+    // caller without a key, or a burst of uploads, cannot make the receiver
+    // buffer bodies without bound.
+    if let Err(error) = ingest_service.check_key(key).await {
+        return Problem::from(error).into_response();
+    }
+    let Some(_slot) = ingest_service.try_admit_request() else {
+        let mut response = temps_core::problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+            .with_title("Log Ingest Busy")
+            .with_detail(format!(
+                "{MAX_CONCURRENT_INGEST_REQUESTS} log ingest requests are already being stored; \
+                 retry the batch shortly"
+            ))
+            .into_response();
+        response
+            .headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+        return response;
+    };
+    // Reads the body under the route's `DefaultBodyLimit`, answering 413
+    // past it exactly as the `Bytes` extractor would.
+    let body = match Bytes::from_request(request, &()).await {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
+    };
     match ingest_service.ingest(key, &body).await {
         Ok(outcome) => (
             StatusCode::ACCEPTED,

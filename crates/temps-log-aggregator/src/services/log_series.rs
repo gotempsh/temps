@@ -142,9 +142,17 @@ fn contributes_to(metric: &Metric) -> Option<AttrPredicate> {
     }
 }
 
+/// Buckets needed to cover `[start, end)`, rounding up on the whole
+/// difference: an end a fraction of a second past a boundary still gets the
+/// bucket its last lines fall in.
 fn bucket_count(start: DateTime<Utc>, end: DateTime<Utc>, bucket_secs: u32) -> usize {
-    let span = (end - start).num_seconds().max(1);
-    let width = i64::from(bucket_secs.max(1));
+    let width = i64::from(bucket_secs.max(1)) * 1_000_000;
+    // Windows are bounded far below the microsecond range of an i64; the
+    // fallback only keeps a wild input from wrapping.
+    let span = (end - start)
+        .num_microseconds()
+        .unwrap_or_else(|| (end - start).num_seconds().saturating_mul(1_000_000))
+        .max(1);
     usize::try_from((span + width - 1) / width).unwrap_or(0)
 }
 
@@ -1362,6 +1370,20 @@ mod tests {
         assert_eq!(values, vec![Some(3.0), Some(0.0), Some(7.0)]);
         assert_eq!(series.method, LogSeriesMethod::Index);
         assert_eq!(store.calls(), 0, "no message was read");
+    }
+
+    #[test]
+    fn a_fractional_end_keeps_its_last_bucket() {
+        let start = t0();
+        let end = t0() + Duration::hours(1) + Duration::milliseconds(500);
+        assert_eq!(bucket_count(start, end, 60), 61);
+        let last = t0() + Duration::hours(1) + Duration::milliseconds(200);
+        assert_eq!(bucket_slot(start, end, 60, last), Some(60));
+        assert_eq!(
+            bucket_count(start, t0() + Duration::hours(1), 60),
+            60,
+            "an end on a boundary adds nothing"
+        );
     }
 
     fn three_and_five() -> FakeIndex {
