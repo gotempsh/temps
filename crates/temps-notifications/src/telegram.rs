@@ -298,7 +298,9 @@ impl TelegramProvider {
             severity_label(severity),
         );
 
-        let message = notification.message.trim();
+        // Rich notifications keep HTML in `message` for email and put the
+        // readable alternative in `text_body`, as Slack and webhooks use it.
+        let message = notification.text_body().trim();
         if !message.is_empty() {
             text.push_str("\n\n");
             text.push_str(&html_escape(&truncate_chars(message, MESSAGE_MAX_CHARS)));
@@ -601,6 +603,31 @@ mod tests {
         assert!(!html.contains("svg"), "{html}");
         // Sorted rows render deterministically.
         assert!(html.find("Environment").unwrap() < html.find("Project Slug").unwrap());
+    }
+
+    #[test]
+    fn render_html_uses_the_readable_body_of_a_rich_notification() {
+        let rich = Notification::new(
+            "Weekly digest",
+            "<html><body><table><tr><td>Deployments</td></tr></table></body></html>",
+        )
+        .with_metadata(
+            "text_body",
+            "Deployments: 3\nhttps://temps.example/projects",
+        );
+        let html = TelegramProvider::render_html(&rich);
+        assert!(
+            html.contains("Deployments: 3\nhttps://temps.example/projects"),
+            "{html}"
+        );
+        assert!(!html.contains("&lt;table&gt;"), "{html}");
+        assert!(!html.contains("Text Body"), "{html}");
+
+        // A blank alternative falls back to the message itself.
+        let blank = Notification::new("Deploy failed", "Build exited with code 1")
+            .with_metadata("text_body", "   ");
+        let html = TelegramProvider::render_html(&blank);
+        assert!(html.contains("Build exited with code 1"), "{html}");
     }
 
     #[test]
