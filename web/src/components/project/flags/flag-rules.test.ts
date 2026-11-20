@@ -12,6 +12,7 @@ import {
   parseAttributeLines,
   parseOperand,
   referencedVariants,
+  setSplitWeight,
   validateRule,
   validateVariantKey,
   type FlagRule,
@@ -274,5 +275,40 @@ describe('drafts', () => {
     }
     const result = fromDraft(draft, 'number', variants, 2)
     expect(result.ok).toBe(false)
+  })
+})
+
+describe('setSplitWeight', () => {
+  test('keeps the saved arm order, so a small edit moves few subjects', () => {
+    const saved = [
+      { variant: 'test', weight: 50 },
+      { variant: 'control', weight: 50 },
+    ]
+    expect(setSplitWeight(saved, 'test', 51)).toEqual([
+      { variant: 'test', weight: 51 },
+      { variant: 'control', weight: 50 },
+    ])
+    expect(setSplitWeight(saved, 'control', 49)).toEqual([
+      { variant: 'test', weight: 50 },
+      { variant: 'control', weight: 49 },
+    ])
+  })
+
+  test('appends a new arm and drops arms left at zero', () => {
+    const saved = [
+      { variant: 'b', weight: 60 },
+      { variant: 'a', weight: 40 },
+    ]
+    expect(setSplitWeight(saved, 'c', 10)).toEqual([
+      ...saved,
+      { variant: 'c', weight: 10 },
+    ])
+    expect(setSplitWeight(saved, 'a', 0)).toEqual([
+      { variant: 'b', weight: 60 },
+      { variant: 'a', weight: 0 },
+    ])
+    expect(setSplitWeight(setSplitWeight(saved, 'a', 0), 'b', 100)).toEqual([
+      { variant: 'b', weight: 100 },
+    ])
   })
 })
