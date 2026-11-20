@@ -4,6 +4,8 @@
 pub mod activity_handler;
 pub mod alert_rules_handler;
 pub mod assignee_handler;
+/// Attachments of events and feedback (ADR 111, D4).
+pub mod attachment_handler;
 pub mod audit;
 pub mod group_workflow_handler;
 pub mod handler;

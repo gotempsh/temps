@@ -38,6 +38,8 @@
 //! Validate on ingestion (providers/sentry.rs)
 //! ```
 
+/// Attachment items: files sent with events and feedback (ADR 111, D4).
+pub mod attachments;
 pub mod dsn_handlers;
 pub mod dsn_service;
 pub mod envelope;

@@ -437,6 +437,23 @@ impl TempsPlugin for ErrorTrackingPlugin {
                 .require_service::<ErrorTrackingService>()
                 .release_health
                 .start(sink);
+            // Attachments (ADR 111, D4) live in the project's blob storage.
+            // Without it they are dropped at ingest, and the usage endpoint
+            // says Blob storage is what is missing.
+            let attachments = context
+                .require_service::<ErrorTrackingService>()
+                .attachments
+                .clone();
+            match context.get_service::<dyn temps_core::PayloadBlobStore>() {
+                Some(store) => {
+                    attachments.set_store(store);
+                    attachments.start();
+                    tracing::debug!("Attachment uploader and sweeper started");
+                }
+                None => tracing::info!(
+                    "Blob storage not available - attachments sent by SDKs will be dropped"
+                ),
+            }
             // Performance issues (ADR 111, D2) read stored traces. Without
             // the OTel plugin there are no traces, so the scanner does not
             // start and the status endpoint says why.
@@ -564,6 +581,9 @@ impl TempsPlugin for ErrorTrackingPlugin {
 
         schema
             .merge(<crate::handlers::feedback_handler::FeedbackApiDoc as OpenApiTrait>::openapi());
+        schema.merge(
+            <crate::handlers::attachment_handler::AttachmentApiDoc as OpenApiTrait>::openapi(),
+        );
         schema.merge(<crate::handlers::release_handler::ReleaseApiDoc as OpenApiTrait>::openapi());
         schema.merge(
             <crate::handlers::release_health_handler::ReleaseHealthApiDoc as OpenApiTrait>::openapi(

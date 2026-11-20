@@ -147,6 +147,16 @@ pub enum ErrorTrackingError {
     #[error("Error event not found")]
     EventNotFound,
 
+    /// An attachment id that is not one of the project's, or whose stored
+    /// object is gone (ADR 111, D4). Maps to HTTP 404 Not Found.
+    #[error("Attachment {attachment_id} not found in project {project_id}")]
+    AttachmentNotFound { project_id: i32, attachment_id: i64 },
+
+    /// Blob storage is not set up or cannot be reached, so an attachment
+    /// cannot be read or deleted. Maps to HTTP 503 Service Unavailable.
+    #[error("Attachment storage is unavailable for project {project_id}: {reason}")]
+    AttachmentStorageUnavailable { project_id: i32, reason: String },
+
     #[error("Invalid fingerprint")]
     InvalidFingerprint,
 

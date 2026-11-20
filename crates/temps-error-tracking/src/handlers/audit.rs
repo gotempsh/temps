@@ -870,3 +870,61 @@ mod tests {
         );
     }
 }
+
+/// Audit event for deleting an attachment (ADR 111, D4). Identifiers and
+/// size only: the file name is what the SDK sent and may name a user.
+#[derive(Debug, Clone, Serialize)]
+pub struct ErrorAttachmentDeletedAudit {
+    pub context: AuditContext,
+    pub project_id: i32,
+    pub attachment_id: i64,
+    /// `error` or `feedback`.
+    pub owner_kind: String,
+    pub owner_id: i64,
+    pub size_bytes: i64,
+}
+
+impl AuditOperation for ErrorAttachmentDeletedAudit {
+    fn operation_type(&self) -> String {
+        "ERROR_ATTACHMENT_DELETED".into()
+    }
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
+    }
+}
+
+/// Audit event for changing a project's attachment quota (ADR 111, D4).
+#[derive(Debug, Clone, Serialize)]
+pub struct ErrorAttachmentQuotaAudit {
+    pub context: AuditContext,
+    pub project_id: i32,
+    pub previous_quota_bytes: i64,
+    pub quota_bytes: i64,
+}
+
+impl AuditOperation for ErrorAttachmentQuotaAudit {
+    fn operation_type(&self) -> String {
+        "ERROR_ATTACHMENT_QUOTA_UPDATED".into()
+    }
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
+    }
+}

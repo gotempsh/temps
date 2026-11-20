@@ -61,6 +61,7 @@ pub struct ErrorTrackingApiDoc;
 pub fn configure_routes() -> Router<Arc<AppState>> {
     Router::new()
         .merge(super::feedback_handler::routes())
+        .merge(super::attachment_handler::routes())
         .merge(super::group_workflow_handler::routes())
         .merge(super::assignee_handler::routes())
         .merge(super::activity_handler::routes())
@@ -452,6 +453,25 @@ impl From<ErrorTrackingError> for temps_core::problemdetails::Problem {
                 .value("group_id", group_id)
                 .value("merged_into_group_id", merged_into_group_id)
                 .build(),
+            ErrorTrackingError::AttachmentNotFound {
+                project_id,
+                attachment_id,
+            } => temps_core::error_builder::ErrorBuilder::new(StatusCode::NOT_FOUND)
+                .type_("https://temps.sh/probs/error-attachment-not-found")
+                .title("Attachment Not Found")
+                .detail(err.to_string())
+                .value("project_id", project_id)
+                .value("attachment_id", attachment_id)
+                .build(),
+            ErrorTrackingError::AttachmentStorageUnavailable { project_id, .. } => {
+                temps_core::error_builder::ErrorBuilder::new(StatusCode::SERVICE_UNAVAILABLE)
+                    .type_("https://temps.sh/probs/error-attachment-storage-unavailable")
+                    .title("Attachment Storage Unavailable")
+                    .detail(err.to_string())
+                    .value("project_id", project_id)
+                    .value("setup_path", "/storage")
+                    .build()
+            }
             ErrorTrackingError::InboundFilterNotFound {
                 project_id,
                 filter_id,
@@ -577,8 +597,12 @@ impl axum::response::IntoResponse for ErrorTrackingError {
             | ErrorTrackingError::CommentNotFound { .. }
             | ErrorTrackingError::SavedSearchNotFound { .. }
             | ErrorTrackingError::InboundFilterNotFound { .. }
+            | ErrorTrackingError::AttachmentNotFound { .. }
             | ErrorTrackingError::FingerprintsNotInGroup { .. } => {
                 (StatusCode::NOT_FOUND, self.to_string())
+            }
+            ErrorTrackingError::AttachmentStorageUnavailable { .. } => {
+                (StatusCode::SERVICE_UNAVAILABLE, self.to_string())
             }
             ErrorTrackingError::GroupAlreadyMerged { .. }
             | ErrorTrackingError::GroupIsMergeTarget { .. }
