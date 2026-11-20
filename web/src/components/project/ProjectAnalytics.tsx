@@ -20,6 +20,7 @@ import {
   CookielessFactLine,
   VisitorIdentityCard,
 } from '@/components/analytics/VisitorIdentityCard'
+import { IdentifyUsersCard } from '@/components/analytics/IdentifyUsersCard'
 
 import { DateTimeRange } from '@/components/ui/date-time-range'
 
@@ -1167,6 +1168,7 @@ export function ProjectAnalytics({ project }: ProjectAnalyticsProps) {
           <div className="space-y-6">
             <AnalyticsTrafficSettings project={project} />
             <VisitorIdentityCard project={project} />
+            <IdentifyUsersCard project={project} />
           </div>
         }
       />
