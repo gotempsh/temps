@@ -17,6 +17,9 @@
 //! whose entries expire after [`SESSION_IDLE`] without activity. A miss
 //! (first event, a restart, or another node) asks the database once for the
 //! visitor's last session inside the window, so a session survives both.
+//! When there is none, the new session's id is derived from the visitor and
+//! the 30-minute window it starts in, so two nodes that both see a visitor's
+//! first events before either is stored still pick the same session.
 //!
 //! Cost per event: one lock-free load of the in-memory salt, one hash and one
 //! cache lookup. The database is read once per node per day for the salt, and
@@ -124,6 +127,23 @@ pub fn derive_visitor_id(
     format!("{COOKIELESS_VISITOR_PREFIX}{}", hex::encode(&digest[..16]))
 }
 
+/// The id of a session `visitor_id` starts at `started_at`: a UUIDv5 of the
+/// project, the visitor and the [`SESSION_IDLE`] window containing the start.
+/// Nodes racing on a visitor's first events derive the same id. A later
+/// session of the same visitor always starts in a later window, since it
+/// begins at least [`SESSION_IDLE`] after the previous one started.
+pub fn derive_session_id(
+    project_id: i32,
+    visitor_id: &str,
+    started_at: chrono::DateTime<Utc>,
+) -> String {
+    let window = started_at
+        .timestamp()
+        .div_euclid(SESSION_IDLE.as_secs() as i64);
+    let name = format!("temps-cookieless-session:{project_id}:{visitor_id}:{window}");
+    uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, name.as_bytes()).to_string()
+}
+
 impl CookielessIdentity {
     pub fn new(db: Arc<DatabaseConnection>, encryption: Arc<EncryptionService>) -> Self {
         Self {
@@ -180,6 +200,7 @@ impl CookielessIdentity {
     ) -> Result<String, CookielessIdentityError> {
         let db = self.db.clone();
         let visitor = visitor_id.to_string();
+        let derived = derive_session_id(project_id, visitor_id, Utc::now());
         self.sessions
             .try_get_with((project_id, visitor_id.to_string()), async move {
                 let since = Utc::now() - chrono::Duration::minutes(30);
@@ -197,9 +218,7 @@ impl CookielessIdentity {
                     Some(row) => row.try_get::<Option<String>>("", "session_id")?,
                     None => None,
                 };
-                Ok::<_, sea_orm::DbErr>(
-                    existing.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-                )
+                Ok::<_, sea_orm::DbErr>(existing.unwrap_or(derived))
             })
             .await
             .map_err(|error| CookielessIdentityError::Session {
@@ -379,6 +398,30 @@ pub fn spawn_salt_sweep(identity: Arc<CookielessIdentity>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn racing_nodes_derive_the_same_new_session_and_a_later_session_differs() {
+        use chrono::TimeZone;
+        let start = Utc
+            .with_ymd_and_hms(2026, 11, 20, 10, 5, 0)
+            .single()
+            .expect("valid time");
+        let a = derive_session_id(7, "cl_abc", start);
+        // Another node, a few seconds later, inside the same window.
+        assert_eq!(
+            a,
+            derive_session_id(7, "cl_abc", start + chrono::Duration::seconds(20))
+        );
+        assert!(uuid::Uuid::parse_str(&a).is_ok(), "{a}");
+        // A new session starts at least SESSION_IDLE later: another window.
+        assert_ne!(
+            a,
+            derive_session_id(7, "cl_abc", start + chrono::Duration::minutes(30))
+        );
+        // Other visitors and projects never share it.
+        assert_ne!(a, derive_session_id(7, "cl_def", start));
+        assert_ne!(a, derive_session_id(8, "cl_abc", start));
+    }
 
     #[test]
     fn an_id_is_stable_within_a_salt_and_unrelated_across_salts() {
