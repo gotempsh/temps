@@ -3178,13 +3178,6 @@ export type AttachmentChunkUpload = {
     chunk: Blob | File;
 };
 
-/**
- * The attachments of an event or feedback, in the order the SDK sent them.
- */
-export type AttachmentList = {
-    data: Array<AttachmentView>;
-};
-
 export type AttachmentUploadStarted = {
     /**
      * The most bytes one chunk may carry.
@@ -3194,64 +3187,6 @@ export type AttachmentUploadStarted = {
      * Opaque id to send every chunk and the completion to.
      */
     upload_id: string;
-};
-
-/**
- * Whether attachments can be stored, and how much of the quota is used.
- */
-export type AttachmentUsage = {
-    /**
-     * Whether blob storage is set up and answering.
-     */
-    configured: boolean;
-    /**
-     * Since the server started: attachments dropped because the project
-     * was over its quota, across every project.
-     */
-    dropped_over_quota: number;
-    /**
-     * Since the server started: attachments dropped because the upload
-     * queue was full, across every project.
-     */
-    dropped_queue_full: number;
-    files: number;
-    max_attachment_bytes: number;
-    max_attachments_per_event: number;
-    max_event_attachment_bytes: number;
-    quota_bytes: number;
-    /**
-     * Why attachments are not stored, when they are not.
-     */
-    reason?: string | null;
-    /**
-     * Console path where blob storage is enabled.
-     */
-    setup_path?: string | null;
-    used_bytes: number;
-};
-
-/**
- * A stored attachment.
- */
-export type AttachmentView = {
-    attachment_type: string;
-    /**
-     * As the SDK sent it. The download is served as an image only for
-     * PNG, JPEG, GIF and WebP, and as a file to save otherwise.
-     */
-    content_type: string;
-    created_at: string;
-    filename: string;
-    id: number;
-    /**
-     * The error event id or feedback id.
-     */
-    owner_id: number;
-    /**
-     * `error` or `feedback`.
-     */
-    owner_kind: string;
-    size_bytes: number;
 };
 
 export type AttrOp = 'eq' | 'neq' | 'exists' | 'prefix' | 'gt' | 'lt';
@@ -9576,8 +9511,8 @@ export type CreateSandboxBody = {
      */
     backend?: string | null;
     /**
-     * CPU cores, `[0.01, 16]` (lower if an administrator set a maximum).
-     * Omit for the operator's default.
+     * CPU cores, `[0.01, 16]`, bounded by the placement host and any
+     * administrator maximum. Omit for the effective placement default.
      */
     cpu_limit?: number | null;
     /**
@@ -31118,6 +31053,26 @@ export type SandboxPlacementResponse = {
  */
 export type SandboxPreviewAccess = 'temps_login' | 'password' | 'public';
 
+export type SandboxResourceHints = {
+    /**
+     * Configured agent-run defaults bounded by the host. Agent runs are
+     * exempt from the ceilings on sandbox API requests.
+     */
+    agent_cpu: number;
+    agent_memory_mb: number;
+    cpu?: number | null;
+    host_cpu_cores?: number | null;
+    host_memory_mb?: number | null;
+    max_cpu: number;
+    max_memory_mb: number;
+    max_pids: number;
+    max_timeout_secs: number;
+    memory_mb?: number | null;
+    node_id?: number | null;
+    pids?: number | null;
+    timeout_secs: number;
+};
+
 /**
  * `@vercel/sandbox` wraps every single-sandbox response as
  * `{ sandbox: {...}, routes: [...] }`. The SDK reads both.
@@ -33269,14 +33224,6 @@ export type SetAlternateSourcesRequest = {
      * project to its configured source again.
      */
     allow_alternate_sources: boolean;
-};
-
-export type SetAttachmentQuotaRequest = {
-    /**
-     * Bytes of attachments the project may store, 0 to 100 GiB. Lowering it
-     * deletes nothing: new attachments are dropped until use falls under it.
-     */
-    quota_bytes: number;
 };
 
 /**
@@ -85113,178 +85060,6 @@ export type UpdateAlertRuleResponses = {
 
 export type UpdateAlertRuleResponse = UpdateAlertRuleResponses[keyof UpdateAlertRuleResponses];
 
-export type SetErrorAttachmentQuotaData = {
-    body: SetAttachmentQuotaRequest;
-    path: {
-        /**
-         * Project ID
-         */
-        project_id: number;
-    };
-    query?: never;
-    url: '/projects/{project_id}/error-attachments/quota';
-};
-
-export type SetErrorAttachmentQuotaErrors = {
-    /**
-     * Quota out of range
-     */
-    400: unknown;
-    /**
-     * Not authenticated
-     */
-    401: unknown;
-    /**
-     * Error tracking write permission required
-     */
-    403: unknown;
-    /**
-     * Internal server error
-     */
-    500: unknown;
-};
-
-export type SetErrorAttachmentQuotaResponses = {
-    /**
-     * Quota set
-     */
-    200: AttachmentUsage;
-};
-
-export type SetErrorAttachmentQuotaResponse = SetErrorAttachmentQuotaResponses[keyof SetErrorAttachmentQuotaResponses];
-
-export type GetErrorAttachmentUsageData = {
-    body?: never;
-    path: {
-        /**
-         * Project ID
-         */
-        project_id: number;
-    };
-    query?: never;
-    url: '/projects/{project_id}/error-attachments/usage';
-};
-
-export type GetErrorAttachmentUsageErrors = {
-    /**
-     * Not authenticated
-     */
-    401: unknown;
-    /**
-     * No access to the project
-     */
-    403: unknown;
-    /**
-     * Internal server error
-     */
-    500: unknown;
-};
-
-export type GetErrorAttachmentUsageResponses = {
-    /**
-     * Storage state, use and limits
-     */
-    200: AttachmentUsage;
-};
-
-export type GetErrorAttachmentUsageResponse = GetErrorAttachmentUsageResponses[keyof GetErrorAttachmentUsageResponses];
-
-export type DeleteErrorAttachmentData = {
-    body?: never;
-    path: {
-        /**
-         * Project ID
-         */
-        project_id: number;
-        /**
-         * Attachment ID
-         */
-        attachment_id: number;
-    };
-    query?: never;
-    url: '/projects/{project_id}/error-attachments/{attachment_id}';
-};
-
-export type DeleteErrorAttachmentErrors = {
-    /**
-     * Not authenticated
-     */
-    401: unknown;
-    /**
-     * Error tracking write permission required
-     */
-    403: unknown;
-    /**
-     * No such attachment in the project
-     */
-    404: unknown;
-    /**
-     * Internal server error
-     */
-    500: unknown;
-    /**
-     * Blob storage is not set up or the file could not be deleted from it
-     */
-    503: unknown;
-};
-
-export type DeleteErrorAttachmentResponses = {
-    /**
-     * Attachment deleted; its bytes are back in the quota
-     */
-    204: void;
-};
-
-export type DeleteErrorAttachmentResponse = DeleteErrorAttachmentResponses[keyof DeleteErrorAttachmentResponses];
-
-export type GetErrorAttachmentContentData = {
-    body?: never;
-    path: {
-        /**
-         * Project ID
-         */
-        project_id: number;
-        /**
-         * Attachment ID
-         */
-        attachment_id: number;
-    };
-    query?: never;
-    url: '/projects/{project_id}/error-attachments/{attachment_id}/content';
-};
-
-export type GetErrorAttachmentContentErrors = {
-    /**
-     * Not authenticated
-     */
-    401: unknown;
-    /**
-     * No access to the project
-     */
-    403: unknown;
-    /**
-     * No such attachment in the project
-     */
-    404: unknown;
-    /**
-     * Internal server error
-     */
-    500: unknown;
-    /**
-     * Blob storage is not set up or not answering
-     */
-    503: unknown;
-};
-
-export type GetErrorAttachmentContentResponses = {
-    /**
-     * The file. PNG, JPEG, GIF and WebP are served inline; everything else as application/octet-stream to save
-     */
-    200: Blob | File;
-};
-
-export type GetErrorAttachmentContentResponse = GetErrorAttachmentContentResponses[keyof GetErrorAttachmentContentResponses];
-
 export type GetErrorDashboardStatsData = {
     body?: never;
     path: {
@@ -85868,54 +85643,6 @@ export type GetErrorEventResponses = {
 };
 
 export type GetErrorEventResponse = GetErrorEventResponses[keyof GetErrorEventResponses];
-
-export type ListErrorEventAttachmentsData = {
-    body?: never;
-    path: {
-        /**
-         * Project ID
-         */
-        project_id: number;
-        /**
-         * Error group ID
-         */
-        group_id: number;
-        /**
-         * Error event ID
-         */
-        event_id: number;
-    };
-    query?: never;
-    url: '/projects/{project_id}/error-groups/{group_id}/events/{event_id}/attachments';
-};
-
-export type ListErrorEventAttachmentsErrors = {
-    /**
-     * Not authenticated
-     */
-    401: unknown;
-    /**
-     * No access to the project
-     */
-    403: unknown;
-    /**
-     * No such event in the group
-     */
-    404: unknown;
-    /**
-     * Internal server error
-     */
-    500: unknown;
-};
-
-export type ListErrorEventAttachmentsResponses = {
-    /**
-     * Attachments of the event
-     */
-    200: AttachmentList;
-};
-
-export type ListErrorEventAttachmentsResponse = ListErrorEventAttachmentsResponses[keyof ListErrorEventAttachmentsResponses];
 
 export type ListErrorGroupFingerprintsData = {
     body?: never;
@@ -87226,7 +86953,7 @@ export type DeleteProjectFeedbackErrors = {
 
 export type DeleteProjectFeedbackResponses = {
     /**
-     * Feedback and its attachments permanently deleted
+     * Feedback permanently deleted
      */
     204: void;
 };
@@ -87285,50 +87012,6 @@ export type UpdateProjectFeedbackResponses = {
 };
 
 export type UpdateProjectFeedbackResponse = UpdateProjectFeedbackResponses[keyof UpdateProjectFeedbackResponses];
-
-export type ListFeedbackAttachmentsData = {
-    body?: never;
-    path: {
-        /**
-         * Project ID
-         */
-        project_id: number;
-        /**
-         * Feedback ID
-         */
-        feedback_id: number;
-    };
-    query?: never;
-    url: '/projects/{project_id}/feedback/{feedback_id}/attachments';
-};
-
-export type ListFeedbackAttachmentsErrors = {
-    /**
-     * Not authenticated
-     */
-    401: unknown;
-    /**
-     * No access to the project
-     */
-    403: unknown;
-    /**
-     * No such feedback in the project
-     */
-    404: unknown;
-    /**
-     * Internal server error
-     */
-    500: unknown;
-};
-
-export type ListFeedbackAttachmentsResponses = {
-    /**
-     * Attachments of the feedback
-     */
-    200: AttachmentList;
-};
-
-export type ListFeedbackAttachmentsResponse = ListFeedbackAttachmentsResponses[keyof ListFeedbackAttachmentsResponses];
 
 export type ListFlagsData = {
     body?: never;
@@ -99987,6 +99670,52 @@ export type EvictNodeSandboxesResponses = {
 };
 
 export type EvictNodeSandboxesResponse = EvictNodeSandboxesResponses[keyof EvictNodeSandboxesResponses];
+
+export type GetSandboxResourceDefaultsData = {
+    body?: never;
+    path?: never;
+    query?: {
+        node?: string | null;
+        backend?: SandboxBackend | null;
+    };
+    url: '/v1/sandboxes/resource-defaults';
+};
+
+export type GetSandboxResourceDefaultsErrors = {
+    /**
+     * Invalid placement or backend
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * No eligible placement
+     */
+    422: unknown;
+    /**
+     * Could not load sandbox settings
+     */
+    500: unknown;
+    /**
+     * Host unavailable
+     */
+    503: unknown;
+};
+
+export type GetSandboxResourceDefaultsResponses = {
+    /**
+     * Effective sandbox defaults
+     */
+    200: SandboxResourceHints;
+};
+
+export type GetSandboxResourceDefaultsResponse = GetSandboxResourceDefaultsResponses[keyof GetSandboxResourceDefaultsResponses];
 
 export type RootfsReportData = {
     body?: never;

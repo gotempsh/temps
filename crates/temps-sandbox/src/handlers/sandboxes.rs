@@ -171,9 +171,11 @@ impl From<SandboxError> for Problem {
             SandboxError::FileOp { .. } => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Sandbox FS Operation Failed")
                 .with_detail(error.to_string()),
-            SandboxError::Validation { .. } => problemdetails::new(StatusCode::BAD_REQUEST)
-                .with_title("Validation Error")
-                .with_detail(error.to_string()),
+            SandboxError::CpuLimit { .. } | SandboxError::Validation { .. } => {
+                problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_title("Validation Error")
+                    .with_detail(error.to_string())
+            }
             SandboxError::InvalidState { .. } => problemdetails::new(StatusCode::CONFLICT)
                 .with_title("Invalid Sandbox State")
                 .with_detail(error.to_string()),
@@ -599,8 +601,8 @@ pub struct CreateSandboxBody {
     /// Extra env vars baked into the container on create.
     #[serde(default)]
     pub env: HashMap<String, String>,
-    /// CPU cores, `[0.01, 16]` (lower if an administrator set a maximum).
-    /// Omit for the operator's default.
+    /// CPU cores, `[0.01, 16]`, bounded by the placement host and any
+    /// administrator maximum. Omit for the effective placement default.
     #[schema(minimum = 0.01, maximum = 16.0)]
     #[serde(default)]
     pub cpu_limit: Option<f64>,
@@ -749,32 +751,20 @@ impl From<CreateSandboxBody> for CreateSandboxRequest {
     }
 }
 
-/// Ceilings for the resource limits a caller may request on create. The
-/// provider treats a request value as authoritative (the operator's
-/// `agent_sandbox` settings are only the defaults for omitted fields), so
-/// without a ceiling here any `sandboxes:write` key could ask for no process
-/// cap (`pids_limit <= 0` means "unlimited" to Docker) or for more memory than
-/// the host has. Generous enough for real workloads, finite so the host's
-/// pid table and memory stay protected from untrusted code.
-pub const MAX_SANDBOX_CPU_CORES: f64 = 16.0;
-/// Floors below which the request cannot be enforced. Docker takes CPU as
-/// integer NanoCPUs, so a tiny positive value truncates to 0, which Docker
-/// reads as "no CPU quota"; it also rejects memory limits under 6 MB.
-pub const MIN_SANDBOX_CPU_CORES: f64 = 0.01;
-pub const MIN_SANDBOX_MEMORY_MB: u64 = 6;
-pub const MAX_SANDBOX_MEMORY_MB: u64 = 32 * 1024;
-pub const MAX_SANDBOX_PIDS_LIMIT: i64 = 4096;
-pub const MAX_SANDBOX_DISK_MB: u64 = 64 * 1024;
+pub use crate::services::create_policy::{
+    MAX_SANDBOX_CPU_CORES, MAX_SANDBOX_DISK_MB, MAX_SANDBOX_MEMORY_MB, MAX_SANDBOX_PIDS_LIMIT,
+    MIN_SANDBOX_CPU_CORES, MIN_SANDBOX_MEMORY_MB,
+};
 
 /// Reject caller-supplied resource limits that are non-positive, non-finite
 /// or above the ceilings. `None` is always accepted: it selects the
 /// operator's defaults.
 fn validate_resource_limits(req: &CreateSandboxRequest) -> Result<(), SandboxError> {
     if let Some(cpu) = req.cpu_limit {
-        if !cpu.is_finite() || !(MIN_SANDBOX_CPU_CORES..=MAX_SANDBOX_CPU_CORES).contains(&cpu) {
+        if !cpu.is_finite() || cpu < MIN_SANDBOX_CPU_CORES {
             return Err(SandboxError::Validation {
                 message: format!(
-                    "cpu_limit/vcpus must be between {MIN_SANDBOX_CPU_CORES} and {MAX_SANDBOX_CPU_CORES}, got {cpu}"
+                    "cpu_limit/vcpus must be finite and at least {MIN_SANDBOX_CPU_CORES}, got {cpu}"
                 ),
             });
         }
@@ -3193,6 +3183,10 @@ pub fn routes() -> Router<Arc<SandboxAppState>> {
         // Rootfs management. Registered before `/{id}` — a static segment so
         // it never collides with the id capture.
         .route("/v1/sandboxes/rootfs", get(rootfs_report))
+        .route(
+            "/v1/sandboxes/resource-defaults",
+            get(super::placement::get_sandbox_resource_defaults),
+        )
         // Sandbox placement (ADR-048) — static segment, same reason.
         .route(
             "/v1/sandboxes/placement",
@@ -3336,6 +3330,24 @@ mod tests {
             let problem = require_sandbox_admin(&auth).expect_err("non-admin must be refused");
             assert_eq!(problem.status_code, StatusCode::FORBIDDEN, "{role:?}");
         }
+    }
+
+    #[test]
+    fn sandbox_host_capacity_error_maps_to_bad_request() {
+        let problem = Problem::from(crate::error::from_agent_error(
+            "sandbox-example",
+            temps_agent_core::error::AgentError::SandboxCpuLimit {
+                run_id: 12,
+                requested: 4.0,
+                host: 2.0,
+            },
+        ));
+        assert_eq!(problem.status_code, StatusCode::BAD_REQUEST);
+        let detail = problem.body["detail"].as_str().unwrap_or_default();
+        assert!(
+            detail.contains("requested 4 CPU cores") && detail.contains("0.01 to 2"),
+            "{detail}"
+        );
     }
 
     #[test]
@@ -3738,7 +3750,6 @@ mod tests {
             MIN_SANDBOX_CPU_CORES / 2.0,
             f64::NAN,
             f64::INFINITY,
-            MAX_SANDBOX_CPU_CORES + 0.5,
         ] {
             let err = validate_resource_limits(&request_with_limits(Some(cpu), None, None, None))
                 .unwrap_err();
@@ -3809,8 +3820,7 @@ mod tests {
         std::collections::BTreeMap::from([("num_items".to_string(), count.into())])
     }
 
-    /// Router over `db`, authenticated as a default-role user.
-    fn create_app(db: sea_orm::DatabaseConnection) -> axum::Router {
+    fn sandbox_router(db: sea_orm::DatabaseConnection) -> axum::Router {
         let service = Arc::new(
             crate::services::sandbox_service::tests::preview_test_service_with_db(Arc::new(db)),
         );
@@ -3824,12 +3834,69 @@ mod tests {
             sensitive_action_authorizer: Arc::new(AllowAll),
             image_preparation,
         });
-        crate::handlers::configure_routes()
-            .with_state(state)
-            .layer(axum::Extension(AuthContext::new_session(
-                test_user(),
-                Role::User,
-            )))
+        crate::handlers::configure_routes().with_state(state)
+    }
+
+    /// Router over `db`, authenticated as a default-role user.
+    fn create_app(db: sea_orm::DatabaseConnection) -> axum::Router {
+        sandbox_router(db).layer(axum::Extension(AuthContext::new_session(
+            test_user(),
+            Role::User,
+        )))
+    }
+
+    #[tokio::test]
+    async fn sandbox_host_capacity_requires_read_access() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use tower::ServiceExt;
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection();
+        let router = sandbox_router(db);
+        let request = || {
+            axum::http::Request::builder()
+                .uri("/v1/sandboxes/resource-defaults")
+                .body(axum::body::Body::empty())
+        };
+        let response = router.clone().oneshot(request()?).await?;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let auth =
+            AuthContext::new_api_key(test_user(), None, Some(vec![]), "sandbox-test".into(), 7);
+        let response = router
+            .layer(axum::Extension(auth))
+            .oneshot(request()?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sandbox_host_capacity_endpoint_reports_operator_limits_for_auto_placement(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use tower::ServiceExt;
+        let row = settings_row(
+            serde_json::json!({"cpu_limit": 2.0, "memory_limit_mb": 1024, "max_cpu_limit": 1.5, "max_memory_limit_mb": 512, "max_pids_limit": 100}),
+        );
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results([vec![row.clone()], vec![row]])
+            .into_connection();
+        let response = create_app(db)
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/sandboxes/resource-defaults")
+                    .body(axum::body::Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096).await?;
+        let body: serde_json::Value = serde_json::from_slice(&bytes)?;
+        assert!(body["node_id"].is_null());
+        assert_eq!(body["agent_cpu"], 2.0);
+        assert_eq!(body["agent_memory_mb"], 1024);
+        assert_eq!(body["max_cpu"], 1.5);
+        assert_eq!(body["max_memory_mb"], 512);
+        assert_eq!(body["max_pids"], 100);
+        assert_eq!(body["timeout_secs"], 3600);
+        Ok(())
     }
 
     /// Status and parsed Problem body of `POST /v1/sandboxes`.

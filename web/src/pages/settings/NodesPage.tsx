@@ -165,6 +165,7 @@ import {
 import { NodeStateStreamStatus } from '@/components/nodes/NodeStateStreamStatus'
 import { NodeAlertRules } from '@/components/monitoring/NodeAlertRules'
 import { ServerMonitoring } from '@/components/monitoring/ServerMonitoring'
+import { scrollToElementId } from '@/lib/scroll-to-element'
 
 // ── Helpers ──
 
@@ -1826,9 +1827,7 @@ export function NodesPage() {
   useEffect(() => {
     if (!linkedSection) return
     const frame = requestAnimationFrame(() =>
-      document
-        .getElementById(linkedSection)
-        ?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+      scrollToElementId(linkedSection, { behavior: 'smooth' })
     )
     return () => cancelAnimationFrame(frame)
   }, [linkedSection, isLoading])
