@@ -213,16 +213,27 @@ export function hasNotFoundMarker(): boolean {
  * whenever a page view is recorded; it emits `not_found` at most once for
  * that page view, checking immediately and once more after
  * `NOT_FOUND_RECHECK_DELAY_MS` for apps that render the 404 view late.
+ *
+ * On an in-app navigation the page view is recorded when the URL changes,
+ * before the router has replaced the old view, so a marker already in the
+ * document at that moment belongs to the page being left and is ignored. Only
+ * the first page view of a document counts a marker that is already there.
  */
 export class NotFoundMarkerWatcher {
   private timer: ReturnType<typeof setTimeout> | null = null;
   private reported = false;
+  private firstPageview = true;
+  private previousMarkers: Set<Element> = new Set();
+  private path = "";
 
   constructor(private readonly report: () => void) {}
 
   afterPageview(): void {
     this.cancel();
     this.reported = false;
+    this.path = window.location.pathname;
+    this.previousMarkers = this.firstPageview ? new Set() : new Set(markerElements());
+    this.firstPageview = false;
     if (this.check()) return;
     this.timer = setTimeout(() => {
       this.timer = null;
@@ -239,9 +250,17 @@ export class NotFoundMarkerWatcher {
   }
 
   private check(): boolean {
-    if (this.reported || !hasNotFoundMarker()) return false;
+    if (this.reported) return false;
+    // The visitor moved on; that navigation records its own page view.
+    if (window.location.pathname !== this.path) return false;
+    const fresh = markerElements().some((element) => !this.previousMarkers.has(element));
+    if (!fresh) return false;
     this.reported = true;
     this.report();
     return true;
   }
+}
+
+function markerElements(): Element[] {
+  return Array.from(document.querySelectorAll(`[${NOT_FOUND_MARKER_ATTRIBUTE}]`));
 }

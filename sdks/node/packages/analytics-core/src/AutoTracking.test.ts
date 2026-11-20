@@ -278,6 +278,36 @@ describe("createAnalytics auto-tracking", () => {
     expect(sentEvents().map((event) => event.event_name)).toEqual(["page_view"]);
   });
 
+  it("does not report the next page when navigating away from a 404 view", () => {
+    vi.useFakeTimers();
+    document.body.innerHTML = "<main data-temps-404>Not found</main>";
+    start({ autoTrackPageviews: true });
+    expect(sentEvents().map((event) => event.event_name)).toEqual(["page_view", NOT_FOUND_EVENT]);
+
+    // The router changes the URL first; the old view is still in the DOM.
+    window.history.pushState({}, "", "/pricing");
+    document.body.innerHTML = "<main>Pricing</main>";
+    vi.advanceTimersByTime(NOT_FOUND_RECHECK_DELAY_MS * 2);
+
+    expect(sentEvents().map((event) => event.event_name)).toEqual([
+      "page_view",
+      NOT_FOUND_EVENT,
+      "page_view",
+    ]);
+  });
+
+  it("reports a 404 view an in-app navigation renders", () => {
+    vi.useFakeTimers();
+    start({ autoTrackPageviews: true });
+    window.history.pushState({}, "", "/missing-page");
+    document.body.innerHTML = "<main data-temps-404>Not found</main>";
+    vi.advanceTimersByTime(NOT_FOUND_RECHECK_DELAY_MS);
+
+    const events = sentEvents();
+    expect(events.map((event) => event.event_name)).toEqual(["page_view", "page_view", NOT_FOUND_EVENT]);
+    expect(events[2].event_data).toMatchObject({ path: "/missing-page" });
+  });
+
   it("ignores the marker when autoTrackNotFound is off", () => {
     document.body.innerHTML = "<main data-temps-404></main>";
     start({ autoTrackPageviews: true, autoTrackNotFound: false });
