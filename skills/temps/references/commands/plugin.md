@@ -22,6 +22,8 @@ Create, install, update and build TypeScript plugins
 
 Install a GitHub TypeScript plugin on the configured Temps server; the server uses its host Git credentials and Docker
 
+**Usage:** `plugin install <repository> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -37,6 +39,8 @@ Install a GitHub TypeScript plugin on the configured Temps server; the server us
 ### `plugin update`
 
 Rebuild an installed GitHub plugin from its stored source; keep the current plugin if the update fails
+
+**Usage:** `plugin update <name> [options]`
 
 **Options:**
 
@@ -58,9 +62,13 @@ Inspect or replace a plugin's host API permissions and AI limits
 
 Show current grants, actor identity, and AI availability
 
+**Usage:** `plugin grants get <name>`
+
 #### `plugin grants set`
 
 Replace all host grants; --clear revokes all permissions immediately
+
+**Usage:** `plugin grants set <name> [options]`
 
 **Options:**
 
@@ -74,6 +82,8 @@ Replace all host grants; --clear revokes all permissions immediately
 ### `plugin dev`
 
 Run a plugin with a local simulated host, UI preview, and events (no Temps server)
+
+**Usage:** `plugin dev [binary] [args...] [options]`
 
 **Options:**
 
@@ -126,6 +136,8 @@ Show the last 200 redacted simulator records
 
 Deliver an event; sent does not mean handler completed
 
+**Usage:** `plugin dev emit [type] [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -165,6 +177,8 @@ Replace all grants or revoke all with --clear
 ### `plugin init`
 
 Create a TypeScript plugin project
+
+**Usage:** `plugin init <directory> [options]`
 
 **Options:**
 

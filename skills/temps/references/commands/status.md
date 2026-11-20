@@ -8,6 +8,8 @@ Apply [the CLI runtime and safety contract](../cli-runtime.md) before executing 
 
 Show project deployment status
 
+**Usage:** `status [project] [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |

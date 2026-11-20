@@ -28,6 +28,8 @@ List available presets
 
 Show details for a specific preset
 
+**Usage:** `presets show <slug> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |

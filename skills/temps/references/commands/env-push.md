@@ -8,6 +8,8 @@ Apply [the CLI runtime and safety contract](../cli-runtime.md) before executing 
 
 Push environment variables from a .env file
 
+**Usage:** `env:push [file] [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
