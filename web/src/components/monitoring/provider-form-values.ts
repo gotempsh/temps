@@ -49,9 +49,11 @@ export function providerFormValues(
 }
 
 /**
- * Loads `provider` into `form` the first time it arrives and whenever the page
- * switches to a different provider. A refetch of the same provider (reconnect,
- * invalidation) does not reset the form, so unsaved edits survive it.
+ * Keeps `form` in step with `provider`. A different provider (or the first
+ * one to arrive) replaces the whole form. A newer copy of the same provider,
+ * such as the background refetch that follows cached data when the page is
+ * reopened, refreshes every field the user has not touched and keeps the ones
+ * they edited, so neither a stale cache nor a refetch can undo anything.
  */
 export function useLoadProviderIntoForm(
   provider: NotificationProviderResponse | undefined,
@@ -59,8 +61,11 @@ export function useLoadProviderIntoForm(
 ) {
   const loadedProviderId = useRef<number | null>(null)
   useEffect(() => {
-    if (!provider || loadedProviderId.current === provider.id) return
+    if (!provider) return
+    const sameProvider = loadedProviderId.current === provider.id
     loadedProviderId.current = provider.id
-    form.reset(providerFormValues(provider))
+    form.reset(providerFormValues(provider), {
+      keepDirtyValues: sameProvider,
+    })
   }, [provider, form])
 }

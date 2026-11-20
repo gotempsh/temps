@@ -68,6 +68,20 @@ test('a refetch of the same provider keeps unsaved edits', () => {
     '123456789:AAReplacement'
   )
   expect(result.current.getValues('name')).toBe('Renamed')
+  // The field the user did not touch takes the newer value.
+  expect(result.current.getValues('config.chat_id')).toBe('-1002')
+})
+
+test('reopening with cached data loads the newer response that follows', () => {
+  // The cache still holds the provider as it was before the last save.
+  const { result, rerender } = renderEditForm(telegramProvider(1, '-1001'))
+  expect(result.current.getValues('config.chat_id')).toBe('-1001')
+
+  // The background refetch returns the saved chat.
+  rerender({ provider: telegramProvider(1, '-1002', 'Phone alerts') })
+
+  expect(result.current.getValues('config.chat_id')).toBe('-1002')
+  expect(result.current.formState.defaultValues?.config?.chat_id).toBe('-1002')
 })
 
 test('switching to another provider loads that provider', () => {

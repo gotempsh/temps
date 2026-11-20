@@ -103,7 +103,7 @@ export function EditNotificationProvider() {
     },
   })
 
-  // Load the provider into the form once; a refetch keeps unsaved edits.
+  // Newer provider data refreshes untouched fields and keeps unsaved edits.
   useLoadProviderIntoForm(provider, form)
 
   // Update mutations
