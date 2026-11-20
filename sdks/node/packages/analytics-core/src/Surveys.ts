@@ -19,6 +19,7 @@
  */
 
 import { postJson, REQUEST_TIMEOUT_MS } from "./request";
+import { isCookielessIdentity } from "./identity";
 import type { JsonValue } from "./types";
 
 export type SurveyQuestionKind =
@@ -287,7 +288,10 @@ export class Surveys {
     }
   }
 
+  // In cookieless mode nothing is read from or written to the device, so
+  // `once_per_visitor` falls back to once per page (`shownHere`).
   private seen(): Set<number> {
+    if (isCookielessIdentity()) return new Set();
     try {
       const raw = this.storage?.getItem(SEEN_STORAGE_KEY);
       const parsed: unknown = raw ? JSON.parse(raw) : [];
@@ -298,6 +302,7 @@ export class Surveys {
   }
 
   private remember(id: number): void {
+    if (isCookielessIdentity()) return;
     try {
       const ids = [...this.seen()].filter((seen) => seen !== id);
       ids.push(id);

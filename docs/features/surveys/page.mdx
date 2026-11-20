@@ -75,7 +75,7 @@ A project can have at most 50 active surveys, and a survey's questions and displ
 | --- | --- | --- |
 | Page | `path_pattern`, e.g. `/checkout/*` (`*` matches anything, empty means every page) | The browser |
 | After an event | `trigger_event`: the name you pass to `trackEvent` (empty means on page load) | The browser |
-| Once per visitor | `once_per_visitor` (default on), remembered in `localStorage` | The browser |
+| Once per visitor | `once_per_visitor` (default on), remembered in `localStorage`. In cookieless mode nothing is stored on the device, so it means once per page load | The browser |
 | Share of visitors | `sample_rate`, 0 to 1 (default 1) | The server |
 | Feature flag | `flag: { "key": "checkout.v2", "value": true }` | The server |
 
