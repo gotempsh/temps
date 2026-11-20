@@ -48,6 +48,8 @@ function monitor(id: number, name: string): MonitorResponse {
     environment_id: 1,
     monitor_type: 'web',
     monitor_url: `https://internal-${id}.example.test/health`,
+    check_kind: 'environment',
+    probe_from_nodes: false,
     check_interval_seconds: 60,
     is_active: true,
     is_managed: false,

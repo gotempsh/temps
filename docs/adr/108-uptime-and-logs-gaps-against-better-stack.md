@@ -3,7 +3,14 @@
 ## Status
 
 Proposed — 2026-11-19. D1 implemented — 2026-11-19 (see *Settled while
-implementing D1*). D2 to D8 not started.
+implementing D1*). D2 implemented — 2026-11-20: the email subscription first, then the feed,
+webhooks, maintenance windows and page password (see *Settled while
+implementing D2*). D3 and D4 implemented together — 2026-11-20: HTTP
+assertions, TCP, TLS certificate and DNS checks against any public target;
+ICMP, domain registration expiry and browser checks deferred (see *Settled
+while implementing D3 and D4*). D5 implemented — 2026-11-20 for monitors
+of targets outside Temps, checked from worker nodes with a majority vote
+(see *Settled while implementing D5*). D6 to D8 not started.
 
 Related: ADR 021 (multi-node log aggregation, humanized alert notifications),
 ADR 025 (unified alarm log), ADR 026 (metric alert label filters), ADR 045 to
@@ -232,6 +239,100 @@ No email subscription, no feed, no webhook, no announced maintenance window.
 - **Access control.** An optional password on a page, for a status page shared
   with customers only.
 
+### Settled while implementing D2
+
+The email subscription shipped first, on its own; the feed, webhooks,
+maintenance windows and page password follow separately.
+
+- **Whole page only.** A subscriber subscribes to a page, not to chosen
+  components (the open question below). A component filter needs a choice
+  in the form, which a page with no JavaScript can only offer as a long
+  list of checkboxes, and it is easy to add later without migrating
+  anything.
+- **What is announced, and from where.** Notices are derived from the
+  published snapshot, the same allowlisted data the page renders: one
+  notice per public update, plus one for the resolution of an incident with
+  none. Only updates published after subscriptions were switched on and
+  within the last 24 hours are announced, so switching on never mails out
+  the page's history and a long outage of the sender does not send a
+  backlog. A notice whose update stops being public (made private, page
+  unpublished, subscriptions off) before delivery finishes is cancelled.
+- **Double opt-in that a link scanner cannot complete.** Opening a
+  confirmation or unsubscribe link shows a button; only the POST acts. A
+  confirmation link is valid for 48 hours and works once; a repeated
+  request sends a new one at most every 10 minutes. An address that is
+  never confirmed is deleted 48 hours after its last request. The public
+  answer is the same for a new, pending or confirmed address.
+- **Tokens.** Only SHA-256 hashes are stored. The confirmation token is
+  random; the unsubscribe token is an HMAC of a per-subscriber nonce under
+  the server key, so every notice carries the link without the token being
+  stored.
+- **Limits.** 10,000 subscribers per page, at most 1,000 of them pending;
+  10 subscription requests per client per 10 minutes on the public routes.
+  The dispatcher runs every 20 seconds and sends at most 200 mails per run
+  across all pages, in batches of 50 recipients, walking a cursor over
+  subscriber ids so each recipient gets a notice at most once, across
+  restarts too. A recipient whose send fails three times is skipped.
+- **Switching on needs a working sender.** Subscriptions cannot be enabled
+  until an email provider exists, the sender address is at a verified
+  domain, and Temps knows a public URL for the links (a custom domain of the
+  page, or the external or public ingress URL). Each missing piece is shown
+  with a link to where it is fixed, and the capability endpoint reports it.
+- **Who sees addresses.** Listing, exporting and deleting subscribers need
+  `status_page:write`, not read. The export is CSV served with `no-store`,
+  with formula characters neutralised. Audit entries for settings changes,
+  deletions and exports never contain an address.
+- **Custom domains.** A verified page host additionally forwards
+  `POST /subscribe` and `GET`/`POST` on `/confirm/{token}` and
+  `/unsubscribe/{token}`, and its CSP gains `form-action 'self'`.
+- **Mail.** Sent through `crates/temps-email`, so its suppression list
+  applies, with open and click tracking off. No `List-Unsubscribe` header
+  yet: the email service only passes `X-Temps-*` headers through, so adding
+  it needs a change there first.
+
+The second part, settled the same way:
+
+- **Feed.** The newest 50 public updates, resolutions and maintenance
+  announcements, built with the snapshot, with opaque entry ids derived
+  from the page token and the event, so an id reveals no database key.
+- **Maintenance suppresses alerts at the source.** Instead of writing
+  `silenced_until` on each monitor, which an operator's own silence would
+  then have to be merged with and restored after, outage detection skips a
+  monitor while a running window covers it. A cancelled or ended window
+  needs no undo. Checks taken inside a window are left out of the uptime
+  of every page showing the monitor (only monitors still on that page
+  count), from the stored checks, so nothing is rewritten.
+- **Maintenance rules.** A window cannot be backdated (5 minutes of slack
+  for "now"), lasts at most 7 days, starts at most a year ahead, and a page
+  has at most 20 open ones. It is announced once, when scheduled; edits and
+  cancellations change the page but are not mailed, which avoids a mail per
+  typo. Once started, its start and monitors are fixed, so what was
+  excluded from uptime stays explainable. Cancelling a running window ends
+  it now.
+- **Password.** An argon2 hash on the page row and a signed cookie (an HMAC
+  under a key derived from the server key, binding the page, a password
+  version and an expiry of 7 days), so checking a visitor needs no query
+  and no per-visitor state. Every password change bumps the version and
+  signs everyone out. While protected, the feed is not served (a reader
+  cannot sign in) and the JSON is not shared cross-origin. Wrong passwords
+  are limited to 5 per client per 15 minutes and at most 2 verifications
+  run at once; a burst beyond that is told to retry rather than queued.
+  Confirmation and unsubscribe links work without the password, so nobody
+  is stuck on a list. A custom host forwards only a well-formed access
+  cookie, never the rest of the visitor's cookies.
+- **Webhooks.** Managed by the page owner (`status_page:write`), at most 10
+  per page, `https://` only, to a public address checked when saved and
+  again, pinned, on every delivery, with no redirects and a 10 second
+  timeout. The body carries only what the page shows. The signing secret
+  is shown once and stored encrypted; the signature is
+  `t=<unix seconds>,v1=<hex HMAC-SHA256 of "t.body">`. Three attempts, 1 and
+  10 minutes apart. A delivery is cancelled when the event leaves the page
+  or the webhook is paused; resuming catches up the last 24 hours. No test
+  send and no secret rotation yet: delete and re-add the webhook.
+- **Schema names.** The webhook types are `StatusPageWebhook*` because the
+  plugin OpenAPI merge keeps the last schema of a name, and a plain
+  `WebhookResponse` silently replaced the project webhooks' schema.
+
 ### D3. Check types
 
 **Missing.** One check exists: HTTP `GET`, 2xx or 3xx is up.
@@ -271,6 +372,58 @@ pointed at internal addresses. D3 and D4 are one change to the monitor model
 and should ship together: most of D3's non-HTTP kinds have few targets until
 D4 exists.
 
+### Settled while implementing D3 and D4
+
+One change, as planned: a monitor watches either an environment or an
+explicit target.
+
+- **A new discriminator, not `monitor_type`.** `status_monitors.check_kind`
+  (`environment`, `http`, `tcp`, `tls`, `dns`) with a typed spec in
+  `check_spec`, and a database constraint that an environment monitor has no
+  target and a target monitor has a target, a spec and no environment.
+  `monitor_type` is a free-form legacy string that existing rows and clients
+  read; target monitors set it to their kind and nothing branches on it.
+- **Assertions apply to target monitors only.** Environment monitors keep
+  their built-in rule (`GET`, 2xx or 3xx); giving them the same assertions is
+  a follow-up, since their URL and path are managed by deployments.
+- **Shipped kinds:** HTTP (method, expected codes or classes such as `2xx`,
+  keyword present or absent in the first 256 KiB, degraded-after threshold,
+  headers and body), TCP connect, TLS certificate (publicly trusted chain for
+  the host; degraded inside the warning period, default 14 days, down when
+  expired or untrusted) and DNS (A, AAAA, CNAME, MX, TXT, NS; any listed
+  value matching is up). Redirects are not followed, so the configured
+  status is judged on the first answer.
+- **Deferred:** ICMP needs raw sockets (`CAP_NET_RAW`), which the binary
+  does not hold by default; domain registration expiry needs RDAP lookups
+  against registries, a new outbound dependency; browser transactions are
+  not built (*Not doing*: no resident headless browser).
+- **Secrets in requests.** Headers and body are encrypted at rest with
+  `EncryptionService` in one column; only header names are stored and shown
+  in plaintext. An update keeps them unless it replaces them, and they are
+  dropped when the kind changes away from HTTP. Hop-by-hop and
+  framing headers (`Host`, `Content-Length` and the like) are refused, and so
+  are credentials in the URL.
+- **Public targets, twice.** On save an IP literal, or a name that resolves,
+  must be public; a name that does not resolve yet is accepted, so a monitor
+  can be created before its DNS. Every probe resolves again and pins the
+  connection to the checked address (`PublicProbeTarget`). DNS checks use
+  the system resolver and never echo a private A or AAAA answer.
+- **Footprint.** 50 target monitors per project, the existing 30-second
+  interval floor and 0.5 to 30-second timeouts, and the scheduler's existing
+  sweep and concurrency limit of 10: no new task or resident process.
+- **Incidents without an environment.** A target monitor's outage opens an
+  incident and notifies like any monitor; deployment alarms are skipped,
+  since there is no deployment. Target monitors can be selected on a status
+  page.
+- **Audit and API.** Writes are audited with the target host only, never the
+  path, query or headers. Creation and changes have their own endpoints
+  (`POST /projects/{id}/monitors/targets`,
+  `PATCH /projects/{id}/monitors/{monitor_id}/target`); listing, history and
+  deletion reuse the monitor endpoints. The schema names are
+  `MonitorCheckKind`, `DnsCheckRecordType` and `CheckRequestHeader` because
+  the plugin OpenAPI merge keeps one schema per name and `CheckKind`,
+  `DnsRecordType` and `RequestHeader` already existed.
+
 ### D5. Probes from more than one place
 
 **Missing.** Every probe runs from the Temps host. A single-node install
@@ -281,6 +434,60 @@ from a real one.
 already distributes health probing). A monitor is down when a quorum of
 locations agree, which removes most false alarms. For a single-node install
 the only honest answer is a probe from somewhere else; see *Open questions*.
+
+### Settled while implementing D5
+
+- **Per monitor, off by default.** `status_monitors.probe_from_nodes`, for
+  monitors of targets outside Temps only (a database constraint). Turning it
+  on is the operator's choice: it sends the check, and its decrypted request
+  headers, to the cluster's workers.
+- **Asked on each check, not scheduled on the workers.** The control
+  plane's scheduler keeps the schedule; for each check it asks up to four
+  online workers (active, a heartbeat in the last three minutes, a stored
+  token), one per `region` label first, over the authenticated agent API,
+  and probes itself at the same time. ADR 053's leased assignments fit
+  probes of a node's own containers; an outbound check needs no state on
+  the worker, and asking per check keeps one schedule, one stale-write
+  fence and one place where results are recorded. The load is bounded by
+  the existing sweep concurrency of 10, so at most 40 node requests are in
+  flight; each agent runs at most 16 checks at once and refuses more.
+- **One probe implementation.** The specs, the public-address policy and
+  the probes moved to a database-free crate, `temps-uptime-probe`, which the
+  status page plugin and the node agent share. A worker validates the check
+  exactly as the control plane does on save and resolves the target through
+  its own resolver, so a target that is private from where a worker stands
+  is not dialled from there. A worker applies the default outbound policy:
+  private networks the operator trusts on the control plane are not trusted
+  on workers.
+- **Secrets travel sealed.** A check with headers or a body is sent only
+  sealed to the node's key (`NodeSealing`), never in plain over an
+  `http://` agent address; a node that cannot receive it sealed is listed as
+  not answering. A check without either is sent sealed when it can be and
+  plain otherwise: the target and the check are shown to anyone who can
+  read the monitor.
+- **Majority of those that answered.** Down when more than half of the
+  answering locations say down; degraded when more than half say down or
+  degraded; otherwise operational, so a tie is not a majority and, with the
+  control plane and one worker, both must agree. A location that does not
+  answer is not counted, and the control plane always answers. The recorded
+  response time is the median.
+- **Where each answer is kept.** The latest answers of every location go on
+  the monitor row (`location_results`, replaced on each check and cleared on
+  each edit), not on `status_checks`, a compressed hypertable: one row per
+  monitor stays bounded and nothing changes in history storage. Writing them
+  does not move `updated_at`, which the scheduler compares to discard checks
+  of edited monitors. A down or degraded check's message names up to three
+  failing locations; per-location history is not kept.
+- **Environment monitors** are checked from the control plane only: their
+  address can be internal to the cluster, and a worker's view of it says
+  nothing about what visitors see. A follow-up can extend the switch to them.
+- **Discoverability.** `GET /projects/{id}/monitors/probe-locations`
+  returns the locations a check would use, and `configured: false`, a
+  reason and `/settings/nodes` when no worker is online; the monitor dialog
+  shows the switch in that onboarding state rather than hiding it.
+- **Single-node installs** still cannot report their own outage. An external
+  probe offered by Temps Cloud stays the open question below; the docs point
+  such installs at an external checker.
 
 ### D6. On-call schedules and escalation
 
@@ -324,5 +531,6 @@ document.
   a hosted dependency that a self-hosted product otherwise avoids.
 - Whether log alerts (D1) should evaluate against the line index or the chunk
   store. The answer decides how far back a window can reach on a small host.
-- Whether subscribers (D2) may choose individual components of a page, or only
-  the whole page.
+- ~~Whether subscribers (D2) may choose individual components of a page, or
+  only the whole page.~~ Settled: the whole page (see *Settled while
+  implementing D2*).

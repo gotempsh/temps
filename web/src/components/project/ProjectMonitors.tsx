@@ -39,6 +39,8 @@ import {
   ExternalLink,
   Globe,
   MoreVertical,
+  Pencil,
+  Radar,
 } from 'lucide-react'
 import { useMemo, useReducer, useState } from 'react'
 import { Link } from 'react-router'
@@ -82,6 +84,8 @@ import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 
 import { RuntimeHealthPanel } from './RuntimeHealthPanel'
 import { visibleExternalMonitors } from './runtime-health-display'
+import { locationSummary, targetSummary } from './target-monitor'
+import { TargetMonitorDialog } from './TargetMonitorDialog'
 import {
   BUCKET_TONE_CLASS,
   BUCKET_TONE_LABEL,
@@ -111,6 +115,8 @@ interface MonitorCardProps {
   monitor: MonitorResponse
   projectSlug: string
   onDelete: () => void
+  /** Set for a monitor of a target outside Temps. */
+  onEdit?: () => void
   environment?: EnvironmentResponse
   /** End of the card's last-24-hours window; Refresh moves it to now. */
   windowEnd: number
@@ -120,9 +126,12 @@ function MonitorCard({
   monitor,
   projectSlug,
   onDelete,
+  onEdit,
   environment,
   windowEnd,
 }: MonitorCardProps) {
+  const summary = targetSummary(monitor)
+  const locations = locationSummary(monitor)
   const isOnDemand = environment?.deployment_config?.onDemand === true
   const { startDate, endDate } = useMemo(() => {
     const end = new Date(windowEnd)
@@ -190,7 +199,11 @@ function MonitorCard({
               </Badge>
             </div>
             <div className="flex items-center gap-2 text-sm text-muted-foreground flex-wrap">
-              <span className="uppercase">{monitor.monitor_type}</span>
+              {summary ? (
+                <span className="[overflow-wrap:anywhere]">{summary}</span>
+              ) : (
+                <span className="uppercase">{monitor.monitor_type}</span>
+              )}
               <span>•</span>
               <span>Check every {monitor.check_interval_seconds}s</span>
               <span>•</span>
@@ -201,6 +214,11 @@ function MonitorCard({
                 })}
               </span>
             </div>
+            {locations && (
+              <p className="text-xs text-muted-foreground [overflow-wrap:anywhere]">
+                {locations}
+              </p>
+            )}
           </div>
         </div>
 
@@ -321,6 +339,12 @@ function MonitorCard({
                   View details
                 </Link>
               </DropdownMenuItem>
+              {onEdit && (
+                <DropdownMenuItem onClick={onEdit}>
+                  <Pencil className="mr-2 h-4 w-4" />
+                  Edit
+                </DropdownMenuItem>
+              )}
               <DropdownMenuItem
                 className="text-destructive focus:text-destructive"
                 onClick={onDelete}
@@ -342,6 +366,14 @@ export function ProjectMonitors({ project }: ProjectMonitorsProps) {
     number | null
   >(null)
   const [isCreateDialogOpen, setIsCreateDialogOpen] = useState(false)
+  const [targetDialogOpen, setTargetDialogOpen] = useState(false)
+  const [editingTarget, setEditingTarget] = useState<MonitorResponse | null>(
+    null
+  )
+  const openTargetDialog = (monitor: MonitorResponse | null) => {
+    setEditingTarget(monitor)
+    setTargetDialogOpen(true)
+  }
   const [monitorToDelete, setMonitorToDelete] =
     useState<MonitorResponse | null>(null)
   // The cards' last-24-hours window ends here; Refresh moves it to now so
@@ -487,6 +519,10 @@ export function ProjectMonitors({ project }: ProjectMonitorsProps) {
               ]}
               onRefresh={moveWindowToNow}
             />
+            <Button variant="outline" onClick={() => openTargetDialog(null)}>
+              <Radar className="size-4 sm:mr-2" />
+              <span className="max-sm:sr-only">Monitor outside Temps</span>
+            </Button>
             <Button variant="outline" asChild>
               <Link to="/status-pages">
                 <Globe className="size-4 sm:mr-2" />
@@ -698,6 +734,9 @@ export function ProjectMonitors({ project }: ProjectMonitorsProps) {
               monitor={monitor}
               projectSlug={project.slug}
               onDelete={() => setMonitorToDelete(monitor)}
+              onEdit={
+                monitor.check ? () => openTargetDialog(monitor) : undefined
+              }
               windowEnd={windowEnd}
               environment={environments?.find(
                 (env) => env.id === monitor.environment_id
@@ -723,6 +762,13 @@ export function ProjectMonitors({ project }: ProjectMonitorsProps) {
           }
         />
       )}
+
+      <TargetMonitorDialog
+        projectId={project.id}
+        open={targetDialogOpen}
+        editing={editingTarget}
+        onOpenChange={setTargetDialogOpen}
+      />
 
       <ConfirmDeleteDialog
         open={monitorToDelete !== null}

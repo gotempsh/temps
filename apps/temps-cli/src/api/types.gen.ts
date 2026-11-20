@@ -5145,6 +5145,36 @@ export type ChatWorkspaceResponse = {
  */
 export type CheckKind = 'http' | 'local';
 
+/**
+ * The secret part of an HTTP check: headers and body, encrypted at rest.
+ */
+export type CheckRequest = {
+    body?: string | null;
+    headers?: Array<CheckRequestHeader>;
+};
+
+/**
+ * One HTTP request header. The value is stored encrypted and never
+ * returned.
+ */
+export type CheckRequestHeader = {
+    name: string;
+    value: string;
+};
+
+/**
+ * A target monitor's check, one shape per kind.
+ */
+export type CheckSpec = (HttpCheck & {
+    kind: 'http';
+}) | (TcpCheck & {
+    kind: 'tcp';
+}) | (TlsCheck & {
+    kind: 'tls';
+}) | (DnsCheck & {
+    kind: 'dns';
+});
+
 export type CheckStatus = 'healthy' | 'warning' | 'error' | 'unknown';
 
 /**
@@ -8931,6 +8961,29 @@ export type CreateLogIngestKeyRequest = {
     name: string;
 };
 
+export type CreateMaintenanceRequest = {
+    /**
+     * Public description, at most 2000 characters.
+     */
+    description?: string | null;
+    /**
+     * After `starts_at`, at most 7 days later.
+     */
+    ends_at: string;
+    /**
+     * Monitors on this page the window covers; at least one.
+     */
+    monitor_ids: Array<number>;
+    /**
+     * No earlier than a few minutes ago: a window cannot be backdated.
+     */
+    starts_at: string;
+    /**
+     * Public title, at most 120 characters.
+     */
+    title: string;
+};
+
 export type CreateMcpRequest = {
     config: {
         [key: string]: unknown;
@@ -9795,6 +9848,37 @@ export type CreateStatusPageRequest = {
      * Public page title, e.g. "Acme status".
      */
     title: string;
+};
+
+export type CreateStatusPageWebhookRequest = {
+    /**
+     * `https://` URL with a public address, at most 2048 characters.
+     */
+    url: string;
+};
+
+export type CreateTargetMonitorRequest = {
+    check: CheckSpec;
+    /**
+     * How often to check, in seconds (default 60, at least 30).
+     */
+    check_interval_seconds?: number | null;
+    /**
+     * Shown in the console and, unless renamed there, on status pages.
+     */
+    name: string;
+    /**
+     * Also check from up to four online worker nodes, and count the
+     * monitor down only when most locations agree (ADR 108 D5).
+     */
+    probe_from_nodes?: boolean;
+    request?: CheckRequest | null;
+    /**
+     * What to check: a URL (`http`), `host:port` (`tcp`, `tls`; `tls`
+     * defaults to 443) or a host name (`dns`). It must have a public
+     * address.
+     */
+    target: string;
 };
 
 export type CreateTeamMemberRequest = {
@@ -11981,6 +12065,18 @@ export type DnsChangesResponse = {
      */
     removed_ids: Array<number>;
 };
+
+export type DnsCheck = {
+    /**
+     * Up when any answer equals one of these (case-insensitive, trailing
+     * dot ignored). Empty: up when the name has any record of the type.
+     */
+    expected?: Array<string>;
+    record_type: DnsCheckRecordType;
+    timeout_ms?: number | null;
+};
+
+export type DnsCheckRecordType = 'A' | 'AAAA' | 'CNAME' | 'MX' | 'TXT' | 'NS';
 
 export type DnsCompletionResponse = {
     domain: string;
@@ -18756,6 +18852,24 @@ export type HttpChallengeDebugResponse = {
     validation_url?: string | null;
 };
 
+export type HttpCheck = {
+    /**
+     * Slower than this many milliseconds is degraded, not up.
+     */
+    degraded_after_ms?: number | null;
+    /**
+     * Status codes that count as up: exact codes ("204") or classes
+     * ("2xx"). Empty: any 2xx or 3xx.
+     */
+    expected_status?: Array<string>;
+    keyword?: KeywordAssertion | null;
+    method?: HttpMethod;
+    /**
+     * Time limit of one request, 500 to 30,000 ms (default 10,000).
+     */
+    timeout_ms?: number | null;
+};
+
 export type HttpCheckList = {
     items: Array<HttpCheckView>;
     page: number;
@@ -18805,6 +18919,8 @@ export type HttpChecksCapabilities = {
     alerts_setup_path: string;
     detection_rule_count: number;
 };
+
+export type HttpMethod = 'GET' | 'HEAD' | 'POST' | 'PUT' | 'PATCH' | 'DELETE' | 'OPTIONS';
 
 /**
  * What a tunnel address answers at Cloudflare's edge, as the user chose
@@ -20448,6 +20564,22 @@ export type KeysResponse = {
     keys: Array<string>;
 };
 
+/**
+ * Text that must, or must not, appear in the response body.
+ */
+export type KeywordAssertion = {
+    /**
+     * `true`: the check fails unless the text is there. `false`: it fails
+     * when the text is there (e.g. "maintenance mode").
+     */
+    present?: boolean;
+    /**
+     * Case-sensitive, at most 200 characters. Only the first 256 KiB of
+     * the body is searched, and the body is never stored.
+     */
+    text: string;
+};
+
 export type KillJobBody = {
     /**
      * When true, sends SIGKILL immediately. Defaults to SIGTERM so the
@@ -21388,6 +21520,41 @@ export type LogsResponse = {
     count: number;
     data: Array<LogRecord>;
 };
+
+export type MaintenanceListResponse = {
+    /**
+     * Newest first.
+     */
+    items: Array<MaintenanceResponse>;
+    page: number;
+    page_size: number;
+    total: number;
+};
+
+export type MaintenanceResponse = {
+    cancelled_at?: string | null;
+    created_at: string;
+    description?: string | null;
+    ends_at: string;
+    id: number;
+    /**
+     * The page's monitors the window covers.
+     */
+    monitor_ids: Array<number>;
+    starts_at: string;
+    state: MaintenanceState;
+    status_page_id: number;
+    /**
+     * Shown on the public page and in announcements.
+     */
+    title: string;
+    updated_at: string;
+};
+
+/**
+ * Where a window is in its life.
+ */
+export type MaintenanceState = 'scheduled' | 'in_progress' | 'completed' | 'cancelled';
 
 /**
  * A service whose continuous archive (Postgres WAL-G, MariaDB binlogs) is
@@ -22403,6 +22570,26 @@ export type ModelUsage = {
     total_tokens: number;
 };
 
+/**
+ * What a monitor checks. `Environment` is the probe of a Temps
+ * environment; the others check an explicit target.
+ */
+export type MonitorCheckKind = 'environment' | 'http' | 'tcp' | 'tls' | 'dns';
+
+/**
+ * How a monitor outside Temps is checked. Header values are not included.
+ */
+export type MonitorCheckView = {
+    check: CheckSpec;
+    has_body: boolean;
+    /**
+     * Names of the request headers sent; their values are stored
+     * encrypted.
+     */
+    header_names: Array<string>;
+    target: string;
+};
+
 export type MonitorConfig = {
     checkin_margin?: number;
     failure_issue_threshold?: number;
@@ -22412,8 +22599,46 @@ export type MonitorConfig = {
     timezone?: string;
 };
 
+/**
+ * What one location reported on a check.
+ */
+export type MonitorLocationResult = {
+    /**
+     * `control plane`, or the worker node's name.
+     */
+    location: string;
+    /**
+     * Why it is not operational, or why the location did not answer.
+     */
+    message?: string | null;
+    /**
+     * The worker node; `null` for the control plane.
+     */
+    node_id?: number | null;
+    /**
+     * The node's `region` label, when it has one.
+     */
+    region?: string | null;
+    response_time_ms?: number | null;
+    status?: ProbeStatus | null;
+};
+
+/**
+ * Every location's answer to the latest check.
+ */
+export type MonitorLocationResults = {
+    checked_at: string;
+    results: Array<MonitorLocationResult>;
+};
+
 export type MonitorResponse = {
+    check?: MonitorCheckView | null;
     check_interval_seconds: number;
+    /**
+     * `environment` for a monitor of a Temps environment, otherwise the
+     * check run against `check.target` (ADR 108 D3, D4).
+     */
+    check_kind: MonitorCheckKind;
     check_path?: string | null;
     created_at: string;
     environment_id?: number | null;
@@ -22423,6 +22648,7 @@ export type MonitorResponse = {
      * Temps-managed HTTP monitor; independent monitors remain visible for workers.
      */
     is_managed: boolean;
+    location_results?: MonitorLocationResults | null;
     monitor_type: string;
     monitor_url: string;
     name: string;
@@ -22433,6 +22659,11 @@ export type MonitorResponse = {
      * next sweep.
      */
     next_check_at?: string | null;
+    /**
+     * Also checked from worker nodes; down only when most locations agree
+     * (ADR 108 D5).
+     */
+    probe_from_nodes: boolean;
     project_id: number;
     updated_at: string;
 };
@@ -24859,6 +25090,14 @@ export type PageHourlySessionsResponse = {
 };
 
 /**
+ * Whether a page needs a password. The password is never returned.
+ */
+export type PagePasswordResponse = {
+    has_password: boolean;
+    status_page_id: number;
+};
+
+/**
  * Query parameters for page path detail analytics
  */
 export type PagePathDetailQuery = {
@@ -26636,6 +26875,53 @@ export type PrivateIpInfo = {
 };
 
 /**
+ * One place checks can run from.
+ */
+export type ProbeLocationView = {
+    /**
+     * `control plane`, or the worker node's name.
+     */
+    name: string;
+    /**
+     * The worker node; `null` for the control plane.
+     */
+    node_id?: number | null;
+    /**
+     * The node's `region` label, when it has one.
+     */
+    region?: string | null;
+};
+
+/**
+ * Where a monitor checked from worker nodes would be checked from now.
+ */
+export type ProbeLocationsResponse = {
+    /**
+     * Whether any worker node is available, so checking from worker
+     * nodes adds a location.
+     */
+    configured: boolean;
+    /**
+     * The control plane first, then each worker node that would be asked.
+     */
+    locations: Array<ProbeLocationView>;
+    /**
+     * What is missing when `configured` is false.
+     */
+    reason?: string | null;
+    /**
+     * Where to fix it in the console.
+     */
+    setup_path?: string | null;
+};
+
+/**
+ * A check's verdict. Serialized as the value stored in
+ * `status_checks.status`.
+ */
+export type ProbeStatus = 'operational' | 'degraded' | 'major_outage';
+
+/**
  * Representation of a Problem error to return to the client.
  * Follows RFC 7807 - Problem Details for HTTP APIs
  */
@@ -28147,7 +28433,7 @@ export type ProxyLogsPaginatedResponse = {
  * Current state of a public component (one selected monitor), or of the page
  * as a whole.
  */
-export type PublicComponentStatus = 'unknown' | 'operational' | 'degraded' | 'outage';
+export type PublicComponentStatus = 'unknown' | 'maintenance' | 'operational' | 'degraded' | 'outage';
 
 export type PublicComposePreviewRequest = {
     branch?: string | null;
@@ -28477,6 +28763,25 @@ export type PublicIpInfo = {
 };
 
 /**
+ * A scheduled maintenance window as visitors see it (ADR 108 D2): the
+ * public title and description the admin wrote for the page, its times, and
+ * the display names of the components it covers.
+ */
+export type PublicMaintenance = {
+    affected_components: Array<string>;
+    description?: string | null;
+    ends_at: string;
+    starts_at: string;
+    status: PublicMaintenanceStatus;
+    title: string;
+};
+
+/**
+ * Whether a public maintenance window has started.
+ */
+export type PublicMaintenanceStatus = 'scheduled' | 'in_progress';
+
+/**
  * Response for preset detection
  */
 export type PublicPresetResponse = {
@@ -28575,6 +28880,10 @@ export type PublicStatusPageResponse = {
      * Active and recently resolved incidents, newest first.
      */
     incidents: Array<PublicIncident>;
+    /**
+     * Maintenance windows in progress or scheduled, soonest first.
+     */
+    maintenances: Array<PublicMaintenance>;
     /**
      * Worst current state across components and active public incidents.
      */
@@ -33894,6 +34203,14 @@ export type SetNodeResourcesRequest = {
     system_reserved?: SystemReserved | null;
 };
 
+/**
+ * `password` set: protect the page with it (8 to 256 characters), ending
+ * every visitor's session. `null`: remove the password.
+ */
+export type SetPagePasswordRequest = {
+    password?: string | null;
+};
+
 export type SetPreviewPasswordBody = {
     /**
      * Plaintext password to protect the sandbox's preview URLs. Hashed
@@ -35740,6 +36057,11 @@ export type StatusPageResponse = {
     appearance: StatusPageAppearance;
     created_at: string;
     description?: string | null;
+    /**
+     * Visitors need a password to read the page (ADR 108 D2). The password
+     * itself is never returned.
+     */
+    has_password: boolean;
     id: number;
     is_published: boolean;
     monitors: Array<StatusPageMonitorResponse>;
@@ -35748,6 +36070,11 @@ export type StatusPageResponse = {
      * needs the matching permission on every one of them.
      */
     projects: Array<StatusPageProject>;
+    /**
+     * Atom feed of the page's public updates. `None` when `public_url` is,
+     * or while the page is password-protected (it has no feed then).
+     */
+    public_feed_url?: string | null;
     /**
      * Machine-readable form of the public page. `None` exactly when
      * `public_url` is.
@@ -35778,6 +36105,48 @@ export type StatusPageResponse = {
  * Color scheme of a public page.
  */
 export type StatusPageTheme = 'auto' | 'light' | 'dark';
+
+/**
+ * The new webhook and its signing secret. The secret is shown only here.
+ */
+export type StatusPageWebhookCreatedResponse = {
+    /**
+     * Verify `X-Temps-Signature` with it. Store it now: it is never shown
+     * again.
+     */
+    secret: string;
+    webhook: StatusPageWebhookResponse;
+};
+
+export type StatusPageWebhookListResponse = {
+    /**
+     * Newest first.
+     */
+    items: Array<StatusPageWebhookResponse>;
+    page: number;
+    page_size: number;
+    total: number;
+};
+
+export type StatusPageWebhookResponse = {
+    created_at: string;
+    enabled: boolean;
+    /**
+     * The signing secret is stored encrypted and shown only when the
+     * webhook is created.
+     */
+    has_secret: boolean;
+    id: number;
+    last_attempt_at?: string | null;
+    /**
+     * Why the last delivery failed, until one succeeds.
+     */
+    last_failure_reason?: string | null;
+    last_success_at?: string | null;
+    status_page_id: number;
+    updated_at: string;
+    url: string;
+};
 
 export type StepConversionResponse = {
     average_time_to_complete_seconds: number;
@@ -35956,6 +36325,82 @@ export type SubmitLoginCodeRequest = {
     code: string;
 };
 
+export type SubscriberListResponse = {
+    items: Array<SubscriberResponse>;
+    page: number;
+    page_size: number;
+    total: number;
+};
+
+/**
+ * One subscriber, as the page's administrators see it. Never shown to
+ * anyone else.
+ */
+export type SubscriberResponse = {
+    confirmed_at?: string | null;
+    created_at: string;
+    email: string;
+    id: number;
+    state: SubscriberState;
+};
+
+export type SubscriberState = 'pending' | 'confirmed';
+
+/**
+ * Whether a prerequisite of subscriptions is in place, and if not, what is
+ * missing and where to fix it.
+ */
+export type SubscriptionCapability = {
+    configured: boolean;
+    /**
+     * What is missing, in words an operator can act on.
+     */
+    reason?: string | null;
+    /**
+     * Console path that fixes it; `None` when the fix is on the same form.
+     */
+    setup_path?: string | null;
+};
+
+/**
+ * Email subscription settings of one status page.
+ */
+export type SubscriptionSettingsResponse = {
+    confirmed_count: number;
+    /**
+     * Whether mail can be sent from `sender`.
+     */
+    email: SubscriptionCapability;
+    /**
+     * Visitors see a subscribe form on the public page.
+     */
+    enabled: boolean;
+    /**
+     * When subscriptions were last switched on; only updates published
+     * after it are announced.
+     */
+    enabled_at?: string | null;
+    /**
+     * Whether confirmation and unsubscribe links have an address people
+     * outside this network can open.
+     */
+    links: SubscriptionCapability;
+    /**
+     * Most subscribers a page can have, confirmed and pending together.
+     */
+    max_subscribers: number;
+    pending_count: number;
+    /**
+     * From address of subscriber mail.
+     */
+    sender?: string | null;
+    status_page_id: number;
+    /**
+     * Verified email domains with an active provider: valid sender domains.
+     */
+    verified_domains: Array<string>;
+};
+
 /**
  * Which answer to suggest next steps for.
  */
@@ -36116,6 +36561,14 @@ export type TargetRecommendation = {
      * `monthly_savings_usd × 12`
      */
     yearly_savings_usd?: number | null;
+};
+
+export type TcpCheck = {
+    /**
+     * Slower than this many milliseconds to connect is degraded.
+     */
+    degraded_after_ms?: number | null;
+    timeout_ms?: number | null;
 };
 
 export type TeamListResponse = {
@@ -36980,6 +37433,15 @@ export type TimeseriesQueryParams = {
      * Filter by user ID
      */
     user_id?: number | null;
+};
+
+export type TlsCheck = {
+    timeout_ms?: number | null;
+    /**
+     * A certificate expiring within this many days is degraded
+     * (default 14, at most 90). An expired or untrusted one is down.
+     */
+    warn_days?: number | null;
 };
 
 export type TlsMode = 'None' | 'Starttls' | 'Tls';
@@ -38754,6 +39216,21 @@ export type UpdateKvResponse = {
 };
 
 /**
+ * Fields left out are unchanged. Once a window has started, only `title`,
+ * `description` and `ends_at` can change.
+ */
+export type UpdateMaintenanceRequest = {
+    /**
+     * An empty string removes the description.
+     */
+    description?: string | null;
+    ends_at?: string | null;
+    monitor_ids?: Array<number> | null;
+    starts_at?: string | null;
+    title?: string | null;
+};
+
+/**
  * Request body of the container-name settings endpoints.
  */
 export type UpdateManagedContainerName = {
@@ -39334,6 +39811,14 @@ export type UpdateStatusPageRequest = {
 };
 
 /**
+ * Fields left out are unchanged.
+ */
+export type UpdateStatusPageWebhookRequest = {
+    enabled?: boolean | null;
+    url?: string | null;
+};
+
+/**
  * Result of the background release-update check, driving the web console's
  * upgrade banner. All optional fields are set together iff
  * `update_available` is true.
@@ -39373,6 +39858,37 @@ export type UpdateStatusResponse = {
      * on this install's channel.
      */
     update_available: boolean;
+};
+
+/**
+ * Change the email subscription settings of a status page. Absent fields are
+ * left as they are.
+ */
+export type UpdateSubscriptionSettingsRequest = {
+    /**
+     * Show the subscribe form. Switching on needs a working sender.
+     */
+    enabled?: boolean | null;
+    /**
+     * From address at a verified email domain; an empty string clears it.
+     */
+    sender?: string | null;
+};
+
+export type UpdateTargetMonitorRequest = {
+    check?: CheckSpec | null;
+    check_interval_seconds?: number | null;
+    /**
+     * `false` pauses the monitor.
+     */
+    is_active?: boolean | null;
+    name?: string | null;
+    /**
+     * Check from worker nodes too, or from the control plane only.
+     */
+    probe_from_nodes?: boolean | null;
+    request?: CheckRequest | null;
+    target?: string | null;
 };
 
 export type UpdateTeamRequest = {
@@ -40514,6 +41030,46 @@ export type WebhookDeliveryResponse = {
     status_code?: number | null;
     success: boolean;
     webhook_id: number;
+};
+
+/**
+ * One public happening on the page.
+ */
+export type WebhookEvent = {
+    affected_components: Array<string>;
+    ends_at?: string | null;
+    /**
+     * Stable per page and event, the same as the Atom entry id: use it to
+     * drop a repeated delivery.
+     */
+    id: string;
+    message: string;
+    published_at: string;
+    /**
+     * When a maintenance window starts; absent for incident events.
+     */
+    starts_at?: string | null;
+    status: string;
+    title: string;
+};
+
+/**
+ * The page an event belongs to.
+ */
+export type WebhookPage = {
+    title: string;
+};
+
+/**
+ * The JSON body of every webhook delivery.
+ */
+export type WebhookPayload = {
+    event: WebhookEvent;
+    page: WebhookPage;
+    /**
+     * `incident_update`, `incident_resolved` or `maintenance_scheduled`.
+     */
+    type: string;
 };
 
 export type WebhookResponse = {
@@ -90812,6 +91368,142 @@ export type CreateMonitorResponses = {
 
 export type CreateMonitorResponse = CreateMonitorResponses[keyof CreateMonitorResponses];
 
+export type GetMonitorProbeLocationsData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/monitors/probe-locations';
+};
+
+export type GetMonitorProbeLocationsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetMonitorProbeLocationsResponses = {
+    /**
+     * Probe locations
+     */
+    200: ProbeLocationsResponse;
+};
+
+export type GetMonitorProbeLocationsResponse = GetMonitorProbeLocationsResponses[keyof GetMonitorProbeLocationsResponses];
+
+export type CreateTargetMonitorData = {
+    body: CreateTargetMonitorRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/monitors/targets';
+};
+
+export type CreateTargetMonitorErrors = {
+    /**
+     * Invalid target or check, or a non-public address
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Project not found
+     */
+    404: unknown;
+    /**
+     * The project has too many target monitors
+     */
+    409: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type CreateTargetMonitorResponses = {
+    /**
+     * Monitor created
+     */
+    201: MonitorResponse;
+};
+
+export type CreateTargetMonitorResponse = CreateTargetMonitorResponses[keyof CreateTargetMonitorResponses];
+
+export type UpdateTargetMonitorData = {
+    body: UpdateTargetMonitorRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Monitor ID
+         */
+        monitor_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/monitors/{monitor_id}/target';
+};
+
+export type UpdateTargetMonitorErrors = {
+    /**
+     * Invalid target or check, or a non-public address
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Monitor not found in the project
+     */
+    404: unknown;
+    /**
+     * The monitor checks a Temps environment
+     */
+    409: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UpdateTargetMonitorResponses = {
+    /**
+     * Monitor updated
+     */
+    200: MonitorResponse;
+};
+
+export type UpdateTargetMonitorResponse = UpdateTargetMonitorResponses[keyof UpdateTargetMonitorResponses];
+
 export type ObservabilityListEventsData = {
     body?: never;
     path: {
@@ -98715,6 +99407,331 @@ export type VerifyStatusPageDomainResponses = {
 
 export type VerifyStatusPageDomainResponse = VerifyStatusPageDomainResponses[keyof VerifyStatusPageDomainResponses];
 
+export type ListStatusPageMaintenancesData = {
+    body?: never;
+    path: {
+        /**
+         * Status page ID
+         */
+        status_page_id: number;
+    };
+    query?: {
+        /**
+         * Page number, starting at 1 (default 1).
+         */
+        page?: number | null;
+        /**
+         * Items per page (default 20, max 100).
+         */
+        page_size?: number | null;
+    };
+    url: '/status-pages/{status_page_id}/maintenances';
+};
+
+export type ListStatusPageMaintenancesErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Status page not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListStatusPageMaintenancesResponses = {
+    /**
+     * Maintenance windows, newest first
+     */
+    200: MaintenanceListResponse;
+};
+
+export type ListStatusPageMaintenancesResponse = ListStatusPageMaintenancesResponses[keyof ListStatusPageMaintenancesResponses];
+
+export type CreateStatusPageMaintenanceData = {
+    body: CreateMaintenanceRequest;
+    path: {
+        /**
+         * Status page ID
+         */
+        status_page_id: number;
+    };
+    query?: never;
+    url: '/status-pages/{status_page_id}/maintenances';
+};
+
+export type CreateStatusPageMaintenanceErrors = {
+    /**
+     * Invalid window
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Status page not found
+     */
+    404: unknown;
+    /**
+     * The page has too many open windows
+     */
+    409: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type CreateStatusPageMaintenanceResponses = {
+    /**
+     * Maintenance window scheduled
+     */
+    201: MaintenanceResponse;
+};
+
+export type CreateStatusPageMaintenanceResponse = CreateStatusPageMaintenanceResponses[keyof CreateStatusPageMaintenanceResponses];
+
+export type CancelStatusPageMaintenanceData = {
+    body?: never;
+    path: {
+        /**
+         * Status page ID
+         */
+        status_page_id: number;
+        /**
+         * Maintenance window ID
+         */
+        maintenance_id: number;
+    };
+    query?: never;
+    url: '/status-pages/{status_page_id}/maintenances/{maintenance_id}';
+};
+
+export type CancelStatusPageMaintenanceErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Status page or window not found
+     */
+    404: unknown;
+    /**
+     * The window was already cancelled or has ended
+     */
+    409: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type CancelStatusPageMaintenanceResponses = {
+    /**
+     * Maintenance window cancelled
+     */
+    200: MaintenanceResponse;
+};
+
+export type CancelStatusPageMaintenanceResponse = CancelStatusPageMaintenanceResponses[keyof CancelStatusPageMaintenanceResponses];
+
+export type GetStatusPageMaintenanceData = {
+    body?: never;
+    path: {
+        /**
+         * Status page ID
+         */
+        status_page_id: number;
+        /**
+         * Maintenance window ID
+         */
+        maintenance_id: number;
+    };
+    query?: never;
+    url: '/status-pages/{status_page_id}/maintenances/{maintenance_id}';
+};
+
+export type GetStatusPageMaintenanceErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Status page or window not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetStatusPageMaintenanceResponses = {
+    /**
+     * Maintenance window
+     */
+    200: MaintenanceResponse;
+};
+
+export type GetStatusPageMaintenanceResponse = GetStatusPageMaintenanceResponses[keyof GetStatusPageMaintenanceResponses];
+
+export type UpdateStatusPageMaintenanceData = {
+    body: UpdateMaintenanceRequest;
+    path: {
+        /**
+         * Status page ID
+         */
+        status_page_id: number;
+        /**
+         * Maintenance window ID
+         */
+        maintenance_id: number;
+    };
+    query?: never;
+    url: '/status-pages/{status_page_id}/maintenances/{maintenance_id}';
+};
+
+export type UpdateStatusPageMaintenanceErrors = {
+    /**
+     * Invalid window
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Status page or window not found
+     */
+    404: unknown;
+    /**
+     * The window can no longer change that way
+     */
+    409: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UpdateStatusPageMaintenanceResponses = {
+    /**
+     * Maintenance window updated
+     */
+    200: MaintenanceResponse;
+};
+
+export type UpdateStatusPageMaintenanceResponse = UpdateStatusPageMaintenanceResponses[keyof UpdateStatusPageMaintenanceResponses];
+
+export type GetStatusPagePasswordData = {
+    body?: never;
+    path: {
+        /**
+         * Status page ID
+         */
+        status_page_id: number;
+    };
+    query?: never;
+    url: '/status-pages/{status_page_id}/password';
+};
+
+export type GetStatusPagePasswordErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Status page not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetStatusPagePasswordResponses = {
+    /**
+     * Whether the page has a password
+     */
+    200: PagePasswordResponse;
+};
+
+export type GetStatusPagePasswordResponse = GetStatusPagePasswordResponses[keyof GetStatusPagePasswordResponses];
+
+export type SetStatusPagePasswordData = {
+    body: SetPagePasswordRequest;
+    path: {
+        /**
+         * Status page ID
+         */
+        status_page_id: number;
+    };
+    query?: never;
+    url: '/status-pages/{status_page_id}/password';
+};
+
+export type SetStatusPagePasswordErrors = {
+    /**
+     * Invalid password
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Status page not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type SetStatusPagePasswordResponses = {
+    /**
+     * Password changed
+     */
+    200: PagePasswordResponse;
+};
+
+export type SetStatusPagePasswordResponse = SetStatusPagePasswordResponses[keyof SetStatusPagePasswordResponses];
+
 export type PreviewStatusPageData = {
     body?: never;
     path: {
@@ -98839,6 +99856,227 @@ export type RotateStatusPageUrlResponses = {
 
 export type RotateStatusPageUrlResponse = RotateStatusPageUrlResponses[keyof RotateStatusPageUrlResponses];
 
+export type ListStatusPageSubscribersData = {
+    body?: never;
+    path: {
+        /**
+         * Status page ID
+         */
+        status_page_id: number;
+    };
+    query?: {
+        /**
+         * Page number, starting at 1 (default 1).
+         */
+        page?: number | null;
+        /**
+         * Items per page (default 20, max 100).
+         */
+        page_size?: number | null;
+    };
+    url: '/status-pages/{status_page_id}/subscribers';
+};
+
+export type ListStatusPageSubscribersErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Status page not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListStatusPageSubscribersResponses = {
+    /**
+     * Subscribers, newest first
+     */
+    200: SubscriberListResponse;
+};
+
+export type ListStatusPageSubscribersResponse = ListStatusPageSubscribersResponses[keyof ListStatusPageSubscribersResponses];
+
+export type ExportStatusPageSubscribersData = {
+    body?: never;
+    path: {
+        /**
+         * Status page ID
+         */
+        status_page_id: number;
+    };
+    query?: never;
+    url: '/status-pages/{status_page_id}/subscribers/export';
+};
+
+export type ExportStatusPageSubscribersErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Status page not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ExportStatusPageSubscribersResponses = {
+    /**
+     * Subscribers as CSV
+     */
+    200: string;
+};
+
+export type ExportStatusPageSubscribersResponse = ExportStatusPageSubscribersResponses[keyof ExportStatusPageSubscribersResponses];
+
+export type DeleteStatusPageSubscriberData = {
+    body?: never;
+    path: {
+        /**
+         * Status page ID
+         */
+        status_page_id: number;
+        /**
+         * Subscriber ID
+         */
+        subscriber_id: number;
+    };
+    query?: never;
+    url: '/status-pages/{status_page_id}/subscribers/{subscriber_id}';
+};
+
+export type DeleteStatusPageSubscriberErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Status page or subscriber not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type DeleteStatusPageSubscriberResponses = {
+    /**
+     * Subscriber deleted
+     */
+    204: void;
+};
+
+export type DeleteStatusPageSubscriberResponse = DeleteStatusPageSubscriberResponses[keyof DeleteStatusPageSubscriberResponses];
+
+export type GetStatusPageSubscriptionsData = {
+    body?: never;
+    path: {
+        /**
+         * Status page ID
+         */
+        status_page_id: number;
+    };
+    query?: never;
+    url: '/status-pages/{status_page_id}/subscriptions';
+};
+
+export type GetStatusPageSubscriptionsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Status page not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetStatusPageSubscriptionsResponses = {
+    /**
+     * Subscription settings
+     */
+    200: SubscriptionSettingsResponse;
+};
+
+export type GetStatusPageSubscriptionsResponse = GetStatusPageSubscriptionsResponses[keyof GetStatusPageSubscriptionsResponses];
+
+export type UpdateStatusPageSubscriptionsData = {
+    body: UpdateSubscriptionSettingsRequest;
+    path: {
+        /**
+         * Status page ID
+         */
+        status_page_id: number;
+    };
+    query?: never;
+    url: '/status-pages/{status_page_id}/subscriptions';
+};
+
+export type UpdateStatusPageSubscriptionsErrors = {
+    /**
+     * Invalid sender address
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Status page not found
+     */
+    404: unknown;
+    /**
+     * Subscriptions cannot be switched on yet
+     */
+    409: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UpdateStatusPageSubscriptionsResponses = {
+    /**
+     * Settings saved
+     */
+    200: SubscriptionSettingsResponse;
+};
+
+export type UpdateStatusPageSubscriptionsResponse = UpdateStatusPageSubscriptionsResponses[keyof UpdateStatusPageSubscriptionsResponses];
+
 export type UnpublishStatusPageData = {
     body?: never;
     path: {
@@ -98879,6 +100117,195 @@ export type UnpublishStatusPageResponses = {
 
 export type UnpublishStatusPageResponse = UnpublishStatusPageResponses[keyof UnpublishStatusPageResponses];
 
+export type ListStatusPageWebhooksData = {
+    body?: never;
+    path: {
+        /**
+         * Status page ID
+         */
+        status_page_id: number;
+    };
+    query?: {
+        /**
+         * Page number, starting at 1 (default 1).
+         */
+        page?: number | null;
+        /**
+         * Items per page (default 20, max 100).
+         */
+        page_size?: number | null;
+    };
+    url: '/status-pages/{status_page_id}/webhooks';
+};
+
+export type ListStatusPageWebhooksErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Status page not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListStatusPageWebhooksResponses = {
+    /**
+     * Webhooks, newest first
+     */
+    200: StatusPageWebhookListResponse;
+};
+
+export type ListStatusPageWebhooksResponse = ListStatusPageWebhooksResponses[keyof ListStatusPageWebhooksResponses];
+
+export type CreateStatusPageWebhookData = {
+    body: CreateStatusPageWebhookRequest;
+    path: {
+        /**
+         * Status page ID
+         */
+        status_page_id: number;
+    };
+    query?: never;
+    url: '/status-pages/{status_page_id}/webhooks';
+};
+
+export type CreateStatusPageWebhookErrors = {
+    /**
+     * Invalid URL or non-public address
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Status page not found
+     */
+    404: unknown;
+    /**
+     * The page already has the most webhooks allowed
+     */
+    409: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type CreateStatusPageWebhookResponses = {
+    /**
+     * Webhook registered; the secret is shown only now
+     */
+    201: StatusPageWebhookCreatedResponse;
+};
+
+export type CreateStatusPageWebhookResponse = CreateStatusPageWebhookResponses[keyof CreateStatusPageWebhookResponses];
+
+export type DeleteStatusPageWebhookData = {
+    body?: never;
+    path: {
+        /**
+         * Status page ID
+         */
+        status_page_id: number;
+        /**
+         * Webhook ID
+         */
+        webhook_id: number;
+    };
+    query?: never;
+    url: '/status-pages/{status_page_id}/webhooks/{webhook_id}';
+};
+
+export type DeleteStatusPageWebhookErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Status page or webhook not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type DeleteStatusPageWebhookResponses = {
+    /**
+     * Webhook deleted
+     */
+    204: void;
+};
+
+export type DeleteStatusPageWebhookResponse = DeleteStatusPageWebhookResponses[keyof DeleteStatusPageWebhookResponses];
+
+export type UpdateStatusPageWebhookData = {
+    body: UpdateStatusPageWebhookRequest;
+    path: {
+        /**
+         * Status page ID
+         */
+        status_page_id: number;
+        /**
+         * Webhook ID
+         */
+        webhook_id: number;
+    };
+    query?: never;
+    url: '/status-pages/{status_page_id}/webhooks/{webhook_id}';
+};
+
+export type UpdateStatusPageWebhookErrors = {
+    /**
+     * Invalid URL or non-public address
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Status page or webhook not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UpdateStatusPageWebhookResponses = {
+    /**
+     * Webhook updated
+     */
+    200: StatusPageWebhookResponse;
+};
+
+export type UpdateStatusPageWebhookResponse = UpdateStatusPageWebhookResponses[keyof UpdateStatusPageWebhookResponses];
+
 export type GetPublicStatusPageData = {
     body?: never;
     path: {
@@ -98893,6 +100320,10 @@ export type GetPublicStatusPageData = {
 
 export type GetPublicStatusPageErrors = {
     /**
+     * The page is password-protected: the password form
+     */
+    401: unknown;
+    /**
      * No published status page at this URL
      */
     404: unknown;
@@ -98905,6 +100336,145 @@ export type GetPublicStatusPageErrors = {
 export type GetPublicStatusPageResponses = {
     /**
      * Rendered status page
+     */
+    200: unknown;
+};
+
+export type StatusPageConfirmFormData = {
+    body?: never;
+    path: {
+        /**
+         * Unguessable status page token
+         */
+        slug: string;
+        /**
+         * Confirmation token from the mail
+         */
+        token: string;
+    };
+    query?: never;
+    url: '/status/{slug}/confirm/{token}';
+};
+
+export type StatusPageConfirmFormErrors = {
+    /**
+     * Unknown page or malformed link
+     */
+    404: unknown;
+};
+
+export type StatusPageConfirmFormResponses = {
+    /**
+     * Page with a confirm button
+     */
+    200: unknown;
+};
+
+export type StatusPageConfirmData = {
+    body?: never;
+    path: {
+        /**
+         * Unguessable status page token
+         */
+        slug: string;
+        /**
+         * Confirmation token from the mail
+         */
+        token: string;
+    };
+    query?: never;
+    url: '/status/{slug}/confirm/{token}';
+};
+
+export type StatusPageConfirmErrors = {
+    /**
+     * Unknown page, or the link expired or was used
+     */
+    404: unknown;
+    /**
+     * Rate limited
+     */
+    429: unknown;
+};
+
+export type StatusPageConfirmResponses = {
+    /**
+     * Subscription confirmed
+     */
+    200: unknown;
+};
+
+export type GetPublicStatusPageFeedData = {
+    body?: never;
+    path: {
+        /**
+         * Unguessable status page token
+         */
+        slug: string;
+    };
+    query?: never;
+    url: '/status/{slug}/feed.atom';
+};
+
+export type GetPublicStatusPageFeedErrors = {
+    /**
+     * No published status page at this URL
+     */
+    404: unknown;
+    /**
+     * Rate limited
+     */
+    429: unknown;
+};
+
+export type GetPublicStatusPageFeedResponses = {
+    /**
+     * Atom feed of the page's public updates
+     */
+    200: unknown;
+};
+
+export type StatusPageSubscribeData = {
+    /**
+     * `email=<address>`
+     */
+    body?: unknown;
+    path: {
+        /**
+         * Unguessable status page token
+         */
+        slug: string;
+    };
+    query?: never;
+    url: '/status/{slug}/subscribe';
+};
+
+export type StatusPageSubscribeErrors = {
+    /**
+     * Not an email address
+     */
+    400: unknown;
+    /**
+     * The page is password-protected and not unlocked
+     */
+    401: unknown;
+    /**
+     * No published status page taking subscriptions at this URL
+     */
+    404: unknown;
+    /**
+     * Rate limited
+     */
+    429: unknown;
+    /**
+     * The page cannot take more subscriptions
+     */
+    503: unknown;
+};
+
+export type StatusPageSubscribeResponses = {
+    /**
+     * Request accepted; a confirmation link is sent
      */
     200: unknown;
 };
@@ -98923,6 +100493,10 @@ export type GetPublicStatusPageJsonData = {
 
 export type GetPublicStatusPageJsonErrors = {
     /**
+     * The page is password-protected and not unlocked
+     */
+    401: unknown;
+    /**
      * No published status page at this URL
      */
     404: unknown;
@@ -98940,6 +100514,104 @@ export type GetPublicStatusPageJsonResponses = {
 };
 
 export type GetPublicStatusPageJsonResponse = GetPublicStatusPageJsonResponses[keyof GetPublicStatusPageJsonResponses];
+
+export type UnlockPublicStatusPageData = {
+    /**
+     * `password=<password>`
+     */
+    body?: unknown;
+    path: {
+        /**
+         * Unguessable status page token
+         */
+        slug: string;
+    };
+    query?: never;
+    url: '/status/{slug}/unlock';
+};
+
+export type UnlockPublicStatusPageErrors = {
+    /**
+     * Wrong password: the form again
+     */
+    401: unknown;
+    /**
+     * No published status page at this URL
+     */
+    404: unknown;
+    /**
+     * Too many wrong passwords from this client
+     */
+    429: unknown;
+    /**
+     * Too many unlocks at once; retry
+     */
+    503: unknown;
+};
+
+export type StatusPageUnsubscribeFormData = {
+    body?: never;
+    path: {
+        /**
+         * Unguessable status page token
+         */
+        slug: string;
+        /**
+         * Unsubscribe token from a mail
+         */
+        token: string;
+    };
+    query?: never;
+    url: '/status/{slug}/unsubscribe/{token}';
+};
+
+export type StatusPageUnsubscribeFormErrors = {
+    /**
+     * Unknown page or malformed link
+     */
+    404: unknown;
+};
+
+export type StatusPageUnsubscribeFormResponses = {
+    /**
+     * Page with an unsubscribe button
+     */
+    200: unknown;
+};
+
+export type StatusPageUnsubscribeData = {
+    body?: never;
+    path: {
+        /**
+         * Unguessable status page token
+         */
+        slug: string;
+        /**
+         * Unsubscribe token from a mail
+         */
+        token: string;
+    };
+    query?: never;
+    url: '/status/{slug}/unsubscribe/{token}';
+};
+
+export type StatusPageUnsubscribeErrors = {
+    /**
+     * Unknown page or malformed link
+     */
+    404: unknown;
+    /**
+     * Rate limited
+     */
+    429: unknown;
+};
+
+export type StatusPageUnsubscribeResponses = {
+    /**
+     * Unsubscribed (also for a link already used)
+     */
+    200: unknown;
+};
 
 export type ListSystemAlarmsData = {
     body?: never;

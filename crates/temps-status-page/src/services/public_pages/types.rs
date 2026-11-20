@@ -239,11 +239,17 @@ pub struct StatusPageResponse {
     /// Machine-readable form of the public page. `None` exactly when
     /// `public_url` is.
     pub public_json_url: Option<String>,
+    /// Atom feed of the page's public updates. `None` when `public_url` is,
+    /// or while the page is password-protected (it has no feed then).
+    pub public_feed_url: Option<String>,
     /// Whether `public_url` exists, and if not (or if it will not open from
     /// outside this network) what to do about it.
     pub public_url_status: PublicUrlStatus,
     pub monitors: Vec<StatusPageMonitorResponse>,
     pub appearance: StatusPageAppearance,
+    /// Visitors need a password to read the page (ADR 108 D2). The password
+    /// itself is never returned.
+    pub has_password: bool,
     #[schema(value_type = Option<String>, format = "date-time")]
     pub published_at: Option<UtcDateTime>,
     #[schema(value_type = String, format = "date-time")]
@@ -267,6 +273,10 @@ pub struct StatusPageListResponse {
 pub enum PublicComponentStatus {
     /// No recent check result, paused, or not deployed yet.
     Unknown,
+    /// In a scheduled maintenance window (ADR 108 D2). Ranked below
+    /// operational, so one component in maintenance never makes the page
+    /// look worse than its other components.
+    Maintenance,
     Operational,
     Degraded,
     Outage,
@@ -288,6 +298,7 @@ impl PublicComponentStatus {
     pub fn label(self) -> &'static str {
         match self {
             Self::Unknown => "No data",
+            Self::Maintenance => "Under maintenance",
             Self::Operational => "Operational",
             Self::Degraded => "Degraded performance",
             Self::Outage => "Outage",
@@ -297,6 +308,7 @@ impl PublicComponentStatus {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Unknown => "unknown",
+            Self::Maintenance => "maintenance",
             Self::Operational => "operational",
             Self::Degraded => "degraded",
             Self::Outage => "outage",
@@ -465,11 +477,45 @@ pub struct PublicStatusPageResponse {
     pub components: Vec<PublicStatusComponent>,
     /// Active and recently resolved incidents, newest first.
     pub incidents: Vec<PublicIncident>,
+    /// Maintenance windows in progress or scheduled, soonest first.
+    pub maintenances: Vec<PublicMaintenance>,
     pub history_days: u32,
     /// When this snapshot was computed. Public pages are served from a
     /// periodically refreshed snapshot, never computed per request.
     #[schema(value_type = String, format = "date-time")]
     pub generated_at: UtcDateTime,
+}
+
+/// Whether a public maintenance window has started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicMaintenanceStatus {
+    Scheduled,
+    InProgress,
+}
+
+impl PublicMaintenanceStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Scheduled => "Scheduled",
+            Self::InProgress => "In progress",
+        }
+    }
+}
+
+/// A scheduled maintenance window as visitors see it (ADR 108 D2): the
+/// public title and description the admin wrote for the page, its times, and
+/// the display names of the components it covers.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PublicMaintenance {
+    pub title: String,
+    pub description: Option<String>,
+    pub status: PublicMaintenanceStatus,
+    #[schema(value_type = String, format = "date-time")]
+    pub starts_at: UtcDateTime,
+    #[schema(value_type = String, format = "date-time")]
+    pub ends_at: UtcDateTime,
+    pub affected_components: Vec<String>,
 }
 
 /// What a status page would show visitors right now, published or not.

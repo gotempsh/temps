@@ -1,0 +1,34 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "temps-uptime-probe"
+version.workspace = true
+edition.workspace = true
+description = "Uptime check specs and the probe that runs them against public targets, shared by the control plane and worker node agents (ADR 108 D3 to D5)"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+temps-core = { path = "../temps-core" }
+async-trait = { workspace = true }
+hickory-resolver = { workspace = true }
+reqwest = { workspace = true }
+rustls = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-rustls = { workspace = true }
+url = { workspace = true }
+utoipa = { workspace = true }
+webpki-roots = { workspace = true }
+x509-parser = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

@@ -168,6 +168,18 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        "status page subscriber addresses are personal data; the page owner lists, exports and deletes them in the console",
+        &[
+            "delete_status_page_subscriber",
+            "export_status_page_subscribers",
+            "list_status_page_subscribers",
+        ],
+    ),
+    (
+        "switches mail to the public on or off for a status page and chooses its sender; a human decides",
+        &["update_status_page_subscriptions"],
+    ),
+    (
         "removes monitoring silently, so a human must do it (same rule as delete_alert)",
         &[
             "ExternalServiceMetricsDeleteAlertRule",
@@ -363,6 +375,13 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
             "record_speed_metrics",
             "revoke_analytics_ingest_key",
             "rotate_analytics_ingest_key",
+            // Status page subscription links and form (ADR 108 D2): used
+            // by visitors and their mail clients.
+            "status_page_confirm",
+            "status_page_confirm_form",
+            "status_page_subscribe",
+            "status_page_unsubscribe",
+            "status_page_unsubscribe_form",
             "track_click",
             "track_open",
             "update_analytics_ingest_key",

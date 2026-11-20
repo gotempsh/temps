@@ -37,6 +37,8 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 
+use temps_core::public_status_page::redact_subscription_token_path;
+
 use crate::service::proxy_log_service::CreateProxyLogRequest;
 
 /// Placeholder written in place of a credential value.
@@ -203,6 +205,28 @@ pub fn redact_url(url: &str) -> Cow<'_, str> {
     }
 }
 
+/// A URL with the token of a status page subscription link in its path
+/// blanked (see [`redact_subscription_token_path`]). Borrowed when there is
+/// nothing to blank.
+pub fn redact_referrer_path(url: &str) -> Cow<'_, str> {
+    let path_start = match url.find("://") {
+        Some(scheme_end) => match url[scheme_end + 3..].find('/') {
+            Some(at) => scheme_end + 3 + at,
+            None => return Cow::Borrowed(url),
+        },
+        None => 0,
+    };
+    let (origin, rest) = url.split_at(path_start);
+    let (rest, fragment) = match rest.find('#') {
+        Some(at) => rest.split_at(at),
+        None => (rest, ""),
+    };
+    match redact_subscription_token_path(rest) {
+        Cow::Borrowed(_) => Cow::Borrowed(url),
+        Cow::Owned(redacted) => Cow::Owned(format!("{origin}{redacted}{fragment}")),
+    }
+}
+
 /// Redact a captured header map in place.
 ///
 /// Credential headers keep their name and lose their value; URL-valued headers
@@ -213,6 +237,9 @@ pub fn redact_headers(headers: &mut BTreeMap<String, String>) {
             *value = REDACTED.to_string();
         } else if is_url_valued_header(name) {
             if let Cow::Owned(redacted) = redact_url(value) {
+                *value = redacted;
+            }
+            if let Cow::Owned(redacted) = redact_referrer_path(value) {
                 *value = redacted;
             }
         }
@@ -239,7 +266,17 @@ pub fn redact_headers_json(value: &mut serde_json::Value) {
         if is_sensitive_header(name) {
             *entry = serde_json::Value::String(REDACTED.to_string());
         } else if is_url_valued_header(name) {
-            if let Cow::Owned(redacted) = redact_url(text) {
+            let redacted = match redact_url(text) {
+                Cow::Owned(redacted) => match redact_referrer_path(&redacted) {
+                    Cow::Owned(again) => Some(again),
+                    Cow::Borrowed(_) => Some(redacted),
+                },
+                Cow::Borrowed(_) => match redact_referrer_path(text) {
+                    Cow::Owned(redacted) => Some(redacted),
+                    Cow::Borrowed(_) => None,
+                },
+            };
+            if let Some(redacted) = redacted {
                 *entry = serde_json::Value::String(redacted);
             }
         }
@@ -262,12 +299,19 @@ pub fn redact_headers_json(value: &mut serde_json::Value) {
 /// for the direct insert), so neither can persist a secret. Idempotent —
 /// redacting an already-redacted entry is a no-op.
 ///
-/// `path` is deliberately *not* touched: a secret embedded in a path segment
-/// (`/reset/<token>`) can't be told apart from a legitimate identifier without
-/// per-application knowledge, and blanket-redacting path segments would destroy
-/// the primary axis these logs are read along. A known limitation, rather than
-/// something silently half-solved.
+/// `path` is touched only for the capability links Temps itself serves: the
+/// token of a status page subscription's confirmation or unsubscribe link
+/// ([`redact_subscription_token_path`]), in the path and in the referrer. Any
+/// other secret embedded in a path segment (`/reset/<token>`) can't be told
+/// apart from a legitimate identifier without per-application knowledge, and
+/// blanket-redacting path segments would destroy the primary axis these logs
+/// are read along. A known limitation, rather than something silently
+/// half-solved.
 pub fn redact_log_entry(request: &mut CreateProxyLogRequest) {
+    if let Cow::Owned(redacted) = redact_subscription_token_path(&request.path) {
+        request.path = redacted;
+    }
+
     if let Some(query) = request.query_string.as_ref() {
         if let Cow::Owned(redacted) = redact_query_string(query) {
             request.query_string = Some(redacted);
@@ -276,6 +320,11 @@ pub fn redact_log_entry(request: &mut CreateProxyLogRequest) {
 
     if let Some(referrer) = request.referrer.as_ref() {
         if let Cow::Owned(redacted) = redact_url(referrer) {
+            request.referrer = Some(redacted);
+        }
+    }
+    if let Some(referrer) = request.referrer.as_ref() {
+        if let Cow::Owned(redacted) = redact_referrer_path(referrer) {
             request.referrer = Some(redacted);
         }
     }
