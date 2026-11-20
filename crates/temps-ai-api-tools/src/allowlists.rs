@@ -1034,6 +1034,10 @@ pub const AI_WRITE_ALLOWLIST: &[&str] = &[
     // only (`update_ingress_connector`). Those stay in the console.
     "set_ingress_hostname_choice",
     "sync_ingress_connector",
+    // Retries DNS setup for one failed hostname on the tunnel that already
+    // carries it: a narrower `sync_ingress_connector`. It takes no
+    // credential, withdraws nothing, and refuses when the route has moved.
+    "retry_ingress_hostname_dns",
     "create_ingress_connector",
     // ── Managed external services (databases, caches, etc.) —
     //    provisioning a new container and linking an existing
