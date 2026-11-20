@@ -21,6 +21,7 @@ import {
   type NodeDnsHealth,
 } from '@/lib/dns-observability'
 import { cn } from '@/lib/utils'
+import { scrollElementIntoView } from '@/lib/scroll-to-element'
 
 function reportedAgo(at: string | null | undefined): string {
   if (!at) return 'Never'
@@ -148,7 +149,8 @@ function NodeRow({
   const ref = useRef<HTMLLIElement>(null)
   // The header badge and alerts link here: bring the row into view.
   useEffect(() => {
-    if (open) ref.current?.scrollIntoView?.({ block: 'nearest' })
+    if (open && ref.current)
+      scrollElementIntoView(ref.current, { block: 'nearest' })
   }, [open])
   const detailsId = `${nodeRowId(resolver.node_id)}-details`
   const toggle = withParams(search, {

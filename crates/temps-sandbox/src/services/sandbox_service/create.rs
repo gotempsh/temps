@@ -220,75 +220,65 @@ impl SandboxService {
         progress.done(CreationStepKind::SelectNode, Some(node_label.clone()));
         progress.start(CreationStepKind::RecordSandbox);
 
+        if node_id.is_some() && req.from_snapshot_artifact.is_some() {
+            return Err(SandboxError::Validation {
+                message: "restoring a snapshot onto a worker node is not available yet; \
+                          create the sandbox on the control plane (node: \"control-plane\")"
+                    .to_string(),
+            });
+        }
+        self.check_placement_backend(node_id, backend)?;
+
         // Operator limits (HTTP create path only). The settings are read once
         // and fail closed: an unreadable section must not turn into "no
-        // limits". Host memory is only known for the control plane.
+        // limits". Docker capacity belongs to the placement host.
         let operator_limits = if req.enforce_operator_limits {
             let settings = self
                 .platform_config
                 .get_agent_sandbox_settings()
                 .await
                 .map_err(|source| SandboxError::LimitSettings { user_id, source })?;
-            let host_memory_mb = if node_id.is_none() {
-                create_policy::control_plane_memory_mb()
-            } else {
-                None
-            };
-            // On the control plane the provider says what it defaults to; a
-            // worker applies the control plane's configured sandbox
-            // defaults (Docker only, ADR-048) and Docker's PID default.
-            let defaults = if node_id.is_none() {
-                self.registry
-                    .provider_arc()
-                    .default_resource_limits(backend)
-            } else {
-                temps_sandbox_providers::DefaultResourceLimits {
-                    cpu_limit: Some(settings.cpu_limit),
-                    memory_limit_mb: Some(settings.memory_limit_mb),
-                    pids_limit: Some(temps_sandbox_providers::docker::DEFAULT_PIDS_LIMIT),
-                    cpu_whole_cores: false,
-                }
-            };
+            let provider = self.registry.provider_arc();
+            let host = provider
+                .host_capacity(node_id, backend)
+                .await
+                .map_err(|e| from_agent_error(&public_id_value, e))?;
+            let host_memory_mb = host.map(|h| h.memory_mb).or_else(|| {
+                node_id
+                    .is_none()
+                    .then(create_policy::control_plane_memory_mb)
+                    .flatten()
+            });
+            let defaults = self.resource_defaults(node_id, backend, &settings);
             // The host-memory check sees only what the caller sent; the
             // clamp then fills in omitted limits, and the maximums are
             // checked against the result.
+            create_policy::check_cpu_limit(
+                &public_id_value,
+                req.cpu_limit,
+                host.map(|h| h.cpu_cores),
+                settings.max_cpu_limit,
+            )?;
             create_policy::check_host_memory(&req, host_memory_mb)?;
-            create_policy::clamp_omitted_limits(&mut req, &settings, defaults);
-            create_policy::pin_omitted_memory_to_host(&mut req, defaults, host_memory_mb);
-            create_policy::check_requested_limits(&req, &settings, defaults)?;
+            // When the daemon is the tighter bound, leave the limit omitted.
+            // Its provider applies and logs the clamp with the new run id.
+            let mut effective_defaults = defaults;
+            if let Some(host) = host {
+                effective_defaults.cpu_limit =
+                    defaults.cpu_limit.map(|cpu| cpu.min(host.cpu_cores));
+                effective_defaults.memory_limit_mb = defaults
+                    .memory_limit_mb
+                    .map(|memory| memory.min(host.memory_mb));
+            }
+            create_policy::clamp_omitted_limits(&mut req, &settings, effective_defaults);
+            if host.is_none() {
+                create_policy::pin_omitted_memory_to_host(&mut req, defaults, host_memory_mb);
+            }
+            create_policy::check_requested_limits(&req, &settings, effective_defaults)?;
             Some(settings)
         } else {
             None
         };
-
-        if node_id.is_some() {
-            if req.from_snapshot_artifact.is_some() {
-                return Err(SandboxError::Validation {
-                    message: "restoring a snapshot onto a worker node is not available yet; \
-                              create the sandbox on the control plane (node: \"control-plane\")"
-                        .to_string(),
-                });
-            }
-            if let Some(b) =
-                backend.filter(|b| !temps_sandbox_providers::WORKER_SANDBOX_BACKENDS.contains(b))
-            {
-                return Err(SandboxError::Validation {
-                    message: placement::worker_backend_unavailable(b),
-                });
-            }
-        }
-
-        // Fail closed if the caller asked for a backend this host can't
-        // provide (e.g. `firecracker` on a Docker-only host). Isolation
-        // level is a security property — silently downgrading to Docker
-        // would be worse than a clear error.
-        if let (Some(b), None) = (backend, node_id) {
-            if !self.registry.provider_arc().supports_backend(b) {
-                return Err(SandboxError::Validation {
-                    message: backend_unavailable_message(b),
-                });
-            }
-        }
 
         // Validate + hash the optional preview password *before* any
         // container/workdir work starts. A caller passing junk should fail
@@ -477,7 +467,7 @@ impl SandboxService {
 
         let container_label = container_label_for(&public_id_value).to_string();
 
-        let config = SandboxCreateConfig {
+        let mut config = SandboxCreateConfig {
             node_id,
             owner_user_id: None,
             run_id: row.id,
@@ -496,6 +486,15 @@ impl SandboxService {
             idle_timeout: Duration::from_secs(timeout),
             backend,
         };
+
+        if managed_application_id.is_some() {
+            if let Err(error) = self.apply_application_limits(&mut config).await {
+                // No provider create was attempted. Only the new row belongs to
+                // this attempt; retain the application's existing directory.
+                self.mark_destroyed(row.id).await?;
+                return Err(from_agent_error(&public_id_value, error));
+            }
+        }
 
         // Choose create path: snapshot restore vs normal create. The
         // provider reports its steps (image, container create and start,
@@ -542,7 +541,13 @@ impl SandboxService {
                     self.remove_work_dir(&public_id_value).await;
                 }
                 self.mark_destroyed(row.id).await.ok();
-                if e.image_pull_failure().is_some() || e.network_pool_exhaustion().is_some() {
+                if matches!(
+                    e,
+                    temps_agent_core::error::AgentError::SandboxCpuLimit { .. }
+                        | temps_agent_core::error::AgentError::Validation { .. }
+                ) || e.image_pull_failure().is_some()
+                    || e.network_pool_exhaustion().is_some()
+                {
                     // The image could not be pulled, or the host has no
                     // address space left for the sandbox's network: report
                     // which, so the caller can tell a missing tag or a full
