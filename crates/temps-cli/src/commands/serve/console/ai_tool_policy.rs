@@ -908,6 +908,25 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
             "verify_status_page_domain",
         ],
     ),
+    (
+        "error triage writes (ADR 111, D1: bulk status changes, merge, unmerge and split, inbound filters, assignment, comments and saved searches) are made by a person in the console or CLI; the assistant reads their results and proposes single-group changes through update_error_group",
+        &[
+            "bulkUpdateErrorGroups",
+            "mergeErrorGroups",
+            "unmergeErrorGroup",
+            "splitErrorGroup",
+            "createErrorInboundFilter",
+            "updateErrorInboundFilter",
+            "deleteErrorInboundFilter",
+            "set_error_group_assignee",
+            "create_error_group_comment",
+            "update_error_group_comment",
+            "delete_error_group_comment",
+            "create_error_saved_search",
+            "update_error_saved_search",
+            "delete_error_saved_search",
+        ],
+    ),
 ];
 
 /// Allowlisted ids that are served by a plugin and so are not in the published
