@@ -15,6 +15,9 @@ use utoipa::OpenApi as OpenApiTrait;
 use crate::routes::maintenance::{
     create_maintenance_router, MaintenanceApiDoc, MaintenanceRoutesState,
 };
+use crate::routes::page_password::{
+    create_page_password_router, PagePasswordApiDoc, PagePasswordRoutesState,
+};
 use crate::routes::public::{create_public_router, PublicStatusState};
 use crate::routes::public_subscriptions::{
     create_public_subscription_router, PublicSubscriptionState,
@@ -24,6 +27,7 @@ use crate::routes::subscribers::{
     create_subscriber_router, SubscriberApiDoc, SubscriberRoutesState,
 };
 use crate::services::maintenance::StatusPageMaintenanceService;
+use crate::services::page_access::PageAccessService;
 use crate::services::public_pages::{DomainServiceCertificates, StatusPageDomainService};
 use crate::services::subscribers::{StatusPageSubscriberService, TempsEmailMailer};
 use crate::services::{
@@ -305,6 +309,16 @@ impl TempsPlugin for StatusPagePlugin {
             context.register_service(subscriber_service.clone());
             tokio::spawn(subscriber_service.run_dispatcher());
 
+            // Page passwords (ADR 108 D2): access cookies are signed with a
+            // key derived from the install's master key.
+            context.register_service(Arc::new(PageAccessService::new(
+                db.clone(),
+                snapshot_cache.clone(),
+                context
+                    .require_service::<temps_core::EncryptionService>()
+                    .as_ref(),
+            )));
+
             // Maintenance windows (ADR 108 D2).
             context.register_service(Arc::new(StatusPageMaintenanceService::new(
                 db.clone(),
@@ -426,10 +440,17 @@ impl TempsPlugin for StatusPagePlugin {
             audit: app_state.audit_service.clone(),
             project_access_checker: app_state.project_access_checker.clone(),
         });
+        let password_state = Arc::new(PagePasswordRoutesState {
+            access: context.require_service::<PageAccessService>(),
+            pages: app_state.public_status_page_service.clone(),
+            audit: app_state.audit_service.clone(),
+            project_access_checker: app_state.project_access_checker.clone(),
+        });
         let routes = create_router()
             .with_state(app_state)
             .merge(create_subscriber_router(subscriber_state))
-            .merge(create_maintenance_router(maintenance_state));
+            .merge(create_maintenance_router(maintenance_state))
+            .merge(create_page_password_router(password_state));
         Some(PluginRoutes::new(routes))
     }
 
@@ -437,11 +458,13 @@ impl TempsPlugin for StatusPagePlugin {
     /// surface). Reads only the snapshot cache; see `routes::public`.
     fn configure_public_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
         let cache = context.require_service::<StatusSnapshotCache>();
+        let access = context.require_service::<PageAccessService>();
         let subscriptions = Arc::new(PublicSubscriptionState::new(
             cache.clone(),
             context.require_service::<StatusPageSubscriberService>(),
+            access.clone(),
         ));
-        let state = Arc::new(PublicStatusState::new(cache));
+        let state = Arc::new(PublicStatusState::new(cache, access));
         Some(PluginRoutes::new(
             create_public_router(state).merge(create_public_subscription_router(subscriptions)),
         ))
@@ -451,6 +474,7 @@ impl TempsPlugin for StatusPagePlugin {
         let mut doc = <StatusPageApiDoc as OpenApiTrait>::openapi();
         doc.merge(<SubscriberApiDoc as OpenApiTrait>::openapi());
         doc.merge(<MaintenanceApiDoc as OpenApiTrait>::openapi());
+        doc.merge(<PagePasswordApiDoc as OpenApiTrait>::openapi());
         Some(doc)
     }
 }

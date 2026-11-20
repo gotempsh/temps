@@ -283,9 +283,15 @@ async fn fixture() -> Option<Fx> {
         audit: audit.clone(),
         project_access_checker: None,
     });
+    let access = Arc::new(crate::services::page_access::PageAccessService::new(
+        db.clone(),
+        cache.clone(),
+        &EncryptionService::new_from_password("subscriber-tests"),
+    ));
     let public = create_public_subscription_router(Arc::new(PublicSubscriptionState::new(
         cache.clone(),
         subscribers.clone(),
+        access,
     )));
     let slug = status_pages::Entity::find_by_id(page.id)
         .one(db.as_ref())
@@ -854,4 +860,63 @@ async fn the_admin_routes_answer_401_without_credentials() {
             "{method} {path}"
         );
     }
+}
+
+#[tokio::test]
+async fn a_protected_page_takes_subscriptions_only_from_visitors_who_unlocked_it() {
+    let Some(fx) = fixture().await else {
+        return;
+    };
+    enable(&fx).await;
+    // Same master key as the fixture's public router, so its cookies verify.
+    let access = crate::services::page_access::PageAccessService::new(
+        fx.db.clone(),
+        fx.cache.clone(),
+        &EncryptionService::new_from_password("subscriber-tests"),
+    );
+    access
+        .set_password(
+            fx.page_id,
+            crate::services::page_access::SetPagePasswordRequest {
+                password: Some("page password".to_string()),
+            },
+        )
+        .await
+        .expect("protect");
+    let subscribe = format!("/status/{}/subscribe", fx.slug);
+    let (status, body) = call(
+        &fx.public,
+        "POST",
+        &subscribe,
+        Some("email=a%40example.test"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(body.contains("type=\"password\""), "{body}");
+    assert!(subscriber_rows(&fx).await.is_empty(), "nothing is stored");
+    assert!(fx.mailer.sent().is_empty());
+
+    let snapshot = fx.cache.get(&fx.slug).expect("published");
+    let crate::services::page_access::UnlockOutcome::Unlocked(cookie) = access
+        .unlock(&snapshot, "page password", "192.0.2.50")
+        .await
+    else {
+        panic!("the right password unlocks");
+    };
+    let response = fx
+        .public
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(&subscribe)
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .header(header::COOKIE, format!("temps_status_access={cookie}"))
+                .body(Body::from("email=a%40example.test"))
+                .expect("request"),
+        )
+        .await
+        .expect("router is infallible");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(subscriber_rows(&fx).await.len(), 1);
 }

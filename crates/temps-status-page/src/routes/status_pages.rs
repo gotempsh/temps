@@ -1406,7 +1406,12 @@ mod tests {
             audit_service: audit.clone(),
             checker: checker(project_a),
         });
-        let public = create_public_router(Arc::new(PublicStatusState::new(cache)));
+        let access = Arc::new(crate::services::page_access::PageAccessService::new(
+            db.clone(),
+            cache.clone(),
+            &temps_core::EncryptionService::new_from_password("status-page-route-tests"),
+        ));
+        let public = create_public_router(Arc::new(PublicStatusState::new(cache, access)));
         Some(Fx {
             certs,
             _db: test_db,

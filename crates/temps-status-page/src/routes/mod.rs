@@ -49,6 +49,7 @@ macro_rules! page_access_guard {
 
 mod audit;
 pub mod maintenance;
+pub mod page_password;
 pub mod public;
 pub mod public_subscriptions;
 pub mod status_page;

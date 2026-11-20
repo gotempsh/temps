@@ -235,6 +235,49 @@ impl AuditOperation for StatusPageSubscriberAudit {
     }
 }
 
+/// A status page's password was set, changed or removed (ADR 108 D2). The
+/// password itself is never recorded.
+#[derive(Debug, Clone, Serialize)]
+pub struct StatusPagePasswordAudit {
+    pub actor_user_id: Option<i32>,
+    pub ip_address: Option<String>,
+    pub user_agent: String,
+    pub project_ids: Vec<i32>,
+    pub status_page_id: i32,
+    pub has_password: bool,
+}
+
+impl AuditOperation for StatusPagePasswordAudit {
+    fn operation_type(&self) -> String {
+        if self.has_password {
+            "STATUS_PAGE_PASSWORD_SET".to_string()
+        } else {
+            "STATUS_PAGE_PASSWORD_REMOVED".to_string()
+        }
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        self.actor_user_id
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.user_agent
+    }
+
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        serde_json::to_string(self).map_err(|source| {
+            temps_core::AuditError::serialize(
+                format!("status page {} password", self.status_page_id),
+                source,
+            )
+        })
+    }
+}
+
 /// Actions on a status page's maintenance windows (ADR 108 D2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]

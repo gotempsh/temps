@@ -244,6 +244,9 @@ pub struct StatusPageResponse {
     pub public_url_status: PublicUrlStatus,
     pub monitors: Vec<StatusPageMonitorResponse>,
     pub appearance: StatusPageAppearance,
+    /// Visitors need a password to read the page (ADR 108 D2). The password
+    /// itself is never returned.
+    pub has_password: bool,
     #[schema(value_type = Option<String>, format = "date-time")]
     pub published_at: Option<UtcDateTime>,
     #[schema(value_type = String, format = "date-time")]

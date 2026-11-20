@@ -725,6 +725,52 @@ pub fn render_notice_page(
     html
 }
 
+/// The password form of a protected page (ADR 108 D2): a plain HTML post to
+/// `action`, no script. `error` is shown above the field after a wrong try.
+pub fn render_unlock_page(
+    page_title: &str,
+    appearance: &super::types::StatusPageAppearance,
+    action: &str,
+    error: Option<&str>,
+) -> String {
+    let mut html = String::with_capacity(4 * 1024);
+    let theme = match appearance.theme {
+        StatusPageTheme::Auto => "auto",
+        StatusPageTheme::Light => "light",
+        StatusPageTheme::Dark => "dark",
+    };
+    let title = escape_html(page_title);
+    let _ = write!(
+        html,
+        "<!doctype html><html lang=\"en\" data-theme=\"{theme}\"><head><meta charset=\"utf-8\">\
+         <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
+         <meta name=\"robots\" content=\"noindex,nofollow\">\
+         <meta name=\"referrer\" content=\"no-referrer\">\
+         <title>{title}</title><style>:root{{--accent:{}}}{STYLE}</style></head><body>\
+         <header class=\"top\"><div class=\"in\"><h1 class=\"brand\"><span>{title}</span></h1>\
+         </div></header><main><h2>This status page is protected</h2><div class=\"card sub\">",
+        accent(appearance.accent_color.as_deref()),
+    );
+    if let Some(error) = error {
+        let _ = write!(
+            html,
+            "<p class=\"t-outage\" role=\"alert\">{}</p>",
+            escape_html(error)
+        );
+    }
+    let _ = write!(
+        html,
+        "<form method=\"post\" action=\"{}\"><label for=\"page-password\">Enter the password \
+         you were given to see this page.</label><div class=\"row\"><input id=\"page-password\" \
+         type=\"password\" name=\"password\" required maxlength=\"256\" \
+         autocomplete=\"current-password\"><button type=\"submit\">Open the page</button></div>\
+         </form><p class=\"meta\">Your browser keeps you signed in to this page for 7 days.</p>\
+         </div></main></body></html>",
+        escape_html(action)
+    );
+    html
+}
+
 fn render_past_incidents(html: &mut String, page: &PublicStatusPageResponse) {
     html.push_str("<h2>Past incidents</h2><div>");
     let today = page.generated_at.date_naive();
@@ -817,6 +863,21 @@ mod tests {
             history_days: 1,
             generated_at: now,
         }
+    }
+
+    #[test]
+    fn the_unlock_page_posts_a_password_without_script_and_escapes() {
+        let html = render_unlock_page(
+            "Acme <b>",
+            &StatusPageAppearance::default(),
+            "/api/status/ab\"cd/unlock",
+            Some("Wrong <password>"),
+        );
+        assert!(html.contains("<form method=\"post\" action=\"/api/status/ab&quot;cd/unlock\">"));
+        assert!(html.contains("type=\"password\" name=\"password\""));
+        assert!(html.contains("Wrong &lt;password&gt;"));
+        assert!(html.contains("Acme &lt;b&gt;"));
+        assert!(!html.contains("<script"));
     }
 
     #[test]

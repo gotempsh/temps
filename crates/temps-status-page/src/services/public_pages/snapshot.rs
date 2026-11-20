@@ -46,7 +46,7 @@ use super::events::{
     incident_events, maintenance_event, newest_events, IncidentSource, MaintenanceSource, PageEvent,
 };
 use super::feed::render_atom_feed;
-use super::render::{render_public_page_html_with, PageActions};
+use super::render::{render_public_page_html_with, render_unlock_page, PageActions};
 use super::types::{
     PublicComponentStatus, PublicDayStatus, PublicIncident, PublicIncidentSeverity,
     PublicIncidentStatus, PublicIncidentUpdate, PublicMaintenance, PublicMaintenanceStatus,
@@ -72,6 +72,15 @@ const MAX_UPDATES_PER_INCIDENT: usize = 20;
 pub const FEED_ENTRIES: usize = 50;
 /// Bound on bind parameters per `IN (...)` list; Postgres allows 65535.
 const MAX_IDS_PER_QUERY: usize = 1000;
+
+/// The password of a protected page (ADR 108 D2), as the public routes
+/// need it: the version signed into access cookies and the argon2 hash the
+/// unlock form is checked against.
+#[derive(Debug, Clone)]
+pub struct PageGate {
+    pub version: i32,
+    pub hash: String,
+}
 
 /// A published page, ready to serve.
 #[derive(Debug)]
@@ -105,9 +114,34 @@ pub struct PublishedSnapshot {
     /// (only the links differ).
     pub feed: Bytes,
     pub feed_custom_host: Bytes,
+    /// Set when the page needs a password.
+    pub(crate) gate: Option<PageGate>,
+    /// The password form a protected page shows instead, for its slug URL
+    /// and for a custom hostname. Empty for an open page.
+    pub locked_html: Bytes,
+    pub locked_html_custom_host: Bytes,
 }
 
 impl PublishedSnapshot {
+    pub fn status_page_id(&self) -> i32 {
+        self.status_page_id
+    }
+
+    /// The page's password, when it has one.
+    pub fn gate(&self) -> Option<&PageGate> {
+        self.gate.as_ref()
+    }
+
+    /// The password form to serve, by whether the request came through a
+    /// custom hostname.
+    pub fn locked_html_for(&self, custom_host: Option<&str>) -> Bytes {
+        if custom_host.is_some() {
+            self.locked_html_custom_host.clone()
+        } else {
+            self.locked_html.clone()
+        }
+    }
+
     /// Whether the page shows the subscribe form.
     pub fn accepts_subscriptions(&self) -> bool {
         self.subscriptions_since.is_some()
@@ -517,22 +551,47 @@ impl StatusSnapshotCache {
                 Bytes::from(render_atom_feed(&page.slug, &response, &events, ""));
             let subscriptions_since = subscriptions_since(page);
             let accepts = subscriptions_since.is_some();
+            let gate = page.password_hash.clone().map(|hash| PageGate {
+                version: page.password_version,
+                hash,
+            });
+            // A protected page has no feed: a feed reader cannot type the
+            // password, so the link is not offered.
+            let open = gate.is_none();
             let base_subscribe = format!("{base_path}/subscribe");
             let base_feed = format!("{base_path}/feed.atom");
             let html = Bytes::from(render_public_page_html_with(
                 &response,
                 PageActions {
                     subscribe: accepts.then_some(base_subscribe.as_str()),
-                    feed: Some(&base_feed),
+                    feed: open.then_some(base_feed.as_str()),
                 },
             ));
             let html_custom_host = Bytes::from(render_public_page_html_with(
                 &response,
                 PageActions {
                     subscribe: accepts.then_some("/subscribe"),
-                    feed: Some("/feed.atom"),
+                    feed: open.then_some("/feed.atom"),
                 },
             ));
+            let (locked_html, locked_html_custom_host) = if open {
+                (Bytes::new(), Bytes::new())
+            } else {
+                (
+                    Bytes::from(render_unlock_page(
+                        &response.title,
+                        &response.appearance,
+                        &format!("{base_path}/unlock"),
+                        None,
+                    )),
+                    Bytes::from(render_unlock_page(
+                        &response.title,
+                        &response.appearance,
+                        "/unlock",
+                        None,
+                    )),
+                )
+            };
             match serde_json::to_vec(&response) {
                 Ok(json) => built.push((
                     page.slug.clone(),
@@ -550,6 +609,9 @@ impl StatusSnapshotCache {
                         html_custom_host,
                         feed,
                         feed_custom_host,
+                        gate,
+                        locked_html,
+                        locked_html_custom_host,
                     }),
                 )),
                 Err(e) => error!(
@@ -1417,6 +1479,8 @@ mod tests {
             subscriptions_enabled: false,
             subscriptions_enabled_at: None,
             subscription_sender: None,
+            password_hash: None,
+            password_version: 0,
             created_at: now,
             updated_at: now,
         }

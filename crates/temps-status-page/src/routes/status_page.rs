@@ -25,7 +25,7 @@ use utoipa::OpenApi;
 use super::audit::{StatusPageMutationAction, StatusPageMutationAudit};
 use super::public::{
     __path_get_public_status_page, __path_get_public_status_page_feed,
-    __path_get_public_status_page_json,
+    __path_get_public_status_page_json, __path_unlock_public_status_page,
 };
 use super::status_pages::{
     __path_add_status_page_domain, __path_create_status_page, __path_delete_status_page,
@@ -108,6 +108,7 @@ pub trait StatusPageAppState: Send + Sync + 'static {
         get_public_status_page,
         get_public_status_page_json,
         get_public_status_page_feed,
+        unlock_public_status_page,
     ),
     components(
         schemas(

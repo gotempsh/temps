@@ -43,6 +43,12 @@ pub struct Model {
     pub subscriptions_enabled_at: Option<DBDateTime>,
     /// From address of subscriber mail, at a verified email domain.
     pub subscription_sender: Option<String>,
+    /// Argon2id hash of the page's password (ADR 108 D2); `None` means
+    /// anyone with the link can read the page. Never leaves the server.
+    pub password_hash: Option<String>,
+    /// Bumped on every password change; signed into access cookies so a
+    /// change ends every session.
+    pub password_version: i32,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
 }

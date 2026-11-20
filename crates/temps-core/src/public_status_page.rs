@@ -49,6 +49,25 @@ pub const NOT_FOUND_HTML: &str = "<!doctype html><html lang=\"en\"><head><meta c
 /// Body of every JSON 404 for a status page (`application/problem+json`).
 pub const NOT_FOUND_JSON: &str = r#"{"type":"about:blank","title":"Status Page Not Found","status":404,"detail":"This status page does not exist or is no longer published."}"#;
 
+/// Cookie that proves a visitor typed a password-protected page's password
+/// (ADR 108 D2). On a custom hostname the proxy strips every other cookie
+/// and forwards only this one, and only when its value is well formed.
+pub const STATUS_ACCESS_COOKIE: &str = "temps_status_access";
+
+/// Longest access cookie value accepted.
+pub const STATUS_ACCESS_COOKIE_MAX_LEN: usize = 160;
+
+/// Whether `value` has the shape of an access cookie: short, and only the
+/// characters the console mints (`[A-Za-z0-9._-]`). Its signature is checked
+/// by the console; this only keeps anything else from being forwarded.
+pub fn is_well_formed_access_cookie(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= STATUS_ACCESS_COOKIE_MAX_LEN
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+}
+
 /// Length of a subscription token in a path: 64 lowercase hex characters.
 pub const SUBSCRIPTION_TOKEN_LEN: usize = 64;
 
@@ -70,6 +89,8 @@ pub enum StatusHostPath {
     Feed,
     /// `/subscribe`: the subscribe form's post (ADR 108 D2).
     Subscribe,
+    /// `/unlock`: the password form's post of a protected page (ADR 108 D2).
+    Unlock,
     /// `/confirm/{token}`: a subscription's confirmation link.
     Confirm(String),
     /// `/unsubscribe/{token}`: a subscriber's unsubscribe link.
@@ -86,6 +107,7 @@ impl StatusHostPath {
             "/summary.json" => return Some(Self::Summary),
             "/feed.atom" => return Some(Self::Feed),
             "/subscribe" => return Some(Self::Subscribe),
+            "/unlock" => return Some(Self::Unlock),
             _ => {}
         }
         if let Some(token) = path.strip_prefix("/confirm/") {
@@ -103,7 +125,7 @@ impl StatusHostPath {
     pub fn allows_method(&self, method: &str) -> bool {
         match self {
             Self::Page | Self::Summary | Self::Feed => matches!(method, "GET" | "HEAD"),
-            Self::Subscribe => method == "POST",
+            Self::Subscribe | Self::Unlock => method == "POST",
             Self::Confirm(_) | Self::Unsubscribe(_) => matches!(method, "GET" | "HEAD" | "POST"),
         }
     }
@@ -116,6 +138,7 @@ impl StatusHostPath {
             Self::Summary => format!("/api/status/{slug}/summary.json"),
             Self::Feed => format!("/api/status/{slug}/feed.atom"),
             Self::Subscribe => format!("/api/status/{slug}/subscribe"),
+            Self::Unlock => format!("/api/status/{slug}/unlock"),
             Self::Confirm(token) => format!("/api/status/{slug}/confirm/{token}"),
             Self::Unsubscribe(token) => format!("/api/status/{slug}/unsubscribe/{token}"),
         }
@@ -125,6 +148,30 @@ impl StatusHostPath {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_unlock_form_only_posts_and_maps_to_its_slug_route() {
+        assert_eq!(
+            StatusHostPath::parse("/unlock"),
+            Some(StatusHostPath::Unlock)
+        );
+        assert_eq!(StatusHostPath::parse("/unlock/"), None);
+        assert!(StatusHostPath::Unlock.allows_method("POST"));
+        assert!(!StatusHostPath::Unlock.allows_method("GET"));
+        assert_eq!(
+            StatusHostPath::Unlock.console_path("ab12"),
+            "/api/status/ab12/unlock"
+        );
+    }
+
+    #[test]
+    fn only_well_formed_access_cookies_are_forwarded() {
+        assert!(is_well_formed_access_cookie("v1.7.3.1767225600.0a1B-_"));
+        assert!(!is_well_formed_access_cookie(""));
+        assert!(!is_well_formed_access_cookie("a;b"));
+        assert!(!is_well_formed_access_cookie("a b"));
+        assert!(!is_well_formed_access_cookie(&"a".repeat(161)));
+    }
 
     #[test]
     fn subscription_paths_carry_a_well_formed_token_only() {
@@ -197,7 +244,10 @@ mod tests {
             StatusHostPath::parse("/summary.json"),
             Some(StatusHostPath::Summary)
         );
-        assert_eq!(StatusHostPath::parse("/feed.atom"), Some(StatusHostPath::Feed));
+        assert_eq!(
+            StatusHostPath::parse("/feed.atom"),
+            Some(StatusHostPath::Feed)
+        );
         for path in [
             "/feed.atom/",
             "/feed.xml",

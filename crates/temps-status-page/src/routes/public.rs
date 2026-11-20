@@ -29,7 +29,10 @@ use axum::{
     Router,
 };
 
+use crate::services::page_access::cookie::set_cookie_header;
+use crate::services::page_access::{PageAccessService, UnlockOutcome};
 use crate::services::public_pages::feed::ATOM_CONTENT_TYPE;
+use crate::services::public_pages::render::render_unlock_page;
 use crate::services::public_pages::{
     is_well_formed_slug, render::NOT_FOUND_HTML, PublicStatusPageResponse, StatusSnapshotCache,
 };
@@ -217,16 +220,42 @@ impl PublicRateLimiter {
 /// State of the public router. Holds its own handles; nothing else.
 pub struct PublicStatusState {
     pub cache: Arc<StatusSnapshotCache>,
+    pub access: Arc<PageAccessService>,
     pub limiter: PublicRateLimiter,
 }
 
 impl PublicStatusState {
-    pub fn new(cache: Arc<StatusSnapshotCache>) -> Self {
+    pub fn new(cache: Arc<StatusSnapshotCache>, access: Arc<PageAccessService>) -> Self {
         Self {
             cache,
+            access,
             limiter: PublicRateLimiter::default(),
         }
     }
+}
+
+/// Body of the JSON answer for a protected page without a valid access
+/// cookie (`application/problem+json`).
+pub const LOCKED_JSON: &str = r#"{"type":"about:blank","title":"Status Page Protected","status":401,"detail":"This status page needs a password. Open it in a browser and enter the password to read it."}"#;
+
+/// Largest unlock form body.
+pub const MAX_UNLOCK_FORM_BYTES: usize = 4 * 1024;
+
+#[derive(Debug, serde::Deserialize)]
+pub struct UnlockForm {
+    #[serde(default)]
+    pub password: String,
+}
+
+fn locked_page(body: axum::body::Bytes) -> Response {
+    let mut response = (
+        StatusCode::UNAUTHORIZED,
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        body,
+    )
+        .into_response();
+    harden(&mut response);
+    response
 }
 
 /// The custom hostname the proxy served this request for (#1412), if any.
@@ -291,6 +320,7 @@ async fn rate_limit(
     params(("slug" = String, Path, description = "Unguessable status page token")),
     responses(
         (status = 200, description = "Rendered status page", content_type = "text/html"),
+        (status = 401, description = "The page is password-protected: the password form", content_type = "text/html"),
         (status = 404, description = "No published status page at this URL"),
         (status = 429, description = "Rate limited"),
     ),
@@ -309,6 +339,9 @@ pub async fn get_public_status_page(
         .flatten()
         .filter(|snapshot| snapshot.serves_host(host.as_deref()));
     let mut response = match snapshot {
+        Some(snapshot) if !state.access.allows(&snapshot, &headers) => {
+            return locked_page(snapshot.locked_html_for(host.as_deref()));
+        }
         Some(snapshot) => (
             StatusCode::OK,
             [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
@@ -333,6 +366,7 @@ pub async fn get_public_status_page(
     params(("slug" = String, Path, description = "Unguessable status page token")),
     responses(
         (status = 200, description = "Status page snapshot", body = PublicStatusPageResponse),
+        (status = 401, description = "The page is password-protected and not unlocked"),
         (status = 404, description = "No published status page at this URL"),
         (status = 429, description = "Rate limited"),
     ),
@@ -349,6 +383,27 @@ pub async fn get_public_status_page_json(
         .flatten()
         .filter(|snapshot| snapshot.serves_host(custom_host(&headers).as_deref()));
     let mut response = match snapshot {
+        Some(snapshot) if !state.access.allows(&snapshot, &headers) => {
+            let mut response = (
+                StatusCode::UNAUTHORIZED,
+                [(header::CONTENT_TYPE, "application/problem+json")],
+                LOCKED_JSON,
+            )
+                .into_response();
+            harden(&mut response);
+            return response;
+        }
+        // A protected page's data is not offered to other origins.
+        Some(snapshot) if snapshot.gate().is_some() => {
+            let mut response = (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/json")],
+                snapshot.json.clone(),
+            )
+                .into_response();
+            harden(&mut response);
+            return response;
+        }
         Some(snapshot) => (
             StatusCode::OK,
             [(header::CONTENT_TYPE, "application/json")],
@@ -373,8 +428,9 @@ pub async fn get_public_status_page_json(
 
 /// Public status page (Atom feed)
 ///
-/// The page's public incident updates as an Atom feed, newest first, built
-/// with the page snapshot: it carries nothing the page does not show.
+/// The page's public incident updates and maintenance announcements as an
+/// Atom feed, newest first, built with the page snapshot: it carries nothing
+/// the page does not show. A password-protected page has no feed.
 #[utoipa::path(
     get,
     path = "/status/{slug}/feed.atom",
@@ -397,7 +453,8 @@ pub async fn get_public_status_page_feed(
     let snapshot = is_well_formed_slug(&slug)
         .then(|| state.cache.get(&slug))
         .flatten()
-        .filter(|snapshot| snapshot.serves_host(host.as_deref()));
+        .filter(|snapshot| snapshot.serves_host(host.as_deref()))
+        .filter(|snapshot| snapshot.gate().is_none());
     let mut response = match snapshot {
         Some(snapshot) => (
             StatusCode::OK,
@@ -416,9 +473,131 @@ pub async fn get_public_status_page_feed(
     response
 }
 
+/// Unlock a password-protected status page
+///
+/// The password form's post. The right password sets a cookie that opens
+/// the page for 7 days and redirects to it; a wrong one shows the form
+/// again. Repeated wrong passwords from one client are refused for a while.
+#[utoipa::path(
+    post,
+    path = "/status/{slug}/unlock",
+    operation_id = "unlock_public_status_page",
+    params(("slug" = String, Path, description = "Unguessable status page token")),
+    request_body(content_type = "application/x-www-form-urlencoded", description = "`password=<password>`"),
+    responses(
+        (status = 303, description = "Unlocked: redirect to the page with the access cookie set"),
+        (status = 401, description = "Wrong password: the form again", content_type = "text/html"),
+        (status = 404, description = "No published status page at this URL"),
+        (status = 429, description = "Too many wrong passwords from this client", content_type = "text/html"),
+        (status = 503, description = "Too many unlocks at once; retry", content_type = "text/html"),
+    ),
+    tag = "Status Page"
+)]
+pub async fn unlock_public_status_page(
+    State(state): State<Arc<PublicStatusState>>,
+    slug: Result<Path<String>, PathRejection>,
+    request: Request,
+) -> Response {
+    use axum::extract::FromRequest;
+    let slug = slug.map(|Path(slug)| slug).unwrap_or_default();
+    let headers = request.headers().clone();
+    let peer = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|info| info.0);
+    let form = axum::Form::<UnlockForm>::from_request(request, &()).await;
+    let host = custom_host(&headers);
+    let Some(snapshot) = is_well_formed_slug(&slug)
+        .then(|| state.cache.get(&slug))
+        .flatten()
+        .filter(|snapshot| snapshot.serves_host(host.as_deref()))
+    else {
+        let mut response = (
+            StatusCode::NOT_FOUND,
+            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            NOT_FOUND_HTML,
+        )
+            .into_response();
+        harden(&mut response);
+        return response;
+    };
+    let (home, unlock_action) = match host {
+        Some(_) => ("/".to_string(), "/unlock".to_string()),
+        None => (
+            format!("/api/status/{slug}"),
+            format!("/api/status/{slug}/unlock"),
+        ),
+    };
+    let client = client_key(&temps_core::resolve_client_ip(&headers, peer));
+    let password = form
+        .map(|axum::Form(form)| form.password)
+        .unwrap_or_default();
+    let form_again = |status: StatusCode, error: &str| {
+        let mut response = (
+            status,
+            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            render_unlock_page(
+                &snapshot.title,
+                &snapshot.appearance,
+                &unlock_action,
+                Some(error),
+            ),
+        )
+            .into_response();
+        harden(&mut response);
+        response
+    };
+    let redirect = |cookie: Option<String>| {
+        let mut response =
+            (StatusCode::SEE_OTHER, [(header::LOCATION, home.clone())]).into_response();
+        harden(&mut response);
+        if let Some(cookie) = cookie.and_then(|c| HeaderValue::from_str(&c).ok()) {
+            response.headers_mut().insert(header::SET_COOKIE, cookie);
+        }
+        response
+    };
+    match state.access.unlock(&snapshot, &password, &client).await {
+        UnlockOutcome::Open => redirect(None),
+        UnlockOutcome::Unlocked(value) => {
+            let secure = headers
+                .get("x-forwarded-proto")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|proto| proto.eq_ignore_ascii_case("https"));
+            redirect(Some(set_cookie_header(&value, &home, secure)))
+        }
+        UnlockOutcome::Wrong => form_again(StatusCode::UNAUTHORIZED, "That password is not right."),
+        UnlockOutcome::Throttled(retry) => {
+            let minutes = retry.as_secs().div_ceil(60).max(1);
+            let mut response = form_again(
+                StatusCode::TOO_MANY_REQUESTS,
+                &format!("Too many wrong passwords. Try again in {minutes} minutes."),
+            );
+            if let Ok(value) = HeaderValue::from_str(&retry.as_secs().max(1).to_string()) {
+                response.headers_mut().insert(header::RETRY_AFTER, value);
+            }
+            response
+        }
+        UnlockOutcome::Busy => {
+            let mut response = form_again(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Too many people are signing in right now. Try again in a few seconds.",
+            );
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
+            response
+        }
+    }
+}
+
 /// Router for the public status page endpoints, rate limit included.
 pub fn create_public_router(state: Arc<PublicStatusState>) -> Router {
     Router::new()
+        .route(
+            "/status/{slug}/unlock",
+            axum::routing::post(unlock_public_status_page)
+                .layer(axum::extract::DefaultBodyLimit::max(MAX_UNLOCK_FORM_BYTES)),
+        )
         .route("/status/{slug}", get(get_public_status_page))
         .route(
             "/status/{slug}/summary.json",

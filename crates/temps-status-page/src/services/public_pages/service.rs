@@ -1009,6 +1009,7 @@ impl PublicStatusPageService {
                 monitors: by_page.remove(&model.id).unwrap_or_default(),
                 projects: projects_by_page.remove(&model.id).unwrap_or_default(),
                 appearance: StatusPageAppearance::from_model(&model),
+                has_password: model.password_hash.is_some(),
                 id: model.id,
                 title: model.title,
                 description: model.description,

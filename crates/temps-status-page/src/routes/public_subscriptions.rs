@@ -34,6 +34,7 @@ use serde::Deserialize;
 use temps_core::public_status_page::{NOT_FOUND_HTML, SECURITY_HEADERS, STATUS_HOST_HEADER};
 
 use super::public::PublicRateLimiter;
+use crate::services::page_access::PageAccessService;
 use crate::services::public_pages::render::render_notice_page;
 use crate::services::public_pages::{is_well_formed_slug, PublishedSnapshot, StatusSnapshotCache};
 use crate::services::subscribers::tokens::is_well_formed_token;
@@ -51,6 +52,7 @@ pub const MAX_FORM_BYTES: usize = 8 * 1024;
 pub struct PublicSubscriptionState {
     pub cache: Arc<StatusSnapshotCache>,
     pub subscribers: Arc<StatusPageSubscriberService>,
+    pub access: Arc<PageAccessService>,
     pub limiter: PublicRateLimiter,
 }
 
@@ -58,10 +60,12 @@ impl PublicSubscriptionState {
     pub fn new(
         cache: Arc<StatusSnapshotCache>,
         subscribers: Arc<StatusPageSubscriberService>,
+        access: Arc<PageAccessService>,
     ) -> Self {
         Self {
             cache,
             subscribers,
+            access,
             limiter: PublicRateLimiter::new(
                 SUBSCRIPTION_PER_CLIENT_LIMIT,
                 SUBSCRIPTION_OVERFLOW_LIMIT,
@@ -284,6 +288,7 @@ async fn rate_limit(
     responses(
         (status = 200, description = "Request accepted; a confirmation link is sent", content_type = "text/html"),
         (status = 400, description = "Not an email address", content_type = "text/html"),
+        (status = 401, description = "The page is password-protected and not unlocked", content_type = "text/html"),
         (status = 404, description = "No published status page taking subscriptions at this URL"),
         (status = 429, description = "Rate limited"),
         (status = 503, description = "The page cannot take more subscriptions", content_type = "text/html"),
@@ -299,6 +304,18 @@ pub async fn subscribe(
     let Some((snapshot, host)) = find(&state, &headers, &slug) else {
         return not_found();
     };
+    // On a protected page only a visitor who typed the password sees the
+    // form; anyone else gets the password form (ADR 108 D2).
+    if !state.access.allows(&snapshot, &headers) {
+        return harden(
+            (
+                StatusCode::UNAUTHORIZED,
+                [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                snapshot.locked_html_for(host.as_deref()),
+            )
+                .into_response(),
+        );
+    }
     let email = form.map(|Form(form)| form.email).unwrap_or_default();
     match state.subscribers.subscribe(&snapshot, &email).await {
         Ok(outcome) => outcome_page(&snapshot, host.as_deref(), &slug, outcome),
