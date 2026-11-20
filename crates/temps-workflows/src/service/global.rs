@@ -4,7 +4,7 @@
 use super::{WorkflowService, MAX_WORKFLOW_NAME};
 use crate::{
     error::{WorkflowError, WorkflowResult},
-    store::{RunFilter, RunRow},
+    store::{RunFilter, ScannedRun},
     types::validate_name,
 };
 use chrono::{DateTime, Utc};
@@ -13,7 +13,8 @@ use temps_core::ProjectAccessChecker;
 use uuid::Uuid;
 
 pub struct GlobalRuns {
-    pub runs: Vec<RunRow>,
+    /// Each run with its project and environment slugs, from the same query.
+    pub runs: Vec<ScannedRun>,
     pub next: Option<String>,
 }
 
@@ -64,29 +65,25 @@ impl WorkflowService {
         let mut runs = Vec::with_capacity(limit);
         for _ in 0..10 {
             let rows = self.store.scan_runs(filter, before, 100).await?;
-            let ids: Vec<i32> = rows.iter().map(|r| r.project_id).collect();
+            let ids: Vec<i32> = rows.iter().map(|r| r.run.project_id).collect();
             let visible = visible_projects(auth, checker, &ids).await?;
             let exhausted = rows.len() < 100;
             for row in rows {
-                before = Some((row.created_at, row.id));
-                if visible.contains(&row.project_id) {
+                before = Some((row.run.created_at, row.run.id));
+                if visible.contains(&row.run.project_id) {
                     runs.push(row);
                 }
                 if runs.len() == limit {
-                    return Ok(GlobalRuns {
-                        runs,
-                        next: self.global_cursor(before).await?,
-                    });
+                    let next = self.global_cursor(before).await?;
+                    return Ok(GlobalRuns { runs, next });
                 }
             }
             if exhausted {
                 return Ok(GlobalRuns { runs, next: None });
             }
         }
-        Ok(GlobalRuns {
-            runs,
-            next: self.global_cursor(before).await?,
-        })
+        let next = self.global_cursor(before).await?;
+        Ok(GlobalRuns { runs, next })
     }
     async fn global_cursor(
         &self,
@@ -113,7 +110,7 @@ impl WorkflowService {
     }
 }
 
-async fn visible_projects(
+pub(super) async fn visible_projects(
     auth: &AuthContext,
     checker: Option<&dyn ProjectAccessChecker>,
     ids: &[i32],

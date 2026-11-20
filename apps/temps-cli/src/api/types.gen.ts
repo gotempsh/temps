@@ -17641,9 +17641,19 @@ export type GlobalTracesResponse = {
     windows: Array<GlobalTraceWindow>;
 };
 
+/**
+ * A run in the cross-project listing: the run, plus the slugs that name its
+ * project and environment, so the list reads `shop · production` rather than
+ * bare ids.
+ */
+export type GlobalWorkflowRunResponse = WorkflowRunResponse & {
+    environment_slug: string;
+    project_slug: string;
+};
+
 export type GlobalWorkflowRunsResponse = {
     next_cursor?: string | null;
-    runs: Array<WorkflowRunResponse>;
+    runs: Array<GlobalWorkflowRunResponse>;
 };
 
 /**
@@ -40598,6 +40608,40 @@ export type WorkflowCredentialStatusResponse = {
      * First characters of the token, to recognise it.
      */
     prefix?: string | null;
+};
+
+/**
+ * One workflow in one environment, with its run counts.
+ */
+export type WorkflowDefinitionResponse = {
+    active_runs: number;
+    completed_runs: number;
+    /**
+     * Runs allowed to execute at once, from the manifest.
+     */
+    concurrency?: number | null;
+    environment_id: number;
+    environment_slug: string;
+    failed_runs: number;
+    last_run_at?: string | null;
+    name: string;
+    project_id: number;
+    project_slug: string;
+    state: WorkflowDefinitionState;
+    version?: string | null;
+};
+
+/**
+ * Whether the environment's current executor declares the workflow.
+ */
+export type WorkflowDefinitionState = 'available' | 'missing' | 'unknown';
+
+export type WorkflowDefinitionsResponse = {
+    page: number;
+    page_size: number;
+    total: number;
+    total_pages: number;
+    workflows: Array<WorkflowDefinitionResponse>;
 };
 
 export type WorkflowDevPollResponse = {
@@ -102157,6 +102201,46 @@ export type RecordRunStepResponses = {
 };
 
 export type RecordRunStepResponse = RecordRunStepResponses[keyof RecordRunStepResponses];
+
+export type ListWorkflowDefinitionsData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * 1-based page; default 1.
+         */
+        page?: number | null;
+        /**
+         * Default 20, at most 100.
+         */
+        page_size?: number | null;
+    };
+    url: '/workflows/definitions';
+};
+
+export type ListWorkflowDefinitionsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Access or database failure
+     */
+    500: unknown;
+};
+
+export type ListWorkflowDefinitionsResponses = {
+    /**
+     * Workflows across the projects the caller may read, most recently run first
+     */
+    200: WorkflowDefinitionsResponse;
+};
+
+export type ListWorkflowDefinitionsResponse = ListWorkflowDefinitionsResponses[keyof ListWorkflowDefinitionsResponses];
 
 export type ListAllWorkflowRunsData = {
     body?: never;
