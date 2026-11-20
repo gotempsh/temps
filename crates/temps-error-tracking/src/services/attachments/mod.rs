@@ -510,14 +510,15 @@ impl AttachmentService {
                     .db
                     .execute(Statement::from_sql_and_values(
                         DatabaseBackend::Postgres,
-                        "UPDATE error_attachments SET stored_at = NOW() WHERE id = $1",
+                        "UPDATE error_attachments SET stored_at = NOW() \
+                         WHERE id = $1 AND stored_at IS NULL AND removing_at IS NULL",
                         [id.into()],
                     ))
                     .await?
                     .rows_affected();
                 if marked == 0 {
-                    // The sweeper removed the row while the object was being
-                    // written (its event expired meanwhile). Bounded like every
+                    // The sweeper removed or claimed the row while the object
+                    // was being written (its event expired meanwhile). Bounded like every
                     // other storage call, so a store that stops answering
                     // cannot hold the only uploader.
                     let deleted = tokio::time::timeout(
@@ -624,9 +625,30 @@ impl AttachmentService {
             }
             // A write that never finished (its object may or may not be
             // there): the resend completes it under the reservation it
-            // already holds, charged once. The single uploader is the only
-            // writer, so nothing else is writing this row now.
-            return Ok(Some(row.try_get("", "id")?));
+            // already holds, charged once. Renewing the reservation keeps
+            // the sweeper from taking it as stale during the write; one the
+            // sweeper already claimed is left to it.
+            let id: i64 = row.try_get("", "id")?;
+            let renewed = tx
+                .execute(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    "UPDATE error_attachments SET created_at = NOW() \
+                     WHERE id = $1 AND stored_at IS NULL AND removing_at IS NULL",
+                    [id.into()],
+                ))
+                .await?
+                .rows_affected();
+            if renewed == 0 {
+                outcome.failed += 1;
+                tracing::debug!(
+                    project_id,
+                    attachment_id = id,
+                    "attachment {id} of project {project_id} is being removed as an unfinished write; its resend is dropped"
+                );
+                return Ok(None);
+            }
+            tx.commit().await?;
+            return Ok(Some(id));
         }
         let owned = tx
             .query_one(Statement::from_sql_and_values(
@@ -804,6 +826,52 @@ impl AttachmentService {
         Ok(count)
     }
 
+    /// Claim a page of unfinished writes older than `stale_before`, after
+    /// `after_id`, for removal: the rows claimed, the last id looked at and
+    /// whether the page was full. A row is claimed only if it is still
+    /// unstored and stale (or claimed by an earlier pass whose delete
+    /// failed) when its lock is taken, so a resend that renewed it first
+    /// keeps it, and once claimed no resend resumes or marks it.
+    async fn claim_stale(
+        &self,
+        stale_before: DateTime<Utc>,
+        after_id: i64,
+    ) -> Result<(Vec<RemovalRow>, Option<i64>, bool), ErrorTrackingError> {
+        let page: Vec<i64> = self
+            .db
+            .query_all(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT id FROM error_attachments \
+                 WHERE stored_at IS NULL AND (created_at < $1 OR removing_at IS NOT NULL) \
+                   AND id > $2 ORDER BY id LIMIT $3",
+                [
+                    stale_before.into(),
+                    after_id.into(),
+                    (SWEEP_BATCH as i64).into(),
+                ],
+            ))
+            .await?
+            .iter()
+            .map(|row| row.try_get("", "id"))
+            .collect::<Result<_, _>>()?;
+        let last = page.last().copied();
+        let full = page.len() as u64 == SWEEP_BATCH;
+        if page.is_empty() {
+            return Ok((Vec::new(), last, full));
+        }
+        let rows = RemovalRow::find_by_statement(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "UPDATE error_attachments SET removing_at = COALESCE(removing_at, NOW()) \
+             WHERE id = ANY($1) AND stored_at IS NULL \
+               AND (created_at < $2 OR removing_at IS NOT NULL) \
+             RETURNING id, project_id",
+            [page.into(), stale_before.into()],
+        ))
+        .all(self.db.as_ref())
+        .await?;
+        Ok((rows, last, full))
+    }
+
     /// Delete attachments whose event expired, reservations never
     /// finished, and every attachment of a deleted project. Bounded: at
     /// most [`MAX_SWEEP_BATCHES`] steps of [`SWEEP_BATCH`] per kind.
@@ -869,21 +937,9 @@ impl AttachmentService {
             - chrono::Duration::from_std(STALE_RESERVATION).unwrap_or(chrono::Duration::hours(1));
         let mut after_id = 0i64;
         for _ in 0..MAX_SWEEP_BATCHES {
-            let rows = RemovalRow::find_by_statement(Statement::from_sql_and_values(
-                DatabaseBackend::Postgres,
-                "SELECT id, project_id FROM error_attachments \
-                 WHERE stored_at IS NULL AND created_at < $1 AND id > $2 ORDER BY id LIMIT $3",
-                [
-                    stale_before.into(),
-                    after_id.into(),
-                    (SWEEP_BATCH as i64).into(),
-                ],
-            ))
-            .all(self.db.as_ref())
-            .await?;
-            let Some(last) = rows.last() else { break };
-            after_id = last.id;
-            let full = rows.len() as u64 == SWEEP_BATCH;
+            let (rows, last, full) = self.claim_stale(stale_before, after_id).await?;
+            let Some(last) = last else { break };
+            after_id = last;
             outcome.stale += self.remove(store, rows).await?;
             if !full {
                 break;

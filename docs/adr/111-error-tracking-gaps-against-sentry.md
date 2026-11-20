@@ -630,7 +630,9 @@ deploys, which is web services. It comes last and may never be worth building.
   a failure stores nothing twice. A file's identity is its owner, name and
   SHA-256, checked under the project's usage row lock before any limit, so a
   resent file is a duplicate even once the quota is full (a resend of a write
-  that never finished completes it, charged once), and a different file
+  that never finished completes it, charged once, and renews its reservation;
+  one the sweeper already claimed for removal, `removing_at`, is left to the
+  sweeper and is never marked stored), and a different file
   sent later for the same owner is new; its display position is the owner's
   next one.
   Ingest does one `try_send` into a queue bounded at 256 envelopes and 16 MiB;

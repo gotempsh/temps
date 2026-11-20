@@ -15,6 +15,11 @@
 //! the same owner is a new row. `ordinal` is the display order, assigned
 //! under the project's usage row lock.
 //!
+//! `removing_at` is set when the sweeper claims an unfinished write for
+//! removal. A resend can resume an unfinished write only while it is
+//! unclaimed, and a claimed row is never marked stored, so a resumed upload
+//! and the removal of the same row never both go ahead.
+//!
 //! `error_attachment_usage` holds one row per project that has attachments:
 //! the bytes and files stored, and the per-project quota, which the admin
 //! can change. Neither table has a foreign key to `projects`: a deleted
@@ -47,6 +52,7 @@ impl MigrationTrait for Migration {
                  content_sha256 BYTEA NOT NULL CHECK (length(content_sha256) = 32), \
                  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), \
                  stored_at TIMESTAMPTZ, \
+                 removing_at TIMESTAMPTZ, \
                  UNIQUE (project_id, owner_kind, owner_id, ordinal), \
                  UNIQUE (project_id, owner_kind, owner_id, filename, content_sha256))",
         )

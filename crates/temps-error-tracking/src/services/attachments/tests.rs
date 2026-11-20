@@ -451,13 +451,14 @@ mod storage {
         };
         let event_id = event(&f, SDK_EVENT, chrono::Duration::minutes(5)).await;
         // A reservation whose object was written but whose row was never
-        // marked stored, charged to the quota as a reservation is.
+        // marked stored, two hours ago, charged to the quota as a
+        // reservation is.
         f.db.execute(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
             "INSERT INTO error_attachments (project_id, owner_kind, owner_id, ordinal, event_time, \
-                 filename, content_type, attachment_type, size_bytes, content_sha256) \
+                 filename, content_type, attachment_type, size_bytes, content_sha256, created_at) \
              SELECT $1, 'error', $2, 0, timestamp, 'a.txt', 'text/plain', 'event.attachment', 3, \
-                 sha256('abc'::bytea) FROM error_events WHERE id = $2",
+                 sha256('abc'::bytea), NOW() - INTERVAL '2 hours' FROM error_events WHERE id = $2",
             [f.project_id.into(), event_id.into()],
         ))
         .await
@@ -493,6 +494,22 @@ mod storage {
         assert_eq!(listed.len(), 1);
         let usage = f.service.usage(f.project_id).await.expect("usage");
         assert_eq!((usage.used_bytes, usage.files), (3, 1));
+        // The resumed write renewed its reservation, so a sweep keeps it.
+        let swept = f
+            .service
+            .sweep(f.store.as_ref(), Utc::now())
+            .await
+            .expect("sweep");
+        assert_eq!(swept.stale, 0, "{swept:?}");
+        assert_eq!(
+            f.service
+                .list(f.project_id, AttachmentOwner::Error(event_id))
+                .await
+                .expect("list")
+                .len(),
+            1
+        );
+        assert_eq!(f.store.keys(f.project_id).len(), 1);
         // Once stored, the next resend is a duplicate.
         let again = f
             .service
@@ -503,6 +520,69 @@ mod storage {
             .await
             .expect("again");
         assert_eq!((again.stored, again.duplicates), (0, 1), "{again:?}");
+    }
+
+    #[tokio::test]
+    async fn a_resend_leaves_an_unfinished_write_the_sweeper_claimed_to_the_sweeper() {
+        let Some(f) = fixture("attachment claimed resend test").await else {
+            return;
+        };
+        let event_id = event(&f, SDK_EVENT, chrono::Duration::minutes(5)).await;
+        f.db.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "INSERT INTO error_attachments (project_id, owner_kind, owner_id, ordinal, event_time, \
+                 filename, content_type, attachment_type, size_bytes, content_sha256, created_at) \
+             SELECT $1, 'error', $2, 0, timestamp, 'a.txt', 'text/plain', 'event.attachment', 3, \
+                 sha256('abc'::bytea), NOW() - INTERVAL '2 hours' FROM error_events WHERE id = $2",
+            [f.project_id.into(), event_id.into()],
+        ))
+        .await
+        .expect("unfinished row");
+        f.db.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "INSERT INTO error_attachment_usage (project_id, bytes, files) VALUES ($1, 3, 1)",
+            [f.project_id.into()],
+        ))
+        .await
+        .expect("charge it");
+
+        // The sweep takes the row, then pauses before deleting it.
+        let stale_before = Utc::now() - chrono::Duration::hours(1);
+        let (claimed, _, _) = f.service.claim_stale(stale_before, 0).await.expect("claim");
+        assert_eq!(claimed.len(), 1);
+
+        // A resend meanwhile neither resumes nor stores the claimed write.
+        let resent = f
+            .service
+            .store_batch(
+                f.store.as_ref(),
+                &batch(&f, SDK_EVENT, vec![file("a.txt", b"abc")]),
+            )
+            .await
+            .expect("resend");
+        assert_eq!((resent.stored, resent.failed), (0, 1), "{resent:?}");
+        assert!(f.store.keys(f.project_id).is_empty());
+
+        // The sweep resumes: the row goes, its bytes come back once.
+        assert_eq!(
+            f.service
+                .remove(f.store.as_ref(), claimed)
+                .await
+                .expect("remove"),
+            1
+        );
+        let usage = f.service.usage(f.project_id).await.expect("usage");
+        assert_eq!((usage.used_bytes, usage.files), (0, 0));
+        // A fresh resend after it is a new file.
+        let later = f
+            .service
+            .store_batch(
+                f.store.as_ref(),
+                &batch(&f, SDK_EVENT, vec![file("a.txt", b"abc")]),
+            )
+            .await
+            .expect("later");
+        assert_eq!(later.stored, 1, "{later:?}");
     }
 
     #[tokio::test]
