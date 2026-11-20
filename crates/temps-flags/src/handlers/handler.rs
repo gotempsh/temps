@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Extension, Path, Query, State},
+    extract::{DefaultBodyLimit, Extension, Path, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::IntoResponse,
     routing::{delete, get, patch, post, put},
@@ -25,12 +25,23 @@ use utoipa::{IntoParams, OpenApi};
 
 use super::audit::{
     AuditContext, FeatureFlagArchivedAudit, FeatureFlagCreatedAudit,
-    FeatureFlagEnvironmentValueSetAudit, FeatureFlagRestoredAudit, FeatureFlagUpdatedAudit,
+    FeatureFlagEnvironmentValueSetAudit, FeatureFlagReshuffledAudit, FeatureFlagRestoredAudit,
+    FeatureFlagRulesSetAudit, FeatureFlagUpdatedAudit,
+};
+use super::public::{
+    ofrep_server_bulk, ofrep_server_single, OfrepBulkResponse, OfrepEvaluationFailure,
+    OfrepEvaluationRequest, OfrepEvaluationSuccess, OfrepMetadata, PublicFlagEvaluation,
+    PublicFlagsRequest, PublicFlagsResponse, EVALUATION_BODY_LIMIT,
 };
 use super::types::*;
 use crate::error::FlagError;
-use crate::eval::{FlagSnapshot, FlagValueType};
-use crate::services::{normalize_pagination, CreateFlag, SetEnvironmentValue, UpdateFlag};
+use crate::eval::{
+    AttributeValue, ConditionOperator, ConditionValue, EvalContext, EvalReason, Evaluation,
+    FlagRule, FlagSnapshot, FlagValueType, FlagVariant, RuleCondition, RuleServe, VariantWeight,
+};
+use crate::services::{
+    normalize_pagination, CreateFlag, SetEnvironmentValue, SetRules, UpdateFlag, UpdatedFlag,
+};
 
 #[derive(OpenApi)]
 #[openapi(
@@ -42,8 +53,16 @@ use crate::services::{normalize_pagination, CreateFlag, SetEnvironmentValue, Upd
         archive_flag,
         restore_flag,
         set_flag_environment,
+        set_flag_rules,
+        reshuffle_flag,
+        evaluate_flag,
         get_flag_snapshot,
         record_flag_exposure,
+        super::public::evaluate_public_flags,
+        super::public::ofrep_public_bulk,
+        super::public::ofrep_public_single,
+        super::public::ofrep_server_bulk,
+        super::public::ofrep_server_single,
     ),
     components(schemas(
         CreateFlagRequest,
@@ -58,6 +77,26 @@ use crate::services::{normalize_pagination, CreateFlag, SetEnvironmentValue, Upd
         RecordExposureResponse,
         FlagSnapshot,
         FlagValueType,
+        SetFlagRulesRequest,
+        EvaluateFlagRequest,
+        Evaluation,
+        EvalReason,
+        FlagVariant,
+        FlagRule,
+        RuleCondition,
+        ConditionOperator,
+        ConditionValue,
+        AttributeValue,
+        RuleServe,
+        VariantWeight,
+        PublicFlagsRequest,
+        PublicFlagsResponse,
+        PublicFlagEvaluation,
+        OfrepEvaluationRequest,
+        OfrepEvaluationSuccess,
+        OfrepEvaluationFailure,
+        OfrepBulkResponse,
+        OfrepMetadata,
     )),
     tags((
         name = "Feature Flags",
@@ -80,6 +119,30 @@ pub fn configure_routes() -> Router<Arc<FlagsAppState>> {
         .route(
             "/projects/{project_id}/flags/{key}/environments/{environment_id}",
             put(set_flag_environment),
+        )
+        .route(
+            "/projects/{project_id}/flags/{key}/environments/{environment_id}/rules",
+            put(set_flag_rules),
+        )
+        .route(
+            "/projects/{project_id}/flags/{key}/reshuffle",
+            post(reshuffle_flag),
+        )
+        .route(
+            "/projects/{project_id}/flags/{key}/evaluate",
+            post(evaluate_flag),
+        )
+        // OpenFeature Remote Evaluation Protocol for server-side SDKs; scope
+        // comes from the deployment token.
+        // Bounded like the public OFREP routes; axum's default would accept
+        // 2 MB before `parse_ofrep` ever saw it.
+        .route(
+            "/ofrep/v1/evaluate/flags",
+            post(ofrep_server_bulk).layer(DefaultBodyLimit::max(EVALUATION_BODY_LIMIT)),
+        )
+        .route(
+            "/ofrep/v1/evaluate/flags/{key}",
+            post(ofrep_server_single).layer(DefaultBodyLimit::max(EVALUATION_BODY_LIMIT)),
         )
         // Delivery endpoint for running services. Scope comes from the
         // deployment token, not the URL.
@@ -104,6 +167,10 @@ impl From<FlagError> for Problem {
 
             FlagError::DuplicateKey { .. } => problemdetails::new(StatusCode::CONFLICT)
                 .with_title("Feature Flag Already Exists")
+                .with_detail(error.to_string()),
+
+            FlagError::StaleWrite { .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Feature Flag Changed")
                 .with_detail(error.to_string()),
 
             // Cross-tenant attachment is a client error, not a server one, but
@@ -178,6 +245,22 @@ pub struct SnapshotQuery {
 // =============================================================================
 // Helpers
 // =============================================================================
+
+/// Parse an `expected_updated_at` revision sent back by a client.
+fn parse_revision(raw: Option<String>) -> Result<Option<chrono::DateTime<chrono::Utc>>, Problem> {
+    raw.map(|text| {
+        chrono::DateTime::parse_from_rfc3339(&text)
+            .map(|parsed| parsed.with_timezone(&chrono::Utc))
+            .map_err(|e| {
+                problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_title("Invalid Revision")
+                    .with_detail(format!(
+                        "expected_updated_at '{text}' is not an RFC 3339 timestamp: {e}"
+                    ))
+            })
+    })
+    .transpose()
+}
 
 fn audit_context(auth: &temps_authz::AuthContext, metadata: &RequestMetadata) -> AuditContext {
     AuditContext {
@@ -322,6 +405,8 @@ pub async fn create_flag(
                 default_value: request.default_value,
                 description: request.description,
                 client_visible: request.client_visible,
+                variants: request.variants,
+                exposure_sample_rate: request.exposure_sample_rate,
             },
         )
         .await?;
@@ -334,6 +419,8 @@ pub async fn create_flag(
         value_type: flag.value_type.clone(),
         default_value: flag.default_value.clone(),
         client_visible: flag.client_visible,
+        variants: flag.variants.clone(),
+        exposure_sample_rate: flag.exposure_sample_rate,
     };
     if let Err(e) = state.audit_service.create_audit_log(&audit).await {
         error!(
@@ -397,6 +484,7 @@ pub async fn get_flag(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Flag not found"),
+        (status = 409, description = "Flag changed since it was read"),
         (status = 500, description = "Internal server error")
     ),
     security(("bearer_auth" = []))
@@ -411,13 +499,15 @@ pub async fn update_flag(
     project_scope_guard!(auth, project_id);
     project_permission_guard!(auth, FlagsWrite, project_id, &state.project_access_checker);
 
-    // One read for the before-image; `update()` reuses it rather than
-    // fetching the flag a second time, and the environments come back with it
-    // instead of costing a third round trip.
-    let before = state.flag_service.get(project_id, &key).await?;
-    let before_flag = before.flag.clone();
-
-    let flag = state
+    // The service returns the row it locked as the before-image, so the audit
+    // records the transition this write made even when another writer
+    // committed after this request was sent.
+    let expected_updated_at = parse_revision(request.expected_updated_at)?;
+    let UpdatedFlag {
+        before: before_flag,
+        flag,
+        environments,
+    } = state
         .flag_service
         .update(
             project_id,
@@ -426,6 +516,9 @@ pub async fn update_flag(
                 default_value: request.default_value,
                 description: request.description,
                 client_visible: request.client_visible,
+                variants: request.variants,
+                exposure_sample_rate: request.exposure_sample_rate,
+                expected_updated_at,
             },
         )
         .await?;
@@ -439,12 +532,16 @@ pub async fn update_flag(
         new_default_value: flag.default_value.clone(),
         old_client_visible: before_flag.client_visible,
         new_client_visible: flag.client_visible,
+        old_variants: before_flag.variants,
+        new_variants: flag.variants.clone(),
+        old_exposure_sample_rate: before_flag.exposure_sample_rate,
+        new_exposure_sample_rate: flag.exposure_sample_rate,
     };
     if let Err(e) = state.audit_service.create_audit_log(&audit).await {
         error!("Failed to create audit log for feature flag update: {}", e);
     }
 
-    Ok(Json(FlagResponse::new(flag, before.environments)))
+    Ok(Json(FlagResponse::new(flag, environments)))
 }
 
 #[utoipa::path(
@@ -487,7 +584,7 @@ pub async fn archive_flag(
 
     Ok(Json(ArchiveFlagResponse {
         key: flag.key,
-        archived_at: flag.archived_at.map(|t| t.to_rfc3339()),
+        archived_at: flag.archived_at.map(super::types::iso),
     }))
 }
 
@@ -613,6 +710,185 @@ pub async fn set_flag_environment(
     Ok(Json(FlagEnvironmentResponse::from(model)))
 }
 
+/// Replace the ordered targeting rules of a flag in one environment.
+///
+/// Rules apply after the kill switch and before the environment value; the
+/// first rule whose conditions hold (and whose rollout includes the subject)
+/// decides the value. Send the environment row's `updated_at` as
+/// `expected_updated_at` so a concurrent edit is refused with 409 instead of
+/// being overwritten.
+#[utoipa::path(
+    tag = "Feature Flags",
+    put,
+    path = "/projects/{project_id}/flags/{key}/environments/{environment_id}/rules",
+    params(
+        ("project_id" = i32, Path, description = "Project ID"),
+        ("key" = String, Path, description = "Flag key"),
+        ("environment_id" = i32, Path, description = "Environment ID")
+    ),
+    request_body = SetFlagRulesRequest,
+    responses(
+        (status = 200, description = "Rules replaced", body = FlagEnvironmentResponse),
+        (status = 400, description = "Validation error"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Flag or environment not found"),
+        (status = 409, description = "Rules changed since they were read"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn set_flag_rules(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<FlagsAppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path((project_id, key, environment_id)): Path<(i32, String, i32)>,
+    Json(request): Json<SetFlagRulesRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    project_scope_guard!(auth, project_id);
+    project_permission_guard!(auth, FlagsWrite, project_id, &state.project_access_checker);
+
+    let expected_updated_at = parse_revision(request.expected_updated_at)?;
+    let (before, after) = state
+        .flag_service
+        .set_rules(
+            project_id,
+            &key,
+            environment_id,
+            SetRules {
+                rules: request.rules,
+                expected_updated_at,
+            },
+        )
+        .await?;
+
+    let audit = FeatureFlagRulesSetAudit {
+        context: audit_context(&auth, &metadata),
+        project_id,
+        flag_id: after.flag_id,
+        key: key.clone(),
+        environment_id,
+        old_rules: before.map(|row| row.rules),
+        new_rules: after.rules.clone(),
+    };
+    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+        error!(
+            "Failed to create audit log for feature flag '{}' rules in environment {}: {}",
+            key, environment_id, e
+        );
+    }
+
+    Ok(Json(FlagEnvironmentResponse::from(after)))
+}
+
+/// Regenerate the flag's bucketing salt.
+///
+/// Reassigns every subject of every percentage rollout and split of this flag,
+/// in every environment. Use it to draw a fresh sample, never on a running
+/// experiment.
+#[utoipa::path(
+    tag = "Feature Flags",
+    post,
+    path = "/projects/{project_id}/flags/{key}/reshuffle",
+    params(
+        ("project_id" = i32, Path, description = "Project ID"),
+        ("key" = String, Path, description = "Flag key")
+    ),
+    responses(
+        (status = 200, description = "Salt regenerated", body = FlagResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Flag not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn reshuffle_flag(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<FlagsAppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path((project_id, key)): Path<(i32, String)>,
+) -> Result<impl IntoResponse, Problem> {
+    project_scope_guard!(auth, project_id);
+    project_permission_guard!(auth, FlagsWrite, project_id, &state.project_access_checker);
+
+    // Read the environments first: a reshuffle does not change them, and a
+    // read failing after the new salt is committed would report a reshuffle
+    // that did happen as failed, inviting a retry that reshuffles again.
+    let environments = state.flag_service.get(project_id, &key).await?.environments;
+    let flag = state.flag_service.reshuffle(project_id, &key).await?;
+
+    let audit = FeatureFlagReshuffledAudit {
+        context: audit_context(&auth, &metadata),
+        project_id,
+        flag_id: flag.id,
+        key: flag.key.clone(),
+    };
+    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+        error!(
+            "Failed to create audit log for feature flag reshuffle: {}",
+            e
+        );
+    }
+
+    Ok(Json(FlagResponse::new(flag, environments)))
+}
+
+/// Evaluate one flag as an app in the given environment would, for a context
+/// you supply. Read-only; the console's "test this flag" panel.
+#[utoipa::path(
+    tag = "Feature Flags",
+    post,
+    path = "/projects/{project_id}/flags/{key}/evaluate",
+    params(
+        ("project_id" = i32, Path, description = "Project ID"),
+        ("key" = String, Path, description = "Flag key")
+    ),
+    request_body = EvaluateFlagRequest,
+    responses(
+        (status = 200, description = "Evaluation", body = Evaluation),
+        (status = 400, description = "Environment not in project, or the context exceeds the evaluation limits"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Flag or environment not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn evaluate_flag(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<FlagsAppState>>,
+    Path((project_id, key)): Path<(i32, String)>,
+    Json(request): Json<EvaluateFlagRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, FlagsRead);
+    // A deployment token is pinned to one environment; this endpoint names
+    // any environment of the project.
+    deny_deployment_token!(auth);
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, &state.project_access_checker);
+
+    let context = EvalContext {
+        key: request.key,
+        attributes: request.attributes,
+    };
+    // The same bounds as the app-facing endpoints: an attribute longer than
+    // the SDKs accept would otherwise test differently here than in an app.
+    if let Err(reason) = super::public::check_context(&context) {
+        return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid Flag Context")
+            .with_detail(format!(
+                "Cannot evaluate flag '{key}' in project {project_id}: {reason}"
+            )));
+    }
+    let evaluation = state
+        .flag_service
+        .evaluate_for_console(project_id, &key, request.environment_id, &context)
+        .await?;
+
+    Ok(Json(evaluation))
+}
+
 /// Record which flags a running app actually evaluated.
 ///
 /// This is what makes `last_evaluated_at` mean something. The snapshot
@@ -725,9 +1001,9 @@ pub async fn get_flag_snapshot(
 
     let flags = state
         .flag_service
-        // Server-side callers see every flag, including server-only ones. The
-        // client_visible filter belongs to the unauthenticated same-origin
-        // endpoint, which does not exist yet.
+        // Server-side callers see every flag, including server-only ones, with
+        // rules and salt so the SDK can evaluate locally. The unauthenticated
+        // same-origin endpoint serves evaluated client_visible flags only.
         .snapshot(project_id, environment_id, false)
         .await
         // Collapse "no such environment" and "someone else's environment" into
@@ -780,6 +1056,7 @@ pub async fn get_flag_snapshot(
 mod tests {
     use super::*;
     use crate::services::FlagService;
+    use axum::body::Bytes;
     use sea_orm::{DatabaseBackend, MockDatabase};
     use temps_authz::context::AuthContext;
     use temps_authz::permissions::{Permission, Role};
@@ -1176,6 +1453,8 @@ mod tests {
                 default_value: serde_json::json!(false),
                 description: None,
                 client_visible: false,
+                variants: Vec::new(),
+                exposure_sample_rate: 0.0,
             }),
         )
         .await
@@ -1193,6 +1472,9 @@ mod tests {
                 default_value: None,
                 description: None,
                 client_visible: Some(true),
+                variants: None,
+                exposure_sample_rate: None,
+                expected_updated_at: None,
             }),
         )
         .await
@@ -1364,6 +1646,197 @@ mod tests {
     }
 
     // =====================================================================
+    // Targeting handlers (ADR 110 D3)
+    // =====================================================================
+
+    async fn rules_rejection(auth: AuthContext, project_id: i32) -> Option<StatusCode> {
+        set_flag_rules(
+            RequireAuth(auth),
+            State(app_state()),
+            Extension(test_metadata()),
+            Path((project_id, "checkout.v2".to_string(), 1)),
+            Json(SetFlagRulesRequest {
+                rules: Vec::new(),
+                expected_updated_at: None,
+            }),
+        )
+        .await
+        .err()
+        .map(|p| p.status_code)
+    }
+
+    async fn reshuffle_rejection(auth: AuthContext, project_id: i32) -> Option<StatusCode> {
+        reshuffle_flag(
+            RequireAuth(auth),
+            State(app_state()),
+            Extension(test_metadata()),
+            Path((project_id, "checkout.v2".to_string())),
+        )
+        .await
+        .err()
+        .map(|p| p.status_code)
+    }
+
+    async fn evaluate_rejection(auth: AuthContext, project_id: i32) -> Option<StatusCode> {
+        evaluate_flag(
+            RequireAuth(auth),
+            State(app_state()),
+            Path((project_id, "checkout.v2".to_string())),
+            Json(EvaluateFlagRequest {
+                environment_id: 1,
+                key: None,
+                attributes: std::collections::HashMap::new(),
+            }),
+        )
+        .await
+        .err()
+        .map(|p| p.status_code)
+    }
+
+    /// Editing targeting and reshuffling a rollout change what a flag serves
+    /// in production, so they need `flags:write` exactly like a value change.
+    #[tokio::test]
+    async fn targeting_writes_reject_readers_read_only_keys_and_deployment_tokens() {
+        let reader = || AuthContext::new_session(test_user(), Role::Reader);
+        let read_only_key = || {
+            AuthContext::new_api_key(
+                test_user(),
+                None,
+                Some(vec![Permission::FlagsRead]),
+                "flags-read-key".to_string(),
+                1,
+            )
+        };
+        let token = || {
+            AuthContext::new_deployment_token(
+                1,
+                Some(1),
+                None,
+                1,
+                "app".to_string(),
+                vec![DeploymentTokenPermission::FullAccess],
+            )
+        };
+
+        for (who, rules, reshuffle) in [
+            (
+                "reader",
+                rules_rejection(reader(), 1).await,
+                reshuffle_rejection(reader(), 1).await,
+            ),
+            (
+                "read-only key",
+                rules_rejection(read_only_key(), 1).await,
+                reshuffle_rejection(read_only_key(), 1).await,
+            ),
+            (
+                "deployment token",
+                rules_rejection(token(), 1).await,
+                reshuffle_rejection(token(), 1).await,
+            ),
+        ] {
+            assert_eq!(
+                rules,
+                Some(StatusCode::FORBIDDEN),
+                "{who} must not set rules"
+            );
+            assert_eq!(
+                reshuffle,
+                Some(StatusCode::FORBIDDEN),
+                "{who} must not reshuffle"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn targeting_writes_admit_a_writer() {
+        let admin = || AuthContext::new_session(test_user(), Role::Admin);
+        assert_ne!(
+            rules_rejection(admin(), 1).await,
+            Some(StatusCode::FORBIDDEN)
+        );
+        assert_ne!(
+            reshuffle_rejection(admin(), 1).await,
+            Some(StatusCode::FORBIDDEN)
+        );
+    }
+
+    /// The console's test panel is a read, and like every project-scoped
+    /// read it confines a deployment token to its own project.
+    #[tokio::test]
+    async fn evaluate_is_a_project_scoped_read() {
+        assert_ne!(
+            evaluate_rejection(AuthContext::new_session(test_user(), Role::Reader), 1).await,
+            Some(StatusCode::FORBIDDEN),
+            "a reader may test a flag"
+        );
+        let token = AuthContext::new_deployment_token(
+            1,
+            Some(1),
+            None,
+            1,
+            "app".to_string(),
+            vec![DeploymentTokenPermission::FlagsRead],
+        );
+        assert_eq!(
+            evaluate_rejection(token, 2).await,
+            Some(StatusCode::FORBIDDEN),
+            "a project-1 token must not evaluate project 2's flags"
+        );
+    }
+
+    async fn ofrep_server_status(auth: AuthContext) -> StatusCode {
+        match ofrep_server_bulk(
+            RequireAuth(auth),
+            State(app_state()),
+            HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await
+        {
+            Ok(response) => response.status(),
+            Err(problem) => problem.status_code,
+        }
+    }
+
+    /// Server-side OFREP is scoped by the deployment token alone: a session
+    /// or a project-wide token has no environment to evaluate in.
+    #[tokio::test]
+    async fn server_ofrep_requires_an_environment_scoped_deployment_token() {
+        assert_eq!(
+            ofrep_server_status(AuthContext::new_session(test_user(), Role::Admin)).await,
+            StatusCode::BAD_REQUEST
+        );
+        let project_wide = AuthContext::new_deployment_token(
+            1,
+            None,
+            None,
+            1,
+            "app".to_string(),
+            vec![DeploymentTokenPermission::FlagsRead],
+        );
+        assert_eq!(
+            ofrep_server_status(project_wide).await,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn server_ofrep_admits_a_read_only_environment_token() {
+        let token = AuthContext::new_deployment_token(
+            1,
+            Some(1),
+            None,
+            1,
+            "app".to_string(),
+            vec![DeploymentTokenPermission::FlagsRead],
+        );
+        let status = ofrep_server_status(token).await;
+        assert_ne!(status, StatusCode::FORBIDDEN);
+        assert_ne!(status, StatusCode::BAD_REQUEST);
+    }
+
+    // =====================================================================
     // ETag
     // =====================================================================
 
@@ -1374,6 +1847,9 @@ mod tests {
             default_value: serde_json::json!(false),
             enabled: true,
             environment_value: Some(value),
+            salt: "a1b2c3".to_string(),
+            variants: Vec::new(),
+            rules: Vec::new(),
         }
     }
 
