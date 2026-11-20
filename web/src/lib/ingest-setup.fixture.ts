@@ -31,7 +31,7 @@ export function ingestSetupFixture({
     ],
     query_param: null,
     browser_safe: false,
-    credential_path: '/keys/new',
+    credential_path: '/settings/keys/new?name=my-app-telemetry',
     cli_command:
       'temps apikeys create --name my-app-telemetry --role custom --permissions otel:write --yes',
   }

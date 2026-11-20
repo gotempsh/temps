@@ -355,7 +355,8 @@ fn build_setup(
         },
         query_param: None,
         browser_safe: false,
-        credential_path: "/keys/new".to_string(),
+        // The console's API-key form, named like the key the CLI creates.
+        credential_path: format!("/settings/keys/new?name={slug}-telemetry"),
         // OTLP ingest accepts any active `tk_` key whose owner can access the
         // project, whatever its permissions, so the exporter key gets only
         // `otel:write`: no reads and no project or deployment management.
@@ -640,6 +641,11 @@ mod tests {
                 "temps apikeys create --name my-app-telemetry --role custom --permissions otel:write --yes"
             );
             assert!(!command.contains("--role user"), "{otlp:?}: {command}");
+            // The console registers the form under /settings.
+            assert_eq!(
+                signal(&setup, otlp).auth.credential_path,
+                "/settings/keys/new?name=my-app-telemetry"
+            );
         }
     }
 

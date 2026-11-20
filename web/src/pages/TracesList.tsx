@@ -666,7 +666,10 @@ function OtelSetupSection({
               <p className="text-xs text-muted-foreground">
                 Set <code>TEMPS_API_KEY</code> to a Temps API key (
                 <code>tk_...</code>) from{' '}
-                <Link className="underline underline-offset-4" to="/keys/new">
+                <Link
+                  className="underline underline-offset-4"
+                  to={`/settings/keys/new?name=${project.slug}-telemetry`}
+                >
                   API keys
                 </Link>
                 . Keep it server-side.

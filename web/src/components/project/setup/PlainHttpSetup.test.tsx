@@ -60,7 +60,7 @@ test('logs and traces show OTLP endpoint, secret-key warning and Collector confi
     expect(html).toContain('Bearer $TEMPS_API_KEY')
     expect(html).toContain('never in browser code')
     expect(html).toContain('otlphttp/temps')
-    expect(html).toContain('href="/keys/new"')
+    expect(html).toContain('href="/settings/keys/new?name=my-app-telemetry"')
   }
 })
 
