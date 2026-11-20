@@ -30,11 +30,13 @@ use super::dispatcher::{WebhookDispatcherState, MAX_ATTEMPTS};
 use super::payload::{signature, WebhookPayload, SIGNATURE_HEADER};
 use super::service::MAX_WEBHOOKS_PER_PAGE;
 use super::{
-    CreateStatusPageWebhookRequest, StatusPageWebhookService, UpdateStatusPageWebhookRequest,
-    WebhookError, WebhookTransport,
+    CreateStatusPageWebhookRequest, StatusPageWebhookService, TransportError,
+    UpdateStatusPageWebhookRequest, WebhookError, WebhookTransport,
 };
 use crate::routes::webhooks::{create_webhook, create_webhook_router, WebhookRoutesState};
-use crate::services::maintenance::{CreateMaintenanceRequest, StatusPageMaintenanceService};
+use crate::services::maintenance::{
+    CreateMaintenanceRequest, StatusPageMaintenanceService, UpdateMaintenanceRequest,
+};
 use crate::services::public_pages::{
     CreateStatusPageRequest, PublicStatusPageService, StatusPageMonitorInput, StatusSnapshotCache,
 };
@@ -52,7 +54,7 @@ struct Sent {
 #[derive(Default)]
 struct FakeTransport {
     /// Statuses to answer with, in order; 204 once empty.
-    answers: Mutex<VecDeque<Result<u16, String>>>,
+    answers: Mutex<VecDeque<Result<u16, TransportError>>>,
     refuse_check: std::sync::atomic::AtomicBool,
     sent: Mutex<Vec<Sent>>,
 }
@@ -62,16 +64,18 @@ impl FakeTransport {
         self.sent.lock().expect("lock").clone()
     }
 
-    fn answer(&self, answer: Result<u16, String>) {
+    fn answer(&self, answer: Result<u16, TransportError>) {
         self.answers.lock().expect("lock").push_back(answer);
     }
 }
 
 #[async_trait]
 impl WebhookTransport for FakeTransport {
-    async fn check(&self, _url: &str) -> Result<(), String> {
+    async fn check(&self, _url: &str) -> Result<(), TransportError> {
         if self.refuse_check.load(std::sync::atomic::Ordering::SeqCst) {
-            Err("the address is not public: 10.0.0.5".to_string())
+            Err(TransportError::NonPublic {
+                reason: "10.0.0.5".to_string(),
+            })
         } else {
             Ok(())
         }
@@ -82,7 +86,7 @@ impl WebhookTransport for FakeTransport {
         url: &str,
         headers: Vec<(&'static str, String)>,
         body: String,
-    ) -> Result<u16, String> {
+    ) -> Result<u16, TransportError> {
         self.sent.lock().expect("lock").push(Sent {
             url: url.to_string(),
             headers,
@@ -456,6 +460,103 @@ async fn failures_are_retried_then_marked_failed_with_the_reason_shown() {
 }
 
 #[tokio::test]
+async fn a_backlog_larger_than_one_insert_is_queued_and_sent_in_full() {
+    let Some(fx) = fixture().await else {
+        return;
+    };
+    fx.webhooks
+        .create(
+            fx.page_id,
+            CreateStatusPageWebhookRequest {
+                url: URL.to_string(),
+            },
+        )
+        .await
+        .expect("create");
+    let windows = super::dispatcher::INSERT_CHUNK * 2 + 1;
+    for index in 0..windows {
+        schedule(&fx, &format!("Upgrade {index}")).await;
+    }
+    let mut state = WebhookDispatcherState::default();
+    let report = fx
+        .webhooks
+        .dispatch_tick(&mut state, Utc::now())
+        .await
+        .expect("tick");
+    assert_eq!(report.queued, windows, "{report:?}");
+    assert_eq!(deliveries(&fx).await.len(), windows);
+    assert_eq!(fx.transport.sent().len(), windows);
+}
+
+#[tokio::test]
+async fn a_retry_sends_the_event_as_the_page_shows_it_now() {
+    let Some(fx) = fixture().await else {
+        return;
+    };
+    fx.webhooks
+        .create(
+            fx.page_id,
+            CreateStatusPageWebhookRequest {
+                url: URL.to_string(),
+            },
+        )
+        .await
+        .expect("create");
+    let starts_at = Utc::now() + Duration::hours(2);
+    let window = fx
+        .maintenance
+        .create(
+            fx.page_id,
+            CreateMaintenanceRequest {
+                title: "Database upgrade".to_string(),
+                description: None,
+                starts_at,
+                ends_at: starts_at + Duration::hours(1),
+                monitor_ids: vec![fx.monitor_id],
+            },
+        )
+        .await
+        .expect("schedule");
+    fx.transport.answer(Ok(500));
+    let mut state = WebhookDispatcherState::default();
+    let mut now = Utc::now();
+    fx.webhooks
+        .dispatch_tick(&mut state, now)
+        .await
+        .expect("first attempt");
+
+    fx.maintenance
+        .update(
+            fx.page_id,
+            window.id,
+            UpdateMaintenanceRequest {
+                title: Some("Database upgrade, moved to Sunday".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("edit");
+    now += Duration::minutes(2);
+    fx.webhooks
+        .dispatch_tick(&mut state, now)
+        .await
+        .expect("retry");
+
+    let sent = fx.transport.sent();
+    assert_eq!(sent.len(), 2);
+    assert!(
+        sent[0].body.contains("\"Database upgrade\""),
+        "{}",
+        sent[0].body
+    );
+    assert!(
+        sent[1].body.contains("Database upgrade, moved to Sunday"),
+        "the retry carries the edited title: {}",
+        sent[1].body
+    );
+}
+
+#[tokio::test]
 async fn a_disabled_webhook_gets_nothing_and_its_pending_events_are_cancelled() {
     let Some(fx) = fixture().await else {
         return;
@@ -471,7 +572,7 @@ async fn a_disabled_webhook_gets_nothing_and_its_pending_events_are_cancelled() 
         .await
         .expect("create");
     schedule(&fx, "Database upgrade").await;
-    fx.transport.answer(Err("could not connect".to_string()));
+    fx.transport.answer(Err(TransportError::Connect));
     let mut state = WebhookDispatcherState::default();
     let now = Utc::now();
     fx.webhooks

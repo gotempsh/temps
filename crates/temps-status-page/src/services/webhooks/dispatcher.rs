@@ -33,6 +33,7 @@ use tracing::{debug, info, warn};
 use super::error::WebhookError;
 use super::payload::{payload_for, signature, EVENT_HEADER, EVENT_ID_HEADER, SIGNATURE_HEADER};
 use super::service::StatusPageWebhookService;
+use super::transport::TransportError;
 use crate::services::public_pages::PublishedSnapshot;
 use crate::services::subscribers::notices::NOTICE_WINDOW;
 
@@ -46,6 +47,10 @@ pub const CONCURRENCY: usize = 8;
 const RETENTION_DAYS: i64 = 30;
 const PRUNE_EVERY_TICKS: u64 = 30;
 const MAX_ERROR_CHARS: usize = 300;
+/// Deliveries queued per insert statement; each binds six values, far below
+/// PostgreSQL's 65,535 bind limit. Tiny under test, so a handful of events
+/// already spans several statements.
+pub const INSERT_CHUNK: usize = if cfg!(test) { 2 } else { 1_000 };
 
 #[derive(Default)]
 pub struct WebhookDispatcherState {
@@ -173,8 +178,13 @@ impl StatusPageWebhookService {
             }
         }
         let count = rows.len();
-        if count > 0 {
-            status_page_webhook_deliveries::Entity::insert_many(rows)
+        // One statement per chunk: PostgreSQL binds at most 65,535 values, and
+        // a backlog after a restart (many pages, webhooks and recent events)
+        // can exceed that in one insert, which would stop delivery entirely.
+        let mut rows = rows.into_iter().peekable();
+        while rows.peek().is_some() {
+            let chunk: Vec<_> = rows.by_ref().take(INSERT_CHUNK).collect();
+            status_page_webhook_deliveries::Entity::insert_many(chunk)
                 .on_conflict(
                     OnConflict::columns([
                         status_page_webhook_deliveries::Column::WebhookId,
@@ -212,12 +222,22 @@ impl StatusPageWebhookService {
             let Some(webhook) = webhook else {
                 continue;
             };
-            let on_page = snapshots
-                .get(&webhook.status_page_id)
-                .is_some_and(|s| s.events.iter().any(|e| e.key == delivery.event_key));
+            // The body is rebuilt from the event as the page shows it now, so a
+            // retry never sends content the page has since changed or removed
+            // (a component taken off the page, an edited title).
+            let current = snapshots.get(&webhook.status_page_id).and_then(|snapshot| {
+                snapshot
+                    .events
+                    .iter()
+                    .find(|event| event.key == delivery.event_key)
+                    .and_then(|event| {
+                        serde_json::to_string(&payload_for(&snapshot.slug, &snapshot.title, event))
+                            .ok()
+                    })
+            });
             let cancel_reason = if !webhook.enabled {
                 Some("the webhook was disabled")
-            } else if !on_page {
+            } else if current.is_none() {
                 Some("the event is no longer on the public page")
             } else {
                 None
@@ -260,15 +280,16 @@ impl StatusPageWebhookService {
                     continue;
                 }
             };
-            sendable.push((delivery, webhook, secret));
+            let body = current.unwrap_or_default();
+            sendable.push((delivery, webhook, secret, body));
         }
 
         for chunk in sendable.chunks(CONCURRENCY) {
             let mut set = JoinSet::new();
-            for (index, (delivery, webhook, secret)) in chunk.iter().enumerate() {
+            for (index, (_, webhook, secret, body)) in chunk.iter().enumerate() {
                 let transport = self.transport.clone();
                 let url = webhook.url.clone();
-                let body = delivery.payload.clone();
+                let body = body.clone();
                 let event_id = serde_json::from_str::<super::payload::WebhookPayload>(&body)
                     .map(|p| (p.kind, p.event.id))
                     .unwrap_or_default();
@@ -279,7 +300,8 @@ impl StatusPageWebhookService {
                 ];
                 set.spawn(async move { (index, transport.post(&url, headers, body).await) });
             }
-            let mut outcomes: Vec<(usize, Result<u16, String>)> = Vec::with_capacity(chunk.len());
+            let mut outcomes: Vec<(usize, Result<u16, TransportError>)> =
+                Vec::with_capacity(chunk.len());
             while let Some(joined) = set.join_next().await {
                 match joined {
                     Ok(outcome) => outcomes.push(outcome),
@@ -287,13 +309,13 @@ impl StatusPageWebhookService {
                 }
             }
             for (index, outcome) in outcomes {
-                let Some((delivery, webhook, _)) = chunk.get(index) else {
+                let Some((delivery, webhook, _, _)) = chunk.get(index) else {
                     continue;
                 };
                 let attempt = match outcome {
                     Ok(status) if (200..300).contains(&status) => Attempt::Delivered,
                     Ok(status) => Attempt::Failed(format!("the endpoint answered HTTP {status}")),
-                    Err(reason) => Attempt::Failed(reason),
+                    Err(error) => Attempt::Failed(error.to_string()),
                 };
                 self.record(delivery, webhook, now, attempt, false, report)
                     .await?;

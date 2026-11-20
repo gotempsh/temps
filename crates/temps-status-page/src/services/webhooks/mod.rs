@@ -26,7 +26,7 @@ pub mod types;
 
 pub use error::WebhookError;
 pub use service::StatusPageWebhookService;
-pub use transport::{PinnedWebhookTransport, WebhookTransport};
+pub use transport::{PinnedWebhookTransport, TransportError, WebhookTransport};
 pub use types::*;
 
 #[cfg(test)]
