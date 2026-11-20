@@ -95,6 +95,31 @@ describe('ReleaseHealthContent', () => {
     expect(html).toContain('The 2 most recently active of 3')
   })
 
+  test('fits narrow containers: secondary columns hide and their values move under the release', () => {
+    const html = render(
+      page({
+        total: 1,
+        items: [
+          release({
+            crash_free_users: 0.9,
+            adoption: 0.25,
+            sessions: 1234,
+            users: 321,
+          }),
+        ],
+      })
+    )
+    expect(html).not.toContain('overflow-x-auto')
+    expect(html).toContain('@container')
+    for (const breakpoint of ['@xl', '@2xl', '@3xl']) {
+      expect(html).toContain(`hidden ${breakpoint}:table-cell`)
+    }
+    const summary = html.slice(html.indexOf('@3xl:hidden'))
+    expect(summary).toContain('90.0% crash-free users')
+    expect(summary).toContain('25.0% adoption')
+    expect(summary).toContain('1,234 sessions · ~321 users')
+  })
+
   test('an empty window says so', () => {
     expect(render(page({}))).toContain('No session started in this window')
   })
