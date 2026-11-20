@@ -616,8 +616,15 @@ deploys, which is web services. It comes last and may never be worth building.
   `event.attachment` (the default) is kept; an `attachment_type` that is not a
   string is unsupported. Minidumps, Apple crash reports and
   Unreal files belong to D7 and stay unsupported. An attachment never rejects
-  its envelope: one that is too large, past the count, or has no event or
-  feedback to belong to is reported unsupported, and the events are stored.
+  its envelope: one that is too large, past the count, or sent in an envelope
+  with no event or feedback to belong to is reported unsupported in the
+  envelope's answer, and the events are stored. A file that passes those
+  checks is queued, which does not guarantee it is stored: the uploader
+  resolves its owner later (see **Owner**), and a file whose event or
+  feedback is not found then (never stored, or deleted meanwhile) is dropped
+  and counted as without an owner, after the envelope was answered, so it
+  cannot appear in that answer. The same holds for the quota, the per-event
+  limit and a failed write, which are also decided by the uploader.
 - **Limits.** 2 MiB per file and 4 MiB or 8 files per event or feedback, under
   the envelope's own 2 MiB body and 10 MiB decompressed limits. The 4 MiB
   counts files earlier envelopes stored for the same owner, so a retry that
