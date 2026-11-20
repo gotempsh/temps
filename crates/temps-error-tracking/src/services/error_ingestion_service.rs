@@ -174,6 +174,8 @@ pub(super) struct IngestedError {
     /// whose conditions are not met yet stays `ignored` (ADR 111, D1.3).
     pub current_status: String,
     pub inserted: bool,
+    /// The ownership rule that matched the event creating the group.
+    pub owner: Option<super::source_control::ownership::OwnershipMatch>,
 }
 
 fn is_transaction_abort(error: &ErrorTrackingError) -> bool {
@@ -196,6 +198,8 @@ pub struct ErrorIngestionService {
     /// Releases already registered for "resolve in the next release"
     /// (ADR 111, D1.5); bounded, so a release costs one statement per process.
     releases: super::group_workflow::ReleaseRegistry,
+    /// Ownership rules matched when an event creates a group (ADR 111, D5).
+    ownership: Option<Arc<super::source_control::ownership::OwnershipService>>,
 }
 
 impl ErrorIngestionService {
@@ -205,7 +209,17 @@ impl ErrorIngestionService {
             db,
             tokenizer: HashTokenizer::new(10000),
             chunk_range: ArcSwapOption::empty(),
+            ownership: None,
         }
+    }
+
+    /// Match ownership rules when an event creates a group.
+    pub fn with_ownership(
+        mut self,
+        ownership: Arc<super::source_control::ownership::OwnershipService>,
+    ) -> Self {
+        self.ownership = Some(ownership);
+        self
     }
 
     /// Create an embedding from error message
@@ -337,6 +351,7 @@ impl ErrorIngestionService {
                     previous_status: String::new(),
                     current_status: String::new(),
                     inserted: false,
+                    owner: None,
                 });
             }
         }
@@ -356,6 +371,7 @@ impl ErrorIngestionService {
             .find_group_by_fingerprint_on(&tx, fingerprint, error_data.project_id)
             .await?;
         let mut created = false;
+        let mut owner = None;
         let group_id = if let Some(id) = existing {
             id
         } else {
@@ -378,6 +394,9 @@ impl ErrorIngestionService {
                 Some(id) => id,
                 None => {
                     created = true;
+                    if let Some(ownership) = &self.ownership {
+                        owner = ownership.match_new_group(&tx, error_data).await;
+                    }
                     self.create_error_group_on(&tx, error_data, fingerprint, event_time)
                         .await?
                 }
@@ -418,6 +437,7 @@ impl ErrorIngestionService {
             previous_status,
             current_status,
             inserted: true,
+            owner,
         })
     }
 

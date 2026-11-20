@@ -11,6 +11,7 @@ pub mod error_tracking_service;
 pub mod group_workflow;
 pub mod inbound_filters;
 pub mod performance;
+pub mod source_control;
 pub mod source_map_service;
 pub mod types;
 

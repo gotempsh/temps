@@ -36,6 +36,10 @@ pub enum ActivityKind {
     Unmerged,
     /// Fingerprints were split out of this group into a new one.
     Split,
+    /// An issue was opened for the group or linked to it (ADR 111, D5).
+    IssueLinked,
+    /// A linked issue was unlinked; the issue itself is unchanged.
+    IssueUnlinked,
 }
 
 impl ActivityKind {
@@ -48,6 +52,8 @@ impl ActivityKind {
             Self::Merged => "merged",
             Self::Unmerged => "unmerged",
             Self::Split => "split",
+            Self::IssueLinked => "issue_linked",
+            Self::IssueUnlinked => "issue_unlinked",
         }
     }
 
@@ -60,6 +66,8 @@ impl ActivityKind {
             "merged" => Self::Merged,
             "unmerged" => Self::Unmerged,
             "split" => Self::Split,
+            "issue_linked" => Self::IssueLinked,
+            "issue_unlinked" => Self::IssueUnlinked,
             _ => return None,
         })
     }
@@ -94,6 +102,15 @@ pub struct ActivityDetails {
     /// `merged`, `unmerged`, `split`: how many fingerprints moved.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fingerprints: Option<u64>,
+    /// `issue_linked`, `issue_unlinked`: the issue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issue_url: Option<String>,
+    /// `issue_linked`, `issue_unlinked`: its title when linked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issue_title: Option<String>,
+    /// `assigned`: the ownership rule pattern that assigned a new group.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ownership_rule: Option<String>,
 }
 
 /// One entry of a group's activity log.

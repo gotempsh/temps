@@ -44,6 +44,8 @@ pub struct ErrorTrackingService {
     pub release_health: Arc<super::release_health::ReleaseHealthService>,
     /// Files sent with events and feedback (ADR 111, D4).
     pub attachments: Arc<super::attachments::AttachmentService>,
+    /// Issues, suspect commits and ownership rules (ADR 111, D5).
+    pub source_control: Arc<super::source_control::SourceControlService>,
     pub workflow: GroupWorkflowService,
     /// Inbound filter rules (ADR 111, D1.4).
     pub inbound_filters: super::inbound_filters::InboundFilterService,
@@ -65,9 +67,12 @@ impl ErrorTrackingService {
     pub fn new(db: Arc<DatabaseConnection>) -> Self {
         let inbound_filter_registry =
             Arc::new(super::inbound_filters::InboundFilterRegistry::new());
+        let ownership = Arc::new(super::source_control::ownership::OwnershipService::new(
+            db.clone(),
+        ));
         Self {
             db: db.clone(),
-            ingestion: ErrorIngestionService::new(db.clone()),
+            ingestion: ErrorIngestionService::new(db.clone()).with_ownership(ownership.clone()),
             crud: ErrorCRUDService::new(db.clone()),
             analytics: ErrorAnalyticsService::new(db.clone()),
             feedback: super::feedback_service::FeedbackService::new(db.clone()),
@@ -75,6 +80,10 @@ impl ErrorTrackingService {
             releases: super::release_service::ReleaseService::new(db.clone()),
             release_health: Arc::new(super::release_health::ReleaseHealthService::new(db.clone())),
             attachments: Arc::new(super::attachments::AttachmentService::new(db.clone())),
+            source_control: Arc::new(super::source_control::SourceControlService::new(
+                db.clone(),
+                ownership.clone(),
+            )),
             workflow: GroupWorkflowService::new(db.clone()),
             inbound_filters: super::inbound_filters::InboundFilterService::new(
                 db.clone(),
@@ -501,6 +510,18 @@ impl ErrorTrackingService {
             None => self.ingestion.process_with_outcome(error_data).await?,
         };
         let group_id = outcome.group_id;
+        // An ownership rule matched the event that created the group
+        // (ADR 111, D5): assign it, unless someone already did.
+        if let Some(owner) = outcome.owner.as_ref() {
+            if let Err(error) = self
+                .source_control
+                .ownership
+                .assign_matched(project_id, group_id, owner)
+                .await
+            {
+                tracing::warn!(project_id, group_id, %error, "Ownership rules could not assign a new error group");
+            }
+        }
         if !outcome.inserted {
             return Ok(super::types::ErrorIngestReceipt {
                 group_id,
