@@ -89,21 +89,23 @@ export function TempsSurveys({ pathname, visitorKey, attributes, onError }: Temp
       const next = surveys.eligible(path, event)[0];
       if (!next) return;
       surveys.markShown(next);
+      // Owned until the card has left the page, thank-you message included,
+      // so a later event cannot open a second one over it and unmounting
+      // can still remove it.
+      let closed = false;
       const close = renderSurveyWidget(next, {
         onSubmit: (answers) => {
           const result = surveys.submit(next, answers);
-          if (result.ok) openRef.current = null;
           return result.ok ? null : result.errors;
         },
-        onDismiss: () => {
-          openRef.current = null;
-          surveys.dismiss(next);
+        onDismiss: () => surveys.dismiss(next),
+        onClosed: () => {
+          closed = true;
+          if (openRef.current === closeThis) openRef.current = null;
         },
       });
-      openRef.current = () => {
-        openRef.current = null;
-        close();
-      };
+      const closeThis = (): void => close();
+      if (!closed) openRef.current = closeThis;
     };
 
     void show();

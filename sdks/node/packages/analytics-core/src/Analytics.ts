@@ -128,21 +128,23 @@ export function createAnalytics(options: AnalyticsOptions = {}): AnalyticsApi {
     const next: Survey | undefined = surveys.eligible(window.location.pathname, event)[0];
     if (!next) return;
     surveys.markShown(next);
+    // The card stays owned until it has left the page, thank-you message
+    // included, so a later event cannot open a second one over it and
+    // `destroy()` can still remove it.
+    let closed = false;
     const close = renderSurveyWidget(next, {
       onSubmit: (answers) => {
         const result = surveys.submit(next, answers);
-        if (result.ok) openSurvey = null;
         return result.ok ? null : result.errors;
       },
-      onDismiss: () => {
-        openSurvey = null;
-        surveys.dismiss(next);
+      onDismiss: () => surveys.dismiss(next),
+      onClosed: () => {
+        closed = true;
+        if (openSurvey === closeThis) openSurvey = null;
       },
     });
-    openSurvey = () => {
-      openSurvey = null;
-      close();
-    };
+    const closeThis = (): void => close();
+    if (!closed) openSurvey = closeThis;
   };
   cleanups.push(() => {
     destroyed = true;
