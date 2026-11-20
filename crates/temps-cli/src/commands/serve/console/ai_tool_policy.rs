@@ -908,6 +908,33 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
             "verify_status_page_domain",
         ],
     ),
+    (
+        "error triage writes (ADR 111, D1: bulk status changes, merge, unmerge and split, inbound filters, assignment, comments and saved searches) are made by a person in the console or CLI; the assistant reads their results and proposes single-group changes through update_error_group",
+        &[
+            "bulkUpdateErrorGroups",
+            "mergeErrorGroups",
+            "unmergeErrorGroup",
+            "splitErrorGroup",
+            "createErrorInboundFilter",
+            "updateErrorInboundFilter",
+            "deleteErrorInboundFilter",
+            "set_error_group_assignee",
+            "create_error_group_comment",
+            "update_error_group_comment",
+            "delete_error_group_comment",
+            "create_error_saved_search",
+            "update_error_saved_search",
+            "delete_error_saved_search",
+        ],
+    ),
+    (
+        "the bytes of an error or feedback attachment (ADR 111, D4) can hold anything an SDK captured (screenshots, logs, request dumps) and are served for a person to open; deleting one and setting the attachment quota are made in the console or CLI",
+        &[
+            "get_error_attachment_content",
+            "delete_error_attachment",
+            "set_error_attachment_quota",
+        ],
+    ),
 ];
 
 /// Allowlisted ids that are served by a plugin and so are not in the published

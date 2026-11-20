@@ -117,6 +117,31 @@ pub const AI_READ_ALLOWLIST: &[&str] = &[
     "has_error_groups",
     "list_error_events",
     "list_error_groups",
+    // Issue workflow (ADR 111, D1): a group's fingerprints, its comments
+    // and activity, the project's inbound filter rules, the caller's saved
+    // searches, and the members a group can be assigned to (names and
+    // emails, the same as `list_team_members`). No secrets.
+    "listErrorGroupFingerprints",
+    "list_error_group_activity",
+    "listErrorInboundFilters",
+    "list_error_saved_searches",
+    "get_error_saved_search",
+    "search_error_group_assignees",
+    // Performance and release health (ADR 111, D2 and D3): aggregates of
+    // spans and sessions, and span descriptions of the same class as
+    // `get_trace`.
+    "get_performance_issue_status",
+    "get_operation_trend",
+    "get_operation_breakdown",
+    "get_deployment_regressions",
+    "get_page_backend",
+    "list_release_health",
+    "get_release_health_series",
+    // Attachments (ADR 111, D4): file names, types and sizes, and the
+    // project's attachment usage. Not the files themselves.
+    "list_error_event_attachments",
+    "list_feedback_attachments",
+    "get_error_attachment_usage",
     "list_alert_rules",
     "get_alert_rule",
     // ── Metric alert rules (OTel) — the rules themselves, so the AI can

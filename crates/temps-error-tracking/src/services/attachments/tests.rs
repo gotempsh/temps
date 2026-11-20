@@ -7,12 +7,15 @@ use std::collections::BTreeMap;
 use std::sync::atomic::AtomicBool;
 
 /// Blob storage in memory. `failing_puts` and `failing_deletes` make
-/// those calls answer as an unreachable store would.
+/// those calls answer as an unreachable store would; `lost_put_answers`
+/// keeps the object but answers with an error, as a store whose answer
+/// timed out would.
 #[derive(Default)]
 pub(crate) struct MemoryStore {
     objects: Mutex<BTreeMap<(i32, String), Bytes>>,
     pub(crate) failing_puts: AtomicBool,
     pub(crate) failing_deletes: AtomicBool,
+    pub(crate) lost_put_answers: AtomicBool,
 }
 
 impl MemoryStore {
@@ -40,6 +43,12 @@ impl PayloadBlobStore for MemoryStore {
             .lock()
             .expect("store lock")
             .insert((project_id, key.to_string()), body);
+        if self.lost_put_answers.load(Ordering::SeqCst) {
+            return Err(PayloadBlobError::Unavailable {
+                project_id,
+                reason: "synthetic lost answer".into(),
+            });
+        }
         Ok(())
     }
 
@@ -332,7 +341,7 @@ mod storage {
     }
 
     #[tokio::test]
-    async fn a_failed_write_leaves_no_row_and_gives_the_bytes_back() {
+    async fn a_failed_write_whose_object_is_gone_leaves_no_row_and_gives_the_bytes_back() {
         let Some(f) = fixture("attachment write failure test").await else {
             return;
         };
@@ -367,6 +376,125 @@ mod storage {
             .await
             .expect("retry");
         assert_eq!(retried.stored, 1, "{retried:?}");
+    }
+
+    #[tokio::test]
+    async fn a_write_whose_answer_was_lost_keeps_its_row_until_the_object_is_deleted() {
+        let Some(f) = fixture("attachment lost write test").await else {
+            return;
+        };
+        let event_id = event(&f, SDK_EVENT, chrono::Duration::minutes(5)).await;
+        // The store kept the file but its answer was lost, and it cannot
+        // delete it now either.
+        f.store.lost_put_answers.store(true, Ordering::SeqCst);
+        f.store.failing_deletes.store(true, Ordering::SeqCst);
+        let outcome = f
+            .service
+            .store_batch(
+                f.store.as_ref(),
+                &batch(&f, SDK_EVENT, vec![file("a.txt", b"abc")]),
+            )
+            .await
+            .expect("store");
+        assert_eq!(outcome.failed, 1, "{outcome:?}");
+        // Not listed, but the row and its bytes stay with the object.
+        assert!(f
+            .service
+            .list(f.project_id, AttachmentOwner::Error(event_id))
+            .await
+            .expect("list")
+            .is_empty());
+        let usage = f.service.usage(f.project_id).await.expect("usage");
+        assert_eq!((usage.used_bytes, usage.files), (3, 1));
+        assert_eq!(f.store.keys(f.project_id).len(), 1);
+
+        // While storage cannot delete, the sweeper keeps the row and does
+        // not loop over it.
+        let later = Utc::now() + chrono::Duration::hours(2);
+        let swept = f
+            .service
+            .sweep(f.store.as_ref(), later)
+            .await
+            .expect("sweep");
+        assert_eq!(swept.stale, 0, "{swept:?}");
+        assert_eq!(f.store.keys(f.project_id).len(), 1);
+
+        // Once it can, the unfinished write goes with its object.
+        f.store.failing_deletes.store(false, Ordering::SeqCst);
+        let swept = f
+            .service
+            .sweep(f.store.as_ref(), later)
+            .await
+            .expect("sweep");
+        assert_eq!(swept.stale, 1, "{swept:?}");
+        assert!(f.store.keys(f.project_id).is_empty());
+        let usage = f.service.usage(f.project_id).await.expect("usage");
+        assert_eq!((usage.used_bytes, usage.files), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn the_per_event_limit_counts_files_an_earlier_envelope_stored() {
+        let Some(f) = fixture("attachment per-event limit test").await else {
+            return;
+        };
+        event(&f, SDK_EVENT, chrono::Duration::minutes(5)).await;
+        let half = MAX_EVENT_ATTACHMENT_BYTES / 2;
+        let big = |name: &str| IncomingAttachment {
+            filename: name.into(),
+            content_type: "application/octet-stream".into(),
+            attachment_type: STORED_ATTACHMENT_TYPE.into(),
+            body: Bytes::from(vec![7u8; half]),
+        };
+        let first = f
+            .service
+            .store_batch(
+                f.store.as_ref(),
+                &batch(&f, SDK_EVENT, vec![big("a.bin"), big("b.bin")]),
+            )
+            .await
+            .expect("store");
+        assert_eq!(first.stored, 2, "{first:?}");
+
+        // A second envelope repeats both and adds one byte more.
+        let second = f
+            .service
+            .store_batch(
+                f.store.as_ref(),
+                &batch(
+                    &f,
+                    SDK_EVENT,
+                    vec![big("a.bin"), big("b.bin"), file("c.txt", b"c")],
+                ),
+            )
+            .await
+            .expect("store");
+        assert_eq!(
+            (second.stored, second.duplicates, second.over_event_limit),
+            (0, 2, 1),
+            "{second:?}"
+        );
+        let usage = f.service.usage(f.project_id).await.expect("usage");
+        assert_eq!(
+            (usage.used_bytes, usage.files),
+            (MAX_EVENT_ATTACHMENT_BYTES as i64, 2)
+        );
+    }
+
+    #[tokio::test]
+    async fn the_uploader_and_sweeper_end_when_the_service_is_dropped() {
+        let Some(f) = fixture("attachment task shutdown test").await else {
+            return;
+        };
+        let Fixture { _db, service, .. } = f;
+        let tasks = service.start().expect("a store is set, so the tasks start");
+        assert!(service.start().is_none(), "the tasks start once");
+        drop(service);
+        let ended = tokio::time::timeout(Duration::from_secs(10), async {
+            tasks.uploader.await.expect("uploader");
+            tasks.sweeper.await.expect("sweeper");
+        })
+        .await;
+        assert!(ended.is_ok(), "both tasks end once the service is gone");
     }
 
     #[tokio::test]

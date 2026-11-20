@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { z } from 'zod'
+import { client } from '@/api/client/client.gen'
 
 /** The types the server serves inline; everything else is a download. */
 const INLINE_IMAGE_TYPES = new Set([
@@ -26,12 +27,38 @@ export function isInlineImage(contentType: string): boolean {
   return INLINE_IMAGE_TYPES.has(contentType)
 }
 
-/** The download URL of an attachment, answered with the session cookie. */
+/**
+ * The download URL of an attachment, answered with the session cookie. It
+ * starts at the API base the console was mounted with, like every SDK call.
+ */
 export function attachmentContentUrl(
   projectId: number,
-  attachmentId: number
+  attachmentId: number,
+  baseUrl: string = client.getConfig().baseUrl ?? '/api'
 ): string {
-  return `/api/projects/${projectId}/error-attachments/${attachmentId}/content`
+  const base = baseUrl.replace(/\/+$/, '')
+  return `${base}/projects/${projectId}/error-attachments/${attachmentId}/content`
+}
+
+/** How often, and how many times, an empty list is read again. */
+export const EMPTY_LIST_POLL_MS = 5_000
+export const EMPTY_LIST_POLLS = 12
+
+/**
+ * The `refetchInterval` of an attachment list. Files are stored just after
+ * their event or feedback, so a list read right after it arrived can be
+ * empty: it is read again every few seconds, for about a minute, unless
+ * blob storage is known to be missing.
+ */
+export function pollWhileEmpty(storageConfigured: boolean | undefined) {
+  return (query: {
+    state: { data?: { data: unknown[] }; dataUpdateCount: number }
+  }): number | false =>
+    storageConfigured !== false &&
+    query.state.data?.data.length === 0 &&
+    query.state.dataUpdateCount < EMPTY_LIST_POLLS
+      ? EMPTY_LIST_POLL_MS
+      : false
 }
 
 /** How full the quota is, 0 to 1. A zero quota with files is full. */

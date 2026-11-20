@@ -31,6 +31,7 @@ import { formatBytesBinary } from '@/lib/server-monitoring'
 import {
   ATTACHMENT_EXAMPLE,
   attachmentContentUrl,
+  pollWhileEmpty,
   isInlineImage,
   STORAGE_SETUP_PATH,
 } from './attachments'
@@ -230,8 +231,11 @@ export function EventAttachments({
   eventId: number
 }) {
   const path = { project_id: projectId, group_id: groupId, event_id: eventId }
-  const list = useQuery(listErrorEventAttachmentsOptions({ path }))
   const usage = useUsage(projectId)
+  const list = useQuery({
+    ...listErrorEventAttachmentsOptions({ path }),
+    refetchInterval: pollWhileEmpty(usage.data?.configured),
+  })
   const { onDelete, dialog } = useAttachmentDelete(
     projectId,
     queryKeyPrefix(listErrorEventAttachmentsQueryKey, { path })
@@ -261,8 +265,11 @@ export function FeedbackAttachments({
   feedbackId: number
 }) {
   const path = { project_id: projectId, feedback_id: feedbackId }
-  const list = useQuery(listFeedbackAttachmentsOptions({ path }))
   const usage = useUsage(projectId)
+  const list = useQuery({
+    ...listFeedbackAttachmentsOptions({ path }),
+    refetchInterval: pollWhileEmpty(usage.data?.configured),
+  })
   const { onDelete, dialog } = useAttachmentDelete(
     projectId,
     queryKeyPrefix(listFeedbackAttachmentsQueryKey, { path })

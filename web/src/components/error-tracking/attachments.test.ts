@@ -8,6 +8,9 @@ import {
   isInlineImage,
   MAX_QUOTA_MIB,
   mibToBytes,
+  pollWhileEmpty,
+  EMPTY_LIST_POLL_MS,
+  EMPTY_LIST_POLLS,
   quotaFormSchema,
   quotaShare,
 } from './attachments'
@@ -27,10 +30,30 @@ describe('attachments', () => {
     }
   })
 
-  test('links the content endpoint of the project', () => {
-    expect(attachmentContentUrl(3, 41)).toBe(
+  test('links the content endpoint of the project under the API base', () => {
+    expect(attachmentContentUrl(3, 41, '/api')).toBe(
       '/api/projects/3/error-attachments/41/content'
     )
+    // A console mounted with its own API base links there too.
+    expect(
+      attachmentContentUrl(3, 41, 'https://console.example.test/temps/api/')
+    ).toBe(
+      'https://console.example.test/temps/api/projects/3/error-attachments/41/content'
+    )
+  })
+
+  test('an empty list is read again for a while, unless storage is missing', () => {
+    const state = (files: number, reads: number) => ({
+      state: {
+        data: { data: Array(files).fill(null) },
+        dataUpdateCount: reads,
+      },
+    })
+    expect(pollWhileEmpty(true)(state(0, 1))).toBe(EMPTY_LIST_POLL_MS)
+    expect(pollWhileEmpty(undefined)(state(0, 1))).toBe(EMPTY_LIST_POLL_MS)
+    expect(pollWhileEmpty(true)(state(0, EMPTY_LIST_POLLS))).toBe(false)
+    expect(pollWhileEmpty(true)(state(1, 1))).toBe(false)
+    expect(pollWhileEmpty(false)(state(0, 1))).toBe(false)
   })
 
   test('the quota share stays between 0 and 1', () => {

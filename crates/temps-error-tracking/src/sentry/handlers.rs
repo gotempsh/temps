@@ -4274,6 +4274,95 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn a_feedback_screenshot_in_an_envelope_is_stored_with_its_feedback() {
+        use crate::services::attachments::{tests::MemoryStore, AttachmentOwner};
+        use sea_orm::ConnectionTrait;
+        let ctx = create_test_context().await;
+        let attachments = ctx.app_state.error_tracking_service.attachments.clone();
+        let store = Arc::new(MemoryStore::default());
+        attachments.set_store(store.clone());
+        attachments.start();
+        let db = ctx._db.connection_arc();
+        let project_id = ctx.project_id;
+        let server = TestServer::new(configure_routes().with_state(ctx.app_state));
+        let auth_header = format!("Sentry sentry_key={},sentry_version=7", ctx.dsn_key);
+
+        // What the browser SDK's feedback widget sends: the feedback item
+        // and its screenshot, an image, in one envelope.
+        let feedback_id = "c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8";
+        let png: &[u8] = b"\x89PNG\r\n\x1a\nsynthetic";
+        let feedback = format!(
+            "{{\"event_id\":\"{feedback_id}\",\"type\":\"feedback\",\"timestamp\":{},\
+             \"contexts\":{{\"feedback\":{{\"message\":\"The checkout button does nothing\",\
+             \"source\":\"widget\"}}}}}}",
+            chrono::Utc::now().timestamp()
+        );
+        let mut envelope = format!(
+            "{{\"event_id\":\"{feedback_id}\"}}\n{{\"type\":\"feedback\",\"length\":{}}}\n{feedback}\n\
+             {{\"type\":\"attachment\",\"length\":{},\"filename\":\"screenshot.png\",\
+             \"content_type\":\"image/png\"}}\n",
+            feedback.len(),
+            png.len()
+        )
+        .into_bytes();
+        envelope.extend_from_slice(png);
+        envelope.push(b'\n');
+
+        let response = server
+            .post(&format!("/{project_id}/envelope/"))
+            .content_type("application/octet-stream")
+            .add_header(
+                HeaderName::from_static("x-sentry-auth"),
+                HeaderValue::from_str(&auth_header).unwrap(),
+            )
+            .bytes(Bytes::from(envelope))
+            .await;
+        assert_eq!(
+            response.status_code(),
+            StatusCode::OK,
+            "{}",
+            response.text()
+        );
+        assert_eq!(response.header("x-temps-sentry-feedback-stored"), "1");
+        assert_eq!(response.header("x-temps-sentry-attachments-queued"), "1");
+        assert_eq!(response.header("x-temps-sentry-unsupported-items"), "0");
+
+        let stored_feedback: i64 = db
+            .query_one(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT id FROM project_feedback WHERE project_id = $1 AND source_id = $2",
+                [project_id.into(), feedback_id.into()],
+            ))
+            .await
+            .expect("query")
+            .expect("feedback row")
+            .try_get("", "id")
+            .expect("id");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let listed = loop {
+            let listed = attachments
+                .list(project_id, AttachmentOwner::Feedback(stored_feedback))
+                .await
+                .expect("list");
+            if !listed.is_empty() || std::time::Instant::now() > deadline {
+                break listed;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        assert_eq!(listed.len(), 1, "the uploader stored the screenshot");
+        assert_eq!(
+            (listed[0].filename.as_str(), listed[0].content_type.as_str()),
+            ("screenshot.png", "image/png")
+        );
+        let (_, bytes) = attachments
+            .content(project_id, listed[0].id)
+            .await
+            .expect("content");
+        assert_eq!(&bytes[..], png);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn test_envelope_endpoint_with_auth_header() {
         let ctx = create_test_context().await;
         let app = configure_routes().with_state(ctx.app_state);
