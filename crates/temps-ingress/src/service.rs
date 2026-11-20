@@ -37,6 +37,7 @@ use crate::wire::{NodeConnectorSpec, NodeConnectorStatusReport, NodeConnectorsRe
 
 mod control_plane_ports;
 mod ensure;
+mod retry_hostname;
 pub(crate) use ensure::ConnectorLocks;
 
 /// The DNS controller name stamped on the records this service owns.
@@ -230,6 +231,8 @@ pub struct HostnameView {
     pub chosen_connector_id: Option<i32>,
     /// The tunnel that publishes it, or would once `detail` is dealt with.
     pub connector_id: Option<i32>,
+    /// Connector on which DNS setup for this failed publication can be retried.
+    pub retry_dns_connector_id: Option<i32>,
     pub connector_name: Option<String>,
     /// `published`, `pending`, `error` or `not_published`.
     pub state: String,
@@ -1533,6 +1536,7 @@ impl IngressConnectorService {
         id: i32,
         tunnel_id: Option<&str>,
     ) -> Result<(), IngressError> {
+        let _connector = self.connector_locks().lock(id).await;
         let connector = match self.find(id).await {
             Ok(connector) => connector,
             Err(IngressError::NotFound(_)) => return Ok(()),
@@ -2247,7 +2251,7 @@ impl IngressConnectorService {
         host: &str,
         existing: Option<&ingress_publications::Model>,
         outcome: Result<(), IngressError>,
-    ) -> Result<(), IngressError> {
+    ) -> Result<ingress_publications::Model, IngressError> {
         let now = Utc::now();
         let (state, error, published_at) = match outcome {
             Ok(()) => ("published", None, Some(now)),
@@ -2256,14 +2260,14 @@ impl IngressConnectorService {
                 ("error", Some(error.to_string()), None)
             }
         };
-        match existing {
+        let saved = match existing {
             Some(row) => {
                 let mut row: ingress_publications::ActiveModel = row.clone().into();
                 row.state = Set(state.into());
                 row.last_error = Set(error);
                 row.published_at = Set(published_at);
                 row.updated_at = Set(now);
-                row.update(self.db.as_ref()).await?;
+                row.update(self.db.as_ref()).await?
             }
             None => {
                 ingress_publications::ActiveModel {
@@ -2277,10 +2281,10 @@ impl IngressConnectorService {
                     ..Default::default()
                 }
                 .insert(self.db.as_ref())
-                .await?;
+                .await?
             }
-        }
-        Ok(())
+        };
+        Ok(saved)
     }
 
     // ----- node side ---------------------------------------------------
@@ -2837,7 +2841,11 @@ impl Plan {
             Some(Some(id)) => (HostnameMode::Tunnel, Some(*id)),
         };
         let name_of = |id: i32| self.connector(id).map(|c| c.model.name.clone());
-        let (connector_id, state, detail) = match self.decide(host) {
+        let decision = self.decide(host);
+        let retry_dns_connector_id = self
+            .retry_dns_connector(&decision, publication)
+            .map(|c| c.model.id);
+        let (connector_id, state, detail) = match decision {
             Decision::Publish(id) => {
                 let name = name_of(id).unwrap_or_default();
                 match publication.filter(|p| p.connector_id == id) {
@@ -2884,6 +2892,7 @@ impl Plan {
             hostname: host.to_string(),
             mode,
             chosen_connector_id,
+            retry_dns_connector_id,
             connector_name: connector_id.and_then(name_of),
             connector_id,
             state: state.into(),
@@ -3337,6 +3346,46 @@ mod tests {
         }
     }
 
+    #[test]
+    fn retry_dns_requires_a_failed_publication_on_the_planned_cloudflare_tunnel() {
+        let mut plan = placement_plan(Placement {
+            workers: true,
+            control_plane: false,
+        });
+        let host = "on-worker.example.com";
+        let now = Utc::now();
+        let mut row = ingress_publications::Model {
+            id: 8,
+            connector_id: 1,
+            hostname: host.into(),
+            state: "error".into(),
+            last_error: Some("Conflicting DNS record".into()),
+            published_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let retry = |plan: &Plan, row: &ingress_publications::Model| {
+            plan.view(host, Some(row)).retry_dns_connector_id
+        };
+        assert_eq!(retry(&plan, &row), None);
+        plan.connectors[0].model.external_id = Some("existing-tunnel".into());
+        plan.connectors[0].model.secret_encrypted = Some("sealed".into());
+        assert_eq!(retry(&plan, &row), Some(1));
+        row.connector_id = 2;
+        assert_eq!(retry(&plan, &row), None);
+        row.connector_id = 1;
+        for state in ["published", "pending", STALE] {
+            row.state = state.into();
+            assert_eq!(retry(&plan, &row), None);
+        }
+        row.state = "error".into();
+        plan.choices.insert(host.into(), None);
+        assert_eq!(retry(&plan, &row), None);
+        plan.choices.clear();
+        plan.connectors[0].model.provider = "another_provider".into();
+        assert_eq!(retry(&plan, &row), None);
+    }
+
     fn publishes(plan: &Plan, host: &str) -> bool {
         matches!(plan.decide(host), Decision::Publish(1))
     }
@@ -3442,6 +3491,8 @@ mod tests {
             ensure: AtomicUsize,
             delete: AtomicUsize,
             fail_delete_once: AtomicBool,
+            publications: std::sync::Mutex<Vec<String>>,
+            fail_publish: AtomicBool,
             /// The `edge_port` the last `ensure` configured the tunnel for.
             ensured_port: std::sync::atomic::AtomicU16,
             fail_ensure: AtomicBool,
@@ -3457,7 +3508,7 @@ mod tests {
         #[async_trait::async_trait]
         impl TunnelProvider for FakeTunnels {
             fn kind(&self) -> &'static str {
-                "fake_tunnel"
+                crate::cloudflare::KIND
             }
             async fn ensure(&self, ctx: &TunnelContext<'_>) -> Result<TunnelHandle, IngressError> {
                 // A real provider recreates a tunnel deleted at the provider.
@@ -3479,7 +3530,7 @@ mod tests {
             fn connector_spec(&self, id: i32, _h: &TunnelHandle, port: u16) -> NodeConnectorSpec {
                 NodeConnectorSpec {
                     id,
-                    provider: "fake_tunnel".into(),
+                    provider: crate::cloudflare::KIND.into(),
                     revision: String::new(),
                     edge_port: port,
                     client_address_header: None,
@@ -3491,8 +3542,12 @@ mod tests {
             async fn publish(
                 &self,
                 _h: &TunnelHandle,
-                _host: &str,
+                host: &str,
             ) -> Result<DnsIntent, IngressError> {
+                self.0.publications.lock().unwrap().push(host.into());
+                if self.0.fail_publish.load(Ordering::SeqCst) {
+                    return Err(IngressError::Provider("DNS record conflicts".into()));
+                }
                 Ok(DnsIntent::None)
             }
             async fn unpublish(&self, _h: &TunnelHandle, _host: &str) -> Result<(), IngressError> {
@@ -3522,7 +3577,7 @@ mod tests {
         impl crate::registry::ProviderFactory for FakeFactory {
             fn info(&self) -> ProviderInfo {
                 ProviderInfo {
-                    kind: "fake_tunnel".into(),
+                    kind: crate::cloudflare::KIND.into(),
                     name: "Fake".into(),
                     summary: String::new(),
                     requirements: Vec::new(),
@@ -3610,7 +3665,7 @@ mod tests {
             let now = Utc::now();
             let connector = ingress_connectors::ActiveModel {
                 name: Set("homelab".into()),
-                provider: Set("fake_tunnel".into()),
+                provider: Set(crate::cloudflare::KIND.into()),
                 dns_provider_id: Set(None),
                 domain: Set("example.com".into()),
                 external_id: Set(Some("tunnel-1".into())),
@@ -3665,18 +3720,10 @@ mod tests {
             drop(test_db);
         }
 
-        /// A reachability run writes the tunnel choice it decided from only
-        /// while the hostname still has the choice it read: one someone made
-        /// meanwhile is kept and reported, never replaced unseen.
-        #[tokio::test]
-        async fn a_run_never_replaces_a_choice_made_while_it_routed() {
-            let Some((test_db, service, _calls, id)) = setup().await else {
-                return;
-            };
-            let db = test_db.connection_arc();
+        async fn managed_zone(db: &DatabaseConnection) {
             let now = Utc::now();
             let provider = temps_entities::dns_providers::ActiveModel {
-                name: Set("choice-race".into()),
+                name: Set("test-zone".into()),
                 provider_type: Set("cloudflare".into()),
                 credentials: Set("{}".into()),
                 is_active: Set(true),
@@ -3684,7 +3731,7 @@ mod tests {
                 updated_at: Set(now),
                 ..Default::default()
             }
-            .insert(db.as_ref())
+            .insert(db)
             .await
             .expect("provider");
             temps_entities::dns_managed_domains::ActiveModel {
@@ -3699,9 +3746,64 @@ mod tests {
                 updated_at: Set(now),
                 ..Default::default()
             }
-            .insert(db.as_ref())
+            .insert(db)
             .await
             .expect("managed zone");
+        }
+
+        #[tokio::test]
+        async fn retry_dns_only_publishes_the_selected_host_and_keeps_its_choice() {
+            let Some((test_db, service, calls, id)) = setup().await else {
+                return;
+            };
+            managed_zone(test_db.connection_arc().as_ref()).await;
+            service
+                .replace_nodes(id, &[CONTROL_PLANE_NODE_ID])
+                .await
+                .unwrap();
+            let selected = "shop.example.com";
+            let other = "blog.example.com";
+            for host in [selected, other] {
+                service.peer_table.insert_sleeping_host_for_test(host);
+                service
+                    .save_publication(
+                        id,
+                        host,
+                        None,
+                        Err(IngressError::Provider("DNS create failed".into())),
+                    )
+                    .await
+                    .unwrap();
+            }
+            let attempts = || calls.publications.lock().unwrap().clone();
+            assert!(service.retry_hostname_dns(id + 1, selected).await.is_err());
+            assert!(attempts().is_empty());
+            calls.fail_publish.store(true, Ordering::SeqCst);
+            let failed = service.retry_hostname_dns(id, selected).await.unwrap();
+            assert_eq!(failed.state, "error");
+            assert!(failed.detail.contains("DNS record conflicts"));
+            calls.fail_publish.store(false, Ordering::SeqCst);
+            let retried = service.retry_hostname_dns(id, selected).await.unwrap();
+            assert_eq!(retried.state, "published");
+            assert_eq!(retried.connector_id, Some(id));
+            assert!(matches!(retried.mode, HostnameMode::Automatic));
+            assert!(service.retry_hostname_dns(id, selected).await.is_err());
+            assert_eq!(attempts(), [selected, selected]);
+            assert_eq!(service.hostname(other).await.unwrap().state, "error");
+            assert_eq!(calls.ensure.load(Ordering::SeqCst), 0);
+        }
+
+        /// A reachability run writes the tunnel choice it decided from only
+        /// while the hostname still has the choice it read: one someone made
+        /// meanwhile is kept and reported, never replaced unseen.
+        #[tokio::test]
+        async fn a_run_never_replaces_a_choice_made_while_it_routed() {
+            let Some((test_db, service, _calls, id)) = setup().await else {
+                return;
+            };
+            let db = test_db.connection_arc();
+            let now = Utc::now();
+            managed_zone(db.as_ref()).await;
             let choose = |host: &'static str, expected| {
                 let service = service.clone();
                 async move { service.choose_tunnel_if_unchanged(host, id, expected).await }

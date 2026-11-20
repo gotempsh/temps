@@ -114,6 +114,7 @@ impl IngressAudit {
         list_ingress_hostnames,
         get_ingress_hostname,
         set_ingress_hostname_choice,
+        retry_ingress_hostname_dns,
         sync_ingress_connector,
         get_ingress_connector_links,
         delete_ingress_connector,
@@ -177,6 +178,10 @@ pub fn configure_routes() -> Router<Arc<IngressAppState>> {
         .route(
             "/ingress/connectors/{id}/links",
             get(get_ingress_connector_links),
+        )
+        .route(
+            "/ingress/connectors/{id}/hostnames/{hostname}/retry-dns",
+            post(retry_ingress_hostname_dns),
         )
         .route("/ingress/hostnames", get(list_ingress_hostnames))
         .route(
@@ -396,6 +401,39 @@ async fn get_ingress_hostname(
     Ok(Json(state.service.hostname(&hostname).await?))
 }
 
+/// Retry DNS setup for a failed hostname publication on its current tunnel.
+#[utoipa::path(
+    tag = "Ingress", post,
+    path = "/ingress/connectors/{id}/hostnames/{hostname}/retry-dns",
+    operation_id = "retry_ingress_hostname_dns",
+    params(("id" = i32, Path), ("hostname" = String, Path)),
+    responses(
+        (status = 200, description = "Publication result, including any DNS conflict", body = HostnameView),
+        (status = 400, description = "Invalid hostname"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Settings write permission required"),
+        (status = 409, description = "Hostname is no longer eligible on this connector"),
+        (status = 500, description = "Could not load or save the publication"),
+        (status = 502, description = "Could not resolve the managed zone")
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn retry_ingress_hostname_dns(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<IngressAppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path((id, hostname)): Path<(i32, String)>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, SettingsWrite);
+    let view = state.service.retry_hostname_dns(id, &hostname).await?;
+    let mut audit = IngressAudit::new("INGRESS_HOSTNAME_DNS_RETRIED", &auth, &metadata)
+        .details(serde_json::json!({ "state": view.state }));
+    audit.hostname = Some(view.hostname.clone());
+    audit.connector_id = Some(id);
+    audit.record(&state).await;
+    Ok(Json(view))
+}
+
 /// Choose how a hostname reaches visitors.
 ///
 /// `automatic` lets the most specific tunnel covering it publish it;
@@ -602,4 +640,70 @@ async fn node_connector_status(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{body::Body, http::Request};
+    use sea_orm::{DatabaseBackend, MockDatabase};
+    use temps_core::{audit::NoopAuditLogger, EncryptionService};
+    use temps_dns::{DnsProviderService, ManagedDnsRecordService};
+    use temps_routes::CachedPeerTable;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn retry_dns_requires_settings_write_before_reading_the_hostname() {
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let encryption =
+            Arc::new(EncryptionService::new("0123456789abcdef0123456789abcdef").unwrap());
+        let providers = Arc::new(DnsProviderService::new(db.clone(), encryption.clone()));
+        let records = Arc::new(ManagedDnsRecordService::new(
+            db.clone(),
+            providers.clone(),
+            encryption.clone(),
+        ));
+        let router = configure_routes().with_state(Arc::new(IngressAppState {
+            service: Arc::new(IngressConnectorService::new(
+                db.clone(),
+                encryption,
+                providers,
+                records,
+                Arc::new(CachedPeerTable::new(db)),
+            )),
+            audit_service: Arc::new(NoopAuditLogger),
+        }));
+        let metadata = RequestMetadata {
+            ip_address: "127.0.0.1".into(),
+            user_agent: "test".into(),
+            headers: HeaderMap::new(),
+            visitor_id_cookie: None,
+            session_id_cookie: None,
+            base_url: "http://localhost".into(),
+            scheme: "http".into(),
+            host: "localhost".into(),
+            is_secure: false,
+        };
+        let scoped =
+            temps_auth::AuthContext::new_deployment_token(1, None, None, 1, "test".into(), vec![]);
+        for (auth, expected) in [
+            (None, StatusCode::UNAUTHORIZED),
+            (Some(scoped), StatusCode::FORBIDDEN),
+        ] {
+            let mut request =
+                Request::post("/ingress/connectors/1/hostnames/shop.example.com/retry-dns")
+                    .extension(metadata.clone())
+                    .body(Body::empty())
+                    .unwrap();
+            if let Some(auth) = auth {
+                request.extensions_mut().insert(auth);
+            }
+            let response = router.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), expected);
+            assert_eq!(
+                response.headers()["content-type"],
+                "application/problem+json"
+            );
+        }
+    }
 }

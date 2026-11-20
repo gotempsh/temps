@@ -169,3 +169,70 @@ test('a real failure of the tunnel reads is still reported, not shown as an empt
   })
   expect(collectRouteQueryFailures(client)).toHaveLength(2)
 })
+
+test('retry targets one failed hostname and refreshes its row after a conflict or success', async () => {
+  const conflict = spyOn(toast, 'error').mockImplementation(() => 'id')
+  const success = spyOn(toast, 'success').mockImplementation(() => 'id')
+  const hostname = 'shop.example.com'
+  const failed = {
+    hostname,
+    connector_id: 9,
+    retry_dns_connector_id: 9,
+    state: 'error',
+    detail: 'DNS record is managed elsewhere',
+  }
+  const published = {
+    ...failed,
+    retry_dns_connector_id: null,
+    state: 'published',
+  }
+  let current: typeof failed | typeof published = failed
+  let finish = (_response: Response) => {}
+  let reads = 0
+  let writes = 0
+  const view = renderTable(undefined, {
+    'GET /ingress/connectors': () => jsonResponse({ connectors: [], total: 0 }),
+    'GET /ingress/hostnames': () => {
+      reads++
+      return jsonResponse([current])
+    },
+    'POST /ingress/connectors/9/hostnames/shop.example.com/retry-dns': () => {
+      writes++
+      return new Promise((resolve) => {
+        finish = resolve
+      })
+    },
+  })
+  try {
+    fireEvent.click(
+      await view.findByRole('button', { name: 'Retry DNS setup' })
+    )
+    expect(
+      (
+        (await view.findByRole('button', {
+          name: 'Retrying DNS setup…',
+        })) as HTMLButtonElement
+      ).disabled
+    ).toBe(true)
+    await waitFor(() => expect(writes).toBe(1))
+    finish(jsonResponse(failed))
+    await waitFor(() =>
+      expect(conflict).toHaveBeenCalledWith(
+        `DNS setup failed for ${hostname}`,
+        { description: failed.detail }
+      )
+    )
+    await waitFor(() => expect(reads).toBeGreaterThan(1))
+    fireEvent.click(
+      await view.findByRole('button', { name: 'Retry DNS setup' })
+    )
+    await waitFor(() => expect(writes).toBe(2))
+    current = published
+    finish(jsonResponse(current))
+    await view.findByText('Live')
+    expect(success).toHaveBeenCalledWith(`DNS setup completed for ${hostname}`)
+    expect(view.queryByRole('button', { name: 'Retry DNS setup' })).toBeNull()
+  } finally {
+    success.mockRestore()
+  }
+})

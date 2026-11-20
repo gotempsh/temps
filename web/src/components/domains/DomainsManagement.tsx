@@ -61,7 +61,7 @@ import {
   isServingCert,
 } from '@/lib/domain-status'
 import { DNSConfigurationHelper } from './DNSConfigurationHelper'
-import { StateBadge } from './TunnelHostnames'
+import { RetryHostnameDns, StateBadge } from './TunnelHostnames'
 import {
   domainRowHref,
   mergeDomainRows,
@@ -209,6 +209,11 @@ export function DomainsManagement({
     searchQuery
   )
   const rows = mergeDomainRows(domains ?? [], tunnels, page, sort, direction)
+  const retries = new Map(
+    (hostnamesQuery.data ?? [])
+      .filter((host) => host.retry_dns_connector_id != null)
+      .map((host) => [host.hostname, host])
+  )
   const failingTunnels = tunnels.filter(
     (r) => r.kind === 'tunnel' && r.view.state === 'error'
   ).length
@@ -288,26 +293,36 @@ export function DomainsManagement({
       key: 'actions',
       header: <span className="sr-only">Actions</span>,
       className: 'w-12',
-      render: (row) =>
-        row.kind === 'certificate' ? (
-          <DomainRowMenu
-            domain={row.domain}
-            onOpen={(id) => navigate(`/domains/${id}`)}
-            onRenew={handleRenewDomain}
-            onDelete={setDomainToDelete}
-            canManageCertificates={canManageCertificates}
-          />
-        ) : (
-          <Button
-            variant="ghost"
-            size="icon"
-            className="h-8 w-8"
-            aria-label={`Details for ${row.name}`}
-            onClick={() => navigate(domainRowHref(row))}
-          >
-            <ChevronRight className="h-4 w-4" />
-          </Button>
-        ),
+      render: (row) => {
+        // A certificate and a tunnel publication can share a single row.
+        const retry = retries.get(row.name)
+        return (
+          <div className="flex items-center justify-end gap-1">
+            {retry && <RetryHostnameDns view={retry} />}
+            {row.kind === 'certificate' ? (
+              <DomainRowMenu
+                domain={row.domain}
+                onOpen={(id) => navigate(`/domains/${id}`)}
+                onRenew={handleRenewDomain}
+                onDelete={setDomainToDelete}
+                canManageCertificates={canManageCertificates}
+              />
+            ) : (
+              !retry && (
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="h-8 w-8"
+                  aria-label={`Details for ${row.name}`}
+                  onClick={() => navigate(domainRowHref(row))}
+                >
+                  <ChevronRight className="h-4 w-4" />
+                </Button>
+              )
+            )}
+          </div>
+        )
+      },
     },
   ]
 

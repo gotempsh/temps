@@ -18609,6 +18609,10 @@ export type HostnameView = {
     mode: HostnameMode;
     published_at?: string | null;
     /**
+     * Connector on which DNS setup for this failed publication can be retried.
+     */
+    retry_dns_connector_id?: number | null;
+    /**
      * Whether workers serve it. A tunnel only publishes those.
      */
     served_by_workers: boolean;
@@ -63931,6 +63935,52 @@ export type SetConnectorEnvironmentHostsResponses = {
 };
 
 export type SetConnectorEnvironmentHostsResponse = SetConnectorEnvironmentHostsResponses[keyof SetConnectorEnvironmentHostsResponses];
+
+export type RetryIngressHostnameDnsData = {
+    body?: never;
+    path: {
+        id: number;
+        hostname: string;
+    };
+    query?: never;
+    url: '/ingress/connectors/{id}/hostnames/{hostname}/retry-dns';
+};
+
+export type RetryIngressHostnameDnsErrors = {
+    /**
+     * Invalid hostname
+     */
+    400: unknown;
+    /**
+     * Authentication required
+     */
+    401: unknown;
+    /**
+     * Settings write permission required
+     */
+    403: unknown;
+    /**
+     * Hostname is no longer eligible on this connector
+     */
+    409: unknown;
+    /**
+     * Could not load or save the publication
+     */
+    500: unknown;
+    /**
+     * Could not resolve the managed zone
+     */
+    502: unknown;
+};
+
+export type RetryIngressHostnameDnsResponses = {
+    /**
+     * Publication result, including any DNS conflict
+     */
+    200: HostnameView;
+};
+
+export type RetryIngressHostnameDnsResponse = RetryIngressHostnameDnsResponses[keyof RetryIngressHostnameDnsResponses];
 
 export type GetIngressConnectorLinksData = {
     body?: never;
