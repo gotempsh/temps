@@ -16,6 +16,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sea_orm::{DatabaseConnection, EntityTrait};
 use serde::Deserialize;
+use temps_core::retry::RetryConfig;
 use temps_core::source_control::{
     IssueState, ProjectRepository, ProjectSourceControl, RepositoryCommit, RepositoryIssue,
     SourceControlError,
@@ -30,6 +31,37 @@ const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 
 /// Most commits one call returns.
 pub const MAX_COMMITS: usize = 20;
+
+/// Attempts for a read, the first included.
+const READ_ATTEMPTS: u32 = 3;
+
+/// The GitLab instance root the calls add `/api/v4` to. A provider's
+/// `api_url` is stored with `/api/v4` (as the GitLab provider is set up)
+/// or without it; either reaches the same root.
+fn gitlab_root(api_url: Option<&str>, base_url: Option<&str>) -> String {
+    let root = api_url
+        .or(base_url)
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .unwrap_or("https://gitlab.com")
+        .trim_end_matches('/');
+    root.strip_suffix("/api/v4")
+        .unwrap_or(root)
+        .trim_end_matches('/')
+        .to_string()
+}
+
+/// One failed attempt, and whether trying again could succeed.
+struct Attempt {
+    error: SourceControlError,
+    retryable: bool,
+}
+
+impl std::fmt::Display for Attempt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
 
 /// Which API a repository is reached through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,6 +90,10 @@ struct Api {
     token: String,
     owner: String,
     repo: String,
+    /// How a read is retried after a connection failure, a 429 or a 5xx.
+    /// Writes (opening an issue) are never retried: a retry after a lost
+    /// answer would open a second issue.
+    retry: RetryConfig,
 }
 
 impl Api {
@@ -99,47 +135,95 @@ impl Api {
         }
     }
 
-    /// Send the request and decode a successful JSON answer. `what` names
-    /// the thing a 404 is missing.
+    /// Send the request once and decode a successful JSON answer. `what`
+    /// names the thing a 404 is missing.
     async fn send<T: serde::de::DeserializeOwned>(
         &self,
         request: reqwest::RequestBuilder,
         operation: &'static str,
         what: &str,
     ) -> Result<T, SourceControlError> {
-        let response = request
-            .send()
+        self.attempt(request, operation, what)
             .await
-            .map_err(|error| self.provider_error(operation, error.to_string()))?;
+            .map_err(|attempt| attempt.error)
+    }
+
+    /// Send a read, trying again after a connection failure, a 429 or a
+    /// 5xx with backoff. A refused token, a missing issue or an answer that
+    /// does not decode is returned at once.
+    async fn send_read<T: serde::de::DeserializeOwned>(
+        &self,
+        request: reqwest::RequestBuilder,
+        operation: &'static str,
+        what: &str,
+    ) -> Result<T, SourceControlError> {
+        self.retry
+            .retry_if(
+                || async {
+                    let Some(request) = request.try_clone() else {
+                        return Err(Attempt {
+                            error: self
+                                .provider_error(operation, "the request cannot be repeated".into()),
+                            retryable: false,
+                        });
+                    };
+                    self.attempt(request, operation, what).await
+                },
+                |attempt| attempt.retryable,
+            )
+            .await
+            .map_err(|attempt| attempt.error)
+    }
+
+    async fn attempt<T: serde::de::DeserializeOwned>(
+        &self,
+        request: reqwest::RequestBuilder,
+        operation: &'static str,
+        what: &str,
+    ) -> Result<T, Attempt> {
+        let fail = |error: SourceControlError| Attempt {
+            error,
+            retryable: false,
+        };
+        let response = request.send().await.map_err(|error| Attempt {
+            error: self.provider_error(operation, error.to_string()),
+            retryable: true,
+        })?;
         let status = response.status();
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-            return Err(SourceControlError::Forbidden {
+            return Err(fail(SourceControlError::Forbidden {
                 project_id: self.project_id,
                 provider: self.flavor.name().into(),
                 repository: self.repository(),
                 operation,
                 status: status.as_u16(),
-            });
+            }));
         }
         // GitHub answers 422 for a commit it does not know.
         if status == reqwest::StatusCode::NOT_FOUND
             || (status == reqwest::StatusCode::UNPROCESSABLE_ENTITY && operation == "list commits")
         {
-            return Err(SourceControlError::NotFound {
+            return Err(fail(SourceControlError::NotFound {
                 project_id: self.project_id,
                 provider: self.flavor.name().into(),
                 repository: self.repository(),
                 what: what.to_string(),
-            });
+            }));
         }
         if !status.is_success() {
-            return Err(self.provider_error(operation, format!("HTTP {status}")));
+            return Err(Attempt {
+                error: self.provider_error(operation, format!("HTTP {status}")),
+                retryable: status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                    || status.is_server_error(),
+            });
         }
-        let body = read_capped(response)
-            .await
-            .map_err(|reason| self.provider_error(operation, reason))?;
-        serde_json::from_slice(&body)
-            .map_err(|error| self.provider_error(operation, format!("unexpected answer: {error}")))
+        let body = read_capped(response).await.map_err(|reason| Attempt {
+            error: self.provider_error(operation, reason),
+            retryable: false,
+        })?;
+        serde_json::from_slice(&body).map_err(|error| {
+            fail(self.provider_error(operation, format!("unexpected answer: {error}")))
+        })
     }
 }
 
@@ -264,7 +348,7 @@ async fn read_issue(
         Flavor::GitHub => {
             let url = format!("{base}/repos/{}/{}/issues/{number}", api.owner, api.repo);
             let request = api.request(http, reqwest::Method::GET, &url);
-            let issue: GhIssue = api.send(request, "read an issue", &what).await?;
+            let issue: GhIssue = api.send_read(request, "read an issue", &what).await?;
             Ok(RepositoryIssue {
                 number: issue.number,
                 url: issue.html_url,
@@ -278,7 +362,7 @@ async fn read_issue(
                 api.gitlab_project()
             );
             let request = api.request(http, reqwest::Method::GET, &url);
-            let issue: GlIssue = api.send(request, "read an issue", &what).await?;
+            let issue: GlIssue = api.send_read(request, "read an issue", &what).await?;
             Ok(RepositoryIssue {
                 number: issue.iid,
                 url: issue.web_url,
@@ -310,7 +394,7 @@ async fn list_commits(
                 query.push(("sha", at));
             }
             let request = api.request(http, reqwest::Method::GET, &url).query(&query);
-            let commits: Vec<GhCommit> = api.send(request, "list commits", &what).await?;
+            let commits: Vec<GhCommit> = api.send_read(request, "list commits", &what).await?;
             Ok(commits
                 .into_iter()
                 .map(|c| RepositoryCommit {
@@ -332,7 +416,7 @@ async fn list_commits(
                 query.push(("ref_name", at));
             }
             let request = api.request(http, reqwest::Method::GET, &url).query(&query);
-            let commits: Vec<GlCommit> = api.send(request, "list commits", &what).await?;
+            let commits: Vec<GlCommit> = api.send_read(request, "list commits", &what).await?;
             Ok(commits
                 .into_iter()
                 .map(|c| RepositoryCommit {
@@ -465,11 +549,7 @@ impl GitSourceControl {
             ),
             "gitlab" => (
                 Flavor::GitLab,
-                provider
-                    .api_url
-                    .clone()
-                    .or_else(|| provider.base_url.clone())
-                    .unwrap_or_else(|| "https://gitlab.com".to_string()),
+                gitlab_root(provider.api_url.as_deref(), provider.base_url.as_deref()),
             ),
             other => {
                 return Err(SourceControlError::Unsupported {
@@ -496,6 +576,9 @@ impl GitSourceControl {
                 token,
                 owner,
                 repo,
+                retry: RetryConfig::new(READ_ATTEMPTS)
+                    .with_base_delay(Duration::from_millis(500))
+                    .with_max_delay(Duration::from_secs(2)),
             },
             http,
         ))
@@ -558,6 +641,7 @@ mod tests {
             token: "tok".into(),
             owner: "acme".into(),
             repo: "shop".into(),
+            retry: RetryConfig::new(READ_ATTEMPTS).with_base_delay(Duration::from_millis(1)),
         }
     }
 
@@ -739,6 +823,114 @@ mod tests {
             .await
             .expect_err("too large");
         assert!(error.to_string().contains("larger than"), "{error}");
+    }
+
+    #[test]
+    fn a_gitlab_api_url_stored_with_or_without_api_v4_reaches_the_same_root() {
+        for stored in [
+            "https://gitlab.example.com/api/v4",
+            "https://gitlab.example.com/api/v4/",
+            "https://gitlab.example.com",
+            "https://gitlab.example.com/",
+        ] {
+            assert_eq!(
+                gitlab_root(Some(stored), None),
+                "https://gitlab.example.com",
+                "{stored}"
+            );
+        }
+        assert_eq!(
+            gitlab_root(None, Some("https://git.example.org/")),
+            "https://git.example.org"
+        );
+        assert_eq!(gitlab_root(Some(" "), None), "https://gitlab.com");
+        assert_eq!(gitlab_root(None, None), "https://gitlab.com");
+    }
+
+    #[tokio::test]
+    async fn a_gitlab_api_url_with_api_v4_reads_an_issue_without_doubling_it() {
+        let mut server = Server::new_async().await;
+        let read = server
+            .mock("GET", "/api/v4/projects/acme%2Fshop/issues/3")
+            .with_status(200)
+            .with_body(r#"{"iid":3,"web_url":"https://gitlab.example/acme/shop/-/issues/3","title":"Boom","state":"opened"}"#)
+            .create_async()
+            .await;
+        let root = gitlab_root(Some(&format!("{}/api/v4", server.url())), None);
+        let issue = read_issue(&reqwest::Client::new(), &api(Flavor::GitLab, &root), 3)
+            .await
+            .expect("read");
+        assert_eq!(issue.number, 3);
+        read.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn a_read_is_retried_after_a_server_error_and_a_write_is_not() {
+        let mut server = Server::new_async().await;
+        // A mock still owed hits answers first: one 502, then the issue.
+        let failing = server
+            .mock("GET", "/repos/acme/shop/issues/5")
+            .with_status(502)
+            .expect(1)
+            .create_async()
+            .await;
+        let ok = server
+            .mock("GET", "/repos/acme/shop/issues/5")
+            .with_status(200)
+            .with_body(r#"{"number":5,"html_url":"https://github.com/acme/shop/issues/5","title":"t","state":"open"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let http = reqwest::Client::new();
+        let api = api(Flavor::GitHub, &server.url());
+        let issue = read_issue(&http, &api, 5).await.expect("read on the retry");
+        assert_eq!(issue.number, 5);
+        failing.assert_async().await;
+        ok.assert_async().await;
+
+        let create = server
+            .mock("POST", "/repos/acme/shop/issues")
+            .with_status(503)
+            .expect(1)
+            .create_async()
+            .await;
+        let error = create_issue(&http, &api, "t", "b")
+            .await
+            .expect_err("a failed create is not retried");
+        assert!(
+            matches!(error, SourceControlError::Provider { .. }),
+            "{error:?}"
+        );
+        create.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn a_refused_or_missing_read_is_not_retried() {
+        let mut server = Server::new_async().await;
+        let refused = server
+            .mock("GET", "/repos/acme/shop/issues/1")
+            .with_status(401)
+            .expect(1)
+            .create_async()
+            .await;
+        let missing = server
+            .mock("GET", "/repos/acme/shop/issues/2")
+            .with_status(404)
+            .expect(1)
+            .create_async()
+            .await;
+        let http = reqwest::Client::new();
+        let api = api(Flavor::GitHub, &server.url());
+        assert!(matches!(
+            read_issue(&http, &api, 1).await,
+            Err(SourceControlError::Forbidden { .. })
+        ));
+        assert!(matches!(
+            read_issue(&http, &api, 2).await,
+            Err(SourceControlError::NotFound { .. })
+        ));
+        refused.assert_async().await;
+        missing.assert_async().await;
     }
 
     #[test]
