@@ -395,7 +395,7 @@ Files SDKs send with errors and feedback, kept in blob storage
 
 **Subcommands:**
 
-- `list` (`ls`) - List the attachments of an error event or a feedback
+- `list` (`ls`) - List the attachments of an error event (--group-id with --event-id) or of a feedback (--feedback-id)
 - `download` - Save an attachment to a file
 - `delete` (`rm`) - Delete an attachment and return its space to the quota
 - `usage` - Show whether attachments are kept and how much of the quota they use
@@ -403,16 +403,16 @@ Files SDKs send with errors and feedback, kept in blob storage
 
 #### `errors attachments list` (alias: `ls`)
 
-List the attachments of an error event or a feedback
+List the attachments of an error event (--group-id with --event-id) or of a feedback (--feedback-id)
 
 **Options:**
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--project-id <id>` | Project ID | - | Yes |
-| `--group-id <id>` | Error group of the event | - | No |
-| `--event-id <id>` | Error event ID | - | No |
-| `--feedback-id <id>` | Feedback ID | - | No |
+| `--group-id <id>` | Error group of the event; give it with --event-id, not with --feedback-id | - | No |
+| `--event-id <id>` | Error event ID; give it with --group-id, not with --feedback-id | - | No |
+| `--feedback-id <id>` | Feedback ID; give it alone, instead of --group-id and --event-id | - | No |
 | `--json` | Output in JSON format | - | No |
 
 #### `errors attachments download`

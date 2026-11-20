@@ -25,7 +25,7 @@ describe('parseQuotaMib', () => {
   })
 
   test('refuses fractions, negatives, junk and too much, naming the flag', () => {
-    for (const bad of ['1.5', '-1', 'lots', String(MAX_QUOTA_MIB + 1)]) {
+    for (const bad of ['1.5', '-1', 'lots', '', ' ', '1e3', '0x10', String(MAX_QUOTA_MIB + 1)]) {
       expect(() => parseQuotaMib(bad)).toThrow('--mib')
     }
   })

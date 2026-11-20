@@ -60,7 +60,8 @@ export function parseOwner(options: { groupId?: string; eventId?: string; feedba
 
 /** A `--mib` quota: a whole number of MiB from 0 to 100 GiB. */
 export function parseQuotaMib(raw: string): number {
-  const mib = Number(raw)
+  // `Number('')` and `Number(' ')` are 0: only digits are a quota.
+  const mib = /^\d+$/.test(raw) ? Number(raw) : Number.NaN
   if (!Number.isInteger(mib) || mib < 0 || mib > MAX_QUOTA_MIB) {
     throw new Error(`--mib must be a whole number from 0 to ${MAX_QUOTA_MIB} (100 GiB), got "${raw}"`)
   }
@@ -117,11 +118,11 @@ export function registerAttachmentCommands(errors: Command): void {
   attachments
     .command('list')
     .alias('ls')
-    .description('List the attachments of an error event or a feedback')
+    .description('List the attachments of an error event (--group-id with --event-id) or of a feedback (--feedback-id)')
     .requiredOption('--project-id <id>', 'Project ID')
-    .option('--group-id <id>', 'Error group of the event')
-    .option('--event-id <id>', 'Error event ID')
-    .option('--feedback-id <id>', 'Feedback ID')
+    .option('--group-id <id>', 'Error group of the event; give it with --event-id, not with --feedback-id')
+    .option('--event-id <id>', 'Error event ID; give it with --group-id, not with --feedback-id')
+    .option('--feedback-id <id>', 'Feedback ID; give it alone, instead of --group-id and --event-id')
     .option('--json', 'Output in JSON format')
     .action(listAction)
 
