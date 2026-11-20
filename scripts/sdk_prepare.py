@@ -132,12 +132,17 @@ class GitHistory:
         except subprocess.CalledProcessError:
             return ''
 
-    def commits(self, base, paths, excludes, head='HEAD'):
-        """Non-merge commits in `base..head` that touched `paths`, newest first."""
+    def commits(self, base, paths, excludes):
+        """Non-merge commits after `base` that touched `paths`, newest first."""
         spec = [*paths, *(f':(exclude){path}' for path in excludes)]
-        output = self.git('log', '--no-merges', '--format=%H%x1f%s%x1f%b%x1e', f'{base}..{head}', '--', *spec)
+        output = self.git('log', '--no-merges', '--format=%H%x1f%s%x1f%b%x1e', f'{base}..HEAD', '--', *spec)
         records = [record.strip('\n') for record in output.split('\x1e') if record.strip()]
         return [dict(zip(('sha', 'subject', 'body'), record.split('\x1f', 2))) for record in records]
+
+    def changed_files(self, candidate, paths, excludes):
+        """Paths whose content `candidate` changes since its merge base with HEAD."""
+        spec = [*paths, *(f':(exclude){path}' for path in excludes)]
+        return self.git('diff', '--name-only', f'HEAD...{candidate}', '--', *spec).split()
 
     def revisions(self, path):
         return self.git('log', '--format=%H', '--', path).split()
@@ -543,31 +548,48 @@ def set_dependency_pins(edits, package, dependency, version):
     edits.files[path] = new
 
 
+def bun_workspace(package, root):
+    """(workspace root, bun.lock path) of the bun workspace an npm package belongs to, if any."""
+    directory = (root / package['path']).parent
+    while directory != root and not (directory / 'bun.lock').exists():
+        directory = directory.parent
+    if directory == root or not (directory / 'bun.lock').exists():
+        return None
+    return directory, (directory / 'bun.lock').relative_to(root).as_posix()
+
+
+def set_lockfile_ranges(edits, package, version, root, dependents):
+    """Keep the explicit ranges bun.lock records for npm dependents equal to their manifests.
+
+    `set_dependency_pins` rewrites `workspace:^0.0.6` in a dependent's package.json; its
+    bun.lock entry records the same range, which a fresh `bun install` would rewrite too.
+    This runs even when `package` keeps its manifest version (a manual bump).
+    """
+    if package['kind'] != 'npm' or not (found := bun_workspace(package, root)):
+        return
+    directory, path = found
+    name = package['name']
+    for dependent in dependents:
+        try:
+            key = (root / dependent['path']).relative_to(directory).as_posix()
+        except ValueError:
+            continue  # Another lockfile's workspace.
+        entry = re.compile(rf'^(    "{re.escape(key)}": \{{\n)(.*?)(^    \}},)', re.M | re.S)
+        edits.files[path] = entry.sub(lambda match: match[1] + re.sub(
+            rf'("{re.escape(name)}": "workspace:[\^~]?)\d[^"]*(")', rf'\g<1>{version}\g<2>', match[2]) + match[3],
+            edits.text(path))
+
+
 def set_lockfile_versions(edits, package, version, root, dependents=()):
     kind, old, name = package['kind'], package['version'], package['name']
     if kind == 'npm':
-        directory = (root / package['path']).parent
-        while directory != root and not (directory / 'bun.lock').exists():
-            directory = directory.parent
-        lock = directory / 'bun.lock'
-        if directory == root or not lock.exists():
+        if not (found := bun_workspace(package, root)):
             return  # A standalone package's own lockfile does not record its version.
+        directory, path = found
         workspace = (root / package['path']).relative_to(directory).as_posix()
-        path = lock.relative_to(root).as_posix()
         edits.replace(path,
                       rf'("{re.escape(workspace)}": \{{\s*"name": "{re.escape(name)}",\s*"version": "){re.escape(old)}(")',
                       rf'\g<1>{version}\g<2>', what=f'workspace entry for {name} {old}')
-        # A dependent's explicit range (`workspace:^0.0.6`) is recorded in its own entry
-        # too; keep it equal to the repinned package.json, as a fresh `bun install` writes.
-        for dependent in dependents:
-            try:
-                key = (root / dependent['path']).relative_to(directory).as_posix()
-            except ValueError:
-                continue  # Another lockfile's workspace.
-            entry = re.compile(rf'^(    "{re.escape(key)}": \{{\n)(.*?)(^    \}},)', re.M | re.S)
-            edits.files[path] = entry.sub(lambda match: match[1] + re.sub(
-                rf'("{re.escape(name)}": "workspace:[\^~]?)\d[^"]*(")', rf'\g<1>{version}\g<2>', match[2]) + match[3],
-                edits.text(path))
     elif kind == 'pypi':
         for lock in [f"{p['path']}/uv.lock" for p in [package, *dependents]]:
             if (root / lock).exists():
@@ -636,12 +658,13 @@ def prepare(tag, root=release.ROOT, *, history=None, published=None, write=True,
     edits = Edits(root)
     for key in selection:
         package, version = by_key[key], final[key]
+        dependents = [by_key[k] for k in sorted(by_key) if key in depends[k]]
         if version != package['version']:
             set_manifest_version(edits, package, version)
-            set_lockfile_versions(edits, package, version, root,
-                                  [by_key[k] for k in sorted(by_key) if key in depends[k]])
-        for dependent in sorted(k for k in by_key if key in depends[k]):
-            set_dependency_pins(edits, by_key[dependent], package, version)
+            set_lockfile_versions(edits, package, version, root, dependents)
+        for dependent in dependents:
+            set_dependency_pins(edits, dependent, package, version)
+        set_lockfile_ranges(edits, package, version, root, dependents)
     prepared = {tag: {key: final[key] for key in selection}} if selection else {}
     edits.files['.github/releases/prepared.json'] = json.dumps(prepared, indent=2) + '\n'
     files = edits.changed()
@@ -669,9 +692,9 @@ def verify_tag(tag, root=release.ROOT, *, history=None, published=None):
 
     Returns (files that would change, keys already released). A commit that landed
     after the prep PR merged can need different versions than prepared.json records,
-    and published versions are immutable. Once part of the selection is released
-    (a re-run), the first attempt has already verified it and the registries no
-    longer describe the pre-release state, so nothing is re-derived.
+    and published versions are immutable. A re-run after part of the selection was
+    released still verifies every package: this release's own package tags and
+    registry versions are hidden, so the derivation sees the pre-release state.
     """
     root = Path(root)
     if history is None:
@@ -682,29 +705,66 @@ def verify_tag(tag, root=release.ROOT, *, history=None, published=None):
     planned = release.plan(tag, root)
     if not planned:
         return [], []
+    own = {entry['name']: (entry['kind'], Version.parse(entry['version'], entry['kind'])) for entry in planned}
+    own_tags = {entry['tag'] for entry in planned}
     released = [entry['key'] for entry in planned if history.tag_exists(entry['tag'])
-                or Version.parse(entry['version'], entry['kind']) in parse_all(published(entry), entry['kind'])]
-    if released:
-        return [], released
-    _, files = prepare(tag, root, history=history, published=published, write=False, at_tag=True)
-    return files, []
+                or own[entry['name']][1] in parse_all(published(entry), entry['kind'])]
+
+    def before_release(package):
+        versions = published(package)
+        if package['name'] not in own:
+            return versions
+        kind, version = own[package['name']]
+        return {text for text in versions if registry_version(text, kind) != version}
+
+    _, files = prepare(tag, root, history=BeforeRelease(history, own_tags), published=before_release,
+                       write=False, at_tag=True)
+    return files, released
+
+
+class BeforeRelease:
+    """A history without the package tags a release itself creates."""
+
+    def __init__(self, history, hidden):
+        self.history, self.hidden = history, hidden
+
+    def __getattr__(self, name):
+        return getattr(self.history, name)
+
+    def tags(self, prefix):
+        return [tag for tag in self.history.tags(prefix) if tag not in self.hidden]
+
+    def tag_exists(self, tag):
+        return tag not in self.hidden and self.history.tag_exists(tag)
+
+
+RELEASE_METADATA = '.github/releases'
 
 
 def branch_only_changes(candidate, root=release.ROOT, *, history=None):
-    """SDK commits reachable from `candidate` (a release branch) but not from HEAD (main).
+    """SDK files `candidate` (a release branch) changes relative to where it left HEAD (main).
 
-    Preparation reads main, so a fix committed only to the release branch would merge
-    into the tag without a version. Such commits must land on main first.
+    Preparation reads main, so an SDK change made only on the release branch would merge
+    into the tag without a version; it must land on main first. This compares content
+    (`git diff HEAD...candidate`), so a change made in a merge commit's resolution counts
+    as much as one in an ordinary commit. Packages, and catalog entries, added only on
+    the branch count too. Returns [(key, [paths])]; a server version bump returns [].
     """
     root = Path(root)
     history = history or GitHistory(root)
     if not history.resolve(candidate):
         raise ValueError(f'{candidate} does not name a commit; fetch the release branch first')
     catalog = release.catalog_packages(root)
+    known = {package['key'] for package in catalog}
+    branch = json.loads(history.show(candidate, f'{RELEASE_METADATA}/packages.json') or '{}')
+    catalog += [dict(package, key=key) for key, package in branch.items() if key not in known]
     found = []
     for package in catalog:
         paths, nested = package_paths(package, catalog)
-        found += [(package['key'], commit) for commit in history.commits('HEAD', paths, nested, head=candidate)]
+        if files := history.changed_files(candidate, paths, nested):
+            found.append((package['key'], files))
+    if files := history.changed_files(candidate, [RELEASE_METADATA], []):
+        found.append(('release metadata', files))
     return found
 
 

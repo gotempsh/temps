@@ -455,31 +455,39 @@ def verify_artifact_plan(output, packages, revision):
 
 def prepare_command(args, parser):
     """Exit 0 when prepared, 1 when files would change (--check), 2 when the check itself failed."""
-    import sdk_prepare
     if not args.tag:
         parser.error('--tag is required for prepare')
     if args.at_tag and (not args.check or args.candidate):
         parser.error('--at-tag re-derives a tagged selection; use it with --check and without --candidate')
+    # Everything but the verdict runs inside this block, outputs included: a failure
+    # anywhere must never read as "files would change" (exit 1).
     try:
-        if args.at_tag:
-            files, released = sdk_prepare.verify_tag(args.tag)
-            if released:
-                print(f"{args.tag}: {', '.join(released)} already released; the first attempt verified this selection")
-            elif files:
-                print(f'error: the SDK selection prepared for {args.tag} is stale at the tag: commits since the '
-                      f'prep PR need different versions. These files would change: ' + ', '.join(files), file=sys.stderr)
-                sys.exit(1)
-            else:
-                print(f'{args.tag}: the prepared SDK selection matches the tagged commit')
-            return
-        if args.candidate:
-            if found := sdk_prepare.branch_only_changes(args.candidate):
-                commits = '; '.join(f"{key}: {commit['sha'][:9]} {commit['subject']}" for key, commit in found)
-                raise ValueError(f'{args.candidate} has SDK commits that are not on main ({commits}); '
-                                 f'land them on main first so they are versioned')
-        report, files = sdk_prepare.prepare(args.tag, write=not args.check)
-    except Exception as error:  # a failed check must never read as "files would change" (exit 1)
+        pending = run_prepare(args)
+    except Exception as error:  # noqa: BLE001 -- every failure maps to exit 2, with its message
         parser.exit(2, f'error: {error}\n' if isinstance(error, ValueError) else f'error: {type(error).__name__}: {error}\n')
+    if pending:
+        print(pending, file=sys.stderr)
+        sys.exit(1)
+
+
+def run_prepare(args):
+    """Run prepare and write its outputs; returns the pending-edits message, or None."""
+    import sdk_prepare
+    if args.at_tag:
+        files, released = sdk_prepare.verify_tag(args.tag)
+        if released:
+            print(f"{args.tag}: {', '.join(released)} already released; verifying against the pre-release state")
+        if files:
+            return (f'error: the SDK selection prepared for {args.tag} is stale at the tag: commits since the '
+                    f'prep PR need different versions. These files would change: ' + ', '.join(files))
+        print(f'{args.tag}: the prepared SDK selection matches the tagged commit')
+        return None
+    if args.candidate:
+        if found := sdk_prepare.branch_only_changes(args.candidate):
+            changes = '; '.join(f"{key}: {', '.join(files)}" for key, files in found)
+            raise ValueError(f'{args.candidate} changes SDK files that main does not have ({changes}); '
+                             f'land them on main first so they are versioned')
+    report, files = sdk_prepare.prepare(args.tag, write=not args.check)
     text = sdk_prepare.summary(args.tag, report)
     print(text, flush=True)
     if args.summary:
@@ -492,9 +500,8 @@ def prepare_command(args, parser):
             stream.write(f"kinds={json.dumps(sorted({entry['kind'] for entry in report}))}\n")
             stream.write(f'changed={str(bool(files)).lower()}\n')
     if args.check and files:
-        print(f'SDK releases for {args.tag} are not prepared; these files would change: ' + ', '.join(files),
-              file=sys.stderr)
-        sys.exit(1)
+        return f'SDK releases for {args.tag} are not prepared; these files would change: ' + ', '.join(files)
+    return None
 
 
 def main():

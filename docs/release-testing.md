@@ -1124,8 +1124,10 @@ version-bump commit; it reaches main through a `release/v<version>` PR (the
 branch is pushed by hand, and every recent release PR used that name), and the
 tag goes on that PR's merge commit. Pushing a `release/v*` branch runs the
 workflow for `v<version>`. Preparation reads main, so it fails when the release
-branch carries an SDK commit main lacks (it would merge into the tag
-unversioned): land that commit on main first. For any other path, dispatch it:
+branch changes SDK files main lacks (they would merge into the tag unversioned),
+whether in a commit, a merge resolution, a package added only on the branch or
+`.github/releases`: land those changes on main first. For any other path,
+dispatch it:
 `gh workflow run sdk-release-prep.yml -f tag=v<version>`. Merge the SDK PR into
 main **before** the release PR so the tag contains it.
 
@@ -1142,8 +1144,9 @@ a selection, `release.yml`'s validation job re-derives it on the tagged commit
 (`prepare --tag <tag> --check --at-tag`, read-only) and fails before anything
 publishes if the versions no longer match, because a published version cannot
 be replaced. Delete the tag, re-run the prep workflow for it, merge its PR and
-tag again. A re-run after part of the selection was published skips the check:
-the first attempt passed it.
+tag again. A re-run after part of the selection was published still verifies
+every package: the check hides this release's own package tags and registry
+versions, so it re-derives from the state before the release.
 
 `release.yml` plans in its existing validation job and tests/packages in its
 existing web-assets job. A single isolated `publish-sdks` job waits for the test

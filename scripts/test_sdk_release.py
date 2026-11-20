@@ -883,6 +883,27 @@ class PrepareTests(unittest.TestCase):
         self.assertIn('"@temps-sdk/analytics-core": "workspace:^0.0.7",', before)
         self.assertNotIn('workspace:^0.0.6', before)
 
+    def test_dependent_bun_lock_ranges_follow_a_kept_manual_bump(self):
+        self.add('analytics-core', 'npm', '0.0.6', published={'0.0.6'})
+        self.add('react-analytics', 'npm', '0.0.9', published={'0.0.9'})
+        path = 'sdks/node/packages/react-analytics/package.json'
+        data = json.loads(self.read(path))
+        data['dependencies'] = {'@temps-sdk/analytics-core': 'workspace:^0.0.6'}
+        self.write(path, json.dumps(data, indent=2) + '\n')
+        for key in ('analytics-core', 'react-analytics'):
+            self.release_tag(key, self.version(key))
+        # Someone bumps core by hand to an unpublished 0.1.0 and its bun.lock entry with it.
+        core = 'sdks/node/packages/analytics-core/package.json'
+        self.write(core, self.read(core).replace('0.0.6', '0.1.0'))
+        self.write_bun_lock()
+        self.change('analytics-core', 'fix: event')
+        self.assertEqual(self.selection(), {'analytics-core': '0.1.0', 'react-analytics': '0.0.10'})
+        self.assertEqual(json.loads(self.read(path))['dependencies'], {'@temps-sdk/analytics-core': 'workspace:^0.1.0'})
+        lock = self.read('sdks/node/bun.lock')
+        self.write_bun_lock()
+        self.assertEqual(self.read('sdks/node/bun.lock'), lock)
+        self.assertIn('"@temps-sdk/analytics-core": "workspace:^0.1.0",', lock)
+
     def test_go_version_qualified_replace_applies_only_to_its_version(self):
         self.add('go-core', 'go', '1.0.0', published={'1.0.0'})
         self.add('go-app', 'go', '1.0.0', published={'1.0.0'})
@@ -1023,16 +1044,26 @@ class PrepareTests(unittest.TestCase):
         files, _ = self.verify()
         self.assertIn('sdks/node/packages/kv/package.json', files)
 
-    def test_tagged_selection_already_partly_released_is_not_re_derived(self):
+    def test_tagged_selection_already_partly_released_is_still_verified(self):
         self.add('analytics-core', 'npm', '0.0.6', published={'0.0.6'})
-        self.release_tag('analytics-core', '0.0.6')
+        self.add('kv', 'npm', '1.0.0', published={'1.0.0'})
+        for key in ('analytics-core', 'kv'):
+            self.release_tag(key, self.version(key))
         self.change('analytics-core', 'fix: event')
+        self.change('kv', 'fix: scan')
         self.prepare_and_tag()
+        # A re-run after analytics-core was published and tagged still re-derives the
+        # whole selection, as if this release had published nothing yet.
         self.registry['@temps-sdk/analytics-core'].add('0.0.7')
-        self.assertEqual(self.verify(), ([], ['analytics-core']))
-        self.registry['@temps-sdk/analytics-core'].discard('0.0.7')
         self.release_tag('analytics-core', '0.0.7')
+        self.history.tag('v9.0.0')  # the package tag moved HEAD's ref map; keep the server tag at HEAD
         self.assertEqual(self.verify(), ([], ['analytics-core']))
+        # ...so a late change to a package not yet published is still caught.
+        self.change('kv', 'feat!: drop the v1 client')
+        self.history.tag('v9.0.0')
+        files, released = self.verify()
+        self.assertEqual(released, ['analytics-core'])
+        self.assertIn('sdks/node/packages/kv/package.json', files)
 
     def test_server_only_tag_has_nothing_to_verify(self):
         self.add('analytics-core', 'npm', '0.0.6', published={'0.0.6'})
@@ -1166,31 +1197,57 @@ class GitHistoryTests(unittest.TestCase):
         self.assertIsNone(history.show(first, 'missing.toml'))
 
 
-    def test_release_branch_sdk_commits_missing_from_main_are_found(self):
+    def release_branch_repo(self):
         if shutil.which('git') is None:
             self.skipTest('git is not installed')
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         self.root = Path(temp.name)
         self.git('init', '-q', '-b', 'main')
-        catalog = {'kv': {'kind': 'npm', 'path': 'sdks/node/packages/kv', 'name': '@temps-sdk/kv'}}
-        (self.root / '.github/releases').mkdir(parents=True)
-        (self.root / '.github/releases/packages.json').write_text(json.dumps(catalog))
+        self.catalog = {'kv': {'kind': 'npm', 'path': 'sdks/node/packages/kv', 'name': '@temps-sdk/kv'}}
+        self.commit('.github/releases/packages.json', json.dumps(self.catalog), 'chore: catalog')
         self.commit('sdks/node/packages/kv/package.json', '{"name": "@temps-sdk/kv", "version": "1.0.0"}', 'chore: add kv')
         self.git('switch', '-q', '-c', 'release/v9.0.0')
         self.commit('Cargo.toml', 'version = "9.0.0"\n', 'chore: bump version to v9.0.0')
-        history = sdk_prepare.GitHistory(self.root)
         self.git('switch', '-q', 'main')
         self.commit('sdks/node/packages/kv/src/index.ts', 'x', 'fix(kv): on main')
-        # A bump-only release branch, and SDK commits already on main, are fine.
-        self.assertEqual(sdk_prepare.branch_only_changes('release/v9.0.0', self.root, history=history), [])
-        self.git('switch', '-q', 'release/v9.0.0')
-        self.commit('sdks/node/packages/kv/src/scan.ts', 'x', 'fix(kv): only on the branch')
+        return sdk_prepare.GitHistory(self.root)
+
+    def branch_changes(self, history):
         self.git('switch', '-q', 'main')
-        found = sdk_prepare.branch_only_changes('release/v9.0.0', self.root, history=history)
-        self.assertEqual([(key, commit['subject']) for key, commit in found], [('kv', 'fix(kv): only on the branch')])
+        return sdk_prepare.branch_only_changes('release/v9.0.0', self.root, history=history)
+
+    def test_a_bump_only_release_branch_has_no_branch_only_sdk_changes(self):
+        history = self.release_branch_repo()
+        # The server bump, and SDK commits already on main, are fine.
+        self.assertEqual(self.branch_changes(history), [])
         with self.assertRaisesRegex(ValueError, 'release/v9.9.9 does not name a commit'):
             sdk_prepare.branch_only_changes('release/v9.9.9', self.root, history=history)
+
+    def test_sdk_commits_only_on_the_release_branch_are_found(self):
+        history = self.release_branch_repo()
+        self.git('switch', '-q', 'release/v9.0.0')
+        self.commit('sdks/node/packages/kv/src/scan.ts', 'x', 'fix(kv): only on the branch')
+        self.assertEqual(self.branch_changes(history), [('kv', ['sdks/node/packages/kv/src/scan.ts'])])
+
+    def test_sdk_changes_made_in_a_release_branch_merge_are_found(self):
+        history = self.release_branch_repo()
+        self.git('switch', '-q', 'release/v9.0.0')
+        self.git('merge', '-q', '--no-ff', '--no-commit', 'main')
+        (self.root / 'sdks/node/packages/kv/src/index.ts').write_text('edited while merging')
+        self.git('add', '-A')
+        self.git('commit', '-q', '-m', "Merge branch 'main' into release/v9.0.0")
+        self.assertEqual(self.branch_changes(history), [('kv', ['sdks/node/packages/kv/src/index.ts'])])
+
+    def test_packages_and_release_metadata_added_only_on_the_branch_are_found(self):
+        history = self.release_branch_repo()
+        self.git('switch', '-q', 'release/v9.0.0')
+        catalog = dict(self.catalog, blob={'kind': 'npm', 'path': 'sdks/node/packages/blob', 'name': '@temps-sdk/blob'})
+        self.commit('sdks/node/packages/blob/package.json', '{"name": "@temps-sdk/blob", "version": "0.1.0"}', 'feat(blob): add')
+        self.commit('.github/releases/packages.json', json.dumps(catalog), 'chore: catalog blob')
+        self.assertEqual(self.branch_changes(history), [
+            ('blob', ['sdks/node/packages/blob/package.json']),
+            ('release metadata', ['.github/releases/packages.json'])])
 
 
 class PrepareCommandTests(unittest.TestCase):
@@ -1222,13 +1279,20 @@ class PrepareCommandTests(unittest.TestCase):
                 self.assertIn('error:', message)
 
     def test_release_branch_commits_missing_from_main_fail_the_check(self):
-        found = [('kv', {'sha': 'a' * 40, 'subject': 'fix(kv): only on the branch'})]
+        found = [('kv', ['sdks/node/packages/kv/src/scan.ts'])]
         with patch.object(sdk_prepare, 'branch_only_changes', return_value=found), \
                 patch.object(sdk_prepare, 'prepare') as prepare:
             status, message = self.run_command('--candidate')
         self.assertEqual(status, 2)
-        self.assertIn('fix(kv): only on the branch', message)
+        self.assertIn('kv: sdks/node/packages/kv/src/scan.ts', message)
         prepare.assert_not_called()
+
+    def test_a_failure_writing_outputs_exits_2_not_1(self):
+        with patch.object(sdk_prepare, 'prepare', return_value=([], [])), \
+                patch.object(sdk_prepare, 'summary', side_effect=OSError('disk full')):
+            status, message = self.run_command('--check')
+        self.assertEqual(status, 2)
+        self.assertIn('OSError: disk full', message)
 
     def test_at_tag_fails_only_on_a_stale_selection(self):
         for result, expected in [(([], []), 0), (([], ['kv']), 0), ((['sdks/node/packages/kv/package.json'], []), 1)]:
