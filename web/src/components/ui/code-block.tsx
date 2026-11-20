@@ -163,7 +163,7 @@ export function CodeBlock({
   const scrollerProps = scrollableRegionProps(scrollable)
 
   const controls = (className: string) => (
-    <div className={cn('flex items-center gap-0.5 opacity-100', className)}>
+    <div className={cn('flex items-center gap-0.5', className)}>
       <Button
         size="icon"
         variant="ghost"
@@ -228,7 +228,7 @@ export function CodeBlock({
     // temps.sh/docs or the console.
     <div
       className={cn(
-        'group overflow-hidden rounded-2xl bg-white shadow-md ring-1 ring-zinc-900/[0.075]',
+        'group group/code relative overflow-hidden rounded-2xl bg-white shadow-md ring-1 ring-zinc-900/[0.075]',
         'dark:bg-zinc-900 dark:ring-white/10',
         className
       )}
@@ -245,22 +245,29 @@ export function CodeBlock({
           slightly-lifted tone in the docs; without it the block reads as a
           flat hole in the page. */}
       <div className="flex min-w-0 flex-col dark:bg-white/[0.025]">
-        {!title && controls('mt-2 mr-2 shrink-0 self-end')}
+        {/* Untitled blocks look like the docs: the code starts at the top and
+            the controls float in the corner, shown on hover or keyboard
+            focus, and always on touch screens, which have no hover. They
+            sit on the panel colour so a long line never shows through. */}
+        {!title &&
+          controls(
+            cn(
+              'absolute top-2 right-2 z-10 rounded-lg bg-white/90 p-0.5 backdrop-blur-sm dark:bg-zinc-900/90',
+              'opacity-0 transition-opacity group-hover/code:opacity-100 group-focus-within/code:opacity-100 [@media(hover:none)]:opacity-100'
+            )
+          )}
         <div
           ref={scrollerRef}
           {...scrollerProps}
           className={cn(
             'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring',
-            // Keep the toolbar above the full-width code scroller.
-            title
-              ? 'min-w-0 w-full px-4 py-3'
-              : 'min-w-0 w-full px-4 pt-2 pb-4',
+            'min-w-0 w-full px-4 py-4',
             wrapLines ? 'overflow-x-hidden' : 'overflow-x-auto'
           )}
         >
           <pre
             className={cn(
-              'm-0 font-mono text-[13px] leading-6 sm:text-xs',
+              'm-0 font-mono text-[13px] leading-6',
               // Wrap at spaces first; split a token only when it alone is too long.
               wrapLines
                 ? 'whitespace-pre-wrap [overflow-wrap:anywhere]'

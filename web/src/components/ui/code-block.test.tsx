@@ -71,13 +71,15 @@ test('dark comments are lightened and other token colours are untouched', () => 
   })
 })
 
-// The toolbar must occupy space outside the code scroller. Padding inside the
-// scroller does not stop an unwrapped line painting underneath an overlay.
+// Untitled blocks look like the docs: the code starts at the top and the
+// controls float in the corner. They appear on hover or keyboard focus, stay
+// visible on touch screens (no hover there), and sit on the panel colour so
+// a long unwrapped line never shows through them.
 test.each([
   { showCopy: true, disableWrapToggle: false },
   { showCopy: false, disableWrapToggle: false },
   { showCopy: false, disableWrapToggle: true },
-])('code and controls have separate layout space: %j', async (props) => {
+])('untitled controls float over the code like the docs: %j', async (props) => {
   const command = `bunx @temps-sdk/cli mcp add claude-code --url https://${'long-'.repeat(30)}example.test`
   const view = render(<CodeBlock code={command} language="text" {...props} />)
   await act(async () => {})
@@ -87,17 +89,17 @@ test.each([
     name: 'Show line numbers',
   }).parentElement!
 
-  expect(scroller.parentElement).toBe(controls.parentElement)
-  expect(scroller.parentElement!.classList.contains('flex')).toBe(true)
-  expect(scroller.classList.contains('min-w-0')).toBe(true)
-  expect(scroller.classList.contains('w-full')).toBe(true)
-  expect(scroller.parentElement!.classList.contains('flex-col')).toBe(true)
   expect(controls.nextElementSibling).toBe(scroller)
-  expect(controls.classList.contains('self-end')).toBe(true)
-  expect(controls.classList.contains('shrink-0')).toBe(true)
-  expect(controls.classList.contains('absolute')).toBe(false)
-  expect(controls.classList.contains('opacity-100')).toBe(true)
-  expect(controls.classList.contains('opacity-0')).toBe(false)
+  expect(controls.classList.contains('absolute')).toBe(true)
+  expect(controls.classList.contains('opacity-0')).toBe(true)
+  expect(controls.className).toContain('group-hover/code:opacity-100')
+  expect(controls.className).toContain('group-focus-within/code:opacity-100')
+  expect(controls.className).toContain('[@media(hover:none)]:opacity-100')
+  expect(controls.className).toContain('bg-white/90')
+  // No toolbar row: the code is padded evenly from the top.
+  expect(scroller.classList.contains('py-4')).toBe(true)
+  expect(scroller.classList.contains('pt-2')).toBe(false)
+  expect(scroller.classList.contains('w-full')).toBe(true)
   expect(pre.textContent).toBe(command)
 
   if (!props.disableWrapToggle) {
