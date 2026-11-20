@@ -3,7 +3,10 @@
 
 pub mod audit;
 pub mod handler;
+pub mod public;
+pub mod rate_limit;
 pub mod types;
 
 pub use handler::{configure_routes, FlagsApiDoc};
+pub use public::{configure_public_routes, PublicFlagsState};
 pub use types::FlagsAppState;

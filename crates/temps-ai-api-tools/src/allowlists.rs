@@ -1181,6 +1181,9 @@ pub const AI_WRITE_ALLOWLIST: &[&str] = &[
     "create_flag",
     "update_flag",
     "set_flag_environment",
+    // Replaces one environment's targeting rules; compare-and-set on the
+    // flag's revision, like the console.
+    "set_flag_rules",
     "restore_flag",
     "archive_flag",
     "create_alert_rule",
@@ -1444,6 +1447,10 @@ pub const AI_READ_SAFE_POSTS: &[&str] = &[
     // fired?" *before* proposing it, so a suggested alert arrives with
     // evidence attached instead of a guessed threshold.
     "preview_alert",
+    // Explains what one subject would get from a flag in one environment, and
+    // why. FlagsRead; evaluates in memory and stores nothing (no
+    // exposure is recorded). A POST only because it takes a context body.
+    "evaluate_flag",
     // ── Coverage audit: POSTs that write nothing (search, preview, quote) ──
     // Read-only POST: log search and facets
     "search_logs",

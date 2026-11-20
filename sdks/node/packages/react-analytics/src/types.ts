@@ -2,7 +2,12 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import type React from "react";
-import type { JsonValue, AnalyticsClientOptions } from "@temps-sdk/analytics-core";
+import type {
+  JsonValue,
+  AnalyticsClientOptions,
+  FeatureFlags,
+  FeatureFlagsOptions,
+} from "@temps-sdk/analytics-core";
 import type { SessionRecorderConfig } from "./SessionRecorder";
 
 export type {
@@ -23,9 +28,16 @@ export interface AnalyticsContextValue {
   trackPageview: () => void;
   /** Whether analytics are currently enabled. */
   enabled: boolean;
+  /** Client-visible feature flags for this visitor. Prefer `useFlag`. */
+  flags: FeatureFlags;
 }
 
 export interface TempsAnalyticsProviderProps extends AnalyticsClientOptions {
+  /**
+   * Feature-flag context (`key`, `attributes`) and server-rendered
+   * `bootstrap` values. Read flags with `useFlag`.
+   */
+  flags?: Pick<FeatureFlagsOptions, "key" | "attributes" | "bootstrap" | "onError">;
   /** Auto track pageviews on route changes. Defaults to true. */
   autoTrackPageviews?: boolean;
   /** Auto track page leave events. Defaults to true. */

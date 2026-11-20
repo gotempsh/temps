@@ -12,6 +12,7 @@ import {
 import { EngagementTracker } from "./EngagementTracker";
 import { SpeedTracker } from "./SpeedTracker";
 import { SessionRecorder } from "./SessionRecorder";
+import { exposureEventData, FeatureFlags } from "./FeatureFlags";
 
 interface InternalCleanup {
   (): void;
@@ -38,6 +39,7 @@ export function createAnalytics(options: AnalyticsOptions = {}): AnalyticsApi {
     engagementThreshold = 10000,
     enableSessionRecording = false,
     sessionRecordingConfig = {},
+    flags: flagOptions = {},
   } = options;
 
   const cleanups: InternalCleanup[] = [];
@@ -86,6 +88,18 @@ export function createAnalytics(options: AnalyticsOptions = {}): AnalyticsApi {
       ingestKey
     );
   };
+
+  // Flags work wherever the page is served by Temps, including when
+  // analytics is off for localhost; only `disabled` turns them off. Exposure
+  // events need analytics, so they are only sent when it is on.
+  const flags = new FeatureFlags({
+    ...flagOptions,
+    basePath,
+    disabled,
+    onExposure: (exposure) => {
+      if (enabled) void trackEvent("flag_exposure", exposureEventData(exposure));
+    },
+  });
 
   const identify: AnalyticsApi["identify"] = async () => {
     // Placeholder for SDK parity; implement when identity endpoint is available.
@@ -138,6 +152,7 @@ export function createAnalytics(options: AnalyticsOptions = {}): AnalyticsApi {
       return enabled;
     },
     ingestKey,
+    flags,
     trackEvent,
     trackPageview,
     identify,
