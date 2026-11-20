@@ -1,0 +1,192 @@
+export const metadata = {
+  title: 'Surveys',
+  description:
+    'In-app surveys on Temps. Ask visitors an NPS, rating, choice or open-text question inside your app and read the answers next to the rest of your analytics.',
+  alternates: {
+    canonical: '/docs/surveys',
+  },
+}
+
+# Surveys
+
+Ask visitors a question inside your app — "How likely are you to recommend us?" after checkout, "What stopped you?" on the pricing page — and read the answers in the same console as your analytics. Answers are ordinary analytics events, so there is no second store to run. {{ className: 'lead' }}
+
+---
+
+## Overview
+
+<Row>
+  <Col>
+    **Key Features**
+    - Five question types: NPS, rating (3, 5, 7 or 10 points), single choice, multiple choice, open text
+    - Show a survey on a page pattern, after an event, to a share of visitors, or only where a feature flag serves a value
+    - Once per visitor, or every time
+    - A built-in widget, or the definitions alone to render your own UI
+    - Results per survey: response rate, distribution per question, average, NPS score
+    - Each response links to the visitor's profile
+  </Col>
+  <Col>
+    **Why Use It**
+    - Hear from users at the moment something happened, not in a quarterly email
+    - Measure NPS without a third-party survey tool reading your traffic
+    - Ask only the users who saw a new feature, by its flag
+    - Answers appear in event breakdowns and can be funnel steps
+  </Col>
+</Row>
+
+---
+
+## Creating a survey
+
+Open a project, then **Analytics → Surveys → New survey**. A new survey is a draft: nobody sees it until you **Launch** it.
+
+From the CLI, questions are a JSON array:
+
+```bash
+cat > questions.json <<'JSON'
+[
+  { "id": "nps", "kind": "nps", "prompt": "How likely are you to recommend us to a friend?" },
+  { "id": "why", "kind": "open_text", "prompt": "What is the main reason for your score?", "optional": true }
+]
+JSON
+
+temps surveys create "Checkout feedback" --questions @questions.json \
+  --targeting '{"path_pattern": "/checkout/*", "trigger_event": "checkout_completed"}'
+temps surveys launch 1
+```
+
+| Kind | Answer | Options |
+| --- | --- | --- |
+| `nps` | A whole number from 0 to 10 | `lower_label`, `upper_label` |
+| `rating` | A whole number from 1 to `scale` | `scale`: 3, 5, 7 or 10 (default 5); labels |
+| `single_choice` | One of `choices` | `choices`: 2 to 20, all different |
+| `multiple_choice` | Any of `choices` | `choices` |
+| `open_text` | Up to 2,000 characters | — |
+
+A question's `id` (`a-z`, `0-9`, `_`) is the key its answer is stored under. Keep it when you reword the question, so old and new answers are counted together.
+
+A project can have at most 50 active surveys.
+
+---
+
+## When a survey is shown
+
+| Condition | Field | Decided by |
+| --- | --- | --- |
+| Page | `path_pattern`, e.g. `/checkout/*` (`*` matches anything, empty means every page) | The browser |
+| After an event | `trigger_event`: the name you pass to `trackEvent` (empty means on page load) | The browser |
+| Once per visitor | `once_per_visitor` (default on), remembered in `localStorage` | The browser |
+| Share of visitors | `sample_rate`, 0 to 1 (default 1) | The server |
+| Feature flag | `flag: { "key": "checkout.v2", "value": true }` | The server |
+
+Sampling is sticky: the same visitor is always in or out of a survey's sample. Below 100%, only visitors Temps can recognise — the visitor cookie or a key you pass — are sampled; anyone else does not see the survey.
+
+A flag condition is evaluated with the same rules, environment and attributes as the flag itself. If the flag does not exist, is archived, or cannot be evaluated, the survey is not shown.
+
+The server never sends a survey's sample rate or flag condition to the browser, only the surveys this visitor should see.
+
+---
+
+## Showing surveys in your app
+
+Surveys are delivered by the analytics SDK from your own origin (`POST /api/_temps/surveys`), with no key and no CORS. They record answers as analytics events, so they appear only where analytics is enabled — not on `localhost` unless you set `ignoreLocalhost={false}`.
+
+### React
+
+Place `<TempsSurveys />` once inside the analytics provider:
+
+```tsx
+import { TempsAnalyticsProvider, TempsSurveys } from '@temps-sdk/react-analytics'
+import { usePathname } from 'next/navigation'
+
+export function Providers({ children }: { children: React.ReactNode }) {
+  return (
+    <TempsAnalyticsProvider>
+      {children}
+      <TempsSurveys pathname={usePathname()} />
+    </TempsAnalyticsProvider>
+  )
+}
+```
+
+Pass your router's path so a survey for `/checkout/*` appears on client-side navigation. A survey with a `trigger_event` opens when you call `trackEvent` with that name. `visitorKey` (for example a signed-in user id) and `attributes` feed sampling and the flag condition.
+
+### Any page
+
+```js
+import { createAnalytics } from '@temps-sdk/analytics-core'
+
+const analytics = createAnalytics({ surveys: { enabled: true } })
+```
+
+The built-in widget opens on load, on navigation and after a matching `trackEvent`. To draw your own UI instead, set `autoShow: false` and use `analytics.surveys`:
+
+```js
+const analytics = createAnalytics({ surveys: { enabled: true, autoShow: false } })
+
+await analytics.surveys.load()
+const [survey] = analytics.surveys.eligible(location.pathname)
+if (survey) {
+  analytics.surveys.markShown(survey)
+  // ...render survey.questions, then:
+  const result = analytics.surveys.submit(survey, { nps: 9, why: 'Fast checkout' })
+  if (!result.ok) console.log(result.errors) // per question id
+}
+```
+
+---
+
+## Answers are events
+
+| Event | When | Properties |
+| --- | --- | --- |
+| `survey_shown` | The survey was displayed | `survey_id`, `survey_name` |
+| `survey_dismissed` | Closed without answering | `survey_id`, `survey_name` |
+| `survey_sent` | Answered | `survey_id`, `survey_name`, `responses` (question id → answer) |
+
+They go through the same ingest path as your other events and count toward the same limits. You can break them down, use them as funnel steps, or query them like any other event.
+
+Deleting a survey removes its definition and its results page; the events already recorded stay.
+
+---
+
+## Reading the results
+
+A survey's page shows, for the last 7, 30 or 90 days:
+
+- **Shown, answered, dismissed** and the **response rate** (answered ÷ shown).
+- Per question: how many answered, the count and share of each choice or score, the average for scales, and the **NPS** (percentage of 9–10 minus percentage of 0–6).
+- **Responses**, newest first, each with the page it was answered on and a link to the visitor.
+
+Answers that no longer match a current choice — because the question changed after they were given — are counted as *other* rather than dropped.
+
+```bash
+temps surveys results 1 --days 30
+temps surveys responses 1 --environment production --json
+```
+
+---
+
+## Security and limits
+
+- Reading surveys needs `surveys:read`; creating, editing and deleting needs `surveys:write`. Readers can see results; deployment tokens cannot change surveys.
+- Every change is in the audit log with its status, question count and display conditions before and after.
+- The browser endpoint resolves the project from the request's `Host`, returns only active surveys the visitor should see, and is limited to 30,000 requests a minute per project and 600 per client address (`429` with `Retry-After` above that). Requests are capped at 16 KiB.
+- Survey definitions are cached in memory for at most 5 seconds; a change made through Temps is live on the next request on a single server.
+
+---
+
+## CLI reference
+
+```bash
+temps surveys list [--status active]
+temps surveys get <id>
+temps surveys create <name> --questions <json|@file|-> [--targeting <json|@file|->] [--status active]
+temps surveys update <id> [--name] [--description] [--questions] [--targeting] [--status]
+temps surveys launch <id>
+temps surveys pause <id>
+temps surveys complete <id>
+temps surveys delete <id> [--yes]
+temps surveys results <id> [--days 30] [--environment <name>]
+temps surveys responses <id> [--days 30] [--environment <name>] [--page 1]
+```

@@ -2,8 +2,8 @@
 
 ## Status
 
-Accepted — 2026-11-19. D3 implemented;
-D1, D2, D4–D9 proposed. See [Settled while implementing](#settled-while-implementing).
+Accepted — 2026-11-19. D3 implemented; D1 implemented 2026-11-20;
+D2, D4–D9 proposed. See [Settled while implementing](#settled-while-implementing).
 
 Related: ADR 034 (feature flags; its Phases 2 and 3 are D3 here, and its
 non-goal R8 is revisited by D2), ADR 012 (ClickHouse analytics backend),
@@ -276,6 +276,56 @@ wrong about the code:
   vectors. One deliberate difference: JavaScript has no linear-time regex
   engine, so `matches` never matches an input longer than 1,024 characters
   there.
+
+### D1
+
+Built in a new `temps-surveys` crate. Decisions the shape above left open:
+
+- **Its own endpoint, the flags mechanism.** `POST /api/_temps/surveys`,
+  resolved by `Host` through the route table like `/api/_temps/flags`, with
+  the same body cap (16 KiB) and limits (30,000 requests/minute per project,
+  600 per client address, 429 with `Retry-After`). A separate endpoint rather
+  than a field on the flags response, so an app that uses only one of them
+  does not pay for the other, and each can fail without hiding the other.
+- **The server decides sampling and the flag condition; the browser decides
+  the rest.** `sample_rate` is `bucket("survey:{id}", "", subject)`, so it is
+  sticky per visitor; without a subject a survey under 100% is not shown. A
+  flag condition evaluates the flag in the request's environment with the
+  same implicit attributes as the flags endpoint, and fails closed (missing,
+  archived, unevaluable flag, or flags that could not be loaded). Neither the
+  rate nor the condition is sent to the browser. Path pattern, triggering
+  event and once-per-visitor are applied in the browser, because only it
+  knows the client-side route, the event just tracked and what it has shown
+  (`localStorage`, at most 200 ids).
+- **Cohort targeting waits on D5**, as the shape said.
+- **Own permissions.** `surveys:read` (readers and up) and `surveys:write`
+  (users and up). `analytics:write` is admin-only, which would have kept
+  survey authoring from the product people it is for. Deployment tokens get
+  neither.
+- **At most 50 active surveys per project**, so the delivery payload and the
+  per-request selection stay bounded. Activating one more is a 400 naming the
+  limit.
+- **Delivery reuses D3's cache design:** active surveys per project in an
+  `ArcSwap` map (TTL 5 s, at most 4 concurrent loads, at most 4,096 projects,
+  an invalidation generation so a load that read before a write is not
+  cached). Every write through `SurveyService` drops the project's entry.
+- **Edits are compare-and-set** on `expected_updated_at`, under a row lock,
+  like flags.
+- **Results are SQL over `events`**, three `GROUP BY` queries over the
+  survey's `survey_*` events in a window (default 30 days, at most 366),
+  reading `COALESCE(props, event_data::jsonb)` so events from older SDKs
+  count. A distribution is capped at 5,000 rows. Choice answers keep the
+  declared order and zero-fill; answers that no longer match a choice are
+  counted as `other`, not dropped.
+- **Responses link to the visitor, not the replay.** `events.session_id` is
+  the analytics session, which does not map to a replay recording; the
+  visitor profile lists that visitor's replays. A direct replay link waits on
+  that mapping.
+- **Deleting a survey keeps its answers**: they are events, and events are
+  not deleted by deleting a definition.
+- **An API mode is the SDK's `autoShow: false`**: `analytics.surveys` returns
+  the eligible definitions and validates and records answers, and the app
+  renders them.
 
 ## Open questions
 
