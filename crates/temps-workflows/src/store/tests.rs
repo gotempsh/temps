@@ -1613,7 +1613,11 @@ async fn scoped_workflow_summaries_filter_projects_before_the_limit() {
         .await
         .unwrap()
         .is_empty());
-    assert!(store.workflow_project_ids().await.unwrap().is_empty());
+    assert!(store
+        .workflow_project_ids(41, 500)
+        .await
+        .unwrap()
+        .is_empty());
     drop(store);
 
     let log = Arc::try_unwrap(conn)
@@ -1641,12 +1645,21 @@ async fn scoped_workflow_summaries_filter_projects_before_the_limit() {
             ),
         ])
     );
-    let projects = &log[1].statements()[0].sql;
+    let projects = &log[1].statements()[0];
     for clause in [
-        "FROM projects p WHERE p.deleted_at IS NULL",
+        "FROM projects p WHERE p.deleted_at IS NULL AND p.id > $1",
         "EXISTS (SELECT 1 FROM workflow_runs r",
         "e.deleted_at IS NULL",
+        "ORDER BY p.id LIMIT $2",
     ] {
-        assert!(projects.contains(clause), "{clause}: {projects}");
+        assert!(projects.sql.contains(clause), "{clause}: {}", projects.sql);
     }
+    // A keyset page: after project 41, at most 500 projects.
+    assert_eq!(
+        projects.values.as_ref().map(|values| values.0.clone()),
+        Some(vec![
+            sea_orm::Value::Int(Some(41)),
+            sea_orm::Value::BigInt(Some(500)),
+        ])
+    );
 }

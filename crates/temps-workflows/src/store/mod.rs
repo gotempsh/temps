@@ -499,9 +499,10 @@ pub trait WorkflowStore: Send + Sync {
         projects: Option<&[i32]>,
     ) -> WorkflowResult<Vec<EnvironmentWorkflowSummary>>;
 
-    /// Live projects with at least one workflow run: one row per project,
-    /// not per run.
-    async fn workflow_project_ids(&self) -> WorkflowResult<Vec<i32>>;
+    /// One page of the live projects with at least one workflow run, by
+    /// ascending id after `after`, at most `limit`: one row per project, not
+    /// per run, so callers walk every project in bounded batches.
+    async fn workflow_project_ids(&self, after: i32, limit: u64) -> WorkflowResult<Vec<i32>>;
     /// Live environments among `environment_ids` with their project, in one
     /// joined query. Deleted environments and projects are absent.
     async fn environment_names(

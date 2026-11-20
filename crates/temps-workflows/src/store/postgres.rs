@@ -1670,17 +1670,19 @@ impl WorkflowStore for PgWorkflowStore {
             .collect())
     }
 
-    async fn workflow_project_ids(&self) -> WorkflowResult<Vec<i32>> {
+    async fn workflow_project_ids(&self, after: i32, limit: u64) -> WorkflowResult<Vec<i32>> {
         #[derive(FromQueryResult)]
         struct Row {
             id: i32,
         }
+        let limit = i64::try_from(limit.clamp(1, 1000)).unwrap_or(1000);
         let rows = Row::find_by_statement(stmt(
-            "SELECT p.id FROM projects p WHERE p.deleted_at IS NULL \
+            "SELECT p.id FROM projects p WHERE p.deleted_at IS NULL AND p.id > $1 \
              AND EXISTS (SELECT 1 FROM workflow_runs r \
              INNER JOIN environments e ON e.id = r.environment_id AND e.deleted_at IS NULL \
-             WHERE r.project_id = p.id)",
-            Vec::new(),
+             WHERE r.project_id = p.id) \
+             ORDER BY p.id LIMIT $2",
+            vec![after.into(), limit.into()],
         ))
         .all(self.db.as_ref())
         .await

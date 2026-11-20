@@ -6,6 +6,7 @@
 //! environment slug.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::future::Future;
 
 use chrono::{DateTime, Utc};
 use temps_authz::AuthContext;
@@ -16,11 +17,15 @@ use super::{
     WorkflowService,
 };
 use crate::error::WorkflowResult;
-use crate::store::EnvironmentName;
+use crate::store::{EnvironmentName, WorkflowStore};
 
 /// At most this many (environment, workflow) pairs are listed; the run
 /// history query is bounded by it and so is the response.
 pub const MAX_WORKFLOW_DEFINITIONS: u64 = 1_000;
+
+/// Projects read and access-checked per batch when scoping a caller limited
+/// to some projects.
+const PROJECT_BATCH: u64 = 500;
 
 /// Whether the environment's current executor declares a workflow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,9 +75,24 @@ impl WorkflowService {
         let scope: Option<BTreeSet<i32>> = if listing_is_unrestricted(auth, checker) {
             None
         } else {
-            let mut candidates = self.store.workflow_project_ids().await?;
-            candidates.extend(declaring.iter().map(|environment| environment.project_id));
-            Some(visible_projects(auth, checker, &candidates).await?)
+            let declared: Vec<i32> = declaring
+                .iter()
+                .map(|environment| environment.project_id)
+                .collect();
+            let mut visible = BTreeSet::new();
+            for batch in declared.chunks(PROJECT_BATCH as usize) {
+                visible.extend(visible_projects(auth, checker, batch).await?);
+            }
+            let scan = CallerProjects {
+                store: self.store.as_ref(),
+                auth,
+                checker,
+            };
+            let with_runs =
+                readable_in_batches(&scan, PROJECT_BATCH, MAX_WORKFLOW_DEFINITIONS as usize)
+                    .await?;
+            visible.extend(with_runs);
+            Some(visible)
         };
         let scoped: Option<Vec<i32>> = scope.as_ref().map(|ids| ids.iter().copied().collect());
         let in_scope = |project_id: i32| scope.as_ref().is_none_or(|ids| ids.contains(&project_id));
@@ -161,5 +181,134 @@ impl WorkflowService {
         definitions.retain(|definition| in_scope(definition.environment.project_id));
         definitions.truncate(MAX_WORKFLOW_DEFINITIONS as usize);
         Ok(definitions)
+    }
+}
+
+/// The projects with workflow runs, one page at a time, and which of them a
+/// caller may read.
+trait ProjectScan {
+    fn page(&self, after: i32, limit: u64)
+        -> impl Future<Output = WorkflowResult<Vec<i32>>> + Send;
+    fn readable(
+        &self,
+        page: Vec<i32>,
+    ) -> impl Future<Output = WorkflowResult<BTreeSet<i32>>> + Send;
+}
+
+struct CallerProjects<'a> {
+    store: &'a dyn WorkflowStore,
+    auth: &'a AuthContext,
+    checker: Option<&'a dyn ProjectAccessChecker>,
+}
+
+impl ProjectScan for CallerProjects<'_> {
+    fn page(
+        &self,
+        after: i32,
+        limit: u64,
+    ) -> impl Future<Output = WorkflowResult<Vec<i32>>> + Send {
+        self.store.workflow_project_ids(after, limit)
+    }
+    async fn readable(&self, page: Vec<i32>) -> WorkflowResult<BTreeSet<i32>> {
+        visible_projects(self.auth, self.checker, &page).await
+    }
+}
+
+/// Walks project ids page by page (ascending) and keeps the readable ones,
+/// so memory and each access check stay bounded by `batch`. Stops once
+/// `enough` are readable: every project with runs adds at least one
+/// workflow, so more could not change a list capped at `enough`.
+async fn readable_in_batches(
+    scan: &impl ProjectScan,
+    batch: u64,
+    enough: usize,
+) -> WorkflowResult<BTreeSet<i32>> {
+    let mut visible = BTreeSet::new();
+    let mut after = 0;
+    while visible.len() < enough {
+        let page = scan.page(after, batch).await?;
+        let Some(&last) = page.last() else {
+            break;
+        };
+        after = last;
+        let full = page.len() as u64 >= batch;
+        visible.extend(scan.readable(page).await?);
+        if !full {
+            break;
+        }
+    }
+    Ok(visible)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+    use std::sync::Mutex;
+
+    use super::{readable_in_batches, ProjectScan};
+    use crate::error::{WorkflowError, WorkflowResult};
+
+    /// Projects 1..=n; even ids are readable. Records each access check's size.
+    struct Fake {
+        n: i32,
+        fail: bool,
+        checked: Mutex<Vec<usize>>,
+    }
+
+    impl ProjectScan for Fake {
+        async fn page(&self, after: i32, limit: u64) -> WorkflowResult<Vec<i32>> {
+            Ok(((after + 1)..=self.n).take(limit as usize).collect())
+        }
+        async fn readable(&self, page: Vec<i32>) -> WorkflowResult<BTreeSet<i32>> {
+            if self.fail {
+                return Err(WorkflowError::ListingAccess { user_id: Some(7) });
+            }
+            self.checked.lock().unwrap().push(page.len());
+            Ok(page.into_iter().filter(|id| id % 2 == 0).collect())
+        }
+    }
+
+    fn fake(n: i32) -> Fake {
+        Fake {
+            n,
+            fail: false,
+            checked: Mutex::new(Vec::new()),
+        }
+    }
+
+    #[tokio::test]
+    async fn every_project_is_checked_in_bounded_batches() {
+        let scan = fake(23);
+        let visible = readable_in_batches(&scan, 10, 1_000).await.unwrap();
+        assert_eq!(visible, (2..=22).step_by(2).collect());
+        // No access check is ever larger than one batch.
+        assert_eq!(*scan.checked.lock().unwrap(), vec![10, 10, 3]);
+    }
+
+    #[tokio::test]
+    async fn the_scan_stops_once_enough_projects_are_readable() {
+        let scan = fake(10_000);
+        let visible = readable_in_batches(&scan, 10, 7).await.unwrap();
+        assert!(visible.len() >= 7, "{visible:?}");
+        assert_eq!(scan.checked.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn no_projects_checks_nothing() {
+        let scan = fake(0);
+        assert!(readable_in_batches(&scan, 10, 1_000)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(scan.checked.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failed_access_check_fails_the_scan() {
+        let scan = Fake {
+            fail: true,
+            ..fake(5)
+        };
+        assert!(readable_in_batches(&scan, 10, 1_000).await.is_err());
     }
 }
