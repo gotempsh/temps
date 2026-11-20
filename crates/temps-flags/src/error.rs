@@ -44,6 +44,13 @@ pub enum FlagError {
     #[error("Deployment token for project {project_id} is not scoped to a single environment; feature-flag snapshots require an environment-scoped token")]
     TokenNotEnvironmentScoped { project_id: i32 },
 
+    #[error("Feature flag '{key}' in project {project_id}{} changed since it was read; reload it and apply the change again", .environment_id.map(|id| format!(" (environment {id})")).unwrap_or_default())]
+    StaleWrite {
+        project_id: i32,
+        key: String,
+        environment_id: Option<i32>,
+    },
+
     #[error("Database error: {0}")]
     Database(sea_orm::DbErr),
 
