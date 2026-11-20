@@ -82,4 +82,22 @@ describe("cookieless identity (ADR 109 D3)", () => {
     // Starting a recorder posts a replay init request; none was sent.
     expect(fetchMock).not.toHaveBeenCalled();
   });
+
+  it("keeps session recording off for a later instance created without the option", () => {
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    analytics = createAnalytics({ cookieless: true, ignoreLocalhost: false, autoTrackPageviews: false });
+    analytics.destroy();
+    analytics = createAnalytics({
+      ignoreLocalhost: false,
+      autoTrackPageviews: false,
+      autoTrackEngagement: false,
+      autoTrackSpeedAnalytics: false,
+      enableSessionRecording: true,
+    });
+    analytics.enableSessionRecording();
+
+    const replayCalls = fetchMock.mock.calls.filter(([url]) => String(url).includes("session-replay"));
+    expect(replayCalls).toHaveLength(0);
+    expect(localStorage.length).toBe(0);
+  });
 });

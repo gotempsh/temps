@@ -315,7 +315,7 @@ export function TempsAnalyticsProvider({
             basePath={basePath}
             ingestKey={ingestKey}
             domain={domain}
-            enabled={isRecordingEnabled && !cookieless}
+            enabled={isRecordingEnabled && !cookieless && !isCookielessIdentity()}
           />
         )}
       </SessionRecordingProvider>
