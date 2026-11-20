@@ -263,6 +263,9 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
             "createProjectSecret",
             "create_api_key",
             "create_deployment_token",
+            // Log ingest keys (ADR 108 D1): creation returns the key in
+            // plaintext once; revoking one cuts off a collector.
+            "create_log_ingest_key",
             "create_oidc_provider",
             "create_oidc_role_mapping",
             // Returns a Shield bypass token in plaintext.
@@ -278,6 +281,7 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
             "delete_user",
             "disable_mfa",
             "get_admin_gate",
+            "list_log_ingest_keys",
             "list_users",
             "login",
             "logout",
@@ -289,6 +293,7 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
             "reset_user_mfa",
             "reset_user_password",
             "restore_user",
+            "revoke_log_ingest_key",
             "revoke_shield_token",
             "rotate_api_key",
             "rotate_deployment_token",

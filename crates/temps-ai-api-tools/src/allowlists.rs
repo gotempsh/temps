@@ -563,6 +563,12 @@ pub const AI_READ_ALLOWLIST: &[&str] = &[
     // Dashboard config (queries, panel layout) — no secrets. Gated OtelRead.
     "get_dashboard",
     "list_dashboards",
+    // ── Saved log searches (ADR 108 D1) ──
+    // A named query over the project's logs and its counts per bucket; no
+    // secrets. Gated LogsRead plus project access.
+    "list_saved_searches",
+    "get_saved_search",
+    "saved_search_series",
     // ── Platform info + update status ──
     // OS type, architecture, and supported platform strings — no secrets.
     "get_platform_info",
@@ -1311,6 +1317,11 @@ pub const AI_WRITE_ALLOWLIST: &[&str] = &[
     "create_dashboard",
     "update_dashboard",
     "delete_dashboard",
+    // Saved log searches: a name and a filter, no credential. Deleting one
+    // that an alert rule uses is refused by the service.
+    "create_saved_search",
+    "update_saved_search",
+    "delete_saved_search",
     "create_facet",
     "delete_facet",
     "retry_facet_backfill",
