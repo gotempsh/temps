@@ -464,6 +464,7 @@ class FakeHistory:
     def __init__(self):
         self.log = []
         self.refs = {}
+        self.unreachable = set()  # tags created on commits after HEAD (a later release)
 
     def commit(self, subject, files, body=''):
         sha = hashlib.sha1(f'{len(self.log)}:{subject}'.encode()).hexdigest()
@@ -479,6 +480,9 @@ class FakeHistory:
 
     def tag_exists(self, tag):
         return tag in self.refs
+
+    def reachable_tags(self):
+        return set(self.refs) - self.unreachable
 
     def resolve(self, ref):
         if ref == 'HEAD':
@@ -1065,6 +1069,19 @@ class PrepareTests(unittest.TestCase):
         self.assertEqual(released, ['analytics-core'])
         self.assertIn('sdks/node/packages/kv/package.json', files)
 
+    def test_an_older_tag_is_verified_without_the_sdk_releases_that_followed_it(self):
+        self.add('analytics-core', 'npm', '0.0.6', published={'0.0.6'})
+        self.release_tag('analytics-core', '0.0.6')
+        self.change('analytics-core', 'fix: event')
+        self.prepare_and_tag()
+        self.registry['@temps-sdk/analytics-core'].add('0.0.7')
+        self.release_tag('analytics-core', '0.0.7')
+        # A later server release published 0.0.8 from a commit after this tag.
+        self.registry['@temps-sdk/analytics-core'].add('0.0.8')
+        self.release_tag('analytics-core', '0.0.8')
+        self.history.unreachable.add('sdk/analytics-core/v0.0.8')
+        self.assertEqual(self.verify(), ([], ['analytics-core']))
+
     def test_server_only_tag_has_nothing_to_verify(self):
         self.add('analytics-core', 'npm', '0.0.6', published={'0.0.6'})
         self.release_tag('analytics-core', '0.0.6')
@@ -1193,6 +1210,11 @@ class GitHistoryTests(unittest.TestCase):
         self.assertEqual([c['subject'] for c in commits], ['fix(plugin): outer'])
         self.assertIn('BREAKING CHANGE: renamed', commits[0]['body'])
         self.assertEqual(history.revisions('sdks/python/pyproject.toml'), [first])
+        self.git('switch', '-q', '-c', 'later')
+        self.commit('sdks/python/plugin.py', 'y', 'fix(plugin): later')
+        self.git('tag', 'sdk/python/v1.0.1')
+        self.git('switch', '-q', 'main')
+        self.assertEqual(history.reachable_tags(), {'sdk/python/v1.0.0'})
         self.assertIn('1.0.0', history.show(first, 'sdks/python/pyproject.toml'))
         self.assertIsNone(history.show(first, 'missing.toml'))
 

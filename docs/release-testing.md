@@ -1145,8 +1145,10 @@ a selection, `release.yml`'s validation job re-derives it on the tagged commit
 publishes if the versions no longer match, because a published version cannot
 be replaced. Delete the tag, re-run the prep workflow for it, merge its PR and
 tag again. A re-run after part of the selection was published still verifies
-every package: the check hides this release's own package tags and registry
-versions, so it re-derives from the state before the release.
+every package, and so does a fresh run at an older tag: the check hides this
+release's own package tags and registry versions, and those of later releases
+(package tags not on the tagged commit's history), so it re-derives from the
+state before the release.
 
 `release.yml` plans in its existing validation job and tests/packages in its
 existing web-assets job. A single isolated `publish-sdks` job waits for the test

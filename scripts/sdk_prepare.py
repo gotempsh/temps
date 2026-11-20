@@ -125,6 +125,10 @@ class GitHistory:
     def tag_exists(self, tag):
         return bool(self.git('tag', '--list', tag).strip())
 
+    def reachable_tags(self):
+        """Every tag on HEAD's history (HEAD included)."""
+        return set(self.git('for-each-ref', '--merged', 'HEAD', '--format=%(refname:strip=2)', 'refs/tags/').split())
+
     def resolve(self, ref):
         """The commit `ref` names, or '' when it names none."""
         try:
@@ -692,9 +696,11 @@ def verify_tag(tag, root=release.ROOT, *, history=None, published=None):
 
     Returns (files that would change, keys already released). A commit that landed
     after the prep PR merged can need different versions than prepared.json records,
-    and published versions are immutable. A re-run after part of the selection was
-    released still verifies every package: this release's own package tags and
-    registry versions are hidden, so the derivation sees the pre-release state.
+    and published versions are immutable. The derivation sees the registries and tags
+    as they were before this release: its own package tags and registry versions are
+    hidden (a re-run after part of it was published still verifies every package), and
+    so are later releases, whose package tags are not on the tagged commit's history
+    (a fresh run at an older tag still matches its selection).
     """
     root = Path(root)
     if history is None:
@@ -705,25 +711,31 @@ def verify_tag(tag, root=release.ROOT, *, history=None, published=None):
     planned = release.plan(tag, root)
     if not planned:
         return [], []
-    own = {entry['name']: (entry['kind'], Version.parse(entry['version'], entry['kind'])) for entry in planned}
-    own_tags = {entry['tag'] for entry in planned}
     released = [entry['key'] for entry in planned if history.tag_exists(entry['tag'])
-                or own[entry['name']][1] in parse_all(published(entry), entry['kind'])]
+                or Version.parse(entry['version'], entry['kind']) in parse_all(published(entry), entry['kind'])]
+    hidden_tags = {entry['tag'] for entry in planned}
+    hidden = {entry['name']: {Version.parse(entry['version'], entry['kind'])} for entry in planned}
+    reachable = history.reachable_tags()
+    for package in release.catalog_packages(root):
+        prefix = release.package_tag(package['key'], package, '')
+        for later in (tag for tag in history.tags(prefix) if tag not in reachable):
+            hidden_tags.add(later)
+            try:
+                hidden.setdefault(package['name'], set()).add(Version.parse(later.removeprefix(prefix), package['kind']))
+            except ValueError:
+                continue
 
     def before_release(package):
         versions = published(package)
-        if package['name'] not in own:
-            return versions
-        kind, version = own[package['name']]
-        return {text for text in versions if registry_version(text, kind) != version}
+        return {text for text in versions if registry_version(text, package['kind']) not in hidden.get(package['name'], ())}
 
-    _, files = prepare(tag, root, history=BeforeRelease(history, own_tags), published=before_release,
+    _, files = prepare(tag, root, history=BeforeRelease(history, hidden_tags), published=before_release,
                        write=False, at_tag=True)
     return files, released
 
 
 class BeforeRelease:
-    """A history without the package tags a release itself creates."""
+    """A history without the package tags of this release and of later ones."""
 
     def __init__(self, history, hidden):
         self.history, self.hidden = history, hidden
