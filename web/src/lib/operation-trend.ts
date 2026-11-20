@@ -103,3 +103,11 @@ export function comparableDeployments<
     )
     .sort((a, b) => b.created_at - a.created_at)
 }
+
+/** "42%" for a share from 0 to 1 (or more, for parallel calls). */
+export function formatShare(share: number | null | undefined): string {
+  if (share == null || !Number.isFinite(share)) return '—'
+  const pct = share * 100
+  if (pct > 0 && pct < 1) return '<1%'
+  return `${Math.round(pct)}%`
+}

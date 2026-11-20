@@ -1540,10 +1540,23 @@ async fn test_e2e_operation_trends_authorize_and_explain() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 
+    let breakdown_uri = format!(
+        "/otel/operations/breakdown?project_id={project_id}&service_name=checkout-api&span_name=GET%20%2Fcart"
+    );
+    let (status, body) = get(&router, &breakdown_uri).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["instances"], 0);
+    assert_eq!(body["sample"], "recent");
+    assert_eq!(body["max_traces"], 20);
+    let (status, body) = get(&router, &format!("{breakdown_uri}&sample=fastest")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["detail"].as_str().is_some_and(|d| d.contains("fastest")), "{body}");
+
     let Some((_db, anonymous, _)) = setup_e2e_as(None).await else {
         return;
     };
     assert_eq!(get(&anonymous, &trend_uri).await.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(get(&anonymous, &breakdown_uri).await.0, StatusCode::UNAUTHORIZED);
     let Some((_db, ingest_only, _)) = setup_e2e_as(Some(temps_authz::Role::MetricsIngest)).await else {
         return;
     };

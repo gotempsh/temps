@@ -145,6 +145,14 @@ pub fn configure_routes() -> Router<OtelAppState> {
             get(operation_trends_handler::get_operation_trend),
         )
         .route(
+            "/otel/operations/breakdown",
+            get(operation_trends_handler::get_operation_breakdown),
+        )
+        .route(
+            "/otel/pages/backend",
+            get(operation_trends_handler::get_page_backend),
+        )
+        .route(
             "/otel/operations/regressions",
             get(operation_trends_handler::get_deployment_regressions),
         )

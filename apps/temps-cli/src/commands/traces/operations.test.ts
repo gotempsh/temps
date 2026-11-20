@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { describe, expect, test } from 'bun:test'
-import { formatChange, MAX_TREND_DAYS, parseTrendDays, summarizeByDay } from './operations.js'
+import { formatChange, formatSharePercent, MAX_TREND_DAYS, parseTrendDays, summarizeByDay } from './operations.js'
 
 const point = (bucket_start: string, p95_ms: number, count = 10, error_count = 0) => ({
   bucket_start,
@@ -52,5 +52,14 @@ describe('formatChange', () => {
     expect(formatChange(0.404)).toBe('+40%')
     expect(formatChange(-0.3)).toBe('-30%')
     expect(formatChange(null)).toBe('-')
+  })
+})
+
+describe('formatSharePercent', () => {
+  test('rounds to whole percents and keeps tiny shares visible', () => {
+    expect(formatSharePercent(0.756)).toBe('76%')
+    expect(formatSharePercent(0.002)).toBe('<1%')
+    expect(formatSharePercent(1.4)).toBe('140%')
+    expect(formatSharePercent(null)).toBe('-')
   })
 })

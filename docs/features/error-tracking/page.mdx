@@ -122,7 +122,7 @@ These checks use synthetic applications, real HTTP endpoints, native storage que
 | Alert APIs and alerts | Existing Temps alert rules and alarms; cron health feeds native alarms | Sentry alert APIs are not implemented. Delivery requires a configured provider; external delivery was not verified in the synthetic run. |
 | Debug ID source maps and artifact bundles | Adapted: CLI artifact bundles imported into native source maps; exact Debug ID lookup without a release, including maps uploaded after an error | Full-access project build credential required; public DSNs cannot access artifacts. SYSB v2, stored/deflated ZIP entries, 50 MiB compressed/expanded bundle, 256 files, 128 maps. Symbolication loads at most 32 maps/50 MiB per event; staged chunks expire after one hour (64 MiB/project, 256 MiB globally). Indexed/Hermes/native debug artifacts are outside this contract. |
 | Releases | Native extension: correlate retained errors, logs, spans, metric points, feedback and check-ins by SDK release version | Errors → Releases shows exact counts and native example links in a bounded 1–31 day window. Deployment/finalization, commits and release health are separate workflows. |
-| Tracing | Adapted: transaction events and version-2 batched span items become native spans | Other span versions and Sentry performance product parity are outstanding. |
+| Tracing | Adapted: transaction events and version-2 batched span items become native spans; native extension: [performance issues](#performance-issues) (N+1, slow query, consecutive HTTP, large payload), [Apdex](#apdex), [trends and regressions after a deployment](#operation-trends), a [breakdown inside an operation](#operation-breakdown) and [pages joined to their backend requests](#page-backend) | Other span versions are outstanding. Pages are joined to backend requests by path and time, not by trace id. |
 | Structured logs | Adapted: version-1/2 batched `log` items become native telemetry logs; native extension: typed attribute queries and UI | String, boolean, int64 and finite numeric comparisons preserve declared types. Historical rows without type metadata remain available through Any type. Version-2 opt-in IP/UA inference uses trusted request metadata. |
 | Metrics | Adapted: version-1/2 batched `trace_metric` and legacy SDK StatsD counters, gauges and distributions become native metric points | Modern counters are delta monotonic sums; legacy counters are delta up/down sums. Sets, `metric_buckets`, future versions and cumulative Sentry wire formats are unsupported. The current Sentry metrics protocol defines increments rather than cumulative counters. |
 | Replay | Adapted: paired web replay metadata and rrweb recording segments become native visitors and replays | No Temps analytics SDK required. Mobile/video replay is unsupported; technical timeline events are labeled as SDK breadcrumbs, performance measurements, recorder configuration or segment metadata. |
@@ -1072,6 +1072,42 @@ const trend = await fetch(
 
 const changes = await fetch(
   'https://your-temps-instance.com/api/otel/operations/regressions?project_id=42&deployment_id=812',
+  { headers: { 'Authorization': `Bearer ${API_KEY}` } }
+).then(r => r.json());
+```
+</CodeGroup>
+
+### Where the Time Goes {{ anchor: true, id: 'operation-breakdown' }}
+
+The trend sheet of an operation also shows where the time of its calls goes. Temps reads up to 20 traces from the last 24 hours that contain the operation and charges every span under each call only the time its own children do not cover (its exclusive time). Those times are summed per downstream call (a query, an HTTP call to another service, a cache read) and shown as a share of the operation's time, next to the operation's own time. A query run ten times per call appears once, with **10.0×** calls each.
+
+- **Recent calls** samples the latest calls; **Slow calls (p95+)** samples only calls at or over the window's p95, which shows what the slow ones spend their time on.
+- **Split calls by an attribute** groups the calls by the value of one attribute of the operation's own spans (for example `http.route`, `tenant.id` or `gen_ai.request.model`) with their count, average, maximum and share of the time.
+- Calls that run in parallel each keep their own time, so shares can add up to more than 100%.
+
+### Pages and the Backend Requests That Served Them {{ anchor: true, id: 'page-backend' }}
+
+In **Speed Insights**, break down by **Path** and choose **Backend** on a page to compare its web vitals with the server requests your backend traced for that path in the last 24 hours: their count, failures, p50/p75/p95, how much of the page's time to first byte (p75) the backend accounts for, and the slowest requests linked to their traces.
+
+A page load carries no trace id (the browser sends no `traceparent` on a navigation), so requests are matched by project, path and time, not one to one. A server span matches when its `url.path` (or the older `http.target`, query string ignored) is the page's path, which OpenTelemetry and Sentry HTTP instrumentations set. A static page has no backend request; the sheet says so and links to traces.
+
+<CodeGroup title="Breakdown and Page Backend">
+```bash {{ title: 'CLI' }}
+# Where the time of slow calls goes, and which tenant is slow
+temps traces breakdown --project-id 42 --service checkout-api --operation "GET /cart" --sample slow --attribute tenant.id
+
+# A page's web vitals next to the backend requests for its path
+temps traces page --project-id 42 --path /checkout
+```
+
+```typescript {{ title: 'API' }}
+const breakdown = await fetch(
+  'https://your-temps-instance.com/api/otel/operations/breakdown?project_id=42&service_name=checkout-api&span_name=GET%20%2Fcart&sample=slow',
+  { headers: { 'Authorization': `Bearer ${API_KEY}` } }
+).then(r => r.json());
+
+const page = await fetch(
+  'https://your-temps-instance.com/api/otel/pages/backend?project_id=42&path=%2Fcheckout',
   { headers: { 'Authorization': `Bearer ${API_KEY}` } }
 ).then(r => r.json());
 ```

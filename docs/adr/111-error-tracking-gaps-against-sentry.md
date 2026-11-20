@@ -6,8 +6,10 @@ Proposed — 2026-11-19. Being implemented in the order of the Decision
 section. D1.1 (bulk actions), D1.2 (merge and split), D1.3 (ignore
 until), D1.4 (inbound filters), D1.5 (resolve in the next release),
 D1.6 (assignment), D1.7 (comments and activity) and D1.8 (saved searches)
-have shipped, so D1 is complete. Of D2, D2.1 (performance issues), D2.2
-(trends and regressions after a deployment) and D2.3 (Apdex) have shipped. The questions they settled
+have shipped, so D1 is complete. D2.1 (performance issues), D2.2 (trends
+and regressions after a deployment), D2.3 (Apdex), D2.4 (pages joined to
+backend requests) and D2.5 (breakdown inside an operation) have shipped, so
+D2 is complete. The questions they settled
 are recorded under "Settled while implementing".
 
 Related: ADR 016 (ClickHouse traces backend), ADR 027 (cross-project trace
@@ -479,4 +481,48 @@ deploys, which is web services. It comes last and may never be worth building.
   on request for one deployment, not stored or alerted on. A deployment
   that never went live is a 400 that says so; one from another project is a
   404 naming both IDs.
+
+### D2.4 Pages joined to backend requests
+
+- **By path and time, not by trace id.** A page load carries no trace id: a
+  navigation sends no `traceparent`, and the proxy only reads one on an
+  inbound request. Carrying one would need the analytics SDK to read a
+  `Server-Timing: traceparent` header the backend would have to set, a new
+  column on `performance_metrics` and a change to analytics ingest. The
+  conservative option is a join that needs none of that: the server spans
+  of the same project whose `url.path` (or `http.target`, query string
+  ignored) equals the page's path, in the same window. It answers how much
+  of the p75 time to first byte the backend explains and links the slowest
+  requests; it is not a one-to-one link, and the console and docs say so.
+  A trace id on page loads remains a follow-up.
+- **Bounded on request.** `GET /otel/pages/backend` reads the page's web
+  vitals with one aggregate over `performance_metrics` and at most 500
+  server spans per attribute looked up (two exact attribute filters), over
+  a window of at most 7 days (24 hours by default), and returns the 10
+  slowest. It stores nothing.
+
+### D2.5 Breakdown inside an operation
+
+- **Exclusive time from a sample of traces.** `GET /otel/operations/breakdown`
+  reads at most 20 traces (2,000 spans each) that contain the operation,
+  from the latest 500 calls in a window of at most 7 days (24 hours by
+  default). Every span under each call is charged its duration minus the
+  union of its own children's intervals, clipped to it, and the times are
+  summed per (service, span name, category). The operation's own exclusive
+  time is reported separately. Parallel calls each keep their time, so
+  shares can exceed 100%; that is stated in the response docs, the console
+  and the CLI. A call of the operation nested in another is counted once,
+  through the outer call.
+- **Category from attributes.** `database` (`db.system`), `messaging`,
+  `http` (a client span with an HTTP method or URL), `rpc`, else by span
+  kind. At most 25 groups are returned, the rest summed into one row.
+- **Samples.** `recent` (default) reads the latest calls; `slow` reads only
+  calls at or over the window's p95 from the span-stats report. Span names
+  are used as they are: OpenTelemetry names are low cardinality by
+  convention, and statement normalization stays in the performance-issue
+  detectors.
+- **Split by an attribute.** An optional `attribute` groups the calls by
+  the value of that attribute on the operation's own spans (at most 20
+  values, the rest summed), which answers "which tenant, route or model is
+  the slow one" without a new index.
 

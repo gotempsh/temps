@@ -583,7 +583,7 @@ export default function TraceOperations({ project }: TraceOperationsProps) {
                           variant="ghost"
                           size="icon"
                           aria-label={`Trend of ${row.span_name}`}
-                          title="Latency over the last 14 days"
+                          title="Latency over 14 days, and where the time goes"
                           onClick={(e) => {
                             e.stopPropagation()
                             setTrendTarget({

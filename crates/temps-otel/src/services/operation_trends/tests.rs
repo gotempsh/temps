@@ -55,6 +55,120 @@ fn hours_round_down_and_up() {
     assert_eq!(hour_ceil(exact), exact);
 }
 
+mod sampling {
+    use super::*;
+    use crate::test_support::MockOtelStorage;
+    use crate::types::{ResourceInfo, SpanKind, SpanRecord, SpanStatusCode};
+
+    #[allow(clippy::too_many_arguments, reason = "a test fixture spelling out one span")]
+    fn span(
+        trace: &str,
+        id: &str,
+        parent: Option<&str>,
+        name: &str,
+        kind: SpanKind,
+        start: DateTime<Utc>,
+        duration_ms: i64,
+        attributes: &[(&str, &str)],
+    ) -> SpanRecord {
+        SpanRecord {
+            ingest_identity: None,
+            project_id: 1,
+            deployment_id: None,
+            resource: ResourceInfo {
+                service_name: "checkout-api".to_string(),
+                service_version: None,
+                deployment_environment: None,
+                attributes: Default::default(),
+            },
+            trace_id: trace.to_string(),
+            span_id: id.to_string(),
+            parent_span_id: parent.map(str::to_string),
+            name: name.to_string(),
+            kind,
+            start_time: start,
+            end_time: start + Duration::milliseconds(duration_ms),
+            duration_ms: duration_ms as f64,
+            status_code: SpanStatusCode::Ok,
+            status_message: String::new(),
+            attributes: attributes
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            events: Vec::new(),
+        }
+    }
+
+    /// 19 fast calls whose time goes to a cache read, and one slow call
+    /// whose time goes to a query.
+    async fn service() -> (OperationTrendService, DateTime<Utc>) {
+        let storage = Arc::new(MockOtelStorage::new());
+        let now = Utc::now();
+        let mut spans = Vec::new();
+        for i in 0..19 {
+            let trace = format!("fast{i:02}");
+            let at = now - Duration::minutes(30) + Duration::seconds(i);
+            spans.push(span(&trace, "a", None, "GET /cart", SpanKind::Server, at, 20, &[("tier", "free")]));
+            spans.push(span(&trace, "b", Some("a"), "cache.get", SpanKind::Client, at, 15, &[]));
+            // A span whose name merely contains the operation's.
+            spans.push(span(&trace, "c", Some("a"), "GET /cart/items", SpanKind::Internal, at, 1, &[]));
+        }
+        let at = now - Duration::minutes(10);
+        spans.push(span("slow", "a", None, "GET /cart", SpanKind::Server, at, 900, &[("tier", "paid")]));
+        spans.push(span("slow", "b", Some("a"), "SELECT cart_items", SpanKind::Client, at, 850, &[("db.system", "postgresql")]));
+        storage.store_spans(spans).await.expect("spans");
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(DatabaseBackend::Postgres).into_connection(),
+        );
+        (OperationTrendService::new(db, storage), now)
+    }
+
+    #[tokio::test]
+    async fn a_recent_sample_reads_at_most_the_budget_and_exact_calls_only() {
+        let (service, now) = service().await;
+        let result = service
+            .breakdown(1, "checkout-api", "GET /cart", now - Duration::days(1), now, BreakdownSample::Recent, Some("tier"))
+            .await
+            .expect("breakdown");
+        assert_eq!(result.breakdown.traces, BREAKDOWN_TRACES);
+        assert_eq!(result.breakdown.instances, BREAKDOWN_TRACES as u64);
+        assert_eq!(result.slow_threshold_ms, None);
+        assert!(result.breakdown.by_attribute.iter().any(|s| s.value.as_deref() == Some("free")));
+    }
+
+    #[tokio::test]
+    async fn a_slow_sample_starts_from_the_p95_and_shows_where_slow_calls_go() {
+        let (service, now) = service().await;
+        let result = service
+            .breakdown(1, "checkout-api", "GET /cart", now - Duration::days(1), now, BreakdownSample::Slow, None)
+            .await
+            .expect("breakdown");
+        let threshold = result.slow_threshold_ms.expect("threshold");
+        assert!(threshold > 20.0, "p95 {threshold}");
+        assert_eq!(result.breakdown.instances, 1);
+        assert_eq!(result.breakdown.groups[0].span_name, "SELECT cart_items");
+        assert_eq!(result.breakdown.groups[0].category, "database");
+    }
+
+    #[tokio::test]
+    async fn a_breakdown_request_is_validated() {
+        let (service, now) = service().await;
+        for (svc, name, start, attribute) in [
+            ("", "GET /cart", now - Duration::days(1), None),
+            ("checkout-api", "GET /cart", now - Duration::days(MAX_BREAKDOWN_DAYS + 1), None),
+            ("checkout-api", "GET /cart", now - Duration::days(1), Some(" ")),
+        ] {
+            let error = service
+                .breakdown(1, svc, name, start, now, BreakdownSample::Recent, attribute)
+                .await
+                .expect_err("invalid");
+            assert!(matches!(error, OtelError::Validation { .. }), "{error}");
+        }
+        assert_eq!(BreakdownSample::parse("slow"), Some(BreakdownSample::Slow));
+        assert_eq!(BreakdownSample::parse("fastest"), None);
+    }
+}
+
 mod database {
     use super::*;
     use crate::test_support::MockOtelStorage;

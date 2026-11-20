@@ -4,8 +4,19 @@
 import type { Command } from 'commander'
 import { requireAuth } from '../../config/store.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
-import { getDeploymentRegressions, getOperationTrend } from '../../api/sdk.gen.js'
-import type { OperationChangeResponse, OperationTrendPointResponse } from '../../api/types.gen.js'
+import {
+  getDeploymentRegressions,
+  getOperationBreakdown,
+  getOperationTrend,
+  getPageBackend,
+} from '../../api/sdk.gen.js'
+import type {
+  AttributeSliceResponse,
+  BackendRequestResponse,
+  BreakdownGroupResponse,
+  OperationChangeResponse,
+  OperationTrendPointResponse,
+} from '../../api/types.gen.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { printTable, type TableColumn } from '../../ui/table.js'
 import { newline, header, icons, json, colors, info, warning, keyValue } from '../../ui/output.js'
@@ -62,6 +73,16 @@ export function formatChange(ratio: number | null | undefined): string {
   return pct > 0 ? `+${pct}%` : `${pct}%`
 }
 
+/** A share from 0 to 1 as a whole percent; tiny shares stay visible. */
+export function formatSharePercent(share: number | null | undefined): string {
+  if (share == null || !Number.isFinite(share)) return '-'
+  const pct = share * 100
+  if (pct > 0 && pct < 1) return '<1%'
+  return `${Math.round(pct)}%`
+}
+
+export const BREAKDOWN_SAMPLES = ['recent', 'slow']
+
 function formatMs(ms: number | null | undefined): string {
   if (ms == null || !Number.isFinite(ms)) return '-'
   if (ms >= 1000) return `${(ms / 1000).toFixed(2)}s`
@@ -73,6 +94,21 @@ interface TrendOptions {
   service?: string
   operation?: string
   days: string
+  json?: boolean
+}
+
+interface BreakdownOptions {
+  projectId?: string
+  service?: string
+  operation?: string
+  sample: string
+  attribute?: string
+  json?: boolean
+}
+
+interface PageOptions {
+  projectId?: string
+  path?: string
   json?: boolean
 }
 
@@ -119,6 +155,173 @@ Examples:
 `,
     )
     .action(regressionsAction)
+
+  traces
+    .command('breakdown')
+    .description('Show where the time inside one operation goes: queries, downstream calls, its own code')
+    .option('--project-id <id>', 'Project ID')
+    .option('--service <name>', 'Service of the operation')
+    .option('--operation <name>', 'The operation (span name)')
+    .option('--sample <kind>', `Calls to sample (${BREAKDOWN_SAMPLES.join(', ')})`, 'recent')
+    .option('--attribute <key>', 'Also split the calls by this attribute, e.g. http.route')
+    .option('--json', 'Output in JSON format')
+    .addHelpText(
+      'after',
+      `
+Reads at most 20 traces of the last 24 hours that contain the operation and
+charges every span under it only the time its own children do not cover.
+
+Examples:
+  $ temps traces breakdown --project-id 4 --service checkout-api --operation "GET /cart"
+  $ temps traces breakdown --project-id 4 --service checkout-api --operation "GET /cart" --sample slow
+  $ temps traces breakdown --project-id 4 --service checkout-api --operation "GET /cart" --attribute tenant.id
+`,
+    )
+    .action(breakdownAction)
+
+  traces
+    .command('page')
+    .description("Compare a page's web vitals with the backend requests that served it")
+    .option('--project-id <id>', 'Project ID')
+    .option('--path <path>', 'The page path, e.g. /checkout')
+    .option('--json', 'Output in JSON format')
+    .addHelpText(
+      'after',
+      `
+Page loads carry no trace id, so backend requests are matched by path (the
+url.path or http.target attribute of server spans) and time, over the last
+24 hours.
+
+Examples:
+  $ temps traces page --project-id 4 --path /checkout
+`,
+    )
+    .action(pageAction)
+}
+
+async function breakdownAction(options: BreakdownOptions): Promise<void> {
+  if (!options.projectId || !options.service || !options.operation) {
+    warning('Provide --project-id, --service and --operation')
+    return
+  }
+  if (!BREAKDOWN_SAMPLES.includes(options.sample)) {
+    warning(`Invalid --sample: ${options.sample}. Available: ${BREAKDOWN_SAMPLES.join(', ')}`)
+    return
+  }
+  await requireAuth()
+  await setupClient()
+  const result = await withSpinner('Breaking the operation down...', async () => {
+    const { data, error } = await getOperationBreakdown({
+      client,
+      query: {
+        project_id: parseInt(options.projectId!, 10),
+        service_name: options.service!,
+        span_name: options.operation!,
+        sample: options.sample,
+        ...(options.attribute && { attribute: options.attribute }),
+      },
+    })
+    if (error) throw new Error(getErrorMessage(error))
+    return data
+  })
+  if (options.json) {
+    json(result)
+    return
+  }
+  if (!result) return
+  newline()
+  header(`${icons.info} Where the time of ${options.operation} goes (${result.sample} calls)`)
+  if (result.instances === 0) {
+    info('No call of this operation was traced in the last 24 hours.')
+    newline()
+    return
+  }
+  keyValue(
+    'Sample',
+    `${result.instances} calls in ${result.traces} traces (at most ${result.max_traces})` +
+      (result.slow_threshold_ms != null ? `, each ${formatMs(result.slow_threshold_ms)} or slower` : ''),
+  )
+  keyValue('Own time', formatSharePercent(result.self_share))
+  const columns: TableColumn<BreakdownGroupResponse>[] = [
+    { header: 'Kind', key: 'category' },
+    { header: 'Call', key: 'span_name', color: (v) => colors.bold(v) },
+    { header: 'Service', key: 'service_name' },
+    { header: 'Per call', accessor: (r) => formatMs(r.avg_ms), align: 'right' },
+    { header: 'Calls each', accessor: (r) => r.calls_per_instance.toFixed(1), align: 'right' },
+    { header: 'Share', accessor: (r) => formatSharePercent(r.share), align: 'right' },
+  ]
+  printTable(result.groups, columns, { style: 'minimal' })
+  if (result.attribute && result.by_attribute.length > 0) {
+    newline()
+    header(`By ${result.attribute}`)
+    const sliceColumns: TableColumn<AttributeSliceResponse>[] = [
+      { header: 'Value', accessor: (r) => r.value ?? '(not set)' },
+      { header: 'Calls', accessor: (r) => r.calls.toString(), align: 'right' },
+      { header: 'Avg', accessor: (r) => formatMs(r.avg_ms), align: 'right' },
+      { header: 'Max', accessor: (r) => formatMs(r.max_ms), align: 'right' },
+      { header: 'Share', accessor: (r) => formatSharePercent(r.share), align: 'right' },
+    ]
+    printTable(result.by_attribute, sliceColumns, { style: 'minimal' })
+  }
+  info('Parallel calls each keep their own time, so shares can add up to more than 100%.')
+  newline()
+}
+
+async function pageAction(options: PageOptions): Promise<void> {
+  if (!options.projectId || !options.path) {
+    warning('Provide --project-id and --path')
+    return
+  }
+  if (!options.path.startsWith('/')) {
+    warning(`Invalid --path: ${options.path}. A page path starts with /`)
+    return
+  }
+  await requireAuth()
+  await setupClient()
+  const result = await withSpinner('Matching backend requests to the page...', async () => {
+    const { data, error } = await getPageBackend({
+      client,
+      query: { project_id: parseInt(options.projectId!, 10), path: options.path! },
+    })
+    if (error) throw new Error(getErrorMessage(error))
+    return data
+  })
+  if (options.json) {
+    json(result)
+    return
+  }
+  if (!result) return
+  newline()
+  header(`${icons.info} ${result.path}, last 24 hours`)
+  keyValue('Page loads', result.vitals.page_loads.toLocaleString())
+  keyValue('TTFB p75', formatMs(result.vitals.ttfb_p75_ms))
+  keyValue('LCP p75', formatMs(result.vitals.lcp_p75_ms))
+  if (!result.configured) {
+    info(result.reason ?? 'No backend request for this path was traced.')
+    newline()
+    return
+  }
+  keyValue(
+    'Backend',
+    `${result.requests} requests, p50 ${formatMs(result.p50_ms)}, p75 ${formatMs(result.p75_ms)}, p95 ${formatMs(result.p95_ms)}` +
+      (result.errors > 0 ? `, ${result.errors} failed` : ''),
+  )
+  if (result.backend_share_of_ttfb != null) {
+    keyValue('Backend share of TTFB (p75)', formatSharePercent(Math.min(result.backend_share_of_ttfb, 1)))
+  }
+  const columns: TableColumn<BackendRequestResponse>[] = [
+    { header: 'Trace', key: 'trace_id' },
+    { header: 'Request', key: 'span_name' },
+    { header: 'Service', key: 'service_name' },
+    {
+      header: 'Duration',
+      accessor: (r) => formatMs(r.duration_ms),
+      align: 'right',
+      color: (v, r) => (r.error ? colors.error(v) : v),
+    },
+  ]
+  printTable(result.slowest, columns, { style: 'minimal' })
+  newline()
 }
 
 async function trendAction(options: TrendOptions): Promise<void> {

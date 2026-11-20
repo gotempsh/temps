@@ -15,6 +15,9 @@
 //! band ([`crate::detectors::robust_band`], the anomaly detectors' model) of
 //! the week before it.
 
+pub mod breakdown;
+pub mod page_backend;
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -26,7 +29,10 @@ use sea_orm::{
 use crate::detectors::{robust_band, MIN_BASELINE_SAMPLES};
 use crate::error::OtelError;
 use crate::storage::OtelStorage;
-use crate::types::{SortOrder, SpanStats, SpanStatsQuery, SpanStatsSortField, SPAN_STATS_MAX_LIMIT};
+use crate::types::{
+    SortOrder, SpanStats, SpanStatsQuery, SpanStatsSortField, TraceQuery, SPAN_STATS_MAX_LIMIT,
+};
+use breakdown::{Breakdown, BreakdownBuilder};
 
 /// Operations kept per project and hour, by total time spent.
 pub const MAX_TRACKED_OPERATIONS: u64 = 200;
@@ -63,6 +69,52 @@ pub const MIN_RELATIVE_CHANGE: f64 = 0.2;
 pub const MIN_SCALE_SHARE: f64 = 0.05;
 /// Changed operations returned per deployment.
 pub const MAX_CHANGES_RETURNED: usize = 50;
+/// Traces read for one breakdown.
+pub const BREAKDOWN_TRACES: usize = 20;
+/// Spans read from one of them; a larger trace is broken down on its first
+/// ones.
+pub const BREAKDOWN_SPANS_PER_TRACE: usize = 2_000;
+/// Calls of the operation listed to pick the traces from.
+pub const BREAKDOWN_CANDIDATES: u64 = 500;
+/// The widest breakdown window, in days.
+pub const MAX_BREAKDOWN_DAYS: i64 = 7;
+/// The longest attribute key a breakdown accepts.
+pub const MAX_ATTRIBUTE_KEY_CHARS: usize = 200;
+
+/// Which calls of an operation a breakdown samples.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BreakdownSample {
+    /// The most recent calls.
+    Recent,
+    /// The most recent calls at or over the window's p95.
+    Slow,
+}
+
+impl BreakdownSample {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "recent" => Some(Self::Recent),
+            "slow" => Some(Self::Slow),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Recent => "recent",
+            Self::Slow => "slow",
+        }
+    }
+}
+
+/// A breakdown and how it was sampled.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OperationBreakdown {
+    pub sample: BreakdownSample,
+    /// The p95 a `slow` sample started from.
+    pub slow_threshold_ms: Option<f64>,
+    pub breakdown: Breakdown,
+}
 
 /// What the rollup job last did for a project.
 #[derive(Debug, Clone, PartialEq)]
@@ -712,6 +764,121 @@ impl OperationTrendService {
             })
         });
         result.changes.truncate(MAX_CHANGES_RETURNED);
+        Ok(result)
+    }
+}
+
+impl OperationTrendService {
+    /// Where the time of one operation goes, from at most
+    /// [`BREAKDOWN_TRACES`] traces in `[start, end]`.
+    #[allow(clippy::too_many_arguments, reason = "each argument is one filter of the request")]
+    pub async fn breakdown(
+        &self,
+        project_id: i32,
+        service_name: &str,
+        span_name: &str,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        sample: BreakdownSample,
+        attribute: Option<&str>,
+    ) -> Result<OperationBreakdown, OtelError> {
+        if service_name.trim().is_empty() || span_name.trim().is_empty() {
+            return Err(OtelError::Validation {
+                message: format!(
+                    "A breakdown of project {project_id} needs both a service name and an operation name"
+                ),
+            });
+        }
+        if start >= end {
+            return Err(OtelError::Validation {
+                message: format!("The breakdown window must start before it ends ({start} to {end})"),
+            });
+        }
+        if end - start > Duration::days(MAX_BREAKDOWN_DAYS) {
+            return Err(OtelError::Validation {
+                message: format!(
+                    "The breakdown window is {} days; at most {MAX_BREAKDOWN_DAYS} are read",
+                    (end - start).num_days()
+                ),
+            });
+        }
+        if let Some(key) = attribute {
+            if key.trim().is_empty() || key.chars().count() > MAX_ATTRIBUTE_KEY_CHARS {
+                return Err(OtelError::Validation {
+                    message: format!(
+                        "The attribute to split by must be 1 to {MAX_ATTRIBUTE_KEY_CHARS} characters"
+                    ),
+                });
+            }
+        }
+        let mut result = OperationBreakdown {
+            sample,
+            slow_threshold_ms: None,
+            breakdown: Breakdown::default(),
+        };
+        if sample == BreakdownSample::Slow {
+            let stats = self
+                .storage
+                .query_span_stats(SpanStatsQuery {
+                    project_ids: vec![project_id],
+                    start_time: start,
+                    end_time: end,
+                    service_name: Some(service_name.to_string()),
+                    span_name: Some(span_name.to_string()),
+                    name_pattern: None,
+                    kind: None,
+                    status: None,
+                    environment_id: None,
+                    deployment_id: None,
+                    attributes: None,
+                    min_duration_ms: None,
+                    min_count: 1,
+                    sort_by: SpanStatsSortField::TotalDurationMs,
+                    sort_order: SortOrder::Desc,
+                    limit: Some(1),
+                    offset: None,
+                    apdex_threshold_ms: None,
+                })
+                .await?;
+            let Some(row) = stats.into_iter().next() else {
+                result.breakdown = BreakdownBuilder::new(service_name, span_name, attribute).finish();
+                return Ok(result);
+            };
+            result.slow_threshold_ms = Some(row.p95_duration_ms);
+        }
+        let candidates = self
+            .storage
+            .query_spans(TraceQuery {
+                project_id,
+                service_name: Some(service_name.to_string()),
+                name_pattern: Some(span_name.to_string()),
+                min_duration_ms: result.slow_threshold_ms,
+                start_time: Some(start),
+                end_time: Some(end),
+                limit: Some(BREAKDOWN_CANDIDATES),
+                ..Default::default()
+            })
+            .await?;
+        // The name filter is a substring match; keep exact calls only.
+        let mut trace_ids: Vec<String> = Vec::new();
+        for span in candidates
+            .iter()
+            .filter(|span| span.name == span_name && span.resource.service_name == service_name)
+        {
+            if !trace_ids.contains(&span.trace_id) {
+                trace_ids.push(span.trace_id.clone());
+                if trace_ids.len() == BREAKDOWN_TRACES {
+                    break;
+                }
+            }
+        }
+        let mut builder = BreakdownBuilder::new(service_name, span_name, attribute);
+        for trace_id in &trace_ids {
+            let mut spans = self.storage.get_trace(project_id, trace_id).await?;
+            spans.truncate(BREAKDOWN_SPANS_PER_TRACE);
+            builder.add_trace(&spans);
+        }
+        result.breakdown = builder.finish();
         Ok(result)
     }
 }

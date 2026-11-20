@@ -19,6 +19,7 @@ import {
 } from '@/lib/operation-trend'
 import { useQuery } from '@tanstack/react-query'
 import { useMemo } from 'react'
+import { OperationBreakdown } from './OperationBreakdown'
 import { Link } from 'react-router'
 
 export interface TrendTarget {
@@ -74,7 +75,7 @@ export function OperationTrendSheet({
           <SheetTitle className="break-all">{target?.spanName}</SheetTitle>
           <SheetDescription>
             {target?.serviceName} · hourly latency over the last 14 days, with
-            deployments marked
+            deployments marked, and where the time of its calls goes
           </SheetDescription>
         </SheetHeader>
         <div className="space-y-4 px-4 pb-6">
@@ -132,6 +133,14 @@ export function OperationTrendSheet({
                 </p>
               )}
             </>
+          )}
+          {target && (
+            <OperationBreakdown
+              key={`${target.serviceName}-${target.spanName}`}
+              projectId={projectId}
+              serviceName={target.serviceName}
+              spanName={target.spanName}
+            />
           )}
         </div>
       </SheetContent>

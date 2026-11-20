@@ -3212,6 +3212,21 @@ export type AttributeKeysResponse = {
 };
 
 /**
+ * One value of the requested attribute.
+ */
+export type AttributeSliceResponse = {
+    avg_ms: number;
+    calls: number;
+    max_ms: number;
+    share: number;
+    total_ms: number;
+    /**
+     * Null for calls without the attribute.
+     */
+    value?: string | null;
+};
+
+/**
  * Who an address is for.
  */
 export type Audience = 'public' | 'private' | 'signed_in' | 'tailnet_users' | 'unsupported';
@@ -3659,6 +3674,18 @@ export type AvailablePermissions = {
 };
 
 /**
+ * One backend request that served the page.
+ */
+export type BackendRequestResponse = {
+    duration_ms: number;
+    error: boolean;
+    service_name: string;
+    span_name: string;
+    start_time: string;
+    trace_id: string;
+};
+
+/**
  * Response body for the list-backup-alerts endpoint.
  */
 export type BackupAlertListResponse = {
@@ -4050,6 +4077,40 @@ export type BranchInfo = {
 
 export type BranchListResponse = {
     branches: Array<BranchInfo>;
+};
+
+/**
+ * One downstream call inside the operation.
+ */
+export type BreakdownGroupResponse = {
+    /**
+     * Exclusive time per call.
+     */
+    avg_ms: number;
+    calls: number;
+    /**
+     * Calls per sampled call of the operation.
+     */
+    calls_per_instance: number;
+    /**
+     * `database`, `http`, `messaging`, `rpc`, `client`, `server`,
+     * `internal`, or `other` for the summed remainder.
+     */
+    category: string;
+    /**
+     * Empty for the summed remainder.
+     */
+    service_name: string;
+    /**
+     * `total_ms` over the operation's total time. Parallel calls can add
+     * up to more than 1.
+     */
+    share: number;
+    span_name: string;
+    /**
+     * Exclusive time, summed over the sample.
+     */
+    total_ms: number;
 };
 
 export type BrowserCount = {
@@ -23661,6 +23722,51 @@ export type OperatingSystemCount = {
 };
 
 /**
+ * Where the time of an operation goes, from a sample of its calls.
+ */
+export type OperationBreakdownResponse = {
+    /**
+     * The attribute the calls were split by, if any.
+     */
+    attribute?: string | null;
+    /**
+     * Largest total time first, at most 20 values (the rest summed).
+     */
+    by_attribute: Array<AttributeSliceResponse>;
+    end_time: string;
+    /**
+     * Largest exclusive time first, at most 25 (the rest summed).
+     */
+    groups: Array<BreakdownGroupResponse>;
+    /**
+     * Calls of the operation found in them.
+     */
+    instances: number;
+    max_traces: number;
+    /**
+     * `recent` or `slow`.
+     */
+    sample: string;
+    /**
+     * The operation's own exclusive time.
+     */
+    self_ms: number;
+    self_share: number;
+    service_name: string;
+    /**
+     * The p95 a `slow` sample started from.
+     */
+    slow_threshold_ms?: number | null;
+    span_name: string;
+    start_time: string;
+    total_ms: number;
+    /**
+     * Traces read; at most `max_traces`.
+     */
+    traces: number;
+};
+
+/**
  * One operation that changed after a deployment.
  */
 export type OperationChangeResponse = {
@@ -24203,6 +24309,50 @@ export type PageActivityBucket = {
 };
 
 /**
+ * A page's web vitals next to the backend requests for its path.
+ */
+export type PageBackendResponse = {
+    /**
+     * Backend p75 over the page's p75 time to first byte: the part of the
+     * wait the backend explains. Null without both.
+     */
+    backend_share_of_ttfb?: number | null;
+    /**
+     * True when backend requests for the path were found.
+     */
+    configured: boolean;
+    end_time: string;
+    errors: number;
+    p50_ms?: number | null;
+    p75_ms?: number | null;
+    p95_ms?: number | null;
+    path: string;
+    /**
+     * Why none were, when `configured` is false.
+     */
+    reason?: string | null;
+    /**
+     * Backend requests found; at most 500 per attribute are read.
+     */
+    requests: number;
+    /**
+     * Services that served the path, most requests first.
+     */
+    services: Array<ServiceRequestsResponse>;
+    /**
+     * The console page, relative to the project, that sets up what is
+     * missing.
+     */
+    setup_path?: string | null;
+    /**
+     * Slowest first, at most 10, each linking to its trace.
+     */
+    slowest: Array<BackendRequestResponse>;
+    start_time: string;
+    vitals: PageVitalsResponse;
+};
+
+/**
  * Geographic distribution of visitors for a page
  */
 export type PageCountryStats = {
@@ -24646,6 +24796,17 @@ export type PageVisitorSession = {
      * Visitor UUID
      */
     visitor_uuid: string;
+};
+
+/**
+ * The 75th percentiles of a page's web vitals.
+ */
+export type PageVitalsResponse = {
+    fcp_p75_ms?: number | null;
+    inp_p75_ms?: number | null;
+    lcp_p75_ms?: number | null;
+    page_loads: number;
+    ttfb_p75_ms?: number | null;
 };
 
 export type PagesComparisonResponse = {
@@ -32437,6 +32598,14 @@ export type ServiceReadiness = {
      * When the gate started waiting (ISO 8601, UTC).
      */
     started_at: string;
+};
+
+/**
+ * How many of a page's backend requests one service served.
+ */
+export type ServiceRequestsResponse = {
+    requests: number;
+    service_name: string;
 };
 
 /**
@@ -70602,6 +70771,66 @@ export type QueryMetricsResponses = {
 
 export type QueryMetricsResponse = QueryMetricsResponses[keyof QueryMetricsResponses];
 
+export type GetOperationBreakdownData = {
+    body?: never;
+    path?: never;
+    query: {
+        project_id: number;
+        service_name: string;
+        /**
+         * The operation (span name).
+         */
+        span_name: string;
+        /**
+         * Window start (RFC 3339); defaults to 24 hours before `end_time`.
+         */
+        start_time?: string | null;
+        /**
+         * Window end (RFC 3339); defaults to now.
+         */
+        end_time?: string | null;
+        /**
+         * `recent` (default): the latest calls. `slow`: the latest calls at or
+         * over the window's p95.
+         */
+        sample?: string | null;
+        /**
+         * Also split the calls by the value of this attribute of the
+         * operation's own spans, e.g. `http.route` or `tenant.id`.
+         */
+        attribute?: string | null;
+    };
+    url: '/otel/operations/breakdown';
+};
+
+export type GetOperationBreakdownErrors = {
+    /**
+     * Missing operation, unknown sample, or a window over 7 days
+     */
+    400: unknown;
+    /**
+     * Not authenticated
+     */
+    401: unknown;
+    /**
+     * Missing otel:read or project access
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetOperationBreakdownResponses = {
+    /**
+     * Downstream calls by exclusive time
+     */
+    200: OperationBreakdownResponse;
+};
+
+export type GetOperationBreakdownResponse = GetOperationBreakdownResponses[keyof GetOperationBreakdownResponses];
+
 export type GetDeploymentRegressionsData = {
     body?: never;
     path?: never;
@@ -70693,6 +70922,55 @@ export type GetOperationTrendResponses = {
 };
 
 export type GetOperationTrendResponse = GetOperationTrendResponses[keyof GetOperationTrendResponses];
+
+export type GetPageBackendData = {
+    body?: never;
+    path?: never;
+    query: {
+        project_id: number;
+        /**
+         * The page path, as the analytics SDK records it, e.g. `/checkout`.
+         */
+        path: string;
+        /**
+         * Window start (RFC 3339); defaults to 24 hours before `end_time`.
+         */
+        start_time?: string | null;
+        /**
+         * Window end (RFC 3339); defaults to now.
+         */
+        end_time?: string | null;
+    };
+    url: '/otel/pages/backend';
+};
+
+export type GetPageBackendErrors = {
+    /**
+     * A path not starting with /, or a window over 7 days
+     */
+    400: unknown;
+    /**
+     * Not authenticated
+     */
+    401: unknown;
+    /**
+     * Missing otel:read or project access
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetPageBackendResponses = {
+    /**
+     * Web vitals and backend timing of the page
+     */
+    200: PageBackendResponse;
+};
+
+export type GetPageBackendResponse = GetPageBackendResponses[keyof GetPageBackendResponses];
 
 export type GetPipelineHistoryData = {
     body?: never;

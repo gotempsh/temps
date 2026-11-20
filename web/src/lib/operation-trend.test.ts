@@ -3,6 +3,7 @@
 
 import { describe, expect, test } from 'bun:test'
 import {
+  formatShare,
   changePercent,
   comparableDeployments,
   deploymentMarkers,
@@ -83,5 +84,15 @@ describe('comparableDeployments', () => {
       { id: 4, status: 'pending', created_at: 4 },
     ])
     expect(list.map((d) => d.id)).toEqual([3, 1])
+  })
+})
+
+describe('formatShare', () => {
+  test('rounds to whole percents and keeps tiny shares visible', () => {
+    expect(formatShare(0.4249)).toBe('42%')
+    expect(formatShare(0.004)).toBe('<1%')
+    expect(formatShare(0)).toBe('0%')
+    expect(formatShare(1.3)).toBe('130%')
+    expect(formatShare(undefined)).toBe('—')
   })
 })
