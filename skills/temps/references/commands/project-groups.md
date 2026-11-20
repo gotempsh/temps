@@ -40,6 +40,8 @@ List projects (groups) and their services
 
 Show a project (group), by slug or id
 
+**Usage:** `project-groups show <group> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -64,6 +66,8 @@ Create a project (group), optionally with services
 
 Rename a project (group) or change its description
 
+**Usage:** `project-groups update <group> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -77,6 +81,8 @@ Rename a project (group) or change its description
 
 Delete a project (group); its services keep running as standalone services
 
+**Usage:** `project-groups delete <group> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -87,9 +93,13 @@ Delete a project (group); its services keep running as standalone services
 
 Add services to a project (group), by slug or id as listed by `projects list`; moves them out of any other project
 
+**Usage:** `project-groups add <group> <services...>`
+
 ### `project-groups remove`
 
 Remove a service (slug or id) from a project (group); it becomes a standalone service
+
+**Usage:** `project-groups remove <group> <service>`
 
 ### `project-groups repo`
 
@@ -105,6 +115,8 @@ The repository a project deploys its services from (monorepos)
 
 Show the project's repository and which services follow it
 
+**Usage:** `project-groups repo show <group> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -114,6 +126,8 @@ Show the project's repository and which services follow it
 #### `project-groups repo set`
 
 Point the project at a repository and branch; services that follow it are updated to match
+
+**Usage:** `project-groups repo set <group> [options]`
 
 **Options:**
 
@@ -129,6 +143,8 @@ Point the project at a repository and branch; services that follow it are update
 
 Remove the repository; services keep their current settings and stop following
 
+**Usage:** `project-groups repo unset <group> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -138,6 +154,8 @@ Remove the repository; services keep their current settings and stop following
 ### `project-groups import`
 
 Scan the project's repository and add its apps as services that follow it
+
+**Usage:** `project-groups import <group> [options]`
 
 **Options:**
 
@@ -152,9 +170,13 @@ Scan the project's repository and add its apps as services that follow it
 
 Make a service follow the project's repository and branch (keeps its directory)
 
+**Usage:** `project-groups follow <group> <service>`
+
 ### `project-groups unfollow`
 
 Stop a service following the project's repository; it keeps its current settings
+
+**Usage:** `project-groups unfollow <group> <service>`
 
 ### `project-groups routes`
 
@@ -170,6 +192,8 @@ Serve a path of one service's domains from another service (e.g. /api → backen
 
 List path routes and how each applies per environment
 
+**Usage:** `project-groups routes list <group> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -179,6 +203,8 @@ List path routes and how each applies per environment
 #### `project-groups routes add`
 
 Send requests under <prefix> on <source>'s domains to <target>, e.g. `routes add shop web /api api`
+
+**Usage:** `project-groups routes add <group> <source> <prefix> <target> [options]`
 
 **Options:**
 
@@ -190,6 +216,8 @@ Send requests under <prefix> on <source>'s domains to <target>, e.g. `routes add
 #### `project-groups routes remove` (alias: `rm`)
 
 Stop routing <prefix>; <source> serves it itself again
+
+**Usage:** `project-groups routes remove <group> <source> <prefix> [options]`
 
 **Options:**
 
@@ -212,6 +240,8 @@ Variables shared by every service in a project (group)
 
 List shared variables (secret values are never shown)
 
+**Usage:** `project-groups vars list <group> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -221,6 +251,8 @@ List shared variables (secret values are never shown)
 #### `project-groups vars set`
 
 Create or update a shared variable; a service's own variable still wins. Omit the value to type it at a hidden prompt, or pass --value-stdin to pipe it (keeps secrets out of shell history)
+
+**Usage:** `project-groups vars set <group> <key> [value] [options]`
 
 **Options:**
 
@@ -237,6 +269,8 @@ Create or update a shared variable; a service's own variable still wins. Omit th
 
 Show the shared variables a service (slug or id) receives from its project, and which of them the service's own variables override
 
+**Usage:** `project-groups vars inherited <service> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -246,6 +280,8 @@ Show the shared variables a service (slug or id) receives from its project, and 
 #### `project-groups vars unset`
 
 Remove a shared variable
+
+**Usage:** `project-groups vars unset <group> <key> [options]`
 
 **Options:**
 

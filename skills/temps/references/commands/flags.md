@@ -40,6 +40,8 @@ List feature flags
 
 Show a feature flag and its per-environment values
 
+**Usage:** `flags get <key> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -50,6 +52,8 @@ Show a feature flag and its per-environment values
 ### `flags create`
 
 Create a feature flag
+
+**Usage:** `flags create <key> [options]`
 
 **Options:**
 
@@ -66,6 +70,8 @@ Create a feature flag
 
 Update a flag definition (default value, description, visibility)
 
+**Usage:** `flags update <key> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -81,6 +87,8 @@ Update a flag definition (default value, description, visibility)
 
 Set a flag value in one environment
 
+**Usage:** `flags set <key> <value> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -93,6 +101,8 @@ Set a flag value in one environment
 
 Clear a flag override so the environment inherits the default
 
+**Usage:** `flags clear <key> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -103,6 +113,8 @@ Clear a flag override so the environment inherits the default
 ### `flags disable`
 
 Kill switch: serve the default in this environment, ignoring any override
+
+**Usage:** `flags disable <key> [options]`
 
 **Options:**
 
@@ -115,6 +127,8 @@ Kill switch: serve the default in this environment, ignoring any override
 
 Re-enable a flag in this environment after a kill switch
 
+**Usage:** `flags enable <key> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -126,6 +140,8 @@ Re-enable a flag in this environment after a kill switch
 
 Restore an archived flag
 
+**Usage:** `flags restore <key> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -135,6 +151,8 @@ Restore an archived flag
 ### `flags archive`
 
 Archive a flag (callers fall back to their own default)
+
+**Usage:** `flags archive <key> [options]`
 
 **Options:**
 

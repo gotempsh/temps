@@ -106,6 +106,9 @@ impl From<OtelError> for Problem {
                     .with_title("Project Not Found")
                     .with_detail(error.to_string())
             }
+            OtelError::DeploymentNotFound { .. } => problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("Deployment Not Found")
+                .with_detail(error.to_string()),
             OtelError::DashboardNotFound { .. } => {
                 warn!(error = %error, "OTel dashboard not found");
                 problemdetails::new(StatusCode::NOT_FOUND)

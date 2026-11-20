@@ -2,7 +2,7 @@
 
 > Auto-generated documentation for the Temps CLI.
 >
-> Generated on: 2026-11-18
+> Generated on: 2026-11-20
 
 ## Installation
 

@@ -240,6 +240,120 @@ impl SandboxService {
             .is_some_and(|row| placement::is_control_plane_role(&row.role)))
     }
 
+    pub(super) fn check_placement_backend(
+        &self,
+        node_id: Option<i32>,
+        backend: Option<temps_sandbox_providers::SandboxBackend>,
+    ) -> Result<(), SandboxError> {
+        let Some(backend) = backend else {
+            return Ok(());
+        };
+        if node_id.is_some() {
+            if !temps_sandbox_providers::WORKER_SANDBOX_BACKENDS.contains(&backend) {
+                return Err(SandboxError::Validation {
+                    message: placement::worker_backend_unavailable(backend),
+                });
+            }
+        } else if !temps_sandbox_providers::SELECTABLE_SANDBOX_BACKENDS.contains(&backend)
+            || !self.registry.provider_arc().supports_backend(backend)
+        {
+            return Err(SandboxError::Validation {
+                message: backend_unavailable_message(backend),
+            });
+        }
+        Ok(())
+    }
+
+    pub(super) fn resource_defaults(
+        &self,
+        node_id: Option<i32>,
+        backend: Option<temps_sandbox_providers::SandboxBackend>,
+        settings: &temps_config::AgentSandboxSettings,
+    ) -> temps_sandbox_providers::DefaultResourceLimits {
+        if node_id.is_none() {
+            self.registry
+                .provider_arc()
+                .default_resource_limits(backend)
+        } else {
+            temps_sandbox_providers::DefaultResourceLimits {
+                cpu_limit: Some(settings.cpu_limit),
+                memory_limit_mb: Some(settings.memory_limit_mb),
+                pids_limit: Some(temps_sandbox_providers::docker::DEFAULT_PIDS_LIMIT),
+                cpu_whole_cores: false,
+            }
+        }
+    }
+
+    pub async fn resource_hints(
+        &self,
+        user_id: i32,
+        node: Option<String>,
+        backend: Option<temps_sandbox_providers::SandboxBackend>,
+    ) -> Result<SandboxResourceHints, SandboxError> {
+        use crate::services::create_policy::{
+            max_cpu_limit, MAX_SANDBOX_MEMORY_MB, MAX_SANDBOX_PIDS_LIMIT,
+        };
+        let mut req = CreateSandboxRequest {
+            node,
+            ..Default::default()
+        };
+        let node_id = self.place_sandbox(&req).await?;
+        self.check_placement_backend(node_id, backend)?;
+        let settings = self
+            .platform_config
+            .get_agent_sandbox_settings()
+            .await
+            .map_err(|source| SandboxError::LimitSettings { user_id, source })?;
+        let defaults = self.resource_defaults(node_id, backend, &settings);
+        let host = self
+            .registry
+            .provider_arc()
+            .host_capacity(node_id, backend)
+            .await
+            .map_err(|e| crate::error::from_agent_error("sandbox placement", e))?;
+        let host_memory_mb = host.map(|h| h.memory_mb).or_else(|| {
+            node_id
+                .is_none()
+                .then(create_policy::control_plane_memory_mb)
+                .flatten()
+        });
+        create_policy::clamp_omitted_limits(&mut req, &settings, defaults);
+        create_policy::pin_omitted_memory_to_host(&mut req, defaults, host_memory_mb);
+        let cpu_bound = host.map_or(f64::MAX, |h| h.cpu_cores);
+        let max_cpu = max_cpu_limit(settings.max_cpu_limit, host.map(|h| h.cpu_cores));
+        Ok(SandboxResourceHints {
+            agent_cpu: settings.cpu_limit.min(cpu_bound),
+            agent_memory_mb: settings
+                .memory_limit_mb
+                .min(host_memory_mb.unwrap_or(u64::MAX)),
+            node_id,
+            host_cpu_cores: host.map(|h| h.cpu_cores),
+            host_memory_mb,
+            cpu: req
+                .cpu_limit
+                .or(defaults.cpu_limit)
+                .map(|v| v.min(cpu_bound)),
+            max_cpu: if defaults.cpu_whole_cores {
+                max_cpu.floor()
+            } else {
+                max_cpu
+            },
+            memory_mb: req.memory_limit_mb.or(defaults.memory_limit_mb),
+            max_memory_mb: settings
+                .max_memory_limit_mb
+                .unwrap_or(MAX_SANDBOX_MEMORY_MB)
+                .min(MAX_SANDBOX_MEMORY_MB)
+                .min(host_memory_mb.unwrap_or(u64::MAX)),
+            pids: req.pids_limit.or(defaults.pids_limit),
+            max_pids: settings
+                .max_pids_limit
+                .unwrap_or(MAX_SANDBOX_PIDS_LIMIT)
+                .min(MAX_SANDBOX_PIDS_LIMIT),
+            timeout_secs: DEFAULT_TIMEOUT_SECS,
+            max_timeout_secs: MAX_TIMEOUT_SECS,
+        })
+    }
+
     /// Every node with its sandbox placement state (control plane first).
     pub async fn placement_nodes(&self) -> Result<Vec<placement::PlacementNode>, SandboxError> {
         let policy = self.placement_policy().await?;

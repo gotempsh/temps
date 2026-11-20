@@ -140,6 +140,8 @@ Provision a new VPS instance
 
 Show VPS instance details and provisioning logs
 
+**Usage:** `cloud vps show <id> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -150,13 +152,19 @@ Show VPS instance details and provisioning logs
 
 Destroy a VPS instance
 
+**Usage:** `cloud vps destroy <id>`
+
 #### `cloud vps retry`
 
 Retry failed VPS provisioning
 
+**Usage:** `cloud vps retry <id>`
+
 #### `cloud vps credentials`
 
 Show VPS panel credentials
+
+**Usage:** `cloud vps credentials <id> [options]`
 
 **Options:**
 
@@ -312,6 +320,8 @@ Show where a project’s spans are written, what is queued, and any gaps
 
 Set the write mode to "local" (stored on this instance) or "cloud" (written to Temps Cloud, not stored here)
 
+**Usage:** `cloud telemetry write-mode set <mode> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -352,6 +362,8 @@ Switch many projects to Temps Cloud and ship their history in one job — estima
 
 Show the Temps Cloud activation running on this instance — progress, ETA, skips and failures
 
+**Usage:** `cloud telemetry bulk-status [batch_id] [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -362,6 +374,8 @@ Show the Temps Cloud activation running on this instance — progress, ETA, skip
 #### `cloud telemetry bulk-cancel`
 
 Stop a Temps Cloud activation at its next chunk boundary
+
+**Usage:** `cloud telemetry bulk-cancel <batch_id> [options]`
 
 **Options:**
 

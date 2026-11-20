@@ -2385,6 +2385,7 @@ fn span_stats_query(project_ids: Vec<i32>) -> SpanStatsQuery {
         sort_order: SortOrder::default(),
         limit: None,
         offset: None,
+        apdex_threshold_ms: None,
     }
 }
 

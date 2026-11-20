@@ -29,6 +29,8 @@ List registered span attribute facets
 
 Register an attribute key as a facet, making it fast to filter on across all traces. Backfills existing spans that carry the attribute. Capped at 20 facets platform-wide.
 
+**Usage:** `facets create <attribute-key> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -38,6 +40,8 @@ Register an attribute key as a facet, making it fast to filter on across all tra
 ### `facets remove` (alias: `rm`)
 
 Remove a registered facet, freeing its slot for reuse
+
+**Usage:** `facets remove <attribute-key> [options]`
 
 **Options:**
 
@@ -49,6 +53,8 @@ Remove a registered facet, freeing its slot for reuse
 ### `facets retry`
 
 Retry a failed historical backfill. Only valid when the facet's status is "failed" — resets progress and lets the background poller re-attempt from the beginning.
+
+**Usage:** `facets retry <attribute-key> [options]`
 
 **Options:**
 
