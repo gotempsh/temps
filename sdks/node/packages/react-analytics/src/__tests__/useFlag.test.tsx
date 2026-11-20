@@ -64,6 +64,35 @@ describe("useFlag", () => {
     expect(result.current.flags.get("checkout.v2", false)).toBe(true);
   });
 
+  it("applies later changes to the provider's disabled and flags props", async () => {
+    const fetchSpy = serveFlags();
+    const flagCalls = () => fetchSpy.mock.calls.filter(([url]) => String(url).endsWith("/flags"));
+    let props: { disabled: boolean; plan: string } = { disabled: true, plan: "free" };
+    const changing = ({ children }: { children: React.ReactNode }) => (
+      <TempsAnalyticsProvider ignoreLocalhost={false} disabled={props.disabled} flags={{ attributes: { plan: props.plan } }}>
+        {children}
+      </TempsAnalyticsProvider>
+    );
+    const { result, rerender } = renderHook(() => useFlag("checkout.v2", false), { wrapper: changing });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(flagCalls()).toHaveLength(0);
+
+    props = { disabled: false, plan: "free" };
+    rerender();
+    await waitFor(() => expect(result.current).toBe(true));
+    expect(flagCalls()).toHaveLength(1);
+
+    props = { disabled: false, plan: "pro" };
+    rerender();
+    await waitFor(() => expect(flagCalls()).toHaveLength(2));
+    expect(JSON.parse((flagCalls()[1][1] as RequestInit).body as string).attributes).toEqual({ plan: "pro" });
+
+    props = { disabled: true, plan: "team" };
+    rerender();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(flagCalls()).toHaveLength(2);
+  });
+
   it("re-evaluates with a new context on reload", async () => {
     const fetchSpy = serveFlags();
     const { result } = renderHook(() => useFeatureFlags(), { wrapper });

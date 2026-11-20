@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 "use client";
-import { useCallback, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useSyncExternalStore } from "react";
 import type { FeatureFlags, FlagContext } from "@temps-sdk/analytics-core";
 import { useTempsAnalytics } from "./Provider";
 
@@ -26,15 +26,29 @@ function useFlagsVersion(flags: FeatureFlags): number {
  */
 export function useFlag<T>(key: string, fallback: T): T {
   const { flags } = useTempsAnalytics();
-  useFlagsVersion(flags);
-  return flags.get(key, fallback);
+  const version = useFlagsVersion(flags);
+  const value = flags.peek(key, fallback);
+  // Fetching and exposure recording happen after commit, so a render React
+  // discards neither starts a request nor records an exposure. `get` dedupes
+  // per variant and records nothing when the value is not of `fallback`'s type.
+  useEffect(() => {
+    flags.get(key, fallback);
+    // `fallback` is deliberately left out: an inline object or array would
+    // re-run this on every render, and its type is all that matters here.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [flags, key, version]);
+  return value;
 }
 
 /** The variant served for a flag (`"control"`, `"test"`, ...), or `null`. */
 export function useFlagVariant(key: string): string | null {
   const { flags } = useTempsAnalytics();
-  useFlagsVersion(flags);
-  return flags.getVariant(key);
+  const version = useFlagsVersion(flags);
+  const variant = flags.peekVariant(key);
+  useEffect(() => {
+    flags.getVariant(key);
+  }, [flags, key, version]);
+  return variant;
 }
 
 /**

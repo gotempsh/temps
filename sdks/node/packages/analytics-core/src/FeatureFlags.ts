@@ -94,7 +94,7 @@ export class FeatureFlags {
   private readonly onExposure?: (exposure: FlagExposure) => void;
   private readonly onError: (error: Error) => void;
   private readonly fetchImpl?: typeof fetch;
-  private readonly disabled: boolean;
+  private disabled: boolean;
 
   private context: FlagContext;
   private results = new Map<string, FlagEvaluation>();
@@ -139,11 +139,26 @@ export class FeatureFlags {
   get<T>(key: string, fallback: T): T {
     this.ensureLoaded();
     const evaluation = this.results.get(key);
+    if (evaluation && compatible(evaluation.value, fallback)) this.recordExposure(evaluation);
+    return this.peek(key, fallback);
+  }
+
+  /**
+   * What `get` would return, without starting the request or recording an
+   * exposure. For render phases that must stay free of side effects; pair it
+   * with a `get` after commit.
+   */
+  peek<T>(key: string, fallback: T): T {
+    const evaluation = this.results.get(key);
     if (!evaluation) {
       return this.bootstrap.has(key) ? sameType(this.bootstrap.get(key), fallback) : fallback;
     }
-    this.recordExposure(evaluation);
     return sameType(evaluation.value, fallback);
+  }
+
+  /** What `getVariant` would return, without side effects. */
+  peekVariant(key: string): string | null {
+    return this.results.get(key)?.variant ?? null;
   }
 
   /** The variant served for `key`, or `null`. */
@@ -153,6 +168,34 @@ export class FeatureFlags {
     if (!evaluation) return null;
     this.recordExposure(evaluation);
     return evaluation.variant;
+  }
+
+  /**
+   * Replace the evaluation context (unlike `reload`, attributes are not
+   * merged). Re-fetches only if flags were already requested, so an unread
+   * client stays lazy.
+   */
+  setContext(context: FlagContext): void {
+    this.context = { key: context.key, attributes: context.attributes };
+    if (this.currentStatus !== "idle") void this.load();
+  }
+
+  /**
+   * Turn fetching off or on. Disabling drops any request in flight; enabling
+   * fetches on the next read.
+   */
+  setDisabled(disabled: boolean): void {
+    if (disabled === this.disabled) return;
+    this.disabled = disabled;
+    if (disabled) {
+      this.generation += 1;
+      this.inflight = null;
+      if (this.currentStatus === "loading") this.currentStatus = "idle";
+    } else if (this.currentStatus !== "idle") {
+      void this.load();
+      return;
+    }
+    this.notify();
   }
 
   /** The full evaluation for `key`, for debugging. Records no exposure. */
@@ -207,6 +250,12 @@ export class FeatureFlags {
     // not be overwritten by the anonymous request still in flight.
     const generation = ++this.generation;
     this.currentStatus = "loading";
+    // Subscribers re-render on `version`, so the loading state is visible.
+    // Deferred: a read during render can start this load, and notifying a
+    // store's subscribers synchronously from inside a render is not allowed.
+    void Promise.resolve().then(() => {
+      if (generation === this.generation && this.currentStatus === "loading") this.notify();
+    });
     const body = JSON.stringify({ key: this.context.key, attributes: this.context.attributes ?? {} });
 
     const request = (async () => {
@@ -223,23 +272,31 @@ export class FeatureFlags {
         const parsed = (await response.json()) as FlagsResponseBody;
         if (generation !== this.generation) return;
         this.results = new Map((parsed.flags ?? []).map((flag) => [flag.key, flag]));
+        // The response is authoritative: a bootstrapped flag it omits was
+        // removed, archived or made server-only, so it now serves the
+        // fallback. A failed request keeps the bootstrap values.
+        this.bootstrap.clear();
         this.currentStatus = "ready";
       } catch (error) {
         if (generation !== this.generation) return;
         this.currentStatus = "error";
         this.onError(error instanceof Error ? error : new Error(String(error)));
       }
-      this.revision += 1;
-      for (const listener of [...this.listeners]) {
-        try {
-          listener();
-        } catch {
-          // A failing subscriber must not stop the others.
-        }
-      }
+      this.notify();
     })();
     this.inflight = request;
     return request;
+  }
+
+  private notify(): void {
+    this.revision += 1;
+    for (const listener of [...this.listeners]) {
+      try {
+        listener();
+      } catch {
+        // A failing subscriber must not stop the others.
+      }
+    }
   }
 
   private recordExposure(evaluation: FlagEvaluation): void {
@@ -259,11 +316,15 @@ export class FeatureFlags {
 /** Serve `value` only if it has the fallback's shape, so a typed call site
  * never receives a string where it expected a boolean. */
 function sameType<T>(value: unknown, fallback: T): T {
-  if (fallback === null || fallback === undefined) return value as T;
-  if (value === null || value === undefined) return fallback;
-  if (typeof value !== typeof fallback) return fallback;
-  if (Array.isArray(fallback) !== Array.isArray(value)) return fallback;
-  return value as T;
+  return compatible(value, fallback) ? (value as T) : fallback;
+}
+
+/** Whether `value` can be served where `fallback`'s type is expected. */
+function compatible(value: unknown, fallback: unknown): boolean {
+  if (fallback === null || fallback === undefined) return true;
+  if (value === null || value === undefined) return false;
+  if (typeof value !== typeof fallback) return false;
+  return Array.isArray(fallback) === Array.isArray(value);
 }
 
 /** Event data for a `flag_exposure` analytics event. */

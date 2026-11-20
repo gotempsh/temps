@@ -52,12 +52,37 @@ describe("FeatureFlags", () => {
     expect(flags.get("other", "fallback")).toBe("x");
     await flags.ready();
     expect(flags.get("checkout.v2", false)).toBe(true);
+    // The response omitted `other` (removed, archived or server-only), so
+    // its bootstrap value is retired.
+    expect(flags.get("other", "fallback")).toBe("fallback");
   });
 
-  it("never serves a value of the wrong type", async () => {
-    const flags = new FeatureFlags({ fetch: served([{ ...checkout, value: "yes" }]) });
+  it("keeps bootstrap values when the request fails", async () => {
+    const flags = new FeatureFlags({ fetch: served([], 503), bootstrap: { other: "x" }, onError: () => {} });
+    await flags.ready();
+    expect(flags.status).toBe("error");
+    expect(flags.get("other", "fallback")).toBe("x");
+  });
+
+  it("never serves a value of the wrong type, and records no exposure for it", async () => {
+    const onExposure = vi.fn();
+    const flags = new FeatureFlags({ fetch: served([{ ...checkout, value: "yes" }]), onExposure });
     await flags.ready();
     expect(flags.get("checkout.v2", false)).toBe(false);
+    expect(onExposure).not.toHaveBeenCalled();
+  });
+
+  it("peeks without fetching or recording an exposure", async () => {
+    const onExposure = vi.fn();
+    const fetch = served([checkout]);
+    const flags = new FeatureFlags({ fetch, onExposure });
+    expect(flags.peek("checkout.v2", false)).toBe(false);
+    expect(fetch).not.toHaveBeenCalled();
+    flags.get("checkout.v2", false);
+    await flags.ready();
+    expect(flags.peek("checkout.v2", false)).toBe(true);
+    expect(flags.peekVariant("checkout.v2")).toBe("test");
+    expect(onExposure).not.toHaveBeenCalled();
   });
 
   it("keeps fallbacks and reports the error when the request fails", async () => {
@@ -96,9 +121,13 @@ describe("FeatureFlags", () => {
     const listener = vi.fn();
     flags.subscribe(listener);
     const before = flags.version;
-    await flags.ready();
+    const request = flags.ready();
+    await Promise.resolve();
+    expect(flags.status).toBe("loading");
     expect(listener).toHaveBeenCalledOnce();
-    expect(flags.version).toBe(before + 1);
+    await request;
+    expect(listener).toHaveBeenCalledTimes(2);
+    expect(flags.version).toBe(before + 2);
   });
 
   it("lets a reload win over an older request still in flight", async () => {
@@ -117,6 +146,39 @@ describe("FeatureFlags", () => {
 
     expect(flags.get("checkout.v2", false)).toBe(true);
     expect(JSON.parse((fetch.mock.calls[1][1] as RequestInit).body as string).key).toBe("user-1");
+  });
+
+  it("replaces the context, re-fetching only once flags were requested", async () => {
+    const fetch = served([checkout]);
+    const flags = new FeatureFlags({ fetch, key: "anon", attributes: { plan: "free", beta: true } });
+    flags.setContext({ key: "user-1", attributes: { plan: "pro" } });
+    expect(fetch).not.toHaveBeenCalled();
+
+    await flags.ready();
+    flags.setContext({ key: "user-2", attributes: { plan: "team" } });
+    await flags.ready();
+    expect(fetch).toHaveBeenCalledTimes(2);
+    const bodies = fetch.mock.calls.map((call) => JSON.parse((call as unknown as [string, RequestInit])[1].body as string));
+    expect(bodies[0]).toEqual({ key: "user-1", attributes: { plan: "pro" } });
+    expect(bodies[1]).toEqual({ key: "user-2", attributes: { plan: "team" } });
+  });
+
+  it("can be disabled and re-enabled after construction", async () => {
+    const fetch = served([checkout]);
+    const flags = new FeatureFlags({ fetch, disabled: true });
+    flags.get("checkout.v2", false);
+    expect(fetch).not.toHaveBeenCalled();
+
+    flags.setDisabled(false);
+    expect(flags.get("checkout.v2", false)).toBe(false);
+    await flags.ready();
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(flags.get("checkout.v2", false)).toBe(true);
+
+    flags.setDisabled(true);
+    flags.setContext({ key: "user-1" });
+    flags.get("checkout.v2", false);
+    expect(fetch).toHaveBeenCalledTimes(1);
   });
 
   it("never fetches when disabled", async () => {
