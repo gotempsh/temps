@@ -927,6 +927,14 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
             "delete_error_saved_search",
         ],
     ),
+    (
+        "the bytes of an error or feedback attachment (ADR 111, D4) can hold anything an SDK captured (screenshots, logs, request dumps) and are served for a person to open; deleting one and setting the attachment quota are made in the console or CLI",
+        &[
+            "get_error_attachment_content",
+            "delete_error_attachment",
+            "set_error_attachment_quota",
+        ],
+    ),
 ];
 
 /// Allowlisted ids that are served by a plugin and so are not in the published

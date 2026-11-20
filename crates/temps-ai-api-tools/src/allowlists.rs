@@ -137,6 +137,11 @@ pub const AI_READ_ALLOWLIST: &[&str] = &[
     "get_page_backend",
     "list_release_health",
     "get_release_health_series",
+    // Attachments (ADR 111, D4): file names, types and sizes, and the
+    // project's attachment usage. Not the files themselves.
+    "list_error_event_attachments",
+    "list_feedback_attachments",
+    "get_error_attachment_usage",
     "list_alert_rules",
     "get_alert_rule",
     // ── Metric alert rules (OTel) — the rules themselves, so the AI can
