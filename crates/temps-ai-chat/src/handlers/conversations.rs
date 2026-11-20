@@ -677,6 +677,21 @@ pub async fn get_global_ai_workspace(
             application_workspace_provider_problem(error, &workspace_id, "inspect global workspace")
         })?;
     let defaults = temps_sandbox::services::ApplicationWorkspaceConfig::default();
+    let capacity = sandboxes
+        .application_workspace_capacity(
+            &workspace_id,
+            &defaults,
+            summary.as_ref().and_then(|s| s.backend.as_deref()),
+        )
+        .await
+        .map_err(|error| {
+            application_workspace_provider_problem(
+                error,
+                &workspace_id,
+                "inspect workspace capacity",
+            )
+        })?;
+    let (cpu_limit, memory_limit_mb) = defaults.display_limits(capacity);
     let mut diagnostic = None;
     let usage = if let Some(summary) = summary
         .as_ref()
@@ -726,8 +741,8 @@ pub async fn get_global_ai_workspace(
         runtime_update_available: false,
         runtime_update_image: None,
         runtime_update_error: None,
-        cpu_limit: defaults.cpu_limit,
-        memory_limit_mb: defaults.memory_limit_mb as i64,
+        cpu_limit,
+        memory_limit_mb: memory_limit_mb as i64,
         pids_limit: defaults.pids_limit,
         disk_limit_mb: defaults.disk_limit_mb as i64,
         disk_limit_enforced: summary

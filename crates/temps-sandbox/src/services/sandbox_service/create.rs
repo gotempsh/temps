@@ -467,7 +467,7 @@ impl SandboxService {
 
         let container_label = container_label_for(&public_id_value).to_string();
 
-        let config = SandboxCreateConfig {
+        let mut config = SandboxCreateConfig {
             node_id,
             owner_user_id: None,
             run_id: row.id,
@@ -486,6 +486,15 @@ impl SandboxService {
             idle_timeout: Duration::from_secs(timeout),
             backend,
         };
+
+        if managed_application_id.is_some() {
+            if let Err(error) = self.apply_application_limits(&mut config).await {
+                // No provider create was attempted. Only the new row belongs to
+                // this attempt; retain the application's existing directory.
+                self.mark_destroyed(row.id).await?;
+                return Err(from_agent_error(&public_id_value, error));
+            }
+        }
 
         // Choose create path: snapshot restore vs normal create. The
         // provider reports its steps (image, container create and start,

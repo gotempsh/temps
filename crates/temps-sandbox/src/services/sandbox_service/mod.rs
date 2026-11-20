@@ -50,6 +50,7 @@ use crate::services::row_status::{self, Expect};
 use crate::services::snapshot_service::SnapshotService;
 
 mod agent_run;
+mod application_resources;
 mod application_workspace;
 mod create;
 mod data_network;

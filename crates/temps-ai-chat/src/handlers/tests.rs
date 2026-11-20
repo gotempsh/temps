@@ -761,10 +761,23 @@ fn application_workspace_image_pull_failure_is_a_503() {
         reason: "manifest unknown".to_string(),
     };
 
-    let problem = application_workspace_failure_problem(&error);
-
-    assert_eq!(problem.status_code, StatusCode::SERVICE_UNAVAILABLE);
     assert!(application_workspace_failure_detail(&error).contains("image tag is published"));
+    let problem = application_workspace_failure_problem(error);
+    assert_eq!(problem.status_code, StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[test]
+fn application_workspace_cpu_override_explains_host_range() {
+    let problem =
+        application_workspace_failure_problem(temps_sandbox::error::SandboxError::CpuLimit {
+            sandbox_id: "workspace".into(),
+            requested: 4.0,
+            host: 2.0,
+            max: 2.0,
+        });
+    assert_eq!(problem.status_code, StatusCode::BAD_REQUEST);
+    let message = serde_json::to_string(&problem.body).unwrap_or_default();
+    assert!(message.contains("4") && message.contains("0.01") && message.contains("2"));
 }
 
 #[test]

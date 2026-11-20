@@ -58,25 +58,35 @@ pub(super) fn application_workspace_failure_detail(
 }
 
 pub(super) fn application_workspace_failure_problem(
-    error: &temps_sandbox::error::SandboxError,
+    error: temps_sandbox::error::SandboxError,
 ) -> Problem {
     use temps_sandbox::error::SandboxError;
 
-    let status = match error {
+    if matches!(error, SandboxError::CpuLimit { .. }) {
+        return Problem::from(error);
+    }
+    let detail = application_workspace_failure_detail(&error);
+    // Workspace clients see only the public diagnostic. Reuse the sandbox
+    // handler's exhaustive status mapping for errors the workspace API exposes.
+    let status = if matches!(
+        error,
         SandboxError::Unavailable { .. }
-        | SandboxError::ImageUnavailable { .. }
-        | SandboxError::NetworkCapacityExhausted { .. } => StatusCode::SERVICE_UNAVAILABLE,
-        SandboxError::Timeout { .. } => StatusCode::GATEWAY_TIMEOUT,
-        SandboxError::InvalidState { .. } | SandboxError::RuntimeVariableConflict { .. } => {
-            StatusCode::CONFLICT
-        }
-        SandboxError::RuntimeEnvironmentNotFound { .. } => StatusCode::NOT_FOUND,
-        SandboxError::RuntimeCredentialsFailed { .. } => StatusCode::BAD_GATEWAY,
-        _ => StatusCode::INTERNAL_SERVER_ERROR,
+            | SandboxError::ImageUnavailable { .. }
+            | SandboxError::NetworkCapacityExhausted { .. }
+            | SandboxError::Timeout { .. }
+            | SandboxError::InvalidState { .. }
+            | SandboxError::RuntimeVariableConflict { .. }
+            | SandboxError::RuntimeEnvironmentNotFound { .. }
+            | SandboxError::RuntimeCredentialsFailed { .. }
+            | SandboxError::Validation { .. }
+    ) {
+        Problem::from(error).status_code
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
     };
     problemdetails::new(status)
         .with_title("Application Workspace Failed")
-        .with_detail(application_workspace_failure_detail(error))
+        .with_detail(detail)
 }
 
 pub(super) fn application_workspace_provider_problem(
@@ -90,7 +100,7 @@ pub(super) fn application_workspace_provider_problem(
         operation,
         "application workspace provider operation failed"
     );
-    application_workspace_failure_problem(&error)
+    application_workspace_failure_problem(error)
 }
 
 pub(super) fn application_workspace_snapshot_problem(
@@ -248,7 +258,7 @@ pub(super) async fn application_workspace_sandbox(
                     "failed to persist application workspace startup diagnostic"
                 );
             }
-            return Err(application_workspace_failure_problem(&error));
+            return Err(application_workspace_failure_problem(error));
         }
     };
     state

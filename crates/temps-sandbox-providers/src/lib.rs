@@ -292,6 +292,7 @@ pub struct SandboxHandle {
 }
 
 /// Configuration for creating a new sandbox.
+#[derive(Clone)]
 pub struct SandboxCreateConfig {
     /// Permit guest Docker installation by retaining normal guest-root semantics.
     /// Only microsandbox supports this opt-in; never grants host Docker access.
