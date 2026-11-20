@@ -507,12 +507,20 @@ impl NodeProbeLocations {
             // Nothing secret to protect: the target and check are shown to
             // anyone who can read the monitor.
             Err(_) if request.request.is_empty() => builder.json(request),
-            Err(source) => return Err(NodeProbeError::NotSealed { node: name(), source }),
+            Err(source) => {
+                return Err(NodeProbeError::NotSealed {
+                    node: name(),
+                    source,
+                })
+            }
         };
         let mut response = builder
             .send()
             .await
-            .map_err(|source| NodeProbeError::Unreachable { node: name(), source })?;
+            .map_err(|source| NodeProbeError::Unreachable {
+                node: name(),
+                source,
+            })?;
         let status = response.status();
         if status == reqwest::StatusCode::NOT_FOUND {
             return Err(NodeProbeError::AgentTooOld { node: name() });
@@ -521,10 +529,14 @@ impl NodeProbeLocations {
             return Err(NodeProbeError::SealingUnsupported { node: name() });
         }
         let mut body = Vec::new();
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|source| NodeProbeError::AnswerUnreadable { node: name(), source })?
+        while let Some(chunk) =
+            response
+                .chunk()
+                .await
+                .map_err(|source| NodeProbeError::AnswerUnreadable {
+                    node: name(),
+                    source,
+                })?
         {
             if body.len() + chunk.len() > MAX_ANSWER_BYTES {
                 return Err(NodeProbeError::AnswerTooLarge {
@@ -747,7 +759,9 @@ mod tests {
         };
         assert!(error.to_string().contains("node 9"), "{error}");
         assert!(
-            error.source().is_some_and(|source| source.to_string().contains("connection reset")),
+            error
+                .source()
+                .is_some_and(|source| source.to_string().contains("connection reset")),
             "the database error stays the source"
         );
         let refused = NodeProbeError::Refused {
@@ -755,7 +769,10 @@ mod tests {
             status: 429,
             reason: "this node is already running 16 uptime checks".into(),
         };
-        assert!(matches!(refused, NodeProbeError::Refused { status: 429, .. }));
+        assert!(matches!(
+            refused,
+            NodeProbeError::Refused { status: 429, .. }
+        ));
         assert!(refused.to_string().contains("HTTP 429"), "{refused}");
     }
 
