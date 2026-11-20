@@ -306,7 +306,7 @@ export function registerSavedLogCommands(logs: Command): void {
         ])
         if (data.partial_before)
           warning(
-            `Counted by a capped scan: buckets before ${data.partial_before} have no value.`,
+            `Counted by a capped scan: the bucket holding ${data.partial_before} and older ones have no value.`,
           )
       },
     )

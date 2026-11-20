@@ -45991,7 +45991,7 @@
             "$ref": "#/components/schemas/LogSeriesMethod"
           },
           "partial_before": {
-            "description": "Set when a scan stopped at its cap: buckets ending before this time\nhave no value.",
+            "description": "Set when a scan stopped before the window's start: the bucket this\ntime falls in and every older bucket have no value, since lines at or\nbefore it may not have been read.",
             "format": "date-time",
             "type": [
               "string",

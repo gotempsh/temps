@@ -96,8 +96,9 @@ pub enum LogSeriesMethod {
 #[derive(Debug, Clone, PartialEq, Serialize, ToSchema)]
 pub struct LogSeries {
     pub points: Vec<LogSeriesPoint>,
-    /// Set when a scan stopped at its cap: buckets ending before this time
-    /// have no value.
+    /// Set when a scan stopped before the window's start: the bucket this
+    /// time falls in and every older bucket have no value, since lines at or
+    /// before it may not have been read.
     #[schema(value_type = Option<String>, format = DateTime)]
     pub partial_before: Option<DateTime<Utc>>,
     pub method: LogSeriesMethod,
@@ -331,9 +332,10 @@ impl LogSeriesService {
     /// A count is read from the line index plus the unsealed head buffers in
     /// one query. When the index cannot answer (a text needle, or no index),
     /// the window is scanned once, newest first, up to
-    /// [`SERIES_SCAN_CAP`] lines; buckets older than the oldest line reached
-    /// are reported with no value and `partial_before` says from when, so a
-    /// chart never draws zero where nothing was counted. A numeric field over
+    /// [`SERIES_SCAN_CAP`] lines; the bucket holding the oldest line reached
+    /// and every older one are reported with no value and `partial_before`
+    /// says from when, so a chart never draws zero, or a part of a bucket's
+    /// count, where not every line was counted. A numeric field over
     /// time needs the index and no text needle, and at most
     /// [`MAX_NUMERIC_SERIES_BUCKETS`] buckets (one indexed aggregate each).
     pub async fn series(
@@ -519,12 +521,15 @@ impl LogSeriesService {
         // stopped the scan, the store's own horizon when its budget did, and
         // `None` when the window was read to its start.
         let values = counts.into_iter().enumerate().map(|(slot, count)| {
-            let bucket_end =
-                start + chrono::Duration::seconds(i64::from(bucket_secs) * (slot as i64 + 1));
+            let bucket_start =
+                start + chrono::Duration::seconds(i64::from(bucket_secs) * slot as i64);
             match partial_before {
-                // A bucket that ends before the oldest line reached was not
-                // (fully) counted: no value, not zero.
-                Some(cutoff) if bucket_end <= cutoff => None,
+                // Lines at or before the cutoff may be unread: lines sharing
+                // the oldest counted line's timestamp past the cap, or a chunk
+                // ending at the horizon. A bucket starting there or earlier
+                // is incomplete, so it has no value rather than a part of its
+                // count.
+                Some(cutoff) if bucket_start <= cutoff => None,
                 _ => Some(count as f64),
             }
         });
@@ -1308,7 +1313,8 @@ mod tests {
     #[tokio::test]
     async fn a_capped_scan_leaves_older_buckets_without_a_value() {
         // Every page is full and has more: only the cap stops the scan. All
-        // lines sit in the last minute, so earlier buckets were never reached.
+        // lines sit in the last minute, so earlier buckets were never reached,
+        // and the last one may hold more lines than the cap let it count.
         let full_page = || LogPage {
             lines: (0..COUNT_PAGE_SIZE).map(|_| at_minute(9)).collect(),
             next_cursor: Some(LogLineKey {
@@ -1326,15 +1332,97 @@ mod tests {
             .series(7, &text_query(), request(10, Metric::Count))
             .await
             .expect("series");
-        assert_eq!(series.points[9].value, Some(SERIES_SCAN_CAP as f64));
-        assert!(series.partial_before.is_some());
+        assert_eq!(series.partial_before, Some(at_minute(9).timestamp));
         assert!(
-            series.points[..9].iter().all(|p| p.value.is_none()),
+            series.points.iter().all(|p| p.value.is_none()),
             "an uncounted bucket is not zero: {:?}",
             series.points
         );
         let read: u64 = store.limits().iter().map(|l| u64::from(*l)).sum();
         assert_eq!(read, SERIES_SCAN_CAP, "the scan reads exactly the cap");
+    }
+
+    #[tokio::test]
+    async fn a_scan_capped_inside_a_bucket_leaves_that_bucket_without_a_value() {
+        // The cap is reached halfway through minute 8: minute 9 was read in
+        // full, minute 8 only from its 10th second on.
+        let newest = LogPage {
+            lines: (0..COUNT_PAGE_SIZE).map(|_| at_minute(9)).collect(),
+            next_cursor: Some(LogLineKey {
+                timestamp: t0(),
+                container_id: "c1".into(),
+                line_id: 1,
+            }),
+            scanned_back_to: None,
+        };
+        let older = || LogPage {
+            lines: (0..COUNT_PAGE_SIZE).map(|_| at_minute(8)).collect(),
+            next_cursor: Some(LogLineKey {
+                timestamp: t0(),
+                container_id: "c1".into(),
+                line_id: 1,
+            }),
+            scanned_back_to: None,
+        };
+        let mut pages = vec![newest];
+        pages.extend((0..SERIES_SCAN_CAP / u64::from(COUNT_PAGE_SIZE)).map(|_| older()));
+        let store = Arc::new(ScriptedStore::new(pages));
+        let series = series_service(store, None)
+            .series(7, &text_query(), request(10, Metric::Count))
+            .await
+            .expect("series");
+        let values: Vec<Option<f64>> = series.points.iter().map(|p| p.value).collect();
+        assert_eq!(values[9], Some(f64::from(COUNT_PAGE_SIZE)));
+        assert!(
+            values[..9].iter().all(Option::is_none),
+            "the bucket the cap stopped in is not a full count: {values:?}"
+        );
+        assert_eq!(series.partial_before, Some(at_minute(8).timestamp));
+    }
+
+    #[tokio::test]
+    async fn a_scan_out_of_budget_inside_a_bucket_leaves_that_bucket_without_a_value() {
+        // The store's budget ran out with every chunk ending after 12:03:30
+        // searched: minute 3 was only partly read.
+        let horizon = t0() + Duration::minutes(3) + Duration::seconds(30);
+        let store = Arc::new(ScriptedStore::new(vec![LogPage {
+            lines: vec![at_minute(4), at_minute(3)],
+            next_cursor: Some(LogLineKey {
+                timestamp: horizon,
+                container_id: "c1".into(),
+                line_id: 1,
+            }),
+            scanned_back_to: Some(horizon),
+        }]));
+        let series = series_service(store, None)
+            .series(7, &text_query(), request(5, Metric::Count))
+            .await
+            .expect("series");
+        let values: Vec<Option<f64>> = series.points.iter().map(|p| p.value).collect();
+        assert_eq!(values, vec![None, None, None, None, Some(1.0)]);
+        assert_eq!(series.partial_before, Some(horizon));
+    }
+
+    #[tokio::test]
+    async fn a_horizon_on_a_bucket_boundary_leaves_that_bucket_without_a_value() {
+        // A chunk ending exactly at the horizon was not searched, and it can
+        // hold lines stamped at the boundary, the first instant of minute 3.
+        let horizon = t0() + Duration::minutes(3);
+        let store = Arc::new(ScriptedStore::new(vec![LogPage {
+            lines: vec![at_minute(4), at_minute(3)],
+            next_cursor: Some(LogLineKey {
+                timestamp: horizon,
+                container_id: "c1".into(),
+                line_id: 1,
+            }),
+            scanned_back_to: Some(horizon),
+        }]));
+        let series = series_service(store, None)
+            .series(7, &text_query(), request(5, Metric::Count))
+            .await
+            .expect("series");
+        let values: Vec<Option<f64>> = series.points.iter().map(|p| p.value).collect();
+        assert_eq!(values, vec![None, None, None, None, Some(1.0)]);
     }
 
     #[tokio::test]

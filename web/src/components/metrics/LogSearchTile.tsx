@@ -28,7 +28,8 @@ interface LogSearchTileProps {
 /**
  * A dashboard tile charting a saved log search over time: matching lines
  * per bucket, or a numeric field. When the server counted by a capped scan,
- * the buckets it never reached have no value, and the tile says from when.
+ * the bucket it stopped in and the older ones have no value, and the tile
+ * says from when.
  */
 export function LogSearchTile({
   projectId,
@@ -119,8 +120,8 @@ export function LogSearchTile({
       <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground">
         {partialBefore ? (
           <span className="text-[11px]">
-            Counted from {formatBucketLabel(partialBefore)}; older buckets were
-            not scanned
+            Only lines after {formatBucketLabel(partialBefore)} were counted;
+            that bucket and older ones have no value
           </span>
         ) : (
           <span className="text-[10px] uppercase tracking-wide">latest</span>

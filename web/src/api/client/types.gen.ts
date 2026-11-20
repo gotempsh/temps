@@ -21310,8 +21310,9 @@ export type LogSearchLine = {
 export type LogSeries = {
     method: LogSeriesMethod;
     /**
-     * Set when a scan stopped at its cap: buckets ending before this time
-     * have no value.
+     * Set when a scan stopped before the window's start: the bucket this
+     * time falls in and every older bucket have no value, since lines at or
+     * before it may not have been read.
      */
     partial_before?: string | null;
     points: Array<LogSeriesPoint>;
