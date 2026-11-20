@@ -420,6 +420,27 @@ export const updateSpeedMetricsMutation = (options?: Partial<Options<UpdateSpeed
     return mutationOptions;
 };
 
+/**
+ * The active surveys the visitor making this request may see.
+ *
+ * Unauthenticated: the project comes from the `Host` the browser called.
+ * Answers are recorded through the analytics event endpoint as
+ * `survey_shown`, `survey_dismissed` and `survey_sent`.
+ */
+export const publicSurveysMutation = (options?: Partial<Options<PublicSurveysData>>): UseMutationOptions<PublicSurveysResponse2, DefaultError, Options<PublicSurveysData>> => {
+    const mutationOptions: UseMutationOptions<PublicSurveysResponse2, DefaultError, Options<PublicSurveysData>> = {
+        mutationFn: async (fnOptions) => {
+            const { data } = await publicSurveys({
+                ...options,
+                ...fnOptions,
+                throwOnError: true
+            });
+            return data;
+        }
+    };
+    return mutationOptions;
+};
+
 export const listAccessServicesGeneralQueryKey = (options?: Options<ListAccessServicesGeneralData>) => createQueryKey('listAccessServicesGeneral', options);
 
 export const listAccessServicesGeneralOptions = (options?: Options<ListAccessServicesGeneralData>) => queryOptions<ListAccessServicesGeneralResponse, DefaultError, ListAccessServicesGeneralResponse, ReturnType<typeof listAccessServicesGeneralQueryKey>>({
@@ -24989,6 +25010,189 @@ export const getStatusOverviewOptions = (options: Options<GetStatusOverviewData>
     queryKey: getStatusOverviewQueryKey(options)
 });
 
+export const listSurveysQueryKey = (options: Options<ListSurveysData>) => createQueryKey('listSurveys', options);
+
+export const listSurveysOptions = (options: Options<ListSurveysData>) => queryOptions<ListSurveysResponse, DefaultError, ListSurveysResponse, ReturnType<typeof listSurveysQueryKey>>({
+    queryFn: async ({ queryKey, signal }) => {
+        const { data } = await listSurveys({
+            ...options,
+            ...queryKey[0],
+            signal,
+            throwOnError: true
+        });
+        return data;
+    },
+    queryKey: listSurveysQueryKey(options)
+});
+
+export const listSurveysInfiniteQueryKey = (options: Options<ListSurveysData>): QueryKey<Options<ListSurveysData>> => createQueryKey('listSurveys', options, true);
+
+export const listSurveysInfiniteOptions = (options: Options<ListSurveysData>) => {
+    const opts = infiniteQueryOptions<ListSurveysResponse, DefaultError, InfiniteData<ListSurveysResponse>, QueryKey<Options<ListSurveysData>>, number | Pick<QueryKey<Options<ListSurveysData>>[0], 'body' | 'headers' | 'path' | 'query'>>(
+    // @ts-ignore
+    {
+        queryFn: async ({ pageParam, queryKey, signal }) => {
+            // @ts-ignore
+            const page: Pick<QueryKey<Options<ListSurveysData>>[0], 'body' | 'headers' | 'path' | 'query'> = typeof pageParam === 'object' ? pageParam : {
+                query: {
+                    page: pageParam
+                }
+            };
+            const params = createInfiniteParams(queryKey, page);
+            const { data } = await listSurveys({
+                ...options,
+                ...params,
+                signal,
+                throwOnError: true
+            });
+            return data;
+        },
+        queryKey: listSurveysInfiniteQueryKey(options)
+    });
+    return opts as Omit<typeof opts, 'initialData'>;
+};
+
+export const createSurveyMutation = (options?: Partial<Options<CreateSurveyData>>): UseMutationOptions<CreateSurveyResponse, DefaultError, Options<CreateSurveyData>> => {
+    const mutationOptions: UseMutationOptions<CreateSurveyResponse, DefaultError, Options<CreateSurveyData>> = {
+        mutationFn: async (fnOptions) => {
+            const { data } = await createSurvey({
+                ...options,
+                ...fnOptions,
+                throwOnError: true
+            });
+            return data;
+        }
+    };
+    return mutationOptions;
+};
+
+export const deleteSurveyMutation = (options?: Partial<Options<DeleteSurveyData>>): UseMutationOptions<DeleteSurveyResponse2, DefaultError, Options<DeleteSurveyData>> => {
+    const mutationOptions: UseMutationOptions<DeleteSurveyResponse2, DefaultError, Options<DeleteSurveyData>> = {
+        mutationFn: async (fnOptions) => {
+            const { data } = await deleteSurvey({
+                ...options,
+                ...fnOptions,
+                throwOnError: true
+            });
+            return data;
+        }
+    };
+    return mutationOptions;
+};
+
+export const getSurveyQueryKey = (options: Options<GetSurveyData>) => createQueryKey('getSurvey', options);
+
+export const getSurveyOptions = (options: Options<GetSurveyData>) => queryOptions<GetSurveyResponse, DefaultError, GetSurveyResponse, ReturnType<typeof getSurveyQueryKey>>({
+    queryFn: async ({ queryKey, signal }) => {
+        const { data } = await getSurvey({
+            ...options,
+            ...queryKey[0],
+            signal,
+            throwOnError: true
+        });
+        return data;
+    },
+    queryKey: getSurveyQueryKey(options)
+});
+
+export const updateSurveyMutation = (options?: Partial<Options<UpdateSurveyData>>): UseMutationOptions<UpdateSurveyResponse, DefaultError, Options<UpdateSurveyData>> => {
+    const mutationOptions: UseMutationOptions<UpdateSurveyResponse, DefaultError, Options<UpdateSurveyData>> = {
+        mutationFn: async (fnOptions) => {
+            const { data } = await updateSurvey({
+                ...options,
+                ...fnOptions,
+                throwOnError: true
+            });
+            return data;
+        }
+    };
+    return mutationOptions;
+};
+
+export const listSurveyResponsesQueryKey = (options: Options<ListSurveyResponsesData>) => createQueryKey('listSurveyResponses', options);
+
+export const listSurveyResponsesOptions = (options: Options<ListSurveyResponsesData>) => queryOptions<ListSurveyResponsesResponse, DefaultError, ListSurveyResponsesResponse, ReturnType<typeof listSurveyResponsesQueryKey>>({
+    queryFn: async ({ queryKey, signal }) => {
+        const { data } = await listSurveyResponses({
+            ...options,
+            ...queryKey[0],
+            signal,
+            throwOnError: true
+        });
+        return data;
+    },
+    queryKey: listSurveyResponsesQueryKey(options)
+});
+
+export const listSurveyResponsesInfiniteQueryKey = (options: Options<ListSurveyResponsesData>): QueryKey<Options<ListSurveyResponsesData>> => createQueryKey('listSurveyResponses', options, true);
+
+export const listSurveyResponsesInfiniteOptions = (options: Options<ListSurveyResponsesData>) => {
+    const opts = infiniteQueryOptions<ListSurveyResponsesResponse, DefaultError, InfiniteData<ListSurveyResponsesResponse>, QueryKey<Options<ListSurveyResponsesData>>, number | Pick<QueryKey<Options<ListSurveyResponsesData>>[0], 'body' | 'headers' | 'path' | 'query'>>(
+    // @ts-ignore
+    {
+        queryFn: async ({ pageParam, queryKey, signal }) => {
+            // @ts-ignore
+            const page: Pick<QueryKey<Options<ListSurveyResponsesData>>[0], 'body' | 'headers' | 'path' | 'query'> = typeof pageParam === 'object' ? pageParam : {
+                query: {
+                    page: pageParam
+                }
+            };
+            const params = createInfiniteParams(queryKey, page);
+            const { data } = await listSurveyResponses({
+                ...options,
+                ...params,
+                signal,
+                throwOnError: true
+            });
+            return data;
+        },
+        queryKey: listSurveyResponsesInfiniteQueryKey(options)
+    });
+    return opts as Omit<typeof opts, 'initialData'>;
+};
+
+export const getSurveyResultsQueryKey = (options: Options<GetSurveyResultsData>) => createQueryKey('getSurveyResults', options);
+
+export const getSurveyResultsOptions = (options: Options<GetSurveyResultsData>) => queryOptions<GetSurveyResultsResponse, DefaultError, GetSurveyResultsResponse, ReturnType<typeof getSurveyResultsQueryKey>>({
+    queryFn: async ({ queryKey, signal }) => {
+        const { data } = await getSurveyResults({
+            ...options,
+            ...queryKey[0],
+            signal,
+            throwOnError: true
+        });
+        return data;
+    },
+    queryKey: getSurveyResultsQueryKey(options)
+});
+
+export const getSurveyResultsInfiniteQueryKey = (options: Options<GetSurveyResultsData>): QueryKey<Options<GetSurveyResultsData>> => createQueryKey('getSurveyResults', options, true);
+
+export const getSurveyResultsInfiniteOptions = (options: Options<GetSurveyResultsData>) => {
+    const opts = infiniteQueryOptions<GetSurveyResultsResponse, DefaultError, InfiniteData<GetSurveyResultsResponse>, QueryKey<Options<GetSurveyResultsData>>, number | Pick<QueryKey<Options<GetSurveyResultsData>>[0], 'body' | 'headers' | 'path' | 'query'>>(
+    // @ts-ignore
+    {
+        queryFn: async ({ pageParam, queryKey, signal }) => {
+            // @ts-ignore
+            const page: Pick<QueryKey<Options<GetSurveyResultsData>>[0], 'body' | 'headers' | 'path' | 'query'> = typeof pageParam === 'object' ? pageParam : {
+                query: {
+                    page: pageParam
+                }
+            };
+            const params = createInfiniteParams(queryKey, page);
+            const { data } = await getSurveyResults({
+                ...options,
+                ...params,
+                signal,
+                throwOnError: true
+            });
+            return data;
+        },
+        queryKey: getSurveyResultsInfiniteQueryKey(options)
+    });
+    return opts as Omit<typeof opts, 'initialData'>;
+};
+
 export const listTelemetryReleasesQueryKey = (options: Options<ListTelemetryReleasesData>) => createQueryKey('listTelemetryReleases', options);
 
 export const listTelemetryReleasesOptions = (options: Options<ListTelemetryReleasesData>) => queryOptions<ListTelemetryReleasesResponse, DefaultError, ListTelemetryReleasesResponse, ReturnType<typeof listTelemetryReleasesQueryKey>>({
@@ -30476,208 +30680,4 @@ export const ingestSentryEventMutation = (options?: Partial<Options<IngestSentry
         }
     };
     return mutationOptions;
-};
-
-/**
- * The active surveys the visitor making this request may see.
- *
- * Unauthenticated: the project comes from the `Host` the browser called.
- * Answers are recorded through the analytics event endpoint as
- * `survey_shown`, `survey_dismissed` and `survey_sent`.
- */
-export const publicSurveysMutation = (options?: Partial<Options<PublicSurveysData>>): UseMutationOptions<PublicSurveysResponse2, DefaultError, Options<PublicSurveysData>> => {
-    const mutationOptions: UseMutationOptions<PublicSurveysResponse2, DefaultError, Options<PublicSurveysData>> = {
-        mutationFn: async (fnOptions) => {
-            const { data } = await publicSurveys({
-                ...options,
-                ...fnOptions,
-                throwOnError: true
-            });
-            return data;
-        }
-    };
-    return mutationOptions;
-};
-
-export const listSurveysQueryKey = (options: Options<ListSurveysData>) => createQueryKey('listSurveys', options);
-
-export const listSurveysOptions = (options: Options<ListSurveysData>) => queryOptions<ListSurveysResponse, DefaultError, ListSurveysResponse, ReturnType<typeof listSurveysQueryKey>>({
-    queryFn: async ({ queryKey, signal }) => {
-        const { data } = await listSurveys({
-            ...options,
-            ...queryKey[0],
-            signal,
-            throwOnError: true
-        });
-        return data;
-    },
-    queryKey: listSurveysQueryKey(options)
-});
-
-export const listSurveysInfiniteQueryKey = (options: Options<ListSurveysData>): QueryKey<Options<ListSurveysData>> => createQueryKey('listSurveys', options, true);
-
-export const listSurveysInfiniteOptions = (options: Options<ListSurveysData>) => {
-    const opts = infiniteQueryOptions<ListSurveysResponse, DefaultError, InfiniteData<ListSurveysResponse>, QueryKey<Options<ListSurveysData>>, number | Pick<QueryKey<Options<ListSurveysData>>[0], 'body' | 'headers' | 'path' | 'query'>>(
-    // @ts-ignore
-    {
-        queryFn: async ({ pageParam, queryKey, signal }) => {
-            // @ts-ignore
-            const page: Pick<QueryKey<Options<ListSurveysData>>[0], 'body' | 'headers' | 'path' | 'query'> = typeof pageParam === 'object' ? pageParam : {
-                query: {
-                    page: pageParam
-                }
-            };
-            const params = createInfiniteParams(queryKey, page);
-            const { data } = await listSurveys({
-                ...options,
-                ...params,
-                signal,
-                throwOnError: true
-            });
-            return data;
-        },
-        queryKey: listSurveysInfiniteQueryKey(options)
-    });
-    return opts as Omit<typeof opts, 'initialData'>;
-};
-
-export const createSurveyMutation = (options?: Partial<Options<CreateSurveyData>>): UseMutationOptions<CreateSurveyResponse, DefaultError, Options<CreateSurveyData>> => {
-    const mutationOptions: UseMutationOptions<CreateSurveyResponse, DefaultError, Options<CreateSurveyData>> = {
-        mutationFn: async (fnOptions) => {
-            const { data } = await createSurvey({
-                ...options,
-                ...fnOptions,
-                throwOnError: true
-            });
-            return data;
-        }
-    };
-    return mutationOptions;
-};
-
-export const deleteSurveyMutation = (options?: Partial<Options<DeleteSurveyData>>): UseMutationOptions<DeleteSurveyResponse2, DefaultError, Options<DeleteSurveyData>> => {
-    const mutationOptions: UseMutationOptions<DeleteSurveyResponse2, DefaultError, Options<DeleteSurveyData>> = {
-        mutationFn: async (fnOptions) => {
-            const { data } = await deleteSurvey({
-                ...options,
-                ...fnOptions,
-                throwOnError: true
-            });
-            return data;
-        }
-    };
-    return mutationOptions;
-};
-
-export const getSurveyQueryKey = (options: Options<GetSurveyData>) => createQueryKey('getSurvey', options);
-
-export const getSurveyOptions = (options: Options<GetSurveyData>) => queryOptions<GetSurveyResponse, DefaultError, GetSurveyResponse, ReturnType<typeof getSurveyQueryKey>>({
-    queryFn: async ({ queryKey, signal }) => {
-        const { data } = await getSurvey({
-            ...options,
-            ...queryKey[0],
-            signal,
-            throwOnError: true
-        });
-        return data;
-    },
-    queryKey: getSurveyQueryKey(options)
-});
-
-export const updateSurveyMutation = (options?: Partial<Options<UpdateSurveyData>>): UseMutationOptions<UpdateSurveyResponse, DefaultError, Options<UpdateSurveyData>> => {
-    const mutationOptions: UseMutationOptions<UpdateSurveyResponse, DefaultError, Options<UpdateSurveyData>> = {
-        mutationFn: async (fnOptions) => {
-            const { data } = await updateSurvey({
-                ...options,
-                ...fnOptions,
-                throwOnError: true
-            });
-            return data;
-        }
-    };
-    return mutationOptions;
-};
-
-export const listSurveyResponsesQueryKey = (options: Options<ListSurveyResponsesData>) => createQueryKey('listSurveyResponses', options);
-
-export const listSurveyResponsesOptions = (options: Options<ListSurveyResponsesData>) => queryOptions<ListSurveyResponsesResponse, DefaultError, ListSurveyResponsesResponse, ReturnType<typeof listSurveyResponsesQueryKey>>({
-    queryFn: async ({ queryKey, signal }) => {
-        const { data } = await listSurveyResponses({
-            ...options,
-            ...queryKey[0],
-            signal,
-            throwOnError: true
-        });
-        return data;
-    },
-    queryKey: listSurveyResponsesQueryKey(options)
-});
-
-export const listSurveyResponsesInfiniteQueryKey = (options: Options<ListSurveyResponsesData>): QueryKey<Options<ListSurveyResponsesData>> => createQueryKey('listSurveyResponses', options, true);
-
-export const listSurveyResponsesInfiniteOptions = (options: Options<ListSurveyResponsesData>) => {
-    const opts = infiniteQueryOptions<ListSurveyResponsesResponse, DefaultError, InfiniteData<ListSurveyResponsesResponse>, QueryKey<Options<ListSurveyResponsesData>>, number | Pick<QueryKey<Options<ListSurveyResponsesData>>[0], 'body' | 'headers' | 'path' | 'query'>>(
-    // @ts-ignore
-    {
-        queryFn: async ({ pageParam, queryKey, signal }) => {
-            // @ts-ignore
-            const page: Pick<QueryKey<Options<ListSurveyResponsesData>>[0], 'body' | 'headers' | 'path' | 'query'> = typeof pageParam === 'object' ? pageParam : {
-                query: {
-                    page: pageParam
-                }
-            };
-            const params = createInfiniteParams(queryKey, page);
-            const { data } = await listSurveyResponses({
-                ...options,
-                ...params,
-                signal,
-                throwOnError: true
-            });
-            return data;
-        },
-        queryKey: listSurveyResponsesInfiniteQueryKey(options)
-    });
-    return opts as Omit<typeof opts, 'initialData'>;
-};
-
-export const getSurveyResultsQueryKey = (options: Options<GetSurveyResultsData>) => createQueryKey('getSurveyResults', options);
-
-export const getSurveyResultsOptions = (options: Options<GetSurveyResultsData>) => queryOptions<GetSurveyResultsResponse, DefaultError, GetSurveyResultsResponse, ReturnType<typeof getSurveyResultsQueryKey>>({
-    queryFn: async ({ queryKey, signal }) => {
-        const { data } = await getSurveyResults({
-            ...options,
-            ...queryKey[0],
-            signal,
-            throwOnError: true
-        });
-        return data;
-    },
-    queryKey: getSurveyResultsQueryKey(options)
-});
-
-export const getSurveyResultsInfiniteQueryKey = (options: Options<GetSurveyResultsData>): QueryKey<Options<GetSurveyResultsData>> => createQueryKey('getSurveyResults', options, true);
-
-export const getSurveyResultsInfiniteOptions = (options: Options<GetSurveyResultsData>) => {
-    const opts = infiniteQueryOptions<GetSurveyResultsResponse, DefaultError, InfiniteData<GetSurveyResultsResponse>, QueryKey<Options<GetSurveyResultsData>>, number | Pick<QueryKey<Options<GetSurveyResultsData>>[0], 'body' | 'headers' | 'path' | 'query'>>(
-    // @ts-ignore
-    {
-        queryFn: async ({ pageParam, queryKey, signal }) => {
-            // @ts-ignore
-            const page: Pick<QueryKey<Options<GetSurveyResultsData>>[0], 'body' | 'headers' | 'path' | 'query'> = typeof pageParam === 'object' ? pageParam : {
-                query: {
-                    page: pageParam
-                }
-            };
-            const params = createInfiniteParams(queryKey, page);
-            const { data } = await getSurveyResults({
-                ...options,
-                ...params,
-                signal,
-                throwOnError: true
-            });
-            return data;
-        },
-        queryKey: getSurveyResultsInfiniteQueryKey(options)
-    });
-    return opts as Omit<typeof opts, 'initialData'>;
 };

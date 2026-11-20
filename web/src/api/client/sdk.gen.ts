@@ -269,6 +269,22 @@ export const updateSpeedMetrics = <ThrowOnError extends boolean = false>(options
     }
 });
 
+/**
+ * The active surveys the visitor making this request may see.
+ *
+ * Unauthenticated: the project comes from the `Host` the browser called.
+ * Answers are recorded through the analytics event endpoint as
+ * `survey_shown`, `survey_dismissed` and `survey_sent`.
+ */
+export const publicSurveys = <ThrowOnError extends boolean = false>(options: Options<PublicSurveysData, ThrowOnError>): RequestResult<PublicSurveysResponses, PublicSurveysErrors, ThrowOnError> => (options.client ?? client).post<PublicSurveysResponses, PublicSurveysErrors, ThrowOnError>({
+    url: '/_temps/surveys',
+    ...options,
+    headers: {
+        'Content-Type': 'application/json',
+        ...options.headers
+    }
+});
+
 export const listAccessServicesGeneral = <ThrowOnError extends boolean = false>(options?: Options<ListAccessServicesGeneralData, ThrowOnError>): RequestResult<ListAccessServicesGeneralResponses, ListAccessServicesGeneralErrors, ThrowOnError> => (options?.client ?? client).get<ListAccessServicesGeneralResponses, ListAccessServicesGeneralErrors, ThrowOnError>({
     security: [{ scheme: 'bearer', type: 'http' }],
     url: '/access-services',
@@ -12565,6 +12581,56 @@ export const getStatusOverview = <ThrowOnError extends boolean = false>(options:
     ...options
 });
 
+export const listSurveys = <ThrowOnError extends boolean = false>(options: Options<ListSurveysData, ThrowOnError>): RequestResult<ListSurveysResponses, ListSurveysErrors, ThrowOnError> => (options.client ?? client).get<ListSurveysResponses, ListSurveysErrors, ThrowOnError>({
+    security: [{ scheme: 'bearer', type: 'http' }],
+    url: '/projects/{project_id}/surveys',
+    ...options
+});
+
+export const createSurvey = <ThrowOnError extends boolean = false>(options: Options<CreateSurveyData, ThrowOnError>): RequestResult<CreateSurveyResponses, CreateSurveyErrors, ThrowOnError> => (options.client ?? client).post<CreateSurveyResponses, CreateSurveyErrors, ThrowOnError>({
+    security: [{ scheme: 'bearer', type: 'http' }],
+    url: '/projects/{project_id}/surveys',
+    ...options,
+    headers: {
+        'Content-Type': 'application/json',
+        ...options.headers
+    }
+});
+
+export const deleteSurvey = <ThrowOnError extends boolean = false>(options: Options<DeleteSurveyData, ThrowOnError>): RequestResult<DeleteSurveyResponses, DeleteSurveyErrors, ThrowOnError> => (options.client ?? client).delete<DeleteSurveyResponses, DeleteSurveyErrors, ThrowOnError>({
+    security: [{ scheme: 'bearer', type: 'http' }],
+    url: '/projects/{project_id}/surveys/{survey_id}',
+    ...options
+});
+
+export const getSurvey = <ThrowOnError extends boolean = false>(options: Options<GetSurveyData, ThrowOnError>): RequestResult<GetSurveyResponses, GetSurveyErrors, ThrowOnError> => (options.client ?? client).get<GetSurveyResponses, GetSurveyErrors, ThrowOnError>({
+    security: [{ scheme: 'bearer', type: 'http' }],
+    url: '/projects/{project_id}/surveys/{survey_id}',
+    ...options
+});
+
+export const updateSurvey = <ThrowOnError extends boolean = false>(options: Options<UpdateSurveyData, ThrowOnError>): RequestResult<UpdateSurveyResponses, UpdateSurveyErrors, ThrowOnError> => (options.client ?? client).patch<UpdateSurveyResponses, UpdateSurveyErrors, ThrowOnError>({
+    security: [{ scheme: 'bearer', type: 'http' }],
+    url: '/projects/{project_id}/surveys/{survey_id}',
+    ...options,
+    headers: {
+        'Content-Type': 'application/json',
+        ...options.headers
+    }
+});
+
+export const listSurveyResponses = <ThrowOnError extends boolean = false>(options: Options<ListSurveyResponsesData, ThrowOnError>): RequestResult<ListSurveyResponsesResponses, ListSurveyResponsesErrors, ThrowOnError> => (options.client ?? client).get<ListSurveyResponsesResponses, ListSurveyResponsesErrors, ThrowOnError>({
+    security: [{ scheme: 'bearer', type: 'http' }],
+    url: '/projects/{project_id}/surveys/{survey_id}/responses',
+    ...options
+});
+
+export const getSurveyResults = <ThrowOnError extends boolean = false>(options: Options<GetSurveyResultsData, ThrowOnError>): RequestResult<GetSurveyResultsResponses, GetSurveyResultsErrors, ThrowOnError> => (options.client ?? client).get<GetSurveyResultsResponses, GetSurveyResultsErrors, ThrowOnError>({
+    security: [{ scheme: 'bearer', type: 'http' }],
+    url: '/projects/{project_id}/surveys/{survey_id}/results',
+    ...options
+});
+
 export const listTelemetryReleases = <ThrowOnError extends boolean = false>(options: Options<ListTelemetryReleasesData, ThrowOnError>): RequestResult<ListTelemetryReleasesResponses, ListTelemetryReleasesErrors, ThrowOnError> => (options.client ?? client).get<ListTelemetryReleasesResponses, ListTelemetryReleasesErrors, ThrowOnError>({ url: '/projects/{project_id}/telemetry-releases', ...options });
 
 /**
@@ -15390,70 +15456,4 @@ export const ingestSentryEvent = <ThrowOnError extends boolean = false>(options:
         'Content-Type': 'application/json',
         ...options.headers
     }
-});
-
-/**
- * The active surveys the visitor making this request may see.
- *
- * Unauthenticated: the project comes from the `Host` the browser called.
- * Answers are recorded through the analytics event endpoint as
- * `survey_shown`, `survey_dismissed` and `survey_sent`.
- */
-export const publicSurveys = <ThrowOnError extends boolean = false>(options: Options<PublicSurveysData, ThrowOnError>): RequestResult<PublicSurveysResponses, PublicSurveysErrors, ThrowOnError> => (options.client ?? client).post<PublicSurveysResponses, PublicSurveysErrors, ThrowOnError>({
-    url: '/_temps/surveys',
-    ...options,
-    headers: {
-        'Content-Type': 'application/json',
-        ...options.headers
-    }
-});
-
-export const listSurveys = <ThrowOnError extends boolean = false>(options: Options<ListSurveysData, ThrowOnError>): RequestResult<ListSurveysResponses, ListSurveysErrors, ThrowOnError> => (options.client ?? client).get<ListSurveysResponses, ListSurveysErrors, ThrowOnError>({
-    security: [{ scheme: 'bearer', type: 'http' }],
-    url: '/projects/{project_id}/surveys',
-    ...options
-});
-
-export const createSurvey = <ThrowOnError extends boolean = false>(options: Options<CreateSurveyData, ThrowOnError>): RequestResult<CreateSurveyResponses, CreateSurveyErrors, ThrowOnError> => (options.client ?? client).post<CreateSurveyResponses, CreateSurveyErrors, ThrowOnError>({
-    security: [{ scheme: 'bearer', type: 'http' }],
-    url: '/projects/{project_id}/surveys',
-    ...options,
-    headers: {
-        'Content-Type': 'application/json',
-        ...options.headers
-    }
-});
-
-export const deleteSurvey = <ThrowOnError extends boolean = false>(options: Options<DeleteSurveyData, ThrowOnError>): RequestResult<DeleteSurveyResponses, DeleteSurveyErrors, ThrowOnError> => (options.client ?? client).delete<DeleteSurveyResponses, DeleteSurveyErrors, ThrowOnError>({
-    security: [{ scheme: 'bearer', type: 'http' }],
-    url: '/projects/{project_id}/surveys/{survey_id}',
-    ...options
-});
-
-export const getSurvey = <ThrowOnError extends boolean = false>(options: Options<GetSurveyData, ThrowOnError>): RequestResult<GetSurveyResponses, GetSurveyErrors, ThrowOnError> => (options.client ?? client).get<GetSurveyResponses, GetSurveyErrors, ThrowOnError>({
-    security: [{ scheme: 'bearer', type: 'http' }],
-    url: '/projects/{project_id}/surveys/{survey_id}',
-    ...options
-});
-
-export const updateSurvey = <ThrowOnError extends boolean = false>(options: Options<UpdateSurveyData, ThrowOnError>): RequestResult<UpdateSurveyResponses, UpdateSurveyErrors, ThrowOnError> => (options.client ?? client).patch<UpdateSurveyResponses, UpdateSurveyErrors, ThrowOnError>({
-    security: [{ scheme: 'bearer', type: 'http' }],
-    url: '/projects/{project_id}/surveys/{survey_id}',
-    ...options,
-    headers: {
-        'Content-Type': 'application/json',
-        ...options.headers
-    }
-});
-
-export const listSurveyResponses = <ThrowOnError extends boolean = false>(options: Options<ListSurveyResponsesData, ThrowOnError>): RequestResult<ListSurveyResponsesResponses, ListSurveyResponsesErrors, ThrowOnError> => (options.client ?? client).get<ListSurveyResponsesResponses, ListSurveyResponsesErrors, ThrowOnError>({
-    security: [{ scheme: 'bearer', type: 'http' }],
-    url: '/projects/{project_id}/surveys/{survey_id}/responses',
-    ...options
-});
-
-export const getSurveyResults = <ThrowOnError extends boolean = false>(options: Options<GetSurveyResultsData, ThrowOnError>): RequestResult<GetSurveyResultsResponses, GetSurveyResultsErrors, ThrowOnError> => (options.client ?? client).get<GetSurveyResultsResponses, GetSurveyResultsErrors, ThrowOnError>({
-    security: [{ scheme: 'bearer', type: 'http' }],
-    url: '/projects/{project_id}/surveys/{survey_id}/results',
-    ...options
 });
