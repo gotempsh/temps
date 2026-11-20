@@ -792,6 +792,38 @@ mod tests {
         .expect("event");
     }
 
+    /// An event flagged at ingest: `crawler_name` is `unknown` for a UA-less
+    /// server-side event, or the reason a traffic filter excluded it.
+    async fn create_flagged_purchase(
+        db: &DatabaseConnection,
+        project_id: i32,
+        environment_id: i32,
+        visitor_id: i32,
+        amount: &str,
+        crawler_name: &str,
+    ) {
+        events::ActiveModel {
+            project_id: Set(project_id),
+            environment_id: Set(Some(environment_id)),
+            session_id: Set(Some(format!("s-{visitor_id}"))),
+            visitor_id: Set(Some(visitor_id)),
+            event_type: Set("custom".to_string()),
+            event_name: Set(Some("purchase".to_string())),
+            pathname: Set("/checkout".to_string()),
+            page_path: Set("/checkout".to_string()),
+            hostname: Set("site.example".to_string()),
+            href: Set("https://site.example/checkout".to_string()),
+            timestamp: Set(Utc::now() - chrono::Duration::hours(1)),
+            props: Set(Some(serde_json::json!({ "amount": amount }))),
+            is_crawler: Set(true),
+            crawler_name: Set(Some(crawler_name.to_string())),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .expect("flagged event");
+    }
+
     #[tokio::test]
     async fn goals_count_conversions_rates_and_revenue_per_source() {
         let Some(test_db) = test_db().await else {
@@ -884,6 +916,10 @@ mod tests {
             false,
         )
         .await;
+        // A purchase the backend recorded (no user agent, stored as the bot
+        // `unknown`) converts; one a traffic filter excluded does not.
+        create_flagged_purchase(db.as_ref(), project_id, env, mail, "10", "unknown").await;
+        create_flagged_purchase(db.as_ref(), project_id, env, mail, "500", "datacenter").await;
         // Crawlers never convert.
         create_event(
             db.as_ref(),
@@ -922,14 +958,14 @@ mod tests {
             stats.goals.iter().map(|g| (g.goal_id, g)).collect();
 
         let p = by_id[&purchase_goal.id];
-        assert_eq!((p.unique_conversions, p.total_conversions), (2, 4));
+        assert_eq!((p.unique_conversions, p.total_conversions), (2, 5));
         assert!((p.conversion_rate - 66.666).abs() < 0.01);
         assert_eq!(
             p.revenue,
             Some(AnalyticsGoalRevenue {
                 currency: "USD".into(),
-                total: 50.0,
-                average: 25.0
+                total: 60.0,
+                average: 20.0
             })
         );
 
@@ -976,7 +1012,7 @@ mod tests {
             // Equal unique conversions; the second purchase puts Paid Search first.
             vec![
                 (Some("Paid Search"), 1, 1, 3, 100.0),
-                (Some("Email"), 2, 1, 1, 50.0),
+                (Some("Email"), 2, 1, 2, 50.0),
             ]
         );
         assert_eq!(

@@ -601,7 +601,7 @@ In the project's **Analytics** overview, the **Conversions** card lists every co
 - **Rate**: converting visitors as a share of all visitors with a page view in the period, the visitor count of the overview.
 - **Revenue**: the sum of the revenue property, when the conversion has one.
 
-Select a conversion to see who converted, grouped by channel, referrer, UTM source, medium or campaign, the page it happened on, country, device, browser or operating system. Each row shows the visitors with that value, how many converted, the rate and the revenue. Channel, referrer and UTM values are the visitor's **first touch**: how they first arrived, as in the visitors list. Crawlers are never counted.
+Select a conversion to see who converted, grouped by channel, referrer, UTM source, medium or campaign, the page it happened on, country, device, browser or operating system. Each row shows the visitors with that value, how many converted, the rate and the revenue. Channel, referrer and UTM values are the visitor's **first touch**: how they first arrived, as in the visitors list. Crawlers and traffic your filters exclude are never counted. Events your backend sends through the authenticated ingest route (for example a purchase recorded server-side) do count, although they carry no browser details.
 
 A project can define up to 50 conversions. Names are unique within a project, ignoring case.
 

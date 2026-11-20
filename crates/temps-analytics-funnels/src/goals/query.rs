@@ -53,7 +53,20 @@ pub(crate) fn page_like_pattern(pattern: &str) -> String {
     out
 }
 
-/// Rows the reports consider: one project, one period, real visitors.
+/// Rows that can be a conversion: people, plus the UA-less events a backend
+/// sends through the authenticated ingest route, which are stored as the bot
+/// `unknown` (a purchase recorded server-side is still a purchase). Detected
+/// bots and traffic a project filter excluded never convert; an excluded
+/// event carries its filter reason as `crawler_name`, so it is never
+/// `unknown`.
+pub(crate) const CONVERSION_TRAFFIC: &str = "(e.is_crawler = false OR e.crawler_name = 'unknown')";
+
+/// Rows that count as a visitor in a conversion-rate denominator: people's
+/// page views, as the overview counts visitors.
+pub(crate) const VISITOR_TRAFFIC: &str = "e.is_crawler = false AND e.event_type = 'page_view'";
+
+/// Rows the reports consider: one project, one period. Callers add
+/// [`CONVERSION_TRAFFIC`] or [`VISITOR_TRAFFIC`].
 pub(crate) fn scope_condition(
     params: &mut Params,
     project_id: i32,
@@ -62,7 +75,7 @@ pub(crate) fn scope_condition(
     environment_id: Option<i32>,
 ) -> String {
     let mut sql = format!(
-        "e.project_id = {} AND e.timestamp >= {} AND e.timestamp < {} AND e.is_crawler = false",
+        "e.project_id = {} AND e.timestamp >= {} AND e.timestamp < {}",
         params.push(project_id),
         params.push(start),
         params.push(end),
@@ -183,7 +196,7 @@ pub(crate) fn stats_query(
                 COUNT(g.revenue)::bigint AS revenue_count \
          FROM events e \
          CROSS JOIN LATERAL ({}) g \
-         WHERE {scope} \
+         WHERE {scope} AND {CONVERSION_TRAFFIC} \
          GROUP BY g.goal_id",
         branches.join(" UNION ALL ")
     );
@@ -203,7 +216,7 @@ pub(crate) fn visitors_query(
     (
         format!(
             "SELECT COUNT(DISTINCT e.visitor_id)::bigint AS visitors \
-             FROM events e WHERE {scope} AND e.event_type = 'page_view'"
+             FROM events e WHERE {scope} AND {VISITOR_TRAFFIC}"
         ),
         params.values,
     )
@@ -255,13 +268,13 @@ pub(crate) fn breakdown_query(
                    SUM({revenue})::float8 AS revenue_total, \
                    COUNT({revenue})::bigint AS revenue_count \
             FROM events e {join} \
-            WHERE {scope} AND {condition} \
+            WHERE {scope} AND {CONVERSION_TRAFFIC} AND {condition} \
             GROUP BY 1 \
          ), vis AS ( \
             SELECT CAST({value} AS TEXT) AS value, \
                    COUNT(DISTINCT e.visitor_id)::bigint AS visitors \
             FROM events e {join} \
-            WHERE {scope} AND e.event_type = 'page_view' \
+            WHERE {scope} AND {VISITOR_TRAFFIC} \
             GROUP BY 1 \
          ) \
          SELECT conv.value, COALESCE(vis.visitors, 0)::bigint AS visitors, \
@@ -392,6 +405,11 @@ mod tests {
         assert!(sql.contains("SELECT 7::int AS goal_id, NULL::numeric AS revenue WHERE COALESCE(e.event_name, e.event_type) = $5"));
         assert!(sql.contains(" UNION ALL SELECT 8::int AS goal_id"));
         assert!(sql.contains("e.environment_id = $4"));
+        // Server-side events convert; detected bots never do.
+        assert!(sql.contains(CONVERSION_TRAFFIC), "{sql}");
+        let (visitors, _) = visitors_query(1, start, end, None);
+        assert!(visitors.contains(VISITOR_TRAFFIC), "{visitors}");
+        assert!(!visitors.contains("'unknown'"), "{visitors}");
         // project, start, end, environment, event name, page path
         assert_eq!(values.len(), 6);
         assert!(stats_query(&[], 1, start, end, None).is_none());
