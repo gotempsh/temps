@@ -5,7 +5,6 @@
 // kept in the project's blob storage (ADR 111, D4).
 
 import type { Command } from 'commander'
-import { access, writeFile } from 'node:fs/promises'
 import { basename } from 'node:path'
 import { requireAuth } from '../../config/store.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
@@ -226,16 +225,12 @@ async function downloadAction(options: {
   })
   const output = options.output ?? name
   if (!options.force) {
-    const exists = await access(output).then(
-      () => true,
-      () => false,
-    )
-    if (exists) {
+    if (await Bun.file(output).exists()) {
       warning(`${output} exists; pass --force to overwrite it or --output to choose another file`)
       return
     }
   }
-  await writeFile(output, bytes)
+  await Bun.write(output, bytes)
   success(`Saved ${formatBytes(bytes.byteLength)} to ${output}`)
 }
 
