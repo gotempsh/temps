@@ -263,28 +263,52 @@ impl IngestSetupService {
     }
 }
 
-/// Trim and validate the public ingress URL. It must be absolute `http(s)`;
-/// anything else would produce URLs no client can call.
+/// Trim and validate the public ingress URL. It must be absolute `http(s)`
+/// with a host, no credentials and no query or fragment; anything else would
+/// produce URLs no client can call, or leak credentials into setup output.
 fn normalize_base_url(project_id: i32, url: &str) -> Result<String, IngestSetupError> {
     let trimmed = url.trim().trim_end_matches('/');
+    // The error is returned and logged, so it never repeats credentials.
     let invalid = |reason| IngestSetupError::InvalidPublicUrl {
         project_id,
-        url: url.to_string(),
+        url: redact_userinfo(trimmed),
         reason,
     };
     let rest = trimmed
         .strip_prefix("https://")
         .or_else(|| trimmed.strip_prefix("http://"))
         .ok_or_else(|| invalid("must start with http:// or https://"))?;
+    // Checked before parsing: the parser reads `https:///x` as host `x`.
     if rest.is_empty() || rest.starts_with('/') {
         return Err(invalid("has no host"));
     }
+    // Parsing validates the authority, e.g. rejects a port above 65535.
+    let parsed = url::Url::parse(trimmed).map_err(|_| invalid("is not a valid URL"))?;
+    if parsed.host_str().is_none_or(str::is_empty) {
+        return Err(invalid("has no host"));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(invalid("must not contain credentials"));
+    }
     // Ingest paths are appended to the base, so a query or fragment would
     // swallow them (`https://h?x=1/api/_temps/event` posts to `/`).
-    if trimmed.contains('?') || trimmed.contains('#') {
+    if parsed.query().is_some() || parsed.fragment().is_some() {
         return Err(invalid("must not contain a query string or fragment"));
     }
     Ok(trimmed.to_string())
+}
+
+/// `scheme://user:pass@host/...` with the userinfo replaced by `***`.
+fn redact_userinfo(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+    match authority.rsplit_once('@') {
+        Some((_, host)) => format!("{scheme}://***@{host}{tail}"),
+        None => url.to_string(),
+    }
 }
 
 fn endpoint(name: &str, method: &str, url: String, content_type: &str) -> IngestEndpoint {
@@ -759,6 +783,139 @@ mod tests {
         ));
     }
 
+    /// Against real rows: a key or DSN bound to a soft-deleted environment is
+    /// rejected by the ingest routes, so setup must not report it configured;
+    /// live-environment and project-wide credentials still count.
+    #[tokio::test]
+    async fn real_rows_skip_credentials_of_deleted_environments() {
+        use sea_orm::{ActiveModelTrait, Set};
+        use temps_entities::{
+            analytics_ingest_keys, environments, project_dsns, projects,
+            upstream_config::UpstreamList,
+        };
+
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
+            Ok(database) => database,
+            Err(error)
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+            {
+                println!("Docker not available, skipping");
+                return;
+            }
+            Err(error) => panic!("failed to create migrated test database: {error}"),
+        };
+        let db = test_db.db.clone();
+        let now = chrono::Utc::now();
+
+        let project = projects::ActiveModel {
+            name: Set("My app".to_string()),
+            slug: Set("my-app".to_string()),
+            repo_name: Set("my-app".to_string()),
+            repo_owner: Set("example".to_string()),
+            directory: Set("/".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(temps_presets::PresetType::Static),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("project");
+        let environment = |slug: &str, deleted: bool| environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set(slug.to_string()),
+            slug: Set(slug.to_string()),
+            subdomain: Set(format!("my-app-{slug}")),
+            host: Set(format!("my-app-{slug}.apps.example.com")),
+            upstreams: Set(UpstreamList::default()),
+            deleted_at: Set(deleted.then_some(now)),
+            ..Default::default()
+        };
+        let deleted = environment("preview", true)
+            .insert(db.as_ref())
+            .await
+            .expect("deleted environment");
+        let live = environment("production", false)
+            .insert(db.as_ref())
+            .await
+            .expect("live environment");
+
+        let analytics_key =
+            |environment_id: Option<i32>, name: &str| analytics_ingest_keys::ActiveModel {
+                project_id: Set(project.id),
+                environment_id: Set(environment_id),
+                name: Set(name.to_string()),
+                public_key: Set(format!("pa_{name}")),
+                is_active: Set(true),
+                event_count: Set(0),
+                created_at: Set(now),
+                updated_at: Set(now),
+                ..Default::default()
+            };
+        let dsn = |environment_id: Option<i32>, name: &str| project_dsns::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment_id),
+            name: Set(name.to_string()),
+            public_key: Set(format!("pk_{name}")),
+            secret_key: Set(format!("sk_{name}")),
+            is_active: Set(true),
+            event_count: Set(0),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        };
+        let configured = |setup: &ProjectIngestSetup| {
+            (
+                signal(setup, IngestSignal::Analytics).configured,
+                signal(setup, IngestSignal::Errors).configured,
+            )
+        };
+        let service = IngestSetupService::new(db.clone());
+        let base = "https://temps.example.com";
+
+        // Only credentials of the deleted environment: nothing usable.
+        analytics_key(Some(deleted.id), "deleted-env-key")
+            .insert(db.as_ref())
+            .await
+            .expect("key of deleted environment");
+        dsn(Some(deleted.id), "deleted-env-dsn")
+            .insert(db.as_ref())
+            .await
+            .expect("DSN of deleted environment");
+        let setup = service
+            .get_ingest_setup(project.id, None, base)
+            .await
+            .expect("setup resolves");
+        assert_eq!(configured(&setup), (false, false));
+
+        // A live-environment key and a project-wide DSN do count.
+        analytics_key(Some(live.id), "live-env-key")
+            .insert(db.as_ref())
+            .await
+            .expect("key of live environment");
+        dsn(None, "project-dsn")
+            .insert(db.as_ref())
+            .await
+            .expect("project-wide DSN");
+        let setup = service
+            .get_ingest_setup(project.id, None, base)
+            .await
+            .expect("setup resolves");
+        assert_eq!(configured(&setup), (true, true));
+        let setup = service
+            .get_ingest_setup(project.id, Some(live.id), base)
+            .await
+            .expect("live environment resolves");
+        assert_eq!(configured(&setup), (true, true));
+
+        // The deleted environment itself is not found.
+        assert!(matches!(
+            service
+                .get_ingest_setup(project.id, Some(deleted.id), base)
+                .await,
+            Err(IngestSetupError::EnvironmentNotFound { .. })
+        ));
+    }
+
     #[test]
     fn public_url_must_be_absolute_http() {
         for bad in [
@@ -770,6 +927,12 @@ mod tests {
             // A query or fragment would swallow the appended ingest paths.
             "https://temps.example.com?mode=console",
             "https://temps.example.com/#console",
+            // Not a valid authority.
+            "https://temps.example.com:65536",
+            "https://temps.example.com:port",
+            // Credentials would end up in every copied URL.
+            "https://user:pass@temps.example.com",
+            "https://token@temps.example.com/",
         ] {
             assert!(
                 matches!(
@@ -777,6 +940,20 @@ mod tests {
                     Err(IngestSetupError::InvalidPublicUrl { .. })
                 ),
                 "{bad:?} must be rejected"
+            );
+        }
+        // Rejected URLs never repeat credentials, even with a query too.
+        for with_credentials in [
+            "https://user:pass@temps.example.com",
+            "https://user:pass@temps.example.com?mode=console",
+        ] {
+            let err = normalize_base_url(1, with_credentials).expect_err("rejected");
+            let message = err.to_string();
+            assert!(!message.contains("pass@"), "{message}");
+            assert!(!message.contains("user:"), "{message}");
+            assert!(
+                message.contains("https://***@temps.example.com"),
+                "{message}"
             );
         }
         assert_eq!(
