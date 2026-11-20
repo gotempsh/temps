@@ -262,6 +262,11 @@ pub fn validate(definition: &SurveyDefinition) -> Result<(), String> {
     }
 }
 
+/// Ids that name `Object.prototype` members within the allowed alphabet.
+/// Answers are keyed by question id in the browser, where `__proto__` is a
+/// setter and `constructor` is inherited, so neither can be a question.
+const RESERVED_QUESTION_IDS: [&str; 2] = ["__proto__", "constructor"];
+
 fn validate_question(question: &SurveyQuestion, at: &str, problems: &mut Vec<String>) {
     let id = &question.id;
     if id.is_empty()
@@ -272,6 +277,10 @@ fn validate_question(question: &SurveyQuestion, at: &str, problems: &mut Vec<Str
     {
         problems.push(format!(
             "{at}: id must be 1-{MAX_QUESTION_ID_LEN} characters of a-z, 0-9 and _"
+        ));
+    } else if RESERVED_QUESTION_IDS.contains(&id.as_str()) {
+        problems.push(format!(
+            "{at}: id \"{id}\" is reserved; answers are JavaScript object keys in the browser SDK"
         ));
     }
     let prompt = question.prompt.trim();
@@ -409,6 +418,18 @@ mod tests {
             questions,
             targeting: SurveyTargeting::default(),
         }
+    }
+
+    #[test]
+    fn object_prototype_names_are_refused_as_question_ids() {
+        for id in ["__proto__", "constructor"] {
+            let error = validate(&definition(vec![question(id, QuestionKind::Nps)])).unwrap_err();
+            assert!(
+                error.contains(&format!("id \"{id}\" is reserved")),
+                "{error}"
+            );
+        }
+        assert!(validate(&definition(vec![question("proto", QuestionKind::Nps)])).is_ok());
     }
 
     #[test]

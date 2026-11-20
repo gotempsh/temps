@@ -63,7 +63,7 @@ temps surveys launch 1
 | `multiple_choice` | Any of `choices` | `choices` |
 | `open_text` | Up to 2,000 characters | — |
 
-A question's `id` (`a-z`, `0-9`, `_`) is the key its answer is stored under. Keep it when you reword the question, so old and new answers are counted together.
+A question's `id` (`a-z`, `0-9`, `_`; not `__proto__` or `constructor`) is the key its answer is stored under. Keep it when you reword the question, so old and new answers are counted together.
 
 A project can have at most 50 active surveys, and a survey's questions and display conditions can take up to 16 KiB together — room for 20 questions of ordinary length.
 

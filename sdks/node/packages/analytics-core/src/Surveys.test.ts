@@ -232,6 +232,29 @@ describe("Surveys", () => {
     }
   });
 
+  it("keeps the answer to a question whose id names a prototype member", () => {
+    const onEvent = vi.fn();
+    const odd: Survey = {
+      id: 4,
+      name: "Odd ids",
+      questions: [
+        { id: "__proto__", kind: "open_text", prompt: "One" },
+        { id: "constructor", kind: "open_text", prompt: "Two", optional: true },
+      ],
+      display: { once_per_visitor: false },
+    };
+    const surveys = new Surveys({ fetch: served([]), onEvent, storage: memoryStorage() });
+    // Unanswered, the required one is reported and nothing inherited counts.
+    const missing = surveys.submit(odd, {});
+    expect(missing.ok).toBe(false);
+    if (!missing.ok) expect(Object.keys(missing.errors)).toEqual(["__proto__"]);
+    const answers = JSON.parse('{"__proto__": "first"}') as Record<string, string>;
+    expect(surveys.submit(odd, answers)).toEqual({ ok: true });
+    const sent = onEvent.mock.calls[0]?.[1] as { responses: Record<string, unknown> };
+    expect(Object.keys(sent.responses)).toEqual(["__proto__"]);
+    expect(JSON.stringify(sent.responses)).toBe('{"__proto__":"first"}');
+  });
+
   it("never fetches when disabled", async () => {
     const fetch = served([nps]);
     const surveys = new Surveys({ fetch, onEvent: () => undefined, disabled: true });
@@ -333,6 +356,38 @@ describe("createAnalytics surveys", () => {
     analytics.destroy();
     release(new Response(JSON.stringify({ surveys: [nps] }), { status: 200 }));
     await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(document.querySelector("[data-temps-survey]")).toBeNull();
+  });
+
+  it("opens no second survey over the thank-you card, and destroy() still removes it", async () => {
+    const first: Survey = { ...nps, id: 10, display: { once_per_visitor: false } };
+    const second: Survey = { ...nps, id: 11, display: { trigger_event: "checkout", once_per_visitor: false } };
+    vi.spyOn(globalThis, "fetch").mockImplementation((input) => {
+      if (String(input).endsWith("/surveys")) {
+        return Promise.resolve(new Response(JSON.stringify({ surveys: [first, second] }), { status: 200 }));
+      }
+      return Promise.resolve(new Response("ok", { status: 200 }));
+    });
+    const analytics = createAnalytics({
+      ignoreLocalhost: false,
+      autoTrackPageviews: false,
+      autoTrackPageLeave: false,
+      autoTrackEngagement: false,
+      autoTrackSpeedAnalytics: false,
+      surveys: { enabled: true },
+    });
+    await vi.waitFor(() => expect(document.querySelector('[data-temps-survey="10"]')).not.toBeNull());
+    const root = document.querySelector('[data-temps-survey="10"]')?.shadowRoot;
+    const score = root?.querySelector<HTMLInputElement>('input[value="9"]');
+    if (score) score.checked = true;
+    root?.querySelector("form")?.dispatchEvent(new Event("submit", { cancelable: true }));
+    expect(root?.querySelector(".thanks")).not.toBeNull();
+
+    await analytics.trackEvent("checkout");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(document.querySelector('[data-temps-survey="11"]')).toBeNull();
+
+    analytics.destroy();
     expect(document.querySelector("[data-temps-survey]")).toBeNull();
   });
 });

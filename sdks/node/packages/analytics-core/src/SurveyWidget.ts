@@ -12,6 +12,8 @@ import {
   MAX_OPEN_TEXT_LENGTH,
   surveyScaleBounds,
   type Survey,
+  idMap,
+  type SurveyAnswer,
   type SurveyAnswers,
   type SurveyQuestion,
 } from "./Surveys";
@@ -20,6 +22,9 @@ export interface SurveyWidgetHandlers {
   /** Return the per-question errors to show, or none when sent. */
   onSubmit: (answers: SurveyAnswers) => Record<string, string> | null;
   onDismiss: () => void;
+  /** The card has left the page, however it closed (dismissed, after the
+   * thank-you message, or removed by its owner). Called once. */
+  onClosed?: () => void;
 }
 
 const STYLE = `
@@ -90,6 +95,7 @@ export function renderSurveyWidget(survey: Survey, handlers: SurveyWidgetHandler
     removed = true;
     document.removeEventListener("keydown", onKey);
     host.remove();
+    handlers.onClosed?.();
   };
   const dismiss = () => {
     if (!answered) handlers.onDismiss();
@@ -170,7 +176,7 @@ function renderQuestion(surveyId: number, question: SurveyQuestion): { fieldset:
 }
 
 function collectAnswers(form: HTMLFormElement, survey: Survey): SurveyAnswers {
-  const answers: SurveyAnswers = {};
+  const answers: SurveyAnswers = idMap<SurveyAnswer>();
   for (const question of survey.questions) {
     const name = `q-${survey.id}-${question.id}`;
     const fields = Array.from(form.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>(`[name="${cssEscape(name)}"]`));

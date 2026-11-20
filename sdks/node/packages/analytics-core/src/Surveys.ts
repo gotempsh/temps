@@ -319,6 +319,11 @@ export class Surveys {
   }
 }
 
+/** A map keyed by question id, with no prototype. */
+export function idMap<T>(): Record<string, T> {
+  return Object.create(null) as Record<string, T>;
+}
+
 function encodedLength(text: string): number {
   return new TextEncoder().encode(text).length;
 }
@@ -327,7 +332,7 @@ function encodedLength(text: string): number {
  * only kind that can grow that large. The visitor's answers stay in the form. */
 function tooLongErrors(survey: Survey, responses: Record<string, JsonValue>): Record<string, string> {
   const message = "These answers are too long to send together. Shorten this one and send again.";
-  const errors: Record<string, string> = {};
+  const errors = idMap<string>();
   for (const question of survey.questions) {
     const answer = responses[question.id];
     if (question.kind === "open_text" && typeof answer === "string" && answer.length > 0) {
@@ -373,10 +378,12 @@ export function validateAnswers(
   survey: Survey,
   answers: SurveyAnswers
 ): { ok: true; responses: Record<string, JsonValue> } | { ok: false; errors: Record<string, string> } {
-  const errors: Record<string, string> = {};
-  const responses: Record<string, JsonValue> = {};
+  // Keyed by question id: without a prototype, an id such as `__proto__`
+  // is an ordinary key, and nothing inherited reads as an answer.
+  const errors = idMap<string>();
+  const responses = idMap<JsonValue>();
   for (const question of survey.questions) {
-    const answer = answers[question.id];
+    const answer = Object.prototype.hasOwnProperty.call(answers, question.id) ? answers[question.id] : undefined;
     const empty =
       answer === undefined ||
       answer === null ||
