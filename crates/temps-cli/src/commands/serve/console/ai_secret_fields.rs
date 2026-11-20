@@ -400,6 +400,13 @@ const REVIEWED_FREE_FORM: &[(&str, &str)] = &[
     ("create_flag:default_value", "feature flag value"),
     ("update_flag:default_value", "feature flag value"),
     ("set_flag_environment:value", "feature flag value"),
+    ("create_flag:variants.[].value", "feature flag variant value"),
+    ("update_flag:variants.[].value", "feature flag variant value"),
+    ("set_flag_rules:rules.[].serve.value", "feature flag value a rule serves"),
+    (
+        "evaluate_flag:attributes",
+        "targeting attributes for a dry-run evaluation; nothing is stored",
+    ),
 ];
 
 #[cfg(test)]

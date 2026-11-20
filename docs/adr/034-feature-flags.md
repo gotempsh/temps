@@ -1,6 +1,6 @@
 # ADR-034: Feature Flags
 
-- **Status:** Phase 1 implemented (`feat/feature-flags`); Phases 2–3 proposed
+- **Status:** Phase 1 implemented (`feat/feature-flags`); Phase 2 implemented with ADR 110 D3, except NOTIFY propagation and server-side implicit context; Phase 3 exposure events implemented for browsers, the rest proposed
 - **Date:** 2026-08-02
 - **Deciders:** TBD
 - **Related:** ADR-017 (split proxy/console), ADR-027 (cross-project traces), ADR-028 (project-scoped RBAC)
@@ -716,6 +716,21 @@ Deviations from the design above, all deliberate:
 
 Phase 1 alone reaches parity with Railway. Phase 3 is the part no competitor can
 copy without also owning analytics, errors, and replay in the same binary.
+
+**Phase 2, as built (ADR 110 D3).** Recorded in detail in ADR 110
+"Settled while implementing". Differences from the plan above:
+
+- R3.6's NOTIFY propagation was not built. The public endpoints read a
+  per-process cache (TTL 5 s) that every write invalidates locally, so a change
+  is immediate on a single binary and takes up to 5 s across split processes.
+- R3.2's single-flag `POST /api/_temps/flags/{key}` was not built; OFREP's
+  single-flag endpoint on the same origin covers it.
+- R2.4's server-side implicit context (proxy header injection) was not built;
+  implicit attributes exist only on the browser and same-origin OFREP
+  endpoints.
+- Variants and splits (not in this ADR) were added: see ADR 110 D3.
+- Exposure events (R6.1) shipped as opt-in, per-flag sampled `flag_exposure`
+  analytics events from the browser SDK.
 
 **Correction to R2.4:** implicit context is free for *browser* calls through the
 proxy, but **not** for in-process server-side evaluation — the proxy is not in

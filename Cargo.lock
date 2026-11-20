@@ -14285,10 +14285,12 @@ dependencies = [
 name = "temps-flags"
 version = "0.1.0-beta.63"
 dependencies = [
+ "arc-swap",
  "async-trait",
  "axum",
  "chrono",
  "hex",
+ "regex",
  "sea-orm 1.1.20",
  "serde",
  "serde_json",
@@ -14296,11 +14298,14 @@ dependencies = [
  "temps-authz",
  "temps-core",
  "temps-entities",
+ "temps-geo",
+ "temps-routes",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
  "utoipa",
  "uuid",
+ "woothee",
 ]
 
 [[package]]

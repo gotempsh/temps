@@ -6944,6 +6944,21 @@
         ],
         "type": "object"
       },
+      "AttributeValue": {
+        "description": "A targeting attribute: what the caller (or the server, implicitly) knows\nabout the subject.",
+        "oneOf": [
+          {
+            "type": "boolean"
+          },
+          {
+            "format": "double",
+            "type": "number"
+          },
+          {
+            "type": "string"
+          }
+        ]
+      },
       "Audience": {
         "description": "Who an address is for.",
         "enum": [
@@ -14253,6 +14268,39 @@
         ],
         "type": "object"
       },
+      "ConditionOperator": {
+        "description": "Comparison applied by one rule condition.",
+        "enum": [
+          "eq",
+          "neq",
+          "in",
+          "not_in",
+          "contains",
+          "not_contains",
+          "matches",
+          "gt",
+          "gte",
+          "lt",
+          "lte",
+          "exists",
+          "not_exists"
+        ],
+        "type": "string"
+      },
+      "ConditionValue": {
+        "description": "The right-hand side of a condition: one value, or a list for `in`/`not_in`.",
+        "oneOf": [
+          {
+            "items": {
+              "$ref": "#/components/schemas/AttributeValue"
+            },
+            "type": "array"
+          },
+          {
+            "$ref": "#/components/schemas/AttributeValue"
+          }
+        ]
+      },
       "ConnectProjectRequest": {
         "description": "Connect the chat's sandbox to the services of a project.",
         "properties": {
@@ -17976,6 +18024,11 @@
               "null"
             ]
           },
+          "exposure_sample_rate": {
+            "description": "Share of subjects (`0..=1`) whose browser records a `flag_exposure`\nevent when it reads the flag. Defaults to 0: exposure is opt-in.",
+            "format": "double",
+            "type": "number"
+          },
           "key": {
             "description": "Stable key used in application code. Immutable after create.",
             "example": "checkout.v2",
@@ -17984,6 +18037,13 @@
           "value_type": {
             "$ref": "#/components/schemas/FlagValueType",
             "description": "Fixed at create: retyping would invalidate every stored value and every\ncall site."
+          },
+          "variants": {
+            "description": "Named values targeting rules may serve. Each must match `value_type`.",
+            "items": {
+              "$ref": "#/components/schemas/FlagVariant"
+            },
+            "type": "array"
           }
         },
         "required": [
@@ -31442,6 +31502,126 @@
         },
         "type": "object"
       },
+      "EvalReason": {
+        "description": "Why an evaluation produced the value it did.\n\nPart of the wire contract, and the only thing that makes \"why is this user\nseeing the old checkout?\" answerable.",
+        "oneOf": [
+          {
+            "description": "No such flag, or it has been archived. The caller's fallback is served.",
+            "properties": {
+              "kind": {
+                "enum": [
+                  "FLAG_NOT_FOUND"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Kill switch engaged for this environment.",
+            "properties": {
+              "kind": {
+                "enum": [
+                  "DISABLED"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Targeting rule `index` (0-based) matched on its conditions alone.",
+            "properties": {
+              "index": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "kind": {
+                "enum": [
+                  "RULE_MATCH"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "index",
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Targeting rule `index` matched and the subject's bucket decided the\noutcome: it was inside the rule's rollout percentage, or the rule split\nsubjects across variants.",
+            "properties": {
+              "index": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "kind": {
+                "enum": [
+                  "PERCENTAGE_ROLLOUT"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "index",
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "An environment-specific value was set.",
+            "properties": {
+              "kind": {
+                "enum": [
+                  "ENVIRONMENT_VALUE"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Nothing more specific applied; the flag default was served.",
+            "properties": {
+              "kind": {
+                "enum": [
+                  "DEFAULT"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Evaluation degraded (malformed stored value or rule). The default is\nserved and the caller is told the value is not trustworthy. Never\npanics.",
+            "properties": {
+              "kind": {
+                "enum": [
+                  "ERROR"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "EvaluateEdgeRuleInput": {
         "description": "A rule supplied to the dry run instead of the saved ones.",
         "properties": {
@@ -31567,6 +31747,56 @@
           "decision",
           "summary",
           "trace"
+        ],
+        "type": "object"
+      },
+      "EvaluateFlagRequest": {
+        "description": "Evaluate one flag as an app in an environment would.",
+        "properties": {
+          "attributes": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/AttributeValue"
+            },
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "environment_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "key": {
+            "description": "Bucketing subject. Required for rules with a rollout or a split to\napply.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "environment_id"
+        ],
+        "type": "object"
+      },
+      "Evaluation": {
+        "description": "The outcome of evaluating one flag. Always carries a usable value.",
+        "properties": {
+          "reason": {
+            "$ref": "#/components/schemas/EvalReason"
+          },
+          "value": {},
+          "variant": {
+            "description": "The variant served, when a rule served one. `None` for plain values.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "value",
+          "reason"
         ],
         "type": "object"
       },
@@ -34290,11 +34520,29 @@
             "format": "int32",
             "type": "integer"
           },
+          "rules": {
+            "description": "Ordered targeting rules; first match wins.",
+            "items": {
+              "$ref": "#/components/schemas/FlagRule"
+            },
+            "type": "array"
+          },
+          "rules_valid": {
+            "description": "`false` when the stored rules could not be decoded. The flag then\nserves its default with reason `ERROR` until they are replaced.",
+            "type": "boolean"
+          },
+          "updated_at": {
+            "description": "Send back as `expected_updated_at` when replacing the rules.",
+            "type": "string"
+          },
           "value": {}
         },
         "required": [
           "environment_id",
-          "enabled"
+          "enabled",
+          "rules",
+          "rules_valid",
+          "updated_at"
         ],
         "type": "object"
       },
@@ -34366,6 +34614,11 @@
             },
             "type": "array"
           },
+          "exposure_sample_rate": {
+            "description": "Share of subjects whose browser records exposure events. 0 = off.",
+            "format": "double",
+            "type": "number"
+          },
           "id": {
             "format": "int32",
             "type": "integer"
@@ -34381,10 +34634,18 @@
             ]
           },
           "updated_at": {
+            "description": "Send back as `expected_updated_at` to make an update conditional.",
             "type": "string"
           },
           "value_type": {
             "type": "string"
+          },
+          "variants": {
+            "description": "Named values targeting rules may serve.",
+            "items": {
+              "$ref": "#/components/schemas/FlagVariant"
+            },
+            "type": "array"
           }
         },
         "required": [
@@ -34393,14 +34654,50 @@
           "value_type",
           "default_value",
           "client_visible",
+          "variants",
+          "exposure_sample_rate",
           "created_at",
           "updated_at",
           "environments"
         ],
         "type": "object"
       },
+      "FlagRule": {
+        "description": "`when <conditions> [within rollout_percentage] serve <serve>`.",
+        "properties": {
+          "conditions": {
+            "description": "All must hold. Empty means every subject.",
+            "items": {
+              "$ref": "#/components/schemas/RuleCondition"
+            },
+            "type": "array"
+          },
+          "description": {
+            "description": "Free text shown in the console, e.g. \"Beta customers\".",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "rollout_percentage": {
+            "description": "Share of matching subjects the rule applies to, `0..=100`. `None` means\nall of them. Ramping it up never removes anyone already included.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "serve": {
+            "$ref": "#/components/schemas/RuleServe"
+          }
+        },
+        "required": [
+          "serve"
+        ],
+        "type": "object"
+      },
       "FlagSnapshot": {
-        "description": "A single flag, already resolved down to one environment. This is what the\nevaluator sees and what the SDK caches in memory.",
+        "description": "A single flag, already resolved down to one environment. This is what the\nevaluator sees and what the server-side SDK caches in memory.\n\nCarries the rules and the salt, so it is **server-side only**: it is served\nto deployment tokens (`/flags/snapshot`) and never to a browser, which only\never receives evaluated results (ADR 034 R5.1).",
         "properties": {
           "default_value": {
             "description": "Served whenever evaluation cannot do better. Genuinely polymorphic by\ndesign — the surrounding struct carries the type."
@@ -34415,8 +34712,26 @@
           "key": {
             "type": "string"
           },
+          "rules": {
+            "description": "Ordered targeting rules for this environment. First match wins.",
+            "items": {
+              "$ref": "#/components/schemas/FlagRule"
+            },
+            "type": "array"
+          },
+          "salt": {
+            "description": "Bucketing salt. Needed by an SDK that evaluates rollouts locally.",
+            "type": "string"
+          },
           "value_type": {
             "$ref": "#/components/schemas/FlagValueType"
+          },
+          "variants": {
+            "description": "Named values rules may serve.",
+            "items": {
+              "$ref": "#/components/schemas/FlagVariant"
+            },
+            "type": "array"
           }
         },
         "required": [
@@ -34456,6 +34771,30 @@
           "json"
         ],
         "type": "string"
+      },
+      "FlagVariant": {
+        "description": "A named value a flag can serve, so a rollout or an experiment keys off a\nstable name (`control`, `test`) rather than a serialized value (ADR 034\nR1.4, ADR 110 D3).",
+        "properties": {
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "key": {
+            "description": "`[a-z0-9][a-z0-9._-]*`, unique within the flag.",
+            "example": "test",
+            "type": "string"
+          },
+          "value": {
+            "description": "Must match the flag's `value_type`."
+          }
+        },
+        "required": [
+          "key",
+          "value"
+        ],
+        "type": "object"
       },
       "Flow": {
         "description": "Data moving from one part to another. `from` is the part that starts it.",
@@ -50991,6 +51330,88 @@
         ],
         "type": "object"
       },
+      "OfrepBulkResponse": {
+        "properties": {
+          "flags": {
+            "items": {
+              "$ref": "#/components/schemas/OfrepEvaluationSuccess"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "flags"
+        ],
+        "type": "object"
+      },
+      "OfrepEvaluationFailure": {
+        "properties": {
+          "errorCode": {
+            "description": "`FLAG_NOT_FOUND`, `INVALID_CONTEXT`, `PARSE_ERROR` or `GENERAL`.",
+            "type": "string"
+          },
+          "errorDetails": {
+            "type": "string"
+          },
+          "key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "key",
+          "errorCode",
+          "errorDetails"
+        ],
+        "type": "object"
+      },
+      "OfrepEvaluationRequest": {
+        "description": "OFREP evaluation request: `{ \"context\": { \"targetingKey\": \"...\", ... } }`.\n\n`context` is an OpenFeature evaluation context, arbitrary JSON by\ndefinition. Scalar entries become targeting attributes; nested objects and\narrays are ignored.",
+        "properties": {
+          "context": {
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": [
+              "object",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "OfrepEvaluationSuccess": {
+        "properties": {
+          "key": {
+            "type": "string"
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/OfrepMetadata"
+          },
+          "reason": {
+            "description": "`STATIC`, `TARGETING_MATCH`, `SPLIT`, `DISABLED`, `DEFAULT` or `ERROR`.",
+            "type": "string"
+          },
+          "value": {},
+          "variant": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "key",
+          "value",
+          "reason",
+          "metadata"
+        ],
+        "type": "object"
+      },
+      "OfrepMetadata": {
+        "description": "OFREP metadata. Always empty today; present because the protocol defines\nit.",
+        "type": "object"
+      },
       "OidcProviderResponse": {
         "properties": {
           "client_id": {
@@ -60322,6 +60743,82 @@
         ],
         "type": "object"
       },
+      "PublicFlagEvaluation": {
+        "description": "One evaluated flag, as a browser sees it.",
+        "properties": {
+          "key": {
+            "type": "string"
+          },
+          "reason": {
+            "$ref": "#/components/schemas/EvalReason"
+          },
+          "record_exposure": {
+            "description": "Whether the app should record a `flag_exposure` analytics event when\nit reads this flag. Decided here, per subject, from the flag's\nexposure sample rate, so sampling is stable for a visitor and costs\nthe browser nothing.",
+            "type": "boolean"
+          },
+          "value": {},
+          "variant": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "key",
+          "value",
+          "reason",
+          "record_exposure"
+        ],
+        "type": "object"
+      },
+      "PublicFlagsRequest": {
+        "description": "Body of `POST /api/_temps/flags`. Every field is optional; an empty body\nevaluates every client-visible flag for the visitor the request carries.",
+        "properties": {
+          "attributes": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/AttributeValue"
+            },
+            "description": "Targeting attributes. Override the implicit ones of the same name.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "key": {
+            "description": "Bucketing subject, e.g. a signed-in user id. Defaults to the Temps\nvisitor cookie when the request carries one.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "keys": {
+            "description": "Evaluate only these flags. Omit for all client-visible flags.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "PublicFlagsResponse": {
+        "properties": {
+          "flags": {
+            "items": {
+              "$ref": "#/components/schemas/PublicFlagEvaluation"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "flags"
+        ],
+        "type": "object"
+      },
       "PublicHostnameStrategy": {
         "description": "Public hostname generation mode for Temps-managed preview routes.\n\nThe mode is stored per managed domain (`dns_managed_domains.generated_hostname_mode`)\nrather than globally, so a provider such as Cloudflare can offer the flat layout\nrequired by its Universal SSL wildcard cert without changing every domain's behaviour.",
         "enum": [
@@ -65355,6 +65852,98 @@
           "roles"
         ],
         "type": "object"
+      },
+      "RuleCondition": {
+        "description": "`attribute <operator> value`.",
+        "properties": {
+          "attribute": {
+            "description": "Context attribute name, e.g. `plan`, `country`, `email`.",
+            "example": "plan",
+            "type": "string"
+          },
+          "operator": {
+            "$ref": "#/components/schemas/ConditionOperator"
+          },
+          "value": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ConditionValue",
+                "description": "Absent for `exists` / `not_exists`; a list for `in` / `not_in`."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "attribute",
+          "operator"
+        ],
+        "type": "object"
+      },
+      "RuleServe": {
+        "description": "What a matching rule serves.",
+        "oneOf": [
+          {
+            "description": "A literal value of the flag's type.",
+            "properties": {
+              "kind": {
+                "enum": [
+                  "value"
+                ],
+                "type": "string"
+              },
+              "value": {}
+            },
+            "required": [
+              "value",
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "One declared variant.",
+            "properties": {
+              "kind": {
+                "enum": [
+                  "variant"
+                ],
+                "type": "string"
+              },
+              "variant": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "variant",
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Subjects split across declared variants by weight, stably per subject.",
+            "properties": {
+              "kind": {
+                "enum": [
+                  "split"
+                ],
+                "type": "string"
+              },
+              "split": {
+                "items": {
+                  "$ref": "#/components/schemas/VariantWeight"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "split",
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
       },
       "RunBackupRequest": {
         "properties": {
@@ -72543,6 +73132,29 @@
             "description": "Tri-state: absent leaves the override, `null` clears it (inherit the\nflag default), anything else sets it. Must match `value_type`."
           }
         },
+        "type": "object"
+      },
+      "SetFlagRulesRequest": {
+        "description": "Replace the ordered targeting rules of a flag in one environment.",
+        "properties": {
+          "expected_updated_at": {
+            "description": "The environment row's `updated_at` as last read, or absent when the\nflag had no row for this environment. A 409 means someone else changed\nthe rules in between: reload and apply the change again.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "rules": {
+            "description": "First match wins. An empty list removes all targeting.",
+            "items": {
+              "$ref": "#/components/schemas/FlagRule"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "rules"
+        ],
         "type": "object"
       },
       "SetGroupRepositoryRequest": {
@@ -82525,6 +83137,30 @@
               "string",
               "null"
             ]
+          },
+          "expected_updated_at": {
+            "description": "The flag's `updated_at` as last read. When sent, the update is refused\nwith 409 if the flag changed since.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "exposure_sample_rate": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "variants": {
+            "description": "Replaces the variant list. A variant still served by a rule cannot be\nremoved.",
+            "items": {
+              "$ref": "#/components/schemas/FlagVariant"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
           }
         },
         "type": "object"
@@ -85548,6 +86184,26 @@
           "total",
           "page",
           "page_size"
+        ],
+        "type": "object"
+      },
+      "VariantWeight": {
+        "description": "One arm of a weighted split.",
+        "properties": {
+          "variant": {
+            "description": "A variant key declared on the flag.",
+            "type": "string"
+          },
+          "weight": {
+            "description": "Share of the rule's subjects, in whole percent. A split's weights sum\nto 100.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "variant",
+          "weight"
         ],
         "type": "object"
       },
@@ -90371,6 +91027,165 @@
         "summary": "Record analytics event",
         "tags": [
           "Metrics"
+        ]
+      }
+    },
+    "/_temps/flags": {
+      "post": {
+        "description": "Unauthenticated: the project and environment come from the `Host` the\nbrowser called, never from the body. Only flags marked `client_visible`\nare evaluated or mentioned; a server-only flag is indistinguishable from\none that does not exist.",
+        "operationId": "evaluate_public_flags",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PublicFlagsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicFlagsResponse"
+                }
+              }
+            },
+            "description": "Evaluated client-visible flags"
+          },
+          "400": {
+            "description": "Malformed or oversized context"
+          },
+          "404": {
+            "description": "No environment serves this host"
+          },
+          "429": {
+            "description": "Rate limit exceeded"
+          },
+          "503": {
+            "description": "Flags could not be loaded"
+          }
+        },
+        "summary": "Evaluate every client-visible flag for the visitor making the request.",
+        "tags": [
+          "Feature Flags"
+        ]
+      }
+    },
+    "/_temps/ofrep/v1/evaluate/flags": {
+      "post": {
+        "operationId": "ofrep_public_bulk",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OfrepEvaluationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OfrepBulkResponse"
+                }
+              }
+            },
+            "description": "Evaluated client-visible flags"
+          },
+          "304": {
+            "description": "Unchanged for this context"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OfrepEvaluationFailure"
+                }
+              }
+            },
+            "description": "Invalid context"
+          },
+          "404": {
+            "description": "No environment serves this host"
+          },
+          "429": {
+            "description": "Rate limit exceeded"
+          }
+        },
+        "summary": "OFREP bulk evaluation for OpenFeature web SDKs, same origin.",
+        "tags": [
+          "Feature Flags"
+        ]
+      }
+    },
+    "/_temps/ofrep/v1/evaluate/flags/{key}": {
+      "post": {
+        "operationId": "ofrep_public_single",
+        "parameters": [
+          {
+            "description": "Flag key",
+            "in": "path",
+            "name": "key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OfrepEvaluationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OfrepEvaluationSuccess"
+                }
+              }
+            },
+            "description": "Evaluated flag"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OfrepEvaluationFailure"
+                }
+              }
+            },
+            "description": "Invalid context"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OfrepEvaluationFailure"
+                }
+              }
+            },
+            "description": "Flag not found or not client-visible"
+          },
+          "429": {
+            "description": "Rate limit exceeded"
+          }
+        },
+        "summary": "OFREP single-flag evaluation, same origin.",
+        "tags": [
+          "Feature Flags"
         ]
       }
     },
@@ -135672,6 +136487,135 @@
         "x-maturity": "beta"
       }
     },
+    "/ofrep/v1/evaluate/flags": {
+      "post": {
+        "description": "Every flag of the token's environment, including server-only ones. Point\nan OFREP provider at `TEMPS_API_URL` with `TEMPS_API_TOKEN` as its bearer\ntoken.",
+        "operationId": "ofrep_server_bulk",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OfrepEvaluationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OfrepBulkResponse"
+                }
+              }
+            },
+            "description": "Evaluated flags"
+          },
+          "304": {
+            "description": "Unchanged for this context"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OfrepEvaluationFailure"
+                }
+              }
+            },
+            "description": "Invalid context or token not environment-scoped"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "OFREP bulk evaluation for server-side OpenFeature SDKs.",
+        "tags": [
+          "Feature Flags"
+        ]
+      }
+    },
+    "/ofrep/v1/evaluate/flags/{key}": {
+      "post": {
+        "operationId": "ofrep_server_single",
+        "parameters": [
+          {
+            "description": "Flag key",
+            "in": "path",
+            "name": "key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OfrepEvaluationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OfrepEvaluationSuccess"
+                }
+              }
+            },
+            "description": "Evaluated flag"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OfrepEvaluationFailure"
+                }
+              }
+            },
+            "description": "Invalid context or token not environment-scoped"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OfrepEvaluationFailure"
+                }
+              }
+            },
+            "description": "Flag not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "OFREP single-flag evaluation for server-side OpenFeature SDKs.",
+        "tags": [
+          "Feature Flags"
+        ]
+      }
+    },
     "/operations": {
       "get": {
         "description": "Deployments, rollbacks, promotions, restores, backups and autofix runs the\ncaller can see, newest first (`created_at` DESC, fixed). Finished\noperations older than 7 days are omitted; operations still in flight are\nalways included. Redeploys are reported as `deployment` — no column\ndistinguishes them.",
@@ -166091,6 +167035,9 @@
           "404": {
             "description": "Flag not found"
           },
+          "409": {
+            "description": "Flag changed since it was read"
+          },
           "500": {
             "description": "Internal server error"
           }
@@ -166182,6 +167129,224 @@
           }
         ],
         "summary": "Set a flag's value in one environment, and/or flip its kill switch.",
+        "tags": [
+          "Feature Flags"
+        ]
+      }
+    },
+    "/projects/{project_id}/flags/{key}/environments/{environment_id}/rules": {
+      "put": {
+        "description": "Rules apply after the kill switch and before the environment value; the\nfirst rule whose conditions hold (and whose rollout includes the subject)\ndecides the value. Send the environment row's `updated_at` as\n`expected_updated_at` so a concurrent edit is refused with 409 instead of\nbeing overwritten.",
+        "operationId": "set_flag_rules",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Flag key",
+            "in": "path",
+            "name": "key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Environment ID",
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetFlagRulesRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FlagEnvironmentResponse"
+                }
+              }
+            },
+            "description": "Rules replaced"
+          },
+          "400": {
+            "description": "Validation error"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Flag or environment not found"
+          },
+          "409": {
+            "description": "Rules changed since they were read"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Replace the ordered targeting rules of a flag in one environment.",
+        "tags": [
+          "Feature Flags"
+        ]
+      }
+    },
+    "/projects/{project_id}/flags/{key}/evaluate": {
+      "post": {
+        "operationId": "evaluate_flag",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Flag key",
+            "in": "path",
+            "name": "key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EvaluateFlagRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Evaluation"
+                }
+              }
+            },
+            "description": "Evaluation"
+          },
+          "400": {
+            "description": "Environment not in project, or the context exceeds the evaluation limits"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Flag or environment not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Evaluate one flag as an app in the given environment would, for a context\nyou supply. Read-only; the console's \"test this flag\" panel.",
+        "tags": [
+          "Feature Flags"
+        ]
+      }
+    },
+    "/projects/{project_id}/flags/{key}/reshuffle": {
+      "post": {
+        "description": "Reassigns every subject of every percentage rollout and split of this flag,\nin every environment. Use it to draw a fresh sample, never on a running\nexperiment.",
+        "operationId": "reshuffle_flag",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Flag key",
+            "in": "path",
+            "name": "key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FlagResponse"
+                }
+              }
+            },
+            "description": "Salt regenerated"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Flag not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Regenerate the flag's bucketing salt.",
         "tags": [
           "Feature Flags"
         ]
