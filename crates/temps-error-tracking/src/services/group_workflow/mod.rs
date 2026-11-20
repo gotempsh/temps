@@ -115,7 +115,8 @@ pub struct BulkGroupOutcome {
     /// Selected groups already in the target status.
     pub skipped: u64,
     /// Matching groups left for a follow-up request because this one hit
-    /// [`BULK_GROUP_LIMIT`]. Always 0 for an explicit id list.
+    /// [`BULK_GROUP_LIMIT`]; repeating the request changes them. Always 0
+    /// for an explicit id list.
     pub remaining: u64,
 }
 
@@ -269,14 +270,12 @@ impl GroupWorkflowService {
             .into_iter()
             .map(|row| row.try_get::<i32>("", "id"))
             .collect::<Result<Vec<i32>, _>>()?;
-        // Updated rows now carry the target status, so the same filter counts
-        // exactly the groups a follow-up request would still change. A
-        // re-ignore with conditions selects ignored groups too, so it reports
-        // nothing remaining rather than counting the groups it just wrote.
-        let remaining: i64 = if write.reapplies() {
-            0
-        } else {
-            tx.query_one(Statement::from_sql_and_values(
+        // Updated rows now hold exactly what this write sets, and the filter
+        // never selects such a row, so the same filter counts exactly the
+        // groups a follow-up request would still change, and that request
+        // moves on to them instead of rewriting the same page.
+        let remaining: i64 = tx
+            .query_one(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
                 format!("SELECT COUNT(*) AS remaining FROM error_groups g WHERE {conditions}"),
                 values,
@@ -287,8 +286,7 @@ impl GroupWorkflowService {
                     "bulk error group count returned no result".to_string(),
                 )
             })?
-            .try_get("", "remaining")?
-        };
+            .try_get("", "remaining")?;
         Ok(BulkGroupOutcome {
             updated_ids,
             skipped: 0,
@@ -360,12 +358,43 @@ impl StatusWrite {
     }
 
     /// Condition selecting the rows this write changes, for `alias`.
+    ///
+    /// A plain write skips groups already in the target status. A write that
+    /// re-applies skips only groups already holding exactly what it would
+    /// write (the same ignore conditions, or resolved after the same
+    /// release). A relative event count is compared against the group's
+    /// current total, so a group that has had events since is re-based.
     fn selects_clause(&self, alias: &str, values: &mut Vec<sea_orm::Value>) -> String {
-        if self.reapplies() {
-            return "TRUE".to_string();
-        }
         values.push(self.status.to_owned().into());
-        format!("{alias}.status <> ${}", values.len())
+        let status = values.len();
+        if !self.reapplies() {
+            return format!("{alias}.status <> ${status}");
+        }
+        if self.status == "resolved" {
+            values.push(self.after_release_id.into());
+            let after_release = values.len();
+            return format!(
+                "NOT ({alias}.status = ${status} AND {alias}.resolved_in_next_release \
+                 AND {alias}.resolved_in_release_after_id IS NOT DISTINCT FROM ${after_release}::int)"
+            );
+        }
+        values.push(self.ignore.until.into());
+        let until = values.len();
+        values.push(self.ignore.event_count.into());
+        let events = values.len();
+        values.push(self.ignore.user_count.into());
+        let users = values.len();
+        values.push(self.ignore.forever.into());
+        let forever = values.len();
+        format!(
+            "NOT ({alias}.status = ${status} \
+             AND {alias}.ignore_until IS NOT DISTINCT FROM ${until}::timestamptz \
+             AND {alias}.ignore_until_event_count IS NOT DISTINCT FROM \
+               (CASE WHEN ${events}::int IS NULL THEN NULL \
+                ELSE LEAST({alias}.total_count::bigint + ${events}::int, 2147483647)::int END) \
+             AND {alias}.ignore_until_user_count IS NOT DISTINCT FROM ${users}::int \
+             AND {alias}.ignore_forever = ${forever}::boolean)"
+        )
     }
 }
 

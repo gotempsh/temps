@@ -460,3 +460,77 @@ fn every_action_maps_to_a_known_group_status() {
             .unwrap_or_else(|error| panic!("{action:?} target status is invalid: {error}"));
     }
 }
+
+/// An ignore with conditions re-applies to groups that are already ignored,
+/// so a selection larger than one request must still page: the follow-up
+/// request changes the groups the first one could not reach, and the count
+/// left says how many those are.
+#[tokio::test]
+async fn a_large_conditional_ignore_by_filter_pages_through_every_group() {
+    use sea_orm::ConnectionTrait;
+
+    let test_db = test_db!("bulk conditional ignore paging");
+    let db = test_db.connection_arc();
+    let project = create_project(db.as_ref()).await;
+    let template = create_group(db.as_ref(), project, GroupSpec::default()).await;
+    db.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "INSERT INTO error_groups (title, error_type, message_template, first_seen, last_seen, \
+         total_count, status, project_id, created_at, updated_at) \
+         SELECT title, error_type, message_template, first_seen, \
+                last_seen - make_interval(secs => n), total_count, status, project_id, \
+                created_at, updated_at \
+         FROM error_groups, generate_series(1, $2) AS n WHERE id = $1",
+        [template.into(), (BULK_GROUP_LIMIT as i32).into()],
+    ))
+    .await
+    .expect("insert more groups than one request may change");
+
+    let service = GroupWorkflowService::new(db.clone());
+    let until = Utc::now() + chrono::Duration::days(7);
+    let ignore = || {
+        service.bulk_update_status(
+            project,
+            BulkGroupSelector::Filter(BulkGroupFilter::default()),
+            BulkGroupAction::Ignore,
+            Some(IgnoreConditions {
+                until: Some(until),
+                ..Default::default()
+            }),
+            false,
+        )
+    };
+
+    let first = ignore().await.expect("first page");
+    assert_eq!(first.updated_ids.len(), BULK_GROUP_LIMIT);
+    assert_eq!(first.remaining, 1, "one group is left for the next request");
+
+    let second = ignore().await.expect("second page");
+    assert_eq!(second.updated_ids.len(), 1, "the next request reaches it");
+    assert!(
+        !first.updated_ids.contains(&second.updated_ids[0]),
+        "and does not rewrite the first page"
+    );
+    assert_eq!(second.remaining, 0);
+
+    let third = ignore().await.expect("nothing left");
+    assert!(third.updated_ids.is_empty());
+    assert_eq!(third.remaining, 0);
+
+    // Different conditions are a new write and select every group again.
+    let reignore = service
+        .bulk_update_status(
+            project,
+            BulkGroupSelector::Filter(BulkGroupFilter::default()),
+            BulkGroupAction::Ignore,
+            Some(IgnoreConditions {
+                forever: true,
+                ..Default::default()
+            }),
+            false,
+        )
+        .await
+        .expect("re-ignore forever");
+    assert_eq!(reignore.updated_ids.len(), BULK_GROUP_LIMIT);
+    assert_eq!(reignore.remaining, 1);
+}

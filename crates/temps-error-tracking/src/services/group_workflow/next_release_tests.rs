@@ -217,13 +217,28 @@ async fn a_plain_status_write_clears_the_next_release_condition() {
     resolve_in_next_release(&db, project, id)
         .await
         .expect("resolve in the next release");
+    let again = resolve_in_next_release(&db, project, id)
+        .await
+        .expect("re-resolving against the same release");
+    assert!(again.updated_ids.is_empty(), "nothing would change");
+    assert_eq!(again.skipped, 1);
+
+    // Another group's event registers a newer release; re-resolving now
+    // re-bases the condition on it.
+    let mut newer = event(project, Some("3.0.0"));
+    newer.exception_type = Some("RangeError".to_string());
+    newer.exception_value = Some("page index out of range".to_string());
+    ingestion
+        .process_error_event(newer)
+        .await
+        .expect("ingest 3.0.0");
     let outcome = resolve_in_next_release(&db, project, id)
         .await
         .expect("re-resolving re-bases the condition");
     assert_eq!(
         outcome.updated_ids,
         vec![id],
-        "a resolved group is re-written"
+        "a group resolved after an older release is re-written"
     );
 
     GroupWorkflowService::new(db.clone())

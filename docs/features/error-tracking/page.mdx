@@ -832,7 +832,7 @@ const { updated, updated_ids, skipped, remaining } = await response.json();
 ```
 </CodeGroup>
 
-The response says what changed: `updated_ids` are the groups whose status moved, `skipped` counts selected groups that were already in that state, and `remaining` counts matching groups left for a follow-up request because this one hit the 1,000-group cap (always `0` when IDs were given). An ID that belongs to another project fails the whole request with a 404 and writes nothing. In the console, select groups with the checkboxes on **Errors** and use the bar above the list.
+The response says what changed: `updated_ids` are the groups whose status moved, `skipped` counts selected groups that were already in that state (for an ignore with conditions or a resolve in the next release, groups that already hold exactly those conditions), and `remaining` counts matching groups left because this one hit the 1,000-group cap (always `0` when IDs were given). Send the same request again to change them; it moves on to the groups the first one did not reach. An ID that belongs to another project fails the whole request with a 404 and writes nothing. In the console, select groups with the checkboxes on **Errors** and use the bar above the list.
 
 A bulk request is audit-logged once, with the selection it was given and the groups it changed. `status_change` alert rules are evaluated for the groups that changed, and at most 50 notifications are delivered per request so a single triage click cannot fan out into thousands; the groups beyond that cap are not recorded as fired and stay eligible next time.
 
