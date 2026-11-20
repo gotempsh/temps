@@ -162,6 +162,12 @@ pub fn derive_session_id(
 /// Reserve `candidate` as the session `visitor_id` starts at `now`, unless
 /// another node reserved one after `since`, and return the session that won.
 /// The upsert is atomic, so racing nodes always return the same id.
+///
+/// The conflict branch always updates, keeping a recent reservation as it
+/// is, so `RETURNING` yields the winner even when it committed while this
+/// statement waited on it: a skipped update returns no row, and a fallback
+/// read in the same statement would use a snapshot taken before the winner
+/// committed.
 async fn reserve_session(
     db: &DatabaseConnection,
     project_id: i32,
@@ -173,20 +179,15 @@ async fn reserve_session(
     let row = db
         .query_one(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
-            "WITH reserved AS ( \
-                 INSERT INTO analytics_cookieless_sessions \
-                     (project_id, visitor_id, session_id, started_at) \
-                 VALUES ($1, $2, $3, $4) \
-                 ON CONFLICT (project_id, visitor_id) DO UPDATE \
-                     SET session_id = EXCLUDED.session_id, started_at = EXCLUDED.started_at \
-                     WHERE analytics_cookieless_sessions.started_at <= $5 \
-                 RETURNING session_id \
-             ) \
-             SELECT session_id FROM reserved \
-             UNION ALL \
-             SELECT session_id FROM analytics_cookieless_sessions \
-             WHERE project_id = $1 AND visitor_id = $2 AND NOT EXISTS (SELECT 1 FROM reserved) \
-             LIMIT 1",
+            "INSERT INTO analytics_cookieless_sessions \
+                 (project_id, visitor_id, session_id, started_at) \
+             VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (project_id, visitor_id) DO UPDATE SET \
+                 session_id = CASE WHEN analytics_cookieless_sessions.started_at <= $5 \
+                     THEN EXCLUDED.session_id ELSE analytics_cookieless_sessions.session_id END, \
+                 started_at = CASE WHEN analytics_cookieless_sessions.started_at <= $5 \
+                     THEN EXCLUDED.started_at ELSE analytics_cookieless_sessions.started_at END \
+             RETURNING session_id",
             [
                 project_id.into(),
                 visitor_id.into(),
@@ -493,6 +494,7 @@ pub fn spawn_salt_sweep(identity: Arc<CookielessIdentity>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sea_orm::TransactionTrait;
 
     #[test]
     fn lookup_errors_keep_the_database_error_as_their_source() {
@@ -696,6 +698,40 @@ mod tests {
             1,
             "only cl_boundary's reservation is past the window; today's visitors keep theirs"
         );
+
+        // A reservation that commits while another node's waits on it: the
+        // waiting one returns the winner's session, not an error.
+        let winner = db.begin().await.expect("winner transaction");
+        winner
+            .execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "INSERT INTO analytics_cookieless_sessions \
+                     (project_id, visitor_id, session_id, started_at) VALUES (7, 'cl_race', 'winner', $1)",
+                [boundary.into()],
+            ))
+            .await
+            .expect("winner reserves");
+        let waiting_db = db.clone();
+        let loser = tokio::spawn(async move {
+            reserve_session(
+                &waiting_db,
+                7,
+                "cl_race",
+                "loser",
+                boundary,
+                boundary - chrono::Duration::minutes(30),
+            )
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!loser.is_finished(), "the second reservation waits");
+        winner.commit().await.expect("winner commits");
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(10), loser)
+            .await
+            .expect("the waiting reservation finishes")
+            .expect("reservation task")
+            .expect("the waiting reservation returns the winner");
+        assert_eq!(joined, "winner");
 
         // An unknown project reads as persistent.
         assert_eq!(
