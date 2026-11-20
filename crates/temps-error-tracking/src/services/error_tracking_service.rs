@@ -148,19 +148,12 @@ impl ErrorTrackingService {
                 self.send_alert_notifications(enriched).await;
             }
         }
-        let to = if self.assignment_mailer.get().is_some() {
-            recipients_with_access(
-                self.project_access.get().map(|checker| checker.as_ref()),
-                project_id,
-                group_id,
-                &outcome.recipients,
-            )
-            .await
-        } else {
-            Vec::new()
-        };
-        if let (Some(mailer), false) = (self.assignment_mailer.get(), to.is_empty()) {
+        if let Some(mailer) = self.assignment_mailer.get() {
+            if outcome.recipients.is_empty() {
+                return Ok(outcome);
+            }
             let mailer = mailer.clone();
+            let checker = self.project_access.get().cloned();
             let slug = temps_entities::projects::Entity::find_by_id(project_id)
                 .one(self.db.as_ref())
                 .await?
@@ -172,8 +165,21 @@ impl ErrorTrackingService {
                 )),
                 _ => None,
             };
-            let message = assignment_email(&outcome, to, group_id, assigned_by, console_url);
+            let outcome = outcome.clone();
+            // The access check and the mail run after the assignment has
+            // answered: neither may slow it down or fail it.
             tokio::spawn(async move {
+                let to = recipients_with_access(
+                    checker.as_deref(),
+                    project_id,
+                    group_id,
+                    &outcome.recipients,
+                )
+                .await;
+                if to.is_empty() {
+                    return;
+                }
+                let message = assignment_email(&outcome, to, group_id, assigned_by, console_url);
                 match mailer.is_email_provider_configured().await {
                     Ok(true) => {
                         if let Err(error) = mailer.send_transactional_email(message).await {
@@ -826,13 +832,13 @@ impl ErrorTrackingService {
     }
 }
 
-/// The email telling an assignee about a group. Plain text plus a link.
 /// The emails of the `recipients` who can open `project_id`.
 ///
 /// A team can be assigned to a group of a project only some of its members
 /// can access, and the email carries the group's title and link, so the rest
-/// are left out. A failed check counts as no access. Without a checker (no
-/// access control installed) everyone can access the project.
+/// are left out. Every member is checked in one batch; if the check fails,
+/// nobody is mailed. Without a checker (no access control installed)
+/// everyone can access the project.
 async fn recipients_with_access(
     checker: Option<&dyn temps_core::ProjectAccessChecker>,
     project_id: i32,
@@ -842,28 +848,42 @@ async fn recipients_with_access(
     let Some(checker) = checker else {
         return recipients.iter().map(|r| r.email.clone()).collect();
     };
-    let mut allowed = Vec::with_capacity(recipients.len());
-    for recipient in recipients {
-        let user_id = recipient.user_id;
-        match checker.user_can_access_project(user_id, project_id).await {
-            Ok(true) => allowed.push(recipient.email.clone()),
-            Ok(false) => tracing::debug!(
+    let user_ids: Vec<i32> = recipients.iter().map(|r| r.user_id).collect();
+    let access = match checker
+        .users_can_access_project(&user_ids, project_id)
+        .await
+    {
+        Ok(access) => access,
+        Err(error) => {
+            tracing::warn!(
                 project_id,
                 group_id,
-                user_id,
-                "user {user_id} cannot access project {project_id}; not mailed about error group {group_id}"
-            ),
-            Err(error) => tracing::warn!(
-                project_id,
-                group_id,
-                user_id,
-                "could not check whether user {user_id} can access project {project_id}, so they are not mailed about error group {group_id}: {error}"
-            ),
+                "could not check which of {} assignees can access project {project_id}, so nobody is mailed about error group {group_id}: {error}",
+                user_ids.len()
+            );
+            return Vec::new();
         }
-    }
-    allowed
+    };
+    recipients
+        .iter()
+        .filter(|recipient| {
+            let allowed = access.get(&recipient.user_id).copied().unwrap_or(false);
+            if !allowed {
+                tracing::debug!(
+                    project_id,
+                    group_id,
+                    user_id = recipient.user_id,
+                    "user {} cannot access project {project_id}; not mailed about error group {group_id}",
+                    recipient.user_id
+                );
+            }
+            allowed
+        })
+        .map(|recipient| recipient.email.clone())
+        .collect()
 }
 
+/// The email telling an assignee about a group. Plain text plus a link.
 fn assignment_email(
     outcome: &super::group_workflow::AssignmentOutcome,
     to: Vec<String>,
@@ -910,20 +930,42 @@ mod assignment_mail_tests {
     use crate::services::group_workflow::AssignmentRecipient;
     use async_trait::async_trait;
 
-    /// Grants project 7 to user 1 only, and fails for user 3.
-    struct OneMemberChecker;
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Grants project 7 to user 1 only. With `failing`, the check fails.
+    /// Answers in batches only, and counts them.
+    #[derive(Default)]
+    struct OneMemberChecker {
+        failing: bool,
+        single: AtomicUsize,
+        batches: AtomicUsize,
+    }
 
     #[async_trait]
     impl temps_core::ProjectAccessChecker for OneMemberChecker {
         async fn user_can_access_project(
             &self,
-            user_id: i32,
-            project_id: i32,
+            _user_id: i32,
+            _project_id: i32,
         ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-            match user_id {
-                3 => Err("access store unavailable".into()),
-                _ => Ok(user_id == 1 && project_id == 7),
+            self.single.fetch_add(1, Ordering::SeqCst);
+            Err("the recipient filter must check users in one batch".into())
+        }
+
+        async fn users_can_access_project(
+            &self,
+            user_ids: &[i32],
+            project_id: i32,
+        ) -> Result<BTreeMap<i32, bool>, Box<dyn std::error::Error + Send + Sync>> {
+            self.batches.fetch_add(1, Ordering::SeqCst);
+            if self.failing {
+                return Err("access store unavailable".into());
             }
+            Ok(user_ids
+                .iter()
+                .map(|&user_id| (user_id, user_id == 1 && project_id == 7))
+                .collect())
         }
     }
 
@@ -937,14 +979,28 @@ mod assignment_mail_tests {
     }
 
     #[tokio::test]
-    async fn only_members_who_can_open_the_project_are_mailed_and_a_failed_check_is_no_access() {
-        let to = recipients_with_access(Some(&OneMemberChecker), 7, 42, &team()).await;
+    async fn only_members_who_can_open_the_project_are_mailed_in_one_batched_check() {
+        let checker = OneMemberChecker::default();
+        let to = recipients_with_access(Some(&checker), 7, 42, &team()).await;
         assert_eq!(to, vec!["member1@example.test".to_string()]);
+        assert_eq!(checker.batches.load(Ordering::SeqCst), 1);
+        assert_eq!(checker.single.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_failed_check_mails_nobody() {
+        let checker = OneMemberChecker {
+            failing: true,
+            ..Default::default()
+        };
+        let to = recipients_with_access(Some(&checker), 7, 42, &team()).await;
+        assert!(to.is_empty(), "{to:?}");
     }
 
     #[tokio::test]
     async fn a_project_none_of_them_can_open_mails_nobody() {
-        let to = recipients_with_access(Some(&OneMemberChecker), 8, 42, &team()).await;
+        let checker = OneMemberChecker::default();
+        let to = recipients_with_access(Some(&checker), 8, 42, &team()).await;
         assert!(to.is_empty(), "{to:?}");
     }
 
