@@ -146,6 +146,11 @@ pub struct VisitorInfo {
     pub first_referrer_hostname: Option<String>,
     /// Marketing channel from the first visit (e.g. "Organic Search", "Direct")
     pub first_channel: Option<String>,
+    /// The app's own user id, once `identify()` labelled this visitor.
+    pub user_id: Option<String>,
+    /// Who set `user_id`: `browser` (the SDK) or `server` (a deployment
+    /// token). `None` while the visitor is anonymous.
+    pub identity_source: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -192,6 +197,16 @@ pub struct VisitorDetails {
     pub first_referrer_hostname: Option<String>,
     /// Marketing channel from the first visit (e.g. "Organic Search", "Direct")
     pub first_channel: Option<String>,
+    /// The app's own user id, once `identify()` labelled this visitor.
+    pub user_id: Option<String>,
+    /// Who set `user_id`: `browser` (the SDK) or `server` (a deployment
+    /// token). `None` while the visitor is anonymous.
+    pub identity_source: Option<String>,
+    #[schema(value_type = Option<String>, format = "date-time", example = "2024-01-01T00:00:00Z")]
+    pub identified_at: Option<UtcDateTime>,
+    /// Who last set each key of `custom_data`: `{"plan": "server"}`. Keys
+    /// written before identify existed are absent.
+    pub trait_sources: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]

@@ -240,6 +240,7 @@ async fn test_live_visitors_honour_the_datacenter_opt_out() -> anyhow::Result<()
         project_id: Set(project.id),
         exclude_datacenter_traffic: Set(false),
         exclude_spam_referrers: Set(true),
+        accept_browser_identify: Set(true),
         created_at: Set(now),
         updated_at: Set(now),
     }

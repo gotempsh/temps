@@ -116,6 +116,15 @@ impl TempsPlugin for EventsPlugin {
             host_ingest_rate_limiter: Arc::new(crate::handlers::HostIngestRateLimiter::new()),
             cookieless_identity: context
                 .require_service::<temps_analytics::cookieless::CookielessIdentity>(),
+            visitor_identity: context
+                .require_service::<temps_analytics::visitor_identity::VisitorIdentityService>(),
+            // Only the public routes identify; each router holds its own.
+            browser_identify_budget: Arc::new(
+                temps_analytics::visitor_audit::EnrichWriteBudget::new(
+                    crate::handlers::events_handler::BROWSER_IDENTIFY_WRITES_PER_MINUTE,
+                    std::time::Duration::from_secs(60),
+                ),
+            ),
         });
 
         let traffic_settings_state = Arc::new(crate::traffic_settings::TrafficSettingsAppState {
@@ -167,6 +176,15 @@ impl TempsPlugin for EventsPlugin {
             host_ingest_rate_limiter: Arc::new(crate::handlers::HostIngestRateLimiter::new()),
             cookieless_identity: context
                 .require_service::<temps_analytics::cookieless::CookielessIdentity>(),
+            visitor_identity: context
+                .require_service::<temps_analytics::visitor_identity::VisitorIdentityService>(),
+            // Only the public routes identify; each router holds its own.
+            browser_identify_budget: Arc::new(
+                temps_analytics::visitor_audit::EnrichWriteBudget::new(
+                    crate::handlers::events_handler::BROWSER_IDENTIFY_WRITES_PER_MINUTE,
+                    std::time::Duration::from_secs(60),
+                ),
+            ),
         });
 
         // The CORS layer resolves keys through the very same service and

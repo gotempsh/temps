@@ -131,6 +131,9 @@ pub struct VisitorSegmentFilters {
     pub filter_channel: Option<String>,
     /// First-touch referrer hostname (matches `visitor.first_referrer_hostname`)
     pub filter_referrer: Option<String>,
+    /// The app's user id set by `identify()` (matches `visitor.user_id`):
+    /// every device and browser the same user was identified on.
+    pub filter_user_id: Option<String>,
 }
 
 #[derive(Deserialize, Clone, ToSchema)]

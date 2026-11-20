@@ -391,6 +391,7 @@ pub(in crate::traffic_settings) mod tests {
             project_id,
             exclude_datacenter_traffic: exclude,
             exclude_spam_referrers: true,
+            accept_browser_identify: true,
             created_at: now,
             updated_at: now,
         }

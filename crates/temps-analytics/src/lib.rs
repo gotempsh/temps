@@ -24,6 +24,7 @@ pub mod retention;
 pub mod traits;
 pub mod types;
 pub mod visitor_audit;
+pub mod visitor_identity;
 
 #[cfg(test)]
 pub mod testing;
