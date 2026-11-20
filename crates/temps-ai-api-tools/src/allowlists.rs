@@ -443,6 +443,11 @@ pub const AI_READ_ALLOWLIST: &[&str] = &[
     // project_access_guard — same three-layer check the list endpoint uses.
     "get_project",
     "get_project_by_slug",
+    // Where each telemetry signal is sent and how it authenticates: public
+    // URLs, header templates such as `Bearer $TEMPS_API_KEY`, and whether an
+    // analytics key or DSN exists. It never returns a credential value, and
+    // runs the same three guards as `get_project`.
+    "get_project_ingest_setup",
     // ── External services: masked env vars only ──
     // `get_service` / `get_service_by_slug` are intentionally NOT included.
     // `get_service` calls `get_service_details`, which runs
