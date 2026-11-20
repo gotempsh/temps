@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { Mail, Webhook } from 'lucide-react'
+import { Mail, Send, Webhook } from 'lucide-react'
 import { CloudflareIcon } from '@/components/icons/DnsProviderIcons'
 import { SlackIcon } from '@/components/icons/SlackIcon'
 
@@ -20,7 +20,9 @@ export function NotificationProviderIcon({
         ? CloudflareIcon
         : provider === 'email'
           ? Mail
-          : Webhook
+          : provider === 'telegram'
+            ? Send
+            : Webhook
   return (
     <span
       aria-hidden="true"

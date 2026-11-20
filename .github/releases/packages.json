@@ -57,7 +57,8 @@
   "api": {
     "kind": "npm",
     "path": "packages/api",
-    "name": "@temps-sdk/api"
+    "name": "@temps-sdk/api",
+    "sources": ["apps/temps-cli/openapi.json"]
   },
   "python-plugin": {
     "kind": "pypi",

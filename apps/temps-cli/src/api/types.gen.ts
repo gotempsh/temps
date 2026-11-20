@@ -9744,6 +9744,12 @@ export type CreateTeamRequest = {
     slug: string;
 };
 
+export type CreateTelegramProviderRequest = {
+    config: TelegramConfig;
+    enabled?: boolean | null;
+    name: string;
+};
+
 export type CreateThreadArtifactRequest = {
     kind: string;
     payload: unknown;
@@ -35943,6 +35949,27 @@ export type TeamResponse = {
 export type TeamRole = 'owner' | 'admin' | 'deployer' | 'viewer';
 
 /**
+ * Configuration for a Telegram notification provider (Telegram Bot API
+ * `sendMessage`). Request-side config. Not `Serialize`: `bot_token` is a
+ * `SecretString`; use [`TelegramConfig::into_stored_value`].
+ */
+export type TelegramConfig = {
+    /**
+     * Bot token from @BotFather. Encrypted at rest and masked in normal API
+     * responses. Send `***` on update to keep the stored token.
+     */
+    bot_token: SecretString;
+    /**
+     * Chat to post to: a numeric user, group or channel ID (`-100…` for supergroups and channels) or a public `@channelusername`. A JSON integer is accepted too.
+     */
+    chat_id: string | number;
+    /**
+     * Optional forum topic (`message_thread_id`) for forum-style groups.
+     */
+    message_thread_id?: number | null;
+};
+
+/**
  * Area an event belongs to, for operator-facing disclosure (see
  * [`TelemetryEventKind::category`]). Serialized as snake_case.
  */
@@ -39129,6 +39156,12 @@ export type UpdateStatusResponse = {
 
 export type UpdateTeamRequest = {
     description?: string | null;
+    name?: string | null;
+};
+
+export type UpdateTelegramProviderRequest = {
+    config: TelegramConfig;
+    enabled?: boolean | null;
     name?: string | null;
 };
 
@@ -68981,6 +69014,85 @@ export type UpdateSlackProviderResponses = {
 };
 
 export type UpdateSlackProviderResponse = UpdateSlackProviderResponses[keyof UpdateSlackProviderResponses];
+
+export type CreateTelegramProviderData = {
+    body: CreateTelegramProviderRequest;
+    path?: never;
+    query?: never;
+    url: '/notification-providers/telegram';
+};
+
+export type CreateTelegramProviderErrors = {
+    /**
+     * Invalid bot token, chat ID or topic ID
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type CreateTelegramProviderResponses = {
+    /**
+     * Successfully created Telegram provider
+     */
+    201: NotificationProviderResponse;
+};
+
+export type CreateTelegramProviderResponse = CreateTelegramProviderResponses[keyof CreateTelegramProviderResponses];
+
+export type UpdateTelegramProviderData = {
+    body: UpdateTelegramProviderRequest;
+    path: {
+        /**
+         * Provider ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/notification-providers/telegram/{id}';
+};
+
+export type UpdateTelegramProviderErrors = {
+    /**
+     * Invalid bot token, chat ID or topic ID
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Provider not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UpdateTelegramProviderResponses = {
+    /**
+     * Successfully updated Telegram provider
+     */
+    200: NotificationProviderResponse;
+};
+
+export type UpdateTelegramProviderResponse = UpdateTelegramProviderResponses[keyof UpdateTelegramProviderResponses];
 
 export type CreateWebhookProviderData = {
     body: CreateWebhookProviderRequest;
