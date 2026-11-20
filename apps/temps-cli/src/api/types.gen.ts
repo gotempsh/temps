@@ -34649,7 +34649,7 @@ export type TelegramConfig = {
      * Bot token from @BotFather. Encrypted at rest and masked in normal API
      * responses. Send `***` on update to keep the stored token.
      */
-    bot_token: string;
+    bot_token: SecretString;
     /**
      * Chat to post to: a numeric user, group or channel ID (`-100…` for supergroups and channels) or a public `@channelusername`. A JSON integer is accepted too.
      */

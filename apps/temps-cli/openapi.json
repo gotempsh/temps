@@ -74799,9 +74799,8 @@
         "description": "Configuration for a Telegram notification provider (Telegram Bot API\n`sendMessage`). Request-side config. Not `Serialize`: `bot_token` is a\n`SecretString`; use [`TelegramConfig::into_stored_value`].",
         "properties": {
           "bot_token": {
-            "description": "Bot token from @BotFather. Encrypted at rest and masked in normal API\nresponses. Send `***` on update to keep the stored token.",
-            "example": "123456789:AA...",
-            "type": "string"
+            "$ref": "#/components/schemas/SecretString",
+            "description": "Bot token from @BotFather. Encrypted at rest and masked in normal API\nresponses. Send `***` on update to keep the stored token."
           },
           "chat_id": {
             "description": "Chat to post to: a numeric user, group or channel ID (`-100…` for supergroups and channels) or a public `@channelusername`. A JSON integer is accepted too.",
