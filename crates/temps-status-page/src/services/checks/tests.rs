@@ -21,7 +21,7 @@ use temps_entities::{projects, status_checks, status_monitors, users};
 use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
 use tower::ServiceExt;
 
-use super::locations::NodeLocation;
+use super::locations::{NodeLocation, NodeProbeError};
 use super::probe::{ProbeOutcome, ProbeStatus, TargetProber};
 use super::spec::{CheckRequest, CheckRequestHeader, CheckSpec, HttpCheck, Target, TcpCheck};
 use super::{
@@ -777,7 +777,7 @@ impl ProbeLocations for FakeLocations {
         &self,
         node: &NodeLocation,
         request: &RemoteProbeRequest,
-    ) -> Result<ProbeOutcome, String> {
+    ) -> Result<ProbeOutcome, NodeProbeError> {
         self.asked
             .lock()
             .expect("asked lock")
@@ -787,6 +787,11 @@ impl ProbeLocations for FakeLocations {
             .find(|(id, _)| *id == node.node_id)
             .map(|(_, answer)| answer.clone())
             .unwrap_or_else(|| Err("not scripted".to_string()))
+            .map_err(|reason| NodeProbeError::Refused {
+                node: node.name.clone(),
+                status: 503,
+                reason,
+            })
     }
 }
 
@@ -899,7 +904,7 @@ async fn checked_from_nodes_the_majority_decides_and_every_answer_is_kept() {
     assert_eq!(results[1].region.as_deref(), Some("eu"));
     assert_eq!(
         results[3].message.as_deref(),
-        Some("no answer: could not reach its agent")
+        Some("no answer: its agent refused the check (HTTP 503): could not reach its agent")
     );
 }
 

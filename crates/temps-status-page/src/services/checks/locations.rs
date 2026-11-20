@@ -16,19 +16,19 @@
 //! node that cannot receive it sealed.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder};
 use serde::{Deserialize, Serialize};
-use temps_config::node_client::{build_node_http_client, node_agent_endpoint};
+use temps_config::node_client::{build_node_http_client, node_agent_endpoint, ClusterCaError};
 use temps_config::ConfigService;
-use temps_core::sealed_request::{NodeSealing, SEALED_REQUEST_CONTENT_TYPE};
-use temps_core::{EncryptionService, UtcDateTime};
+use temps_core::sealed_request::{NodeSealing, SealRequestError, SEALED_REQUEST_CONTENT_TYPE};
+use temps_core::{EncryptionError, EncryptionService, UtcDateTime};
 use temps_entities::nodes;
 use temps_uptime_probe::{ProbeOutcome, ProbeStatus, RemoteProbeRequest, REMOTE_PROBE_PATH};
-use tokio::sync::Mutex;
+use thiserror::Error;
 use tracing::debug;
 use utoipa::ToSchema;
 
@@ -81,6 +81,69 @@ pub struct NodeLocation {
     pub region: Option<String>,
 }
 
+/// Why a worker node gave no answer to a check. The messages read after the
+/// node's name in the location list ("worker-a: no answer: could not reach
+/// its agent"); the fields say which node and what failed.
+#[derive(Debug, Error)]
+pub enum NodeProbeError {
+    #[error("node {node} is not a probe location")]
+    NotALocation { node: String },
+    #[error("could not read node {node_id}: {source}")]
+    ReadNode {
+        node_id: i32,
+        #[source]
+        source: sea_orm::DbErr,
+    },
+    #[error("node {node_id} no longer exists")]
+    NodeGone { node_id: i32 },
+    #[error("node {node} has no stored token")]
+    NoToken { node: String },
+    #[error("the token of node {node} is unreadable: {source}")]
+    UnreadableToken {
+        node: String,
+        #[source]
+        source: EncryptionError,
+    },
+    #[error("no client for node {node}: {source}")]
+    Client {
+        node: String,
+        #[source]
+        source: ClusterCaError,
+    },
+    #[error("its headers and body were not sent to node {node}: {source}")]
+    NotSealed {
+        node: String,
+        #[source]
+        source: SealRequestError,
+    },
+    #[error("could not reach its agent: {source}")]
+    Unreachable {
+        node: String,
+        #[source]
+        source: reqwest::Error,
+    },
+    #[error("its worker agent is too old to run uptime checks; update it")]
+    AgentTooOld { node: String },
+    #[error("{}", temps_core::sealed_request::older_agent_message(node))]
+    SealingUnsupported { node: String },
+    #[error("its answer could not be read: {source}")]
+    AnswerUnreadable {
+        node: String,
+        #[source]
+        source: reqwest::Error,
+    },
+    #[error("its answer was larger than {limit} bytes")]
+    AnswerTooLarge { node: String, limit: usize },
+    #[error("its agent answered HTTP {status} without a result")]
+    NoResult { node: String, status: u16 },
+    #[error("its agent refused the check (HTTP {status}): {reason}")]
+    Refused {
+        node: String,
+        status: u16,
+        reason: String,
+    },
+}
+
 /// Where checks can run besides the control plane.
 #[async_trait]
 pub trait ProbeLocations: Send + Sync {
@@ -93,7 +156,7 @@ pub trait ProbeLocations: Send + Sync {
         &self,
         node: &NodeLocation,
         request: &RemoteProbeRequest,
-    ) -> Result<ProbeOutcome, String>;
+    ) -> Result<ProbeOutcome, NodeProbeError>;
 }
 
 /// No worker nodes: every check runs from the control plane only.
@@ -110,8 +173,10 @@ impl ProbeLocations for NoNodeLocations {
         &self,
         node: &NodeLocation,
         _: &RemoteProbeRequest,
-    ) -> Result<ProbeOutcome, String> {
-        Err(format!("node {} is not a probe location", node.name))
+    ) -> Result<ProbeOutcome, NodeProbeError> {
+        Err(NodeProbeError::NotALocation {
+            node: node.name.clone(),
+        })
     }
 }
 
@@ -213,14 +278,14 @@ impl MonitorLocationResult {
         }
     }
 
-    pub fn node(node: &NodeLocation, answer: Result<ProbeOutcome, String>) -> Self {
+    pub fn node(node: &NodeLocation, answer: Result<ProbeOutcome, NodeProbeError>) -> Self {
         let (status, response_time_ms, message) = match answer {
             Ok(outcome) => (
                 Some(outcome.status),
                 outcome.response_time_ms.filter(|ms| *ms >= 0),
                 outcome.message,
             ),
-            Err(reason) => (None, None, Some(format!("no answer: {reason}"))),
+            Err(error) => (None, None, Some(format!("no answer: {error}"))),
         };
         Self {
             location: node.name.clone(),
@@ -336,6 +401,9 @@ pub struct NodeProbeLocations {
     db: Arc<DatabaseConnection>,
     config: Arc<ConfigService>,
     encryption: Arc<EncryptionService>,
+    /// A std mutex on purpose: its guard cannot be held across an `.await` in
+    /// these `Send` futures, so a slow client build for one node never blocks
+    /// checks that go to the others.
     clients: Mutex<HashMap<i32, Arc<NodeClient>>>,
 }
 
@@ -353,31 +421,46 @@ impl NodeProbeLocations {
         }
     }
 
-    async fn client(&self, node_id: i32) -> Result<Arc<NodeClient>, String> {
-        let mut clients = self.clients.lock().await;
-        if let Some(client) = clients.get(&node_id) {
-            if client.built.elapsed() < CLIENT_MAX_AGE {
-                return Ok(client.clone());
-            }
+    fn cached(&self, node_id: i32) -> Option<Arc<NodeClient>> {
+        let clients = self.clients.lock().unwrap_or_else(PoisonError::into_inner);
+        clients
+            .get(&node_id)
+            .filter(|client| client.built.elapsed() < CLIENT_MAX_AGE)
+            .cloned()
+    }
+
+    /// The node's client: the cached one while it is fresh, otherwise a new
+    /// one. The cache lock is released while the node is read and the client
+    /// is built.
+    async fn client(&self, node_id: i32) -> Result<Arc<NodeClient>, NodeProbeError> {
+        if let Some(client) = self.cached(node_id) {
+            return Ok(client);
         }
         let node = nodes::Entity::find_by_id(node_id)
             .one(self.db.as_ref())
             .await
-            .map_err(|error| format!("could not read node {node_id}: {error}"))?
-            .ok_or_else(|| format!("node {node_id} no longer exists"))?;
-        let token = node
+            .map_err(|source| NodeProbeError::ReadNode { node_id, source })?
+            .ok_or(NodeProbeError::NodeGone { node_id })?;
+        let encrypted = node
             .token_encrypted
             .as_deref()
-            .ok_or_else(|| format!("node {} has no stored token", node.name))
-            .and_then(|encrypted| {
-                self.encryption.decrypt_string(encrypted).map_err(|error| {
-                    format!("the token of node {} is unreadable: {error}", node.name)
-                })
+            .ok_or_else(|| NodeProbeError::NoToken {
+                node: node.name.clone(),
+            })?;
+        let token = self
+            .encryption
+            .decrypt_string(encrypted)
+            .map_err(|source| NodeProbeError::UnreadableToken {
+                node: node.name.clone(),
+                source,
             })?;
         let endpoint = node_agent_endpoint(&node);
         let client = build_node_http_client(&endpoint, &self.config, &self.encryption, None)
             .await
-            .map_err(|error| format!("no client for node {}: {error}", node.name))?;
+            .map_err(|source| NodeProbeError::Client {
+                node: node.name.clone(),
+                source,
+            })?;
         let client = Arc::new(NodeClient {
             built: Instant::now(),
             client,
@@ -388,12 +471,18 @@ impl NodeProbeLocations {
             token,
             sealing: node.request_sealing(),
         });
-        clients.insert(node_id, client.clone());
+        self.clients
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(node_id, client.clone());
         Ok(client)
     }
 
-    async fn forget(&self, node_id: i32) {
-        self.clients.lock().await.remove(&node_id);
+    fn forget(&self, node_id: i32) {
+        self.clients
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&node_id);
     }
 
     async fn ask(
@@ -401,7 +490,8 @@ impl NodeProbeLocations {
         node: &NodeLocation,
         client: &NodeClient,
         request: &RemoteProbeRequest,
-    ) -> Result<ProbeOutcome, String> {
+    ) -> Result<ProbeOutcome, NodeProbeError> {
+        let name = || node.name.clone();
         let sealed = client
             .sealing
             .seal_json(&node.name, REMOTE_PROBE_PATH, request);
@@ -417,37 +507,49 @@ impl NodeProbeLocations {
             // Nothing secret to protect: the target and check are shown to
             // anyone who can read the monitor.
             Err(_) if request.request.is_empty() => builder.json(request),
-            Err(error) => return Err(format!("its headers and body were not sent: {error}")),
+            Err(source) => return Err(NodeProbeError::NotSealed { node: name(), source }),
         };
         let mut response = builder
             .send()
             .await
-            .map_err(|error| format!("could not reach its agent: {error}"))?;
+            .map_err(|source| NodeProbeError::Unreachable { node: name(), source })?;
         let status = response.status();
         if status == reqwest::StatusCode::NOT_FOUND {
-            return Err("its worker agent is too old to run uptime checks; update it".to_string());
+            return Err(NodeProbeError::AgentTooOld { node: name() });
         }
         if status == reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE {
-            return Err(temps_core::sealed_request::older_agent_message(&node.name));
+            return Err(NodeProbeError::SealingUnsupported { node: name() });
         }
         let mut body = Vec::new();
         while let Some(chunk) = response
             .chunk()
             .await
-            .map_err(|error| format!("its answer could not be read: {error}"))?
+            .map_err(|source| NodeProbeError::AnswerUnreadable { node: name(), source })?
         {
             if body.len() + chunk.len() > MAX_ANSWER_BYTES {
-                return Err("its answer was too large".to_string());
+                return Err(NodeProbeError::AnswerTooLarge {
+                    node: name(),
+                    limit: MAX_ANSWER_BYTES,
+                });
             }
             body.extend_from_slice(&chunk);
         }
-        let answer: AgentAnswer = serde_json::from_slice(&body)
-            .map_err(|_| format!("its agent answered HTTP {status} without a result"))?;
-        match (answer.success, answer.data) {
-            (true, Some(outcome)) => Ok(outcome),
-            _ => Err(answer
-                .error
-                .unwrap_or_else(|| format!("its agent answered HTTP {status}"))),
+        let answer: AgentAnswer =
+            serde_json::from_slice(&body).map_err(|_| NodeProbeError::NoResult {
+                node: name(),
+                status: status.as_u16(),
+            })?;
+        match (answer.success, answer.data, answer.error) {
+            (true, Some(outcome), _) => Ok(outcome),
+            (_, _, Some(reason)) => Err(NodeProbeError::Refused {
+                node: name(),
+                status: status.as_u16(),
+                reason,
+            }),
+            _ => Err(NodeProbeError::NoResult {
+                node: name(),
+                status: status.as_u16(),
+            }),
         }
     }
 }
@@ -469,12 +571,12 @@ impl ProbeLocations for NodeProbeLocations {
         &self,
         node: &NodeLocation,
         request: &RemoteProbeRequest,
-    ) -> Result<ProbeOutcome, String> {
+    ) -> Result<ProbeOutcome, NodeProbeError> {
         let client = self.client(node.node_id).await?;
         let answer = self.ask(node, &client, request).await;
-        if let Err(reason) = &answer {
-            debug!(node_id = node.node_id, node = %node.name, %reason, "A node gave no uptime answer");
-            self.forget(node.node_id).await;
+        if let Err(error) = &answer {
+            debug!(node_id = node.node_id, node = %node.name, %error, "A node gave no uptime answer");
+            self.forget(node.node_id);
         }
         answer
     }
@@ -622,14 +724,39 @@ mod tests {
         );
         assert_eq!(long.response_time_ms, None);
         assert_eq!(long.message.unwrap().chars().count(), MAX_MESSAGE_CHARS + 1);
-        let silent =
-            MonitorLocationResult::node(&location, Err("could not reach its agent".into()));
+        let silent = MonitorLocationResult::node(
+            &location,
+            Err(NodeProbeError::AgentTooOld {
+                node: "worker-a".into(),
+            }),
+        );
         assert_eq!(silent.status, None);
         assert_eq!(silent.region.as_deref(), Some("eu"));
         assert_eq!(
             silent.message.as_deref(),
-            Some("no answer: could not reach its agent")
+            Some("no answer: its worker agent is too old to run uptime checks; update it")
         );
+    }
+
+    #[test]
+    fn node_probe_errors_keep_their_cause_and_node() {
+        use std::error::Error as _;
+        let error = NodeProbeError::ReadNode {
+            node_id: 9,
+            source: sea_orm::DbErr::Custom("connection reset".into()),
+        };
+        assert!(error.to_string().contains("node 9"), "{error}");
+        assert!(
+            error.source().is_some_and(|source| source.to_string().contains("connection reset")),
+            "the database error stays the source"
+        );
+        let refused = NodeProbeError::Refused {
+            node: "worker-a".into(),
+            status: 429,
+            reason: "this node is already running 16 uptime checks".into(),
+        };
+        assert!(matches!(refused, NodeProbeError::Refused { status: 429, .. }));
+        assert!(refused.to_string().contains("HTTP 429"), "{refused}");
     }
 
     #[test]
