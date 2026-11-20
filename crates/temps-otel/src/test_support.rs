@@ -314,8 +314,7 @@ impl MockOtelStorage {
                     last_seen,
                     query.apdex_threshold_ms.map(|threshold_ms| ApdexCounts {
                         threshold_ms,
-                        satisfied: durations.iter().filter(|d| **d <= threshold_ms).count()
-                            as i64,
+                        satisfied: durations.iter().filter(|d| **d <= threshold_ms).count() as i64,
                         tolerating: durations
                             .iter()
                             .filter(|d| **d > threshold_ms && **d <= threshold_ms * 4.0)
@@ -883,7 +882,9 @@ impl OtelStorage for MockOtelStorage {
                 }
             }
             // The time window, as the real backends apply it to span starts.
-            if query.start_time.is_some_and(|start| span.start_time < start)
+            if query
+                .start_time
+                .is_some_and(|start| span.start_time < start)
                 || query.end_time.is_some_and(|end| span.start_time > end)
             {
                 continue;

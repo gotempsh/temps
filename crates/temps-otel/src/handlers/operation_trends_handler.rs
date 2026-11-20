@@ -16,8 +16,8 @@ use utoipa::{IntoParams, OpenApi, ToSchema};
 use crate::services::operation_trends::breakdown::{AttributeSlice, BreakdownGroup};
 use crate::services::operation_trends::page_backend::{BackendRequest, PageBackend, PageVitals};
 use crate::services::operation_trends::{
-    self, BreakdownSample, DeploymentMarker, OperationBreakdown, DeploymentRegressions, OperationChange, OperationTrend,
-    TrackingState, TrendPoint,
+    self, BreakdownSample, DeploymentMarker, DeploymentRegressions, OperationBreakdown,
+    OperationChange, OperationTrend, TrackingState, TrendPoint,
 };
 use crate::OtelAppState;
 
@@ -628,9 +628,7 @@ pub async fn get_operation_breakdown(
         })?,
     };
     let end_time = params.end_time.unwrap_or_else(Utc::now);
-    let start_time = params
-        .start_time
-        .unwrap_or(end_time - Duration::hours(24));
+    let start_time = params.start_time.unwrap_or(end_time - Duration::hours(24));
     let attribute = params.attribute.as_deref().filter(|a| !a.is_empty());
     let result = state
         .operation_trends
@@ -644,7 +642,9 @@ pub async fn get_operation_breakdown(
             attribute,
         )
         .await?;
-    Ok(Json(breakdown_response(&params, start_time, end_time, result)))
+    Ok(Json(breakdown_response(
+        &params, start_time, end_time, result,
+    )))
 }
 
 /// A page's web vitals next to the backend requests that served it
@@ -671,9 +671,7 @@ pub async fn get_page_backend(
     project_scope_guard!(auth, params.project_id);
     project_access_guard!(auth, params.project_id, state.project_access_checker);
     let end_time = params.end_time.unwrap_or_else(Utc::now);
-    let start_time = params
-        .start_time
-        .unwrap_or(end_time - Duration::hours(24));
+    let start_time = params.start_time.unwrap_or(end_time - Duration::hours(24));
     let result = state
         .operation_trends
         .page_backend(params.project_id, &params.path, start_time, end_time)
@@ -726,7 +724,10 @@ mod tests {
     fn an_untracked_project_explains_itself_and_links_to_setup() {
         let response = OperationTrackingResponse::from(None);
         assert!(!response.configured);
-        assert!(response.reason.as_deref().is_some_and(|r| r.contains("10 minutes")));
+        assert!(response
+            .reason
+            .as_deref()
+            .is_some_and(|r| r.contains("10 minutes")));
         assert_eq!(response.setup_path.as_deref(), Some("traces"));
         assert_eq!(
             response.max_tracked_operations,
@@ -791,7 +792,10 @@ mod tests {
         let now = Utc::now();
         let empty = page_backend_response("/pricing".into(), now, now, PageBackend::default());
         assert!(!empty.configured);
-        assert!(empty.reason.as_deref().is_some_and(|r| r.contains("/pricing") && r.contains("url.path")));
+        assert!(empty
+            .reason
+            .as_deref()
+            .is_some_and(|r| r.contains("/pricing") && r.contains("url.path")));
         assert_eq!(empty.setup_path.as_deref(), Some("traces"));
         assert_eq!(empty.backend_share_of_ttfb, None);
 

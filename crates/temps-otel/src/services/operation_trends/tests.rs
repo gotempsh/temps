@@ -60,7 +60,10 @@ mod sampling {
     use crate::test_support::MockOtelStorage;
     use crate::types::{ResourceInfo, SpanKind, SpanRecord, SpanStatusCode};
 
-    #[allow(clippy::too_many_arguments, reason = "a test fixture spelling out one span")]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "a test fixture spelling out one span"
+    )]
     fn span(
         trace: &str,
         id: &str,
@@ -108,18 +111,61 @@ mod sampling {
         for i in 0..19 {
             let trace = format!("fast{i:02}");
             let at = now - Duration::minutes(30) + Duration::seconds(i);
-            spans.push(span(&trace, "a", None, "GET /cart", SpanKind::Server, at, 20, &[("tier", "free")]));
-            spans.push(span(&trace, "b", Some("a"), "cache.get", SpanKind::Client, at, 15, &[]));
+            spans.push(span(
+                &trace,
+                "a",
+                None,
+                "GET /cart",
+                SpanKind::Server,
+                at,
+                20,
+                &[("tier", "free")],
+            ));
+            spans.push(span(
+                &trace,
+                "b",
+                Some("a"),
+                "cache.get",
+                SpanKind::Client,
+                at,
+                15,
+                &[],
+            ));
             // A span whose name merely contains the operation's.
-            spans.push(span(&trace, "c", Some("a"), "GET /cart/items", SpanKind::Internal, at, 1, &[]));
+            spans.push(span(
+                &trace,
+                "c",
+                Some("a"),
+                "GET /cart/items",
+                SpanKind::Internal,
+                at,
+                1,
+                &[],
+            ));
         }
         let at = now - Duration::minutes(10);
-        spans.push(span("slow", "a", None, "GET /cart", SpanKind::Server, at, 900, &[("tier", "paid")]));
-        spans.push(span("slow", "b", Some("a"), "SELECT cart_items", SpanKind::Client, at, 850, &[("db.system", "postgresql")]));
+        spans.push(span(
+            "slow",
+            "a",
+            None,
+            "GET /cart",
+            SpanKind::Server,
+            at,
+            900,
+            &[("tier", "paid")],
+        ));
+        spans.push(span(
+            "slow",
+            "b",
+            Some("a"),
+            "SELECT cart_items",
+            SpanKind::Client,
+            at,
+            850,
+            &[("db.system", "postgresql")],
+        ));
         storage.store_spans(spans).await.expect("spans");
-        let db = Arc::new(
-            sea_orm::MockDatabase::new(DatabaseBackend::Postgres).into_connection(),
-        );
+        let db = Arc::new(sea_orm::MockDatabase::new(DatabaseBackend::Postgres).into_connection());
         (OperationTrendService::new(db, storage), now)
     }
 
@@ -127,20 +173,40 @@ mod sampling {
     async fn a_recent_sample_reads_at_most_the_budget_and_exact_calls_only() {
         let (service, now) = service().await;
         let result = service
-            .breakdown(1, "checkout-api", "GET /cart", now - Duration::days(1), now, BreakdownSample::Recent, Some("tier"))
+            .breakdown(
+                1,
+                "checkout-api",
+                "GET /cart",
+                now - Duration::days(1),
+                now,
+                BreakdownSample::Recent,
+                Some("tier"),
+            )
             .await
             .expect("breakdown");
         assert_eq!(result.breakdown.traces, BREAKDOWN_TRACES);
         assert_eq!(result.breakdown.instances, BREAKDOWN_TRACES as u64);
         assert_eq!(result.slow_threshold_ms, None);
-        assert!(result.breakdown.by_attribute.iter().any(|s| s.value.as_deref() == Some("free")));
+        assert!(result
+            .breakdown
+            .by_attribute
+            .iter()
+            .any(|s| s.value.as_deref() == Some("free")));
     }
 
     #[tokio::test]
     async fn a_slow_sample_starts_from_the_p95_and_shows_where_slow_calls_go() {
         let (service, now) = service().await;
         let result = service
-            .breakdown(1, "checkout-api", "GET /cart", now - Duration::days(1), now, BreakdownSample::Slow, None)
+            .breakdown(
+                1,
+                "checkout-api",
+                "GET /cart",
+                now - Duration::days(1),
+                now,
+                BreakdownSample::Slow,
+                None,
+            )
             .await
             .expect("breakdown");
         let threshold = result.slow_threshold_ms.expect("threshold");
@@ -155,8 +221,18 @@ mod sampling {
         let (service, now) = service().await;
         for (svc, name, start, attribute) in [
             ("", "GET /cart", now - Duration::days(1), None),
-            ("checkout-api", "GET /cart", now - Duration::days(MAX_BREAKDOWN_DAYS + 1), None),
-            ("checkout-api", "GET /cart", now - Duration::days(1), Some(" ")),
+            (
+                "checkout-api",
+                "GET /cart",
+                now - Duration::days(MAX_BREAKDOWN_DAYS + 1),
+                None,
+            ),
+            (
+                "checkout-api",
+                "GET /cart",
+                now - Duration::days(1),
+                Some(" "),
+            ),
         ] {
             let error = service
                 .breakdown(1, svc, name, start, now, BreakdownSample::Recent, attribute)
@@ -279,7 +355,14 @@ mod database {
         storage
             .store_spans(
                 (0..10)
-                    .map(|i| span(project_id, "GET /cart", hour + Duration::minutes(i), 100.0 + i as f64))
+                    .map(|i| {
+                        span(
+                            project_id,
+                            "GET /cart",
+                            hour + Duration::minutes(i),
+                            100.0 + i as f64,
+                        )
+                    })
                     .collect(),
             )
             .await
@@ -289,22 +372,37 @@ mod database {
         let report = service.tick(now).await.expect("tick");
         assert_eq!(report.projects, 1);
         assert_eq!(report.hours, HOURS_PER_PROJECT_PER_TICK as usize);
-        let state = service.tracking_state(project_id).await.expect("state").expect("saved");
+        let state = service
+            .tracking_state(project_id)
+            .await
+            .expect("state")
+            .expect("saved");
         assert_eq!(
             state.rolled_until,
-            hour_floor(now) - Duration::hours(BACKFILL_HOURS) + Duration::hours(HOURS_PER_PROJECT_PER_TICK)
+            hour_floor(now) - Duration::hours(BACKFILL_HOURS)
+                + Duration::hours(HOURS_PER_PROJECT_PER_TICK)
         );
 
         // Later ticks catch up to the last complete hour and no further.
         for _ in 0..5 {
             service.tick(now).await.expect("tick");
         }
-        let state = service.tracking_state(project_id).await.expect("state").expect("saved");
+        let state = service
+            .tracking_state(project_id)
+            .await
+            .expect("state")
+            .expect("saved");
         assert_eq!(state.rolled_until, hour_floor(now));
         assert_eq!(state.overflow_operations, 0);
 
         let trend = service
-            .trend(project_id, "checkout-api", "GET /cart", now - Duration::days(1), now)
+            .trend(
+                project_id,
+                "checkout-api",
+                "GET /cart",
+                now - Duration::days(1),
+                now,
+            )
             .await
             .expect("trend");
         assert_eq!(trend.points.len(), 1, "only the hour with spans has a row");
@@ -315,7 +413,13 @@ mod database {
         // Rolling the same hour again replaces its row.
         service.roll_up_hour(project_id, hour).await.expect("again");
         let again = service
-            .trend(project_id, "checkout-api", "GET /cart", now - Duration::days(1), now)
+            .trend(
+                project_id,
+                "checkout-api",
+                "GET /cart",
+                now - Duration::days(1),
+                now,
+            )
             .await
             .expect("trend");
         assert_eq!(again.points.len(), 1);
@@ -334,13 +438,23 @@ mod database {
         storage
             .store_spans(
                 (0..MAX_TRACKED_OPERATIONS as i64 + extra)
-                    .map(|i| span(project_id, &format!("GET /item/{i}"), hour + Duration::seconds(i), 10.0 + i as f64))
+                    .map(|i| {
+                        span(
+                            project_id,
+                            &format!("GET /item/{i}"),
+                            hour + Duration::seconds(i),
+                            10.0 + i as f64,
+                        )
+                    })
                     .collect(),
             )
             .await
             .expect("spans");
         let service = OperationTrendService::new(db.clone(), storage);
-        let (tracked, overflow) = service.roll_up_hour(project_id, hour).await.expect("rollup");
+        let (tracked, overflow) = service
+            .roll_up_hour(project_id, hour)
+            .await
+            .expect("rollup");
         assert_eq!(tracked, MAX_TRACKED_OPERATIONS as usize);
         assert_eq!(overflow, extra as usize);
         let rows: i64 = db
@@ -385,22 +499,45 @@ mod database {
         for h in 1..=24 {
             let at = hour_floor(live_at) - Duration::hours(h);
             for i in 0..5 {
-                spans.push(span(project_id, "GET /cart", at + Duration::minutes(i), 100.0 + (h % 3) as f64));
-                spans.push(span(project_id, "GET /home", at + Duration::minutes(i), 50.0));
+                spans.push(span(
+                    project_id,
+                    "GET /cart",
+                    at + Duration::minutes(i),
+                    100.0 + (h % 3) as f64,
+                ));
+                spans.push(span(
+                    project_id,
+                    "GET /home",
+                    at + Duration::minutes(i),
+                    50.0,
+                ));
             }
         }
         for h in 0..4 {
             let at = hour_ceil(live_at) + Duration::hours(h);
             for i in 0..5 {
-                spans.push(span(project_id, "GET /cart", at + Duration::minutes(i), 180.0));
-                spans.push(span(project_id, "GET /home", at + Duration::minutes(i), 51.0));
+                spans.push(span(
+                    project_id,
+                    "GET /cart",
+                    at + Duration::minutes(i),
+                    180.0,
+                ));
+                spans.push(span(
+                    project_id,
+                    "GET /home",
+                    at + Duration::minutes(i),
+                    51.0,
+                ));
             }
         }
         storage.store_spans(spans).await.expect("spans");
         let service = OperationTrendService::new(db.clone(), storage);
         let mut hour = hour_floor(live_at) - Duration::hours(24);
         while hour < hour_floor(now) {
-            service.roll_up_hour(project_id, hour).await.expect("rollup");
+            service
+                .roll_up_hour(project_id, hour)
+                .await
+                .expect("rollup");
             hour += Duration::hours(1);
         }
         let deployment_id = insert_deployment(&db, project_id, environment_id, Some(live_at)).await;
@@ -419,7 +556,13 @@ mod database {
         assert_eq!(result.after_start, hour_ceil(live_at));
 
         let trend = service
-            .trend(project_id, "checkout-api", "GET /cart", now - Duration::days(2), now)
+            .trend(
+                project_id,
+                "checkout-api",
+                "GET /cart",
+                now - Duration::days(2),
+                now,
+            )
             .await
             .expect("trend");
         assert_eq!(trend.deployments.len(), 1);
@@ -452,7 +595,12 @@ mod database {
         for (service_name, span_name, start, end) in [
             ("", "GET /", now - Duration::days(1), now),
             ("api", "GET /", now, now - Duration::days(1)),
-            ("api", "GET /", now - Duration::days(MAX_TREND_DAYS + 1), now),
+            (
+                "api",
+                "GET /",
+                now - Duration::days(MAX_TREND_DAYS + 1),
+                now,
+            ),
         ] {
             let error = service
                 .trend(1, service_name, span_name, start, end)

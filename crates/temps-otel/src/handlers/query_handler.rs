@@ -2234,7 +2234,13 @@ mod tests {
             apdex_threshold(Some(MAX_APDEX_THRESHOLD_MS)).unwrap(),
             MAX_APDEX_THRESHOLD_MS
         );
-        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY, MAX_APDEX_THRESHOLD_MS + 1.0] {
+        for bad in [
+            0.0,
+            -1.0,
+            f64::NAN,
+            f64::INFINITY,
+            MAX_APDEX_THRESHOLD_MS + 1.0,
+        ] {
             let problem = apdex_threshold(Some(bad)).expect_err("rejected");
             assert_eq!(problem.status_code, axum::http::StatusCode::BAD_REQUEST);
             let detail = problem.body.get("detail").and_then(|d| d.as_str());

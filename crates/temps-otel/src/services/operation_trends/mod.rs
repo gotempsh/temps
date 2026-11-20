@@ -541,7 +541,10 @@ impl OperationTrendService {
 
     /// What the rollup job last did for a project; `None` before its first
     /// run.
-    pub async fn tracking_state(&self, project_id: i32) -> Result<Option<TrackingState>, OtelError> {
+    pub async fn tracking_state(
+        &self,
+        project_id: i32,
+    ) -> Result<Option<TrackingState>, OtelError> {
         let row = self
             .db
             .query_one(Statement::from_sql_and_values(
@@ -746,7 +749,10 @@ impl OperationTrendService {
                 ChangeKind::InsufficientBaseline => result.insufficient_baseline += 1,
                 ChangeKind::InsufficientAfter => result.insufficient_after += 1,
             }
-            if matches!(comparison.kind, ChangeKind::Regressed | ChangeKind::Improved) {
+            if matches!(
+                comparison.kind,
+                ChangeKind::Regressed | ChangeKind::Improved
+            ) {
                 result.changes.push(OperationChange {
                     service_name,
                     span_name,
@@ -757,7 +763,8 @@ impl OperationTrendService {
         result.changes.sort_by(|a, b| {
             let rank = |c: &OperationChange| (c.comparison.kind != ChangeKind::Regressed) as u8;
             rank(a).cmp(&rank(b)).then_with(|| {
-                let magnitude = |c: &OperationChange| c.comparison.change_ratio.unwrap_or(0.0).abs();
+                let magnitude =
+                    |c: &OperationChange| c.comparison.change_ratio.unwrap_or(0.0).abs();
                 magnitude(b)
                     .partial_cmp(&magnitude(a))
                     .unwrap_or(std::cmp::Ordering::Equal)
@@ -771,7 +778,10 @@ impl OperationTrendService {
 impl OperationTrendService {
     /// Where the time of one operation goes, from at most
     /// [`BREAKDOWN_TRACES`] traces in `[start, end]`.
-    #[allow(clippy::too_many_arguments, reason = "each argument is one filter of the request")]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "each argument is one filter of the request"
+    )]
     pub async fn breakdown(
         &self,
         project_id: i32,
@@ -791,7 +801,9 @@ impl OperationTrendService {
         }
         if start >= end {
             return Err(OtelError::Validation {
-                message: format!("The breakdown window must start before it ends ({start} to {end})"),
+                message: format!(
+                    "The breakdown window must start before it ends ({start} to {end})"
+                ),
             });
         }
         if end - start > Duration::days(MAX_BREAKDOWN_DAYS) {
@@ -841,7 +853,8 @@ impl OperationTrendService {
                 })
                 .await?;
             let Some(row) = stats.into_iter().next() else {
-                result.breakdown = BreakdownBuilder::new(service_name, span_name, attribute).finish();
+                result.breakdown =
+                    BreakdownBuilder::new(service_name, span_name, attribute).finish();
                 return Ok(result);
             };
             result.slow_threshold_ms = Some(row.p95_duration_ms);

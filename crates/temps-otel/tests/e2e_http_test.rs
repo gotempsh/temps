@@ -1504,12 +1504,23 @@ async fn test_e2e_operation_trends_authorize_and_explain() {
     async fn get(router: &axum::Router, uri: &str) -> (StatusCode, serde_json::Value) {
         let response = router
             .clone()
-            .oneshot(Request::builder().method("GET").uri(uri).body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         let status = response.status();
-        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
-        (status, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
     }
 
     let Some((_db, router, project_id)) = setup_e2e().await else {
@@ -1518,7 +1529,8 @@ async fn test_e2e_operation_trends_authorize_and_explain() {
     let trend_uri = format!(
         "/otel/operations/trend?project_id={project_id}&service_name=checkout-api&span_name=GET%20%2Fcart"
     );
-    let regressions_uri = format!("/otel/operations/regressions?project_id={project_id}&deployment_id=987654");
+    let regressions_uri =
+        format!("/otel/operations/regressions?project_id={project_id}&deployment_id=987654");
 
     let (status, body) = get(&router, &trend_uri).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -1529,7 +1541,9 @@ async fn test_e2e_operation_trends_authorize_and_explain() {
     let (status, body) = get(&router, &regressions_uri).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
     assert!(
-        body["detail"].as_str().is_some_and(|d| d.contains("987654")),
+        body["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("987654")),
         "the problem names the deployment: {body}"
     );
 
@@ -1550,15 +1564,30 @@ async fn test_e2e_operation_trends_authorize_and_explain() {
     assert_eq!(body["max_traces"], 20);
     let (status, body) = get(&router, &format!("{breakdown_uri}&sample=fastest")).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert!(body["detail"].as_str().is_some_and(|d| d.contains("fastest")), "{body}");
+    assert!(
+        body["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("fastest")),
+        "{body}"
+    );
 
     let Some((_db, anonymous, _)) = setup_e2e_as(None).await else {
         return;
     };
-    assert_eq!(get(&anonymous, &trend_uri).await.0, StatusCode::UNAUTHORIZED);
-    assert_eq!(get(&anonymous, &breakdown_uri).await.0, StatusCode::UNAUTHORIZED);
-    let Some((_db, ingest_only, _)) = setup_e2e_as(Some(temps_authz::Role::MetricsIngest)).await else {
+    assert_eq!(
+        get(&anonymous, &trend_uri).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        get(&anonymous, &breakdown_uri).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    let Some((_db, ingest_only, _)) = setup_e2e_as(Some(temps_authz::Role::MetricsIngest)).await
+    else {
         return;
     };
-    assert_eq!(get(&ingest_only, &regressions_uri).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(
+        get(&ingest_only, &regressions_uri).await.0,
+        StatusCode::FORBIDDEN
+    );
 }

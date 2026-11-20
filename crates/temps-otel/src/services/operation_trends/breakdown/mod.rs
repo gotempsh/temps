@@ -159,8 +159,10 @@ impl<'a> BreakdownBuilder<'a> {
     pub fn add_trace(&mut self, spans: &[SpanRecord]) {
         self.traces += 1;
         let mut children: HashMap<&str, Vec<&SpanRecord>> = HashMap::new();
-        let by_id: HashMap<&str, &SpanRecord> =
-            spans.iter().map(|span| (span.span_id.as_str(), span)).collect();
+        let by_id: HashMap<&str, &SpanRecord> = spans
+            .iter()
+            .map(|span| (span.span_id.as_str(), span))
+            .collect();
         for span in spans {
             if let Some(parent) = span.parent_span_id.as_deref().filter(|p| !p.is_empty()) {
                 children.entry(parent).or_default().push(span);
@@ -212,8 +214,7 @@ impl<'a> BreakdownBuilder<'a> {
             // Walk the descendants; `seen` guards against a malformed cycle.
             let mut stack: Vec<&SpanRecord> = root_children.clone();
             let mut seen: HashSet<&str> = HashSet::new();
-            let mut touched: HashSet<(String, String, &'static str)> =
-                HashSet::new();
+            let mut touched: HashSet<(String, String, &'static str)> = HashSet::new();
             while let Some(span) = stack.pop() {
                 if !seen.insert(span.span_id.as_str()) {
                     continue;

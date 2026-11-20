@@ -1034,9 +1034,7 @@ pub fn build_span_stats(
         coefficient_of_variation: ratio(durations.stddev_ms, durations.avg_ms),
         tail_ratio: ratio(durations.p99_ms, durations.p50_ms),
         last_seen,
-        apdex: apdex.map(|a| {
-            ratio(a.satisfied as f64 + a.tolerating as f64 / 2.0, count as f64)
-        }),
+        apdex: apdex.map(|a| ratio(a.satisfied as f64 + a.tolerating as f64 / 2.0, count as f64)),
         apdex_threshold_ms: apdex.map(|a| a.threshold_ms),
         satisfied_count: apdex.map(|a| a.satisfied),
         tolerating_count: apdex.map(|a| a.tolerating),

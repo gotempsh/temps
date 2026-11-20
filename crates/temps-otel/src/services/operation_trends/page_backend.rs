@@ -89,7 +89,9 @@ pub fn summarize(vitals: PageVitals, spans: Vec<SpanRecord>) -> PageBackend {
     durations.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let mut services: BTreeMap<String, usize> = BTreeMap::new();
     for span in &spans {
-        *services.entry(span.resource.service_name.clone()).or_default() += 1;
+        *services
+            .entry(span.resource.service_name.clone())
+            .or_default() += 1;
     }
     let mut services: Vec<(String, usize)> = services.into_iter().collect();
     services.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
@@ -254,12 +256,23 @@ mod tests {
     #[test]
     fn only_server_spans_for_the_exact_path_match() {
         let path = "/products/42";
-        assert!(serves_path(&span("a", SpanKind::Server, &[("url.path", path)], 1.0), path));
         assert!(serves_path(
-            &span("b", SpanKind::Server, &[("http.target", "/products/42?ref=home")], 1.0),
+            &span("a", SpanKind::Server, &[("url.path", path)], 1.0),
             path
         ));
-        assert!(!serves_path(&span("c", SpanKind::Client, &[("url.path", path)], 1.0), path));
+        assert!(serves_path(
+            &span(
+                "b",
+                SpanKind::Server,
+                &[("http.target", "/products/42?ref=home")],
+                1.0
+            ),
+            path
+        ));
+        assert!(!serves_path(
+            &span("c", SpanKind::Client, &[("url.path", path)], 1.0),
+            path
+        ));
         assert!(!serves_path(
             &span("d", SpanKind::Server, &[("url.path", "/products/420")], 1.0),
             path
@@ -270,7 +283,14 @@ mod tests {
     #[test]
     fn the_summary_ranks_the_slowest_requests_and_counts_errors() {
         let spans: Vec<SpanRecord> = (0..20)
-            .map(|i| span(&format!("s{i}"), SpanKind::Server, &[], 100.0 + i as f64 * 100.0))
+            .map(|i| {
+                span(
+                    &format!("s{i}"),
+                    SpanKind::Server,
+                    &[],
+                    100.0 + i as f64 * 100.0,
+                )
+            })
             .collect();
         let summary = summarize(PageVitals::default(), spans);
         assert_eq!(summary.requests, 20);
@@ -288,8 +308,18 @@ mod tests {
         let storage = Arc::new(MockOtelStorage::new());
         storage
             .store_spans(vec![
-                span("a", SpanKind::Server, &[("url.path", "/products/42")], 120.0),
-                span("b", SpanKind::Server, &[("http.target", "/products/42?x=1")], 300.0),
+                span(
+                    "a",
+                    SpanKind::Server,
+                    &[("url.path", "/products/42")],
+                    120.0,
+                ),
+                span(
+                    "b",
+                    SpanKind::Server,
+                    &[("http.target", "/products/42?x=1")],
+                    300.0,
+                ),
                 span("c", SpanKind::Server, &[("url.path", "/cart")], 50.0),
                 span("d", SpanKind::Client, &[("url.path", "/products/42")], 80.0),
             ])
@@ -315,7 +345,10 @@ mod tests {
         assert_eq!(result.vitals.page_loads, 12);
         assert_eq!(result.vitals.ttfb_p75_ms, Some(400.0));
         assert_eq!(result.vitals.inp_p75_ms, None);
-        assert_eq!(result.requests, 2, "the client span and other path are left out");
+        assert_eq!(
+            result.requests, 2,
+            "the client span and other path are left out"
+        );
         assert_eq!(result.slowest[0].duration_ms, 300.0);
     }
 
