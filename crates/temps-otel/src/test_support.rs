@@ -663,6 +663,13 @@ impl OtelStorage for MockOtelStorage {
                     .map(|min| s.duration_ms >= min)
                     .unwrap_or(true)
             })
+            .filter(|s| {
+                query.attribute_path.as_ref().is_none_or(|wanted| {
+                    s.attributes
+                        .get(&wanted.key)
+                        .is_some_and(|value| wanted.matches(value))
+                })
+            })
             .take(query.limit.unwrap_or(100) as usize)
             .cloned()
             .collect();

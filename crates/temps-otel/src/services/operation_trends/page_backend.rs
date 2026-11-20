@@ -155,14 +155,31 @@ impl OperationTrendService {
         let vitals = self.page_vitals(project_id, path, start, end).await?;
         let mut matched: Vec<SpanRecord> = Vec::new();
         let mut seen = std::collections::HashSet::new();
+        // `url.path` holds the bare path; `http.target` (older semantic
+        // conventions) carries the query string too, so it matches by prefix.
         for key in ["url.path", "http.target"] {
+            let (attributes, attribute_path) = if key == "url.path" {
+                (
+                    Some(BTreeMap::from([(key.to_string(), path.to_string())])),
+                    None,
+                )
+            } else {
+                (
+                    None,
+                    Some(crate::types::AttributePath {
+                        key: key.to_string(),
+                        path: path.to_string(),
+                    }),
+                )
+            };
             let spans = self
                 .storage
                 .query_spans(TraceQuery {
                     project_id,
                     start_time: Some(start),
                     end_time: Some(end),
-                    attributes: Some(BTreeMap::from([(key.to_string(), path.to_string())])),
+                    attributes,
+                    attribute_path,
                     limit: Some(PAGE_BACKEND_CANDIDATES),
                     ..Default::default()
                 })

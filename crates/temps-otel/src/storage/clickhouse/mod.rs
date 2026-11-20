@@ -1746,6 +1746,26 @@ impl OtelStorage for ClickHouseOtelStorage {
                 }
             }
         }
+        if let Some(ref wanted) = query.attribute_path {
+            let facet_slot = self
+                .facet_cache
+                .as_ref()
+                .and_then(|c| c.load().get(wanted.key.as_str()).copied());
+            let column = match facet_slot {
+                Some(slot) => crate::services::facet_service::facet_column_name(slot),
+                None => "JSONExtractString(attributes, ?)".to_string(),
+            };
+            let [query_prefix, fragment_prefix] = wanted.suffixed();
+            where_sql.push_str(&format!(
+                " AND ({column} = ? OR startsWith({column}, ?) OR startsWith({column}, ?))"
+            ));
+            for value in [wanted.path.clone(), query_prefix, fragment_prefix] {
+                if facet_slot.is_none() {
+                    binds.push(Bv::Str(wanted.key.clone()));
+                }
+                binds.push(Bv::Str(value));
+            }
+        }
         if let Some(ref pattern) = query.name_pattern {
             where_sql.push_str(" AND name ILIKE ?");
             binds.push(Bv::Str(format!("%{}%", escape_like(pattern))));

@@ -674,6 +674,30 @@ pub struct PipelineStats {
 
 // ── Query types ─────────────────────────────────────────────────────
 
+/// An attribute holding a request path, and the path it must serve.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttributePath {
+    pub key: String,
+    /// Starts with `/`, without a query string.
+    pub path: String,
+}
+
+impl AttributePath {
+    /// The prefixes of a value that serves `path` with a query or fragment.
+    pub fn suffixed(&self) -> [String; 2] {
+        [format!("{}?", self.path), format!("{}#", self.path)]
+    }
+
+    /// Whether `value` is the path, or the path with a query or fragment.
+    pub fn matches(&self, value: &str) -> bool {
+        value == self.path
+            || self
+                .suffixed()
+                .iter()
+                .any(|p| value.starts_with(p.as_str()))
+    }
+}
+
 /// Filter for querying traces.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TraceQuery {
@@ -693,6 +717,12 @@ pub struct TraceQuery {
     pub attributes: Option<BTreeMap<String, String>>,
     /// Filter by span name pattern (ILIKE).
     pub name_pattern: Option<String>,
+    /// Spans whose attribute holds a request path that is this path, with or
+    /// without a query string or fragment (ADR 111, D2.4). `http.target`
+    /// carries the query (`/products/42?ref=home`), so an exact match would
+    /// miss it.
+    #[serde(default)]
+    pub attribute_path: Option<AttributePath>,
     /// When `true`, only return ROOT spans (no parent) — one row per trace.
     /// Roots are `parent_span_id IS NULL` on TimescaleDB and the `''`
     /// sentinel on ClickHouse; each backend applies its own form. Used by
@@ -1562,6 +1592,20 @@ pub struct IngestErrorSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_request_path_matches_with_a_query_or_fragment_only() {
+        let wanted = AttributePath {
+            key: "http.target".to_string(),
+            path: "/products/42".to_string(),
+        };
+        for value in ["/products/42", "/products/42?ref=home", "/products/42#top"] {
+            assert!(wanted.matches(value), "{value}");
+        }
+        for value in ["/products/420", "/products/42/reviews", "/products", ""] {
+            assert!(!wanted.matches(value), "{value}");
+        }
+    }
 
     // ── LogSeverity ordering ────────────────────────────────────────
 

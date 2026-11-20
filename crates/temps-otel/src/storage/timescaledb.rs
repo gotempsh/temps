@@ -1712,6 +1712,31 @@ impl OtelStorage for TimescaleDbStorage {
                 }
             }
         }
+        if let Some(ref wanted) = query.attribute_path {
+            let facet_slot = self
+                .facet_cache
+                .as_ref()
+                .and_then(|c| c.load().get(wanted.key.as_str()).copied());
+            let column = match facet_slot {
+                Some(slot) => crate::services::facet_service::facet_column_name(slot),
+                None => {
+                    values.push(wanted.key.clone().into());
+                    param_idx += 1;
+                    format!("(attributes->>${}::text)", param_idx - 1)
+                }
+            };
+            let [query_prefix, fragment_prefix] = wanted.suffixed();
+            where_clauses.push(format!(
+                "({column} = ${} OR starts_with({column}, ${}) OR starts_with({column}, ${}))",
+                param_idx,
+                param_idx + 1,
+                param_idx + 2
+            ));
+            values.push(wanted.path.clone().into());
+            values.push(query_prefix.into());
+            values.push(fragment_prefix.into());
+            param_idx += 3;
+        }
         if let Some(ref pattern) = query.name_pattern {
             where_clauses.push(format!("name ILIKE ${}", param_idx));
             values.push(format!("%{}%", escape_like(pattern)).into());
@@ -4501,6 +4526,7 @@ mod tests {
 
     fn base_query(project_id: i32) -> TraceQuery {
         TraceQuery {
+            attribute_path: None,
             project_id,
             trace_id: None,
             service_name: None,

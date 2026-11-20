@@ -1066,3 +1066,55 @@ async fn span_stats_agrees_between_clickhouse_and_timescaledb() {
         assert_eq!(ch_total, ts_total, "total differs for sort_by {sort_by:?}");
     }
 }
+
+/// `http.target` carries the query string, so a page path matches it with or
+/// without one, and nothing that merely starts with the same characters.
+#[tokio::test]
+async fn query_spans_matches_a_request_path_with_or_without_its_query() {
+    let Some((storage, _probe, _c)) = setup().await else {
+        return;
+    };
+    let targets = [
+        ("p001", "/products/42"),
+        ("p002", "/products/42?ref=home"),
+        ("p003", "/products/42#reviews"),
+        ("p004", "/products/420"),
+        ("p005", "/products/42/reviews"),
+    ];
+    let spans = targets
+        .iter()
+        .enumerate()
+        .map(|(index, (span_id, target))| {
+            span(
+                PROJECT,
+                &format!("eeee{index:04}"),
+                span_id,
+                None,
+                "GET /products/:id",
+                "storefront",
+                SpanStatusCode::Ok,
+                5,
+                20.0,
+                None,
+                &[("http.target", target)],
+            )
+        })
+        .collect();
+    storage.store_spans(spans).await.expect("store spans");
+
+    let mut found = ids(&storage
+        .query_spans(TraceQuery {
+            project_id: PROJECT,
+            start_time: Some(Utc::now() - Duration::hours(1)),
+            attribute_path: Some(temps_otel::types::AttributePath {
+                key: "http.target".to_string(),
+                path: "/products/42".to_string(),
+            }),
+            limit: Some(100),
+            ..Default::default()
+        })
+        .await
+        .expect("path query"));
+    found.sort();
+    assert_eq!(found, vec!["p001", "p002", "p003"]);
+}

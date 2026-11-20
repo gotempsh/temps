@@ -756,6 +756,7 @@ pub async fn query_traces(
     });
 
     let query = TraceQuery {
+        attribute_path: None,
         project_id: params.project_id,
         trace_id: params.trace_id,
         service_name: params.service_name,
@@ -842,6 +843,7 @@ pub async fn query_trace_summaries(
     )?;
 
     let query = TraceQuery {
+        attribute_path: None,
         project_id: params.project_id,
         trace_id: params.trace_id,
         service_name: params.service_name,

@@ -3202,3 +3202,64 @@ async fn typed_log_column_default_preserves_compressed_history() {
         "historical types must not be invented"
     );
 }
+
+/// `http.target` carries the query string, so a page path matches it with or
+/// without one, and nothing that merely starts with the same characters,
+/// through the JSON attributes and through a facet column alike.
+#[tokio::test]
+async fn test_query_spans_matches_a_request_path_with_or_without_its_query() {
+    for faceted in [false, true] {
+        let setup = if faceted {
+            setup_storage_with_facets(&[("http.target", 2)]).await
+        } else {
+            setup_storage().await
+        };
+        let Some((_db, storage)) = setup else {
+            return;
+        };
+        let project_id = 31;
+        let targets = [
+            ("p001", "/products/42"),
+            ("p002", "/products/42?ref=home"),
+            ("p003", "/products/42#reviews"),
+            ("p004", "/products/420"),
+            ("p005", "/products/42/reviews"),
+        ];
+        let spans = targets
+            .iter()
+            .map(|(span_id, target)| {
+                let mut span = sample_span(
+                    project_id,
+                    &format!("trace_{span_id}"),
+                    span_id,
+                    None,
+                    "GET /products/:id",
+                    SpanKind::Server,
+                    SpanStatusCode::Ok,
+                    20.0,
+                );
+                span.attributes
+                    .insert("http.target".to_string(), target.to_string());
+                span
+            })
+            .collect();
+        storage.store_spans(spans).await.unwrap();
+
+        let mut found: Vec<String> = storage
+            .query_spans(TraceQuery {
+                project_id,
+                attribute_path: Some(AttributePath {
+                    key: "http.target".to_string(),
+                    path: "/products/42".to_string(),
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|span| span.span_id)
+            .collect();
+        found.sort();
+        assert_eq!(found, vec!["p001", "p002", "p003"], "faceted: {faceted}");
+    }
+}
