@@ -9593,6 +9593,21 @@
         ],
         "type": "object"
       },
+      "CertFailureCause": {
+        "description": "Why the last certificate attempt for a domain failed.",
+        "enum": [
+          "dns_lookup",
+          "unreachable",
+          "upstream_answered",
+          "dns_record_mismatch",
+          "caa_forbids",
+          "rate_limited",
+          "ca_transient",
+          "config",
+          "unknown"
+        ],
+        "type": "string"
+      },
       "CertStatusResponse": {
         "description": "Current on-demand cert status for a single hostname (ADR-018 §5). Backs\n`GET /domains/by-host/{hostname}/cert-status`.",
         "properties": {
@@ -26672,6 +26687,17 @@
             "type": [
               "integer",
               "null"
+            ]
+          },
+          "failure_cause": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/CertFailureCause",
+                "description": "Why the last certificate attempt failed, when it did: the CA could not\nreach the host (`unreachable`), DNS has no usable record\n(`dns_lookup`), something other than this server answered\n(`upstream_answered`), a rate limit (`rate_limited`), ... `last_error`\nkeeps the full text. `None` when the domain has not failed since this\nwas recorded."
+              },
+              {
+                "type": "null"
+              }
             ]
           },
           "id": {
@@ -64950,6 +64976,16 @@
       },
       "SandboxResourceHints": {
         "properties": {
+          "agent_cpu": {
+            "description": "Configured agent-run defaults bounded by the host. Agent runs are\nexempt from the ceilings on sandbox API requests.",
+            "format": "double",
+            "type": "number"
+          },
+          "agent_memory_mb": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
           "cpu": {
             "format": "double",
             "type": [
@@ -65019,6 +65055,8 @@
           }
         },
         "required": [
+          "agent_cpu",
+          "agent_memory_mb",
           "max_cpu",
           "max_memory_mb",
           "max_pids",

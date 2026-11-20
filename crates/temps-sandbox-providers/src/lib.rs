@@ -1592,6 +1592,15 @@ done
         true
     }
 
+    /// Capacity of the driver that can satisfy this create, including features
+    /// that can cause the planner to pass over the default backend.
+    async fn capacity_for_create(
+        &self,
+        config: &SandboxCreateConfig,
+    ) -> Result<Option<SandboxHostCapacity>, AgentError> {
+        self.host_capacity(config.node_id, config.backend).await
+    }
+
     /// Capacity of the daemon that serves this placement, when reported.
     async fn host_capacity(
         &self,

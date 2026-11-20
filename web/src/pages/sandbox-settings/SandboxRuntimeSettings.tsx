@@ -143,17 +143,6 @@ function getResourcePresetLabel(cpu: number, memory: number): string {
 
 export function SandboxRuntimeSettings() {
   const { data: settings, isLoading, error, refetch } = useSettingsPage()
-  const { data: hints } = useQuery(
-    getSandboxResourceDefaultsOptions({ query: { backend: 'docker' } })
-  )
-  const maxCpu = Math.min(
-    CPU_LIMIT_RANGE.max,
-    hints?.max_cpu ?? CPU_LIMIT_RANGE.max
-  )
-  const maxMemory = Math.min(
-    MEMORY_LIMIT_RANGE.max,
-    hints?.max_memory_mb ?? MEMORY_LIMIT_RANGE.max
-  )
   const updateSettings = useUpdateSettings()
 
   const [runtime, setRuntime] = useState('node')
@@ -166,6 +155,26 @@ export function SandboxRuntimeSettings() {
   const [configRepoAllowlist, setConfigRepoAllowlist] = useState('')
   const [defaultProvider, setDefaultProvider] = useState('claude_cli')
   const [sandboxBackend, setSandboxBackend] = useState('docker')
+  const { data: hints } = useQuery(
+    getSandboxResourceDefaultsOptions({
+      query: {
+        backend:
+          sandboxBackend === 'docker' ||
+          sandboxBackend === 'firecracker' ||
+          sandboxBackend === 'microsandbox'
+            ? sandboxBackend
+            : undefined,
+      },
+    })
+  )
+  const maxCpu = Math.min(
+    CPU_LIMIT_RANGE.max,
+    hints?.host_cpu_cores ?? CPU_LIMIT_RANGE.max
+  )
+  const maxMemory = Math.min(
+    MEMORY_LIMIT_RANGE.max,
+    hints?.host_memory_mb ?? MEMORY_LIMIT_RANGE.max
+  )
   const [workspaceFileLimits, setWorkspaceFileLimits] =
     useState<WorkspaceFileLimitsDraft>(DEFAULT_WORKSPACE_FILE_LIMITS)
   const [apiLimits, setApiLimits] =
@@ -736,16 +745,16 @@ export function SandboxRuntimeSettings() {
             <CardDescription>
               CPU and memory limits per sandbox container. Automatic placement:{' '}
               {defaultHint(
-                hints?.cpu,
+                hints?.agent_cpu,
                 'cores',
-                hints?.max_cpu,
+                hints && maxCpu,
                 hints?.host_cpu_cores
               )}
               .{' '}
               {defaultHint(
-                hints?.memory_mb,
+                hints?.agent_memory_mb,
                 'MB',
-                hints?.max_memory_mb,
+                hints && maxMemory,
                 hints?.host_memory_mb
               )}
               .

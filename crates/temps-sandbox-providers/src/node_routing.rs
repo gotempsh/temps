@@ -457,6 +457,16 @@ impl SandboxProvider for NodeRoutingSandboxProvider {
         self.local.supports_backend(backend)
     }
 
+    async fn capacity_for_create(
+        &self,
+        config: &SandboxCreateConfig,
+    ) -> Result<Option<crate::SandboxHostCapacity>, AgentError> {
+        self.for_node(config.node_id)
+            .await?
+            .capacity_for_create(config)
+            .await
+    }
+
     async fn host_capacity(
         &self,
         node_id: Option<i32>,

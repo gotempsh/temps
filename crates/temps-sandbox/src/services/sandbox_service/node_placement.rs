@@ -322,6 +322,10 @@ impl SandboxService {
         let cpu_bound = host.map_or(f64::MAX, |h| h.cpu_cores);
         let max_cpu = max_cpu_limit(settings.max_cpu_limit, host.map(|h| h.cpu_cores));
         Ok(SandboxResourceHints {
+            agent_cpu: settings.cpu_limit.min(cpu_bound),
+            agent_memory_mb: settings
+                .memory_limit_mb
+                .min(host_memory_mb.unwrap_or(u64::MAX)),
             node_id,
             host_cpu_cores: host.map(|h| h.cpu_cores),
             host_memory_mb,

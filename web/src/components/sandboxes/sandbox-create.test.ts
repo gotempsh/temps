@@ -222,6 +222,8 @@ test('placement defaults and validation use the advertised host and operator lim
     pids: 128,
     max_pids: 256,
     timeout_secs: 3600,
+    agent_cpu: 2,
+    agent_memory_mb: 1024,
     max_timeout_secs: 86400,
   }
   expect(

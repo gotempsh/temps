@@ -3874,7 +3874,7 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         use tower::ServiceExt;
         let row = settings_row(
-            serde_json::json!({"max_cpu_limit": 1.5, "max_memory_limit_mb": 512, "max_pids_limit": 100}),
+            serde_json::json!({"cpu_limit": 2.0, "memory_limit_mb": 1024, "max_cpu_limit": 1.5, "max_memory_limit_mb": 512, "max_pids_limit": 100}),
         );
         let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
             .append_query_results([vec![row.clone()], vec![row]])
@@ -3890,6 +3890,8 @@ mod tests {
         let bytes = axum::body::to_bytes(response.into_body(), 4096).await?;
         let body: serde_json::Value = serde_json::from_slice(&bytes)?;
         assert!(body["node_id"].is_null());
+        assert_eq!(body["agent_cpu"], 2.0);
+        assert_eq!(body["agent_memory_mb"], 1024);
         assert_eq!(body["max_cpu"], 1.5);
         assert_eq!(body["max_memory_mb"], 512);
         assert_eq!(body["max_pids"], 100);

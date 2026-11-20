@@ -1956,6 +1956,9 @@ mod tests {
             is_wildcard: false,
             verification_method: "http-01".to_string(),
             on_demand_backoff_until: None,
+            on_demand_failure_streak: 0,
+            on_demand_last_failure_at: None,
+            failure_cause: None,
             created_at: now,
             updated_at: now,
         };
@@ -2027,6 +2030,9 @@ mod tests {
             is_wildcard: false,
             verification_method: "dns-01".to_string(),
             on_demand_backoff_until: None,
+            on_demand_failure_streak: 0,
+            on_demand_last_failure_at: None,
+            failure_cause: None,
             created_at: now,
             updated_at: now,
         };

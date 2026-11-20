@@ -938,22 +938,6 @@ impl AgentExecutor {
             .and_then(|y| yaml_serde::from_str::<temps_core::WorkflowYamlConfig>(y).ok())
             .map(|y| (y.cpu_limit, y.memory_limit_mb))
             .unwrap_or((None, None));
-        let (cpu_limit, memory_limit_mb) = match self
-            .sandbox_registry
-            .provider()
-            .host_capacity(None, None)
-            .await?
-        {
-            Some(host) => (
-                host.cpu_limit(run_id, yaml_cpu, global_sandbox.cpu_limit)?,
-                host.memory_limit(run_id, yaml_mem, global_sandbox.memory_limit_mb)?,
-            ),
-            None => (
-                yaml_cpu.unwrap_or(global_sandbox.cpu_limit),
-                yaml_mem.unwrap_or(global_sandbox.memory_limit_mb),
-            ),
-        };
-
         // Per-run named volume for `/workspace`. Retained so follow-up phases
         // (autofixer fix → PR) or workspace sandboxes can re-mount it.
         let workspace_volume = format!("temps-wfrun-{}", run_id);
@@ -980,7 +964,7 @@ impl AgentExecutor {
             .ok()
             .and_then(|r| r.triggered_by_user_id);
 
-        let sandbox_config = SandboxCreateConfig {
+        let mut sandbox_config = SandboxCreateConfig {
             node_id: None,
             run_id,
             owner_user_id,
@@ -988,8 +972,8 @@ impl AgentExecutor {
             host_work_dir: host_work_dir.clone(),
             workspace_volume: Some(workspace_volume),
             image: resolved_image,
-            cpu_limit: Some(cpu_limit),
-            memory_limit_mb: Some(memory_limit_mb),
+            cpu_limit: Some(yaml_cpu.unwrap_or(global_sandbox.cpu_limit)),
+            memory_limit_mb: Some(yaml_mem.unwrap_or(global_sandbox.memory_limit_mb)),
             pids_limit: None,
             disk_size_mb: None,
             allow_docker: false,
@@ -999,6 +983,23 @@ impl AgentExecutor {
             idle_timeout: Duration::from_secs(timeout_seconds as u64 + 60),
             backend: None,
         };
+        let (cpu_limit, memory_limit_mb) = match self
+            .sandbox_registry
+            .provider()
+            .capacity_for_create(&sandbox_config)
+            .await?
+        {
+            Some(host) => (
+                host.cpu_limit(run_id, yaml_cpu, global_sandbox.cpu_limit)?,
+                host.memory_limit(run_id, yaml_mem, global_sandbox.memory_limit_mb)?,
+            ),
+            None => (
+                yaml_cpu.unwrap_or(global_sandbox.cpu_limit),
+                yaml_mem.unwrap_or(global_sandbox.memory_limit_mb),
+            ),
+        };
+        sandbox_config.cpu_limit = Some(cpu_limit);
+        sandbox_config.memory_limit_mb = Some(memory_limit_mb);
         self.run_service
             .append_log(
                 run_id,

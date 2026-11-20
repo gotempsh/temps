@@ -296,6 +296,16 @@ fn stream_sink(cb: OnStreamEventCallback) -> temps_workload::ExecLineSink {
 
 #[async_trait]
 impl SandboxProvider for DriverSandboxProvider {
+    async fn capacity_for_create(
+        &self,
+        config: &SandboxCreateConfig,
+    ) -> Result<Option<crate::SandboxHostCapacity>, AgentError> {
+        let plan = self.plan_create(config)?;
+        self.product
+            .host_capacity(config.node_id, Some(plan.backend))
+            .await
+    }
+
     async fn host_capacity(
         &self,
         node_id: Option<i32>,
@@ -1114,6 +1124,17 @@ pub(crate) mod tests {
         let host = facade.host_capacity(None, backend).await?;
         assert_eq!(host.map(|h| (h.cpu_cores, h.memory_mb)), Some((2.0, 1024)));
         assert_eq!(facade.default_resource_limits(backend).cpu_limit, Some(4.0));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn named_workspace_uses_docker_host_capacity_when_the_default_is_firecracker(
+    ) -> Result<(), AgentError> {
+        let (facade, ..) = facade(SandboxBackend::Firecracker);
+        let mut request = config("workspace");
+        request.workspace_volume = Some("test-workspace".into());
+        let host = facade.capacity_for_create(&request).await?;
+        assert_eq!(host.map(|h| (h.cpu_cores, h.memory_mb)), Some((2.0, 1024)));
         Ok(())
     }
 

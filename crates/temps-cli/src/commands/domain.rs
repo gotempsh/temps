@@ -1951,8 +1951,8 @@ async fn execute_import(cmd: ImportCertificateCommand) -> anyhow::Result<()> {
         domain_update.expiration_time = Set(Some(expiration_time));
         domain_update.status = Set("active".to_string());
         domain_update.last_renewed = Set(Some(Utc::now()));
-        domain_update.last_error = Set(None);
-        domain_update.last_error_type = Set(None);
+        // An imported certificate ends any failed ACME or on-demand streak.
+        domain_update.clear_certificate_failure();
         domain_update.verification_method = Set("manual".to_string());
         domain_update.updated_at = Set(Utc::now());
 

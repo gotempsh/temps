@@ -20,6 +20,7 @@ test('settings already in the cache fill the form on the first render', () => {
     defaultOptions: { queries: { retry: false, staleTime: Infinity } },
   })
   client.setQueryData(['platform-settings'], {
+    agent_sandbox: { sandbox_backend: 'firecracker' },
     ai_config: {
       config_repo: 'acme/global-config',
       config_repo_branch: 'release',
@@ -27,18 +28,20 @@ test('settings already in the cache fill the form on the first render', () => {
     },
   })
   client.setQueryData(
-    getSandboxResourceDefaultsOptions({ query: { backend: 'docker' } })
+    getSandboxResourceDefaultsOptions({ query: { backend: 'firecracker' } })
       .queryKey,
     {
-      cpu: 2,
-      max_cpu: 2,
+      cpu: 0.1,
+      max_cpu: 0.1,
       host_cpu_cores: 2,
-      memory_mb: 1024,
-      max_memory_mb: 2048,
+      memory_mb: 256,
+      max_memory_mb: 256,
       host_memory_mb: 2048,
       pids: 256,
       max_pids: 4096,
       timeout_secs: 3600,
+      agent_cpu: 2,
+      agent_memory_mb: 1024,
       max_timeout_secs: 86400,
     }
   )

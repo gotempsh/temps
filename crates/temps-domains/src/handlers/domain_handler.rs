@@ -364,6 +364,12 @@ impl From<DomainServiceError> for Problem {
                     .detail(msg)
                     .build()
             }
+            error @ DomainServiceError::OnDemandBackoffActive { .. } => {
+                ErrorBuilder::new(StatusCode::TOO_MANY_REQUESTS)
+                    .title("On-demand TLS Backing Off")
+                    .detail(error.to_string())
+                    .build()
+            }
             DomainServiceError::OnDemandRateLimited {
                 hostname, detail, ..
             } => ErrorBuilder::new(StatusCode::TOO_MANY_REQUESTS)
@@ -376,6 +382,7 @@ impl From<DomainServiceError> for Problem {
                 hostname,
                 category,
                 error_chain,
+                ..
             } => ErrorBuilder::new(StatusCode::BAD_GATEWAY)
                 .title("On-demand TLS Issuance Failed")
                 .detail(format!(
@@ -454,6 +461,7 @@ impl From<DomainServiceError> for Problem {
             CertificateRenewalMode,
             CreateDomainRequest,
             DomainResponse,
+            crate::CertFailureCause,
             DomainChallengeResponse,
             DnsCompletionResponse,
             TxtRecord,
@@ -608,7 +616,22 @@ async fn create_domain(
                 "Domain {} created but challenge request failed - can be retried later",
                 request.domain
             );
-            Ok((StatusCode::CREATED, Json(DomainResponse::from(domain))))
+            // `request_challenge` stored the failure (`last_error`,
+            // `failure_cause`) on the row after `domain` was read; answer with
+            // the stored row so the caller sees why, not a bare `pending`.
+            // A failed re-read falls back to the row as created.
+            let stored = match app_state.domain_service.get_domain_by_id(domain.id).await {
+                Ok(Some(stored)) => stored,
+                Ok(None) => domain,
+                Err(read_err) => {
+                    warn!(
+                        "Failed to re-read domain {} (ID {}) after its challenge request failed: {}",
+                        request.domain, domain.id, read_err
+                    );
+                    domain
+                }
+            };
+            Ok((StatusCode::CREATED, Json(DomainResponse::from(stored))))
         }
     }
 }

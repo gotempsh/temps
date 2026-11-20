@@ -4489,6 +4489,11 @@ export type CatalogReference = {
 };
 
 /**
+ * Why the last certificate attempt for a domain failed.
+ */
+export type CertFailureCause = 'dns_lookup' | 'unreachable' | 'upstream_answered' | 'dns_record_mismatch' | 'caa_forbids' | 'rate_limited' | 'ca_transient' | 'config' | 'unknown';
+
+/**
  * Current on-demand cert status for a single hostname (ADR-018 §5). Backs
  * `GET /domains/by-host/{hostname}/cert-status`.
  */
@@ -12703,6 +12708,7 @@ export type DomainResponse = {
     dns_challenge_value?: string | null;
     domain: string;
     expiration_time?: number | null;
+    failure_cause?: CertFailureCause | null;
     id: number;
     is_wildcard: boolean;
     last_error?: string | null;
@@ -30130,6 +30136,12 @@ export type SandboxPlacementResponse = {
 export type SandboxPreviewAccess = 'temps_login' | 'password' | 'public';
 
 export type SandboxResourceHints = {
+    /**
+     * Configured agent-run defaults bounded by the host. Agent runs are
+     * exempt from the ceilings on sandbox API requests.
+     */
+    agent_cpu: number;
+    agent_memory_mb: number;
     cpu?: number | null;
     host_cpu_cores?: number | null;
     host_memory_mb?: number | null;
