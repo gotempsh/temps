@@ -11,8 +11,8 @@ and regressions after a deployment), D2.3 (Apdex), D2.4 (pages joined to
 backend requests) and D2.5 (breakdown inside an operation) have shipped, so
 D2 is complete. D3.1 (session counters), D3.2 (the release page),
 D3.3 (the crash-free alert) and D3.4 (releases tied to deployments) have
-shipped, so D3 is complete. D4 (attachments) has shipped; D5 to D7 are not
-scheduled. The questions they settled are recorded under "Settled while
+shipped, so D3 is complete. D4 (attachments) and D5 (links to issue trackers
+and source control) have shipped; D6 and D7 are not scheduled. The questions they settled are recorded under "Settled while
 implementing".
 
 Related: ADR 016 (ClickHouse traces backend), ADR 027 (cross-project trace
@@ -654,3 +654,48 @@ deploys, which is web services. It comes last and may never be worth building.
   stored HTML or SVG file never runs in the console's origin. File names lose
   directories and control characters.
 
+### D5 Links to issue trackers and source control
+
+- **GitHub and GitLab, through the project's own repository.** Opening an
+  issue and reading commits use the repository and git provider connection
+  the project already deploys from, with its credentials. Other providers and
+  projects without a repository answer "not connected" with a link to
+  `/git-providers` or the project's git settings, and the console shows that
+  onboarding state instead of hiding the panels. Jira, Linear and any other
+  tracker are plain links: an http(s) URL without credentials, at most ten
+  links per group.
+- **One-way and on request.** Temps never closes, reopens or comments on an
+  issue, and an issue's state never resolves a group. The state of a GitHub or
+  GitLab issue is read when it is linked and again when someone presses
+  refresh; a read that fails keeps the last state and is counted in the
+  answer. There is no webhook and no polling job.
+- **One open issue per group and repository.** Opening one takes a
+  transaction-scoped advisory lock on the group, so two people pressing the
+  button at once get one issue and a conflict, and an open issue already
+  linked in the same repository is a conflict too. A closed one can be
+  followed by a new one.
+- **What the issue says.** Title (the group's, or the one given, at most 255
+  characters), exception type and message, first and last seen, event count,
+  up to ten application frames shown as repository paths, and a link back to the
+  group. Text is escaped as Markdown. Nothing from the request, the user, tags
+  or breadcrumbs is copied out: the repository's audience may be wider than
+  the project's.
+- **Suspect commits are not blame.** They are the newest five commits that
+  touched the file of the latest event's innermost in-app frame that maps to a
+  repository path (webpack, `app://` and `file://` prefixes and the project's
+  source root removed; dependency directories, URLs and paths with `..`
+  ignored), read at the deployment's commit, or the default branch when the
+  event has none. Line-level blame would need one provider call per frame and
+  is left out. When nothing matches, the answer says why.
+- **Ownership rules assign new groups only.** A project has at most 50
+  ordered rules of a path pattern (`src/billing/` a directory, `*.py` a file
+  name anywhere, `**` any depth) and an owner. When a group is created, its
+  frames are tried innermost first against the rules in order; the first match
+  assigns the group if it is still unassigned, and the activity names the
+  rule. Existing groups are never reassigned and no mail is sent. Every owner
+  must be able to open the project when the rules are saved. The rules are
+  held in memory and reloaded on every save, so ingest makes no extra query
+  for a project without rules.
+- **Assistant.** The console assistant may read the repository status, the
+  linked issues, suspect commits and the ownership rules. Opening, linking,
+  unlinking and refreshing issues and replacing the rules stay with people.
