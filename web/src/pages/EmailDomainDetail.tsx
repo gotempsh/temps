@@ -68,6 +68,7 @@ import { useAuth } from '@/contexts/AuthContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { errorWithStatus } from '@/lib/http-error-status'
 import { isVerifiedNotFound } from '@/lib/read-failure'
+import { scrollToElementId } from '@/lib/scroll-to-element'
 import { cn } from '@/lib/utils'
 import {
   Button,
@@ -708,9 +709,10 @@ export function EmailDomainDetail() {
                       onClick={() => {
                         // On narrow screens the panel sits below the main
                         // column, so bring it into view before opening it.
-                        document
-                          .getElementById('authorized-projects')
-                          ?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+                        scrollToElementId('authorized-projects', {
+                          behavior: 'smooth',
+                          block: 'center',
+                        })
                         setProjectPickerOpen(true)
                       }}
                     >

@@ -660,6 +660,10 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        "per-placement host capacity and effective limits are read by the sandbox creation and settings forms",
+        &["get_sandbox_resource_defaults"],
+    ),
+    (
         "served by the dedicated sandbox tools",
         &[
             "clear_preview_password",
@@ -906,6 +910,25 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
             "update_runtime_health",
             "update_status_page",
             "verify_status_page_domain",
+        ],
+    ),
+    (
+        "error triage writes (ADR 111, D1: bulk status changes, merge, unmerge and split, inbound filters, assignment, comments and saved searches) are made by a person in the console or CLI; the assistant reads their results and proposes single-group changes through update_error_group",
+        &[
+            "bulkUpdateErrorGroups",
+            "mergeErrorGroups",
+            "unmergeErrorGroup",
+            "splitErrorGroup",
+            "createErrorInboundFilter",
+            "updateErrorInboundFilter",
+            "deleteErrorInboundFilter",
+            "set_error_group_assignee",
+            "create_error_group_comment",
+            "update_error_group_comment",
+            "delete_error_group_comment",
+            "create_error_saved_search",
+            "update_error_saved_search",
+            "delete_error_saved_search",
         ],
     ),
 ];

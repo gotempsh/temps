@@ -3,6 +3,7 @@
 
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
+import { getSandboxResourceDefaultsQueryKey } from '@/api/client/@tanstack/react-query.gen'
 import {
   getPlatformSettings,
   updatePlatformSettings as updateSettingsApi,
@@ -70,7 +71,12 @@ export function useUpdateSettings() {
 
   return useMutation({
     mutationFn: updateSettingsApi,
-    onSuccess: (data) => {
+    onSuccess: (data, changes) => {
+      if (changes.agent_sandbox) {
+        void queryClient.invalidateQueries({
+          queryKey: getSandboxResourceDefaultsQueryKey(),
+        })
+      }
       queryClient.setQueryData(['platform-settings'], data)
       queryClient.invalidateQueries({ queryKey: ['platform-settings'] })
     },

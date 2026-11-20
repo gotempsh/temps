@@ -77,7 +77,18 @@ fn default_placeholder(value: &str) -> bool {
     matches!(value, "{{ default }}" | "{{default}}")
 }
 
+/// SHA-256 of `value`, hex encoded.
+pub(crate) fn keyed_hex(value: &str) -> String {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(value.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
 fn sdk_event_id(data: &CreateErrorEventData) -> Option<String> {
+    if let Some(key) = data.dedup_key.as_deref() {
+        return Some(keyed_hex(&format!("dedup:{key}"))[..32].to_string());
+    }
     if data.source.as_deref() != Some("sentry") {
         return None;
     }
@@ -158,6 +169,10 @@ pub(super) struct IngestedError {
     pub group_id: i32,
     pub created: bool,
     pub previous_status: String,
+    /// The group's status after this event was counted. Equal to
+    /// `previous_status` unless the event reopened the group; an ignored group
+    /// whose conditions are not met yet stays `ignored` (ADR 111, D1.3).
+    pub current_status: String,
     pub inserted: bool,
 }
 
@@ -178,11 +193,15 @@ pub struct ErrorIngestionService {
     tokenizer: HashTokenizer,
     // One lock-free range per service/database, never a per-project/key cache.
     chunk_range: ArcSwapOption<ErrorChunkRange>,
+    /// Releases already registered for "resolve in the next release"
+    /// (ADR 111, D1.5); bounded, so a release costs one statement per process.
+    releases: super::group_workflow::ReleaseRegistry,
 }
 
 impl ErrorIngestionService {
     pub fn new(db: Arc<DatabaseConnection>) -> Self {
         Self {
+            releases: super::group_workflow::ReleaseRegistry::new(db.clone()),
             db,
             tokenizer: HashTokenizer::new(10000),
             chunk_range: ArcSwapOption::empty(),
@@ -216,12 +235,35 @@ impl ErrorIngestionService {
         self.process_with_fingerprint(error_data, fingerprint).await
     }
 
+    /// Register a release seen outside an error event (in sessions), once
+    /// per process like the releases of events (ADR 111, D3).
+    pub async fn observe_release(
+        &self,
+        project_id: i32,
+        release: &str,
+        deployment_id: Option<i32>,
+    ) -> Result<(), ErrorTrackingError> {
+        self.releases
+            .observe(project_id, Some(release), deployment_id)
+            .await
+    }
+
     /// The orchestrator may capture submitted-frame identity before symbolication.
     pub(super) async fn process_with_fingerprint(
         &self,
         error_data: CreateErrorEventData,
         fingerprint: String,
     ) -> Result<IngestedError, ErrorTrackingError> {
+        // Registered before the event's transaction so it is committed even if
+        // that transaction is retried, and so the counter statement can order
+        // the event's release against the one a group was resolved after.
+        self.releases
+            .observe(
+                error_data.project_id,
+                error_data.release_version.as_deref(),
+                error_data.deployment_id,
+            )
+            .await?;
         let mut attempt = 0;
         loop {
             let result = self.process_once(&error_data, &fingerprint).await;
@@ -293,6 +335,7 @@ impl ErrorIngestionService {
                     group_id,
                     created: false,
                     previous_status: String::new(),
+                    current_status: String::new(),
                     inserted: false,
                 });
             }
@@ -340,15 +383,7 @@ impl ErrorIngestionService {
                 }
             }
         };
-        let previous_status: String = tx
-            .query_one(Statement::from_sql_and_values(
-                DatabaseBackend::Postgres,
-                "SELECT status FROM error_groups WHERE id=$1 FOR UPDATE",
-                [group_id.into()],
-            ))
-            .await?
-            .ok_or(ErrorTrackingError::GroupNotFound)?
-            .try_get("", "status")?;
+        let (group_id, previous_status) = Self::lock_group_following_merge(&tx, group_id).await?;
         tx.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,
             "INSERT INTO error_group_fingerprints(project_id,fingerprint_hash,error_group_id) VALUES($1,$2,$3) ON CONFLICT DO NOTHING",
             [error_data.project_id.into(),fingerprint.into(),group_id.into()])).await?;
@@ -360,9 +395,14 @@ impl ErrorIngestionService {
                 "INSERT INTO error_event_source_keys(project_id,sdk_event_id,environment_id,deployment_id,error_group_id,error_event_id,received_at) VALUES($1,$2,$3,$4,$5,$6,NOW()) ON CONFLICT(project_id,sdk_event_id) DO UPDATE SET environment_id=EXCLUDED.environment_id,deployment_id=EXCLUDED.deployment_id,error_group_id=EXCLUDED.error_group_id,error_event_id=EXCLUDED.error_event_id,received_at=EXCLUDED.received_at",
                 [error_data.project_id.into(),id.into(),error_data.environment_id.into(),error_data.deployment_id.into(),group_id.into(),event_id.into()])).await?;
         }
-        tx.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,
-            "UPDATE error_groups SET total_count = total_count + 1, last_seen = GREATEST(last_seen, $2), updated_at = NOW(), status = CASE WHEN status IN ('resolved','ignored') THEN 'unresolved' ELSE status END WHERE id = $1",
-            [group_id.into(),event_time.into()])).await?;
+        let current_status = super::group_workflow::count_event::count_event_in_group(
+            &tx,
+            group_id,
+            &previous_status,
+            event_time,
+            error_data,
+        )
+        .await?;
         let observed_chunk = if refresh_chunk {
             Self::lookup_chunk(&tx, event_time).await?
         } else {
@@ -376,8 +416,47 @@ impl ErrorIngestionService {
             group_id,
             created,
             previous_status,
+            current_status,
             inserted: true,
         })
+    }
+
+    /// Lock the group an event is about to be counted in, and return its id
+    /// and status.
+    ///
+    /// The fingerprint lookup happens before the row lock, so a merge (ADR
+    /// 074, D1.2) can commit in between: the alias read a moment ago then
+    /// names a group that has just been merged away. Merges are one level
+    /// deep (a merge target cannot itself be merged away), so following
+    /// `merged_into_group_id` once reaches the surviving group, which keeps
+    /// the merged group's count frozen and the survivor's count exact. The
+    /// common path is the same single locking read as before.
+    pub(crate) async fn lock_group_following_merge<C: ConnectionTrait>(
+        tx: &C,
+        group_id: i32,
+    ) -> Result<(i32, String), ErrorTrackingError> {
+        let row = tx
+            .query_one(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT status, merged_into_group_id FROM error_groups WHERE id=$1 FOR UPDATE",
+                [group_id.into()],
+            ))
+            .await?
+            .ok_or(ErrorTrackingError::GroupNotFound)?;
+        let merged_into: Option<i32> = row.try_get("", "merged_into_group_id")?;
+        let Some(target) = merged_into else {
+            return Ok((group_id, row.try_get("", "status")?));
+        };
+        let status: String = tx
+            .query_one(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT status FROM error_groups WHERE id=$1 FOR UPDATE",
+                [target.into()],
+            ))
+            .await?
+            .ok_or(ErrorTrackingError::GroupNotFound)?
+            .try_get("", "status")?;
+        Ok((target, status))
     }
 
     // error_events also hash-partitions on id. A time range is warm only
@@ -784,6 +863,10 @@ impl ErrorIngestionService {
             error_type: Set(exception_type.clone()),
             message_template: Set(Some(exception_value.clone())),
             embedding: Set(embedding),
+            issue_type: Set(error_data
+                .issue_type
+                .clone()
+                .unwrap_or_else(|| "error".to_string())),
             first_seen: Set(event_time),
             last_seen: Set(event_time),
             total_count: Set(0),

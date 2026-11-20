@@ -176,6 +176,8 @@ fn application_workspace_config_preserves_explicit_image_and_maps_null_runtime()
         desired_state: "running".to_string(),
         runtime: "python".to_string(),
         image: None,
+        cpu_limit_explicit: false,
+        memory_limit_explicit: false,
         cpu_limit: 1.0,
         memory_limit_mb: 1024,
         pids_limit: 128,
@@ -198,6 +200,28 @@ fn application_workspace_config_preserves_explicit_image_and_maps_null_runtime()
         explicit.image.as_deref(),
         Some("ghcr.io/gotempsh/temps-sandbox-all:0.2.0")
     );
+
+    // Earlier versions stored numeric defaults for every row. Preserve custom legacy limits,
+    // and distinguish a newly selected default-sized value from an inherited one.
+    assert_eq!(
+        (mapped.cpu_limit, mapped.memory_limit_mb),
+        (Some(1.0), Some(1024))
+    );
+    row.cpu_limit = ApplicationWorkspaceConfig::DEFAULT_CPU;
+    row.memory_limit_mb = ApplicationWorkspaceConfig::DEFAULT_MEMORY_MB as i64;
+    let inherited = ApplicationWorkspaceConfig::from(&row);
+    assert_eq!(
+        (inherited.cpu_limit, inherited.memory_limit_mb),
+        (None, None)
+    );
+    row.memory_limit_explicit = true;
+    let pinned = ApplicationWorkspaceConfig::from(&row);
+    assert_eq!(
+        (pinned.cpu_limit, pinned.memory_limit_mb),
+        (None, Some(8192))
+    );
+    row.cpu_limit_explicit = true;
+    assert_eq!(ApplicationWorkspaceConfig::from(&row).cpu_limit, Some(4.0));
 }
 
 #[test]

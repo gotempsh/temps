@@ -564,6 +564,28 @@ impl OtelStorage for CloudRoutedOtelStorage {
         }
     }
 
+    async fn get_trace_spans(
+        &self,
+        project_id: i32,
+        trace_id: &str,
+        max_spans: usize,
+    ) -> StorageResult<Vec<SpanRecord>> {
+        let resolution = self.resolve(project_id, None, None).await;
+        match resolution.source {
+            CloudTelemetryWriteMode::Local => {
+                self.local
+                    .get_trace_spans(project_id, trace_id, max_spans)
+                    .await
+            }
+            // The Cloud reader already bounds a trace read by its row cap.
+            CloudTelemetryWriteMode::Cloud => {
+                let mut spans = self.cloud.get_trace(project_id, trace_id).await?;
+                spans.truncate(max_spans);
+                Ok(spans)
+            }
+        }
+    }
+
     async fn get_trace_in_window(
         &self,
         project_id: i32,

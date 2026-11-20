@@ -30,6 +30,7 @@ async fn application_workspace_response(
                 "inspect workspace",
             )
         })?;
+    let config = temps_sandbox::services::ApplicationWorkspaceConfig::from(&desired);
     let mut diagnostic = desired.last_error.clone();
     let usage = if let Some(summary) = summary
         .as_ref()
@@ -47,8 +48,9 @@ async fn application_workspace_response(
                     error = %error,
                     "Could not read application workspace resource usage"
                 );
-                diagnostic =
-                    Some("Workspace resource usage is temporarily unavailable.".to_string());
+                diagnostic.get_or_insert_with(|| {
+                    "Workspace resource usage is temporarily unavailable.".to_string()
+                });
                 temps_sandbox::services::ApplicationWorkspaceUsage::default()
             }
         }
@@ -69,8 +71,9 @@ async fn application_workspace_response(
                     error = %error,
                     "Could not inspect application database topology"
                 );
-                diagnostic =
-                    Some("The workspace database topology is temporarily unavailable.".to_string());
+                diagnostic.get_or_insert_with(|| {
+                    "The workspace database topology is temporarily unavailable.".to_string()
+                });
                 0
             }
         };
@@ -127,6 +130,20 @@ async fn application_workspace_response(
             && summary.backend.as_deref() == Some("docker")
             && target_image.is_some()
     });
+    let capacity = sandboxes
+        .application_workspace_capacity(
+            &application.application.public_id,
+            &config,
+            summary.as_ref().and_then(|s| s.backend.as_deref()),
+        )
+        .await;
+    let (cpu_limit, memory_limit_mb) = workspace_status_limits(
+        &application.application.public_id,
+        &config,
+        capacity,
+        &mut diagnostic,
+    );
+
     Ok(ApplicationWorkspaceResponse {
         state: state_name.to_string(),
         desired_state: desired.desired_state,
@@ -140,8 +157,8 @@ async fn application_workspace_response(
         runtime_update_available,
         runtime_update_image: runtime_update_available.then_some(target_image).flatten(),
         runtime_update_error,
-        cpu_limit: desired.cpu_limit,
-        memory_limit_mb: desired.memory_limit_mb,
+        cpu_limit,
+        memory_limit_mb: memory_limit_mb as i64,
         pids_limit: desired.pids_limit,
         disk_limit_mb: desired.disk_limit_mb,
         disk_limit_enforced: summary
@@ -249,32 +266,56 @@ pub async fn update_application_workspace(
         .lock_application_runtime_update(&application_public_id)
         .await
         .map_err(Problem::from)?;
+    let summary = if let Some(sandboxes) = state.application_sandboxes.as_ref() {
+        let summary = sandboxes
+            .application_workspace_summary(auth.user_id(), &application_public_id)
+            .await
+            .map_err(|error| {
+                application_workspace_provider_problem(
+                    error,
+                    &application_public_id,
+                    "inspect before resource update",
+                )
+            })?;
+        if request.cpu_limit.is_some() || request.memory_limit_mb.is_some() {
+            let overrides = temps_sandbox::services::ApplicationWorkspaceConfig {
+                cpu_limit: request.cpu_limit,
+                memory_limit_mb: request
+                    .memory_limit_mb
+                    .and_then(|mb| u64::try_from(mb).ok()),
+                ..Default::default()
+            };
+            let capacity = sandboxes
+                .application_workspace_capacity(
+                    &application_public_id,
+                    &overrides,
+                    summary.as_ref().and_then(|s| s.backend.as_deref()),
+                )
+                .await
+                .map_err(|error| {
+                    application_workspace_provider_problem(
+                        error,
+                        &application_public_id,
+                        "validate resource update",
+                    )
+                })?;
+            overrides
+                .validate_resource_overrides(&application_public_id, capacity)
+                .map_err(Problem::from)?;
+        }
+        summary
+    } else {
+        None
+    };
     if let Some(runtime) = request.runtime.as_deref() {
         let current = state
             .applications
             .workspace(application.application.id)
             .await?;
-        if runtime != current.runtime {
-            let has_compute = if let Some(sandboxes) = state.application_sandboxes.as_ref() {
-                sandboxes
-                    .application_workspace_summary(auth.user_id(), &application_public_id)
-                    .await
-                    .map_err(|error| {
-                        application_workspace_provider_problem(
-                            error,
-                            &application_public_id,
-                            "inspect before runtime setting",
-                        )
-                    })?
-                    .is_some()
-            } else {
-                false
-            };
-            if has_compute {
-                return Err(problemdetails::new(StatusCode::CONFLICT)
-                    .with_title("Confirm Runtime Change")
-                    .with_detail("Use the update_runtime control action with confirm: true and the selected built-in runtime to safely replace existing compute."));
-            }
+        if runtime != current.runtime && summary.is_some() {
+            return Err(problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Confirm Runtime Change")
+                .with_detail("Use the update_runtime control action with confirm: true and the selected built-in runtime to safely replace existing compute."));
         }
     }
     let desired = state

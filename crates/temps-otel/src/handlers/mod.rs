@@ -15,6 +15,8 @@ pub mod facet_handler;
 pub mod global_traces;
 pub mod ingest_handler;
 pub mod metric_alert_handler;
+/// Per-operation trends and regressions after a deployment (ADR 111, D2).
+pub mod operation_trends_handler;
 pub mod query_handler;
 
 use axum::extract::DefaultBodyLimit;
@@ -138,6 +140,22 @@ pub fn configure_routes() -> Router<OtelAppState> {
         // Registered before `/otel/traces/{project_id}/{trace_id}` for
         // readability only — matchit prefers static segments regardless.
         .route("/otel/span-stats", get(query_handler::query_span_stats))
+        .route(
+            "/otel/operations/trend",
+            get(operation_trends_handler::get_operation_trend),
+        )
+        .route(
+            "/otel/operations/breakdown",
+            get(operation_trends_handler::get_operation_breakdown),
+        )
+        .route(
+            "/otel/pages/backend",
+            get(operation_trends_handler::get_page_backend),
+        )
+        .route(
+            "/otel/operations/regressions",
+            get(operation_trends_handler::get_deployment_regressions),
+        )
         .route(
             "/otel/traces/{project_id}/{trace_id}",
             get(query_handler::get_trace),

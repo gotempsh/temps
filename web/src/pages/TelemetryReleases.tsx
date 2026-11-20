@@ -17,6 +17,7 @@ import {
 import type { ProjectResponse, TelemetryRelease } from '@/api/client'
 import { listTelemetryReleasesOptions } from '@/api/client/@tanstack/react-query.gen'
 import { readFailureServerDetail } from '@/lib/read-failure'
+import { ReleaseHealthSection } from '@/components/releases/ReleaseHealthSection'
 
 /** Collection screen: native release identity and retained signal correlation. */
 export default function TelemetryReleases({
@@ -65,7 +66,7 @@ export default function TelemetryReleases({
   return (
     <Ledger<TelemetryRelease>
       title="Releases"
-      description="Correlate SDK release versions across retained native errors, traces, logs, metrics, feedback and cron check-ins. Counts cover the selected observation window."
+      description="See how healthy each release is, and correlate SDK release versions across retained native errors, traces, logs, metrics, feedback and cron check-ins. Counts cover the selected observation window."
       actions={
         <Button
           variant="outline"
@@ -78,6 +79,7 @@ export default function TelemetryReleases({
       }
       toolbar={
         <div className="space-y-3">
+          <ReleaseHealthSection project={project} />
           <form
             className="flex flex-wrap gap-2"
             aria-label="Filter releases"

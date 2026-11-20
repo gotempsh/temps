@@ -81,6 +81,9 @@ pub enum OtelError {
     #[error("Metric dashboard {dashboard_id} not found")]
     DashboardNotFound { dashboard_id: i32 },
 
+    #[error("Deployment {deployment_id} not found in project {project_id}")]
+    DeploymentNotFound { project_id: i32, deployment_id: i32 },
+
     #[error("Metric alert rule {rule_id} not found")]
     MetricAlertNotFound { rule_id: i32 },
 
@@ -284,6 +287,7 @@ impl OtelError {
             | OtelError::InvalidApiKey => "auth_failed",
             OtelError::ProjectNotFound { .. }
             | OtelError::DashboardNotFound { .. }
+            | OtelError::DeploymentNotFound { .. }
             | OtelError::MetricAlertNotFound { .. } => "not_found",
             OtelError::MetricAlertLimitReached { .. } => "limit_reached",
             OtelError::Internal { .. } => "internal",
@@ -325,6 +329,7 @@ impl OtelError {
             | OtelError::S3 { .. }
             | OtelError::Validation { .. }
             | OtelError::DashboardNotFound { .. }
+            | OtelError::DeploymentNotFound { .. }
             | OtelError::MetricAlertNotFound { .. }
             | OtelError::MetricAlertLimitReached { .. }
             | OtelError::Io(_)
