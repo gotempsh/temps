@@ -222,8 +222,14 @@ export function hasNotFoundMarker(): boolean {
 export class NotFoundMarkerWatcher {
   private timer: ReturnType<typeof setTimeout> | null = null;
   private reported = false;
-  private firstPageview = true;
+  /**
+   * Markers seen while the previous page view was current: a view the router
+   * has not torn down yet when the next page view is recorded. A marker the
+   * new route rendered before its page view (a manual `trackPageview()` in
+   * an effect) was never seen, so it still counts.
+   */
   private previousMarkers: Set<Element> = new Set();
+  private observedMarkers: Set<Element> = new Set();
   private path = "";
 
   constructor(private readonly report: () => void) {}
@@ -232,8 +238,8 @@ export class NotFoundMarkerWatcher {
     this.cancel();
     this.reported = false;
     this.path = window.location.pathname;
-    this.previousMarkers = this.firstPageview ? new Set() : new Set(markerElements());
-    this.firstPageview = false;
+    this.previousMarkers = this.observedMarkers;
+    this.observedMarkers = new Set();
     if (this.check()) return;
     this.timer = setTimeout(() => {
       this.timer = null;
@@ -253,7 +259,9 @@ export class NotFoundMarkerWatcher {
     if (this.reported) return false;
     // The visitor moved on; that navigation records its own page view.
     if (window.location.pathname !== this.path) return false;
-    const fresh = markerElements().some((element) => !this.previousMarkers.has(element));
+    const markers = markerElements();
+    for (const element of markers) this.observedMarkers.add(element);
+    const fresh = markers.some((element) => !this.previousMarkers.has(element));
     if (!fresh) return false;
     this.reported = true;
     this.report();

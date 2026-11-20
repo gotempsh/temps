@@ -308,6 +308,22 @@ describe("createAnalytics auto-tracking", () => {
     expect(events[2].event_data).toMatchObject({ path: "/missing-page" });
   });
 
+  it("reports a 404 view rendered before a manually recorded page view", () => {
+    vi.useFakeTimers();
+    const api = start({ autoTrackPageviews: false });
+    api.trackPageview();
+    vi.advanceTimersByTime(NOT_FOUND_RECHECK_DELAY_MS);
+
+    // The router renders the new route, then its effect records the view.
+    window.history.pushState({}, "", "/missing-page");
+    document.body.innerHTML = "<main data-temps-404>Not found</main>";
+    api.trackPageview();
+
+    const events = sentEvents();
+    expect(events.map((event) => event.event_name)).toEqual(["page_view", "page_view", NOT_FOUND_EVENT]);
+    expect(events[2].event_data).toMatchObject({ path: "/missing-page" });
+  });
+
   it("ignores the marker when autoTrackNotFound is off", () => {
     document.body.innerHTML = "<main data-temps-404></main>";
     start({ autoTrackPageviews: true, autoTrackNotFound: false });
