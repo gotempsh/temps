@@ -696,10 +696,11 @@ deploys, which is web services. It comes last and may never be worth building.
   the project's.
 - **Suspect commits are not blame.** They are the newest five commits that
   touched the file of the latest event's innermost in-app frame that maps to a
-  repository path (webpack, `app://` and `file://` prefixes and the project's
-  source root removed; dependency directories, URLs and paths with `..`
-  ignored), read at the deployment's commit, or the default branch when the
-  event has none. Line-level blame would need one provider call per frame and
+  repository path (the location source maps resolved, webpack, `app://` and
+  `file://` prefixes removed, and the project's source root, the repository
+  directory frame paths are relative to, put in front; dependency
+  directories, URLs and paths with `..` ignored), read at the deployment's
+  commit, or the default branch when the event has none. Line-level blame would need one provider call per frame and
   is left out. When nothing matches, the answer says why.
 - **Ownership rules assign new groups only.** A project has at most 50
   ordered rules of a path pattern (`src/billing/` a directory, `*.py` a file

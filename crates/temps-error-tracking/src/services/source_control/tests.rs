@@ -86,6 +86,7 @@ fn an_issue_body_has_the_error_its_frames_and_a_link_but_nothing_else() {
             lineno: Some(41),
             in_app: true,
         }],
+        source_root: None,
         console_url: Some("https://temps.example.test/projects/shop/errors/42".into()),
     };
     let body = issue_body(&source);
@@ -101,6 +102,48 @@ fn an_issue_body_has_the_error_its_frames_and_a_link_but_nothing_else() {
         ),
         "{body}"
     );
+}
+
+#[test]
+fn an_issue_body_lists_frames_by_repository_path_and_leaves_out_the_rest() {
+    let frame = |filename: &str, lineno: i64| frames::AppFrame {
+        filename: filename.into(),
+        function: None,
+        lineno: Some(lineno),
+        in_app: true,
+    };
+    let source = IssueSource {
+        group_id: 42,
+        title: "TypeError".into(),
+        error_type: "TypeError".into(),
+        message: None,
+        total_count: 1,
+        first_seen: Utc::now(),
+        last_seen: Utc::now(),
+        frames: vec![
+            frame("https://shop.example.test/static/app.js?session=a1b2c3", 1),
+            frame("webpack:///./src/cart.ts", 41),
+            frame("<anonymous>", 2),
+        ],
+        source_root: Some("apps/web".into()),
+        console_url: None,
+    };
+    let body = issue_body(&source);
+    assert!(body.contains("`apps/web/src/cart.ts:41`"), "{body}");
+    assert!(!body.contains("shop.example.test"), "{body}");
+    assert!(!body.contains("session="), "{body}");
+    assert!(!body.contains("anonymous"), "{body}");
+
+    // No frame in the repository: no stack section at all.
+    let body = issue_body(&IssueSource {
+        frames: vec![frame(
+            "https://shop.example.test/static/app.js?session=a1b2c3",
+            1,
+        )],
+        ..source
+    });
+    assert!(!body.contains("Stack"), "{body}");
+    assert!(!body.contains("session="), "{body}");
 }
 
 /// A repository in memory.
@@ -595,6 +638,169 @@ mod database {
         ));
         let activity = activity_kinds(db.as_ref(), project, group).await;
         assert_eq!(activity.last().map(String::as_str), Some("issue_unlinked"));
+    }
+
+    #[tokio::test]
+    async fn a_group_at_the_link_limit_opens_no_issue() {
+        let test_db = test_db!("issue at the link limit");
+        let db = test_db.connection_arc();
+        let project = create_project(db.as_ref()).await;
+        let group = create_group(db.as_ref(), project, GroupSpec::default()).await;
+        event_with_frames(db.as_ref(), project, group).await;
+        let service = service(&db);
+        let fake = FakeRepository::on(github());
+        service.set_source_control(fake.clone());
+        for n in 0..MAX_LINKS_PER_GROUP {
+            service
+                .link_issue(
+                    project,
+                    group,
+                    &format!("https://tracker.example.test/{n}"),
+                    None,
+                    None,
+                )
+                .await
+                .expect("under the limit");
+        }
+
+        let error = service
+            .create_issue(project, group, None, None, None)
+            .await
+            .expect_err("the group is full");
+        assert!(
+            matches!(error, ErrorTrackingError::IssueLinkLimit { group_id, .. } if group_id == group),
+            "{error}"
+        );
+        assert!(
+            fake.opened.lock().expect("lock").is_empty(),
+            "no issue is opened in the repository that could not be linked"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_links_added_at_once_do_not_pass_the_limit() {
+        use sea_orm::TransactionTrait;
+        let test_db = test_db!("concurrent links");
+        let db = test_db.connection_arc();
+        let project = create_project(db.as_ref()).await;
+        let group = create_group(db.as_ref(), project, GroupSpec::default()).await;
+        let service = Arc::new(service(&db));
+        for n in 0..(MAX_LINKS_PER_GROUP - 1) {
+            service
+                .link_issue(
+                    project,
+                    group,
+                    &format!("https://tracker.example.test/{n}"),
+                    None,
+                    None,
+                )
+                .await
+                .expect("under the limit");
+        }
+
+        // The last free slot, taken by a link not yet committed.
+        let first = db.begin().await.expect("transaction");
+        SourceControlService::insert_link(
+            &first,
+            project,
+            group,
+            "link",
+            None,
+            None,
+            "https://tracker.example.test/first",
+            "first",
+            None,
+            None,
+        )
+        .await
+        .expect("the last slot");
+
+        let second = tokio::spawn({
+            let service = service.clone();
+            async move {
+                service
+                    .link_issue(
+                        project,
+                        group,
+                        "https://tracker.example.test/second",
+                        None,
+                        None,
+                    )
+                    .await
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !second.is_finished(),
+            "the second link waits for the first to be counted"
+        );
+        first.commit().await.expect("commit the first");
+        let error = tokio::time::timeout(std::time::Duration::from_secs(10), second)
+            .await
+            .expect("the second link finishes")
+            .expect("task")
+            .expect_err("the group is full");
+        assert!(
+            matches!(error, ErrorTrackingError::IssueLinkLimit { .. }),
+            "{error}"
+        );
+        assert_eq!(
+            service
+                .list_links(project, group)
+                .await
+                .expect("links")
+                .len(),
+            MAX_LINKS_PER_GROUP
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refresh_reads_only_issues_of_the_projects_repository() {
+        let test_db = test_db!("refresh another repository");
+        let db = test_db.connection_arc();
+        let project = create_project(db.as_ref()).await;
+        let group = create_group(db.as_ref(), project, GroupSpec::default()).await;
+        let service = service(&db);
+        let fake = FakeRepository::on(github());
+        service.set_source_control(fake.clone());
+        let own = service
+            .link_issue(
+                project,
+                group,
+                "https://github.com/acme/shop/issues/3",
+                None,
+                None,
+            )
+            .await
+            .expect("own issue");
+        // Linked while the project deployed from another repository, where
+        // issue 3 is another issue.
+        db.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "INSERT INTO error_group_issue_links \
+             (project_id, error_group_id, provider, repository, number, url, title, state, \
+              state_checked_at) \
+             VALUES ($1, $2, 'github', 'acme/legacy', 3, \
+                     'https://github.com/acme/legacy/issues/3', 'Legacy issue', 'open', NOW())",
+            [project.into(), group.into()],
+        ))
+        .await
+        .expect("old link");
+        fake.states
+            .lock()
+            .expect("lock")
+            .insert(3, IssueState::Closed);
+
+        let (links, failed) = service
+            .refresh_links(project, group)
+            .await
+            .expect("refresh");
+        assert_eq!(failed, 1, "the other repository's issue is not refreshed");
+        let by_url = |url: &str| links.iter().find(|l| l.url == url).cloned().expect("link");
+        assert_eq!(by_url(&own.url).state.as_deref(), Some("closed"));
+        let legacy = by_url("https://github.com/acme/legacy/issues/3");
+        assert_eq!(legacy.state.as_deref(), Some("open"));
+        assert_eq!(legacy.title, "Legacy issue");
     }
 
     #[tokio::test]

@@ -186,13 +186,16 @@ pub struct IssueSource {
     pub first_seen: DateTime<Utc>,
     pub last_seen: DateTime<Utc>,
     pub frames: Vec<frames::AppFrame>,
+    /// The project's `error_source_root`, which frame paths are relative to.
+    pub source_root: Option<String>,
     /// The group's page in the console, when the server knows its URL.
     pub console_url: Option<String>,
 }
 
 /// The body of an issue opened from a group: what failed, how often, where,
-/// and a link back. Only the exception and the application frames; never
-/// request data, user data, tags or breadcrumbs.
+/// and a link back. Only the exception and the application frames in files
+/// of the repository; never request data, user data, tags or breadcrumbs,
+/// nor a frame's URL, whose query string can carry a token or a user's id.
 pub fn issue_body(source: &IssueSource) -> String {
     let mut body = String::new();
     body.push_str(&format!(
@@ -211,13 +214,20 @@ pub fn issue_body(source: &IssueSource) -> String {
         source.first_seen.format("%Y-%m-%d %H:%M UTC"),
         source.last_seen.format("%Y-%m-%d %H:%M UTC"),
     ));
-    if !source.frames.is_empty() {
+    // The repository path of each frame in a file of the repository: what
+    // a reader opens, without the bundler's `webpack:///` and the like.
+    let located: Vec<(&frames::AppFrame, String)> = source
+        .frames
+        .iter()
+        .filter_map(|frame| {
+            frames::repository_path(&frame.filename, source.source_root.as_deref())
+                .map(|file| (frame, file))
+        })
+        .take(ISSUE_BODY_FRAMES)
+        .collect();
+    if !located.is_empty() {
         body.push_str("\n**Stack (innermost first)**\n\n");
-        for frame in source.frames.iter().take(ISSUE_BODY_FRAMES) {
-            // The repository path when the file is in it: what a reader
-            // opens, without the bundler's `webpack:///` and the like.
-            let file = frames::repository_path(&frame.filename, None)
-                .unwrap_or_else(|| frame.filename.clone());
+        for (frame, file) in located {
             let location = match frame.lineno {
                 Some(line) => format!("{file}:{line}"),
                 None => file,
@@ -383,6 +393,39 @@ impl SourceControlService {
         rows.iter().map(link_from_row).collect()
     }
 
+    /// Take the group's link lock for the rest of `txn` and refuse when the
+    /// group has [`MAX_LINKS_PER_GROUP`] links. Two links added at once are
+    /// counted one after the other, so neither goes past the limit. The
+    /// lock is not the group row, which ingest updates.
+    async fn reserve_link<C: ConnectionTrait>(
+        txn: &C,
+        group_id: i32,
+    ) -> Result<(), ErrorTrackingError> {
+        txn.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT pg_advisory_xact_lock(hashtext('error_group_issue_links'), $1)",
+            [group_id.into()],
+        ))
+        .await?;
+        let count: i64 = txn
+            .query_one(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT COUNT(*) AS n FROM error_group_issue_links WHERE error_group_id = $1",
+                [group_id.into()],
+            ))
+            .await?
+            .map(|row| row.try_get("", "n"))
+            .transpose()?
+            .unwrap_or(0);
+        if count >= MAX_LINKS_PER_GROUP as i64 {
+            return Err(ErrorTrackingError::IssueLinkLimit {
+                group_id,
+                limit: MAX_LINKS_PER_GROUP,
+            });
+        }
+        Ok(())
+    }
+
     /// Store a link inside `txn`, refusing a duplicate URL or one past the
     /// limit, and record it in the group's activity.
     #[allow(
@@ -401,22 +444,7 @@ impl SourceControlService {
         state: Option<&str>,
         actor_user_id: Option<i32>,
     ) -> Result<IssueLink, ErrorTrackingError> {
-        let count: i64 = txn
-            .query_one(Statement::from_sql_and_values(
-                DatabaseBackend::Postgres,
-                "SELECT COUNT(*) AS n FROM error_group_issue_links WHERE error_group_id = $1",
-                [group_id.into()],
-            ))
-            .await?
-            .map(|row| row.try_get("", "n"))
-            .transpose()?
-            .unwrap_or(0);
-        if count >= MAX_LINKS_PER_GROUP as i64 {
-            return Err(ErrorTrackingError::IssueLinkLimit {
-                group_id,
-                limit: MAX_LINKS_PER_GROUP,
-            });
-        }
+        Self::reserve_link(txn, group_id).await?;
         let row = txn
             .query_one(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
@@ -638,6 +666,10 @@ impl SourceControlService {
                 url: row.try_get("", "url")?,
             });
         }
+        // A group at the limit is refused before the issue is opened, and
+        // the slot stays reserved while the provider answers, so an issue
+        // is never opened that cannot then be linked.
+        Self::reserve_link(&txn, group_id).await?;
         let title = title.unwrap_or_else(|| truncate_chars(&source.title, MAX_ISSUE_TITLE_CHARS));
         let issue = source_control
             .create_issue(project_id, &title, &issue_body(&source))
@@ -705,19 +737,45 @@ impl SourceControlService {
 
     /// Read again the state of the group's issues in the project's
     /// repository. A failed read keeps the last state; the links are
-    /// returned either way, with the failures counted.
+    /// returned either way, with the number not refreshed. An issue of
+    /// another repository (the project moved, or the link was made before)
+    /// cannot be read through this one and keeps its last state, counted
+    /// as not refreshed.
     pub async fn refresh_links(
         &self,
         project_id: i32,
         group_id: i32,
     ) -> Result<(Vec<IssueLink>, usize), ErrorTrackingError> {
         let links = self.list_links(project_id, group_id).await?;
-        let Some(source_control) = self.source_control() else {
+        let tracked: Vec<&IssueLink> = links
+            .iter()
+            .filter(|l| l.provider != "link" && l.number.is_some())
+            .collect();
+        if tracked.is_empty() {
             return Ok((links, 0));
+        }
+        let Some(source_control) = self.source_control() else {
+            return Ok((links.clone(), tracked.len()));
+        };
+        let repository = match source_control.repository(project_id).await {
+            Ok(repository) => repository,
+            Err(error) => {
+                tracing::warn!(project_id, group_id, %error, "Could not read the project's repository to refresh linked issues");
+                None
+            }
         };
         let mut failed = 0;
-        for link in links.iter().filter(|l| l.provider != "link") {
+        for link in tracked {
             let Some(number) = link.number else { continue };
+            let current = repository.as_ref().is_some_and(|repository| {
+                repository.provider == link.provider
+                    && link.repository.as_deref() == Some(repository.repository.as_str())
+            });
+            if !current {
+                failed += 1;
+                tracing::info!(project_id, group_id, link_id = link.id, provider = %link.provider, repository = ?link.repository, "A linked issue is not in the project's repository; its state is not refreshed");
+                continue;
+            }
             match source_control.issue(project_id, number).await {
                 Ok(issue) => {
                     self.db
@@ -753,8 +811,9 @@ impl SourceControlService {
             .query_one(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
                 "SELECT g.title, g.error_type, g.message_template, g.total_count, g.first_seen, \
-                        g.last_seen, e.exception_value, e.data \
+                        g.last_seen, e.exception_value, e.data, p.error_source_root \
                  FROM error_groups g \
+                 JOIN projects p ON p.id = g.project_id \
                  LEFT JOIN LATERAL (SELECT exception_value, data FROM error_events \
                                     WHERE error_group_id = g.id AND project_id = g.project_id \
                                     ORDER BY timestamp DESC LIMIT 1) e ON TRUE \
@@ -778,6 +837,7 @@ impl SourceControlService {
             first_seen: group.try_get("", "first_seen")?,
             last_seen: group.try_get("", "last_seen")?,
             frames: data.as_ref().map(frames::app_frames).unwrap_or_default(),
+            source_root: group.try_get("", "error_source_root")?,
             console_url: None,
         })
     }
