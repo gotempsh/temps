@@ -7,6 +7,7 @@ import { ProjectResponse } from '@/api/client'
 import { getErrorEventOptions } from '@/api/client/@tanstack/react-query.gen'
 import { SentryEventDetail } from '@/components/error-tracking/SentryEventDetail'
 import { CspReportDetails } from '@/components/error-tracking/CspReportDetails'
+import { EventAttachments } from '@/components/error-tracking/EventAttachments'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -247,6 +248,15 @@ export function ErrorEventDetail({ project }: { project: ProjectResponse }) {
           </CardContent>
         </Card>
       )}
+      <Card className="mt-6">
+        <CardContent className="pt-6">
+          <EventAttachments
+            projectId={project.id}
+            groupId={event.error_group_id}
+            eventId={event.id}
+          />
+        </CardContent>
+      </Card>
     </div>
   )
 }

@@ -67,6 +67,7 @@ import TelemetryReleases from './TelemetryReleases'
 import ClientOutcomes from './ClientOutcomes'
 import { SourceMapArtifacts, SourceMapCredentials } from './SourceMapArtifacts'
 import { InboundFilters } from '@/components/error-tracking/InboundFilters'
+import { ErrorAttachmentsSettings } from '@/components/error-tracking/ErrorAttachmentsSettings'
 import { ProjectMonitors } from '@/components/project/ProjectMonitors'
 import {
   LegacyStatusPageRedirect,
@@ -607,6 +608,12 @@ export function ProjectDetail() {
                     element={<InboundFilters projectId={project.id} />}
                   />
                   <Route
+                    path="errors/attachments"
+                    element={
+                      <ErrorAttachmentsSettings projectId={project.id} />
+                    }
+                  />
+                  <Route
                     path="errors/:errorGroupId"
                     element={<ErrorGroupDetail project={project} />}
                   />
@@ -1097,6 +1104,10 @@ export function ProjectDetail() {
                 <Route
                   path="errors/inbound-filters"
                   element={<InboundFilters projectId={project.id} />}
+                />
+                <Route
+                  path="errors/attachments"
+                  element={<ErrorAttachmentsSettings projectId={project.id} />}
                 />
                 <Route
                   path="errors/:errorGroupId"

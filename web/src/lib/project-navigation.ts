@@ -52,6 +52,7 @@ import {
   Lock,
   MessageSquare,
   Network,
+  Paperclip,
   Plug,
   Puzzle,
   Radar,
@@ -246,6 +247,7 @@ export const PROJECT_NAV_GROUPS: ProjectNavGroup[] = [
             icon: ListFilter,
             url: 'errors/inbound-filters',
           },
+          { title: 'Attachments', icon: Paperclip, url: 'errors/attachments' },
           { title: 'SDK health', icon: HeartPulse, url: 'client-outcomes' },
           { title: 'Setup', icon: Plug, url: 'errors/setup' },
         ],
@@ -332,7 +334,11 @@ export const PROJECT_NAV_GROUPS: ProjectNavGroup[] = [
           // Jobs scheduled elsewhere, reporting through the Sentry SDK: a
           // different feature from the jobs Temps runs, so its own tab.
           { title: 'Check-ins', icon: CalendarCheck, url: 'check-ins' },
-          { title: 'Durable workflows', icon: Workflow, url: 'durable-workflows' },
+          {
+            title: 'Durable workflows',
+            icon: Workflow,
+            url: 'durable-workflows',
+          },
         ],
       },
     ],
