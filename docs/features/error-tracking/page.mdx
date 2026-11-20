@@ -119,6 +119,7 @@ These checks use synthetic applications, real HTTP endpoints, native storage que
 | Breadcrumbs, users, tags and contexts | Adapted: error detail payload and native metadata | User/request/browser/runtime fields populate native details; exact user/tag filtering is available on native event queries. Other typed contexts stay in JSON metadata and the original source event. Not every field has a separate index. |
 | Fingerprints and grouping | Adapted: native fingerprints and grouping; concurrent insertion and counts reconciled; native extension: reversible group merge and fingerprint split | Explicit SDK fingerprints and `{{ default }}` are supported. Default grouping uses Temps stack/message normalization, not Sentry server algorithm versions. Grouping configuration APIs are not provided. A merge or split redirects future events and never rewrites stored ones. |
 | Issue APIs and triage | Existing native error list, detail and resolution APIs/UI; native extension: bulk resolve/reopen/ignore by ID or filter (`POST /projects/{project_id}/error-groups/bulk`, `temps errors bulk`); [resolve in the next release](#resolve-next-release); [assignment to a user or team](#assign) with an assigned-to-me filter; ignore until a time, count or user count; server-side [inbound filters](#inbound-filters) that drop matching events before storage | Sentry issue APIs are not implemented. Bulk requests are capped at 1,000 groups and 50 status-change notifications each. |
+| Issue trackers and source control | Native extension: [open a GitHub or GitLab issue](#issue-links) from a group in the project's repository, link an issue from any tracker, suspect commits for the failing file, and ownership rules that assign new groups by path | One-way: an issue's state is read when linked or refreshed and never resolves the group. GitHub and GitLab only; other trackers are plain links. Suspect commits are the latest commits to the file, not line blame. |
 | Alert APIs and alerts | Existing Temps alert rules and alarms; cron health feeds native alarms | Sentry alert APIs are not implemented. Delivery requires a configured provider; external delivery was not verified in the synthetic run. |
 | Debug ID source maps and artifact bundles | Adapted: CLI artifact bundles imported into native source maps; exact Debug ID lookup without a release, including maps uploaded after an error | Full-access project build credential required; public DSNs cannot access artifacts. SYSB v2, stored/deflated ZIP entries, 50 MiB compressed/expanded bundle, 256 files, 128 maps. Symbolication loads at most 32 maps/50 MiB per event; staged chunks expire after one hour (64 MiB/project, 256 MiB globally). Indexed/Hermes/native debug artifacts are outside this contract. |
 | Releases | Native extension: correlate retained errors, logs, spans, metric points, feedback and check-ins by SDK release version | Errors → Releases shows exact counts and native example links in a bounded 1–31 day window. Deployment/finalization and commits are separate workflows; [release health](#release-health) is shown above the table. |
@@ -773,6 +774,63 @@ const activity = await fetch(
 </CodeGroup>
 
 Activity is recorded from this version on; changes made before the upgrade are not in the log. An event that reopens a group is logged once, when it reopens it; ordinary events are never logged here.
+
+### Issues, Suspect Commits and Ownership {{ anchor: true, id: 'issue-links' }}
+
+The **Overview** tab of a group has two panels that use the GitHub or GitLab repository the project deploys from, with the git provider connection it already has.
+
+- **Issues.** **Open issue** creates an issue in that repository with the exception, its counts, the innermost application frames in files of the repository and a link back to the group, and links it. Nothing from the request, the user, tags or breadcrumbs goes into the issue, nor a frame's URL, whose query string can carry a token. **Link issue** links one that already exists, in that repository or in any tracker (Jira, Linear, a ticket URL): up to 10 per group. A group has at most one open issue per repository; opening a second one while it is open is refused with the existing link. The state of a GitHub or GitLab issue (open or closed) is read when it is linked and again when you press **Refresh**; an issue of a repository the project no longer deploys from keeps its last state and is counted as not read. Temps never closes or comments on the issue, and closing the issue does not resolve the group. Unlinking leaves the issue as it is.
+- **Suspect commits.** The newest five commits that touched the file of the latest event's innermost application frame, read at the commit that was deployed (or the default branch when the event has no deployment). Frames are matched to repository paths by their source-mapped location, without `webpack:///`, `app://` and `file://` prefixes, and under the project's source root when one is set (a frame `src/cart.ts` with the source root `apps/web` is `apps/web/src/cart.ts`); dependency files are skipped. When nothing matches, the panel says why.
+
+Without a connected GitHub or GitLab repository both panels say what is missing and link to **Git providers** or the project's git settings.
+
+**Ownership rules** (Errors → **Ownership**) assign new groups by where they fail. Each rule is a repository path pattern and a person: `src/billing/` covers a directory, `*.py` a file name anywhere, and `src/**/cart.ts` any depth. When a group is first created, its frames are tried innermost first against the rules in order, and the first match assigns it, if nobody has yet; the activity names the rule. Existing groups are never reassigned and no email is sent. A project has up to 50 rules, and every owner must be able to open the project.
+
+<CodeGroup title="Issues, Suspect Commits and Ownership">
+```bash {{ title: 'CLI' }}
+# Open an issue in the project's repository, or link one from any tracker
+temps errors issues open --project-id 42 --group-id 123
+temps errors issues link --project-id 42 --group-id 123 --url https://tracker.example.com/browse/SHOP-12
+
+# List the links, reading again whether each issue is open
+temps errors issues list --project-id 42 --group-id 123 --refresh
+temps errors issues unlink --project-id 42 --group-id 123 --link-id 5
+
+# The commits that last touched the failing file
+temps errors commits --project-id 42 --group-id 123
+
+# Ownership rules: one "<pattern> <user-id>" per line, tried in order
+printf 'src/billing/ 7\n*.py 9\n' > owners.txt
+temps errors ownership set --project-id 42 --file owners.txt
+temps errors ownership list --project-id 42
+```
+
+```typescript {{ title: 'API' }}
+const headers = { 'Authorization': `Bearer ${API_KEY}`, 'Content-Type': 'application/json' };
+
+// Open an issue (201), or link one by URL (201)
+await fetch('https://your-temps-instance.com/api/projects/42/error-groups/123/issues', {
+  method: 'POST', headers, body: JSON.stringify({ title: 'Checkout fails on empty carts' })
+});
+await fetch('https://your-temps-instance.com/api/projects/42/error-groups/123/issues/link', {
+  method: 'POST', headers, body: JSON.stringify({ url: 'https://tracker.example.com/browse/SHOP-12' })
+});
+
+// Suspect commits
+const suspects = await fetch(
+  'https://your-temps-instance.com/api/projects/42/error-groups/123/suspect-commits',
+  { headers }
+).then(r => r.json());
+
+// Replace the ownership rules, in the order they are tried
+await fetch('https://your-temps-instance.com/api/projects/42/error-ownership-rules', {
+  method: 'PUT', headers,
+  body: JSON.stringify({ rules: [{ pattern: 'src/billing/', owner_user_id: 7 }] })
+});
+```
+</CodeGroup>
+
+`GET /projects/{project_id}/error-tracking/source-control` tells whether the project has a repository these features can use (`configured`, `reason`, `setup_path`).
 
 ### Saved Searches {{ anchor: true, id: 'saved-searches' }}
 

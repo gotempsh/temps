@@ -33,6 +33,7 @@ import { registerInboundFilterCommands } from './filters.js'
 import { checkIssueType, registerPerformanceCommands } from './performance.js'
 import { registerReleaseHealthCommands } from './release-health.js'
 import { registerAttachmentCommands } from './attachments.js'
+import { registerSourceControlCommands } from './source-control.js'
 import { applySavedSearch, loadSavedSearch, registerSavedSearchCommands } from './saved-searches.js'
 
 interface ListOptions {
@@ -543,6 +544,7 @@ export function registerErrorsCommands(program: Command): void {
   registerPerformanceCommands(errors)
   registerReleaseHealthCommands(errors)
   registerAttachmentCommands(errors)
+  registerSourceControlCommands(errors)
 
   errors
     .command('events')

@@ -928,3 +928,77 @@ impl AuditOperation for ErrorAttachmentQuotaAudit {
         temps_core::serialize_audit_operation(self)
     }
 }
+
+/// Audit event for opening an issue from an error group or linking one to
+/// it (ADR 111, D5). The issue's provider, repository and number; not its
+/// title, which repeats the error message.
+#[derive(Debug, Clone, Serialize)]
+pub struct ErrorIssueLinkAudit {
+    pub context: AuditContext,
+    pub project_id: i32,
+    pub group_id: i32,
+    pub link_id: i64,
+    /// `github`, `gitlab` or `link`.
+    pub provider: String,
+    pub repository: Option<String>,
+    pub number: Option<i64>,
+    /// `opened` (Temps opened the issue), `linked` or `unlinked`.
+    pub action: &'static str,
+}
+
+impl AuditOperation for ErrorIssueLinkAudit {
+    fn operation_type(&self) -> String {
+        match self.action {
+            "opened" => "ERROR_GROUP_ISSUE_OPENED",
+            "unlinked" => "ERROR_GROUP_ISSUE_UNLINKED",
+            _ => "ERROR_GROUP_ISSUE_LINKED",
+        }
+        .into()
+    }
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
+    }
+}
+
+/// One ownership rule as audited.
+#[derive(Debug, Clone, Serialize)]
+pub struct AuditedOwnershipRule {
+    pub pattern: String,
+    pub owner_user_id: i32,
+}
+
+/// Audit event for replacing a project's ownership rules (ADR 111, D5).
+#[derive(Debug, Clone, Serialize)]
+pub struct ErrorOwnershipRulesAudit {
+    pub context: AuditContext,
+    pub project_id: i32,
+    pub previous: Vec<AuditedOwnershipRule>,
+    pub rules: Vec<AuditedOwnershipRule>,
+}
+
+impl AuditOperation for ErrorOwnershipRulesAudit {
+    fn operation_type(&self) -> String {
+        "ERROR_OWNERSHIP_RULES_UPDATED".into()
+    }
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
+    }
+}

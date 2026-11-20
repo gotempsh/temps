@@ -360,6 +360,18 @@ export type ActivityDetails = {
      */
     in_next_release?: boolean;
     /**
+     * `issue_linked`, `issue_unlinked`: its title when linked.
+     */
+    issue_title?: string | null;
+    /**
+     * `issue_linked`, `issue_unlinked`: the issue.
+     */
+    issue_url?: string | null;
+    /**
+     * `assigned`: the ownership rule pattern that assigned a new group.
+     */
+    ownership_rule?: string | null;
+    /**
      * `regressed`: the release of the event that reopened the group.
      */
     release?: string | null;
@@ -518,7 +530,7 @@ export type ActivityGraphResponse = {
 /**
  * What happened to the group.
  */
-export type ActivityKind = 'comment' | 'status_changed' | 'regressed' | 'assigned' | 'merged' | 'unmerged' | 'split';
+export type ActivityKind = 'comment' | 'status_changed' | 'regressed' | 'assigned' | 'merged' | 'unmerged' | 'split' | 'issue_linked' | 'issue_unlinked';
 
 export type ActivityPreview = {
     report: ActivityReport;
@@ -8962,6 +8974,16 @@ export type CreateIpAccessControlRequest = {
      * Optional reason for the action
      */
     reason?: string | null;
+};
+
+/**
+ * Open an issue for a group in the project's repository.
+ */
+export type CreateIssueRequest = {
+    /**
+     * The issue's title; the group's title when absent.
+     */
+    title?: string | null;
 };
 
 export type CreateMcpRequest = {
@@ -20181,6 +20203,42 @@ export type IpAccessControlResponse = {
 export type IpAccessMode = 'disabled' | 'allow' | 'deny';
 
 /**
+ * The issues of a group.
+ */
+export type IssueLinkList = {
+    data: Array<IssueLinkView>;
+    /**
+     * After a refresh: how many issues could not be read (they keep their
+     * last state).
+     */
+    failed_refreshes: number;
+};
+
+/**
+ * An issue linked to an error group.
+ */
+export type IssueLinkView = {
+    created_at: string;
+    created_by?: number | null;
+    group_id: number;
+    id: number;
+    number?: number | null;
+    /**
+     * `github` or `gitlab` for an issue of the project's repository, whose
+     * state Temps reads; `link` for any other URL.
+     */
+    provider: string;
+    repository?: string | null;
+    /**
+     * `open` or `closed` when last read; absent for plain links.
+     */
+    state?: string | null;
+    state_checked_at?: string | null;
+    title: string;
+    url: string;
+};
+
+/**
  * A new workflow credential. `token` is shown this once.
  */
 export type IssuedWorkflowCredentialResponse = {
@@ -20601,6 +20659,21 @@ export type LineIndexBackend = 'clickhouse' | 'temps_cloud' | 'timescaledb';
 
 export type LinkApplicationProjectRequest = {
     project_id: number;
+};
+
+/**
+ * Link an existing issue by its URL.
+ */
+export type LinkIssueRequest = {
+    /**
+     * What to call it; the issue's own title, or the URL, when absent.
+     */
+    title?: string | null;
+    /**
+     * An http(s) URL: an issue of the project's GitHub or GitLab repository
+     * (its state is then read), or any other tracker's issue.
+     */
+    url: string;
 };
 
 /**
@@ -24612,6 +24685,44 @@ export type OverprovisioningAssessment = {
  * Overall overprovisioning verdict
  */
 export type OverprovisioningVerdict = 'severe' | 'moderate' | 'reasonable' | 'unknown';
+
+/**
+ * The project's ownership rules, in order.
+ */
+export type OwnershipRuleList = {
+    data: Array<OwnershipRuleView>;
+};
+
+/**
+ * One rule as written.
+ */
+export type OwnershipRuleRequest = {
+    /**
+     * The member a matching new group is assigned to.
+     */
+    owner_user_id: number;
+    /**
+     * A repository path: `src/billing/` (everything under it), `*.py` (a
+     * file name anywhere), `src**cart.ts`.
+     */
+    pattern: string;
+};
+
+/**
+ * An ownership rule.
+ */
+export type OwnershipRuleView = {
+    created_at: string;
+    id: number;
+    owner_name?: string | null;
+    owner_user_id: number;
+    pattern: string;
+    /**
+     * Rules are tried in this order.
+     */
+    position: number;
+    updated_at: string;
+};
 
 /**
  * Time bucket data point for page activity graph
@@ -29859,6 +29970,16 @@ export type ReorderEdgeRulesRequest = {
 };
 
 /**
+ * Replace every ownership rule of the project, in order.
+ */
+export type ReplaceOwnershipRulesRequest = {
+    /**
+     * At most 50; the first match wins.
+     */
+    rules: Array<OwnershipRuleRequest>;
+};
+
+/**
  * Deliberately, explicitly move where a service's continuous archiving
  * process (Postgres/Timescale WAL-G, MariaDB's binlog shipper) points. See
  * `ExternalServiceManager::repoint_continuous_archive_source` for why this is a
@@ -35092,6 +35213,33 @@ export type SourceBody = {
     url: string;
 };
 
+/**
+ * Whether the project's repository can be reached for issues and commits.
+ */
+export type SourceControlStatusView = {
+    /**
+     * Issues can be opened and commits read.
+     */
+    configured: boolean;
+    /**
+     * `github`, `gitlab`, or the provider that is not supported.
+     */
+    provider?: string | null;
+    /**
+     * What is missing, when not configured.
+     */
+    reason?: string | null;
+    /**
+     * `owner/name`.
+     */
+    repository?: string | null;
+    /**
+     * The console page that fixes it.
+     */
+    setup_path?: string | null;
+    web_url?: string | null;
+};
+
 export type SourceFileListResponse = {
     source_files: Array<SourceFileResponse>;
     total: number;
@@ -36161,6 +36309,37 @@ export type SuggestionModeSource = 'chat' | 'default';
  * What (if anything) will restart the process after it exits.
  */
 export type SupervisorKind = 'systemd' | 'launchd' | 'container' | 'none';
+
+/**
+ * A commit that touched the failing file.
+ */
+export type SuspectCommitView = {
+    author_name?: string | null;
+    authored_at?: string | null;
+    sha: string;
+    summary: string;
+    url: string;
+};
+
+/**
+ * The newest commits that touched the file of the latest event's
+ * innermost application frame.
+ */
+export type SuspectCommitsView = {
+    /**
+     * The deployed commit the history was read at; the default branch
+     * when absent.
+     */
+    at?: string | null;
+    commits: Array<SuspectCommitView>;
+    function?: string | null;
+    lineno?: number | null;
+    path?: string | null;
+    /**
+     * Why there are no commits, when there are none.
+     */
+    reason?: string | null;
+};
 
 export type SyncedRepositoryListQuery = {
     direction?: string | null;
@@ -86822,6 +87001,254 @@ export type ListErrorGroupFingerprintsResponses = {
 
 export type ListErrorGroupFingerprintsResponse = ListErrorGroupFingerprintsResponses[keyof ListErrorGroupFingerprintsResponses];
 
+export type ListErrorGroupIssuesData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Error group ID
+         */
+        group_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/error-groups/{group_id}/issues';
+};
+
+export type ListErrorGroupIssuesErrors = {
+    /**
+     * Not authenticated
+     */
+    401: unknown;
+    /**
+     * No access to the project
+     */
+    403: unknown;
+    /**
+     * No such group in the project
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListErrorGroupIssuesResponses = {
+    /**
+     * Linked issues, oldest first, with their last read state
+     */
+    200: IssueLinkList;
+};
+
+export type ListErrorGroupIssuesResponse = ListErrorGroupIssuesResponses[keyof ListErrorGroupIssuesResponses];
+
+export type CreateErrorGroupIssueData = {
+    body: CreateIssueRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Error group ID
+         */
+        group_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/error-groups/{group_id}/issues';
+};
+
+export type CreateErrorGroupIssueErrors = {
+    /**
+     * Title too long
+     */
+    400: unknown;
+    /**
+     * Not authenticated
+     */
+    401: unknown;
+    /**
+     * Error tracking write permission required
+     */
+    403: unknown;
+    /**
+     * No such group in the project
+     */
+    404: unknown;
+    /**
+     * No repository connected, a provider that is not GitHub or GitLab, an issue already open for the group, or one being opened
+     */
+    409: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+    /**
+     * The provider refused or failed the request
+     */
+    502: unknown;
+    /**
+     * This server has no git provider integration
+     */
+    503: unknown;
+};
+
+export type CreateErrorGroupIssueResponses = {
+    /**
+     * Issue opened and linked
+     */
+    201: IssueLinkView;
+};
+
+export type CreateErrorGroupIssueResponse = CreateErrorGroupIssueResponses[keyof CreateErrorGroupIssueResponses];
+
+export type LinkErrorGroupIssueData = {
+    body: LinkIssueRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Error group ID
+         */
+        group_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/error-groups/{group_id}/issues/link';
+};
+
+export type LinkErrorGroupIssueErrors = {
+    /**
+     * Not an http(s) URL, or a title too long
+     */
+    400: unknown;
+    /**
+     * Not authenticated
+     */
+    401: unknown;
+    /**
+     * Error tracking write permission required
+     */
+    403: unknown;
+    /**
+     * No such group in the project
+     */
+    404: unknown;
+    /**
+     * Already linked, or the group has the maximum of 10 issues
+     */
+    409: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type LinkErrorGroupIssueResponses = {
+    /**
+     * Issue linked
+     */
+    201: IssueLinkView;
+};
+
+export type LinkErrorGroupIssueResponse = LinkErrorGroupIssueResponses[keyof LinkErrorGroupIssueResponses];
+
+export type RefreshErrorGroupIssuesData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Error group ID
+         */
+        group_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/error-groups/{group_id}/issues/refresh';
+};
+
+export type RefreshErrorGroupIssuesErrors = {
+    /**
+     * Not authenticated
+     */
+    401: unknown;
+    /**
+     * No access to the project
+     */
+    403: unknown;
+    /**
+     * No such group in the project
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type RefreshErrorGroupIssuesResponses = {
+    /**
+     * Linked issues with their state as read now
+     */
+    200: IssueLinkList;
+};
+
+export type RefreshErrorGroupIssuesResponse = RefreshErrorGroupIssuesResponses[keyof RefreshErrorGroupIssuesResponses];
+
+export type UnlinkErrorGroupIssueData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Error group ID
+         */
+        group_id: number;
+        /**
+         * Issue link ID
+         */
+        link_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/error-groups/{group_id}/issues/{link_id}';
+};
+
+export type UnlinkErrorGroupIssueErrors = {
+    /**
+     * Not authenticated
+     */
+    401: unknown;
+    /**
+     * Error tracking write permission required
+     */
+    403: unknown;
+    /**
+     * No such link on the group
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UnlinkErrorGroupIssueResponses = {
+    /**
+     * Unlinked
+     */
+    204: void;
+};
+
+export type UnlinkErrorGroupIssueResponse = UnlinkErrorGroupIssueResponses[keyof UnlinkErrorGroupIssueResponses];
+
 export type MergeErrorGroupsData = {
     body: MergeErrorGroupsRequest;
     path: {
@@ -86925,6 +87352,50 @@ export type SplitErrorGroupResponses = {
 };
 
 export type SplitErrorGroupResponse2 = SplitErrorGroupResponses[keyof SplitErrorGroupResponses];
+
+export type GetErrorGroupSuspectCommitsData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Error group ID
+         */
+        group_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/error-groups/{group_id}/suspect-commits';
+};
+
+export type GetErrorGroupSuspectCommitsErrors = {
+    /**
+     * Not authenticated
+     */
+    401: unknown;
+    /**
+     * No access to the project
+     */
+    403: unknown;
+    /**
+     * No such group in the project
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetErrorGroupSuspectCommitsResponses = {
+    /**
+     * Up to 5 commits that touched the file of the latest event's innermost application frame, or why there are none
+     */
+    200: SuspectCommitsView;
+};
+
+export type GetErrorGroupSuspectCommitsResponse = GetErrorGroupSuspectCommitsResponses[keyof GetErrorGroupSuspectCommitsResponses];
 
 export type UnmergeErrorGroupData = {
     body?: never;
@@ -87145,6 +87616,82 @@ export type UpdateErrorInboundFilterResponses = {
 };
 
 export type UpdateErrorInboundFilterResponse = UpdateErrorInboundFilterResponses[keyof UpdateErrorInboundFilterResponses];
+
+export type ListErrorOwnershipRulesData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/error-ownership-rules';
+};
+
+export type ListErrorOwnershipRulesErrors = {
+    /**
+     * Not authenticated
+     */
+    401: unknown;
+    /**
+     * No access to the project
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListErrorOwnershipRulesResponses = {
+    /**
+     * Rules in the order they are tried
+     */
+    200: OwnershipRuleList;
+};
+
+export type ListErrorOwnershipRulesResponse = ListErrorOwnershipRulesResponses[keyof ListErrorOwnershipRulesResponses];
+
+export type ReplaceErrorOwnershipRulesData = {
+    body: ReplaceOwnershipRulesRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/error-ownership-rules';
+};
+
+export type ReplaceErrorOwnershipRulesErrors = {
+    /**
+     * A pattern that is not a repository path, more than 50 rules, or an owner who is not a user or cannot open the project
+     */
+    400: unknown;
+    /**
+     * Not authenticated
+     */
+    401: unknown;
+    /**
+     * Error tracking write permission required
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ReplaceErrorOwnershipRulesResponses = {
+    /**
+     * The rules now in force
+     */
+    200: OwnershipRuleList;
+};
+
+export type ReplaceErrorOwnershipRulesResponse = ReplaceErrorOwnershipRulesResponses[keyof ReplaceErrorOwnershipRulesResponses];
 
 export type ListErrorSavedSearchesData = {
     body?: never;
@@ -87447,6 +87994,42 @@ export type GetErrorTimeSeriesResponses = {
 };
 
 export type GetErrorTimeSeriesResponse = GetErrorTimeSeriesResponses[keyof GetErrorTimeSeriesResponses];
+
+export type GetErrorSourceControlData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/error-tracking/source-control';
+};
+
+export type GetErrorSourceControlErrors = {
+    /**
+     * Not authenticated
+     */
+    401: unknown;
+    /**
+     * No access to the project
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetErrorSourceControlResponses = {
+    /**
+     * The repository, or what is missing
+     */
+    200: SourceControlStatusView;
+};
+
+export type GetErrorSourceControlResponse = GetErrorSourceControlResponses[keyof GetErrorSourceControlResponses];
 
 export type GetEventsCountData = {
     body?: never;
