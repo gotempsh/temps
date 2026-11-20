@@ -118,10 +118,13 @@ export function createAnalytics(options: AnalyticsOptions = {}): AnalyticsApi {
     },
   });
   let openSurvey: (() => void) | null = null;
+  // Set by destroy(): a delivery request still in flight must not open a
+  // widget after cleanup has run.
+  let destroyed = false;
   const showSurvey = async (event?: string): Promise<void> => {
-    if (!autoShowSurveys || openSurvey) return;
+    if (!autoShowSurveys || openSurvey || destroyed) return;
     await surveys.load();
-    if (openSurvey) return;
+    if (openSurvey || destroyed) return;
     const next: Survey | undefined = surveys.eligible(window.location.pathname, event)[0];
     if (!next) return;
     surveys.markShown(next);
@@ -141,7 +144,10 @@ export function createAnalytics(options: AnalyticsOptions = {}): AnalyticsApi {
       close();
     };
   };
-  if (autoShowSurveys) cleanups.push(() => openSurvey?.());
+  cleanups.push(() => {
+    destroyed = true;
+    openSurvey?.();
+  });
 
   const trackEvent: AnalyticsApi["trackEvent"] = async (eventName, data = {}) => {
     // A survey triggered by this event is shown without waiting for the send.

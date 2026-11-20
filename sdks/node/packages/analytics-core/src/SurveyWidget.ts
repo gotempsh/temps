@@ -82,6 +82,9 @@ export function renderSurveyWidget(survey: Survey, handlers: SurveyWidgetHandler
   document.body.appendChild(host);
 
   let removed = false;
+  // Once answered, closing (button or Escape) only removes the card: the
+  // visitor did not dismiss the survey, they finished it.
+  let answered = false;
   const remove = () => {
     if (removed) return;
     removed = true;
@@ -89,7 +92,7 @@ export function renderSurveyWidget(survey: Survey, handlers: SurveyWidgetHandler
     host.remove();
   };
   const dismiss = () => {
-    handlers.onDismiss();
+    if (!answered) handlers.onDismiss();
     remove();
   };
   const onKey = (event: KeyboardEvent) => {
@@ -103,8 +106,8 @@ export function renderSurveyWidget(survey: Survey, handlers: SurveyWidgetHandler
     const errors = handlers.onSubmit(collectAnswers(card, survey));
     for (const [id, slot] of errorSlots) slot.textContent = errors?.[id] ?? "";
     if (errors) return;
+    answered = true;
     card.replaceChildren(head);
-    close.addEventListener("click", remove);
     const thanks = element("p", { class: "thanks", role: "status" });
     thanks.textContent = "Thanks for your answer.";
     card.appendChild(thanks);

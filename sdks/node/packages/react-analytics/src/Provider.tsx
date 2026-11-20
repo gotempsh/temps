@@ -281,8 +281,8 @@ export function TempsAnalyticsProvider({
   }, [flags, flagContext]);
 
   const value = useMemo<AnalyticsContextValue>(
-    () => ({ trackEvent, identify, trackPageview, enabled, flags }),
-    [trackEvent, identify, trackPageview, enabled, flags]
+    () => ({ trackEvent, identify, trackPageview, enabled, flags, basePath }),
+    [trackEvent, identify, trackPageview, enabled, flags, basePath]
   );
 
   return (

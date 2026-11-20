@@ -4,6 +4,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { pathMatches, Surveys, validateAnswers, type Survey } from "./Surveys";
 import { renderSurveyWidget } from "./SurveyWidget";
+import { createAnalytics } from "./Analytics";
 
 function served(surveys: Survey[], status = 200) {
   return vi.fn(async () =>
@@ -199,6 +200,52 @@ describe("renderSurveyWidget", () => {
     renderSurveyWidget(checkout, { onSubmit: () => null, onDismiss });
     document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
     expect(onDismiss).toHaveBeenCalledTimes(2);
+    expect(document.querySelector("[data-temps-survey]")).toBeNull();
+  });
+
+  it("does not record a dismissal when the thank-you card is closed", () => {
+    const onDismiss = vi.fn();
+    renderSurveyWidget(nps, { onSubmit: () => null, onDismiss });
+    (shadow().querySelector("input[value='9']") as HTMLInputElement).checked = true;
+    (shadow().querySelector("form") as HTMLFormElement).dispatchEvent(new Event("submit", { cancelable: true }));
+    (shadow().querySelector("button[aria-label='Close survey']") as HTMLButtonElement).click();
+    expect(document.querySelector("[data-temps-survey]")).toBeNull();
+
+    renderSurveyWidget(nps, { onSubmit: () => null, onDismiss });
+    (shadow().querySelector("input[value='9']") as HTMLInputElement).checked = true;
+    (shadow().querySelector("form") as HTMLFormElement).dispatchEvent(new Event("submit", { cancelable: true }));
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
+    expect(document.querySelector("[data-temps-survey]")).toBeNull();
+    expect(onDismiss).not.toHaveBeenCalled();
+  });
+});
+
+describe("createAnalytics surveys", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    document.body.replaceChildren();
+  });
+
+  it("does not open a survey whose delivery finishes after destroy()", async () => {
+    let release: (response: Response) => void = () => {};
+    vi.spyOn(globalThis, "fetch").mockImplementation((input) => {
+      if (String(input).endsWith("/surveys")) {
+        return new Promise<Response>((resolve) => (release = resolve));
+      }
+      return Promise.resolve(new Response("ok", { status: 200 }));
+    });
+    const analytics = createAnalytics({
+      ignoreLocalhost: false,
+      autoTrackPageviews: false,
+      autoTrackPageLeave: false,
+      autoTrackEngagement: false,
+      autoTrackSpeedAnalytics: false,
+      surveys: { enabled: true },
+    });
+    await Promise.resolve();
+    analytics.destroy();
+    release(new Response(JSON.stringify({ surveys: [nps] }), { status: 200 }));
+    await new Promise((resolve) => setTimeout(resolve, 10));
     expect(document.querySelector("[data-temps-survey]")).toBeNull();
   });
 });

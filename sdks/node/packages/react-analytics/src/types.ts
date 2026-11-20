@@ -30,6 +30,8 @@ export interface AnalyticsContextValue {
   enabled: boolean;
   /** Client-visible feature flags for this visitor. Prefer `useFlag`. */
   flags: FeatureFlags;
+  /** Where the Temps endpoints live, as configured on the provider. */
+  basePath: string;
 }
 
 export interface TempsAnalyticsProviderProps extends AnalyticsClientOptions {

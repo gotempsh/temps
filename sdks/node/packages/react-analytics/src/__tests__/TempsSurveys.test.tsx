@@ -103,4 +103,28 @@ describe("TempsSurveys", () => {
     expect(fetch.mock.calls.some(([input]) => String(input).endsWith("/surveys"))).toBe(false);
     expect(widget(1)).toBeNull();
   });
+
+  it("closes an open survey when analytics is turned off", async () => {
+    serve();
+    const tree = (disabled: boolean) => (
+      <TempsAnalyticsProvider ignoreLocalhost={false} disabled={disabled} autoTrackPageviews={false} autoTrackEngagement={false} autoTrackSpeedAnalytics={false}>
+        <TempsSurveys pathname="/" />
+      </TempsAnalyticsProvider>
+    );
+    const { rerender } = render(tree(false));
+    await waitFor(() => expect(widget(1)).not.toBeNull());
+    rerender(tree(true));
+    await waitFor(() => expect(widget(1)).toBeNull());
+  });
+
+  it("requests surveys from the provider's basePath", async () => {
+    const fetch = serve();
+    render(
+      <TempsAnalyticsProvider basePath="/custom/_temps" ignoreLocalhost={false} autoTrackPageviews={false} autoTrackEngagement={false} autoTrackSpeedAnalytics={false}>
+        <TempsSurveys pathname="/" />
+      </TempsAnalyticsProvider>
+    );
+    await waitFor(() => expect(widget(1)).not.toBeNull());
+    expect(fetch.mock.calls.some(([input]) => String(input) === "/custom/_temps/surveys")).toBe(true);
+  });
 });

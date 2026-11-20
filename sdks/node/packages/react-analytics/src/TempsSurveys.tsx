@@ -38,7 +38,7 @@ export interface TempsSurveysProps extends Pick<SurveysOptions, "attributes" | "
  * disabled (for example on localhost unless `ignoreLocalhost={false}`).
  */
 export function TempsSurveys({ pathname, visitorKey, attributes, onError }: TempsSurveysProps): null {
-  const { trackEvent, enabled } = useTempsAnalytics();
+  const { trackEvent, enabled, basePath } = useTempsAnalytics();
   const trackRef = useRef(trackEvent);
   trackRef.current = trackEvent;
   const surveysRef = useRef<Surveys | null>(null);
@@ -48,6 +48,8 @@ export function TempsSurveys({ pathname, visitorKey, attributes, onError }: Temp
   // flags client.
   if (surveysRef.current === null && enabled) {
     surveysRef.current = new Surveys({
+      // The provider's path, so delivery and the answers' events agree.
+      basePath,
       key: visitorKey,
       attributes,
       onError,
@@ -59,10 +61,15 @@ export function TempsSurveys({ pathname, visitorKey, attributes, onError }: Temp
 
   useEffect(() => {
     const surveys = surveysRef.current;
-    if (!surveys) return undefined;
+    // Analytics turned off: close what is open and listen for nothing, since
+    // answers could not be recorded.
+    if (!surveys || !enabled) {
+      openRef.current?.();
+      return undefined;
+    }
     let cancelled = false;
 
-    const show = async (event?: string) => {
+    const show = async (event?: string): Promise<void> => {
       if (openRef.current) return;
       await surveys.load();
       if (cancelled || openRef.current) return;
@@ -88,11 +95,11 @@ export function TempsSurveys({ pathname, visitorKey, attributes, onError }: Temp
     };
 
     void show();
-    const onTrack = (event: Event) => {
+    const onTrack = (event: Event): void => {
       const name = (event as CustomEvent<{ name?: string }>).detail?.name;
       if (typeof name === "string") void show(name);
     };
-    const onPop = () => void show();
+    const onPop = (): void => void show();
     window.addEventListener(TRACK_EVENT, onTrack);
     window.addEventListener("popstate", onPop);
     return () => {
