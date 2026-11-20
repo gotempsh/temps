@@ -52,9 +52,12 @@ jobs:
   #
   # .github/scripts/ci-affected-crates.py then narrows the Rust tests:
   #   tests         nextest filterset of the crates the change can reach (the
-  #                 changed crates, everything depending on them, and any
-  #                 crate reading a changed file); `all()` for anything it
-  #                 cannot place, such as Cargo.lock or .github/
+  #                 changed crates, everything linking them, the tests of
+  #                 anything dev-depending on them, any crate reading a
+  #                 changed file, and the crates a Cargo.lock or
+  #                 [workspace.dependencies] change reaches); CI-only files
+  #                 reach only their readers; `all()` for anything it cannot
+  #                 place, such as this workflow, .cargo/ or scripts/
   #   docker_tests  "false" when temps-providers and temps-backup are out of
   #                 reach, so their docker-tests archive is not built
   # Every test group still runs, on its share of that set: a pull request to
