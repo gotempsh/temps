@@ -18,7 +18,8 @@ use temps_authz::{AuthContext, RequireAuth};
 use temps_config::ConfigService;
 use temps_core::{AuditLogger, AuditOperation, RequestMetadata};
 use temps_entities::{
-    environments, projects, status_checks, status_pages, upstream_config::UpstreamList, users,
+    environments, projects, status_checks, status_page_maintenance_monitors,
+    status_page_maintenances, status_pages, upstream_config::UpstreamList, users,
 };
 use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
 use tower::ServiceExt;
@@ -33,6 +34,7 @@ use crate::routes::maintenance::{
 use crate::services::public_pages::{
     CreateStatusPageRequest, PublicComponentStatus, PublicMaintenanceStatus,
     PublicStatusPageResponse, PublicStatusPageService, StatusPageMonitorInput, StatusSnapshotCache,
+    UpdateStatusPageRequest,
 };
 use crate::services::{CreateMonitorRequest, StatusPageService};
 
@@ -386,6 +388,129 @@ async fn a_window_in_progress_marks_its_components_and_drops_its_checks_from_upt
         "an uncovered monitor counts everything"
     );
     assert_ne!(web.status, PublicComponentStatus::Maintenance);
+}
+
+#[tokio::test]
+async fn completed_days_follow_a_page_dropping_the_monitor_its_window_covered() {
+    let Some(fx) = fixture().await else {
+        return;
+    };
+    // Yesterday, 11:30-12:30 UTC, the page held a window over API, which
+    // was down during it and up afterwards.
+    let yesterday = (Utc::now() - Duration::days(1)).date_naive();
+    let at = |hour: u32, minute: u32| {
+        yesterday
+            .and_hms_opt(hour, minute, 0)
+            .expect("valid time")
+            .and_utc()
+    };
+    let window = status_page_maintenances::ActiveModel {
+        status_page_id: Set(fx.page_id),
+        title: Set("Database upgrade".to_string()),
+        starts_at: Set(at(11, 30)),
+        ends_at: Set(at(12, 30)),
+        created_at: Set(at(10, 0)),
+        updated_at: Set(at(10, 0)),
+        ..Default::default()
+    }
+    .insert(fx.db.as_ref())
+    .await
+    .expect("window");
+    status_page_maintenance_monitors::ActiveModel {
+        maintenance_id: Set(window.id),
+        monitor_id: Set(fx.api_monitor),
+    }
+    .insert(fx.db.as_ref())
+    .await
+    .expect("window monitor");
+    for (status, hour, minute) in [("down", 12, 0), ("down", 12, 10), ("operational", 13, 0)] {
+        let checked_at = at(hour, minute);
+        status_checks::ActiveModel {
+            monitor_id: Set(fx.api_monitor),
+            status: Set(status.to_string()),
+            response_time_ms: Set(Some(100)),
+            checked_at: Set(checked_at),
+            created_at: Set(checked_at),
+            ..Default::default()
+        }
+        .insert(fx.db.as_ref())
+        .await
+        .expect("check");
+    }
+
+    // The fixture's page cached API's history before these backdated rows
+    // existed; start from a cold history, as on the next UTC day.
+    fx.cache.forget_history(&[fx.api_monitor]).await;
+
+    // A second page shows API too, without a window of its own.
+    let other = fx
+        .state
+        .pages
+        .create(CreateStatusPageRequest {
+            title: "Partner status".to_string(),
+            description: None,
+            monitors: vec![StatusPageMonitorInput {
+                monitor_id: fx.api_monitor,
+                display_name: "API".to_string(),
+                group_name: None,
+            }],
+            appearance: None,
+        })
+        .await
+        .expect("second page");
+    fx.state.pages.publish(other.id).await.expect("publish");
+    let other_slug = status_pages::Entity::find_by_id(other.id)
+        .one(fx.db.as_ref())
+        .await
+        .expect("page row")
+        .expect("page exists")
+        .slug;
+    let api_yesterday = || {
+        let snapshot = fx.cache.get(&other_slug).expect("published");
+        let page: PublicStatusPageResponse =
+            serde_json::from_slice(&snapshot.json).expect("snapshot json");
+        let date = yesterday.format("%Y-%m-%d").to_string();
+        page.components
+            .into_iter()
+            .find(|c| c.name == "API")
+            .expect("API")
+            .days
+            .into_iter()
+            .find(|day| day.date == date)
+            .expect("yesterday")
+            .total_checks
+    };
+    fx.cache.refresh_page(other.id).await.expect("refresh");
+    assert_eq!(
+        api_yesterday(),
+        Some(1),
+        "the first page still shows API, so its window's checks are left out"
+    );
+
+    // The first page stops showing API: its window no longer excludes
+    // anything, and the completed day is recomputed rather than served from
+    // the cached history.
+    fx.state
+        .pages
+        .update(
+            fx.page_id,
+            UpdateStatusPageRequest {
+                monitors: Some(vec![StatusPageMonitorInput {
+                    monitor_id: fx.web_monitor,
+                    display_name: "Web".to_string(),
+                    group_name: None,
+                }]),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("drop API");
+    fx.cache.refresh_page(other.id).await.expect("refresh");
+    assert_eq!(
+        api_yesterday(),
+        Some(3),
+        "every check of the day counts again"
+    );
 }
 
 #[tokio::test]

@@ -639,13 +639,22 @@ impl PublicStatusPageService {
                 active.description = Set(description);
             }
             let model = active.update(&txn).await?;
+            let mut reselected = Vec::new();
             if let Some(selection) = &selection {
+                reselected = Self::page_monitor_ids(&txn, status_page_id).await?;
+                reselected.extend(selection.iter().map(|c| c.monitor_id));
                 Self::write_selection(&txn, status_page_id, selection).await?;
             }
-            Ok(model)
+            Ok((model, reselected))
         }
         .await;
-        let model = Self::finish(txn, result).await?;
+        let (model, reselected) = Self::finish(txn, result).await?;
+        // Maintenance windows only exclude checks while a page showing the
+        // monitor holds them, so a selection change alters completed days
+        // too: drop their cached uptime so every page recomputes it.
+        if !reselected.is_empty() {
+            self.cache.forget_history(&reselected).await;
+        }
 
         // Always rebuild: cheap for one page, and correct even if the page was
         // published concurrently (a draft simply stays out of the cache).
@@ -747,6 +756,7 @@ impl PublicStatusPageService {
     }
 
     pub async fn delete(&self, status_page_id: i32) -> Result<(), StatusPageError> {
+        let shown = Self::page_monitor_ids(self.db.as_ref(), status_page_id).await?;
         let result = status_pages::Entity::delete_by_id(status_page_id)
             .exec(self.db.as_ref())
             .await?;
@@ -754,6 +764,8 @@ impl PublicStatusPageService {
             return Err(StatusPageError::StatusPageNotFound { status_page_id });
         }
         self.cache.remove_page(status_page_id).await;
+        // Its maintenance windows no longer exclude checks on other pages.
+        self.cache.forget_history(&shown).await;
         info!(status_page_id, "deleted status page");
         Ok(())
     }
@@ -880,6 +892,20 @@ impl PublicStatusPageService {
         self.projects_of_monitors(selection.iter().map(|c| c.monitor_id).collect())
             .await
             .map(|_| ())
+    }
+
+    /// The monitors `status_page_id` shows now.
+    async fn page_monitor_ids<C: sea_orm::ConnectionTrait>(
+        conn: &C,
+        status_page_id: i32,
+    ) -> Result<Vec<i32>, StatusPageError> {
+        Ok(status_page_monitors::Entity::find()
+            .filter(status_page_monitors::Column::StatusPageId.eq(status_page_id))
+            .all(conn)
+            .await?
+            .into_iter()
+            .map(|row| row.monitor_id)
+            .collect())
     }
 
     async fn write_selection<C: sea_orm::ConnectionTrait>(
