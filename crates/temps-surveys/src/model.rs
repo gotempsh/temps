@@ -25,6 +25,11 @@ pub const MAX_EVENT_NAME_LEN: usize = 128;
 /// Longest open-text answer the browser SDK sends. Results treat anything
 /// longer as the SDK would have: cut at this length.
 pub const MAX_OPEN_TEXT_LEN: usize = 2_000;
+/// Questions and display conditions together, serialized. The per-field
+/// limits alone allow ~95 KB per survey; this keeps what the delivery cache
+/// holds (at most 50 active surveys per project) and what one browser
+/// response carries under 800 KiB per project. Real surveys are 1-5 KiB.
+pub const MAX_DEFINITION_BYTES: usize = 16 * 1024;
 /// Rating scales a question may use.
 pub const RATING_SCALES: [u8; 4] = [3, 5, 7, 10];
 pub const DEFAULT_RATING_SCALE: u8 = 5;
@@ -242,6 +247,14 @@ pub fn validate(definition: &SurveyDefinition) -> Result<(), String> {
 
     validate_targeting(&definition.targeting, &mut problems);
 
+    match definition_size(definition) {
+        Ok(bytes) if bytes > MAX_DEFINITION_BYTES => problems.push(format!(
+            "questions and targeting take {bytes} bytes, maximum is {MAX_DEFINITION_BYTES}"
+        )),
+        Ok(_) => {}
+        Err(reason) => problems.push(format!("questions or targeting cannot be stored: {reason}")),
+    }
+
     if problems.is_empty() {
         Ok(())
     } else {
@@ -321,6 +334,13 @@ fn validate_question(question: &SurveyQuestion, at: &str, problems: &mut Vec<Str
     }
 }
 
+/// Serialized size of what a browser receives and the cache holds.
+fn definition_size(definition: &SurveyDefinition) -> Result<usize, String> {
+    let questions = serde_json::to_vec(&definition.questions).map_err(|e| e.to_string())?;
+    let targeting = serde_json::to_vec(&definition.targeting).map_err(|e| e.to_string())?;
+    Ok(questions.len() + targeting.len())
+}
+
 fn validate_targeting(targeting: &SurveyTargeting, problems: &mut Vec<String>) {
     if let Some(pattern) = &targeting.path_pattern {
         if !pattern.starts_with('/') {
@@ -389,6 +409,31 @@ mod tests {
             questions,
             targeting: SurveyTargeting::default(),
         }
+    }
+
+    #[test]
+    fn an_oversized_definition_is_refused() {
+        let mut big = question("plan", QuestionKind::SingleChoice);
+        big.prompt = "p".repeat(MAX_PROMPT_LEN);
+        big.choices = (0..MAX_CHOICES)
+            .map(|i| format!("{i}{}", "c".repeat(150)))
+            .collect();
+        let questions: Vec<_> = (0..6)
+            .map(|i| SurveyQuestion {
+                id: format!("q{i}"),
+                ..big.clone()
+            })
+            .collect();
+        let error = validate(&definition(questions)).unwrap_err();
+        assert!(error.contains("maximum is 16384"), "{error}");
+
+        let mut flagged = definition(vec![question("nps", QuestionKind::Nps)]);
+        flagged.targeting.flag = Some(SurveyFlagCondition {
+            key: "beta".into(),
+            value: serde_json::Value::String("v".repeat(MAX_DEFINITION_BYTES)),
+        });
+        assert!(validate(&flagged).unwrap_err().contains("bytes"));
+        assert!(validate(&definition(vec![question("nps", QuestionKind::Nps)])).is_ok());
     }
 
     #[test]

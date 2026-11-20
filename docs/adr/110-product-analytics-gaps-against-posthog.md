@@ -304,7 +304,10 @@ Built in a new `temps-surveys` crate. Decisions the shape above left open:
   neither.
 - **At most 50 active surveys per project**, so the delivery payload and the
   per-request selection stay bounded. Activating one more is a 400 naming the
-  limit.
+  limit. A definition (questions and display conditions, serialized) is
+  capped at 16 KiB: the per-field limits alone allow about 95 KB, and the cap
+  keeps one project's cached surveys, and one browser response, under
+  800 KiB.
 - **Delivery reuses D3's cache design:** active surveys per project in an
   `ArcSwap` map (TTL 5 s, at most 4 concurrent loads, at most 4,096 projects,
   an invalidation generation so a load that read before a write is not
