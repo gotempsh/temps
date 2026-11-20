@@ -87,6 +87,22 @@ test('OTLP prompts state the protocol and any OpenTelemetry SDK or Collector', (
   }
 })
 
+test('session replay prompt uses the camelCase batch fields and requires privacy safeguards', () => {
+  const prompt = monitoringSetupPrompt(
+    'session_replay',
+    project,
+    'https://console.example.com',
+    signalFixture('session_replay')
+  )
+  // SessionReplayEventsRequest is camelCase: session_id would be rejected.
+  expect(prompt).toContain('{"sessionId","events","batchId"}')
+  expect(prompt).not.toContain('"session_id"')
+  expect(prompt).toContain('Privacy (required)')
+  expect(prompt).toContain('consents')
+  expect(prompt).toContain('maskAllInputs: true')
+  expect(prompt).toContain('rr-block')
+})
+
 test('an unconfigured signal says what is missing first', () => {
   const prompt = monitoringSetupPrompt(
     'errors',

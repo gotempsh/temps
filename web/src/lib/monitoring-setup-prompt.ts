@@ -81,7 +81,8 @@ A 204 response means the event was recorded.`
       break
     }
     case 'session_replay':
-      shapes = `Flow: POST init once per session with JSON {"sessionId","visitorId","url","userAgent","language","viewportWidth","viewportHeight"}, then POST batches to events as {"session_id","events","batch_id"} where events = base64(zlib-deflate(JSON array of rrweb events)) and batch_id is stable across retries. Record with the rrweb library.`
+      shapes = `Flow: POST init once per session with JSON {"sessionId","visitorId","url","userAgent","language","viewportWidth","viewportHeight"}, then POST batches to events as {"sessionId","events","batchId"} where events = base64(zlib-deflate(JSON array of rrweb events)) and batchId is stable across retries. Record with the rrweb library.
+Privacy (required): start recording only after the visitor consents where the law requires it, and let them turn it off; set maskAllInputs: true; add the rr-block class to elements that show personal or payment data, and the rr-mask class to sensitive text; do not record login, checkout or account pages.`
       break
     case 'errors':
       shapes = `This is a Sentry-compatible ingest: any official Sentry SDK works. Configure it with dsn = $${setup.auth.env_var} and change nothing else. Without an SDK, POST a Sentry envelope (newline-delimited JSON: envelope header, item header {"type":"event"}, event payload) to the envelope URL with ?${setup.auth.query_param ?? 'sentry_key'}=<public key from the DSN>.`

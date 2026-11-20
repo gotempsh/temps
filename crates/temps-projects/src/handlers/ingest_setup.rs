@@ -19,6 +19,7 @@ use axum::{
 };
 use serde::Deserialize;
 use temps_auth::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
+use temps_core::error_builder;
 use temps_core::problemdetails::{self, Problem, ProblemDetails};
 use tracing::error;
 use utoipa::IntoParams;
@@ -115,11 +116,12 @@ pub async fn get_project_ingest_setup(
         .await
         .map_err(|e| {
             error!(project_id, error = %e, "Failed to read the public ingress URL");
-            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Ingest Setup Unavailable")
-                .with_detail(format!(
+            error_builder::internal_server_error()
+                .title("Ingest Setup Unavailable")
+                .detail(format!(
                     "Could not read the public ingress URL for project {project_id}: {e}"
                 ))
+                .build()
         })?;
 
     let setup = state

@@ -119,7 +119,7 @@ export function sessionReplayCurl(setup: IngestSignalSetup): string {
     ...headerFlags(setup).map((h) => `${h} \\`),
     `  -H 'Content-Type: application/json' \\`,
     `  -d '{"sessionId":"s_4f5a6b7c","visitorId":"v_0b1c2d3e","url":"https://apps.example.com/"}'`,
-    `# Then POST {"session_id","events"} to ${endpointUrl(setup, 'events')},`,
+    `# Then POST {"sessionId","events","batchId"} to ${endpointUrl(setup, 'events')},`,
     '# where events is base64(zlib(JSON array of rrweb events)).',
   ].join('\n')
 }
@@ -205,11 +205,12 @@ function fixed64Field(field: number, value: bigint): number[] {
   for (let i = 0n; i < 8n; i++) out.push(Number((value >> (8n * i)) & 0xffn))
   return out
 }
-const keyValue = (key: string, value: string) =>
-  bytesField(1, [
-    ...stringField(1, key),
-    ...bytesField(2, stringField(1, value)),
-  ])
+/** `KeyValue { key = 1, value = 2: AnyValue { string_value = 1 } }`. */
+const keyValue = (key: string, value: string) => [
+  ...stringField(1, key),
+  ...bytesField(2, stringField(1, value)),
+]
+/** `ResourceLogs/ResourceSpans.resource = 1: Resource { attributes = 1 }`. */
 const resource = (serviceName: string) =>
   bytesField(1, bytesField(1, keyValue('service.name', serviceName)))
 const scope = bytesField(1, stringField(1, 'temps-setup-check'))
@@ -297,10 +298,18 @@ export function otlpEnvVars(
     setup.signal === 'logs' ? 'otlp_logs' : 'otlp_traces'
   )
   // Header-list values are URL-encoded: the space after Bearer is %20.
+  // SDKs and most .env loaders (Node's --env-file, dotenv) do not expand
+  // `$VAR`, so the key is a placeholder to paste over, never `$TEMPS_API_KEY`.
+  const envRef = `$${setup.auth.env_var}`
+  const placeholder = `<value of ${setup.auth.env_var}>`
   const headers = setup.auth.headers
-    .map((h) => `${h.name}=${h.value.replace(' ', '%20')}`)
+    .map(
+      (h) =>
+        `${h.name}=${h.value.replace(envRef, placeholder).replace(' ', '%20')}`
+    )
     .join(',')
   return [
+    `# Paste the key over ${placeholder}: $VARS are not expanded here.`,
     `${signalVar}=${url}`,
     `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf`,
     `OTEL_EXPORTER_OTLP_HEADERS=${headers}`,
@@ -334,7 +343,12 @@ export function otelCollectorConfig(setup: IngestSignalSetup): string {
         `      ${h.name}: "${h.value.replace('$TEMPS_API_KEY', '${env:TEMPS_API_KEY}')}"`
     )
     .join('\n')
-  return `exporters:
+  return `receivers:
+  otlp:
+    protocols:
+      grpc: {}
+      http: {}
+exporters:
   otlphttp/temps:
     ${logs ? 'logs_endpoint' : 'traces_endpoint'}: ${url}
     encoding: proto

@@ -13,6 +13,7 @@ import {
   otlpLogsRequest,
   otlpTracesRequest,
   sentryEnvelope,
+  sessionReplayCurl,
 } from './plain-http-setup'
 
 type Field = { field: number; wire: number; value: bigint | Uint8Array }
@@ -57,14 +58,24 @@ const text = (fields: Field[], n: number) =>
 const num = (fields: Field[], n: number) =>
   fields.find((f) => f.field === n)?.value as bigint
 
+/**
+ * `service.name` of a ResourceLogs/ResourceSpans, read by the OTLP schema:
+ * `.resource = 1: Resource`, `Resource.attributes = 1: KeyValue`,
+ * `KeyValue { key = 1, value = 2: AnyValue { string_value = 1 } }`.
+ */
+function serviceName(resourceX: Field[]): string | undefined {
+  const attributes = sub(sub(resourceX, 1), 1)
+  if (text(attributes, 1) !== 'service.name') return undefined
+  return text(sub(attributes, 2), 1)
+}
+
 const NOW = 1_795_000_000_000
 
 describe('OTLP protobuf encoding', () => {
   test('a logs request carries the service name, body and timestamp', () => {
+    // ExportLogsServiceRequest.resource_logs = 1
     const resourceLogs = sub(parse(otlpLogsRequest('my-app', NOW)), 1)
-    const attr = sub(sub(sub(resourceLogs, 1), 1), 1)
-    expect(text(attr, 1)).toBe('service.name')
-    expect(text(sub(attr, 2), 1)).toBe('my-app')
+    expect(serviceName(resourceLogs)).toBe('my-app')
     const record = sub(sub(resourceLogs, 2), 2)
     expect(num(record, 1)).toBe(BigInt(NOW) * 1_000_000n)
     expect(num(record, 2)).toBe(9n)
@@ -79,6 +90,7 @@ describe('OTLP protobuf encoding', () => {
       parse(otlpTracesRequest('my-app', NOW, traceId, spanId)),
       1
     )
+    expect(serviceName(resourceSpans)).toBe('my-app')
     const span = sub(sub(resourceSpans, 2), 2)
     expect((span.find((f) => f.field === 1)?.value as Uint8Array).length).toBe(
       16
@@ -122,6 +134,13 @@ describe('curl examples', () => {
     expect(JSON.parse(lines[2]).event_id).toBe('a'.repeat(32))
   })
 
+  test('session replay inits with camelCase fields and names the batch fields', () => {
+    const curl = sessionReplayCurl(signalFixture('session_replay'))
+    expect(curl).toContain('"sessionId":"s_4f5a6b7c"')
+    expect(curl).toContain('POST {"sessionId","events","batchId"}')
+    expect(curl).not.toContain('session_id')
+  })
+
   test('OTLP posts protobuf with the bearer and project headers', () => {
     for (const signal of ['logs', 'traces'] as const) {
       const curl = otlpCurl(signalFixture(signal), 'my-app', NOW)
@@ -140,7 +159,12 @@ describe('curl examples', () => {
     expect(vars).toContain(
       'OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=https://temps.example.com/api/otel/v1/traces'
     )
-    expect(vars).toContain('Authorization=Bearer%20$TEMPS_API_KEY')
+    // SDKs and .env loaders do not expand $VARS: a literal `$TEMPS_API_KEY`
+    // would be sent as the bearer token.
+    expect(vars).toContain(
+      'OTEL_EXPORTER_OTLP_HEADERS=Authorization=Bearer%20<value of TEMPS_API_KEY>,X-Temps-Project-Id=42'
+    )
+    expect(vars).not.toContain('$TEMPS_API_KEY')
     expect(vars).toContain('OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf')
   })
 
@@ -151,6 +175,9 @@ describe('curl examples', () => {
     )
     expect(config).toContain('${env:TEMPS_API_KEY}')
     expect(config).toContain('encoding: proto')
+    // The pipeline's receiver is declared, so the config loads as is.
+    expect(config.startsWith('receivers:\n  otlp:\n    protocols:')).toBe(true)
+    expect(config).toContain('receivers: [otlp]')
   })
 })
 
