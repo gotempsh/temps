@@ -19796,9 +19796,67 @@ export type IncrResponse = {
 };
 
 /**
+ * How to authenticate a signal's requests, without the credential itself.
+ */
+export type IngestAuth = {
+    /**
+     * Whether the credential may ship in browser code. Analytics keys and
+     * DSN keys are public by design; an API key never is.
+     */
+    browser_safe: boolean;
+    /**
+     * `temps` CLI command that creates the credential.
+     */
+    cli_command: string;
+    /**
+     * Console path where the credential is created or shown.
+     */
+    credential_path: string;
+    /**
+     * Environment variable the app should read the credential from.
+     */
+    env_var: string;
+    /**
+     * Headers to send, as templates over `env_var`.
+     */
+    headers: Array<IngestHeader>;
+    kind: IngestAuthKind;
+    /**
+     * Query-string fallback for clients that cannot set headers
+     * (`navigator.sendBeacon`), when the route accepts one.
+     */
+    query_param?: string | null;
+};
+
+/**
+ * The credential a signal's ingest route expects.
+ */
+export type IngestAuthKind = 'analytics_ingest_key' | 'sentry_dsn' | 'api_key';
+
+/**
  * Which budget a dropped line exceeded.
  */
 export type IngestDropReason = 'lines_per_sec' | 'bytes_per_sec';
+
+/**
+ * One ingest route.
+ */
+export type IngestEndpoint = {
+    /**
+     * The `Content-Type` the route accepts.
+     */
+    content_type: string;
+    method: string;
+    /**
+     * Stable identifier of the route within its signal (`event`, `envelope`,
+     * `otlp_traces`, …).
+     */
+    name: string;
+    /**
+     * Absolute URL, built from the public ingress URL.
+     */
+    url: string;
+};
 
 /**
  * One aggregated ingest-failure group: "this signal failed this way N times".
@@ -19839,6 +19897,51 @@ export type IngestErrorsResponse = {
      * Failure groups, most recently seen first.
      */
     errors: Array<IngestErrorSummary>;
+};
+
+/**
+ * A header a request must carry. `value` is a template naming an
+ * environment variable, never a credential.
+ */
+export type IngestHeader = {
+    name: string;
+    value: string;
+};
+
+/**
+ * A kind of telemetry an app can send to Temps.
+ */
+export type IngestSignal = 'analytics' | 'session_replay' | 'errors' | 'logs' | 'traces';
+
+/**
+ * Everything an app needs to send one signal.
+ */
+export type IngestSignalSetup = {
+    auth: IngestAuth;
+    /**
+     * Whether the project has what this signal needs. `false` means a
+     * credential still has to be created. Logs and traces are always `true`:
+     * they authenticate with the caller's own API key, which is not project
+     * state; `auth.credential_path` and `auth.cli_command` say how to get one.
+     */
+    configured: boolean;
+    endpoints: Array<IngestEndpoint>;
+    /**
+     * For OTLP signals without an environment: the value of
+     * `OTEL_EXPORTER_OTLP_ENDPOINT`. SDKs append `/v1/traces` or `/v1/logs`
+     * to it. `None` with an environment, whose per-signal URLs in
+     * `endpoints` go in `OTEL_EXPORTER_OTLP_{TRACES,LOGS}_ENDPOINT`.
+     */
+    otlp_endpoint?: string | null;
+    /**
+     * What is missing when `configured` is `false`.
+     */
+    reason?: string | null;
+    /**
+     * Console path that fixes what is missing, or the signal's setup page.
+     */
+    setup_path: string;
+    signal: IngestSignal;
 };
 
 export type IngressLoginGrantResponse = {
@@ -27180,6 +27283,23 @@ export type ProjectInfo = {
     created_at: string;
     id: number;
     slug: string;
+};
+
+/**
+ * The ingest setup of one project (and optionally one environment).
+ */
+export type ProjectIngestSetup = {
+    /**
+     * The environment the URLs attribute telemetry to, when one was asked for.
+     */
+    environment_id?: number | null;
+    project_id: number;
+    project_slug: string;
+    /**
+     * Public ingress URL every endpoint is built from, without a trailing slash.
+     */
+    public_base_url: string;
+    signals: Array<IngestSignalSetup>;
 };
 
 /**
@@ -90391,6 +90511,53 @@ export type GetBucketedIncidentsResponses = {
 };
 
 export type GetBucketedIncidentsResponse = GetBucketedIncidentsResponses[keyof GetBucketedIncidentsResponses];
+
+export type GetProjectIngestSetupData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: {
+        /**
+         * Attribute telemetry to this environment of the project.
+         */
+        environment_id?: number;
+    };
+    url: '/projects/{project_id}/ingest-setup';
+};
+
+export type GetProjectIngestSetupErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Project or environment not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetProjectIngestSetupError = GetProjectIngestSetupErrors[keyof GetProjectIngestSetupErrors];
+
+export type GetProjectIngestSetupResponses = {
+    /**
+     * Ingest setup of the project
+     */
+    200: ProjectIngestSetup;
+};
+
+export type GetProjectIngestSetupResponse = GetProjectIngestSetupResponses[keyof GetProjectIngestSetupResponses];
 
 export type GetInheritedEnvVarsData = {
     body?: never;

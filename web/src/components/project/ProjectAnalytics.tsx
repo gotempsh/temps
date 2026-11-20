@@ -50,6 +50,7 @@ import {
   hasAnalyticsEventsQueryKey,
   listAnalyticsIngestKeysOptions,
   getAnalyticsIngestKeyEndpointOptions,
+  getProjectIngestSetupQueryKey,
   revokeAnalyticsIngestKeyMutation,
   rotateAnalyticsIngestKeyMutation,
 } from '@/api/client/@tanstack/react-query.gen'
@@ -175,11 +176,13 @@ import {
   type AnalyticsDateFilter,
 } from '@/hooks/useAnalyticsDateRange'
 import { useAdvancingDateRange } from '@/hooks/useAdvancingDateRange'
+import { PlainHttpSetup } from '@/components/project/setup/PlainHttpSetup'
 import {
   ArrowLeft,
   ArrowRight,
   Ban,
   Check,
+  Code2,
   FileCode,
   Globe,
   Info,
@@ -1770,8 +1773,15 @@ function IngestKeySetup({ project }: ProjectAnalyticsProps) {
     ...listAnalyticsIngestKeysOptions({ path: { project_id: project.id } }),
   })
 
-  const invalidateKeys = () =>
-    queryClient.invalidateQueries({ queryKey: keysQueryKey })
+  const invalidateKeys = () => {
+    void queryClient.invalidateQueries({ queryKey: keysQueryKey })
+    // The plain HTTP setup reports whether an active key exists.
+    void queryClient.invalidateQueries({
+      queryKey: getProjectIngestSetupQueryKey({
+        path: { project_id: project.id },
+      }),
+    })
+  }
 
   const createKey = useMutation({
     ...createAnalyticsIngestKeyMutation(),
@@ -2004,6 +2014,7 @@ function IngestKeySetup({ project }: ProjectAnalyticsProps) {
               showCopy
             />
             <CodeBlock
+              title="layout.tsx"
               language="tsx"
               code={`import { TempsAnalyticsProvider } from '@temps-sdk/react-analytics';
 
@@ -2018,7 +2029,8 @@ function IngestKeySetup({ project }: ProjectAnalyticsProps) {
           </TabsContent>
           <TabsContent value="script" className="space-y-3 pt-3">
             <CodeBlock
-              language="text"
+              title="index.html"
+              language="html"
               code={`<script
   defer
   data-base-path="${baseUrl}"
@@ -2088,6 +2100,9 @@ function MarkExternalNotice({ project }: ProjectAnalyticsProps) {
     </div>
   )
 }
+
+/** The framework-agnostic option of the analytics setup. */
+const PLAIN_HTTP_OPTION = 'plain-http'
 
 function AnalyticsSetup({ project }: ProjectAnalyticsProps) {
   // An app hosted elsewhere sends its data with an ingest key.
@@ -2316,11 +2331,20 @@ export default function App() {
       description: 'Vercel, Netlify, static hosting, or anywhere else',
       setupCode: '',
     },
+    {
+      id: PLAIN_HTTP_OPTION,
+      name: 'Any language or framework',
+      category: 'Other',
+      icon: () => <Code2 className="h-5 w-5" />,
+      description: 'The SDK, a script tag, or plain fetch',
+      setupCode: '',
+    },
   ]
 
   const selectedFrameworkData =
     frameworks.find((f) => f.id === selectedFramework) || frameworks[0]
   const isExternal = selectedFramework === 'external'
+  const isPlainHttp = selectedFramework === PLAIN_HTTP_OPTION
 
   // Generate AI prompt for coding agents based on the selected framework
   const getAnalyticsAiPrompt = () => {
@@ -2542,7 +2566,8 @@ After implementation:
                 )}
               </div>
             </div>
-            {!isExternal && (
+            {/* The plain HTTP view carries its own prompt. */}
+            {!isPlainHttp && !isExternal && (
               <CopyButton
                 value={getAnalyticsAiPrompt()}
                 className="shrink-0 rounded-md border border-border px-3 py-1.5 text-xs font-medium"
@@ -2552,7 +2577,22 @@ After implementation:
             )}
           </div>
 
-          {isExternal ? (
+          {isPlainHttp ? (
+            <>
+              <IngestKeySetup project={project} />
+              {/* The key card above already shows the key. */}
+              <PlainHttpSetup
+                project={project}
+                signal="analytics"
+                showCredentialStep={false}
+              />
+              <PlainHttpSetup
+                project={project}
+                signal="session_replay"
+                showCredentialStep={false}
+              />
+            </>
+          ) : isExternal ? (
             <>
               {project.hosting !== 'external' && (
                 <MarkExternalNotice project={project} />

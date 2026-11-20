@@ -42301,6 +42301,66 @@
         ],
         "type": "object"
       },
+      "IngestAuth": {
+        "description": "How to authenticate a signal's requests, without the credential itself.",
+        "properties": {
+          "browser_safe": {
+            "description": "Whether the credential may ship in browser code. Analytics keys and\nDSN keys are public by design; an API key never is.",
+            "type": "boolean"
+          },
+          "cli_command": {
+            "description": "`temps` CLI command that creates the credential.",
+            "example": "temps analytics keys create --project my-app",
+            "type": "string"
+          },
+          "credential_path": {
+            "description": "Console path where the credential is created or shown.",
+            "example": "/projects/my-app/analytics/setup",
+            "type": "string"
+          },
+          "env_var": {
+            "description": "Environment variable the app should read the credential from.",
+            "example": "TEMPS_ANALYTICS_KEY",
+            "type": "string"
+          },
+          "headers": {
+            "description": "Headers to send, as templates over `env_var`.",
+            "items": {
+              "$ref": "#/components/schemas/IngestHeader"
+            },
+            "type": "array"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/IngestAuthKind"
+          },
+          "query_param": {
+            "description": "Query-string fallback for clients that cannot set headers\n(`navigator.sendBeacon`), when the route accepts one.",
+            "example": "temps_key",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "kind",
+          "env_var",
+          "headers",
+          "browser_safe",
+          "credential_path",
+          "cli_command"
+        ],
+        "type": "object"
+      },
+      "IngestAuthKind": {
+        "description": "The credential a signal's ingest route expects.",
+        "enum": [
+          "analytics_ingest_key",
+          "sentry_dsn",
+          "api_key"
+        ],
+        "type": "string"
+      },
       "IngestDropReason": {
         "description": "Which budget a dropped line exceeded.",
         "enum": [
@@ -42308,6 +42368,37 @@
           "bytes_per_sec"
         ],
         "type": "string"
+      },
+      "IngestEndpoint": {
+        "description": "One ingest route.",
+        "properties": {
+          "content_type": {
+            "description": "The `Content-Type` the route accepts.",
+            "example": "application/json",
+            "type": "string"
+          },
+          "method": {
+            "example": "POST",
+            "type": "string"
+          },
+          "name": {
+            "description": "Stable identifier of the route within its signal (`event`, `envelope`,\n`otlp_traces`, …).",
+            "example": "event",
+            "type": "string"
+          },
+          "url": {
+            "description": "Absolute URL, built from the public ingress URL.",
+            "example": "https://temps.example.com/api/_temps/event",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "method",
+          "url",
+          "content_type"
+        ],
+        "type": "object"
       },
       "IngestErrorSummary": {
         "description": "One aggregated ingest-failure group: \"this signal failed this way N times\".\n\nThe pipeline-stats counters say *how many* records were dropped;\nthis says *why*. Rows are grouped by `(signal_type, error_class)` rather\nthan stored per-event, so a sustained outage collapses into one row with a\nrising `count` instead of flooding the table.\n\n`sample_message` is one representative backend error string, kept for the\ndetail a class name cannot carry (the failing column, the refused address).\nIt is a sample, not a guarantee: which occurrence it came from is\nunspecified.",
@@ -42361,6 +42452,84 @@
         },
         "required": [
           "errors"
+        ],
+        "type": "object"
+      },
+      "IngestHeader": {
+        "description": "A header a request must carry. `value` is a template naming an\nenvironment variable, never a credential.",
+        "properties": {
+          "name": {
+            "example": "Authorization",
+            "type": "string"
+          },
+          "value": {
+            "example": "Bearer $TEMPS_API_KEY",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "value"
+        ],
+        "type": "object"
+      },
+      "IngestSignal": {
+        "description": "A kind of telemetry an app can send to Temps.",
+        "enum": [
+          "analytics",
+          "session_replay",
+          "errors",
+          "logs",
+          "traces"
+        ],
+        "type": "string"
+      },
+      "IngestSignalSetup": {
+        "description": "Everything an app needs to send one signal.",
+        "properties": {
+          "auth": {
+            "$ref": "#/components/schemas/IngestAuth"
+          },
+          "configured": {
+            "description": "Whether the project has what this signal needs. `false` means a\ncredential still has to be created. Logs and traces are always `true`:\nthey authenticate with the caller's own API key, which is not project\nstate; `auth.credential_path` and `auth.cli_command` say how to get one.",
+            "type": "boolean"
+          },
+          "endpoints": {
+            "items": {
+              "$ref": "#/components/schemas/IngestEndpoint"
+            },
+            "type": "array"
+          },
+          "otlp_endpoint": {
+            "description": "For OTLP signals without an environment: the value of\n`OTEL_EXPORTER_OTLP_ENDPOINT`. SDKs append `/v1/traces` or `/v1/logs`\nto it. `None` with an environment, whose per-signal URLs in\n`endpoints` go in `OTEL_EXPORTER_OTLP_{TRACES,LOGS}_ENDPOINT`.",
+            "example": "https://temps.example.com/api/otel",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reason": {
+            "description": "What is missing when `configured` is `false`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "setup_path": {
+            "description": "Console path that fixes what is missing, or the signal's setup page.",
+            "example": "/projects/my-app/errors/setup",
+            "type": "string"
+          },
+          "signal": {
+            "$ref": "#/components/schemas/IngestSignal"
+          }
+        },
+        "required": [
+          "signal",
+          "endpoints",
+          "auth",
+          "configured",
+          "setup_path"
         ],
         "type": "object"
       },
@@ -58408,6 +58577,45 @@
           "id",
           "slug",
           "created_at"
+        ],
+        "type": "object"
+      },
+      "ProjectIngestSetup": {
+        "description": "The ingest setup of one project (and optionally one environment).",
+        "properties": {
+          "environment_id": {
+            "description": "The environment the URLs attribute telemetry to, when one was asked for.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "project_slug": {
+            "example": "my-app",
+            "type": "string"
+          },
+          "public_base_url": {
+            "description": "Public ingress URL every endpoint is built from, without a trailing slash.",
+            "example": "https://temps.example.com",
+            "type": "string"
+          },
+          "signals": {
+            "items": {
+              "$ref": "#/components/schemas/IngestSignalSetup"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "project_id",
+          "project_slug",
+          "public_base_url",
+          "signals"
         ],
         "type": "object"
       },
@@ -170638,6 +170846,95 @@
         "summary": "Get bucketed incident data for a project",
         "tags": [
           "Status Page"
+        ]
+      }
+    },
+    "/projects/{project_id}/ingest-setup": {
+      "get": {
+        "description": "The public URL, method and content type of every ingest route (analytics,\nsession replay, errors, OTLP logs and traces), the credential each expects\nand where to create it, and whether the project already has it. Header\nvalues are templates over an environment variable; no credential is\nreturned.",
+        "operationId": "get_project_ingest_setup",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Attribute telemetry to this environment of the project.",
+            "in": "query",
+            "name": "environment_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectIngestSetup"
+                }
+              }
+            },
+            "description": "Ingest setup of the project"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Project or environment not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Get where this project's apps send telemetry",
+        "tags": [
+          "Projects"
         ]
       }
     },
