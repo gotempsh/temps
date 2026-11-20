@@ -269,6 +269,7 @@ pub async fn get_monitor_probe_locations(
         project_id,
         state.project_access_checker.clone()
     );
+    project_scope_guard!(auth, project_id);
     Ok(Json(state.monitors.probe_locations().await?))
 }
 

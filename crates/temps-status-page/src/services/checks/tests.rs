@@ -762,6 +762,27 @@ async fn a_key_scoped_to_another_project_cannot_create_or_change_monitors() {
     };
     assert_eq!(problem.status_code, StatusCode::FORBIDDEN);
 
+    let locations = get_monitor_probe_locations(
+        scoped_key(fx.other_project_id),
+        State(state.clone()),
+        Path(fx.project_id),
+    )
+    .await;
+    let Err(problem) = locations else {
+        panic!("a key scoped to another project must not read its probe locations")
+    };
+    assert_eq!(problem.status_code, StatusCode::FORBIDDEN);
+    assert!(
+        get_monitor_probe_locations(
+            scoped_key(fx.project_id),
+            State(state.clone()),
+            Path(fx.project_id),
+        )
+        .await
+        .is_ok(),
+        "a key may read its own project's probe locations"
+    );
+
     // The key's own project is allowed.
     let own = create_target_monitor(
         scoped_key(fx.project_id),
