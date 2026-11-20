@@ -146,6 +146,26 @@ describe('requests', () => {
   })
 })
 
+describe('editing keeps the saved timeout', () => {
+  it('sends back a timeout set through the API', () => {
+    const edited = targetMonitorValues(
+      monitor({
+        target: 'db.example.test:5432',
+        check: { kind: 'tcp', degraded_after_ms: 20000, timeout_ms: 30000 },
+        header_names: [],
+        has_body: false,
+      })
+    )
+    expect(
+      updateTargetMonitorRequest({ ...edited, name: 'renamed' }).check
+    ).toEqual({ kind: 'tcp', degraded_after_ms: 20000, timeout_ms: 30000 })
+  })
+
+  it('leaves the timeout to the server default for a new monitor', () => {
+    expect(newTargetMonitorValues('dns').timeoutMs).toBeNull()
+  })
+})
+
 describe('targetSummary', () => {
   it('says what is checked', () => {
     expect(

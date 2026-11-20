@@ -93,6 +93,11 @@ export const targetMonitorSchema = z
     keyword: z.string().max(200, 'At most 200 characters'),
     keywordPresent: z.boolean(),
     degradedAfterMs: optionalMs,
+    /**
+     * The saved timeout, which the form does not edit (the API and CLI set
+     * it). Kept so an edit sends it back instead of resetting it.
+     */
+    timeoutMs: z.number().int().positive().nullable(),
     headers: z.array(
       z.object({
         name: z.string().trim().max(100),
@@ -199,6 +204,7 @@ export function newTargetMonitorValues(
     keyword: '',
     keywordPresent: true,
     degradedAfterMs: '',
+    timeoutMs: null,
     headers: [],
     replaceRequest: true,
     body: '',
@@ -221,6 +227,7 @@ export function targetMonitorValues(
   values.target = view.target
   const check = view.check
   values.kind = check.kind
+  values.timeoutMs = check.timeout_ms ?? null
   switch (check.kind) {
     case 'http':
       values.method = check.method ?? 'GET'
@@ -249,6 +256,9 @@ function ms(value: string): number | null {
 }
 
 export function checkSpec(values: TargetMonitorValues): CheckSpec {
+  // Sent only when one is saved; otherwise the server default applies.
+  const timeout =
+    values.timeoutMs === null ? {} : { timeout_ms: values.timeoutMs }
   switch (values.kind) {
     case 'http':
       return {
@@ -259,16 +269,22 @@ export function checkSpec(values: TargetMonitorValues): CheckSpec {
           ? { text: values.keyword.trim(), present: values.keywordPresent }
           : null,
         degraded_after_ms: ms(values.degradedAfterMs),
+        ...timeout,
       }
     case 'tcp':
-      return { kind: 'tcp', degraded_after_ms: ms(values.degradedAfterMs) }
+      return {
+        kind: 'tcp',
+        degraded_after_ms: ms(values.degradedAfterMs),
+        ...timeout,
+      }
     case 'tls':
-      return { kind: 'tls', warn_days: values.warnDays }
+      return { kind: 'tls', warn_days: values.warnDays, ...timeout }
     case 'dns':
       return {
         kind: 'dns',
         record_type: values.recordType,
         expected: splitList(values.expectedValues),
+        ...timeout,
       }
   }
 }
