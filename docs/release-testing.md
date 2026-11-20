@@ -1123,15 +1123,27 @@ It fits how beta and stable tags are cut today. `scripts/release.sh` makes the
 version-bump commit; it reaches main through a `release/v<version>` PR (the
 branch is pushed by hand, and every recent release PR used that name), and the
 tag goes on that PR's merge commit. Pushing a `release/v*` branch runs the
-workflow for `v<version>`. For any other path, dispatch it:
+workflow for `v<version>`. Preparation reads main, so it fails when the release
+branch carries an SDK commit main lacks (it would merge into the tag
+unversioned): land that commit on main first. For any other path, dispatch it:
 `gh workflow run sdk-release-prep.yml -f tag=v<version>`. Merge the SDK PR into
 main **before** the release PR so the tag contains it.
 
-`release.sh` runs `prepare --check` before its bump commit. If the tag already
-has a selection that is now stale, it stops: publishing it would ship newer code
-under the selected versions. If nothing is selected yet, it asks before
-releasing the server without those SDK changes. Nightlies never publish SDKs, so
+`release.sh` runs `prepare --check` before its bump commit. `--check` exits 1
+when files would change and 2 when the check itself failed (a registry lookup,
+an invalid manifest); a failed check stops the release. If the tag already has a
+selection that is now stale, it stops: publishing it would ship newer code under
+the selected versions. If nothing is selected yet, it asks before releasing the
+server without those SDK changes. Nightlies never publish SDKs, so
 `nightly-release.yml` does not run it.
+
+Commits can still land on main between `release.sh` and the tag. When a tag has
+a selection, `release.yml`'s validation job re-derives it on the tagged commit
+(`prepare --tag <tag> --check --at-tag`, read-only) and fails before anything
+publishes if the versions no longer match, because a published version cannot
+be replaced. Delete the tag, re-run the prep workflow for it, merge its PR and
+tag again. A re-run after part of the selection was published skips the check:
+the first attempt passed it.
 
 `release.yml` plans in its existing validation job and tests/packages in its
 existing web-assets job. A single isolated `publish-sdks` job waits for the test
@@ -1223,8 +1235,9 @@ curl -s -o /dev/null -w '%{http_code}\n' -A 'temps-sdk-release' https://crates.i
      -f default_workflow_permissions=read -F can_approve_pull_request_reviews=true
    ```
 
-   GitHub starts no `pull_request` workflows for a PR the workflow token opens
-   or updates: close and reopen the SDK PR to run CI before merging it.
+   CI runs for a PR the workflow token opens or updates wait for approval: a
+   maintainer with write access selects **Approve workflows to run** in the
+   PR's merge box before merging it.
 
 2. **Create the environments.** `release.yml` refers to `sdk-${channel}`;
    GitHub would otherwise create them on first use without protection.

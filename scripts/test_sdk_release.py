@@ -1,10 +1,13 @@
 # SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 # SPDX-License-Identifier: MIT OR Apache-2.0
 
+import argparse
 import base64
+from contextlib import redirect_stderr, redirect_stdout
 import hashlib
 import json
 import io
+import os
 import re
 import shutil
 import subprocess
@@ -172,6 +175,13 @@ class ReleaseTests(unittest.TestCase):
         with patch.object(release, 'run', side_effect=command) as run, patch.object(release, 'check_npm_archive'):
             release.build([kv], self.root / 'artifacts-kv')
         self.assertNotIn(('bun', 'run', 'generate'), [call.args for call in run.call_args_list])
+
+    def test_only_the_generate_script_itself_counts_as_regenerating(self):
+        for script, expected in [('bun run generate && bun run build', True), ('bun run generate', True),
+                                 ('tsc; bun run generate', True), ('bun run generate:types', False),
+                                 ('bun run generated', False), ('bun run build', False), ('', False)]:
+            with self.subTest(script=script):
+                self.assertIs(release.runs_generate(script), expected)
 
     def test_rust_build_collects_verified_package_archive(self):
         package = {'kind': 'crate', 'key': 'rust', 'path': 'crates/temps-workflows-sdk',
@@ -469,6 +479,11 @@ class FakeHistory:
 
     def tag_exists(self, tag):
         return tag in self.refs
+
+    def resolve(self, ref):
+        if ref == 'HEAD':
+            return self.log[-1]['sha']
+        return self.refs.get(ref.removeprefix('refs/tags/'), '')
 
     def position(self, revision):
         sha = self.refs.get(revision.removeprefix('refs/tags/'), revision)
@@ -924,6 +939,96 @@ class PrepareTests(unittest.TestCase):
         # Once the cause is gone a retry succeeds from the untouched inputs.
         self.assertEqual(self.selection(), {'analytics-core': '0.0.7', 'temps-plugin-protocol': '1.0.1'})
 
+    def test_python_requirement_with_extras_is_repinned_and_keeps_them(self):
+        self.add('py-core', 'pypi', '1.0.0', name='temps-core', published={'1.0.0'})
+        self.add('py-app', 'pypi', '1.0.0', name='temps-app', published={'1.0.0'})
+        self.write('sdks/py-app/pyproject.toml', '[project]\nname = "temps-app"\nversion = "1.0.0"\n'
+                   'dependencies = ["temps-core[fast] == 1.0.0; python_version >= \'3.10\'"]\n\n'
+                   '[tool.uv.sources]\ntemps-core = { path = "../py-core" }\n')
+        self.write('sdks/py-app/uv.lock', 'version = 1\n\n[[package]]\nname = "temps-app"\nversion = "1.0.0"\n'
+                   'source = { editable = "." }\n\n'
+                   '[[package]]\nname = "temps-core"\nversion = "1.0.0"\nsource = { directory = "../py-core" }\n')
+        for key in ('py-core', 'py-app'):
+            self.release_tag(key, '1.0.0')
+        self.change('py-core', 'fix: core')
+        self.assertEqual(self.selection(), {'py-app': '1.0.1', 'py-core': '1.0.1'})
+        self.assertIn('"temps-core[fast] == 1.0.1; python_version >= \'3.10\'"', self.read('sdks/py-app/pyproject.toml'))
+
+    def test_rollback_restores_the_original_bytes_and_line_endings(self):
+        self.add('analytics-core', 'npm', '0.0.6', published={'0.0.6'})
+        self.release_tag('analytics-core', '0.0.6')
+        manifest = self.root / 'sdks/node/packages/analytics-core/package.json'
+        original = b'{\r\n  "name": "@temps-sdk/analytics-core",\r\n  "version": "0.0.6"\r\n}\r\n'
+        manifest.write_bytes(original)
+        self.change('analytics-core', 'fix: event')
+        with patch.object(release, 'validate', side_effect=ValueError('validation failed')), \
+                self.assertRaisesRegex(ValueError, 'validation failed'):
+            self.prepare()
+        self.assertEqual(manifest.read_bytes(), original)
+
+    def prepare_and_tag(self, tag='v9.0.0'):
+        """Merge the prep change and tag the server release at it, as a release cut does."""
+        report, files = self.prepare(tag)
+        self.history.commit(f'chore(release): prepare SDKs for {tag}', {path: self.read(path) for path in files})
+        self.history.tag(tag)
+        return report
+
+    def verify(self, tag='v9.0.0'):
+        return sdk_prepare.verify_tag(tag, self.root, history=self.history,
+                                      published=lambda package: self.registry.get(package['name'], set()))
+
+    def test_tagged_selection_is_re_derived_before_publishing(self):
+        self.add('analytics-core', 'npm', '0.0.6', published={'0.0.6'})
+        self.add('kv', 'npm', '1.0.0', published={'1.0.0'})
+        for key in ('analytics-core', 'kv'):
+            self.release_tag(key, self.version(key))
+        self.change('analytics-core', 'fix: event')
+        self.prepare_and_tag()
+        self.assertEqual(self.verify(), ([], []))
+        # The tag must be the checked-out commit, and re-deriving never writes.
+        with self.assertRaisesRegex(ValueError, 'v9.1.0 is not the checked-out commit'):
+            sdk_prepare.prepare('v9.1.0', self.root, history=self.history, published=lambda p: set(),
+                                write=False, at_tag=True)
+        with self.assertRaisesRegex(ValueError, 'never writes'):
+            sdk_prepare.prepare('v9.0.0', self.root, history=self.history, published=lambda p: set(), at_tag=True)
+        # A breaking change merged after the prep PR needs 0.1.0, not the prepared 0.0.7.
+        self.change('analytics-core', 'feat!: drop the v1 events')
+        self.history.tag('v9.0.0')
+        files, released = self.verify()
+        self.assertEqual(released, [])
+        self.assertIn('sdks/node/packages/analytics-core/package.json', files)
+        self.assertIn('.github/releases/prepared.json', files)
+
+    def test_tagged_selection_with_a_late_unprepared_package_is_stale(self):
+        self.add('analytics-core', 'npm', '0.0.6', published={'0.0.6'})
+        self.add('kv', 'npm', '1.0.0', published={'1.0.0'})
+        for key in ('analytics-core', 'kv'):
+            self.release_tag(key, self.version(key))
+        self.change('analytics-core', 'fix: event')
+        self.prepare_and_tag()
+        self.change('kv', 'fix: scan')
+        self.history.tag('v9.0.0')
+        files, _ = self.verify()
+        self.assertIn('sdks/node/packages/kv/package.json', files)
+
+    def test_tagged_selection_already_partly_released_is_not_re_derived(self):
+        self.add('analytics-core', 'npm', '0.0.6', published={'0.0.6'})
+        self.release_tag('analytics-core', '0.0.6')
+        self.change('analytics-core', 'fix: event')
+        self.prepare_and_tag()
+        self.registry['@temps-sdk/analytics-core'].add('0.0.7')
+        self.assertEqual(self.verify(), ([], ['analytics-core']))
+        self.registry['@temps-sdk/analytics-core'].discard('0.0.7')
+        self.release_tag('analytics-core', '0.0.7')
+        self.assertEqual(self.verify(), ([], ['analytics-core']))
+
+    def test_server_only_tag_has_nothing_to_verify(self):
+        self.add('analytics-core', 'npm', '0.0.6', published={'0.0.6'})
+        self.release_tag('analytics-core', '0.0.6')
+        self.change('analytics-core', 'fix: event')
+        self.history.tag('v9.0.0')
+        self.assertEqual(self.verify(), ([], []))
+
     def test_commit_touching_no_package_selects_nothing(self):
         self.add('kv', 'npm', '1.0.0', published={'1.0.0'})
         self.add('py', 'pypi', '1.0.0', name='temps-sample', published={'1.0.0'})
@@ -1049,6 +1154,79 @@ class GitHistoryTests(unittest.TestCase):
         self.assertIsNone(history.show(first, 'missing.toml'))
 
 
+    def test_release_branch_sdk_commits_missing_from_main_are_found(self):
+        if shutil.which('git') is None:
+            self.skipTest('git is not installed')
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        self.git('init', '-q', '-b', 'main')
+        catalog = {'kv': {'kind': 'npm', 'path': 'sdks/node/packages/kv', 'name': '@temps-sdk/kv'}}
+        (self.root / '.github/releases').mkdir(parents=True)
+        (self.root / '.github/releases/packages.json').write_text(json.dumps(catalog))
+        self.commit('sdks/node/packages/kv/package.json', '{"name": "@temps-sdk/kv", "version": "1.0.0"}', 'chore: add kv')
+        self.git('switch', '-q', '-c', 'release/v9.0.0')
+        self.commit('Cargo.toml', 'version = "9.0.0"\n', 'chore: bump version to v9.0.0')
+        history = sdk_prepare.GitHistory(self.root)
+        self.git('switch', '-q', 'main')
+        self.commit('sdks/node/packages/kv/src/index.ts', 'x', 'fix(kv): on main')
+        # A bump-only release branch, and SDK commits already on main, are fine.
+        self.assertEqual(sdk_prepare.branch_only_changes('release/v9.0.0', self.root, history=history), [])
+        self.git('switch', '-q', 'release/v9.0.0')
+        self.commit('sdks/node/packages/kv/src/scan.ts', 'x', 'fix(kv): only on the branch')
+        self.git('switch', '-q', 'main')
+        found = sdk_prepare.branch_only_changes('release/v9.0.0', self.root, history=history)
+        self.assertEqual([(key, commit['subject']) for key, commit in found], [('kv', 'fix(kv): only on the branch')])
+        with self.assertRaisesRegex(ValueError, 'release/v9.9.9 does not name a commit'):
+            sdk_prepare.branch_only_changes('release/v9.9.9', self.root, history=history)
+
+
+class PrepareCommandTests(unittest.TestCase):
+    """Exit statuses: 0 prepared, 1 files would change, 2 the check itself failed."""
+
+    def run_command(self, *argv):
+        parser = argparse.ArgumentParser()
+        args = argparse.Namespace(tag='v9.0.0', check='--check' in argv, at_tag='--at-tag' in argv,
+                                  candidate='release/v9.0.0' if '--candidate' in argv else None,
+                                  summary=None, changed_files=None)
+        with patch.dict(os.environ), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
+            os.environ.pop('GITHUB_OUTPUT', None)
+            try:
+                release.prepare_command(args, parser)
+            except SystemExit as exit:
+                return exit.code, err.getvalue()
+        return 0, err.getvalue()
+
+    def test_pending_edits_exit_1_and_failed_checks_exit_2(self):
+        with patch.object(sdk_prepare, 'prepare', return_value=([], [])):
+            self.assertEqual(self.run_command('--check')[0], 0)
+        with patch.object(sdk_prepare, 'prepare', return_value=([], ['.github/releases/prepared.json'])):
+            self.assertEqual(self.run_command('--check')[0], 1)
+        for error in (ValueError('kv: bad manifest'), urllib.error.URLError('registry unreachable'),
+                      TimeoutError('timed out'), KeyError('version')):
+            with self.subTest(error=error), patch.object(sdk_prepare, 'prepare', side_effect=error):
+                status, message = self.run_command('--check')
+                self.assertEqual(status, 2)
+                self.assertIn('error:', message)
+
+    def test_release_branch_commits_missing_from_main_fail_the_check(self):
+        found = [('kv', {'sha': 'a' * 40, 'subject': 'fix(kv): only on the branch'})]
+        with patch.object(sdk_prepare, 'branch_only_changes', return_value=found), \
+                patch.object(sdk_prepare, 'prepare') as prepare:
+            status, message = self.run_command('--candidate')
+        self.assertEqual(status, 2)
+        self.assertIn('fix(kv): only on the branch', message)
+        prepare.assert_not_called()
+
+    def test_at_tag_fails_only_on_a_stale_selection(self):
+        for result, expected in [(([], []), 0), (([], ['kv']), 0), ((['sdks/node/packages/kv/package.json'], []), 1)]:
+            with self.subTest(result=result), patch.object(sdk_prepare, 'verify_tag', return_value=result):
+                self.assertEqual(self.run_command('--check', '--at-tag')[0], expected)
+        with patch.object(sdk_prepare, 'verify_tag', side_effect=urllib.error.URLError('down')):
+            self.assertEqual(self.run_command('--check', '--at-tag')[0], 2)
+        self.assertEqual(self.run_command('--at-tag')[0], 2)  # re-deriving at a tag is check-only
+
+
 class SdkReleasePrepWorkflowTests(unittest.TestCase):
     workflow = (release.ROOT / '.github/workflows/sdk-release-prep.yml').read_text()
 
@@ -1086,6 +1264,27 @@ class SdkReleasePrepWorkflowTests(unittest.TestCase):
         self.assertIn('git commit -q -s -F -', self.workflow)
         self.assertIn('release/v*', self.workflow)
 
+    def test_release_branch_pushes_reject_sdk_commits_missing_from_main(self):
+        prepare = self.workflow.index('name: Prepare SDK versions from Conventional Commits')
+        step = self.workflow[prepare:self.workflow.index('- name:', prepare + 1)]
+        self.assertIn('candidate=(--candidate "refs/remotes/origin/${REF_NAME}")', step)
+        self.assertIn('"${candidate[@]}"', step)
+
+    def test_pr_body_asks_for_workflow_approval(self):
+        self.assertIn('Approve workflows to run', self.workflow)
+        self.assertNotIn('reopen', self.workflow)
+
+    def test_release_run_re_derives_the_selection_before_anything_publishes(self):
+        workflow = (release.ROOT / '.github/workflows/release.yml').read_text()
+        job = workflow[workflow.index('\n  validate-release-ref:\n'):workflow.index('\n  require-tests:\n')]
+        self.assertIn('fetch-depth: 0', job)
+        step = job[job.index('name: Verify the prepared SDK selection at the tag'):]
+        self.assertIn('prepare --tag "$RELEASE_TAG" --check --at-tag', step)
+        self.assertIn("github.ref_type == 'tag' && steps.sdk.outputs.selected == 'true'", step)
+        self.assertNotIn('continue-on-error', step)
+        # Every publishing job runs after validate-release-ref.
+        self.assertIn('needs: [validate-release-ref, require-tests, build-web-assets, create-release]', workflow)
+
     def test_release_script_refuses_unprepared_sdks(self):
         script = (release.ROOT / 'scripts/release.sh').read_text()
         self.assertIn('python3 scripts/sdk_release.py prepare --tag "v${VERSION}" --check', script)
@@ -1093,6 +1292,10 @@ class SdkReleasePrepWorkflowTests(unittest.TestCase):
         # A stale, non-empty selection stops the release instead of offering to continue.
         stale = script.index('python3 scripts/sdk_release.py plan --tag "v${VERSION}")" != "[]"')
         self.assertLess(script.index('exit 1', stale), script.index('read -r CONTINUE', stale))
+        # Only pending edits (exit 1) offer the server-only release; a failed check aborts.
+        failed = script.index('if [ "$PREPARE_STATUS" -ne 0 ] && [ "$PREPARE_STATUS" -ne 1 ]; then')
+        self.assertLess(script.index('exit 1', failed), script.index('if [ "$PREPARE_STATUS" -eq 1 ]; then'))
+        self.assertLess(script.index('if [ "$PREPARE_STATUS" -eq 1 ]; then'), script.index('read -r CONTINUE', stale))
 
 
 if __name__ == '__main__':

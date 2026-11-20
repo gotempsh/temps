@@ -125,10 +125,17 @@ class GitHistory:
     def tag_exists(self, tag):
         return bool(self.git('tag', '--list', tag).strip())
 
-    def commits(self, base, paths, excludes):
-        """Non-merge commits after `base` that touched `paths`, newest first."""
+    def resolve(self, ref):
+        """The commit `ref` names, or '' when it names none."""
+        try:
+            return self.git('rev-parse', '--verify', '--quiet', f'{ref}^{{commit}}').strip()
+        except subprocess.CalledProcessError:
+            return ''
+
+    def commits(self, base, paths, excludes, head='HEAD'):
+        """Non-merge commits in `base..head` that touched `paths`, newest first."""
         spec = [*paths, *(f':(exclude){path}' for path in excludes)]
-        output = self.git('log', '--no-merges', '--format=%H%x1f%s%x1f%b%x1e', f'{base}..HEAD', '--', *spec)
+        output = self.git('log', '--no-merges', '--format=%H%x1f%s%x1f%b%x1e', f'{base}..{head}', '--', *spec)
         records = [record.strip('\n') for record in output.split('\x1e') if record.strip()]
         return [dict(zip(('sha', 'subject', 'body'), record.split('\x1f', 2))) for record in records]
 
@@ -438,7 +445,8 @@ class Edits:
 
     def write(self):
         """Write every change, or restore the originals when any write fails."""
-        originals = {path: (self.root / path).read_text() for path in self.changed()}
+        # Bytes, so a rollback also restores the original line endings.
+        originals = {path: (self.root / path).read_bytes() for path in self.changed()}
         self.originals = originals
         try:
             for path in originals:
@@ -448,8 +456,8 @@ class Edits:
             raise
 
     def restore(self):
-        for path, text in getattr(self, 'originals', {}).items():
-            (self.root / path).write_text(text)
+        for path, data in getattr(self, 'originals', {}).items():
+            (self.root / path).write_bytes(data)
 
 
 def set_manifest_version(edits, package, version):
@@ -515,7 +523,8 @@ def set_dependency_pins(edits, package, dependency, version):
                  and spec['version'].lstrip('=^~ ') != version]
     elif kind == 'pypi':
         # PEP 503: `temps_core`, `temps-core` and `Temps.Core` name the same project.
-        spelled = '[-_.]+'.join(map(re.escape, re.split(r'[-_.]+', name)))
+        # Extras (`temps-core[fast]==1.0.0`) stay as they are.
+        spelled = '[-_.]+'.join(map(re.escape, re.split(r'[-_.]+', name))) + r'\s*(?:\[[^\]]*\])?'
         new = re.sub(rf'(["\']{spelled}\s*==\s*)[^"\';,\s]+', rf'\g<1>{version}', text, flags=re.I)
         stale = [requirement for requirement in tomllib.loads(new).get('project', {}).get('dependencies', [])
                  if re.match(rf'{spelled}\s*==', requirement, re.I) and not re.match(
@@ -558,8 +567,11 @@ def set_lockfile_versions(edits, package, version, root, dependents=()):
                       rf'\g<1>{version}\g<2>', what=f'path package entry for {name} {old}')
 
 
-def prepare(tag, root=release.ROOT, *, history=None, published=None, write=True):
-    """Select and version SDK releases for server tag `tag`; returns (selection, changed files)."""
+def prepare(tag, root=release.ROOT, *, history=None, published=None, write=True, at_tag=False):
+    """Select and version SDK releases for server tag `tag`; returns (selection, changed files).
+
+    `at_tag` re-derives the selection on the commit `tag` already points at (read-only).
+    """
     if re.fullmatch(NIGHTLY_TAG, tag):
         raise ValueError('Nightly server releases never prepare SDK releases')
     if not re.fullmatch(SERVER_TAG, tag):
@@ -570,7 +582,12 @@ def prepare(tag, root=release.ROOT, *, history=None, published=None, write=True)
         history.ensure_full_history()
     if published is None:
         published = published_versions
-    if history.tag_exists(tag):
+    if at_tag:
+        if write:
+            raise ValueError('Re-deriving the selection at a server tag never writes files')
+        if not history.tag_exists(tag) or history.resolve(tag) != history.resolve('HEAD'):
+            raise ValueError(f'{tag} is not the checked-out commit; check out the tag to verify its SDK selection')
+    elif history.tag_exists(tag):
         raise ValueError(f'{tag} is already tagged; prepare SDK releases for the next server tag')
     target = 'beta' if '-' in tag else 'stable'
     catalog = release.catalog_packages(root)
@@ -633,6 +650,50 @@ def prepare(tag, root=release.ROOT, *, history=None, published=None, write=True)
             edits.restore()
             raise
     return report, files
+
+
+def verify_tag(tag, root=release.ROOT, *, history=None, published=None):
+    """Re-derive `tag`'s SDK selection on its tagged commit before anything publishes.
+
+    Returns (files that would change, keys already released). A commit that landed
+    after the prep PR merged can need different versions than prepared.json records,
+    and published versions are immutable. Once part of the selection is released
+    (a re-run), the first attempt has already verified it and the registries no
+    longer describe the pre-release state, so nothing is re-derived.
+    """
+    root = Path(root)
+    if history is None:
+        history = GitHistory(root)
+        history.ensure_full_history()
+    if published is None:
+        published = published_versions
+    planned = release.plan(tag, root)
+    if not planned:
+        return [], []
+    released = [entry['key'] for entry in planned if history.tag_exists(entry['tag'])
+                or Version.parse(entry['version'], entry['kind']) in parse_all(published(entry), entry['kind'])]
+    if released:
+        return [], released
+    _, files = prepare(tag, root, history=history, published=published, write=False, at_tag=True)
+    return files, []
+
+
+def branch_only_changes(candidate, root=release.ROOT, *, history=None):
+    """SDK commits reachable from `candidate` (a release branch) but not from HEAD (main).
+
+    Preparation reads main, so a fix committed only to the release branch would merge
+    into the tag without a version. Such commits must land on main first.
+    """
+    root = Path(root)
+    history = history or GitHistory(root)
+    if not history.resolve(candidate):
+        raise ValueError(f'{candidate} does not name a commit; fetch the release branch first')
+    catalog = release.catalog_packages(root)
+    found = []
+    for package in catalog:
+        paths, nested = package_paths(package, catalog)
+        found += [(package['key'], commit) for commit in history.commits('HEAD', paths, nested, head=candidate)]
+    return found
 
 
 def inline(text):

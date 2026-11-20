@@ -185,7 +185,7 @@ def build(packages, output):
             # Packing runs with --ignore-scripts, so honour a prepublishOnly that
             # regenerates sources first: @temps-sdk/api is selected by changes to
             # apps/temps-cli/openapi.json and must ship the client for that spec.
-            if re.search(r'\bbun run generate\b', data['scripts'].get('prepublishOnly', '')):
+            if runs_generate(data['scripts'].get('prepublishOnly', '')):
                 run('bun', 'run', 'generate', cwd=path)
             # Workspace consumers require core declarations before their build.
             if '@temps-sdk/analytics-core' in data.get('dependencies', {}):
@@ -242,6 +242,11 @@ def build(packages, output):
     inventory = {str(f.relative_to(output)): digest(f) for p in packages
                  for f in (output / p['key']).iterdir()}
     (output / 'sha256.json').write_text(json.dumps(inventory, sort_keys=True) + '\n')
+
+
+def runs_generate(script):
+    """Whether a package script runs `bun run generate` itself (`generate:types` is another script)."""
+    return bool(re.search(r'(?:^|[\s;&|(])bun run generate(?=$|[\s;&|)])', script))
 
 
 def registry_json(url, parse=json.load, missing=(404,)):
@@ -449,13 +454,32 @@ def verify_artifact_plan(output, packages, revision):
 
 
 def prepare_command(args, parser):
+    """Exit 0 when prepared, 1 when files would change (--check), 2 when the check itself failed."""
     import sdk_prepare
     if not args.tag:
         parser.error('--tag is required for prepare')
+    if args.at_tag and (not args.check or args.candidate):
+        parser.error('--at-tag re-derives a tagged selection; use it with --check and without --candidate')
     try:
+        if args.at_tag:
+            files, released = sdk_prepare.verify_tag(args.tag)
+            if released:
+                print(f"{args.tag}: {', '.join(released)} already released; the first attempt verified this selection")
+            elif files:
+                print(f'error: the SDK selection prepared for {args.tag} is stale at the tag: commits since the '
+                      f'prep PR need different versions. These files would change: ' + ', '.join(files), file=sys.stderr)
+                sys.exit(1)
+            else:
+                print(f'{args.tag}: the prepared SDK selection matches the tagged commit')
+            return
+        if args.candidate:
+            if found := sdk_prepare.branch_only_changes(args.candidate):
+                commits = '; '.join(f"{key}: {commit['sha'][:9]} {commit['subject']}" for key, commit in found)
+                raise ValueError(f'{args.candidate} has SDK commits that are not on main ({commits}); '
+                                 f'land them on main first so they are versioned')
         report, files = sdk_prepare.prepare(args.tag, write=not args.check)
-    except ValueError as error:
-        parser.exit(2, f'error: {error}\n')
+    except Exception as error:  # a failed check must never read as "files would change" (exit 1)
+        parser.exit(2, f'error: {error}\n' if isinstance(error, ValueError) else f'error: {type(error).__name__}: {error}\n')
     text = sdk_prepare.summary(args.tag, report)
     print(text, flush=True)
     if args.summary:
@@ -480,9 +504,13 @@ def main():
     parser.add_argument('--all', action='store_true', help='Build all current SDKs for validation only')
     parser.add_argument('--output', type=Path, default=Path('sdk-artifacts'))
     parser.add_argument('--kind', choices=['npm', 'pypi', 'crate', 'go'])
-    parser.add_argument('--check', action='store_true', help='prepare: change nothing; exit 1 when files would change')
+    parser.add_argument('--check', action='store_true',
+                        help='prepare: change nothing; exit 1 when files would change, 2 when the check fails')
     parser.add_argument('--summary', type=Path, help='prepare: write the per-package changelog table here')
     parser.add_argument('--changed-files', type=Path, help='prepare: write the changed paths here, one per line')
+    parser.add_argument('--candidate', help='prepare: fail when this release branch has SDK commits that main lacks')
+    parser.add_argument('--at-tag', action='store_true',
+                        help='prepare --check: re-derive the selection on the checked-out, already tagged commit')
     args = parser.parse_args()
     if args.command == 'validate':
         validate()

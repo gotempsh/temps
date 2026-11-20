@@ -84,13 +84,22 @@ jobs:
         id: base
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
+      # Preparation reads main. A release branch merges into the tag, so an SDK
+      # commit only on that branch would ship unversioned; it must land on main.
       - name: Prepare SDK versions from Conventional Commits
         id: prepare
         env:
           TARGET: ${{ steps.target.outputs.tag }}
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          python3 scripts/sdk_release.py prepare --tag "$TARGET" --summary "$RUNNER_TEMP/sdk-prep.md"
+          candidate=()
+          if [[ "$EVENT" == "push" ]]; then
+            git fetch -q --no-tags origin "+refs/heads/${REF_NAME}:refs/remotes/origin/${REF_NAME}"
+            candidate=(--candidate "refs/remotes/origin/${REF_NAME}")
+          fi
+          python3 scripts/sdk_release.py prepare --tag "$TARGET" "${candidate[@]}" --summary "$RUNNER_TEMP/sdk-prep.md"
           cat "$RUNNER_TEMP/sdk-prep.md" >> "$GITHUB_STEP_SUMMARY"
 
       # The PR job re-derives the change and must arrive at these exact bytes.
@@ -232,7 +241,7 @@ jobs:
             echo
             echo "Opened by the [SDK Release Prep](${RUN_URL}) workflow. Merge it before the release PR for \`${TARGET}\` so the tag contains it."
             echo
-            echo "GitHub does not start pull_request workflows for a PR the workflow token opens or pushes to: close and reopen this PR to run CI."
+            echo "CI for a PR the workflow token opens or pushes to waits for approval: select **Approve workflows to run** in the merge box before merging."
           } > "$body"
           number="$(gh pr list --repo "$REPOSITORY" --head "$branch" --base main --state open --json number --jq '.[0].number // empty')"
           if [[ -n "$number" ]]; then
