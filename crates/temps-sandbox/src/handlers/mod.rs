@@ -105,6 +105,7 @@ pub struct SandboxAppState {
         sandboxes::rootfs_report,
         sandboxes::rootfs_gc,
         // Sandbox placement (ADR-048)
+        placement::get_sandbox_resource_defaults,
         placement::get_sandbox_placement,
         placement::update_sandbox_placement,
         placement::list_node_sandboxes,
@@ -169,6 +170,7 @@ pub struct SandboxAppState {
         temps_sandbox_providers::RootfsVmEntry,
         temps_sandbox_providers::RootfsGcReport,
         // Sandbox placement schemas (ADR-048)
+        crate::services::sandbox_service::SandboxResourceHints,
         placement::SandboxPlacementResponse,
         placement::UpdateSandboxPlacementBody,
         placement::NodeSandboxesResponse,

@@ -104,6 +104,8 @@ fn expected_sdk_paths() -> Vec<&'static str> {
         // Multi-node placement (ADR-048): which nodes may run sandboxes, the
         // operator's per-node view, and clearing a node before removal.
         "/v1/sandboxes/placement",
+        // Effective resource limits for the console's selected placement.
+        "/v1/sandboxes/resource-defaults",
         "/v1/sandboxes/placement/nodes/{node}",
         "/v1/sandboxes/placement/nodes/{node}/evict",
         // Changing a sandbox's egress policy after it was created (temps

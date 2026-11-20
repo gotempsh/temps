@@ -167,6 +167,12 @@ pub struct RemoteCreateRequest {
     /// Container suffix (`temps-sandbox-<label>`). Validated by the worker
     /// with [`is_valid_sandbox_label`].
     pub label: String,
+    /// An older worker still receives the configured limits. Updated workers
+    /// use these flags to distinguish inherited limits from user input.
+    #[serde(default)]
+    pub cpu_is_default: bool,
+    #[serde(default)]
+    pub memory_is_default: bool,
     pub image: Option<String>,
     pub cpu_limit: Option<f64>,
     pub memory_limit_mb: Option<u64>,
@@ -403,6 +409,7 @@ pub struct RemoteAliveResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct RemoteStatusResponse {
+    pub capacity: Option<crate::SandboxHostCapacity>,
     pub available: bool,
     pub image_ready: bool,
     pub image: String,
@@ -1724,6 +1731,13 @@ impl RemoteSandboxProvider {
 
 #[async_trait]
 impl SandboxProvider for RemoteSandboxProvider {
+    async fn host_capacity(
+        &self,
+        _node_id: Option<i32>,
+        _backend: Option<SandboxBackend>,
+    ) -> Result<Option<crate::SandboxHostCapacity>, AgentError> {
+        Ok(self.status().await?.capacity)
+    }
     async fn service_access(
         &self,
         handle: &SandboxHandle,
@@ -1781,6 +1795,8 @@ impl SandboxProvider for RemoteSandboxProvider {
                 .image
                 .filter(|image| !image.is_empty())
                 .or_else(|| self.defaults.image.clone()),
+            cpu_is_default: config.cpu_limit.is_none(),
+            memory_is_default: config.memory_limit_mb.is_none(),
             cpu_limit: config.cpu_limit.or(self.defaults.cpu_limit),
             memory_limit_mb: config.memory_limit_mb.or(self.defaults.memory_limit_mb),
             pids_limit: config.pids_limit,

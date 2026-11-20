@@ -665,6 +665,10 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        "per-placement host capacity and effective limits are read by the sandbox creation and settings forms",
+        &["get_sandbox_resource_defaults"],
+    ),
+    (
         "served by the dedicated sandbox tools",
         &[
             "clear_preview_password",

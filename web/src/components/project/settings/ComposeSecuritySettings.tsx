@@ -50,6 +50,7 @@ import {
   filterComposeSecurityChecks,
   type SecurityCheckStatusFilter,
 } from '@/lib/compose-security-filter'
+import { scrollToElementId } from '@/lib/scroll-to-element'
 
 export function ComposeSecuritySettings({
   projectId,
@@ -79,10 +80,7 @@ export function ComposeSecuritySettings({
   }
   useEffect(() => {
     if (!focusCheck) return
-    document.getElementById('compose-security')?.scrollIntoView({
-      behavior: 'smooth',
-      block: 'start',
-    })
+    scrollToElementId('compose-security', { behavior: 'smooth' })
   }, [focusCheck])
   const [pending, setPending] = useState<ComposeSecurityCheckDefinition | null>(
     null

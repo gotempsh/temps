@@ -56,6 +56,12 @@ pub enum AgentError {
 
     #[error("Validation error: {message}")]
     Validation { message: String },
+    #[error("Sandbox run {run_id} requested {requested} CPU cores on a host with {host} cores (allowed range 0.01 to {host})")]
+    SandboxCpuLimit {
+        run_id: i32,
+        requested: f64,
+        host: f64,
+    },
 
     /// An `error_group_id` that does not resolve inside the project the
     /// request names: either no such group exists, or it belongs to another
@@ -574,9 +580,11 @@ impl From<AgentError> for Problem {
                     .with_title("Encryption Error")
                     .with_detail(error.to_string())
             }
-            AgentError::Validation { .. } => problemdetails::new(StatusCode::BAD_REQUEST)
-                .with_title("Validation Error")
-                .with_detail(error.to_string()),
+            AgentError::SandboxCpuLimit { .. } | AgentError::Validation { .. } => {
+                problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_title("Validation Error")
+                    .with_detail(error.to_string())
+            }
             // 400 like every other rejected request-body field, and like the
             // sibling error-group checks in the trigger and workflow
             // handlers. Its message never says whether the group exists in
