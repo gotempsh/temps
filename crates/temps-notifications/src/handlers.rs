@@ -508,7 +508,6 @@ pub struct UpdateCloudflareProviderRequest {
 pub struct TelegramConfig {
     /// Bot token from @BotFather. Encrypted at rest and masked in normal API
     /// responses. Send `***` on update to keep the stored token.
-    #[schema(value_type = String, example = "123456789:AA...")]
     pub bot_token: SecretString,
     /// Chat to post to: a numeric user, group or channel ID (`-100…` for
     /// supergroups and channels) or a public `@channelusername`. A JSON
@@ -3061,7 +3060,7 @@ mod tests {
     }
 
     #[test]
-    fn telegram_chat_id_schema_declares_string_and_integer_forms() {
+    fn telegram_config_schema_marks_the_token_secret_and_accepts_integer_chat_ids() {
         let spec = serde_json::to_value(NotificationProvidersApiDoc::openapi())
             .expect("the OpenAPI document serializes");
         let chat_id = &spec["components"]["schemas"]["TelegramConfig"]["properties"]["chat_id"];
@@ -3085,6 +3084,21 @@ mod tests {
         assert!(
             required.contains(&serde_json::json!("chat_id")),
             "{required:?}"
+        );
+
+        // The bot token keeps the SecretString markers, so the AI assistant
+        // takes it through a secret slot instead of the conversation.
+        let bot_token = &spec["components"]["schemas"]["TelegramConfig"]["properties"]["bot_token"];
+        assert_eq!(
+            bot_token["$ref"], "#/components/schemas/SecretString",
+            "{bot_token}"
+        );
+        let secret = &spec["components"]["schemas"]["SecretString"];
+        assert_eq!(secret["format"], "password", "{secret}");
+        assert_eq!(
+            secret[temps_core::secret_string::SECRET_SCHEMA_EXTENSION],
+            true,
+            "{secret}"
         );
     }
 
