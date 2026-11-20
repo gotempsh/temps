@@ -7,7 +7,9 @@ import {
   createMaintenanceRequest,
   fromLocalInput,
   isOpen,
+  hasStarted,
   maintenanceSchema,
+  maintenanceValues,
   newMaintenanceValues,
   toLocalInput,
   updateMaintenanceRequest,
@@ -104,14 +106,50 @@ describe('requests', () => {
   })
 
   it('only sends what a running window may change', () => {
-    const running = updateMaintenanceRequest(values({ description: 'x' }), true)
+    const running = updateMaintenanceRequest(
+      values({ description: 'x' }),
+      values(),
+      true
+    )
     expect(running).not.toHaveProperty('starts_at')
     expect(running).not.toHaveProperty('monitor_ids')
     expect(running.description).toBe('x')
-    const scheduled = updateMaintenanceRequest(values(), false)
+    const scheduled = updateMaintenanceRequest(values(), values(), false)
     expect(scheduled.monitor_ids).toEqual([4])
     // An empty description removes the stored one.
     expect(scheduled.description).toBe('')
+  })
+
+  it('does not resend times the user left alone', () => {
+    // A window created at 22:00:30 shows as 22:00 in the form.
+    const saved = maintenanceValues({
+      title: 'Database upgrade',
+      description: null,
+      starts_at: new Date(2026, 10, 20, 22, 0, 30).toISOString(),
+      ends_at: new Date(2026, 10, 20, 23, 0, 30).toISOString(),
+      monitor_ids: [4],
+    } as MaintenanceResponse)
+    const renamed = updateMaintenanceRequest(
+      { ...saved, title: 'Database upgrade, part 2' },
+      saved,
+      false
+    )
+    expect(renamed).not.toHaveProperty('starts_at')
+    expect(renamed).not.toHaveProperty('ends_at')
+    const later = toLocalInput(new Date(2026, 10, 21, 0, 0))
+    expect(
+      updateMaintenanceRequest({ ...saved, endsAt: later }, saved, true).ends_at
+    ).toBe(new Date(2026, 10, 21, 0, 0).toISOString())
+  })
+
+  it('knows a scheduled window has begun once its start passes', () => {
+    const scheduled = {
+      state: 'scheduled',
+      starts_at: new Date(2026, 10, 20, 10, 0).toISOString(),
+    } as MaintenanceResponse
+    expect(hasStarted(scheduled, new Date(2026, 10, 20, 9, 59))).toBe(false)
+    expect(hasStarted(scheduled, NOW)).toBe(true)
+    expect(hasStarted({ ...scheduled, state: 'cancelled' }, NOW)).toBe(false)
   })
 
   it('treats scheduled and running windows as open', () => {

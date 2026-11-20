@@ -164,20 +164,37 @@ export function createMaintenanceRequest(
  * The edit body. A window that has started only sends what may still
  * change (title, description, end); an empty description removes it.
  */
+/**
+ * The edit body. Times are sent only when the user changed them: the form
+ * shows them to the minute, so resending an untouched value would move a
+ * window created with seconds (`--starts now`), and the server refuses any
+ * start change once the window has begun.
+ */
 export function updateMaintenanceRequest(
   values: MaintenanceValues,
+  saved: MaintenanceValues,
   started: boolean
 ): UpdateMaintenanceRequest {
   const body: UpdateMaintenanceRequest = {
     title: values.title.trim(),
     description: values.description.trim(),
-    ends_at: iso(values.endsAt),
   }
+  if (values.endsAt !== saved.endsAt) body.ends_at = iso(values.endsAt)
   if (!started) {
-    body.starts_at = iso(values.startsAt)
+    if (values.startsAt !== saved.startsAt) {
+      body.starts_at = iso(values.startsAt)
+    }
     body.monitor_ids = values.monitorIds
   }
   return body
+}
+
+/** Whether `item` has begun at `now`, even if the list was loaded before. */
+export function hasStarted(item: MaintenanceResponse, now: Date): boolean {
+  return (
+    item.state === 'in_progress' ||
+    (item.state === 'scheduled' && new Date(item.starts_at) <= now)
+  )
 }
 
 export function isOpen(item: MaintenanceResponse): boolean {
