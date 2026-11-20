@@ -5801,6 +5801,8 @@ Targeting rules: serve a different value to some users, or to a percentage of th
 
 Show the ordered rules of a flag in one environment
 
+**Usage:** `flags rules list <key> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -5812,6 +5814,8 @@ Show the ordered rules of a flag in one environment
 #### `flags rules set`
 
 Replace the rules of a flag in one environment, from a JSON array (or @path to a file, or - for stdin)
+
+**Usage:** `flags rules set <key> <rules> [options]`
 
 **Options:**
 
@@ -5825,6 +5829,8 @@ Replace the rules of a flag in one environment, from a JSON array (or @path to a
 
 Remove every rule of a flag in one environment
 
+**Usage:** `flags rules clear <key> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -5835,6 +5841,8 @@ Remove every rule of a flag in one environment
 ### `flags evaluate` (alias: `eval`)
 
 Show what a user would get, and why, in one environment
+
+**Usage:** `flags evaluate <key> [options]`
 
 **Options:**
 
@@ -5849,6 +5857,8 @@ Show what a user would get, and why, in one environment
 ### `flags reshuffle`
 
 Draw new rollout buckets for every rollout and split of this flag (never during an experiment)
+
+**Usage:** `flags reshuffle <key> [options]`
 
 **Options:**
 
