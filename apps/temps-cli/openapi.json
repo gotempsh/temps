@@ -187317,6 +187317,10 @@
       "name": "Feature Flags"
     },
     {
+      "description": "In-app surveys shown by the browser SDK; answers are analytics events",
+      "name": "Surveys"
+    },
+    {
       "description": "Ingress connectors: tunnels into the cluster (ADR 058)",
       "name": "Ingress"
     },
@@ -187555,10 +187559,6 @@
     {
       "description": "Which other projects may call a project's *.temps.local addresses",
       "name": "Internal Access"
-    },
-    {
-      "description": "In-app surveys shown by the browser SDK; answers are analytics events",
-      "name": "Surveys"
     }
   ]
 }
