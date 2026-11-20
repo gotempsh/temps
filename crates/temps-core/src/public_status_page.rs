@@ -78,6 +78,39 @@ fn is_subscription_token(candidate: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
+/// What replaces a subscription token in a logged path.
+pub const REDACTED_TOKEN: &str = "[REDACTED]";
+
+/// `path` with the token of a subscription link blanked, for logs.
+///
+/// Confirmation and unsubscribe links carry their capability in the path
+/// (`/confirm/{token}`, `/unsubscribe/{token}` on a custom hostname, and
+/// `/api/status/{slug}/confirm/{token}` and `.../unsubscribe/{token}` on the
+/// console), so a stored access log would let anyone who reads it confirm or
+/// cancel someone else's subscription. Only those two routes are rewritten;
+/// every other path is returned borrowed and unchanged. A query string, if
+/// one is attached, is kept as it is.
+pub fn redact_subscription_token_path(path: &str) -> std::borrow::Cow<'_, str> {
+    let (route, query) = match path.find('?') {
+        Some(at) => path.split_at(at),
+        None => (path, ""),
+    };
+    let token_at = ["/confirm/", "/unsubscribe/"].iter().find_map(|marker| {
+        let at = route.rfind(marker)?;
+        let prefix = &route[..at];
+        let token = &route[at + marker.len()..];
+        let is_status_route = prefix.is_empty()
+            || prefix
+                .strip_prefix("/api/status/")
+                .is_some_and(|slug| !slug.is_empty() && !slug.contains('/'));
+        (is_status_route && is_subscription_token(token)).then_some(at + marker.len())
+    });
+    match token_at {
+        Some(at) => std::borrow::Cow::Owned(format!("{}{REDACTED_TOKEN}{query}", &route[..at])),
+        None => std::borrow::Cow::Borrowed(path),
+    }
+}
+
 /// What a request path on a custom status-page hostname maps to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StatusHostPath {
@@ -148,6 +181,43 @@ impl StatusHostPath {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subscription_tokens_are_blanked_in_logged_paths_and_nothing_else_is() {
+        let token = "c".repeat(SUBSCRIPTION_TOKEN_LEN);
+        for (path, logged) in [
+            (
+                format!("/confirm/{token}"),
+                "/confirm/[REDACTED]".to_string(),
+            ),
+            (
+                format!("/unsubscribe/{token}"),
+                "/unsubscribe/[REDACTED]".to_string(),
+            ),
+            (
+                format!("/api/status/ab12/confirm/{token}"),
+                "/api/status/ab12/confirm/[REDACTED]".to_string(),
+            ),
+            (
+                format!("/api/status/ab12/unsubscribe/{token}?x=1"),
+                "/api/status/ab12/unsubscribe/[REDACTED]?x=1".to_string(),
+            ),
+        ] {
+            assert_eq!(redact_subscription_token_path(&path), logged, "{path}");
+        }
+        for path in [
+            "/".to_string(),
+            "/api/status/ab12".to_string(),
+            "/api/status/ab12/subscribe".to_string(),
+            format!("/app/confirm/{token}"),
+            format!("/api/status/ab12/extra/confirm/{token}"),
+            "/confirm/not-a-token".to_string(),
+        ] {
+            let kept = redact_subscription_token_path(&path);
+            assert!(matches!(kept, std::borrow::Cow::Borrowed(_)), "{path}");
+            assert_eq!(kept, path);
+        }
+    }
 
     #[test]
     fn the_unlock_form_only_posts_and_maps_to_its_slug_route() {
