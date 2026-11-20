@@ -222,6 +222,26 @@ describe("FeatureFlags", () => {
     expect(fetch).toHaveBeenCalledTimes(1);
   });
 
+  it("fails a request that stalls, keeping the bootstrap values", async () => {
+    vi.useFakeTimers();
+    try {
+      const onError = vi.fn();
+      // Headers arrive, then the body never finishes.
+      const fetch = vi.fn(async () => ({ ok: true, status: 200, json: () => new Promise(() => undefined) }) as unknown as Response);
+      const flags = new FeatureFlags({ fetch, onError, bootstrap: { "checkout.v2": true }, timeoutMs: 1_000 });
+      const ready = flags.ready();
+      expect(flags.status).toBe("loading");
+      await vi.advanceTimersByTimeAsync(1_000);
+      await ready;
+      expect(flags.status).toBe("error");
+      expect(onError).toHaveBeenCalledOnce();
+      expect(String(onError.mock.calls[0]?.[0])).toContain("did not answer within 1s");
+      expect(flags.get("checkout.v2", false)).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("never fetches when disabled", async () => {
     const fetch = served([checkout]);
     const flags = new FeatureFlags({ fetch, disabled: true, bootstrap: { "checkout.v2": true } });
