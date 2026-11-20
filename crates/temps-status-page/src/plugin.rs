@@ -26,7 +26,11 @@ use crate::routes::status_page::{create_router, StatusPageApiDoc, StatusPageAppS
 use crate::routes::subscribers::{
     create_subscriber_router, SubscriberApiDoc, SubscriberRoutesState,
 };
+use crate::routes::target_monitors::{
+    create_target_monitor_router, TargetMonitorApiDoc, TargetMonitorRoutesState,
+};
 use crate::routes::webhooks::{create_webhook_router, WebhookApiDoc, WebhookRoutesState};
+use crate::services::checks::{NetworkProber, TargetChecks, TargetMonitorService};
 use crate::services::maintenance::StatusPageMaintenanceService;
 use crate::services::page_access::PageAccessService;
 use crate::services::public_pages::{DomainServiceCertificates, StatusPageDomainService};
@@ -263,12 +267,25 @@ impl TempsPlugin for StatusPagePlugin {
 
             // Create health check service with mandatory ConfigService and JobQueue
             // The service will emit StatusCheckCompleted jobs for outage detection
-            let mut health_check_service =
-                HealthCheckService::new(db.clone(), config_service, queue_service.clone())
-                    .map_err(|error| PluginError::PluginRegistrationFailed {
-                        plugin_name: "status-page".to_string(),
-                        error: error.to_string(),
-                    })?;
+            // Monitors for targets outside Temps (ADR 108 D3, D4).
+            let target_checks = Arc::new(TargetChecks::new(
+                context.require_service::<temps_core::EncryptionService>(),
+                Arc::new(NetworkProber),
+            ));
+            context.register_service(Arc::new(TargetMonitorService::new(
+                db.clone(),
+                target_checks.clone(),
+            )));
+            let mut health_check_service = HealthCheckService::new(
+                db.clone(),
+                config_service,
+                queue_service.clone(),
+                target_checks,
+            )
+            .map_err(|error| PluginError::PluginRegistrationFailed {
+                plugin_name: "status-page".to_string(),
+                error: error.to_string(),
+            })?;
             // ADR 068 D4: probe each environment's primary address.
             if let Some(slot) =
                 context.get_service::<temps_core::environment_address::EnvironmentAddressSlot>()
@@ -465,12 +482,18 @@ impl TempsPlugin for StatusPagePlugin {
             audit: app_state.audit_service.clone(),
             project_access_checker: app_state.project_access_checker.clone(),
         });
+        let target_monitor_state = Arc::new(TargetMonitorRoutesState {
+            monitors: context.require_service::<TargetMonitorService>(),
+            audit: app_state.audit_service.clone(),
+            project_access_checker: app_state.project_access_checker.clone(),
+        });
         let routes = create_router()
             .with_state(app_state)
             .merge(create_subscriber_router(subscriber_state))
             .merge(create_maintenance_router(maintenance_state))
             .merge(create_page_password_router(password_state))
-            .merge(create_webhook_router(webhook_state));
+            .merge(create_webhook_router(webhook_state))
+            .merge(create_target_monitor_router(target_monitor_state));
         Some(PluginRoutes::new(routes))
     }
 
@@ -496,6 +519,7 @@ impl TempsPlugin for StatusPagePlugin {
         doc.merge(<MaintenanceApiDoc as OpenApiTrait>::openapi());
         doc.merge(<PagePasswordApiDoc as OpenApiTrait>::openapi());
         doc.merge(<WebhookApiDoc as OpenApiTrait>::openapi());
+        doc.merge(<TargetMonitorApiDoc as OpenApiTrait>::openapi());
         Some(doc)
     }
 }

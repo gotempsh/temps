@@ -1608,6 +1608,10 @@ mod tests {
             is_active: true,
             is_managed: true,
             next_check_at: None,
+            check_kind: "environment".to_string(),
+            target: None,
+            check_spec: None,
+            request_encrypted: None,
             created_at: now,
             updated_at: now,
         }

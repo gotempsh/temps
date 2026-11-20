@@ -28,6 +28,15 @@ pub struct Model {
     /// does not set it) are still picked up on the next sweep. The scheduler
     /// stamps `now() + check_interval_seconds` after every probe.
     pub next_check_at: Option<DBDateTime>,
+    /// `environment`, or the check run against `target`: `http`, `tcp`,
+    /// `tls` or `dns` (ADR 108 D3, D4).
+    pub check_kind: String,
+    /// URL, `host:port` or hostname of a monitor outside Temps.
+    pub target: Option<String>,
+    /// Typed settings of a target monitor's check; no secret values.
+    pub check_spec: Option<Json>,
+    /// HTTP request headers and body, encrypted with `EncryptionService`.
+    pub request_encrypted: Option<String>,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
 }

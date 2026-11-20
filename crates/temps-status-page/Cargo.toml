@@ -34,6 +34,12 @@ arc-swap = { workspace = true }
 hex = { workspace = true }
 hmac = { workspace = true }
 argon2 = { workspace = true }
+# Target monitors (ADR 108 D3): TLS certificate and DNS checks.
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+webpki-roots = { workspace = true }
+x509-parser = { workspace = true }
+hickory-resolver = { workspace = true }
 rand = { workspace = true }
 sha2 = { workspace = true }
 async-trait = { workspace = true }

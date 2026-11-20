@@ -472,3 +472,55 @@ mod tests {
         assert!(payload.get("slug").is_none());
     }
 }
+
+/// Actions on a monitor for a target outside Temps (ADR 108 D4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TargetMonitorAction {
+    Created,
+    Updated,
+}
+
+/// A target monitor was created or changed. Only the target's host is
+/// recorded: a URL's path or query may carry a token, and request headers
+/// and bodies are never recorded.
+#[derive(Debug, Clone, Serialize)]
+pub struct TargetMonitorAudit {
+    pub actor_user_id: Option<i32>,
+    pub ip_address: Option<String>,
+    pub user_agent: String,
+    pub action: TargetMonitorAction,
+    pub project_id: i32,
+    pub monitor_id: i32,
+    pub check_kind: String,
+    pub target_host: Option<String>,
+    pub header_names: Vec<String>,
+    pub is_active: bool,
+}
+
+impl AuditOperation for TargetMonitorAudit {
+    fn operation_type(&self) -> String {
+        match self.action {
+            TargetMonitorAction::Created => "STATUS_PAGE_MONITOR_CREATED".to_string(),
+            TargetMonitorAction::Updated => "STATUS_PAGE_MONITOR_UPDATED".to_string(),
+        }
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        self.actor_user_id
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.user_agent
+    }
+
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        serde_json::to_string(self).map_err(|source| {
+            temps_core::AuditError::serialize(format!("monitor {}", self.monitor_id), source)
+        })
+    }
+}
