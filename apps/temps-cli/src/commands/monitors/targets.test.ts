@@ -2,7 +2,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { describe, expect, it } from 'bun:test'
-import { checkSpecFromOptions, parseHeaderLines } from './targets.js'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { checkSpecFromOptions, parseHeaderLines, requestFromFiles } from './targets.js'
 
 describe('checkSpecFromOptions', () => {
   it('builds each kind', () => {
@@ -44,5 +47,27 @@ describe('parseHeaderLines', () => {
       { name: 'X-Env', value: 'prod' },
     ])
     expect(parseHeaderLines('no colon here')).toContain('line 1')
+  })
+})
+
+describe('requestFromFiles', () => {
+  it('reads the header and body files', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'temps-monitor-request-'))
+    try {
+      writeFileSync(join(dir, 'headers'), 'Authorization: Bearer example\n')
+      writeFileSync(join(dir, 'body'), '{"ping":true}')
+      expect(await requestFromFiles(join(dir, 'headers'), join(dir, 'body'))).toEqual({
+        headers: [{ name: 'Authorization', value: 'Bearer example' }],
+        body: '{"ping":true}',
+      })
+      expect(await requestFromFiles()).toBeNull()
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('names the file it could not read', async () => {
+    const missing = join(tmpdir(), 'temps-monitor-request-missing', 'headers')
+    await expect(requestFromFiles(missing)).rejects.toThrow(`could not read ${missing}`)
   })
 })

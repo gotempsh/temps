@@ -3,7 +3,6 @@
 
 // Monitors for targets outside Temps (ADR 108 D3, D4).
 
-import { readFile } from 'node:fs/promises'
 import type { Command } from 'commander'
 import { requireAuth } from '../../config/store.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
@@ -131,12 +130,15 @@ export function parseHeaderLines(text: string): CheckRequest['headers'] | string
 }
 
 /** The request read from --header-file and --body-file, `null` when neither is given. */
-async function requestFromFiles(headerFile?: string, bodyFile?: string): Promise<CheckRequest | null> {
+/** The request of `--header-file` and `--body-file`, or null when neither is given. */
+export async function requestFromFiles(headerFile?: string, bodyFile?: string): Promise<CheckRequest | null> {
   if (!headerFile && !bodyFile) return null
   const read = (path: string) =>
-    readFile(path, 'utf8').catch((error: Error) => {
-      throw new Error(`could not read ${path}: ${error.message}`)
-    })
+    Bun.file(path)
+      .text()
+      .catch((error: Error) => {
+        throw new Error(`could not read ${path}: ${error.message}`)
+      })
   const headers = headerFile ? parseHeaderLines(await read(headerFile)) : []
   if (typeof headers === 'string') throw new Error(headers)
   return { headers, body: bodyFile ? await read(bodyFile) : null }
