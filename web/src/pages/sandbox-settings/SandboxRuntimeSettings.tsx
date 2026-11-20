@@ -3,6 +3,7 @@
 
 import { getSandboxResourceDefaultsOptions } from '@/api/client/@tanstack/react-query.gen'
 import { defaultHint } from '@/components/sandboxes/sandbox-create'
+import { ReadFailure } from '@/components/ui/read-failure'
 import { SettingsLoadFailure } from '@/components/settings/SettingsLoadFailure'
 import { isForbiddenRead } from '@/lib/read-failure'
 import { useState } from 'react'
@@ -155,7 +156,12 @@ export function SandboxRuntimeSettings() {
   const [configRepoAllowlist, setConfigRepoAllowlist] = useState('')
   const [defaultProvider, setDefaultProvider] = useState('claude_cli')
   const [sandboxBackend, setSandboxBackend] = useState('docker')
-  const { data: hints } = useQuery(
+  const {
+    data: hints,
+    error: hintsError,
+    isFetching: hintsFetching,
+    refetch: refetchHints,
+  } = useQuery(
     getSandboxResourceDefaultsOptions({
       query: {
         backend:
@@ -743,24 +749,41 @@ export function SandboxRuntimeSettings() {
               Resources
             </CardTitle>
             <CardDescription>
-              CPU and memory limits per sandbox container. Automatic placement:{' '}
-              {defaultHint(
-                hints?.agent_cpu,
-                'cores',
-                hints && maxCpu,
-                hints?.host_cpu_cores
+              CPU and memory limits per sandbox container.
+              {hints && (
+                <>
+                  {' '}
+                  Automatic placement:{' '}
+                  {defaultHint(
+                    hints.agent_cpu,
+                    'cores',
+                    maxCpu,
+                    hints.host_cpu_cores
+                  )}
+                  .{' '}
+                  {defaultHint(
+                    hints.agent_memory_mb,
+                    'MB',
+                    maxMemory,
+                    hints.host_memory_mb
+                  )}
+                  .
+                </>
               )}
-              .{' '}
-              {defaultHint(
-                hints?.agent_memory_mb,
-                'MB',
-                hints && maxMemory,
-                hints?.host_memory_mb
-              )}
-              .
+              {!hints && !hintsError && ' Reading placement limits…'}
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
+            {hintsError && (
+              <ReadFailure
+                resource="Sandbox placement limits"
+                error={hintsError}
+                cached={Boolean(hints)}
+                onRetry={() => void refetchHints()}
+                retrying={hintsFetching}
+                embedded
+              />
+            )}
             <div className="space-y-2">
               <Label>Preset</Label>
               <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
