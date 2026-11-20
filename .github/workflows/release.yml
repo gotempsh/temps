@@ -97,8 +97,12 @@ jobs:
     permissions:
       contents: read
     steps:
+      # Full history and tags: verifying the SDK selection re-derives it from commits.
       - name: Checkout release validation script
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
 
       - name: Reject unsafe publishing refs
         env:
@@ -129,6 +133,15 @@ jobs:
           with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as out:
               out.write(release.notes(packages))
           PYTHON
+
+      # prepared.json was derived before the tag; a commit that landed since can
+      # need other versions, and a published version cannot be replaced. Runs
+      # before every job that publishes, and reads only git and the registries.
+      - name: Verify the prepared SDK selection at the tag
+        if: github.ref_type == 'tag' && steps.sdk.outputs.selected == 'true' && steps.sdk.outputs.all != 'true'
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: python3 scripts/sdk_release.py prepare --tag "$RELEASE_TAG" --check --at-tag
 
   # SDK packaging runs focused tests, but the platform suite must also have
   # passed before publication. Rather than re-running the whole suite here
