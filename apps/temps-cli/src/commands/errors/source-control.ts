@@ -18,7 +18,7 @@ import {
   replaceErrorOwnershipRules,
   unlinkErrorGroupIssue,
 } from '../../api/sdk.gen.js'
-import type { IssueLinkView, OwnershipRuleRequest, SourceControlStatusView } from '../../api/types.gen.js'
+import type { IssueLinkList, IssueLinkView, OwnershipRuleRequest, SourceControlStatusView } from '../../api/types.gen.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { printTable } from '../../ui/table.js'
 import { header, info, json, keyValue, success, warning } from '../../ui/output.js'
@@ -177,14 +177,44 @@ async function listAction(options: GroupOptions & { refresh?: boolean }): Promis
     if (error || !data) throw new Error(getErrorMessage(error))
     return data
   })
-  if (options.json) {
-    json(result.data)
-    return
+  reportIssueList(result, path.group_id, Boolean(options.json))
+}
+
+/** Where {@link reportIssueList} writes: the terminal, or a test. */
+export interface IssueListOutput {
+  json: (data: unknown) => void
+  table: (groupId: number, links: IssueLinkView[]) => void
+  /** Written to standard error, so `--json` output stays parseable. */
+  warning: (message: string) => void
+}
+
+const terminalOutput: IssueListOutput = {
+  json,
+  table: (groupId, links) => {
+    header(`Issues of error group #${groupId}`)
+    printLinks(links)
+  },
+  warning,
+}
+
+/**
+ * Print a group's issues. Issues a refresh could not read are reported in
+ * both forms: with `--json` the links stay a JSON array on standard output
+ * and the count goes to standard error.
+ */
+export function reportIssueList(
+  result: IssueLinkList,
+  groupId: number,
+  asJson: boolean,
+  out: IssueListOutput = terminalOutput,
+): void {
+  if (asJson) {
+    out.json(result.data)
+  } else {
+    out.table(groupId, result.data)
   }
-  header(`Issues of error group #${path.group_id}`)
-  printLinks(result.data)
   if (result.failed_refreshes > 0) {
-    warning(`${result.failed_refreshes} issue(s) could not be read; they keep their last state`)
+    out.warning(`${result.failed_refreshes} issue(s) could not be read; they keep their last state`)
   }
 }
 
