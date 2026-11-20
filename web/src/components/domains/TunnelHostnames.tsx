@@ -49,11 +49,17 @@ function useRefreshIngress() {
     ])
 }
 
-export function RetryHostnameDns({ view }: { view: HostnameView }) {
+export function RetryHostnameDns({
+  hostname,
+  connectorId,
+}: {
+  hostname: string
+  connectorId?: number | null
+}) {
   const queries = useQueryClient()
   const refresh = useRefreshIngress()
   const detail = getIngressHostnameOptions({
-    path: { hostname: view.hostname },
+    path: { hostname },
   })
   const retry = useMutation({
     ...retryIngressHostnameDnsMutation(),
@@ -68,7 +74,7 @@ export function RetryHostnameDns({ view }: { view: HostnameView }) {
       }
     },
     onError: (error) =>
-      toast.error(`Could not retry DNS setup for ${view.hostname}`, {
+      toast.error(`Could not retry DNS setup for ${hostname}`, {
         description: problemDetail(
           error,
           'Refresh the hostname status and try again.'
@@ -80,8 +86,7 @@ export function RetryHostnameDns({ view }: { view: HostnameView }) {
         queries.invalidateQueries({ queryKey: detail.queryKey }),
       ]),
   })
-  const id = view.retry_dns_connector_id
-  if (id == null) return null
+  if (connectorId == null && !retry.isPending) return null
   return (
     <Button
       variant="outline"
@@ -89,7 +94,8 @@ export function RetryHostnameDns({ view }: { view: HostnameView }) {
       disabled={retry.isPending}
       onClick={(event) => {
         event.stopPropagation()
-        retry.mutate({ path: { id, hostname: view.hostname } })
+        if (connectorId != null)
+          retry.mutate({ path: { id: connectorId, hostname } })
       }}
     >
       {retry.isPending ? 'Retrying DNS setup…' : 'Retry DNS setup'}
@@ -191,9 +197,12 @@ function HostnameRow({
             <span className="break-all text-sm">{view.hostname}</span>
           )}
           <StateBadge view={view} />
-          {view.retry_dns_connector_id === connectorId && (
-            <RetryHostnameDns view={view} />
-          )}
+          <RetryHostnameDns
+            hostname={view.hostname}
+            connectorId={
+              view.retry_dns_connector_id === connectorId ? connectorId : null
+            }
+          />
         </div>
         <HostnameChoice view={view} />
       </div>

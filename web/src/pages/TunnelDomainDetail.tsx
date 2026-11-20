@@ -223,7 +223,11 @@ function HostnameDetail({
       verdict={<Status tone={verdict.tone} label={verdict.label} />}
       actions={
         <>
-          <RetryHostnameDns view={view} />
+          <RetryHostnameDns
+            key={view.hostname}
+            hostname={view.hostname}
+            connectorId={view.retry_dns_connector_id}
+          />
           {view.state === 'published' && (
             <Button variant="outline" asChild>
               <a

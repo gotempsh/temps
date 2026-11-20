@@ -212,7 +212,7 @@ export function DomainsManagement({
   const retries = new Map(
     (hostnamesQuery.data ?? [])
       .filter((host) => host.retry_dns_connector_id != null)
-      .map((host) => [host.hostname, host])
+      .map((host) => [host.hostname, host.retry_dns_connector_id])
   )
   const failingTunnels = tunnels.filter(
     (r) => r.kind === 'tunnel' && r.view.state === 'error'
@@ -295,10 +295,10 @@ export function DomainsManagement({
       className: 'w-12',
       render: (row) => {
         // A certificate and a tunnel publication can share a single row.
-        const retry = retries.get(row.name)
+        const connectorId = retries.get(row.name)
         return (
           <div className="flex items-center justify-end gap-1">
-            {retry && <RetryHostnameDns view={retry} />}
+            <RetryHostnameDns hostname={row.name} connectorId={connectorId} />
             {row.kind === 'certificate' ? (
               <DomainRowMenu
                 domain={row.domain}
@@ -308,7 +308,7 @@ export function DomainsManagement({
                 canManageCertificates={canManageCertificates}
               />
             ) : (
-              !retry && (
+              connectorId == null && (
                 <Button
                   variant="ghost"
                   size="icon"

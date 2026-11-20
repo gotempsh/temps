@@ -6,6 +6,7 @@ import { cleanup, fireEvent, render, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter, Route, Routes, useParams } from 'react-router'
 import { toast } from 'sonner'
+import { listIngressHostnamesQueryKey } from '@/api/client/@tanstack/react-query.gen'
 import type { DomainResponse } from '@/api/client/types.gen'
 import { PlatformAccessContext } from '@/contexts/PlatformAccessContext-shared'
 import { installBrowserWindow } from '@/test/dom'
@@ -190,7 +191,10 @@ test('retry targets one failed hostname and refreshes its row after a conflict o
   let finish = (_response: Response) => {}
   let reads = 0
   let writes = 0
-  const view = renderTable(undefined, {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  const view = renderTable(client, {
     'GET /ingress/connectors': () => jsonResponse({ connectors: [], total: 0 }),
     'GET /ingress/hostnames': () => {
       reads++
@@ -228,8 +232,21 @@ test('retry targets one failed hostname and refreshes its row after a conflict o
     )
     await waitFor(() => expect(writes).toBe(2))
     current = published
-    finish(jsonResponse(current))
+    await client.invalidateQueries({ queryKey: listIngressHostnamesQueryKey() })
     await view.findByText('Live')
+    expect(
+      (
+        view.getByRole('button', {
+          name: 'Retrying DNS setup…',
+        }) as HTMLButtonElement
+      ).disabled
+    ).toBe(true)
+    finish(jsonResponse(current))
+    await waitFor(() =>
+      expect(
+        view.queryByRole('button', { name: 'Retrying DNS setup…' })
+      ).toBeNull()
+    )
     expect(success).toHaveBeenCalledWith(`DNS setup completed for ${hostname}`)
     expect(view.queryByRole('button', { name: 'Retry DNS setup' })).toBeNull()
   } finally {
