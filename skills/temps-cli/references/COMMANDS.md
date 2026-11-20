@@ -5980,6 +5980,8 @@ List surveys
 
 Show a survey: its questions and when it is shown
 
+**Usage:** `surveys get <id> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -5990,6 +5992,8 @@ Show a survey: its questions and when it is shown
 ### `surveys create`
 
 Create a survey (a draft unless --status active)
+
+**Usage:** `surveys create <name> [options]`
 
 **Options:**
 
@@ -6005,6 +6009,8 @@ Create a survey (a draft unless --status active)
 ### `surveys update`
 
 Change a survey; only the options given are changed
+
+**Usage:** `surveys update <id> [options]`
 
 **Options:**
 
@@ -6022,6 +6028,8 @@ Change a survey; only the options given are changed
 
 Start showing a survey to visitors
 
+**Usage:** `surveys launch <id> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -6031,6 +6039,8 @@ Start showing a survey to visitors
 ### `surveys pause`
 
 Stop showing a survey for now
+
+**Usage:** `surveys pause <id> [options]`
 
 **Options:**
 
@@ -6042,6 +6052,8 @@ Stop showing a survey for now
 
 Stop showing a survey for good (its results stay)
 
+**Usage:** `surveys complete <id> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -6051,6 +6063,8 @@ Stop showing a survey for good (its results stay)
 ### `surveys delete`
 
 Delete a survey (answers already recorded stay in analytics events)
+
+**Usage:** `surveys delete <id> [options]`
 
 **Options:**
 
@@ -6062,6 +6076,8 @@ Delete a survey (answers already recorded stay in analytics events)
 ### `surveys results`
 
 Summarise the answers: counts, averages and NPS per question
+
+**Usage:** `surveys results <id> [options]`
 
 **Options:**
 
@@ -6075,6 +6091,8 @@ Summarise the answers: counts, averages and NPS per question
 ### `surveys responses`
 
 List individual responses, newest first
+
+**Usage:** `surveys responses <id> [options]`
 
 **Options:**
 
