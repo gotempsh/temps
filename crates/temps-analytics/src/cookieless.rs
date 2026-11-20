@@ -73,14 +73,20 @@ pub enum CookielessIdentityError {
     },
     #[error("Cookieless salt for {day} is missing after it was created")]
     Missing { day: NaiveDate },
-    #[error("Looking up the current session of cookieless visitor {visitor_id} in project {project_id} failed: {reason}")]
+    #[error("Looking up the current session of cookieless visitor {visitor_id} in project {project_id} failed: {source}")]
     Session {
         project_id: i32,
         visitor_id: String,
-        reason: String,
+        /// Shared: the cache hands every waiting caller the same error.
+        #[source]
+        source: Arc<sea_orm::DbErr>,
     },
-    #[error("Reading the analytics identity mode of project {project_id} failed: {reason}")]
-    Mode { project_id: i32, reason: String },
+    #[error("Reading the analytics identity mode of project {project_id} failed: {source}")]
+    Mode {
+        project_id: i32,
+        #[source]
+        source: Arc<sea_orm::DbErr>,
+    },
 }
 
 /// The visitor and session a cookieless event belongs to.
@@ -221,10 +227,10 @@ impl CookielessIdentity {
                 Ok::<_, sea_orm::DbErr>(existing.unwrap_or(derived))
             })
             .await
-            .map_err(|error| CookielessIdentityError::Session {
+            .map_err(|source| CookielessIdentityError::Session {
                 project_id,
                 visitor_id: visitor_id.to_string(),
-                reason: error.to_string(),
+                source,
             })
     }
 
@@ -252,10 +258,7 @@ impl CookielessIdentity {
                 Ok::<_, sea_orm::DbErr>(mode_from_stored(stored.as_deref()))
             })
             .await
-            .map_err(|error| CookielessIdentityError::Mode {
-                project_id,
-                reason: error.to_string(),
-            })
+            .map_err(|source| CookielessIdentityError::Mode { project_id, source })
     }
 
     /// Drop the cached mode of `project_id` after it changed, so this
@@ -398,6 +401,18 @@ pub fn spawn_salt_sweep(identity: Arc<CookielessIdentity>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lookup_errors_keep_the_database_error_as_their_source() {
+        use std::error::Error as _;
+        let error = CookielessIdentityError::Mode {
+            project_id: 7,
+            source: Arc::new(sea_orm::DbErr::Custom("connection reset".into())),
+        };
+        assert!(error.to_string().contains("project 7"), "{error}");
+        let source = error.source().expect("typed source");
+        assert!(source.to_string().contains("connection reset"), "{source}");
+    }
 
     #[test]
     fn racing_nodes_derive_the_same_new_session_and_a_later_session_differs() {
