@@ -144,6 +144,17 @@ async function highlight(
   )
 }
 
+/**
+ * On touch screens (no hover) the untitled block's controls are always
+ * visible, so they leave the corner and take their own row above the code.
+ */
+const TOUCH_TOOLBAR = cn(
+  '[@media(hover:none)]:static [@media(hover:none)]:self-end',
+  '[@media(hover:none)]:mt-2 [@media(hover:none)]:mr-2',
+  '[@media(hover:none)]:bg-transparent [@media(hover:none)]:backdrop-blur-none',
+  '[@media(hover:none)]:opacity-100'
+)
+
 export function CodeBlock({
   code,
   language = 'text',
@@ -247,13 +258,16 @@ export function CodeBlock({
       <div className="flex min-w-0 flex-col dark:bg-white/[0.025]">
         {/* Untitled blocks look like the docs: the code starts at the top and
             the controls float in the corner, shown on hover or keyboard
-            focus, and always on touch screens, which have no hover. They
-            sit on the panel colour so a long line never shows through. */}
+            focus. They sit on the panel colour so a long line never shows
+            through. Touch screens have no hover, so there the controls stay
+            visible in their own row above the code instead of covering its
+            first line. */}
         {!title &&
           controls(
             cn(
               'absolute top-2 right-2 z-10 rounded-lg bg-white/90 p-0.5 backdrop-blur-sm dark:bg-zinc-900/90',
-              'opacity-0 transition-opacity group-hover/code:opacity-100 group-focus-within/code:opacity-100 [@media(hover:none)]:opacity-100'
+              'opacity-0 transition-opacity group-hover/code:opacity-100 group-focus-within/code:opacity-100',
+              TOUCH_TOOLBAR
             )
           )}
         <div
@@ -262,6 +276,8 @@ export function CodeBlock({
           className={cn(
             'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring',
             'min-w-0 w-full px-4 py-4',
+            // Under the touch toolbar row, the code needs less top padding.
+            !title && '[@media(hover:none)]:pt-1',
             wrapLines ? 'overflow-x-hidden' : 'overflow-x-auto'
           )}
         >

@@ -72,9 +72,9 @@ test('dark comments are lightened and other token colours are untouched', () => 
 })
 
 // Untitled blocks look like the docs: the code starts at the top and the
-// controls float in the corner. They appear on hover or keyboard focus, stay
-// visible on touch screens (no hover there), and sit on the panel colour so
-// a long unwrapped line never shows through them.
+// controls float in the corner, appearing on hover or keyboard focus, on the
+// panel colour so a long unwrapped line never shows through them. On touch
+// screens they take their own row so they never cover the code.
 test.each([
   { showCopy: true, disableWrapToggle: false },
   { showCopy: false, disableWrapToggle: false },
@@ -94,7 +94,12 @@ test.each([
   expect(controls.classList.contains('opacity-0')).toBe(true)
   expect(controls.className).toContain('group-hover/code:opacity-100')
   expect(controls.className).toContain('group-focus-within/code:opacity-100')
+  // Touch screens have no hover: the controls stay visible in their own row
+  // above the code instead of covering its first line.
   expect(controls.className).toContain('[@media(hover:none)]:opacity-100')
+  expect(controls.className).toContain('[@media(hover:none)]:static')
+  expect(controls.className).toContain('[@media(hover:none)]:self-end')
+  expect(scroller.className).toContain('[@media(hover:none)]:pt-1')
   expect(controls.className).toContain('bg-white/90')
   // No toolbar row: the code is padded evenly from the top.
   expect(scroller.classList.contains('py-4')).toBe(true)
@@ -111,6 +116,17 @@ test.each([
 
 // A titled block keeps its controls in the title bar, so no empty toolbar
 // row sits between the title and the code.
+test('titled blocks keep their controls in the title bar on touch screens too', () => {
+  const view = render(<CodeBlock code="A=1" language="bash" title=".env" />)
+  const controls = view.getByRole('button', {
+    name: 'Show line numbers',
+  }).parentElement!
+  expect(controls.className).not.toContain('absolute')
+  expect(controls.className).not.toContain('[@media(hover:none)]')
+  const scroller = view.container.querySelector('pre')!.parentElement!
+  expect(scroller.className).not.toContain('[@media(hover:none)]:pt-1')
+})
+
 test('a titled block puts its controls in the title bar', async () => {
   const view = render(<CodeBlock code="A=1" language="bash" title=".env" />)
   await act(async () => {})
