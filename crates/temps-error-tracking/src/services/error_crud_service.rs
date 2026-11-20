@@ -343,11 +343,11 @@ impl ErrorCRUDService {
         {
             let ids = self
                 .get_range_sorted_group_ids(
+                    query.clone(),
                     project_id,
                     start,
                     end,
                     environment_id,
-                    status_filter.as_deref(),
                     sort_order.as_deref(),
                     page,
                     page_size,
@@ -538,65 +538,76 @@ impl ErrorCRUDService {
 
     /// Page error groups by the same time-bounded event count returned to the UI.
     /// This must run in SQL before pagination; sorting just the fetched page is incorrect.
+    ///
+    /// `filtered` is the list query with every filter applied (status,
+    /// environment, assignee, issue type, search, merged groups), so the page
+    /// holds only groups the list would show and matches its total.
     #[allow(clippy::too_many_arguments)]
     async fn get_range_sorted_group_ids(
         &self,
+        filtered: sea_orm::Select<error_groups::Entity>,
         project_id: i32,
         start: DateTime<Utc>,
         end: DateTime<Utc>,
         environment_id: Option<i32>,
-        status: Option<&str>,
         sort_order: Option<&str>,
         page: u64,
         page_size: u64,
     ) -> Result<Vec<i32>, ErrorTrackingError> {
+        use sea_orm::sea_query::{Alias, Expr, JoinType, Order, Query};
+        use sea_orm::{QuerySelect, QueryTrait};
+
         #[derive(FromQueryResult)]
         struct ErrorGroupIdRow {
             id: i32,
         }
 
-        let mut values: Vec<sea_orm::Value> = vec![project_id.into(), start.into(), end.into()];
-        let mut event_env = String::new();
-        let mut group_env = String::new();
+        let events = Alias::new("e");
+        let counts = Alias::new("range_counts");
+        let group_id = Alias::new("error_group_id");
+        let event_count = Alias::new("event_count");
+
+        let mut count_query = Query::select();
+        count_query
+            .column((events.clone(), group_id.clone()))
+            .expr_as(Expr::cust("COUNT(*)"), event_count.clone())
+            .from_as(Alias::new("error_events"), events.clone())
+            .and_where(Expr::col((events.clone(), Alias::new("project_id"))).eq(project_id))
+            .and_where(Expr::col((events.clone(), Alias::new("timestamp"))).gte(start))
+            .and_where(Expr::col((events.clone(), Alias::new("timestamp"))).lte(end))
+            .group_by_col((events.clone(), group_id.clone()));
         if let Some(env_id) = environment_id {
-            values.push(env_id.into());
-            let placeholder = values.len();
-            event_env = format!(" AND e.environment_id = ${placeholder}");
-            group_env = format!(" AND g.environment_id = ${placeholder}");
+            count_query
+                .and_where(Expr::col((events.clone(), Alias::new("environment_id"))).eq(env_id));
         }
-        let mut group_status = String::new();
-        if let Some(status) = status {
-            values.push(status.to_owned().into());
-            group_status = format!(" AND g.status = ${}", values.len());
-        }
-        values.push((page_size as i64).into());
-        let limit_placeholder = values.len();
-        let offset =
-            i64::try_from(page.saturating_sub(1).saturating_mul(page_size)).unwrap_or(i64::MAX);
-        values.push(offset.into());
-        let offset_placeholder = values.len();
-        let direction = if sort_order == Some("asc") {
-            "ASC"
+
+        let offset = page.saturating_sub(1).saturating_mul(page_size);
+        let order = if sort_order == Some("asc") {
+            Order::Asc
         } else {
-            "DESC"
+            Order::Desc
         };
-        let sql = format!(
-            "SELECT g.id FROM error_groups g \
-             JOIN (SELECT e.error_group_id, COUNT(*) AS event_count \
-                   FROM error_events e \
-                   WHERE e.project_id = $1 AND e.timestamp >= $2 AND e.timestamp <= $3{event_env} \
-                   GROUP BY e.error_group_id) counts ON counts.error_group_id = g.id \
-             WHERE g.project_id = $1 AND g.merged_into_group_id IS NULL{group_env}{group_status} \
-             ORDER BY counts.event_count {direction}, g.id ASC \
-             LIMIT ${limit_placeholder} OFFSET ${offset_placeholder}"
-        );
-        let rows = ErrorGroupIdRow::find_by_statement(Statement::from_sql_and_values(
-            DatabaseBackend::Postgres,
-            sql,
-            values,
-        ))
-        .all(self.db.as_ref())
-        .await?;
+        let mut statement = filtered
+            .select_only()
+            .column(error_groups::Column::Id)
+            .into_query();
+        statement
+            .clear_order_by()
+            .join_subquery(
+                JoinType::InnerJoin,
+                count_query,
+                counts.clone(),
+                Expr::col((counts.clone(), group_id))
+                    .equals((error_groups::Entity, error_groups::Column::Id)),
+            )
+            .order_by((counts, event_count), order)
+            .order_by((error_groups::Entity, error_groups::Column::Id), Order::Asc)
+            .limit(page_size)
+            .offset(offset);
+
+        let rows = ErrorGroupIdRow::find_by_statement(DatabaseBackend::Postgres.build(&statement))
+            .all(self.db.as_ref())
+            .await?;
         Ok(rows.into_iter().map(|row| row.id).collect())
     }
 
@@ -1355,6 +1366,87 @@ mod tests {
                     Some(if expected_id == high_in_range { 3 } else { 1 })
                 );
             }
+        }
+    }
+
+    /// The busiest groups in the range do not match the filters: the page
+    /// must still hold the matching group, not come back empty while the
+    /// total says there is one.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_range_event_sort_pages_only_groups_matching_every_filter() {
+        use sea_orm::ConnectionTrait;
+
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error)
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+            {
+                eprintln!("Skipping filtered range sort database test: {error}");
+                return;
+            }
+            Err(error) => panic!("Filtered range sort test database setup failed: {error}"),
+        };
+        let db = test_db.connection_arc();
+        let service = ErrorCRUDService::new(db.clone());
+        let project_id = create_test_project(&db).await;
+        let busy = create_test_error_group(&db, project_id, "unresolved").await;
+        let quiet = create_test_error_group(&db, project_id, "unresolved").await;
+        let mut group: error_groups::ActiveModel = error_groups::Entity::find_by_id(quiet)
+            .one(db.as_ref())
+            .await
+            .expect("read group")
+            .expect("group exists")
+            .into();
+        group.issue_type = Set("performance".to_string());
+        group.title = Set("N+1 query in checkout".to_string());
+        group.update(db.as_ref()).await.expect("mark performance");
+
+        let start = Utc::now() - chrono::Duration::hours(1);
+        for (group_id, count) in [(busy, 5), (quiet, 1)] {
+            for index in 0..count {
+                db.execute(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    "INSERT INTO error_events (error_group_id, project_id, timestamp, fingerprint_hash, exception_type, source) VALUES ($1, $2, NOW(), $3, 'TypeError', 'test')",
+                    vec![group_id.into(), project_id.into(), format!("filtered-{group_id}-{index}").into()],
+                ))
+                .await
+                .expect("insert event");
+            }
+        }
+        let end = Utc::now() + chrono::Duration::seconds(1);
+
+        for refine in [
+            crate::services::types::GroupListRefinement {
+                issue_type: Some("performance".to_string()),
+                ..Default::default()
+            },
+            crate::services::types::GroupListRefinement {
+                search: Some("checkout".to_string()),
+                ..Default::default()
+            },
+        ] {
+            let (groups, total) = service
+                .list_error_groups(
+                    project_id,
+                    Some(1),
+                    Some(1),
+                    None,
+                    None,
+                    Some("events_in_range".to_string()),
+                    Some("desc".to_string()),
+                    Some(start),
+                    Some(end),
+                    &refine,
+                )
+                .await
+                .expect("filtered range-sorted page");
+            assert_eq!(total, 1, "{refine:?}");
+            assert_eq!(
+                groups.iter().map(|g| g.id).collect::<Vec<_>>(),
+                vec![quiet],
+                "{refine:?}"
+            );
         }
     }
 
