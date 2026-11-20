@@ -216,6 +216,22 @@ describe("Surveys", () => {
     expect(onEvent).toHaveBeenCalledOnce();
   });
 
+  it("fails a request that stalls, so a later load can retry", async () => {
+    vi.useFakeTimers();
+    try {
+      const onError = vi.fn();
+      const fetch = vi.fn(() => new Promise<Response>(() => undefined));
+      const surveys = new Surveys({ fetch, onEvent: () => undefined, onError, storage: memoryStorage(), timeoutMs: 1_000 });
+      const loaded = surveys.load();
+      await vi.advanceTimersByTimeAsync(1_000);
+      await loaded;
+      expect(surveys.status).toBe("error");
+      expect(onError).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("never fetches when disabled", async () => {
     const fetch = served([nps]);
     const surveys = new Surveys({ fetch, onEvent: () => undefined, disabled: true });

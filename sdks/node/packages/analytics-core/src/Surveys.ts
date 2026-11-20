@@ -18,6 +18,7 @@
  * with `eligible()`, `markShown()`, `dismiss()` and `submit()`.
  */
 
+import { postJson, REQUEST_TIMEOUT_MS } from "./request";
 import type { JsonValue } from "./types";
 
 export type SurveyQuestionKind =
@@ -91,6 +92,9 @@ export interface SurveysOptions {
   fetch?: typeof fetch;
   storage?: Pick<Storage, "getItem" | "setItem"> | null;
   now?: () => number;
+  /** How long the surveys request may take, body included. Defaults to 10 s;
+   * past it the request fails and is retried later like any other. */
+  timeoutMs?: number;
 }
 
 interface SurveysResponseBody {
@@ -105,6 +109,7 @@ export class Surveys {
   private readonly storage: Pick<Storage, "getItem" | "setItem"> | null;
   private readonly disabled: boolean;
   private readonly now: () => number;
+  private readonly timeoutMs: number;
   private context: { key?: string; attributes?: SurveysOptions["attributes"] };
   /** Bumped by `setContext`, so a request for the old context is ignored. */
   private generation = 0;
@@ -133,6 +138,7 @@ export class Surveys {
     this.storage = options.storage === undefined ? defaultStorage() : options.storage;
     this.disabled = options.disabled ?? false;
     this.now = options.now ?? Date.now;
+    this.timeoutMs = options.timeoutMs ?? REQUEST_TIMEOUT_MS;
     this.context = { key: options.key, attributes: options.attributes };
   }
 
@@ -172,14 +178,12 @@ export class Surveys {
       let surveys: Survey[] | null = null;
       let failure: Error | null = null;
       try {
-        const response = await fetchImpl(`${this.basePath}/surveys`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          credentials: "same-origin",
-          body: JSON.stringify({ key: context.key, attributes: context.attributes ?? {} }),
-        });
-        if (!response.ok) throw new Error(`surveys request returned ${response.status}`);
-        const parsed = (await response.json()) as SurveysResponseBody;
+        const parsed = await postJson<SurveysResponseBody>(
+          fetchImpl,
+          `${this.basePath}/surveys`,
+          JSON.stringify({ key: context.key, attributes: context.attributes ?? {} }),
+          this.timeoutMs
+        );
         surveys = Array.isArray(parsed.surveys) ? parsed.surveys : [];
       } catch (error) {
         failure = error instanceof Error ? error : new Error(String(error));
