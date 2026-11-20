@@ -53,9 +53,10 @@ describe('conversion form', () => {
   })
 
   test('a property filter needs a safe key and a value', () => {
-    expect(
-      issues({ eventName: 'signup', propertyKey: 'plan-tier' })
-    ).toEqual(['propertyKey', 'propertyValue'])
+    expect(issues({ eventName: 'signup', propertyKey: 'plan-tier' })).toEqual([
+      'propertyKey',
+      'propertyValue',
+    ])
     expect(
       issues({
         eventName: 'signup',
@@ -70,7 +71,11 @@ describe('conversion form', () => {
       'revenueProperty',
     ])
     expect(
-      issues({ eventName: 'buy', revenueProperty: 'amount', revenueCurrency: 'EURO' })
+      issues({
+        eventName: 'buy',
+        revenueProperty: 'amount',
+        revenueCurrency: 'EURO',
+      })
     ).toEqual(['revenueCurrency'])
   })
 })
@@ -147,7 +152,9 @@ describe('labels', () => {
       )
     ).toBe('Event purchase where plan = pro')
     expect(
-      describeGoal(goal({ kind: 'page', event_name: null, page_path: '/docs/*' }))
+      describeGoal(
+        goal({ kind: 'page', event_name: null, page_path: '/docs/*' })
+      )
     ).toBe('Visit to /docs/*')
   })
 
@@ -157,5 +164,23 @@ describe('labels', () => {
     expect(formatRate(66.67)).toBe('67%')
     expect(formatRevenue(50, 'USD')).toBe('$50.00')
     expect(formatRevenue(5, 'ZZZZ')).toBe('5.00 ZZZZ')
+  })
+
+  test('renaming a page goal keeps its property filter', () => {
+    const existing = goal({
+      kind: 'page',
+      event_name: null,
+      page_path: '/thank-you',
+      event_filter: [
+        { type: 'custom_data', value: { path: 'plan', value: 'pro' } },
+      ],
+    })
+    const input = formValuesToInput(
+      { ...goalToFormValues(existing), name: 'Renamed' },
+      existing
+    )
+    expect(input.event_filter).toEqual([
+      { type: 'custom_data', value: { path: 'plan', value: 'pro' } },
+    ])
   })
 })

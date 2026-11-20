@@ -467,6 +467,10 @@ function ConversionBreakdown({
                 value: row.unique_conversions.toLocaleString('en-US'),
               },
               {
+                label: 'Total',
+                value: row.total_conversions.toLocaleString('en-US'),
+              },
+              {
                 label: 'Visitors',
                 value: row.visitors.toLocaleString('en-US'),
               },

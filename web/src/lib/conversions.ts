@@ -127,9 +127,10 @@ export function formValuesToInput(
   previous?: AnalyticsGoal
 ): AnalyticsGoalInput {
   const kept = previous?.event_filter ?? []
-  const firstCustom = kept.findIndex(isCustomData)
-  const untouched = kept.filter((_, index) => index !== firstCustom)
   const isEvent = values.kind === 'event'
+  // Only the event form edits a property; a page goal keeps every filter it had.
+  const firstCustom = isEvent ? kept.findIndex(isCustomData) : -1
+  const untouched = kept.filter((_, index) => index !== firstCustom)
   const property: SmartFilter[] =
     isEvent && values.propertyKey
       ? [
