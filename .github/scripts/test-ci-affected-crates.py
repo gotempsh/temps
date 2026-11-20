@@ -185,6 +185,17 @@ class FixtureWorkspaceTests(unittest.TestCase):
         self.assertEqual(affected.lockfile_crates(self.workspace, self.lock(), added), {"mid", "top"})
         self.assertEqual(affected.lockfile_crates(self.workspace, self.lock(), self.lock()), set())
 
+    def test_same_name_and_version_from_two_sources_are_compared_separately(self) -> None:
+        # Cargo allows one name and version from two sources; a change to the first
+        # entry must not be hidden by an unchanged second one.
+        git_serde = (
+            '\n[[package]]\nname = "serde"\nversion = "1.0.1"\n'
+            'source = "git+https://example.invalid/serde#0000"\n'
+        )
+        before = self.lock() + git_serde
+        after = before.replace('checksum = "aaaa"', 'checksum = "cccc"')
+        self.assertEqual(affected.lockfile_crates(self.workspace, before, after), {"base", "mid", "top"})
+
     def test_an_unparseable_or_missing_lockfile_reaches_everything(self) -> None:
         self.assertIsNone(affected.lockfile_crates(self.workspace, self.lock(), "[[package]\n"))
         self.assertIsNone(affected.lockfile_crates(self.workspace, None, self.lock()))

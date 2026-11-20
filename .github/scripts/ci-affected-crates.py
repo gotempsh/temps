@@ -352,10 +352,11 @@ def lockfile_crates(workspace: Workspace, old: str | None, new: str | None) -> s
     if before is None or after is None:
         return None
 
-    def index(packages: list[dict]) -> dict[tuple[str, str], tuple]:
+    # Cargo identifies a package by name, version and source: one name and
+    # version can come from two sources, and each entry is compared on its own.
+    def index(packages: list[dict]) -> dict[tuple[str, str, str], tuple]:
         return {
-            (str(p.get("name")), str(p.get("version"))): (
-                p.get("source"),
+            (str(p.get("name")), str(p.get("version")), str(p.get("source", ""))): (
                 p.get("checksum"),
                 tuple(sorted(p.get("dependencies", []))),
             )
@@ -364,8 +365,8 @@ def lockfile_crates(workspace: Workspace, old: str | None, new: str | None) -> s
 
     old_index, new_index = index(before), index(after)
     changed = {
-        name for name, version in old_index.keys() | new_index.keys()
-        if old_index.get((name, version)) != new_index.get((name, version))
+        key[0] for key in old_index.keys() | new_index.keys()
+        if old_index.get(key) != new_index.get(key)
     }
     # Lockfile dependencies read "name", "name version" or "name version (source)".
     reverse: dict[str, set[str]] = {}
