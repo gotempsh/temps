@@ -33,10 +33,26 @@ pub struct RemoteProbeRequest {
 impl RemoteProbeRequest {
     /// Validate the request as the control plane validates it on save, then
     /// probe. An invalid request is refused rather than probed.
+    ///
+    /// The whole probe, name resolution included, is bounded by the check's
+    /// timeout: an HTTP client's timeout starts after DNS, so a slow resolver
+    /// would otherwise hold one of the agent's few probe slots long after the
+    /// control plane stopped waiting. A probe past its timeout reads as down.
     pub async fn run(self, prober: &dyn TargetProber) -> Result<ProbeOutcome, CheckConfigError> {
         let check = validate_spec(self.check, &self.request)?;
         let target = parse_target(check.kind(), &self.target)?;
-        Ok(prober.probe(&check, &target, &self.request).await)
+        let timeout = check.timeout();
+        match tokio::time::timeout(timeout, prober.probe(&check, &target, &self.request)).await {
+            Ok(outcome) => Ok(outcome),
+            Err(_) => Ok(ProbeOutcome::down(
+                Some(timeout),
+                format!(
+                    "No answer from {} within {} ms, name resolution included",
+                    target.stored(),
+                    timeout.as_millis()
+                ),
+            )),
+        }
     }
 }
 
@@ -78,6 +94,30 @@ mod tests {
         assert_eq!(outcome.message.as_deref(), Some("db.example.com:5432"));
         let error = tcp("db.example.com").run(&Recording).await.unwrap_err();
         assert!(error.to_string().contains("port"), "{error}");
+    }
+
+    struct Hanging;
+
+    #[async_trait]
+    impl TargetProber for Hanging {
+        async fn probe(&self, _: &CheckSpec, _: &Target, _: &CheckRequest) -> ProbeOutcome {
+            // A resolver that never answers.
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_probe_that_never_answers_is_down_after_the_check_timeout() {
+        let mut request = tcp("db.example.com:5432");
+        request.check = CheckSpec::Tcp(TcpCheck {
+            degraded_after_ms: None,
+            timeout_ms: Some(2_000),
+        });
+        let outcome = request.run(&Hanging).await.unwrap();
+        assert_eq!(outcome.status, ProbeStatus::Down);
+        assert_eq!(outcome.response_time_ms, Some(2_000));
+        let message = outcome.message.unwrap();
+        assert!(message.contains("db.example.com:5432") && message.contains("2000 ms"), "{message}");
     }
 
     #[test]
