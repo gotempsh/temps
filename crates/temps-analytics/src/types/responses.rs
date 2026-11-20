@@ -936,6 +936,34 @@ pub struct EventBrowserStats {
     pub percentage: f64,
 }
 
+/// One event broken down by one of its custom properties, most frequent
+/// value first. Used for the outbound-link and file-download reports
+/// (ADR 109 D1), and for any `trackEvent()` property.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct EventPropertiesResponse {
+    /// The event that was broken down
+    pub event_name: String,
+    /// The property the values belong to
+    pub property: String,
+    /// Occurrences of the event in the period, whatever the property's value
+    pub total_count: i64,
+    /// The most frequent values, at most `limit` of them
+    pub items: Vec<EventPropertyValue>,
+}
+
+/// One value of an event property and how often it occurred
+#[derive(Debug, Serialize, Deserialize, ToSchema, Clone)]
+pub struct EventPropertyValue {
+    /// The value as text; null when the event did not carry the property
+    pub value: Option<String>,
+    /// Occurrences of the event with this value
+    pub count: i64,
+    /// Distinct visitors who sent the event with this value
+    pub unique_visitors: i64,
+    /// Share of `total_count`, 0 to 100
+    pub percentage: f64,
+}
+
 /// A visitor who triggered a specific event
 #[derive(Debug, Serialize, Deserialize, ToSchema, Clone)]
 pub struct EventVisitorInfo {

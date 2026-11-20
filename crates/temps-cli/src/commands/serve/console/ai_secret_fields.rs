@@ -533,6 +533,16 @@ mod tests {
             &["/name"],
         ),
         (
+            "create_telegram_provider",
+            &["/config/bot_token"],
+            &["/name", "/config/chat_id"],
+        ),
+        (
+            "update_telegram_provider",
+            &["/config/bot_token"],
+            &["/name", "/config/chat_id"],
+        ),
+        (
             "create_webhook_provider",
             &[
                 "/config/headers/Authorization",

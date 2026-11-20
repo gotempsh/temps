@@ -12,6 +12,7 @@ use crate::services::{
     NotificationPreferences, NotificationPreferencesService, NotificationProviderCreateError,
     NotificationProviderRevealError, NotificationService, TlsMode,
 };
+use crate::telegram::TELEGRAM_PROVIDER_TYPE;
 use axum::{
     extract::{Extension, Path, Query, State},
     http::{header, StatusCode},
@@ -191,6 +192,8 @@ fn make_audit_context(auth: &temps_authz::AuthContext, metadata: &RequestMetadat
         update_notification_email_provider,
         update_webhook_provider,
         update_cloudflare_provider,
+        create_telegram_provider,
+        update_telegram_provider,
         get_preferences,
         update_preferences,
         delete_preferences,
@@ -224,6 +227,9 @@ fn make_audit_context(auth: &temps_authz::AuthContext, metadata: &RequestMetadat
             UpdateNotificationEmailProviderRequest,
             UpdateWebhookProviderRequest,
             UpdateCloudflareProviderRequest,
+            TelegramConfig,
+            CreateTelegramProviderRequest,
+            UpdateTelegramProviderRequest,
             NotificationPreferencesResponse,
             UpdatePreferencesRequest,
             TriggerDigestResponse,
@@ -232,7 +238,7 @@ fn make_audit_context(auth: &temps_authz::AuthContext, metadata: &RequestMetadat
     info(
         title = "Notifications API",
         description = "API endpoints for managing notification providers and user notification preferences. \
-        Handles email, Slack, webhook, and other notification delivery services, as well as user notification settings.",
+        Handles email, Slack, webhook, Telegram, and other notification delivery services, as well as user notification settings.",
         version = "1.0.0"
     ),
     tags(
@@ -492,6 +498,75 @@ pub struct CreateCloudflareProviderRequest {
 pub struct UpdateCloudflareProviderRequest {
     pub name: Option<String>,
     pub config: CloudflareConfig,
+    pub enabled: Option<bool>,
+}
+
+/// Configuration for a Telegram notification provider (Telegram Bot API
+/// `sendMessage`). Request-side config. Not `Serialize`: `bot_token` is a
+/// `SecretString`; use [`TelegramConfig::into_stored_value`].
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct TelegramConfig {
+    /// Bot token from @BotFather. Encrypted at rest and masked in normal API
+    /// responses. Send `***` on update to keep the stored token.
+    pub bot_token: SecretString,
+    /// Chat to post to: a numeric user, group or channel ID (`-100…` for
+    /// supergroups and channels) or a public `@channelusername`. A JSON
+    /// integer is accepted too.
+    #[serde(deserialize_with = "crate::telegram::deserialize_chat_id")]
+    #[schema(schema_with = telegram_chat_id_schema)]
+    pub chat_id: String,
+    /// Optional forum topic (`message_thread_id`) for forum-style groups.
+    #[serde(default)]
+    #[schema(example = 42)]
+    pub message_thread_id: Option<i64>,
+}
+
+/// OpenAPI schema for [`TelegramConfig::chat_id`]: a string, or the JSON
+/// integer form Telegram itself uses for chat IDs. Both are stored as a string.
+fn telegram_chat_id_schema() -> utoipa::openapi::schema::Schema {
+    use utoipa::openapi::schema::{ObjectBuilder, OneOfBuilder, Schema, Type};
+    use utoipa::openapi::{KnownFormat, SchemaFormat};
+
+    Schema::OneOf(
+        OneOfBuilder::new()
+            .item(ObjectBuilder::new().schema_type(Type::String))
+            .item(
+                ObjectBuilder::new()
+                    .schema_type(Type::Integer)
+                    .format(Some(SchemaFormat::KnownFormat(KnownFormat::Int64))),
+            )
+            .description(Some(
+                "Chat to post to: a numeric user, group or channel ID (`-100…` for \
+                 supergroups and channels) or a public `@channelusername`. A JSON \
+                 integer is accepted too.",
+            ))
+            .examples([serde_json::json!("-1001234567890")])
+            .build(),
+    )
+}
+
+impl TelegramConfig {
+    /// The JSON persisted (encrypted) for this provider, with the secret exposed.
+    pub fn into_stored_value(self) -> serde_json::Value {
+        serde_json::json!({
+            "bot_token": self.bot_token.into_exposed().trim(),
+            "chat_id": self.chat_id.trim(),
+            "message_thread_id": self.message_thread_id,
+        })
+    }
+}
+
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct CreateTelegramProviderRequest {
+    pub name: String,
+    pub config: TelegramConfig,
+    pub enabled: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct UpdateTelegramProviderRequest {
+    pub name: Option<String>,
+    pub config: TelegramConfig,
     pub enabled: Option<bool>,
 }
 
@@ -794,6 +869,20 @@ fn notification_provider_write_problem(error: &NotificationError, title: &'stati
             .detail(validation_error.to_string())
             .build();
     }
+    if let NotificationError::ProviderTypeMismatch { .. } = error {
+        // From the type-specific endpoint's point of view there is no such
+        // provider; the detail names the type the ID actually belongs to.
+        return ErrorBuilder::new(StatusCode::NOT_FOUND)
+            .title("Provider not found")
+            .detail(error.to_string())
+            .build();
+    }
+    if let NotificationError::InvalidProviderConfig(config_error) = error {
+        return ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .title("Invalid provider configuration")
+            .detail(config_error.to_string())
+            .build();
+    }
 
     ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
         .title(title)
@@ -805,11 +894,24 @@ fn notification_provider_create_problem(
     error: &NotificationProviderCreateError,
     title: &'static str,
 ) -> Problem {
-    tracing::error!(error = %error, "Notification provider creation failed");
-    ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
-        .title(title)
-        .detail("The notification provider and its catch-all route could not be created")
-        .build()
+    match error {
+        NotificationProviderCreateError::InvalidConfig { source, .. } => {
+            ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                .title("Invalid provider configuration")
+                .detail(source.to_string())
+                .build()
+        }
+        NotificationProviderCreateError::Serialization { .. }
+        | NotificationProviderCreateError::Encryption { .. }
+        | NotificationProviderCreateError::Database { .. }
+        | NotificationProviderCreateError::CatchAllRoute { .. } => {
+            tracing::error!(error = %error, "Notification provider creation failed");
+            ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .title(title)
+                .detail("The notification provider and its catch-all route could not be created")
+                .build()
+        }
+    }
 }
 
 /// Update a notification provider
@@ -1674,6 +1776,167 @@ async fn update_cloudflare_provider(
     }
 }
 
+/// Create a new Telegram notification provider
+#[utoipa::path(
+    post,
+    path = "/notification-providers/telegram",
+    request_body = CreateTelegramProviderRequest,
+    responses(
+        (status = 201, description = "Successfully created Telegram provider", body = NotificationProviderResponse),
+        (status = 400, description = "Invalid bot token, chat ID or topic ID"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 500, description = "Internal server error")
+    ),
+    tag = "Notification Providers",
+    security(
+        ("bearer_auth" = [])
+    )
+)]
+async fn create_telegram_provider(
+    State(app_state): State<Arc<NotificationState>>,
+    RequireAuth(auth): RequireAuth,
+    Extension(metadata): Extension<RequestMetadata>,
+    Json(request): Json<CreateTelegramProviderRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, NotificationProvidersCreate);
+    info!("Creating Telegram notification provider {}", request.name);
+    let enabled = request.enabled.unwrap_or(true);
+    let config = request.config.into_stored_value();
+    let provider = app_state
+        .notification_service
+        .add_provider(
+            request.name,
+            TELEGRAM_PROVIDER_TYPE.to_string(),
+            config,
+            enabled,
+        )
+        .await
+        .map_err(|e| {
+            notification_provider_create_problem(
+                &e,
+                "Failed to create Telegram notification provider",
+            )
+        })?;
+
+    let audit = NotificationProviderAudit {
+        context: make_audit_context(&auth, &metadata),
+        provider_id: provider.id,
+        provider_type: TELEGRAM_PROVIDER_TYPE.to_string(),
+        action: "NOTIFICATION_PROVIDER_CREATED".to_string(),
+    };
+    if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
+        error!("Failed to create audit log: {}", e);
+    }
+
+    let response = provider_response(&app_state, provider)?;
+    Ok((StatusCode::CREATED, Json(response)))
+}
+
+/// Update a Telegram notification provider
+#[utoipa::path(
+    put,
+    path = "/notification-providers/telegram/{id}",
+    request_body = UpdateTelegramProviderRequest,
+    responses(
+        (status = 200, description = "Successfully updated Telegram provider", body = NotificationProviderResponse),
+        (status = 400, description = "Invalid bot token, chat ID or topic ID"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Provider not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    params(
+        ("id" = i32, Path, description = "Provider ID")
+    ),
+    tag = "Notification Providers",
+    security(
+        ("bearer_auth" = [])
+    )
+)]
+async fn update_telegram_provider(
+    State(app_state): State<Arc<NotificationState>>,
+    Path(id): Path<i32>,
+    RequireAuth(auth): RequireAuth,
+    Extension(metadata): Extension<RequestMetadata>,
+    Json(request): Json<UpdateTelegramProviderRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, NotificationProvidersWrite);
+    info!("Updating Telegram notification provider {}", id);
+    let update_request = UpdateProviderRequest {
+        name: request.name,
+        config: Some(request.config.into_stored_value()),
+        enabled: request.enabled,
+    };
+    let provider = app_state
+        .notification_service
+        .update_provider_of_type(id, TELEGRAM_PROVIDER_TYPE, update_request.into())
+        .await
+        .map_err(|e| {
+            error!(
+                "Failed to update Telegram notification provider {}: {}",
+                id, e
+            );
+            notification_provider_write_problem(
+                &e,
+                "Failed to update Telegram notification provider",
+            )
+        })?
+        .ok_or_else(|| {
+            ErrorBuilder::new(StatusCode::NOT_FOUND)
+                .title("Provider not found")
+                .detail(format!(
+                    "Telegram notification provider {id} does not exist"
+                ))
+                .build()
+        })?;
+
+    let audit = NotificationProviderAudit {
+        context: make_audit_context(&auth, &metadata),
+        provider_id: provider.id,
+        provider_type: TELEGRAM_PROVIDER_TYPE.to_string(),
+        action: "NOTIFICATION_PROVIDER_UPDATED".to_string(),
+    };
+    if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
+        error!("Failed to create audit log: {}", e);
+    }
+
+    let response = provider_response(&app_state, provider)?;
+    Ok((StatusCode::OK, Json(response)))
+}
+
+/// Build the masked API response for a stored provider.
+fn provider_response(
+    app_state: &NotificationState,
+    provider: temps_entities::notification_providers::Model,
+) -> Result<NotificationProviderResponse, Problem> {
+    let config = app_state
+        .notification_service
+        .decrypt_provider_config(&provider.config)
+        .map_err(|e| {
+            error!(
+                "Failed to decrypt config of notification provider {}: {}",
+                provider.id, e
+            );
+            ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .title("Failed to decrypt provider configuration")
+                .detail(format!(
+                    "The configuration of notification provider {} could not be decrypted",
+                    provider.id
+                ))
+                .build()
+        })?;
+    Ok(NotificationProviderResponse {
+        id: provider.id,
+        name: provider.name,
+        provider_type: provider.provider_type,
+        config,
+        enabled: provider.enabled,
+        created_at: provider.created_at.timestamp_millis(),
+        updated_at: provider.updated_at.timestamp_millis(),
+    })
+}
+
 // Notification Preferences Types and Handlers
 
 #[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
@@ -2429,6 +2692,10 @@ pub fn configure_routes() -> Router<Arc<NotificationState>> {
             post(create_cloudflare_provider),
         )
         .route(
+            "/notification-providers/telegram",
+            post(create_telegram_provider),
+        )
+        .route(
             "/notification-providers/{id}",
             get(get_notification_provider),
         )
@@ -2455,6 +2722,10 @@ pub fn configure_routes() -> Router<Arc<NotificationState>> {
         .route(
             "/notification-providers/cloudflare/{id}",
             put(update_cloudflare_provider),
+        )
+        .route(
+            "/notification-providers/telegram/{id}",
+            put(update_telegram_provider),
         )
         .route(
             "/notification-providers/{id}",
@@ -2732,6 +3003,117 @@ mod tests {
                 .as_slice(),
             ["NOTIFICATION_PROVIDER_CONFIG_REVEALED"]
         );
+    }
+
+    #[tokio::test]
+    async fn create_telegram_provider_rejects_invalid_config_with_400() {
+        let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password(
+            "notification-handler-telegram-test",
+        ));
+        // Validation runs before any query, so the mock needs no results.
+        let db = Arc::new(MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection());
+        let notification_service =
+            Arc::new(NotificationService::new(db.clone(), encryption_service));
+        let preferences_service = Arc::new(NotificationPreferencesService::new(db.clone()));
+        let digest_service = Arc::new(DigestService::new(db.clone(), notification_service.clone()));
+        let audit_logger = RecordingAuditLogger::default();
+        let state = Arc::new(NotificationState::new(
+            notification_service,
+            Arc::new(NotificationRoutingService::new(db.clone())),
+            preferences_service,
+            digest_service,
+            Arc::new(audit_logger.clone()),
+        ));
+
+        let request: CreateTelegramProviderRequest = serde_json::from_value(serde_json::json!({
+            "name": "Phone",
+            "config": { "bot_token": "123456789:AAExampleSecretToken", "chat_id": "my group" },
+        }))
+        .expect("request should deserialize");
+        let problem = match create_telegram_provider(
+            State(state),
+            RequireAuth(test_auth_context()),
+            Extension(test_request_metadata()),
+            Json(request),
+        )
+        .await
+        {
+            Ok(_) => panic!("an invalid chat id must not create a provider"),
+            Err(problem) => problem,
+        };
+        let response = problem.into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("problem body should be readable");
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("chat ID"), "{body}");
+        assert!(!body.contains("AAExampleSecretToken"), "{body}");
+        assert!(
+            audit_logger
+                .operations
+                .lock()
+                .expect("recording audit mutex should not be poisoned")
+                .is_empty(),
+            "a refused create must not be audited as a creation"
+        );
+    }
+
+    #[test]
+    fn telegram_config_schema_marks_the_token_secret_and_accepts_integer_chat_ids() {
+        let spec = serde_json::to_value(NotificationProvidersApiDoc::openapi())
+            .expect("the OpenAPI document serializes");
+        let chat_id = &spec["components"]["schemas"]["TelegramConfig"]["properties"]["chat_id"];
+        let types: Vec<&str> = chat_id["oneOf"]
+            .as_array()
+            .unwrap_or_else(|| panic!("chat_id should be a oneOf, got {chat_id}"))
+            .iter()
+            .filter_map(|item| item["type"].as_str())
+            .collect();
+        assert_eq!(types, ["string", "integer"], "{chat_id}");
+        assert!(
+            chat_id["description"]
+                .as_str()
+                .is_some_and(|d| d.contains("@channelusername")),
+            "{chat_id}"
+        );
+        let required = spec["components"]["schemas"]["TelegramConfig"]["required"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            required.contains(&serde_json::json!("chat_id")),
+            "{required:?}"
+        );
+
+        // The bot token keeps the SecretString markers, so the AI assistant
+        // takes it through a secret slot instead of the conversation.
+        let bot_token = &spec["components"]["schemas"]["TelegramConfig"]["properties"]["bot_token"];
+        assert_eq!(
+            bot_token["$ref"], "#/components/schemas/SecretString",
+            "{bot_token}"
+        );
+        let secret = &spec["components"]["schemas"]["SecretString"];
+        assert_eq!(secret["format"], "password", "{secret}");
+        assert_eq!(
+            secret[temps_core::secret_string::SECRET_SCHEMA_EXTENSION],
+            true,
+            "{secret}"
+        );
+    }
+
+    #[test]
+    fn telegram_config_masks_token_and_accepts_integer_chat_id() {
+        let config: TelegramConfig = serde_json::from_value(serde_json::json!({
+            "bot_token": " 123456789:real-telegram-secret ",
+            "chat_id": -1001234567890_i64,
+        }))
+        .expect("integer chat ids are accepted");
+        assert!(!format!("{config:?}").contains("real-telegram-secret"));
+        let stored = config.into_stored_value();
+        assert_eq!(stored["bot_token"], "123456789:real-telegram-secret");
+        assert_eq!(stored["chat_id"], "-1001234567890");
+        assert!(stored["message_thread_id"].is_null());
     }
 
     /// A notification state backed by a real database, with an admin caller.

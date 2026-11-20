@@ -51,6 +51,8 @@ pub enum AnalyticsError {
         operation: &'static str,
         detail: String,
     },
+    #[error("Invalid analytics query parameter '{field}': {reason}")]
+    InvalidQuery { field: &'static str, reason: String },
 }
 
 #[derive(Debug, Clone, Serialize)]

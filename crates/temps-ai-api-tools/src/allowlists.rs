@@ -304,6 +304,14 @@ pub const AI_READ_ALLOWLIST: &[&str] = &[
     "get_funnel_metrics",
     "list_funnels",
     "get_unique_events",
+    // Conversion goals (ADR 109 D2): definitions the user wrote and
+    // aggregate counts per goal or per dimension value.
+    // Visitor identity mode (ADR 109 D3): persistent or cookieless.
+    "get_analytics_identity_settings",
+    "list_analytics_goals",
+    "get_analytics_goal",
+    "get_analytics_goal_stats",
+    "get_analytics_goal_breakdown",
     // Traffic exclusion settings, the project's own rules (referrer
     // domains, IPs/CIDR ranges, ASNs, countries the user chose to
     // exclude) and per-reason counts. No secrets; IPs here are ones the
@@ -1231,7 +1239,7 @@ pub const AI_WRITE_ALLOWLIST: &[&str] = &[
     "update_alert",
     // ── Global notification control plane ──
     // Every credential here is a `SecretString` (`webhook_url`, `password`,
-    // `api_token`, each webhook header value), so the model passes a
+    // `api_token`, `bot_token`, each webhook header value), so the model passes a
     // `secret_ref:` handle from `request_secret` and never the value. The
     // generic `create_notification_provider` / `update_notification_provider`
     // take an untyped `config` the secret-slot layer cannot see into, so a
@@ -1248,6 +1256,8 @@ pub const AI_WRITE_ALLOWLIST: &[&str] = &[
     "update_webhook_provider",
     "create_cloudflare_provider",
     "update_cloudflare_provider",
+    "create_telegram_provider",
+    "update_telegram_provider",
     "test_notification_provider",
     "create_notification_route",
     "update_notification_route",
@@ -1353,6 +1363,14 @@ pub const AI_WRITE_ALLOWLIST: &[&str] = &[
     "create_funnel",
     "update_funnel",
     "delete_funnel",
+    // Switching visitor identity changes how new visits are counted; history
+    // already recorded stays as it is (ADR 109 D3).
+    "update_analytics_identity_settings",
+    // Deleting a conversion goal deletes no events; defining it again
+    // brings its history back.
+    "create_analytics_goal",
+    "update_analytics_goal",
+    "delete_analytics_goal",
     "update_project_cloud_telemetry",
     // Which traffic analytics counts: reversible (a rule is deleted, a
     // switch flipped back) and takes no credential.
@@ -1752,6 +1770,8 @@ mod tests {
             "update_slack_provider",
             "create_webhook_provider",
             "update_webhook_provider",
+            "create_telegram_provider",
+            "update_telegram_provider",
             "create_s3_source",
             "update_s3_source",
         ] {

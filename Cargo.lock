@@ -12903,6 +12903,7 @@ name = "temps-analytics"
 version = "0.1.0-beta.63"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "async-trait",
  "axum",
  "bollard",
@@ -13005,6 +13006,7 @@ dependencies = [
  "temps-core",
  "temps-entities",
  "temps-test-utils",
+ "thiserror 2.0.21",
  "tokio",
  "tracing",
  "utoipa",
@@ -14174,6 +14176,7 @@ dependencies = [
  "sha1_smol",
  "sha2 0.11.1",
  "sourcemap",
+ "temps-analytics",
  "temps-analytics-session-replay",
  "temps-authz",
  "temps-config",

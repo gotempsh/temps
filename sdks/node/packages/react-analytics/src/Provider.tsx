@@ -11,7 +11,16 @@ import { EngagementTracker } from "./EngagementTracker";
 import { SessionRecorder } from "./SessionRecorder";
 import { SessionRecordingProvider, useSessionRecordingControl } from "./useSessionRecording";
 import { DEFAULT_BASE_PATH } from "./constants";
-import { FeatureFlags, exposureEventData } from "@temps-sdk/analytics-core";
+import {
+  FeatureFlags,
+  NOT_FOUND_EVENT,
+  NotFoundMarkerWatcher,
+  enableCookielessIdentity,
+  exposureEventData,
+  isCookielessIdentity,
+  notFoundEventData,
+  setupLinkTracking,
+} from "@temps-sdk/analytics-core";
 
 /** Window event dispatched for every tracked custom event, `{ detail: { name } }`. */
 export const TRACK_EVENT = "temps:track";
@@ -34,9 +43,19 @@ export function TempsAnalyticsProvider({
   sessionRecordingConfig = {},
   domain,
   ingestKey,
+  autoTrackOutboundLinks = true,
+  autoTrackFileDownloads = true,
+  fileDownloadExtensions,
+  autoTrackNotFound = true,
+  cookieless = false,
   flags: flagOptions,
   children,
 }: TempsAnalyticsProviderProps): ReactElement {
+  // Cookieless mode (ADR 109 D3) is switched on during render, not in an
+  // effect: children's effects run before this component's, and one of them
+  // may send the first event. Idempotent, and a no-op during SSR.
+  if (cookieless && !isCookielessIdentity()) enableCookielessIdentity();
+
   const enabled = useMemo(() => {
     if (disabled) return false;
     if (typeof window === "undefined") return false;
@@ -69,6 +88,21 @@ export function TempsAnalyticsProvider({
     [enabled, basePath, domain, ingestKey]
   );
 
+  const trackNotFound = useCallback<AnalyticsContextValue["trackNotFound"]>(
+    (data = {}) => trackEvent(NOT_FOUND_EVENT, notFoundEventData(data)),
+    [trackEvent]
+  );
+
+  // Looks for the `data-temps-404` marker after each page view (ADR 109 D1).
+  const notFoundWatcher = useMemo(
+    () =>
+      enabled && autoTrackNotFound
+        ? new NotFoundMarkerWatcher(() => void trackNotFound())
+        : null,
+    [enabled, autoTrackNotFound, trackNotFound]
+  );
+  useEffect(() => () => notFoundWatcher?.cancel(), [notFoundWatcher]);
+
   const trackPageview = useCallback<AnalyticsContextValue["trackPageview"]>(
     () => {
       if (!enabled) return;
@@ -85,8 +119,9 @@ export function TempsAnalyticsProvider({
           timestamp: new Date().toISOString(),
         },
       }, "POST", basePath, ingestKey);
+      notFoundWatcher?.afterPageview();
     },
-    [enabled, basePath, domain, ingestKey]
+    [enabled, basePath, domain, ingestKey, notFoundWatcher]
   );
 
   const identify = useCallback<AnalyticsContextValue["identify"]>(async () => {
@@ -175,6 +210,31 @@ export function TempsAnalyticsProvider({
     document.addEventListener("click", onClick);
     return () => document.removeEventListener("click", onClick);
   }, [enabled, trackEvent]);
+
+  // Outbound links and file downloads: one delegated listener (ADR 109 D1).
+  // Beacon transport, because the click usually navigates away.
+  const fileDownloadExtensionsKey = fileDownloadExtensions?.join(",");
+  useEffect(() => {
+    if (!enabled) return;
+    return setupLinkTracking(
+      {
+        autoTrackOutboundLinks,
+        autoTrackFileDownloads,
+        fileDownloadExtensions: fileDownloadExtensionsKey?.split(","),
+      },
+      (eventName, data) => {
+        sendAnalyticsReliable("event", {
+          event_name: eventName,
+          request_query: window.location.search,
+          request_path: window.location.pathname,
+          // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing -- an empty domain falls back too
+          domain: domain || window.location.hostname,
+          language: navigator.language,
+          event_data: data,
+        }, basePath, ingestKey);
+      }
+    );
+  }, [enabled, autoTrackOutboundLinks, autoTrackFileDownloads, fileDownloadExtensionsKey, domain, basePath, ingestKey]);
 
   // Engagement tracking with heartbeats and page leave
   useEffect(() => {
@@ -281,8 +341,8 @@ export function TempsAnalyticsProvider({
   }, [flags, flagContext]);
 
   const value = useMemo<AnalyticsContextValue>(
-    () => ({ trackEvent, identify, trackPageview, enabled, flags, basePath }),
-    [trackEvent, identify, trackPageview, enabled, flags, basePath]
+    () => ({ trackEvent, identify, trackPageview, trackNotFound, enabled, flags, basePath }),
+    [trackEvent, identify, trackPageview, trackNotFound, enabled, flags, basePath]
   );
 
   return (
@@ -291,13 +351,14 @@ export function TempsAnalyticsProvider({
         {children}
         {enabled && (
           // Forward the whole config; the provider-level values go last so the
-          // config cannot override them.
+          // config cannot override them. A replay needs an id stored on the
+          // device, which cookieless mode never writes.
           <SessionRecorder
             {...sessionRecordingConfig}
             basePath={basePath}
             ingestKey={ingestKey}
             domain={domain}
-            enabled={isRecordingEnabled}
+            enabled={isRecordingEnabled && !cookieless && !isCookielessIdentity()}
           />
         )}
       </SessionRecordingProvider>

@@ -5467,6 +5467,159 @@ WHERE project_id = $1
             entries,
         })
     }
+
+    async fn get_event_properties(
+        &self,
+        project_id: i32,
+        event_name: &str,
+        property: &str,
+        start_date: UtcDateTime,
+        end_date: UtcDateTime,
+        environment_id: Option<i32>,
+        limit: u64,
+    ) -> Result<crate::types::responses::EventPropertiesResponse, AnalyticsError> {
+        validate_event_property_key(property)?;
+        if event_name.is_empty() {
+            return Err(AnalyticsError::InvalidQuery {
+                field: "event_name",
+                reason: format!(
+                    "an event name is required to break down property '{}' in project {}",
+                    property, project_id
+                ),
+            });
+        }
+        let limit = limit.clamp(1, 100) as i64;
+
+        let mut values: Vec<sea_orm::Value> = vec![
+            project_id.into(),
+            event_name.into(),
+            start_date.into(),
+            end_date.into(),
+            property.into(),
+        ];
+        let env_filter = match environment_id {
+            Some(env_id) => {
+                values.push(env_id.into());
+                format!("AND e.environment_id = ${}", values.len())
+            }
+            None => String::new(),
+        };
+        values.push(limit.into());
+        let limit_param = values.len();
+
+        // `props ->> $5::text` is the property's value as text whatever its JSON
+        // type, and NULL when the event did not carry it. The key is bound,
+        // never interpolated. Grouping by ordinal keeps the bound expression
+        // identical in SELECT and GROUP BY.
+        let sql = format!(
+            r#"
+            WITH value_stats AS (
+                SELECT
+                    e.props ->> $5::text AS value,
+                    COUNT(*)::bigint AS count,
+                    COUNT(DISTINCT e.visitor_id)::bigint AS unique_visitors
+                FROM events e
+                WHERE e.project_id = $1
+                  AND COALESCE(e.event_name, e.event_type) = $2
+                  AND e.timestamp >= $3
+                  AND e.timestamp < $4
+                  AND e.is_crawler = false
+                  {env_filter}
+                GROUP BY 1
+            ),
+            total AS (
+                SELECT COALESCE(SUM(count), 0)::bigint AS total_count FROM value_stats
+            )
+            SELECT
+                vs.value,
+                vs.count,
+                vs.unique_visitors,
+                t.total_count,
+                CASE WHEN t.total_count > 0
+                     THEN vs.count::float8 / t.total_count::float8 * 100
+                     ELSE 0 END AS percentage
+            FROM value_stats vs
+            CROSS JOIN total t
+            ORDER BY vs.count DESC, vs.value ASC NULLS LAST
+            LIMIT ${limit_param}
+            "#
+        );
+
+        #[derive(FromQueryResult)]
+        struct ValueRow {
+            value: Option<String>,
+            count: i64,
+            unique_visitors: i64,
+            total_count: i64,
+            percentage: f64,
+        }
+
+        let rows = ValueRow::find_by_statement(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            &sql,
+            values,
+        ))
+        .all(self.db.as_ref())
+        .await?;
+
+        let total_count = rows.first().map(|row| row.total_count).unwrap_or(0);
+        Ok(crate::types::responses::EventPropertiesResponse {
+            event_name: event_name.to_string(),
+            property: property.to_string(),
+            total_count,
+            items: rows
+                .into_iter()
+                .map(|row| crate::types::responses::EventPropertyValue {
+                    value: row.value,
+                    count: row.count,
+                    unique_visitors: row.unique_visitors,
+                    percentage: row.percentage,
+                })
+                .collect(),
+        })
+    }
+}
+
+/// Longest event property key accepted by the property breakdown.
+pub const MAX_EVENT_PROPERTY_KEY_LEN: usize = 64;
+
+/// Check a key of an event's custom properties before it is used in a query.
+///
+/// The key is always bound as a parameter, so this is not what keeps SQL
+/// injection out; it keeps the accepted keys to the shape the SDKs produce
+/// (`url`, `extension`, `plan_tier`, `checkout.step`) and gives a clear error
+/// for anything else.
+pub fn validate_event_property_key(key: &str) -> Result<(), AnalyticsError> {
+    if key.is_empty() {
+        return Err(AnalyticsError::InvalidQuery {
+            field: "property",
+            reason: "the property name is empty".to_string(),
+        });
+    }
+    if key.len() > MAX_EVENT_PROPERTY_KEY_LEN {
+        return Err(AnalyticsError::InvalidQuery {
+            field: "property",
+            reason: format!(
+                "property name '{}…' is {} characters long; the limit is {}",
+                &key[..key.char_indices().nth(16).map_or(key.len(), |(i, _)| i)],
+                key.len(),
+                MAX_EVENT_PROPERTY_KEY_LEN
+            ),
+        });
+    }
+    if !key
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+    {
+        return Err(AnalyticsError::InvalidQuery {
+            field: "property",
+            reason: format!(
+                "property name '{}' may only contain letters, digits, '_', '-' and '.'",
+                key
+            ),
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
