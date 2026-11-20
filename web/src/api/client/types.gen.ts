@@ -1726,6 +1726,194 @@ export type AnalyticsCapability = {
 export type AnalyticsFacet = 'summary' | 'traffic' | 'pages' | 'events' | 'breakdown' | 'speed';
 
 /**
+ * A conversion goal.
+ */
+export type AnalyticsGoal = {
+    created_at: string;
+    event_filter: Array<SmartFilter>;
+    event_name?: string | null;
+    id: number;
+    kind: AnalyticsGoalKind;
+    name: string;
+    page_path?: string | null;
+    project_id: number;
+    revenue_currency?: string | null;
+    revenue_property?: string | null;
+    updated_at: string;
+};
+
+/**
+ * What a goal breakdown groups converting visitors by.
+ */
+export type AnalyticsGoalBreakdownDimension = 'channel' | 'referrer' | 'utm_source' | 'utm_medium' | 'utm_campaign' | 'page' | 'country' | 'device_type' | 'browser' | 'operating_system';
+
+/**
+ * Response of `GET /projects/{project_id}/analytics/goals/{goal_id}/breakdown`.
+ */
+export type AnalyticsGoalBreakdownResponse = {
+    dimension: AnalyticsGoalBreakdownDimension;
+    goal_id: number;
+    /**
+     * Ordered by unique conversions, then total conversions.
+     */
+    items: Array<AnalyticsGoalBreakdownRow>;
+};
+
+/**
+ * One value of a goal breakdown.
+ */
+export type AnalyticsGoalBreakdownRow = {
+    /**
+     * `unique_conversions` as a percentage of `visitors`.
+     */
+    conversion_rate: number;
+    revenue?: AnalyticsGoalRevenue | null;
+    total_conversions: number;
+    unique_conversions: number;
+    /**
+     * `null` when the visitor or event has no value for the dimension.
+     */
+    value?: string | null;
+    /**
+     * Distinct non-crawler visitors with that value in the period.
+     */
+    visitors: number;
+};
+
+/**
+ * Body of `POST` and `PUT /projects/{project_id}/analytics/goals`.
+ */
+export type AnalyticsGoalInput = {
+    /**
+     * Conditions every matching event must meet, in the vocabulary funnel
+     * steps use, e.g. `[{"type":"custom_data","value":{"path":"plan","value":"pro"}}]`.
+     */
+    event_filter?: Array<SmartFilter>;
+    /**
+     * Required for `event` goals, refused for `page` goals.
+     */
+    event_name?: string | null;
+    kind: AnalyticsGoalKind;
+    /**
+     * Shown in the Conversions report, e.g. "Signup". Unique per project,
+     * ignoring case.
+     */
+    name: string;
+    /**
+     * Required for `page` goals, refused for `event` goals. Starts with `/`;
+     * `*` matches any run of characters, e.g. `/thank-you` or `/docs*`.
+     */
+    page_path?: string | null;
+    /**
+     * ISO 4217 currency code of `revenue_property`, e.g. `EUR`.
+     */
+    revenue_currency?: string | null;
+    /**
+     * Event property holding the value of one conversion, e.g. `amount`.
+     * Event goals only; requires `revenue_currency`.
+     */
+    revenue_property?: string | null;
+};
+
+/**
+ * What a goal matches.
+ */
+export type AnalyticsGoalKind = 'event' | 'page';
+
+/**
+ * A page of goals, newest first.
+ */
+export type AnalyticsGoalListResponse = {
+    items: Array<AnalyticsGoal>;
+    page: number;
+    page_size: number;
+    total: number;
+};
+
+/**
+ * Revenue a goal's conversions carried.
+ */
+export type AnalyticsGoalRevenue = {
+    /**
+     * `total` divided by the conversions that carried a number.
+     */
+    average: number;
+    currency: string;
+    /**
+     * Sum of the revenue property over conversions that carried a number.
+     */
+    total: number;
+};
+
+/**
+ * Conversion figures of one goal in a period.
+ */
+export type AnalyticsGoalStats = {
+    /**
+     * `unique_conversions` as a percentage of the period's visitors.
+     */
+    conversion_rate: number;
+    goal_id: number;
+    kind: AnalyticsGoalKind;
+    name: string;
+    revenue?: AnalyticsGoalRevenue | null;
+    /**
+     * Matching events, a visitor converting twice counting twice.
+     */
+    total_conversions: number;
+    /**
+     * Distinct visitors who converted.
+     */
+    unique_conversions: number;
+};
+
+/**
+ * Response of `GET /projects/{project_id}/analytics/goals/stats`.
+ */
+export type AnalyticsGoalStatsResponse = {
+    /**
+     * Every goal of the project, in creation order, including the ones
+     * without conversions in the period.
+     */
+    goals: Array<AnalyticsGoalStats>;
+    /**
+     * Distinct non-crawler visitors with a page view in the period: the
+     * denominator of every conversion rate, as on the overview.
+     */
+    visitors: number;
+};
+
+/**
+ * Per-project visitor identity mode.
+ */
+export type AnalyticsIdentityMode = 'persistent' | 'cookieless';
+
+/**
+ * How a project tells its visitors apart, and what that costs.
+ */
+export type AnalyticsIdentitySettings = {
+    /**
+     * Reports that behave differently in this mode, for the console to say
+     * so next to them.
+     */
+    limitations: Array<string>;
+    /**
+     * `persistent` (the default): ids stored in a cookie or `localStorage`,
+     * visitors recognised across days. `cookieless`: nothing stored on the
+     * device; a visitor is a new visitor every day.
+     */
+    mode: AnalyticsIdentityMode;
+    project_id: number;
+    /**
+     * What the browser SDK must be told for this mode, so it writes nothing
+     * either: `cookieless: true`, or `data-cookieless="true"` on the script
+     * tag. `None` in `persistent` mode.
+     */
+    sdk_option?: string | null;
+    updated_at: string;
+};
+
+/**
  * The public address an app Temps does not deploy should send analytics to.
  *
  * Served separately from the platform settings because `GET /settings`
@@ -15125,6 +15313,75 @@ export type EventMetricsPayload = {
      * generates this value sends camelCase for every ingest endpoint.
      */
     visitor_id?: string | null;
+};
+
+/**
+ * Query parameters for the breakdown of one event by one of its properties
+ */
+export type EventPropertiesQuery = {
+    end_date: string;
+    environment_id?: number | null;
+    /**
+     * The event to break down, e.g. `outbound_click`
+     */
+    event_name: string;
+    /**
+     * Maximum number of values to return (default: 20, max: 100)
+     */
+    limit?: number | null;
+    project_id: number;
+    /**
+     * Top-level key of the event's custom properties to group by, e.g. `url`.
+     * Letters, digits, `_`, `-` and `.`; at most 64 characters.
+     */
+    property: string;
+    start_date: string;
+};
+
+/**
+ * One event broken down by one of its custom properties, most frequent
+ * value first. Used for the outbound-link and file-download reports
+ * (ADR 109 D1), and for any `trackEvent()` property.
+ */
+export type EventPropertiesResponse = {
+    /**
+     * The event that was broken down
+     */
+    event_name: string;
+    /**
+     * The most frequent values, at most `limit` of them
+     */
+    items: Array<EventPropertyValue>;
+    /**
+     * The property the values belong to
+     */
+    property: string;
+    /**
+     * Occurrences of the event in the period, whatever the property's value
+     */
+    total_count: number;
+};
+
+/**
+ * One value of an event property and how often it occurred
+ */
+export type EventPropertyValue = {
+    /**
+     * Occurrences of the event with this value
+     */
+    count: number;
+    /**
+     * Share of `total_count`, 0 to 100
+     */
+    percentage: number;
+    /**
+     * Distinct visitors who sent the event with this value
+     */
+    unique_visitors: number;
+    /**
+     * The value as text; null when the event did not carry the property
+     */
+    value?: string | null;
 };
 
 /**
@@ -37629,7 +37886,7 @@ export type TrafficAggregationRow = {
     metrics: TrafficMetricValues;
 };
 
-export type TrafficDimension = 'client_ip' | 'method' | 'path' | 'host' | 'status_code' | 'status_class' | 'environment_id' | 'deployment_id' | 'request_source' | 'is_bot' | 'browser' | 'operating_system' | 'device_type' | 'cache_status';
+export type TrafficDimension = 'client_ip' | 'method' | 'path' | 'host' | 'status_code' | 'status_class' | 'environment_id' | 'deployment_id' | 'request_source' | 'is_bot' | 'browser' | 'operating_system' | 'device_type' | 'cache_status' | 'referrer';
 
 export type TrafficDimensionValue = {
     dimension: TrafficDimension;
@@ -38038,6 +38295,13 @@ export type UpdateAlertRuleRequest = {
     notification_priority?: string | null;
     trigger_config?: unknown;
     trigger_type?: string | null;
+};
+
+/**
+ * Body of `PUT /projects/{project_id}/analytics/identity`.
+ */
+export type UpdateAnalyticsIdentitySettings = {
+    mode: AnalyticsIdentityMode;
 };
 
 /**
@@ -42741,6 +43005,10 @@ export type AddSessionReplayEventsErrors = {
      * Bad request
      */
     400: ErrorResponse;
+    /**
+     * The project tracks visitors cookieless, so replay data is not stored
+     */
+    403: ErrorResponse;
     /**
      * Session not found
      */
@@ -49134,6 +49402,70 @@ export type GetEventEntriesResponses = {
 };
 
 export type GetEventEntriesResponse = GetEventEntriesResponses[keyof GetEventEntriesResponses];
+
+export type GetEventPropertiesData = {
+    body?: never;
+    path?: never;
+    query: {
+        /**
+         * Event to break down, e.g. outbound_click
+         */
+        event_name: string;
+        /**
+         * Top-level property key to group by, e.g. url. Letters, digits, '_', '-' and '.'; at most 64 characters
+         */
+        property: string;
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID (optional)
+         */
+        environment_id?: number;
+        /**
+         * Start date (ISO 8601)
+         */
+        start_date: string;
+        /**
+         * End date (ISO 8601)
+         */
+        end_date: string;
+        /**
+         * Maximum number of values (default: 20, max: 100)
+         */
+        limit?: number;
+    };
+    url: '/analytics/event-properties';
+};
+
+export type GetEventPropertiesErrors = {
+    /**
+     * Invalid property name or parameters
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetEventPropertiesResponses = {
+    /**
+     * Property values ranked by occurrences
+     */
+    200: EventPropertiesResponse;
+};
+
+export type GetEventPropertiesResponse = GetEventPropertiesResponses[keyof GetEventPropertiesResponses];
 
 export type GetEventVisitorsData = {
     body?: never;
@@ -77469,6 +77801,432 @@ export type GetFilteredTrafficResponses = {
 };
 
 export type GetFilteredTrafficResponse = GetFilteredTrafficResponses[keyof GetFilteredTrafficResponses];
+
+export type ListAnalyticsGoalsData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: {
+        /**
+         * 1-based page, default 1.
+         */
+        page?: number | null;
+        /**
+         * Default 20, at most 100.
+         */
+        page_size?: number | null;
+    };
+    url: '/projects/{project_id}/analytics/goals';
+};
+
+export type ListAnalyticsGoalsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListAnalyticsGoalsResponses = {
+    /**
+     * Goals
+     */
+    200: AnalyticsGoalListResponse;
+};
+
+export type ListAnalyticsGoalsResponse = ListAnalyticsGoalsResponses[keyof ListAnalyticsGoalsResponses];
+
+export type CreateAnalyticsGoalData = {
+    body: AnalyticsGoalInput;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/analytics/goals';
+};
+
+export type CreateAnalyticsGoalErrors = {
+    /**
+     * Invalid goal
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Name taken or goal limit reached
+     */
+    409: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type CreateAnalyticsGoalResponses = {
+    /**
+     * Goal created
+     */
+    201: AnalyticsGoal;
+};
+
+export type CreateAnalyticsGoalResponse = CreateAnalyticsGoalResponses[keyof CreateAnalyticsGoalResponses];
+
+export type GetAnalyticsGoalStatsData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query: {
+        /**
+         * Inclusive start (ISO 8601).
+         */
+        start_date: string;
+        /**
+         * Exclusive end (ISO 8601).
+         */
+        end_date: string;
+        environment_id?: number | null;
+    };
+    url: '/projects/{project_id}/analytics/goals/stats';
+};
+
+export type GetAnalyticsGoalStatsErrors = {
+    /**
+     * Invalid period
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetAnalyticsGoalStatsResponses = {
+    /**
+     * Conversion figures
+     */
+    200: AnalyticsGoalStatsResponse;
+};
+
+export type GetAnalyticsGoalStatsResponse = GetAnalyticsGoalStatsResponses[keyof GetAnalyticsGoalStatsResponses];
+
+export type DeleteAnalyticsGoalData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Goal ID
+         */
+        goal_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/analytics/goals/{goal_id}';
+};
+
+export type DeleteAnalyticsGoalErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Goal not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type DeleteAnalyticsGoalResponses = {
+    /**
+     * Goal deleted
+     */
+    204: void;
+};
+
+export type DeleteAnalyticsGoalResponse = DeleteAnalyticsGoalResponses[keyof DeleteAnalyticsGoalResponses];
+
+export type GetAnalyticsGoalData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Goal ID
+         */
+        goal_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/analytics/goals/{goal_id}';
+};
+
+export type GetAnalyticsGoalErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Goal not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetAnalyticsGoalResponses = {
+    /**
+     * Goal
+     */
+    200: AnalyticsGoal;
+};
+
+export type GetAnalyticsGoalResponse = GetAnalyticsGoalResponses[keyof GetAnalyticsGoalResponses];
+
+export type UpdateAnalyticsGoalData = {
+    body: AnalyticsGoalInput;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Goal ID
+         */
+        goal_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/analytics/goals/{goal_id}';
+};
+
+export type UpdateAnalyticsGoalErrors = {
+    /**
+     * Invalid goal
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Goal not found
+     */
+    404: unknown;
+    /**
+     * Name taken
+     */
+    409: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UpdateAnalyticsGoalResponses = {
+    /**
+     * Goal updated
+     */
+    200: AnalyticsGoal;
+};
+
+export type UpdateAnalyticsGoalResponse = UpdateAnalyticsGoalResponses[keyof UpdateAnalyticsGoalResponses];
+
+export type GetAnalyticsGoalBreakdownData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Goal ID
+         */
+        goal_id: number;
+    };
+    query: {
+        dimension: AnalyticsGoalBreakdownDimension;
+        /**
+         * Inclusive start (ISO 8601).
+         */
+        start_date: string;
+        /**
+         * Exclusive end (ISO 8601).
+         */
+        end_date: string;
+        environment_id?: number | null;
+        /**
+         * Rows to return, default 10, at most 100.
+         */
+        limit?: number | null;
+    };
+    url: '/projects/{project_id}/analytics/goals/{goal_id}/breakdown';
+};
+
+export type GetAnalyticsGoalBreakdownErrors = {
+    /**
+     * Invalid period or limit
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Goal not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetAnalyticsGoalBreakdownResponses = {
+    /**
+     * Breakdown
+     */
+    200: AnalyticsGoalBreakdownResponse;
+};
+
+export type GetAnalyticsGoalBreakdownResponse = GetAnalyticsGoalBreakdownResponses[keyof GetAnalyticsGoalBreakdownResponses];
+
+export type GetAnalyticsIdentitySettingsData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/analytics/identity';
+};
+
+export type GetAnalyticsIdentitySettingsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Project not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetAnalyticsIdentitySettingsResponses = {
+    /**
+     * Identity settings
+     */
+    200: AnalyticsIdentitySettings;
+};
+
+export type GetAnalyticsIdentitySettingsResponse = GetAnalyticsIdentitySettingsResponses[keyof GetAnalyticsIdentitySettingsResponses];
+
+export type UpdateAnalyticsIdentitySettingsData = {
+    body: UpdateAnalyticsIdentitySettings;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/analytics/identity';
+};
+
+export type UpdateAnalyticsIdentitySettingsErrors = {
+    /**
+     * Unknown mode
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Project not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UpdateAnalyticsIdentitySettingsResponses = {
+    /**
+     * Identity settings updated
+     */
+    200: AnalyticsIdentitySettings;
+};
+
+export type UpdateAnalyticsIdentitySettingsResponse = UpdateAnalyticsIdentitySettingsResponses[keyof UpdateAnalyticsIdentitySettingsResponses];
 
 export type GetAnalyticsIngestKeyEndpointData = {
     body?: never;

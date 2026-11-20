@@ -182,7 +182,7 @@ Analytics, error tracking, OpenTelemetry, metrics and logs: ingest, storage and 
 
 | Crate | Description | Consumers | Binaries |
 |---|---|---|---|
-| [`temps-analytics`](../../crates/temps-analytics) | Web analytics read side: visitors, sessions, channels and UTM attribution, API traffic, instance-wide stats, ingest keys and retention | **5**: analytics-events, analytics-performance, analytics-session-replay, cli, proxy |  |
+| [`temps-analytics`](../../crates/temps-analytics) | Web analytics read side: visitors, sessions, channels and UTM attribution, API traffic, instance-wide stats, ingest keys and retention | **6**: analytics-events, analytics-performance, analytics-session-replay, cli, error-tracking, proxy |  |
 | [`temps-analytics-backend`](../../crates/temps-analytics-backend) | Analytics storage abstraction: the AnalyticsBackend trait with TimescaleDB and ClickHouse implementations, migrations and retention | **2**: analytics, analytics-events |  |
 | [`temps-analytics-events`](../../crates/temps-analytics-events) | Web analytics event ingest and queries: page and custom events, traffic filters, ingest rate limiting and ClickHouse fan-out | **2**: analytics-performance, cli |  |
 | [`temps-analytics-funnels`](../../crates/temps-analytics-funnels) | Funnel analytics: define multi-step conversion funnels over analytics events and compute per-step conversion | **1**: cli |  |

@@ -414,6 +414,8 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
             "get_data_import",
             "get_data_import_availability",
             "get_event_entries",
+            // Raw property values of visitors' events, e.g. the URLs they clicked.
+            "get_event_properties",
             "get_ingest_errors",
             "get_log_context",
             "get_preview_gateway_logs",

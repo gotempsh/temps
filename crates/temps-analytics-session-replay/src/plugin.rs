@@ -78,6 +78,8 @@ impl TempsPlugin for SessionReplayPlugin {
                     .require_service::<temps_analytics::AnalyticsIngestKeyService>(),
                 ingest_rate_limiter: context
                     .require_service::<temps_analytics::AnalyticsIngestRateLimiter>(),
+                cookieless_identity: context
+                    .require_service::<temps_analytics::cookieless::CookielessIdentity>(),
             },
         ));
 
@@ -114,6 +116,8 @@ impl TempsPlugin for SessionReplayPlugin {
                 project_access_checker: None,
                 ingest_key_service,
                 ingest_rate_limiter,
+                cookieless_identity: context
+                    .require_service::<temps_analytics::cookieless::CookielessIdentity>(),
             },
         ));
 

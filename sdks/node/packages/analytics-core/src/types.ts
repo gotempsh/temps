@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import type { AutoTrackOptions } from "./AutoTracking";
 import type { FeatureFlags, FeatureFlagsOptions } from "./FeatureFlags";
 
 export type JsonPrimitive = string | number | boolean | null;
@@ -115,9 +116,18 @@ export interface AnalyticsClientOptions {
    * not work on this endpoint.
    */
   ingestKey?: string;
+  /**
+   * Store nothing on the visitor's device (ADR 109 D3). No visitor or session
+   * id is written to `localStorage`, ids an earlier visit stored are deleted,
+   * and session recording does not start. Turn it on together with the
+   * project's "Cookieless" identity mode in the Temps Console, which makes
+   * the server count visitors by a hash that changes every day: a returning
+   * visitor counts as new the next day. Defaults to false.
+   */
+  cookieless?: boolean;
 }
 
-export interface AnalyticsOptions extends AnalyticsClientOptions {
+export interface AnalyticsOptions extends AnalyticsClientOptions, AutoTrackOptions {
   /**
    * Feature-flag context and server-rendered bootstrap values. Flags are read
    * lazily from `{basePath}/flags`; see `AnalyticsApi.flags`.
@@ -166,6 +176,13 @@ export interface AnalyticsApi {
   trackEvent(eventName: string, data?: Record<string, JsonValue>): Promise<void>;
   /** Manually trigger a pageview. */
   trackPageview(): void;
+  /**
+   * Report the current page as missing: emits a `not_found` event whose
+   * `path` property is the current path. For apps that answer `200` for an
+   * unknown route, call it from the "not found" view, or put the
+   * `data-temps-404` attribute on that view and let the tracker do it.
+   */
+  trackNotFound(data?: Record<string, JsonValue>): Promise<void>;
   /** Identify a user. No-op placeholder for now. */
   identify(userId: string, traits?: Record<string, JsonValue>): Promise<void> | void;
   /** Enable session recording at runtime. */

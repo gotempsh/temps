@@ -12,6 +12,13 @@ import {
 import { EngagementTracker } from "./EngagementTracker";
 import { SpeedTracker } from "./SpeedTracker";
 import { SessionRecorder } from "./SessionRecorder";
+import {
+  NOT_FOUND_EVENT,
+  NotFoundMarkerWatcher,
+  notFoundEventData,
+  setupLinkTracking,
+} from "./AutoTracking";
+import { enableCookielessIdentity, isCookielessIdentity, onCookielessIdentity } from "./identity";
 import { exposureEventData, FeatureFlags } from "./FeatureFlags";
 
 interface InternalCleanup {
@@ -39,10 +46,24 @@ export function createAnalytics(options: AnalyticsOptions = {}): AnalyticsApi {
     engagementThreshold = 10000,
     enableSessionRecording = false,
     sessionRecordingConfig = {},
+    autoTrackOutboundLinks = true,
+    autoTrackFileDownloads = true,
+    fileDownloadExtensions,
+    autoTrackNotFound = true,
+    cookieless = false,
     flags: flagOptions = {},
   } = options;
 
   const cleanups: InternalCleanup[] = [];
+
+  // Before anything can send an event, so the first page view already goes
+  // out without a stored id (ADR 109 D3).
+  if (cookieless) enableCookielessIdentity();
+  // Session replay needs a visitor that persists across page loads, which is
+  // exactly what cookieless mode gives up. Cookieless is page-wide and
+  // one-way, so it is read when recording would start, not from this
+  // instance's own option: an earlier instance may have switched it on.
+  const recordingAllowed = (): boolean => !isCookielessIdentity();
 
   const enabled = computeEnabled(disabled, ignoreLocalhost);
 
@@ -67,6 +88,16 @@ export function createAnalytics(options: AnalyticsOptions = {}): AnalyticsApi {
     );
   };
 
+  const trackNotFound: AnalyticsApi["trackNotFound"] = (data = {}) =>
+    trackEvent(NOT_FOUND_EVENT, notFoundEventData(data));
+
+  // Created before the first page view so that page view is checked too.
+  const notFoundWatcher =
+    enabled && autoTrackNotFound
+      ? new NotFoundMarkerWatcher(() => void trackNotFound())
+      : null;
+  if (notFoundWatcher) cleanups.push(() => notFoundWatcher.cancel());
+
   const trackPageview: AnalyticsApi["trackPageview"] = () => {
     if (!enabled) return;
     void sendAnalytics(
@@ -87,6 +118,7 @@ export function createAnalytics(options: AnalyticsOptions = {}): AnalyticsApi {
       basePath,
       ingestKey
     );
+    notFoundWatcher?.afterPageview();
   };
 
   // Flags work wherever the page is served by Temps, including when
@@ -130,10 +162,36 @@ export function createAnalytics(options: AnalyticsOptions = {}): AnalyticsApi {
     }
 
     cleanups.push(setupClickDelegation(trackEvent));
+    cleanups.push(
+      setupLinkTracking(
+        { autoTrackOutboundLinks, autoTrackFileDownloads, fileDownloadExtensions },
+        (eventName, data) => {
+          sendAnalyticsReliable(
+            "event",
+            {
+              event_name: eventName,
+              request_query: window.location.search,
+              request_path: window.location.pathname,
+              domain: resolveDomain(),
+              language: navigator.language,
+              event_data: data,
+            },
+            basePath,
+            ingestKey
+          );
+        }
+      )
+    );
   }
 
+  if (!recordingAllowed() && enableSessionRecording) {
+    // eslint-disable-next-line no-console
+    console.warn(
+      "[temps] Session recording is off in cookieless mode: a replay needs a visitor id stored on the device."
+    );
+  }
   const recorder =
-    enabled && enableSessionRecording
+    enabled && enableSessionRecording && recordingAllowed()
       ? new SessionRecorder({
           basePath,
           ingestKey,
@@ -146,6 +204,14 @@ export function createAnalytics(options: AnalyticsOptions = {}): AnalyticsApi {
 
   // Runtime-controlled recorder handle for enable/disable after init
   let runtimeRecorder: SessionRecorder | null = recorder;
+  // Another instance switching the page to cookieless ends this one's replay
+  // and drops what it has not uploaded yet.
+  cleanups.push(
+    onCookielessIdentity(() => {
+      runtimeRecorder?.discard();
+      runtimeRecorder = null;
+    })
+  );
 
   return {
     get enabled(): boolean {
@@ -155,9 +221,10 @@ export function createAnalytics(options: AnalyticsOptions = {}): AnalyticsApi {
     flags,
     trackEvent,
     trackPageview,
+    trackNotFound,
     identify,
     enableSessionRecording(): void {
-      if (!enabled) return;
+      if (!enabled || !recordingAllowed()) return;
       if (runtimeRecorder) {
         runtimeRecorder.start();
         return;

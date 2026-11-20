@@ -10,6 +10,16 @@ import { PageHeader } from '@/components/layout/PageContainer'
 
 import { AnalyticsTrafficChart } from '@/components/analytics/overview/AnalyticsTrafficChart'
 import { AnalyticsBreakdowns } from '@/components/analytics/overview/AnalyticsBreakdowns'
+import {
+  FileDownloadsCard,
+  NotFoundCard,
+  OutboundLinksCard,
+} from '@/components/analytics/overview/AutoEventsCards'
+import { ConversionsCard } from '@/components/analytics/overview/ConversionsCard'
+import {
+  CookielessFactLine,
+  VisitorIdentityCard,
+} from '@/components/analytics/VisitorIdentityCard'
 
 import { DateTimeRange } from '@/components/ui/date-time-range'
 
@@ -1034,6 +1044,8 @@ function SessionReplaysTab({ project }: SessionReplaysTabProps) {
         onRefresh={advance}
       />
 
+      <CookielessFactLine project={project} view="replays" />
+
       {/* Session Replays Component */}
       <SessionReplays
         project={project}
@@ -1081,6 +1093,8 @@ function JourneyTab({ project }: JourneyTabProps) {
         refreshQueryKeys={[queryKeyPrefix(getPageFlowQueryKey)]}
         onRefresh={advance}
       />
+
+      <CookielessFactLine project={project} view="journey" />
 
       <PageFlow
         project={project}
@@ -1144,7 +1158,12 @@ export function ProjectAnalytics({ project }: ProjectAnalyticsProps) {
       <Route path="setup" element={<AnalyticsSetup project={project} />} />
       <Route
         path="settings"
-        element={<AnalyticsTrafficSettings project={project} />}
+        element={
+          <div className="space-y-6">
+            <AnalyticsTrafficSettings project={project} />
+            <VisitorIdentityCard project={project} />
+          </div>
+        }
       />
       <Route
         path="live"
@@ -1377,6 +1396,12 @@ export function ProjectAnalyticsOverview({
               />
             )}
           </div>
+          <ConversionsCard
+            project={project}
+            startDate={startDate}
+            endDate={endDate}
+            environment={selectedEnvironment}
+          />
           <AnalyticsBreakdowns
             traffic={
               <div className="grid min-w-0 grid-cols-1 gap-4 md:grid-cols-2">
@@ -1453,6 +1478,24 @@ export function ProjectAnalyticsOverview({
             events={
               <div className="grid min-w-0 grid-cols-1 gap-4 md:grid-cols-2">
                 <EventsChart
+                  project={project}
+                  startDate={startDate}
+                  endDate={endDate}
+                  environment={selectedEnvironment}
+                />
+                <NotFoundCard
+                  project={project}
+                  startDate={startDate}
+                  endDate={endDate}
+                  environment={selectedEnvironment}
+                />
+                <OutboundLinksCard
+                  project={project}
+                  startDate={startDate}
+                  endDate={endDate}
+                  environment={selectedEnvironment}
+                />
+                <FileDownloadsCard
                   project={project}
                   startDate={startDate}
                   endDate={endDate}

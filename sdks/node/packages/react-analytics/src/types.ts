@@ -5,6 +5,7 @@ import type React from "react";
 import type {
   JsonValue,
   AnalyticsClientOptions,
+  AutoTrackOptions,
   FeatureFlags,
   FeatureFlagsOptions,
 } from "@temps-sdk/analytics-core";
@@ -26,13 +27,19 @@ export interface AnalyticsContextValue {
   identify: (userId: string, traits?: Record<string, JsonValue>) => Promise<void> | void;
   /** Manually trigger a pageview. */
   trackPageview: () => void;
+  /**
+   * Report the current page as missing: sends a `not_found` event whose
+   * `path` property is the current path. Call it from your "not found" view,
+   * or mark that view with `data-temps-404` and let the provider do it.
+   */
+  trackNotFound: (data?: Record<string, JsonValue>) => Promise<void>;
   /** Whether analytics are currently enabled. */
   enabled: boolean;
   /** Client-visible feature flags for this visitor. Prefer `useFlag`. */
   flags: FeatureFlags;
 }
 
-export interface TempsAnalyticsProviderProps extends AnalyticsClientOptions {
+export interface TempsAnalyticsProviderProps extends AnalyticsClientOptions, AutoTrackOptions {
   /**
    * Feature-flag context (`key`, `attributes`) and server-rendered
    * `bootstrap` values. Read flags with `useFlag`.

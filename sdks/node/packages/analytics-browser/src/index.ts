@@ -55,6 +55,14 @@ export function trackPageview(): void {
   getAnalytics().trackPageview();
 }
 
+/**
+ * Report the current page as missing (`not_found` event). Convenience
+ * wrapper — throws if uninitialized.
+ */
+export function trackNotFound(data?: Record<string, JsonValue>): Promise<void> {
+  return getAnalytics().trackNotFound(data);
+}
+
 /** Tear down the instance and remove listeners. */
 export function destroy(): void {
   instance?.destroy();
