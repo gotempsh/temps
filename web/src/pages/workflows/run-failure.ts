@@ -6,6 +6,20 @@ import type {
   WorkflowRunResponse,
   WorkflowStepResponse,
 } from '@/api/client'
+import { listWorkflowSteps } from '@/api/client/sdk.gen'
+
+type RunGeneration = Pick<
+  WorkflowRunResponse,
+  'id' | 'attempt' | 'finished_at' | 'updated_at'
+>
+
+/**
+ * Which failure of a run this is: a retried run that fails again has a new
+ * attempt and finish time, so reads keyed on it never reuse the last one.
+ */
+export function failureGeneration(run: RunGeneration): string {
+  return `${run.attempt}:${run.finished_at ?? run.updated_at}`
+}
 
 type RunFailureFields = Pick<WorkflowRunResponse, 'error_kind' | 'step_count'>
 type FailedStep = Pick<WorkflowStepResponse, 'sequence' | 'name' | 'attempts'>
@@ -59,16 +73,13 @@ export function runPayloadsKey(runId: string) {
  * so it reads its new error instead of showing the cached one.
  */
 export function payloadQueryKey(
-  run: Pick<
-    WorkflowRunResponse,
-    'id' | 'attempt' | 'finished_at' | 'updated_at'
-  >,
+  run: RunGeneration,
   target: WorkflowRevealTarget,
   sequence?: number
 ) {
   return [
     ...runPayloadsKey(run.id),
-    `${run.attempt}:${run.finished_at ?? run.updated_at}`,
+    failureGeneration(run),
     target,
     sequence ?? null,
   ] as const
@@ -130,4 +141,33 @@ export function findFailedStep<T extends Pick<WorkflowStepResponse, 'status'>>(
     }
   }
   return undefined
+}
+
+/**
+ * One journal page read to find the step that failed `run`, keyed on the
+ * failure's generation: a retry that fails at another step while the page
+ * is open reads the journal again instead of naming the previous failure.
+ */
+export function failedStepQuery(
+  path: { project_id: number; environment_id: number; run_id: string },
+  run: RunGeneration,
+  page: number
+) {
+  return {
+    queryKey: [
+      'workflow-run-failed-step',
+      path,
+      failureGeneration(run),
+      page,
+    ] as const,
+    queryFn: async ({ signal }: { signal: AbortSignal }) =>
+      (
+        await listWorkflowSteps({
+          path,
+          query: { page, page_size: FAILED_STEP_PAGE_SIZE },
+          signal,
+          throwOnError: true,
+        })
+      ).data,
+  }
 }

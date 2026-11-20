@@ -184,7 +184,9 @@ export function WorkflowEnvironment({
                   aria-disabled={issue.isPending}
                 >
                   {!overview
-                    ? 'Checking credential…'
+                    ? query.isError
+                      ? 'Credential status unavailable'
+                      : 'Checking credential…'
                     : overview.credential.configured
                       ? 'Rotate credential'
                       : 'Create credential'}

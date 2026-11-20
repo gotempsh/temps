@@ -6,7 +6,7 @@ import { cleanup, fireEvent, render } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { installBrowserWindow } from '@/test/dom'
-import { MemoryRouter, Route, Routes } from 'react-router'
+import { Link, MemoryRouter, Route, Routes } from 'react-router'
 import { BreadcrumbProvider } from '@/contexts/BreadcrumbContext'
 import {
   getWorkflowSettingsOptions,
@@ -242,6 +242,42 @@ test('an unsaved access edit survives switching to another tab and back', () => 
   expect(view.container.textContent).not.toContain('Journal storage')
 })
 
+test('an unsaved access edit stays with its environment', () => {
+  const cache = withRuns('orders', [])
+  const other = { project_id: 1, environment_id: 3 }
+  for (const grantsPath of [path, other])
+    cache.setQueryData<object>(workflowGrantsOptions(grantsPath, 1).queryKey, {
+      grants: [],
+      total: 0,
+      total_pages: 0,
+      page: 1,
+      page_size: 20,
+    })
+  const view = render(
+    <MemoryRouter
+      initialEntries={['/workflows/1/2?workflow=orders&tab=access']}
+    >
+      <QueryClientProvider client={cache}>
+        <BreadcrumbProvider>
+          <Link to="/workflows/1/3?workflow=orders&tab=access">Staging</Link>
+          <Routes>
+            <Route
+              path="/workflows/:projectId/:environmentId"
+              element={<WorkflowDetail />}
+            />
+          </Routes>
+        </BreadcrumbProvider>
+      </QueryClientProvider>
+    </MemoryRouter>
+  )
+  const resource = () =>
+    view.container.querySelector<HTMLInputElement>('#workflow-resource')
+  fireEvent.input(resource()!, { target: { value: 'orders-draft' } })
+  fireEvent.click(view.getByRole('link', { name: 'Staging' }))
+  // The page stays mounted across environments; the form starts over.
+  expect(resource()?.value).toBe('')
+})
+
 test('refresh reloads the list on the open tab, never the settings form', () => {
   expect(openTabQueryKeys('access', path, 2)).toEqual([
     workflowGrantsOptions(path, 2).queryKey,
@@ -250,5 +286,9 @@ test('refresh reloads the list on the open tab, never the settings form', () => 
     workflowKeysOptions(path.project_id, 3).queryKey,
   ])
   expect(openTabQueryKeys('settings', path, 1)).toEqual([])
+  // Settings that failed to load say "Refresh to retry", so Refresh retries.
+  expect(openTabQueryKeys('settings', path, 1, true)).toEqual([
+    getWorkflowSettingsOptions({ path }).queryKey,
+  ])
   expect(openTabQueryKeys('runs', path, 1)).toEqual([])
 })

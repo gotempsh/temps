@@ -23,11 +23,7 @@ import { usePageTitle } from '@/hooks/usePageTitle'
 import { problemDetail } from '@/lib/api-problem'
 import { workflowTone } from './status'
 import { RunFailure } from './RunFailure'
-import {
-  FAILED_STEP_PAGE_SIZE,
-  failedStepPages,
-  findFailedStep,
-} from './run-failure'
+import { failedStepPages, failedStepQuery, findFailedStep } from './run-failure'
 
 export function WorkflowRunDetail() {
   const params = useParams()
@@ -47,16 +43,15 @@ export function WorkflowRunDetail() {
   const steps = useQuery(stepOptions)
   // The failed step is read from the journal's end, not the page on screen,
   // so the failure reads the same while the journal is browsed.
-  const failedStepOptions = (
+  const failedRun =
     run.data?.status === 'failed' && run.data.error_kind === 'step_failed'
-      ? failedStepPages(run.data.step_count)
-      : []
-  ).map((stepPage) =>
-    listWorkflowStepsOptions({
-      path,
-      query: { page: stepPage, page_size: FAILED_STEP_PAGE_SIZE },
-    })
-  )
+      ? run.data
+      : undefined
+  const failedStepOptions = failedRun
+    ? failedStepPages(failedRun.step_count).map((stepPage) =>
+        failedStepQuery(path, failedRun, stepPage)
+      )
+    : []
   const failedStepLookup = useQueries({ queries: failedStepOptions })
   const failedStep = findFailedStep(
     failedStepLookup.map((lookup) => lookup.data?.steps ?? [])
@@ -100,6 +95,7 @@ export function WorkflowRunDetail() {
       queryKeys={[
         runOptions.queryKey,
         stepOptions.queryKey,
+        ...failedStepOptions.map((options) => options.queryKey),
         getProjectOptions({ path: { id: path.project_id } }).queryKey,
         getEnvironmentOptions({
           path: { project_id: path.project_id, env_id: path.environment_id },

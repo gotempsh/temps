@@ -198,7 +198,7 @@ test('until the credential status loads, the menu cannot create or rotate one', 
   client.setQueryDefaults(
     getWorkflowsOverviewOptions({ path: { project_id: 1, environment_id: 2 } })
       .queryKey,
-    { queryFn: () => new Promise(() => {}) }
+    { enabled: false }
   )
   try {
     const view = render(
@@ -219,6 +219,46 @@ test('until the credential status loads, the menu cannot create or rotate one', 
     expect(
       view.queryByRole('menuitem', { name: 'Create credential' })
     ).toBeNull()
+  } finally {
+    cleanup()
+    client.clear()
+  }
+})
+
+test('when the credential status cannot load, the menu says so instead of waiting', async () => {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false, staleTime: Infinity } },
+  })
+  const { queryKey } = getWorkflowsOverviewOptions({
+    path: { project_id: 1, environment_id: 2 },
+  })
+  // A failed load, kept as is: the test never reaches the network.
+  client.setQueryDefaults(queryKey, { enabled: false })
+  client
+    .getQueryCache()
+    .build(client, { queryKey })
+    .setState({
+      status: 'error',
+      error: new Error('The server did not answer'),
+      fetchStatus: 'idle',
+    })
+  try {
+    const view = render(
+      <MemoryRouter>
+        <QueryClientProvider client={client}>
+          <WorkflowEnvironment projectId={1} environmentId={2} />
+        </QueryClientProvider>
+      </MemoryRouter>
+    )
+    await view.findByText('Could not load workflows')
+    fireEvent.keyDown(
+      view.getByRole('button', { name: 'Workflow settings and access' }),
+      { key: 'Enter' }
+    )
+    const item = await view.findByRole('menuitem', {
+      name: 'Credential status unavailable',
+    })
+    expect(item.hasAttribute('data-disabled')).toBe(true)
   } finally {
     cleanup()
     client.clear()

@@ -124,7 +124,12 @@ const guides: Record<
           'Apps deployed on Temps get these variables automatically. Anywhere else, set them with an API key:',
         content: (
           <>
-            <CodeBlock code={traceEnvironment(projectId)} language="bash" />
+            <CodeBlock
+              code={traceEnvironment(projectId)}
+              language="bash"
+              defaultWrap
+              disableWrapToggle
+            />
             {setupLink('Open trace setup')}
           </>
         ),

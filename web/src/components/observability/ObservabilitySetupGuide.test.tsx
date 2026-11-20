@@ -98,6 +98,8 @@ describe('empty observability pages teach the setup', () => {
       client
     )
     expect(html).toContain('X-Temps-Project-Id=7')
+    // The headers line is long: it wraps instead of scrolling sideways.
+    expect(html).toContain('whitespace-pre-wrap break-all')
   })
 
   test('each kind links to the service page that sets it up', () => {

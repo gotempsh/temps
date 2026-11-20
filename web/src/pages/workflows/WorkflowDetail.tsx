@@ -29,6 +29,7 @@ import {
   getProjectOptions,
   getEnvironmentOptions,
   getWorkflowsOverviewOptions,
+  getWorkflowSettingsOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { RefreshButton } from '@/components/ui/refresh-button'
@@ -78,6 +79,11 @@ export function WorkflowDetail() {
   if (!opened.has(tab)) setOpened(new Set([...opened, tab]))
   const overviewOptions = getWorkflowsOverviewOptions({ path })
   const overview = useQuery(overviewOptions)
+  // Watches the settings the Settings panel loads, without loading them.
+  const settings = useQuery({
+    ...getWorkflowSettingsOptions({ path }),
+    enabled: false,
+  })
   const summary = overview.data?.workflows.find((row) => row.name === workflow)
   const project = useQuery(getProjectOptions({ path: { id: path.project_id } }))
   const environment = useQuery(
@@ -122,7 +128,7 @@ export function WorkflowDetail() {
           queryKeys={[
             runsOptions.queryKey,
             overviewOptions.queryKey,
-            ...openTabQueryKeys(tab, path, page),
+            ...openTabQueryKeys(tab, path, page, settings.isError),
           ]}
         />
       }
@@ -157,6 +163,8 @@ export function WorkflowDetail() {
           <TabsContent value="settings" forceMount className={keptPanel}>
             {opened.has('settings') && (
               <WorkflowSettingsPanel
+                // Another environment's draft never carries over.
+                key={`${path.project_id}:${path.environment_id}`}
                 path={path}
                 embedded
                 description={`Applies to every workflow in ${environmentName}.`}
@@ -166,6 +174,7 @@ export function WorkflowDetail() {
           <TabsContent value="access" forceMount className={keptPanel}>
             {opened.has('access') && (
               <WorkflowGrantsPanel
+                key={`${path.project_id}:${path.environment_id}`}
                 path={path}
                 page={tab === 'access' ? page : 1}
                 onPageChange={(value) => go('access', value)}
@@ -176,6 +185,7 @@ export function WorkflowDetail() {
           <TabsContent value="keys" forceMount className={keptPanel}>
             {opened.has('keys') && (
               <WorkflowKeysPanel
+                key={path.project_id}
                 projectId={path.project_id}
                 page={tab === 'keys' ? page : 1}
                 onPageChange={(value) => go('keys', value)}

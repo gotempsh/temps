@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import {
+  getWorkflowSettingsOptions,
   listWorkflowGrantsOptions,
   listWorkflowProjectKeysOptions,
 } from '@/api/client/@tanstack/react-query.gen'
@@ -92,21 +93,26 @@ export function workflowKeysOptions(project_id: number, page: number) {
 
 /**
  * What Refresh reloads besides the runs and the overview: the list on the
- * open tab. Settings is left out, so a refresh never resets a form being
- * edited.
+ * open tab. Settings that loaded are left out, so a refresh never resets a
+ * form being edited; settings that failed to load are retried, as their
+ * error tells the user to refresh.
  */
 export function openTabQueryKeys(
   tab: WorkflowDetailTab,
   path: { project_id: number; environment_id: number },
-  page: number
+  page: number,
+  settingsFailed = false
 ): readonly unknown[][] {
   switch (tab) {
     case 'access':
       return [workflowGrantsOptions(path, page).queryKey]
     case 'keys':
       return [workflowKeysOptions(path.project_id, page).queryKey]
-    case 'runs':
     case 'settings':
+      return settingsFailed
+        ? [getWorkflowSettingsOptions({ path }).queryKey]
+        : []
+    case 'runs':
       return []
   }
 }
