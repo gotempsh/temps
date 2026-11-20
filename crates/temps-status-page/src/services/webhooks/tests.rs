@@ -51,12 +51,28 @@ struct Sent {
     body: String,
 }
 
+/// A one-shot async action run from inside the transport, to change the
+/// world while a delivery is in flight.
+type Hook =
+    Box<dyn FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send>;
+
 #[derive(Default)]
 struct FakeTransport {
     /// Statuses to answer with, in order; 204 once empty.
     answers: Mutex<VecDeque<Result<u16, TransportError>>>,
     refuse_check: std::sync::atomic::AtomicBool,
     sent: Mutex<Vec<Sent>>,
+    /// Run once, during the next post.
+    during_post: Mutex<Option<Hook>>,
+    /// Pause in every post, so concurrent dispatchers interleave.
+    delay: Mutex<Option<std::time::Duration>>,
+}
+
+fn hook<F>(future: F) -> Option<Hook>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    Some(Box::new(move || Box::pin(future)))
 }
 
 impl FakeTransport {
@@ -87,6 +103,14 @@ impl WebhookTransport for FakeTransport {
         headers: Vec<(&'static str, String)>,
         body: String,
     ) -> Result<u16, TransportError> {
+        let during = self.during_post.lock().expect("lock").take();
+        if let Some(during) = during {
+            during().await;
+        }
+        let delay = *self.delay.lock().expect("lock");
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
         self.sent.lock().expect("lock").push(Sent {
             url: url.to_string(),
             headers,
@@ -772,4 +796,205 @@ async fn the_handlers_authorize_return_the_secret_once_and_audit_without_it() {
             "{method} {path}"
         );
     }
+}
+
+async fn one_webhook(fx: &Fx) -> i32 {
+    fx.webhooks
+        .create(
+            fx.page_id,
+            CreateStatusPageWebhookRequest {
+                url: URL.to_string(),
+            },
+        )
+        .await
+        .expect("create")
+        .webhook
+        .id
+}
+
+#[tokio::test]
+async fn two_dispatchers_on_one_database_post_each_event_once() {
+    let Some(fx) = fixture().await else {
+        return;
+    };
+    one_webhook(&fx).await;
+    for index in 0..5 {
+        schedule(&fx, &format!("Upgrade {index}")).await;
+    }
+    *fx.transport.delay.lock().expect("lock") = Some(std::time::Duration::from_millis(30));
+    let other = StatusPageWebhookService::new(
+        fx.db.clone(),
+        fx.webhooks.cache.clone(),
+        Arc::new(EncryptionService::new_from_password("webhook-tests")),
+        fx.transport.clone(),
+    );
+    let (mut one, mut two) = (
+        WebhookDispatcherState::default(),
+        WebhookDispatcherState::default(),
+    );
+    let now = Utc::now();
+    let (a, b) = tokio::join!(
+        fx.webhooks.dispatch_tick(&mut one, now),
+        other.dispatch_tick(&mut two, now)
+    );
+    let (a, b) = (a.expect("first tick"), b.expect("second tick"));
+    assert_eq!(a.delivered + b.delivered, 5, "{a:?} {b:?}");
+    assert_eq!(fx.transport.sent().len(), 5, "every event is posted once");
+    for row in deliveries(&fx).await {
+        assert_eq!(row.attempts, 1, "{row:?}");
+        assert!(row.delivered_at.is_some(), "{row:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_webhook_disabled_while_a_group_is_sending_gets_no_more_requests() {
+    let Some(fx) = fixture().await else {
+        return;
+    };
+    let id = one_webhook(&fx).await;
+    let events = super::dispatcher::CONCURRENCY + 2;
+    for index in 0..events {
+        schedule(&fx, &format!("Upgrade {index}")).await;
+    }
+    let db = fx.db.clone();
+    *fx.transport.during_post.lock().expect("lock") = hook(async move {
+        status_page_webhooks::Entity::update_many()
+            .col_expr(
+                status_page_webhooks::Column::Enabled,
+                sea_orm::sea_query::Expr::value(false),
+            )
+            .filter(status_page_webhooks::Column::Id.eq(id))
+            .exec(db.as_ref())
+            .await
+            .expect("disable");
+    });
+    let report = fx
+        .webhooks
+        .dispatch_tick(&mut WebhookDispatcherState::default(), Utc::now())
+        .await
+        .expect("tick");
+    assert_eq!(
+        fx.transport.sent().len(),
+        super::dispatcher::CONCURRENCY,
+        "only the group already sending goes out"
+    );
+    assert_eq!(report.cancelled, 2, "{report:?}");
+}
+
+#[tokio::test]
+async fn a_url_edited_while_a_group_is_sending_is_used_for_the_next_group() {
+    let Some(fx) = fixture().await else {
+        return;
+    };
+    let id = one_webhook(&fx).await;
+    let events = super::dispatcher::CONCURRENCY + 1;
+    for index in 0..events {
+        schedule(&fx, &format!("Upgrade {index}")).await;
+    }
+    let db = fx.db.clone();
+    *fx.transport.during_post.lock().expect("lock") = hook(async move {
+        status_page_webhooks::Entity::update_many()
+            .col_expr(
+                status_page_webhooks::Column::Url,
+                sea_orm::sea_query::Expr::value("https://hooks.example.test/moved"),
+            )
+            .filter(status_page_webhooks::Column::Id.eq(id))
+            .exec(db.as_ref())
+            .await
+            .expect("edit url");
+    });
+    fx.webhooks
+        .dispatch_tick(&mut WebhookDispatcherState::default(), Utc::now())
+        .await
+        .expect("tick");
+    let sent = fx.transport.sent();
+    assert_eq!(sent.len(), events);
+    assert_eq!(
+        sent.last().expect("last").url,
+        "https://hooks.example.test/moved"
+    );
+}
+
+#[tokio::test]
+async fn queueing_a_backlog_holds_one_insert_batch_at_a_time() {
+    let Some(fx) = fixture().await else {
+        return;
+    };
+    let webhooks = super::dispatcher::WEBHOOKS_PER_QUERY as usize * 2 + 1;
+    for index in 0..webhooks {
+        fx.webhooks
+            .create(
+                fx.page_id,
+                CreateStatusPageWebhookRequest {
+                    url: format!("https://hooks.example.test/{index}"),
+                },
+            )
+            .await
+            .expect("create");
+    }
+    for index in 0..3 {
+        schedule(&fx, &format!("Upgrade {index}")).await;
+    }
+    let mut state = WebhookDispatcherState::default();
+    let report = fx
+        .webhooks
+        .dispatch_tick(&mut state, Utc::now())
+        .await
+        .expect("tick");
+    assert_eq!(report.queued, webhooks * 3, "{report:?}");
+    assert_eq!(deliveries(&fx).await.len(), webhooks * 3);
+    assert!(
+        state.peak_buffered() <= super::dispatcher::INSERT_CHUNK,
+        "held {} payloads at once",
+        state.peak_buffered()
+    );
+}
+
+#[tokio::test]
+async fn an_attempt_interrupted_after_its_claim_is_retried_and_then_given_up() {
+    let Some(fx) = fixture().await else {
+        return;
+    };
+    one_webhook(&fx).await;
+    schedule(&fx, "Database upgrade").await;
+    let now = Utc::now();
+    let mut state = WebhookDispatcherState::default();
+    // The first attempt fails and is due again a minute later.
+    fx.transport.answer(Ok(500));
+    fx.webhooks
+        .dispatch_tick(&mut state, now)
+        .await
+        .expect("first attempt");
+    // A dispatcher claims the last attempt and stops before recording it.
+    status_page_webhook_deliveries::Entity::update_many()
+        .col_expr(
+            status_page_webhook_deliveries::Column::Attempts,
+            sea_orm::sea_query::Expr::value(MAX_ATTEMPTS),
+        )
+        .col_expr(
+            status_page_webhook_deliveries::Column::NextAttemptAt,
+            sea_orm::sea_query::Expr::value(now + super::dispatcher::CLAIM_LEASE),
+        )
+        .exec(fx.db.as_ref())
+        .await
+        .expect("interrupted claim");
+    let report = fx
+        .webhooks
+        .dispatch_tick(&mut state, now + Duration::minutes(2))
+        .await
+        .expect("inside the lease");
+    assert_eq!(report, Default::default(), "the lease holds the attempt");
+    let report = fx
+        .webhooks
+        .dispatch_tick(&mut state, now + Duration::minutes(6))
+        .await
+        .expect("after the lease");
+    assert_eq!(report.cancelled, 1, "{report:?}");
+    assert_eq!(fx.transport.sent().len(), 1);
+    let row = deliveries(&fx).await.remove(0);
+    assert!(row.failed_at.is_some());
+    assert!(row
+        .last_error
+        .as_deref()
+        .is_some_and(|error| error.contains("interrupted")));
 }
