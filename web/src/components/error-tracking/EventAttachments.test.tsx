@@ -8,7 +8,11 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 
 import type { AttachmentUsage, AttachmentView } from '@/api/client/types.gen'
 import { AttachmentItems } from './EventAttachments'
-import { AttachmentUsageSummary, QuotaForm } from './ErrorAttachmentsSettings'
+import {
+  AttachmentsSettingsBody,
+  AttachmentUsageSummary,
+  QuotaForm,
+} from './ErrorAttachmentsSettings'
 
 const usage = (overrides: Partial<AttachmentUsage> = {}): AttachmentUsage => ({
   configured: true,
@@ -174,5 +178,38 @@ describe('QuotaForm', () => {
     const html = renderForm(1)
     expect(html).toContain('The current quota, 1 B, is not a whole number')
     expect(html).not.toMatch(/<button[^>]*disabled=""[^>]*>Save quota/)
+  })
+})
+
+describe('AttachmentsSettingsBody', () => {
+  const renderBody = (props: { usage?: AttachmentUsage; error?: unknown }) =>
+    renderToStaticMarkup(
+      <QueryClientProvider client={new QueryClient()}>
+        <MemoryRouter>
+          <AttachmentsSettingsBody
+            projectId={3}
+            usage={props.usage}
+            isPending={false}
+            error={props.error ?? null}
+            isRetrying={false}
+            onRetry={() => {}}
+          />
+        </MemoryRouter>
+      </QueryClientProvider>
+    )
+
+  test('a failed refresh keeps the quota form under its error', () => {
+    const html = renderBody({ usage: usage(), error: new Error('offline') })
+    expect(html).toContain('could not be refreshed')
+    expect(html).toContain('Retry')
+    expect(html).toContain('id="attachment-quota"')
+    expect(html).toContain('of 256 MiB used')
+  })
+
+  test('a failed first load shows only the error and a retry', () => {
+    const html = renderBody({ error: new Error('offline') })
+    expect(html).toContain('Attachment usage could not be loaded.')
+    expect(html).toContain('Retry')
+    expect(html).not.toContain('id="attachment-quota"')
   })
 })

@@ -184,6 +184,66 @@ export function QuotaForm({
 }
 
 /**
+ * The usage and quota form, or why they cannot be shown. A failed refresh
+ * keeps the form mounted, with any unsaved edit, under its error: the
+ * error sits in its own slot so the form never changes position and
+ * remounts.
+ */
+export function AttachmentsSettingsBody({
+  projectId,
+  usage,
+  isPending,
+  error,
+  isRetrying,
+  onRetry,
+}: {
+  projectId: number
+  usage: AttachmentUsage | undefined
+  isPending: boolean
+  error: unknown
+  isRetrying: boolean
+  onRetry: () => void
+}) {
+  if (isPending) {
+    return (
+      <div className="space-y-3">
+        <Skeleton className="h-5 w-64" />
+        <Skeleton className="h-2 w-full" />
+        <Skeleton className="h-9 w-56" />
+      </div>
+    )
+  }
+  const failure = error ? (
+    <Alert variant="destructive">
+      <AlertDescription className="space-y-2">
+        <p>
+          {readFailureServerDetail(error) ??
+            (usage
+              ? 'Attachment usage could not be refreshed; the values below may be out of date.'
+              : 'Attachment usage could not be loaded.')}
+        </p>
+        <Button
+          type="button"
+          size="sm"
+          variant="outline"
+          disabled={isRetrying}
+          onClick={onRetry}
+        >
+          {isRetrying ? 'Retrying…' : 'Retry'}
+        </Button>
+      </AlertDescription>
+    </Alert>
+  ) : null
+  return (
+    <>
+      {failure}
+      {usage && <AttachmentUsageSummary usage={usage} />}
+      {usage && <QuotaForm projectId={projectId} usage={usage} />}
+    </>
+  )
+}
+
+/**
  * Files SDKs send with errors and feedback (ADR 111, D4): whether they are
  * kept, how much of the project's quota they use, and the quota itself.
  */
@@ -196,36 +256,14 @@ export function ErrorAttachmentsSettings({ projectId }: { projectId: number }) {
       <PageHeader title="Attachments" />
       <Card>
         <CardContent className="space-y-6 pt-6">
-          {usage.isPending ? (
-            <div className="space-y-3">
-              <Skeleton className="h-5 w-64" />
-              <Skeleton className="h-2 w-full" />
-              <Skeleton className="h-9 w-56" />
-            </div>
-          ) : usage.isError ? (
-            <Alert variant="destructive">
-              <AlertDescription className="space-y-2">
-                <p>
-                  {readFailureServerDetail(usage.error) ??
-                    'Attachment usage could not be loaded.'}
-                </p>
-                <Button
-                  type="button"
-                  size="sm"
-                  variant="outline"
-                  disabled={usage.isFetching}
-                  onClick={() => void usage.refetch()}
-                >
-                  {usage.isFetching ? 'Retrying…' : 'Retry'}
-                </Button>
-              </AlertDescription>
-            </Alert>
-          ) : (
-            <>
-              <AttachmentUsageSummary usage={usage.data} />
-              <QuotaForm projectId={projectId} usage={usage.data} />
-            </>
-          )}
+          <AttachmentsSettingsBody
+            projectId={projectId}
+            usage={usage.data}
+            isPending={usage.isPending}
+            error={usage.error}
+            isRetrying={usage.isFetching}
+            onRetry={() => void usage.refetch()}
+          />
         </CardContent>
       </Card>
     </div>
