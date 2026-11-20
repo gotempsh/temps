@@ -305,7 +305,9 @@ Built in a new `temps-surveys` crate. Decisions the shape above left open:
   neither.
 - **At most 50 active surveys per project**, so the delivery payload and the
   per-request selection stay bounded. Activating one more is a 400 naming the
-  limit. A definition (questions and display conditions, serialized) is
+  limit. Activations in a project take a transaction-scoped advisory lock
+  before counting, so two concurrent launches cannot both pass at 49. A
+  definition (questions and display conditions, serialized) is
   capped at 16 KiB: the per-field limits alone allow about 95 KB, and the cap
   keeps one project's cached surveys, and one browser response, under
   800 KiB.
@@ -315,10 +317,15 @@ Built in a new `temps-surveys` crate. Decisions the shape above left open:
   cached). Every write through `SurveyService` drops the project's entry.
 - **Edits are compare-and-set** on `expected_updated_at`, under a row lock,
   like flags.
+- **Question ids from the console are random** (`q_` and 10 base-36
+  characters). Answers are stored under the id and a survey does not keep the
+  ids of questions removed in earlier edits, so an id numbered after the
+  questions left could take a removed question's id and inherit its answers.
 - **Results are SQL over `events`**, three `GROUP BY` queries over the
   survey's `survey_*` events in a window (default 30 days, at most 366),
   reading `COALESCE(props, event_data::jsonb)` so events from older SDKs
-  count. A distribution is capped at 5,000 rows. Choice answers keep the
+  count. A distribution is capped at 5,000 rows and covers only questions
+  with a distribution, so open-text answers cannot crowd it. Choice answers keep the
   declared order and zero-fill; answers that no longer match a choice are
   counted as `other`, not dropped.
 - **Responses link to the visitor, not the replay.** `events.session_id` is

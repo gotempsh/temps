@@ -8,20 +8,24 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Utc};
 use sea_orm::{
-    ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseBackend, DatabaseConnection,
-    EntityTrait, FromQueryResult, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Statement,
-    TransactionTrait,
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseBackend,
+    DatabaseConnection, EntityTrait, FromQueryResult, PaginatorTrait, QueryFilter, QueryOrder,
+    QuerySelect, Statement, TransactionTrait,
 };
 use temps_entities::surveys;
 use tracing::{info, warn};
 
-use super::delivery::{Lookup, ProjectSurveys, SurveyDeliveryCache, MAX_ACTIVE_SURVEYS};
+use super::delivery::{
+    Lookup, ProjectSurveys, RefreshClaim, SurveyDeliveryCache, MAX_ACTIVE_SURVEYS,
+};
 use super::results::{
     sanitize_answers, summarize, AnswerRow, AnswerValue, QuestionResults, DISMISSED_EVENT,
     MAX_DISTRIBUTION_ROWS, SENT_EVENT, SHOWN_EVENT,
 };
 use crate::error::SurveyError;
-use crate::model::{validate, SurveyDefinition, SurveyQuestion, SurveyStatus, SurveyTargeting};
+use crate::model::{
+    validate, QuestionKind, SurveyDefinition, SurveyQuestion, SurveyStatus, SurveyTargeting,
+};
 use crate::selection::DeliveredSurvey;
 
 pub const DEFAULT_PAGE_SIZE: u64 = 20;
@@ -310,9 +314,10 @@ impl SurveyService {
             name: definition.name.clone(),
             message,
         })?;
+        let txn = self.db.begin().await?;
         if definition.status == SurveyStatus::Active {
-            self.ensure_room_for_active(project_id, None, &definition.name)
-                .await?;
+            lock_active_cap(&txn, project_id).await?;
+            ensure_room_for_active(&txn, project_id, None, &definition.name).await?;
         }
 
         let model = surveys::ActiveModel {
@@ -332,8 +337,9 @@ impl SurveyService {
             )?),
             ..Default::default()
         }
-        .insert(self.db.as_ref())
+        .insert(&txn)
         .await?;
+        txn.commit().await?;
         self.delivery.invalidate_project(project_id);
         info!(project_id, survey_id = model.id, name = %model.name, "Created survey");
         Survey::try_from(model)
@@ -389,13 +395,8 @@ impl SurveyService {
             message,
         })?;
         if definition.status == SurveyStatus::Active && before.status != SurveyStatus::Active {
-            let active = surveys::Entity::find()
-                .filter(surveys::Column::ProjectId.eq(project_id))
-                .filter(surveys::Column::Status.eq(SurveyStatus::Active.as_str()))
-                .filter(surveys::Column::Id.ne(survey_id))
-                .count(&txn)
-                .await?;
-            check_active_room(active, &definition.name)?;
+            lock_active_cap(&txn, project_id).await?;
+            ensure_room_for_active(&txn, project_id, Some(survey_id), &definition.name).await?;
         }
 
         let mut active: surveys::ActiveModel = model.into();
@@ -441,21 +442,6 @@ impl SurveyService {
         Ok(survey)
     }
 
-    async fn ensure_room_for_active(
-        &self,
-        project_id: i32,
-        except: Option<i32>,
-        name: &str,
-    ) -> Result<(), SurveyError> {
-        let mut query = surveys::Entity::find()
-            .filter(surveys::Column::ProjectId.eq(project_id))
-            .filter(surveys::Column::Status.eq(SurveyStatus::Active.as_str()));
-        if let Some(id) = except {
-            query = query.filter(surveys::Column::Id.ne(id));
-        }
-        check_active_room(query.count(self.db.as_ref()).await?, name)
-    }
-
     // ---------------------------------------------------------------------
     // Delivery
     // ---------------------------------------------------------------------
@@ -475,20 +461,23 @@ impl SurveyService {
                 entry,
                 refresh: true,
             } => {
+                // Released on every exit, cancellation included.
+                let _claim = RefreshClaim::new(entry.clone());
+                // Refreshes share the load budget with misses. Without a free
+                // permit the previous set is served and a later request
+                // retries the refresh.
+                let Ok(_permit) = self.delivery.load_permit().try_acquire() else {
+                    return Ok(entry);
+                };
                 let generation = self.delivery.generation();
                 match self.load_active(project_id).await {
-                    Ok(fresh) => {
-                        let fresh = self.delivery.insert(fresh, generation);
-                        self.delivery.release_refresh(&entry);
-                        Ok(fresh)
-                    }
+                    Ok(fresh) => Ok(self.delivery.insert(fresh, generation)),
                     Err(error) => {
                         warn!(
                             project_id,
                             %error,
                             "Failed to refresh cached surveys; serving the previous set"
                         );
-                        self.delivery.release_refresh(&entry);
                         Ok(entry)
                     }
                 }
@@ -502,9 +491,11 @@ impl SurveyService {
                         ),
                     }
                 })?;
-                match self.delivery.lookup(project_id) {
-                    Lookup::Hit { entry, .. } => Ok(entry),
-                    Lookup::Miss => {
+                // `peek`, not `lookup`: this request is not going to refresh,
+                // so it must not claim a refresh someone else should run.
+                match self.delivery.peek(project_id) {
+                    Some(entry) => Ok(entry),
+                    None => {
                         let generation = self.delivery.generation();
                         let fresh = self.load_active(project_id).await?;
                         Ok(self.delivery.insert(fresh, generation))
@@ -583,9 +574,21 @@ impl SurveyService {
             .map(|q| q.id.as_str())
             .collect::<Vec<_>>()
             .join(",");
+        // The distribution covers the questions that have one. Open-text
+        // answers are mostly distinct, so letting them into the grouped and
+        // limited query could push rare scores and choices past the row cap.
+        let distributed_ids = survey
+            .questions
+            .iter()
+            .filter(|q| q.kind != QuestionKind::OpenText)
+            .map(|q| q.id.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
         let (filter, values) = event_filter(project_id, survey_id, &window, 3);
         let mut sent_values = vec![SENT_EVENT.into(), question_ids.into()];
         sent_values.extend(values);
+        let mut distribution_values = sent_values.clone();
+        distribution_values[1] = distributed_ids.into();
         // Each answer is one row; a multiple-choice answer is one row per
         // selection. `#>> '{}'` renders a JSON scalar as text (`"Pro"` ->
         // `Pro`, `9` -> `9`).
@@ -608,7 +611,7 @@ impl SurveyService {
                    AND {filter} \
                  GROUP BY 1, 2 ORDER BY 3 DESC LIMIT {MAX_DISTRIBUTION_ROWS}"
             ),
-            sent_values.clone(),
+            distribution_values,
         ))
         .all(db)
         .await?;
@@ -737,6 +740,38 @@ fn event_filter(
     (clauses.join(" AND "), values)
 }
 
+/// Advisory-lock class for "a survey in this project is becoming active".
+const ACTIVE_CAP_LOCK_CLASS: i32 = 110_001;
+
+/// Serialize activations within a project for the rest of `txn`. Row locks
+/// on the surveys being launched do not stop two launches from each counting
+/// 49 active surveys and both succeeding; this transaction-scoped lock on the
+/// project does, without touching the projects table.
+async fn lock_active_cap<C: ConnectionTrait>(conn: &C, project_id: i32) -> Result<(), SurveyError> {
+    conn.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "SELECT pg_advisory_xact_lock($1, $2)",
+        [ACTIVE_CAP_LOCK_CLASS.into(), project_id.into()],
+    ))
+    .await?;
+    Ok(())
+}
+
+async fn ensure_room_for_active<C: ConnectionTrait>(
+    conn: &C,
+    project_id: i32,
+    except: Option<i32>,
+    name: &str,
+) -> Result<(), SurveyError> {
+    let mut query = surveys::Entity::find()
+        .filter(surveys::Column::ProjectId.eq(project_id))
+        .filter(surveys::Column::Status.eq(SurveyStatus::Active.as_str()));
+    if let Some(id) = except {
+        query = query.filter(surveys::Column::Id.ne(id));
+    }
+    check_active_room(query.count(conn).await?, name)
+}
+
 fn check_active_room(active: u64, name: &str) -> Result<(), SurveyError> {
     if active >= MAX_ACTIVE_SURVEYS as u64 {
         return Err(SurveyError::Validation {
@@ -771,7 +806,6 @@ fn to_json<T: serde::Serialize>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::QuestionKind;
     use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult, Value};
     use std::collections::BTreeMap;
 
@@ -870,12 +904,27 @@ mod tests {
     #[tokio::test]
     async fn activating_beyond_the_cap_is_refused() {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_exec_results(vec![lock_taken()])
             .append_query_results(vec![vec![count(MAX_ACTIVE_SURVEYS as i64)]]);
-        let error = service(db)
+        let service = service(db);
+        let error = service
             .create(7, create_request(SurveyStatus::Active))
             .await
             .unwrap_err();
         assert!(error.to_string().contains("maximum is 50"), "{error}");
+        // The count runs after the project's activation lock, in the same
+        // transaction, so two concurrent launches cannot both see room.
+        let sql = statements(service);
+        assert_eq!(sql[0], "BEGIN", "{sql:?}");
+        assert!(sql[1].contains("pg_advisory_xact_lock"), "{sql:?}");
+        assert!(sql[2].contains("COUNT"), "{sql:?}");
+    }
+
+    fn lock_taken() -> MockExecResult {
+        MockExecResult {
+            last_insert_id: 0,
+            rows_affected: 1,
+        }
     }
 
     #[tokio::test]
@@ -927,6 +976,7 @@ mod tests {
         after.status = "active".into();
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results(vec![vec![before.clone()]])
+            .append_exec_results(vec![lock_taken()])
             .append_query_results(vec![vec![count(0)]])
             .append_query_results(vec![vec![after]]);
         let service = service(db);
@@ -1066,5 +1116,38 @@ mod tests {
         let nps = results.questions[0].nps.as_ref().unwrap();
         assert_eq!((nps.promoters, nps.detractors), (3, 1));
         assert_eq!(results.questions[0].answered, 4);
+    }
+
+    /// Open-text questions are counted as answered but kept out of the
+    /// grouped, row-capped distribution query.
+    #[tokio::test]
+    async fn open_text_answers_stay_out_of_the_distribution_query() {
+        let mut survey = model(1, 7, "active");
+        survey.questions = serde_json::to_value(vec![
+            question("nps", QuestionKind::Nps),
+            question("why", QuestionKind::OpenText),
+        ])
+        .unwrap();
+        let empty = Vec::<BTreeMap<String, Value>>::new();
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![survey]])
+            .append_query_results(vec![empty.clone()])
+            .append_query_results(vec![empty.clone()])
+            .append_query_results(vec![empty]);
+        let service = service(db);
+        service
+            .results(7, 1, ResultsWindow::default())
+            .await
+            .unwrap();
+        let log = transaction_log(service);
+        let values: Vec<String> = log
+            .iter()
+            .flat_map(|t| t.statements().iter().cloned())
+            .filter(|statement| statement.sql.contains("jsonb_each"))
+            .map(|statement| format!("{:?}", statement.values))
+            .collect();
+        assert_eq!(values.len(), 2, "{values:?}");
+        assert!(values[0].contains("\"nps\""), "distribution: {}", values[0]);
+        assert!(values[1].contains("\"nps,why\""), "answered: {}", values[1]);
     }
 }

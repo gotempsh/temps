@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use chrono::SecondsFormat;
 use serde::{Deserialize, Serialize};
 use temps_core::{AuditLogger, ProjectAccessChecker};
 use utoipa::{IntoParams, ToSchema};
@@ -97,8 +98,12 @@ impl From<Survey> for SurveyResponse {
             status: survey.status,
             questions: survey.questions,
             targeting: survey.targeting,
-            created_at: survey.created_at.to_rfc3339(),
-            updated_at: survey.updated_at.to_rfc3339(),
+            created_at: survey
+                .created_at
+                .to_rfc3339_opts(SecondsFormat::AutoSi, true),
+            updated_at: survey
+                .updated_at
+                .to_rfc3339_opts(SecondsFormat::AutoSi, true),
         }
     }
 }
@@ -159,8 +164,14 @@ impl SurveyResultsResponse {
         let response_rate = results.response_rate();
         Self {
             survey_id,
-            start_date: results.window.start.to_rfc3339(),
-            end_date: results.window.end.to_rfc3339(),
+            start_date: results
+                .window
+                .start
+                .to_rfc3339_opts(SecondsFormat::AutoSi, true),
+            end_date: results
+                .window
+                .end
+                .to_rfc3339_opts(SecondsFormat::AutoSi, true),
             shown: results.shown,
             dismissed: results.dismissed,
             sent: results.sent,
@@ -191,7 +202,9 @@ impl From<SubmittedResponse> for SurveyAnswerSet {
     fn from(response: SubmittedResponse) -> Self {
         Self {
             event_id: response.event_id,
-            timestamp: response.timestamp.to_rfc3339(),
+            timestamp: response
+                .timestamp
+                .to_rfc3339_opts(SecondsFormat::AutoSi, true),
             environment_id: response.environment_id,
             visitor_id: response.visitor_id,
             session_id: response.session_id,
@@ -221,5 +234,29 @@ pub fn total_pages(total: u64, page_size: u64) -> u64 {
         0
     } else {
         total.div_ceil(page_size)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    #[test]
+    fn timestamps_use_the_z_suffix_and_keep_their_precision() {
+        let timestamp = chrono::Utc
+            .timestamp_opt(1_763_640_000, 123_456_000)
+            .single()
+            .expect("a valid timestamp");
+        let answer = SurveyAnswerSet::from(SubmittedResponse {
+            event_id: 1,
+            timestamp,
+            environment_id: None,
+            visitor_id: None,
+            session_id: None,
+            pathname: "/".into(),
+            answers: HashMap::new(),
+        });
+        assert_eq!(answer.timestamp, "2025-11-20T12:00:00.123456Z");
     }
 }

@@ -111,6 +111,13 @@ impl SurveyDeliveryCache {
         }
     }
 
+    /// The entry as cached, fresh or not, without claiming its refresh. For
+    /// a caller that has just waited for a load permit and only needs to know
+    /// whether someone else filled the cache meanwhile.
+    pub fn peek(&self, project_id: i32) -> Option<Arc<ProjectSurveys>> {
+        self.entries.load().get(&project_id).cloned()
+    }
+
     pub fn load_permit(&self) -> &Semaphore {
         &self.loads
     }
@@ -141,10 +148,6 @@ impl SurveyDeliveryCache {
         entry
     }
 
-    pub fn release_refresh(&self, entry: &ProjectSurveys) {
-        entry.refreshing.store(false, Ordering::Release);
-    }
-
     pub fn invalidate_project(&self, project_id: i32) {
         self.generation.fetch_add(1, Ordering::AcqRel);
         self.entries.rcu(|current| {
@@ -157,6 +160,26 @@ impl SurveyDeliveryCache {
     #[cfg(test)]
     pub fn cached_projects(&self) -> usize {
         self.entries.load().len()
+    }
+}
+
+/// Ownership of an entry's refresh, won from [`SurveyDeliveryCache::lookup`].
+/// Dropping it releases the claim on every exit, including a request
+/// cancelled during the database read, so a refresh can never stay marked in
+/// progress with nobody running it.
+pub struct RefreshClaim {
+    entry: Arc<ProjectSurveys>,
+}
+
+impl RefreshClaim {
+    pub fn new(entry: Arc<ProjectSurveys>) -> Self {
+        Self { entry }
+    }
+}
+
+impl Drop for RefreshClaim {
+    fn drop(&mut self) {
+        self.entry.refreshing.store(false, Ordering::Release);
     }
 }
 
@@ -216,8 +239,48 @@ mod tests {
             Lookup::Hit { refresh: false, .. }
         ));
         if let Lookup::Hit { entry, .. } = cache.lookup(1) {
-            cache.release_refresh(&entry);
+            drop(RefreshClaim::new(entry));
         }
+        assert!(matches!(cache.lookup(1), Lookup::Hit { refresh: true, .. }));
+    }
+
+    fn stale_entry(project_id: i32) -> ProjectSurveys {
+        ProjectSurveys {
+            project_id,
+            surveys: Vec::new(),
+            loaded_at: Instant::now()
+                .checked_sub(TTL + Duration::from_millis(1))
+                .unwrap(),
+            refreshing: AtomicBool::new(false),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_refresh_releases_its_claim() {
+        let cache = SurveyDeliveryCache::new();
+        cache.insert(stale_entry(1), cache.generation());
+        let Lookup::Hit {
+            entry,
+            refresh: true,
+        } = cache.lookup(1)
+        else {
+            panic!("the first lookup of a stale entry claims its refresh");
+        };
+        let task = tokio::spawn(async move {
+            let _claim = RefreshClaim::new(entry);
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+        task.abort();
+        let _ = task.await;
+        assert!(matches!(cache.lookup(1), Lookup::Hit { refresh: true, .. }));
+    }
+
+    #[test]
+    fn peek_never_claims_a_refresh() {
+        let cache = SurveyDeliveryCache::new();
+        cache.insert(stale_entry(1), cache.generation());
+        assert!(cache.peek(1).is_some());
         assert!(matches!(cache.lookup(1), Lookup::Hit { refresh: true, .. }));
     }
 
