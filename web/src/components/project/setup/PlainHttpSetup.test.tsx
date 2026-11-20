@@ -128,6 +128,22 @@ test('errors without a DSN onboard with what is missing and a deep link', () => 
   expect(html).toContain('href="/projects/my-app/errors/setup"')
 })
 
+test('library tabs wrap to a second row instead of scrolling sideways', () => {
+  const view = mount(
+    <MemoryRouter>
+      <PlainHttpSetupView
+        project={project}
+        setup={signalFixture('errors')}
+        origin="https://console.example.com"
+      />
+    </MemoryRouter>
+  )
+  const strip = view.getByRole('tablist', { name: 'Sentry SDK examples' })
+  expect(strip.className).toContain('flex-wrap')
+  expect(strip.className).not.toContain('overflow-x-auto')
+  expect(view.getAllByRole('tab')).toHaveLength(5)
+})
+
 test('session replay leads with the Temps SDK and offers rrweb', () => {
   const html = render('session_replay')
   expect(html).toContain('enableSessionRecording')

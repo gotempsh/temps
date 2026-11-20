@@ -29,12 +29,7 @@ import {
 } from '@/components/ui/collapsible'
 import { CopyAiPromptButton } from '@/components/ui/ai-prompt-code-block'
 import { Skeleton } from '@/components/ui/skeleton'
-import {
-  ScrollableTabsList,
-  Tabs,
-  TabsContent,
-  TabsTrigger,
-} from '@/components/ui/tabs'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { monitoringSetupPrompt } from '@/lib/monitoring-setup-prompt'
 import {
   analyticsBrowserSnippet,
@@ -138,13 +133,17 @@ function LibraryTabs({
 }) {
   return (
     <Tabs defaultValue={examples[0]?.id}>
-      <ScrollableTabsList aria-label={label}>
+      {/* Wraps to a second row on narrow screens instead of scrolling. */}
+      <TabsList
+        aria-label={label}
+        className="h-auto flex-wrap gap-y-1 overflow-x-visible"
+      >
         {examples.map((example) => (
           <TabsTrigger key={example.id} value={example.id}>
             {example.label}
           </TabsTrigger>
         ))}
-      </ScrollableTabsList>
+      </TabsList>
       {examples.map((example) => (
         <TabsContent key={example.id} value={example.id} className="pt-3">
           <CodeBlock
