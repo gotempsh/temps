@@ -445,6 +445,67 @@ mod storage {
     }
 
     #[tokio::test]
+    async fn a_resend_completes_a_write_that_never_finished_without_charging_it_twice() {
+        let Some(f) = fixture("attachment unfinished resend test").await else {
+            return;
+        };
+        let event_id = event(&f, SDK_EVENT, chrono::Duration::minutes(5)).await;
+        // A reservation whose object was written but whose row was never
+        // marked stored, charged to the quota as a reservation is.
+        f.db.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "INSERT INTO error_attachments (project_id, owner_kind, owner_id, ordinal, event_time, \
+                 filename, content_type, attachment_type, size_bytes, content_sha256) \
+             SELECT $1, 'error', $2, 0, timestamp, 'a.txt', 'text/plain', 'event.attachment', 3, \
+                 sha256('abc'::bytea) FROM error_events WHERE id = $2",
+            [f.project_id.into(), event_id.into()],
+        ))
+        .await
+        .expect("unfinished row");
+        f.db.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "INSERT INTO error_attachment_usage (project_id, bytes, files, quota_bytes) \
+             VALUES ($1, 3, 1, 3)",
+            [f.project_id.into()],
+        ))
+        .await
+        .expect("charge it");
+
+        // The project is at its quota; the resend still completes the file.
+        let resent = f
+            .service
+            .store_batch(
+                f.store.as_ref(),
+                &batch(&f, SDK_EVENT, vec![file("a.txt", b"abc")]),
+            )
+            .await
+            .expect("resend");
+        assert_eq!(
+            (resent.stored, resent.duplicates, resent.over_quota),
+            (1, 0, 0),
+            "{resent:?}"
+        );
+        let listed = f
+            .service
+            .list(f.project_id, AttachmentOwner::Error(event_id))
+            .await
+            .expect("list");
+        assert_eq!(listed.len(), 1);
+        let usage = f.service.usage(f.project_id).await.expect("usage");
+        assert_eq!((usage.used_bytes, usage.files), (3, 1));
+        // Once stored, the next resend is a duplicate.
+        let again = f
+            .service
+            .store_batch(
+                f.store.as_ref(),
+                &batch(&f, SDK_EVENT, vec![file("a.txt", b"abc")]),
+            )
+            .await
+            .expect("again");
+        assert_eq!((again.stored, again.duplicates), (0, 1), "{again:?}");
+    }
+
+    #[tokio::test]
     async fn the_per_event_limit_counts_files_an_earlier_envelope_stored() {
         let Some(f) = fixture("attachment per-event limit test").await else {
             return;

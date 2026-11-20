@@ -601,15 +601,13 @@ impl AttachmentService {
             .ok_or(ErrorTrackingError::ProjectNotFound)?;
         let used: i64 = usage.try_get("", "bytes")?;
         let quota: i64 = usage.try_get("", "quota_bytes")?;
-        let owned = tx
+        // The same file for the same owner: unique by name and content.
+        let replay = tx
             .query_one(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
-                "SELECT COUNT(*)::BIGINT AS files, \
-                        COALESCE(SUM(size_bytes), 0)::BIGINT AS bytes, \
-                        COALESCE(MAX(ordinal) + 1, 0)::INTEGER AS next_ordinal, \
-                        COALESCE(BOOL_OR(filename = $4 AND content_sha256 = $5), FALSE) AS replay \
-                 FROM error_attachments \
-                 WHERE project_id = $1 AND owner_kind = $2 AND owner_id = $3",
+                "SELECT id, stored_at IS NOT NULL AS stored FROM error_attachments \
+                 WHERE project_id = $1 AND owner_kind = $2 AND owner_id = $3 \
+                   AND filename = $4 AND content_sha256 = $5",
                 [
                     project_id.into(),
                     owner.kind().into(),
@@ -618,12 +616,30 @@ impl AttachmentService {
                     digest.clone().into(),
                 ],
             ))
+            .await?;
+        if let Some(row) = replay {
+            if row.try_get::<bool>("", "stored")? {
+                outcome.duplicates += 1;
+                return Ok(None);
+            }
+            // A write that never finished (its object may or may not be
+            // there): the resend completes it under the reservation it
+            // already holds, charged once. The single uploader is the only
+            // writer, so nothing else is writing this row now.
+            return Ok(Some(row.try_get("", "id")?));
+        }
+        let owned = tx
+            .query_one(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT COUNT(*)::BIGINT AS files, \
+                        COALESCE(SUM(size_bytes), 0)::BIGINT AS bytes, \
+                        COALESCE(MAX(ordinal) + 1, 0)::INTEGER AS next_ordinal \
+                 FROM error_attachments \
+                 WHERE project_id = $1 AND owner_kind = $2 AND owner_id = $3",
+                [project_id.into(), owner.kind().into(), owner.id().into()],
+            ))
             .await?
             .ok_or(ErrorTrackingError::ProjectNotFound)?;
-        if owned.try_get::<bool>("", "replay")? {
-            outcome.duplicates += 1;
-            return Ok(None);
-        }
         let owner_files: i64 = owned.try_get("", "files")?;
         let owner_bytes: i64 = owned.try_get("", "bytes")?;
         let next_ordinal: i32 = owned.try_get("", "next_ordinal")?;
