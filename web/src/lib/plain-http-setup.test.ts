@@ -352,3 +352,58 @@ test('the rrweb example keeps a batch until the server accepts it, without keepa
   expect(batches[2].batchId).not.toBe(batches[0].batchId)
   expect(batches[2].events).toEqual([{ type: 3, n: 2 }])
 })
+
+test('the rrweb example stops recording once failed uploads queue too many events', async () => {
+  const code = sessionReplayExamples(signalFixture('session_replay'))[1]
+    .code.replace(/^import .*$/m, '')
+    .replace('export async function', 'async function')
+  const limit = Number(code.match(/MAX_QUEUED_EVENTS = (\d+)/)?.[1])
+  expect(limit).toBeGreaterThan(0)
+  let emit: (event: unknown) => void = () => {}
+  let tick: () => Promise<void> = async () => {}
+  let stopped = 0
+  let initDone = false
+  const startReplay = new Function(
+    'record',
+    'fetch',
+    'setInterval',
+    'sessionStorage',
+    'localStorage',
+    'location',
+    'navigator',
+    'innerWidth',
+    'innerHeight',
+    `${code}\nreturn startReplay;`
+  )(
+    (options: { emit: (event: unknown) => void }) => {
+      emit = options.emit
+      return () => {
+        stopped += 1
+      }
+    },
+    async () => {
+      // Init succeeds; every upload after it is refused (an outage).
+      const status = initDone ? 503 : 201
+      initDone = true
+      return { ok: status < 300, status }
+    },
+    (fn: () => Promise<void>) => {
+      tick = fn
+    },
+    {},
+    {},
+    { href: 'https://apps.example.com/' },
+    { userAgent: 'test', language: 'en' },
+    1280,
+    800
+  ) as () => Promise<void>
+
+  await startReplay()
+  emit({ type: 2 })
+  await tick() // the first batch fails and stays pending
+  // The first event is in the pending batch; the buffer holds the rest.
+  for (let i = 0; i < limit - 1; i++) emit({ type: 3, i })
+  expect(stopped).toBe(0)
+  emit({ type: 3, i: 'last' })
+  expect(stopped).toBe(1)
+})

@@ -256,7 +256,16 @@ export async function startReplay() {
   let buffer = [];
   let pending = null; // kept, with the same batchId, until the server accepts it
   let sending = false;
-  record({ emit: (event) => buffer.push(event), maskAllInputs: true });
+  // While uploads keep failing, events pile up. Past this many, stop
+  // recording: dropping events would break the replay, which needs them all.
+  const MAX_QUEUED_EVENTS = 5000;
+  const stop = record({
+    emit: (event) => {
+      buffer.push(event);
+      if (buffer.length >= MAX_QUEUED_EVENTS) stop?.();
+    },
+    maskAllInputs: true,
+  });
   setInterval(async () => {
     if (sending) return;
     if (!pending && buffer.length) {
