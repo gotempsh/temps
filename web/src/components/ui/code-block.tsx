@@ -168,6 +168,71 @@ export function CodeBlock({
     setTimeout(() => setCopied(false), 2000)
   }
 
+  const controls = (className: string) => (
+    <div className={cn('flex items-center gap-0.5 opacity-100', className)}>
+      <Button
+        size="icon"
+        variant="ghost"
+        className={cn(
+          'size-7 rounded-md',
+          'text-muted-foreground hover:text-foreground',
+          'hover:bg-zinc-200/70 dark:hover:bg-zinc-800/60'
+        )}
+        onClick={() => setShowLineNumbers(!showLineNumbers)}
+        title={showLineNumbers ? 'Hide line numbers' : 'Show line numbers'}
+        aria-label={showLineNumbers ? 'Hide line numbers' : 'Show line numbers'}
+      >
+        <Hash
+          className={cn(
+            'size-3.5',
+            showLineNumbers && 'text-blue-500 dark:text-blue-400'
+          )}
+        />
+      </Button>
+      {!disableWrapToggle && (
+        <Button
+          size="icon"
+          variant="ghost"
+          className={cn(
+            'size-7 rounded-md',
+            'text-muted-foreground hover:text-foreground',
+            'hover:bg-zinc-200/70 dark:hover:bg-zinc-800/60'
+          )}
+          onClick={() => setWrapLines(!wrapLines)}
+          title={wrapLines ? 'Disable line wrap' : 'Enable line wrap'}
+          aria-label={wrapLines ? 'Disable line wrap' : 'Enable line wrap'}
+        >
+          <WrapText
+            className={cn(
+              'size-3.5',
+              wrapLines && 'text-blue-500 dark:text-blue-400'
+            )}
+          />
+        </Button>
+      )}
+      {showCopy && (
+        <Button
+          size="icon"
+          variant="ghost"
+          className={cn(
+            'size-7 rounded-md',
+            'text-muted-foreground hover:text-foreground',
+            'hover:bg-zinc-200/70 dark:hover:bg-zinc-800/60'
+          )}
+          onClick={handleCopy}
+          title={copied ? 'Copied' : 'Copy'}
+          aria-label={copied ? 'Copied' : 'Copy'}
+        >
+          {copied ? (
+            <Check className="size-3.5 text-emerald-600 dark:text-emerald-400" />
+          ) : (
+            <Copy className="size-3.5" />
+          )}
+        </Button>
+      )}
+    </div>
+  )
+
   return (
     // Container, header and type scale are lifted verbatim from the docs site's
     // `CodeGroup` (temps-landing `src/components/Code.tsx`): a rounded-2xl
@@ -182,92 +247,37 @@ export function CodeBlock({
       )}
     >
       {title && (
-        <div className="flex h-9 items-center gap-2 border-b border-zinc-900/[0.075] bg-zinc-900/[0.025] px-4 font-mono text-xs text-muted-foreground dark:border-b-white/5 dark:bg-white/[0.01]">
-          {title}
+        // A titled block carries its controls in the title bar, so the code
+        // starts right under it instead of below an empty toolbar row.
+        <div className="flex h-9 items-center justify-between gap-2 border-b border-zinc-900/[0.075] bg-zinc-900/[0.025] pr-1 pl-4 font-mono text-xs text-muted-foreground dark:border-b-white/5 dark:bg-white/[0.01]">
+          <span className="min-w-0 truncate">{title}</span>
+          {controls('shrink-0')}
         </div>
       )}
       {/* The white/2.5 wash over zinc-900 is what gives the dark panel its
           slightly-lifted tone in the docs; without it the block reads as a
           flat hole in the page. */}
       <div className="flex min-w-0 flex-col dark:bg-white/[0.025]">
-        <div className="mt-2 mr-2 flex shrink-0 self-end items-center gap-0.5 opacity-100">
-          <Button
-            size="icon"
-            variant="ghost"
-            className={cn(
-              'size-7 rounded-md',
-              'text-muted-foreground hover:text-foreground',
-              'hover:bg-zinc-200/70 dark:hover:bg-zinc-800/60'
-            )}
-            onClick={() => setShowLineNumbers(!showLineNumbers)}
-            title={showLineNumbers ? 'Hide line numbers' : 'Show line numbers'}
-            aria-label={
-              showLineNumbers ? 'Hide line numbers' : 'Show line numbers'
-            }
-          >
-            <Hash
-              className={cn(
-                'size-3.5',
-                showLineNumbers && 'text-blue-500 dark:text-blue-400'
-              )}
-            />
-          </Button>
-          {!disableWrapToggle && (
-            <Button
-              size="icon"
-              variant="ghost"
-              className={cn(
-                'size-7 rounded-md',
-                'text-muted-foreground hover:text-foreground',
-                'hover:bg-zinc-200/70 dark:hover:bg-zinc-800/60'
-              )}
-              onClick={() => setWrapLines(!wrapLines)}
-              title={wrapLines ? 'Disable line wrap' : 'Enable line wrap'}
-              aria-label={wrapLines ? 'Disable line wrap' : 'Enable line wrap'}
-            >
-              <WrapText
-                className={cn(
-                  'size-3.5',
-                  wrapLines && 'text-blue-500 dark:text-blue-400'
-                )}
-              />
-            </Button>
-          )}
-          {showCopy && (
-            <Button
-              size="icon"
-              variant="ghost"
-              className={cn(
-                'size-7 rounded-md',
-                'text-muted-foreground hover:text-foreground',
-                'hover:bg-zinc-200/70 dark:hover:bg-zinc-800/60'
-              )}
-              onClick={handleCopy}
-              title={copied ? 'Copied' : 'Copy'}
-              aria-label={copied ? 'Copied' : 'Copy'}
-            >
-              {copied ? (
-                <Check className="size-3.5 text-emerald-600 dark:text-emerald-400" />
-              ) : (
-                <Copy className="size-3.5" />
-              )}
-            </Button>
-          )}
-        </div>
+        {!title && controls('mt-2 mr-2 shrink-0 self-end')}
         <div
           ref={scrollerRef}
           {...scrollerProps}
           className={cn(
             'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring',
             // Keep the toolbar above the full-width code scroller.
-            'min-w-0 w-full px-4 pt-2 pb-4',
+            title
+              ? 'min-w-0 w-full px-4 py-3'
+              : 'min-w-0 w-full px-4 pt-2 pb-4',
             wrapLines ? 'overflow-x-hidden' : 'overflow-x-auto'
           )}
         >
           <pre
             className={cn(
               'm-0 font-mono text-[13px] leading-6 sm:text-xs',
-              wrapLines ? 'whitespace-pre-wrap break-all' : 'whitespace-pre'
+              // Wrap at spaces first; split a token only when it alone is too long.
+              wrapLines
+                ? 'whitespace-pre-wrap [overflow-wrap:anywhere]'
+                : 'whitespace-pre'
             )}
           >
             <HighlightedCode

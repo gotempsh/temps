@@ -106,3 +106,26 @@ test.each([
     expect(pre.textContent).toBe(command)
   }
 })
+
+// A titled block keeps its controls in the title bar, so no empty toolbar
+// row sits between the title and the code.
+test('a titled block puts its controls in the title bar', async () => {
+  const view = render(<CodeBlock code="A=1" language="bash" title=".env" />)
+  await act(async () => {})
+  const controls = view.getByRole('button', {
+    name: 'Show line numbers',
+  }).parentElement!
+  const header = controls.parentElement!
+  expect(header.textContent).toContain('.env')
+  expect(
+    header.nextElementSibling?.firstElementChild?.querySelector('pre')
+  ).toBeTruthy()
+  expect(view.getAllByRole('button', { name: 'Copy' })).toHaveLength(1)
+})
+
+test('wrapped lines break at spaces before splitting a word', () => {
+  const view = render(<CodeBlock code="echo hi" language="bash" defaultWrap />)
+  const pre = view.container.querySelector('pre')!
+  expect(pre.className).toContain('[overflow-wrap:anywhere]')
+  expect(pre.className).not.toContain('break-all')
+})
