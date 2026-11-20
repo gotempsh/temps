@@ -35,6 +35,7 @@ import {
   describeRule,
   emptyDraft,
   evenSplit,
+  setSplitWeight,
   fromDraft,
   operandShape,
   toDraft,
@@ -615,13 +616,7 @@ function SplitEditor({
 
   const setWeight = (variant: string, raw: string) => {
     const weight = raw.trim() === '' ? 0 : Math.max(0, Math.round(Number(raw)))
-    const next = variants
-      .map((v) => ({
-        variant: v.key,
-        weight: v.key === variant ? weight : (weights.get(v.key) ?? 0),
-      }))
-      .filter((arm) => arm.weight > 0 || arm.variant === variant)
-    onChange(next)
+    onChange(setSplitWeight(split, variant, weight))
   }
 
   return (

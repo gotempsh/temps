@@ -21,6 +21,7 @@
  *   page reports a `flag_exposure` event through `onExposure`.
  */
 
+import { postJson, REQUEST_TIMEOUT_MS } from "./request";
 import type { JsonValue } from "./types";
 
 /** Why a flag has the value it has. Mirrors the server's reason. */
@@ -81,6 +82,9 @@ export interface FeatureFlagsOptions extends FlagContext {
   disabled?: boolean;
   /** Test seam. Defaults to the global `fetch`. */
   fetch?: typeof fetch;
+  /** How long the flags request may take, body included. Defaults to 10 s;
+   * past it the request fails like any other (bootstrap values stay). */
+  timeoutMs?: number;
 }
 
 export type FlagsStatus = "idle" | "loading" | "ready" | "error";
@@ -94,6 +98,7 @@ export class FeatureFlags {
   private readonly onExposure?: (exposure: FlagExposure) => void;
   private readonly onError: (error: Error) => void;
   private readonly fetchImpl?: typeof fetch;
+  private readonly timeoutMs: number;
   private disabled: boolean;
 
   private context: FlagContext;
@@ -118,6 +123,7 @@ export class FeatureFlags {
         console.warn("[temps-flags] serving fallbacks:", error.message);
       });
     this.fetchImpl = options.fetch;
+    this.timeoutMs = options.timeoutMs ?? REQUEST_TIMEOUT_MS;
     this.disabled = options.disabled ?? false;
   }
 
@@ -281,16 +287,12 @@ export class FeatureFlags {
 
     const request = (async () => {
       try {
-        const response = await fetchImpl(`${this.basePath}/flags`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          credentials: "same-origin",
+        const parsed = await postJson<FlagsResponseBody>(
+          fetchImpl,
+          `${this.basePath}/flags`,
           body,
-        });
-        if (!response.ok) {
-          throw new Error(`flags request returned ${response.status}`);
-        }
-        const parsed = (await response.json()) as FlagsResponseBody;
+          this.timeoutMs
+        );
         if (generation !== this.generation) return;
         this.results = new Map((parsed.flags ?? []).map((flag) => [flag.key, flag]));
         // The response is authoritative: a bootstrapped flag it omits was

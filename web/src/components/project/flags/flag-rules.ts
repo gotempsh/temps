@@ -287,6 +287,26 @@ export function validateRule(
   }
 }
 
+/**
+ * `split` with `variant` set to `weight`. Subjects are bucketed into ranges
+ * laid out in the split's own order, so the saved arms keep that order and
+ * only the edited weight changes: moving 1% moves about 1% of subjects. A
+ * variant not yet in the split is appended; arms left at 0 are dropped
+ * (they hold no range), except the one being edited.
+ */
+export function setSplitWeight(
+  split: VariantWeight[],
+  variant: string,
+  weight: number
+): VariantWeight[] {
+  const present = split.some((arm) => arm.variant === variant)
+  const next = split.map((arm) =>
+    arm.variant === variant ? { variant, weight } : arm
+  )
+  if (!present) next.push({ variant, weight })
+  return next.filter((arm) => arm.weight > 0 || arm.variant === variant)
+}
+
 /** An even split across `keys`, remainder on the first arms. */
 export function evenSplit(keys: string[]): VariantWeight[] {
   if (keys.length === 0) return []
