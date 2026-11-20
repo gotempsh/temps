@@ -12,7 +12,7 @@ use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
 use temps_core::DBDateTime;
 
-#[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "analytics_identity_salts")]
 pub struct Model {
     /// UTC day the salt is used for.
@@ -28,3 +28,31 @@ pub struct Model {
 pub enum Relation {}
 
 impl ActiveModelBehavior for ActiveModel {}
+
+/// Hand-written so a logged row never prints the (encrypted) salt.
+impl std::fmt::Debug for Model {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Model")
+            .field("day", &self.day)
+            .field("salt", &"<redacted>")
+            .field("created_at", &self.created_at)
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_output_never_contains_the_salt() {
+        let model = Model {
+            day: chrono::NaiveDate::from_ymd_opt(2026, 11, 20).expect("valid date"),
+            salt: "sealed-salt-value".to_string(),
+            created_at: chrono::Utc::now(),
+        };
+        let printed = format!("{model:?}");
+        assert!(!printed.contains("sealed-salt-value"), "{printed}");
+        assert!(printed.contains("<redacted>"));
+    }
+}
