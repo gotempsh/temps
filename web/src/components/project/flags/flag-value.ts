@@ -17,7 +17,7 @@ export const FLAG_VALUE_TYPES: {
 ]
 
 /** Where the value an app actually receives came from. */
-export type ValueSource = 'override' | 'default' | 'disabled'
+export type ValueSource = 'override' | 'default' | 'disabled' | 'invalid-rules'
 
 export interface EffectiveValue {
   value: unknown
@@ -79,6 +79,11 @@ export function resolveEffectiveValue(
   // The kill switch outranks everything, including a stored override.
   if (!override.enabled)
     return { value: flag.default_value, source: 'disabled' }
+
+  // Stored rules that do not decode make the server serve the default with
+  // reason ERROR, whatever value is set here.
+  if (override.rules_valid === false)
+    return { value: flag.default_value, source: 'invalid-rules' }
 
   if (override.value === null || override.value === undefined) {
     return { value: flag.default_value, source: 'default' }

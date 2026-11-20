@@ -23,6 +23,7 @@ import {
   parseFlagValue,
   toEditableString,
 } from './flag-value'
+import { useDraftBaseline } from './draft-baseline'
 
 interface DraftVariant {
   id: string
@@ -43,6 +44,17 @@ function draftId(): string {
  * edit is refused instead of overwritten. A variant still served by a rule in
  * any environment cannot be removed; the server says which rule uses it.
  */
+/** A draft list's content, ignoring the client-only row ids. */
+function draftsKey(drafts: DraftVariant[]): string {
+  return JSON.stringify(
+    drafts.map(({ key, valueText, description }) => [
+      key,
+      valueText,
+      description,
+    ])
+  )
+}
+
 export function FlagVariantsEditor({
   projectId,
   flag,
@@ -58,15 +70,23 @@ export function FlagVariantsEditor({
     (flag.environments ?? []).flatMap((env) => (env.rules ?? []) as FlagRule[])
   )
 
-  const [drafts, setDrafts] = useState<DraftVariant[]>(() =>
-    stored.map((variant) => ({
+  const seed = (variants: FlagVariant[]): DraftVariant[] =>
+    variants.map((variant) => ({
       id: draftId(),
       key: variant.key,
       valueText: toEditableString(variant.value, valueType),
       description: variant.description ?? '',
     }))
-  )
+  const [drafts, setDrafts] = useState<DraftVariant[]>(() => seed(stored))
   const [error, setError] = useState<string | null>(null)
+  // Stays mounted across refetches; this is the revision the drafts are
+  // based on, so a save never carries a newer one than they were made from.
+  const baseRevision = useDraftBaseline(
+    flag.updated_at,
+    stored,
+    (variants) => draftsKey(drafts) !== draftsKey(seed(variants)),
+    (variants) => setDrafts(seed(variants))
+  )
 
   const save = useMutation({
     ...updateFlagMutation(),
@@ -124,7 +144,7 @@ export function FlagVariantsEditor({
       path: { project_id: projectId, key: flag.key },
       body: {
         variants: variants as never,
-        expected_updated_at: flag.updated_at,
+        expected_updated_at: baseRevision,
       },
     })
   }

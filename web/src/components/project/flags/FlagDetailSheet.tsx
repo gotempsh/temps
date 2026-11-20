@@ -48,6 +48,7 @@ import {
   parseFlagValue,
   toEditableString,
 } from './flag-value'
+import { useDraftBaseline } from './draft-baseline'
 
 interface FlagDetailSheetProps {
   projectId: number
@@ -112,9 +113,28 @@ function FlagDetailBody({
   const [description, setDescription] = useState(flag.description ?? '')
   const [defaultError, setDefaultError] = useState<string | null>(null)
   const [exposurePercent, setExposurePercent] = useState(() =>
-    String(Math.round((flag.exposure_sample_rate ?? 0) * 10000) / 100)
+    exposureText(flag.exposure_sample_rate)
   )
   const [exposureError, setExposureError] = useState<string | null>(null)
+  // The definition draft stays mounted across refetches (another section's
+  // save refetches the flag); this is the revision it is based on.
+  const definitionRevision = useDraftBaseline(
+    flag.updated_at,
+    {
+      default_value: flag.default_value,
+      description: flag.description ?? '',
+      exposure_sample_rate: flag.exposure_sample_rate ?? 0,
+    },
+    (stored) =>
+      defaultValue !== toEditableString(stored.default_value, valueType) ||
+      description !== stored.description ||
+      exposurePercent !== exposureText(stored.exposure_sample_rate),
+    (stored) => {
+      setDefaultValue(toEditableString(stored.default_value, valueType))
+      setDescription(stored.description)
+      setExposurePercent(exposureText(stored.exposure_sample_rate))
+    }
+  )
   const [confirmArchive, setConfirmArchive] = useState(false)
   const [confirmReshuffle, setConfirmReshuffle] = useState(false)
 
@@ -189,8 +209,12 @@ function FlagDetailBody({
       body: {
         default_value: parsed.value,
         description: description.trim() || null,
-        exposure_sample_rate: percent / 100,
-        expected_updated_at: flag.updated_at,
+        // Sent only when edited: the field shows a rounded percentage, and
+        // saving that back would change a rate nobody touched.
+        ...(exposurePercent === exposureText(flag.exposure_sample_rate)
+          ? {}
+          : { exposure_sample_rate: percent / 100 }),
+        expected_updated_at: definitionRevision,
       },
     })
   }
@@ -334,8 +358,8 @@ function FlagDetailBody({
 
         <section>
           <FlagVariantsEditor
-            // Re-seeded whenever the stored definition changes.
-            key={flag.updated_at}
+            // Stays mounted across refetches so unsaved edits survive; it
+            // tracks its own baseline revision.
             projectId={projectId}
             flag={flag}
             onChanged={onChanged}
@@ -382,7 +406,6 @@ function FlagDetailBody({
                 />
                 <div className="px-4 pb-4">
                   <FlagRulesEditor
-                    key={rulesEditorKey(flag, environment.id)}
                     projectId={projectId}
                     flag={flag}
                     environment={environment}
@@ -540,10 +563,9 @@ function environmentRowKey(flag: FlagResponse, environmentId: number): string {
   ].join(':')
 }
 
-/** Re-seed the rules editor whenever the stored rules change. */
-function rulesEditorKey(flag: FlagResponse, environmentId: number): string {
-  const override = environmentOverride(flag, environmentId)
-  return `${environmentId}:${override?.updated_at ?? 'none'}:${flag.updated_at}`
+/** The exposure rate as the percentage the field edits, rounded for display. */
+function exposureText(rate: number | null | undefined): string {
+  return String(Math.round((rate ?? 0) * 10000) / 100)
 }
 
 interface EnvironmentRowProps {
