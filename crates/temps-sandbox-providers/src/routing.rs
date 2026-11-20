@@ -402,6 +402,16 @@ impl SandboxProvider for RoutingSandboxProvider {
         self.backends.contains_key(&backend)
     }
 
+    async fn host_capacity(
+        &self,
+        _node_id: Option<i32>,
+        backend: Option<SandboxBackend>,
+    ) -> Result<Option<crate::SandboxHostCapacity>, AgentError> {
+        self.get(backend.unwrap_or(self.default))?
+            .host_capacity(None, backend)
+            .await
+    }
+
     fn default_resource_limits(
         &self,
         backend: Option<SandboxBackend>,

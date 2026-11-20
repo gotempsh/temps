@@ -3,13 +3,20 @@
 
 import { afterEach, describe, expect, test } from 'bun:test'
 import { renderToStaticMarkup as renderMarkup } from 'react-dom/server'
-import { act, cleanup, render } from '@testing-library/react'
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  waitFor,
+} from '@testing-library/react'
 import axe from 'axe-core'
 import type { ReactNode } from 'react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter } from 'react-router'
 
 import type { ApplicationWorkspaceResponse } from '@/api/client'
+import { jsonResponse, mockApi } from '@/test/fetch-mock'
 import { installBrowserWindow } from '@/test/dom'
 import {
   ApplicationWorkspaceSettingsPanel,
@@ -158,6 +165,28 @@ describe('ApplicationWorkspaceSettingsPanel keyboard and assistive access', () =
     })
     return view
   }
+
+  test('saving a workspace sends only edited CPU and memory overrides', async () => {
+    const updates: Array<{ cpu_limit?: number; memory_limit_mb?: number }> = []
+    const api = mockApi({
+      'PATCH /ai/applications/app_example/workspace': async (request) => {
+        updates.push(await request.json())
+        return jsonResponse(workspace)
+      },
+    })
+    try {
+      const view = await renderPanel()
+      fireEvent.change(view.getByLabelText('CPU cores'), {
+        target: { value: '1.5' },
+      })
+      fireEvent.click(view.getByRole('button', { name: 'Save and apply' }))
+      await waitFor(() => expect(updates).toHaveLength(1))
+      expect(updates[0].cpu_limit).toBe(1.5)
+      expect(updates[0]).not.toHaveProperty('memory_limit_mb')
+    } finally {
+      api.restore()
+    }
+  })
 
   test('no command is a bare scroll container that keyboard users cannot reach', () => {
     const html = renderToStaticMarkup(

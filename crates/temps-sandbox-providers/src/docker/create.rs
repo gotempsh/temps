@@ -57,12 +57,29 @@ pub(crate) const HOME_VOLUME_SCHEME: &str = "v2-";
 /// still attached to a container is not listed.
 pub(super) const HOME_VOLUME_LABEL: &str = "sh.temps.sandbox.home";
 
+#[derive(Clone, Copy)]
+struct DockerResourceLimits {
+    cpu_cores: f64,
+    memory_mb: u64,
+}
+
 impl DockerSandboxProvider {
     pub(super) async fn create_inner(
         &self,
         config: SandboxCreateConfig,
     ) -> Result<SandboxHandle, AgentError> {
         config.validate_allow_docker(super::SandboxBackend::Docker)?;
+        let capacity = self.capacity().await?;
+        let cpu_limit = capacity.cpu_limit(
+            config.run_id,
+            config.cpu_limit,
+            self.config.default_cpu_limit,
+        )?;
+        let memory_limit_mb = capacity.memory_limit(
+            config.run_id,
+            config.memory_limit_mb,
+            self.config.default_memory_limit_mb,
+        )?;
         let (container_name, home_volume_name) = Self::sandbox_names(&config);
         let _access_operation = self
             .service_access
@@ -206,6 +223,10 @@ impl DockerSandboxProvider {
             image,
             docker_network.clone(),
             &home_volume_name,
+            DockerResourceLimits {
+                cpu_cores: cpu_limit,
+                memory_mb: memory_limit_mb,
+            },
             uses_daemon,
         );
         if let Some(pending) = &mut access_mount {
@@ -358,6 +379,7 @@ impl DockerSandboxProvider {
         image: &str,
         docker_network: String,
         home_volume_name: &str,
+        limits: DockerResourceLimits,
         uses_daemon: bool,
     ) -> bollard::models::ContainerCreateBody {
         // The proxy variables are enforced after caller-provided values so a
@@ -365,7 +387,8 @@ impl DockerSandboxProvider {
         // chokepoint. Direct egress is absent at the network layer anyway;
         // these variables only tell compliant tooling how to reach the proxy.
         let env_vars = sandbox_container_environment(config.env_vars.clone(), &docker_network);
-        let host_config = self.sandbox_host_config(config, docker_network, home_volume_name);
+        let host_config =
+            self.sandbox_host_config(config, docker_network, home_volume_name, limits);
 
         let mut labels = HashMap::new();
         if uses_daemon {
@@ -403,11 +426,8 @@ impl DockerSandboxProvider {
         config: &SandboxCreateConfig,
         docker_network: String,
         home_volume_name: &str,
+        limits: DockerResourceLimits,
     ) -> bollard::models::HostConfig {
-        let cpu_limit = config.cpu_limit.unwrap_or(self.config.default_cpu_limit);
-        let memory_limit_mb = config
-            .memory_limit_mb
-            .unwrap_or(self.config.default_memory_limit_mb);
         // Map user-friendly names to Docker network modes.
         //
         // IMPORTANT: "full" used to map to docker `host` mode, which bypassed
@@ -458,9 +478,9 @@ impl DockerSandboxProvider {
             // OOM-kill of the offending process (which is the correct
             // signal — the user sees `next dev` die instead of the whole
             // host dragging).
-            nano_cpus: Some((cpu_limit * 1_000_000_000.0) as i64),
-            memory: Some(memory_limit_mb as i64 * 1024 * 1024),
-            memory_swap: Some(memory_limit_mb as i64 * 1024 * 1024),
+            nano_cpus: Some((limits.cpu_cores * 1_000_000_000.0) as i64),
+            memory: Some(limits.memory_mb as i64 * 1024 * 1024),
+            memory_swap: Some(limits.memory_mb as i64 * 1024 * 1024),
             // Security hardening
             cap_drop: Some(vec!["ALL".to_string()]),
             // Minimum caps required for the post-start ownership-normalization
@@ -900,6 +920,45 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn sandbox_host_capacity_is_cached_before_any_docker_mutation() {
+        let (fake, provider) = fake_provider().await;
+        for run_id in [14, 15] {
+            let mut cfg = config(run_id, None);
+            cfg.cpu_limit = Some(4.0);
+            assert!(matches!(
+                provider.create_inner(cfg).await,
+                Err(AgentError::SandboxCpuLimit {
+                    requested: 4.0,
+                    host: 2.0,
+                    ..
+                })
+            ));
+        }
+        assert_eq!(fake.calls().len(), 1);
+        assert_eq!(fake.calls()[0].path, "/info");
+    }
+
+    #[test]
+    fn sandbox_host_capacity_preserves_explicit_limits_and_clamps_defaults(
+    ) -> Result<(), AgentError> {
+        for cores in [1.0, 1.5, 2.0] {
+            let host = crate::SandboxHostCapacity {
+                cpu_cores: cores,
+                memory_mb: 1024,
+            };
+            assert_eq!(host.cpu_limit(42, None, 4.0)?, cores);
+            assert_eq!(host.cpu_limit(42, Some(0.5), 4.0)?, 0.5);
+            assert!(matches!(
+                host.cpu_limit(42, Some(3.0), 4.0),
+                Err(AgentError::SandboxCpuLimit { run_id: 42, .. })
+            ));
+            assert_eq!(host.memory_limit(42, None, 8192)?, 1024);
+            assert!(host.memory_limit(42, Some(2048), 512).is_err());
+        }
+        Ok(())
+    }
+
     fn describe(calls: &[Call]) -> String {
         calls
             .iter()
@@ -1051,10 +1110,17 @@ mod tests {
         assert!(!reason.contains("rollback incomplete"), "{reason}");
 
         let calls = fake.calls();
+        let creates = fake.creates();
+        assert_eq!(creates.len(), 1);
+        let host = &creates[0].body["HostConfig"];
+        assert_eq!(host["NanoCpus"], 2_000_000_000);
+        assert_eq!(host["Memory"], 4_294_967_296_i64);
+        assert_eq!(host["MemorySwap"], host["Memory"]);
         // The leftover sweep runs first, the labelled home volume right
         // before the container.
-        assert_eq!(calls[0].method, "DELETE");
-        assert_eq!(calls[0].path, "/containers/temps-sandbox-7105");
+        assert_eq!(calls[0].path, "/info");
+        assert_eq!(calls[1].method, "DELETE");
+        assert_eq!(calls[1].path, "/containers/temps-sandbox-7105");
         let volume = index_of(&calls, "POST", "/volumes/create");
         let failed_at = index_of(&calls, "POST", "/containers/create");
         assert!(volume < failed_at, "{}", describe(&calls));
@@ -1196,8 +1262,18 @@ mod tests {
         let cfg = config(7112, Some("none"));
         let home = DockerSandboxProvider::home_volume_name("temps-sandbox-7112");
 
-        let daemon =
-            provider.sandbox_container_body(&cfg, CUSTOM_IMAGE, "none".to_string(), &home, true);
+        let limits = DockerResourceLimits {
+            cpu_cores: 2.0,
+            memory_mb: 1024,
+        };
+        let daemon = provider.sandbox_container_body(
+            &cfg,
+            CUSTOM_IMAGE,
+            "none".to_string(),
+            &home,
+            limits,
+            true,
+        );
         assert_eq!(daemon.cmd, Some(vec!["serve".to_string()]));
         let labels = daemon.labels.expect("labels");
         assert_eq!(
@@ -1213,8 +1289,14 @@ mod tests {
             Some("7112")
         );
 
-        let plain =
-            provider.sandbox_container_body(&cfg, CUSTOM_IMAGE, "none".to_string(), &home, false);
+        let plain = provider.sandbox_container_body(
+            &cfg,
+            CUSTOM_IMAGE,
+            "none".to_string(),
+            &home,
+            limits,
+            false,
+        );
         assert_eq!(
             plain.cmd,
             Some(vec!["sleep".to_string(), "infinity".to_string()])
@@ -1235,10 +1317,10 @@ mod tests {
                 &home
             ))
         );
-        // Provider defaults apply, and swap is disabled.
-        assert_eq!(host.memory, Some(8192 * 1024 * 1024));
+        // The host configuration carries the resolved limits and disables swap.
+        assert_eq!(host.memory, Some(1024 * 1024 * 1024));
         assert_eq!(host.memory_swap, host.memory);
-        assert_eq!(host.nano_cpus, Some(4_000_000_000));
+        assert_eq!(host.nano_cpus, Some(2_000_000_000));
         assert_eq!(host.pids_limit, Some(DEFAULT_PIDS_LIMIT));
         assert_eq!(host.cap_drop, Some(vec!["ALL".to_string()]));
         assert_eq!(host.init, Some(true));

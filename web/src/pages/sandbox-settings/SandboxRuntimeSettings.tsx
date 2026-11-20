@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { getSandboxResourceDefaultsOptions } from '@/api/client/@tanstack/react-query.gen'
+import { defaultHint } from '@/components/sandboxes/sandbox-create'
+import { ReadFailure } from '@/components/ui/read-failure'
 import { SettingsLoadFailure } from '@/components/settings/SettingsLoadFailure'
 import { isForbiddenRead } from '@/lib/read-failure'
 import { useState } from 'react'
@@ -153,6 +156,31 @@ export function SandboxRuntimeSettings() {
   const [configRepoAllowlist, setConfigRepoAllowlist] = useState('')
   const [defaultProvider, setDefaultProvider] = useState('claude_cli')
   const [sandboxBackend, setSandboxBackend] = useState('docker')
+  const {
+    data: hints,
+    error: hintsError,
+    isFetching: hintsFetching,
+    refetch: refetchHints,
+  } = useQuery(
+    getSandboxResourceDefaultsOptions({
+      query: {
+        backend:
+          sandboxBackend === 'docker' ||
+          sandboxBackend === 'firecracker' ||
+          sandboxBackend === 'microsandbox'
+            ? sandboxBackend
+            : undefined,
+      },
+    })
+  )
+  const maxCpu = Math.min(
+    CPU_LIMIT_RANGE.max,
+    hints?.host_cpu_cores ?? CPU_LIMIT_RANGE.max
+  )
+  const maxMemory = Math.min(
+    MEMORY_LIMIT_RANGE.max,
+    hints?.host_memory_mb ?? MEMORY_LIMIT_RANGE.max
+  )
   const [workspaceFileLimits, setWorkspaceFileLimits] =
     useState<WorkspaceFileLimitsDraft>(DEFAULT_WORKSPACE_FILE_LIMITS)
   const [apiLimits, setApiLimits] =
@@ -280,11 +308,23 @@ export function SandboxRuntimeSettings() {
   const handleSave = async () => {
     // The boxes may be empty while editing; check them here and say which
     // one is wrong rather than rewriting what the user typed.
-    const limits = validateSandboxLimits({
-      cpuLimit,
-      memoryLimitMb,
-      workspaceFileLimits,
-    })
+    const limits = validateSandboxLimits(
+      {
+        cpuLimit,
+        memoryLimitMb,
+        workspaceFileLimits,
+      },
+      {
+        maxCpu:
+          cpuLimit === settings?.agent_sandbox?.cpu_limit
+            ? CPU_LIMIT_RANGE.max
+            : maxCpu,
+        maxMemory:
+          memoryLimitMb === settings?.agent_sandbox?.memory_limit_mb
+            ? MEMORY_LIMIT_RANGE.max
+            : maxMemory,
+      }
+    )
     if (!limits.ok) {
       toast.error(limits.message)
       return
@@ -710,9 +750,40 @@ export function SandboxRuntimeSettings() {
             </CardTitle>
             <CardDescription>
               CPU and memory limits per sandbox container.
+              {hints && (
+                <>
+                  {' '}
+                  Automatic placement:{' '}
+                  {defaultHint(
+                    hints.agent_cpu,
+                    'cores',
+                    maxCpu,
+                    hints.host_cpu_cores
+                  )}
+                  .{' '}
+                  {defaultHint(
+                    hints.agent_memory_mb,
+                    'MB',
+                    maxMemory,
+                    hints.host_memory_mb
+                  )}
+                  .
+                </>
+              )}
+              {!hints && !hintsError && ' Reading placement limits…'}
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
+            {hintsError && (
+              <ReadFailure
+                resource="Sandbox placement limits"
+                error={hintsError}
+                cached={Boolean(hints)}
+                onRetry={() => void refetchHints()}
+                retrying={hintsFetching}
+                embedded
+              />
+            )}
             <div className="space-y-2">
               <Label>Preset</Label>
               <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
@@ -744,7 +815,7 @@ export function SandboxRuntimeSettings() {
                   <NumberInput
                     id="cpu-limit"
                     min={CPU_LIMIT_RANGE.min}
-                    max={CPU_LIMIT_RANGE.max}
+                    max={maxCpu}
                     step={0.5}
                     value={cpuLimit}
                     onValueChange={(value) => {
@@ -759,7 +830,7 @@ export function SandboxRuntimeSettings() {
                     id="memory-limit"
                     inputMode="numeric"
                     min={MEMORY_LIMIT_RANGE.min}
-                    max={MEMORY_LIMIT_RANGE.max}
+                    max={maxMemory}
                     step={256}
                     value={memoryLimitMb}
                     onValueChange={(value) => {

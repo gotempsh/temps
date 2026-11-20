@@ -9511,8 +9511,8 @@ export type CreateSandboxBody = {
      */
     backend?: string | null;
     /**
-     * CPU cores, `[0.01, 16]` (lower if an administrator set a maximum).
-     * Omit for the operator's default.
+     * CPU cores, `[0.01, 16]`, bounded by the placement host and any
+     * administrator maximum. Omit for the effective placement default.
      */
     cpu_limit?: number | null;
     /**
@@ -31052,6 +31052,26 @@ export type SandboxPlacementResponse = {
  * these, so `Public` plus an allow-list means "anyone from these networks".
  */
 export type SandboxPreviewAccess = 'temps_login' | 'password' | 'public';
+
+export type SandboxResourceHints = {
+    /**
+     * Configured agent-run defaults bounded by the host. Agent runs are
+     * exempt from the ceilings on sandbox API requests.
+     */
+    agent_cpu: number;
+    agent_memory_mb: number;
+    cpu?: number | null;
+    host_cpu_cores?: number | null;
+    host_memory_mb?: number | null;
+    max_cpu: number;
+    max_memory_mb: number;
+    max_pids: number;
+    max_timeout_secs: number;
+    memory_mb?: number | null;
+    node_id?: number | null;
+    pids?: number | null;
+    timeout_secs: number;
+};
 
 /**
  * `@vercel/sandbox` wraps every single-sandbox response as
@@ -99650,6 +99670,52 @@ export type EvictNodeSandboxesResponses = {
 };
 
 export type EvictNodeSandboxesResponse = EvictNodeSandboxesResponses[keyof EvictNodeSandboxesResponses];
+
+export type GetSandboxResourceDefaultsData = {
+    body?: never;
+    path?: never;
+    query?: {
+        node?: string | null;
+        backend?: SandboxBackend | null;
+    };
+    url: '/v1/sandboxes/resource-defaults';
+};
+
+export type GetSandboxResourceDefaultsErrors = {
+    /**
+     * Invalid placement or backend
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * No eligible placement
+     */
+    422: unknown;
+    /**
+     * Could not load sandbox settings
+     */
+    500: unknown;
+    /**
+     * Host unavailable
+     */
+    503: unknown;
+};
+
+export type GetSandboxResourceDefaultsResponses = {
+    /**
+     * Effective sandbox defaults
+     */
+    200: SandboxResourceHints;
+};
+
+export type GetSandboxResourceDefaultsResponse = GetSandboxResourceDefaultsResponses[keyof GetSandboxResourceDefaultsResponses];
 
 export type RootfsReportData = {
     body?: never;

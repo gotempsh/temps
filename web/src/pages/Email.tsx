@@ -21,6 +21,7 @@ import { usePageTitle } from '@/hooks/usePageTitle'
 import { useEffect } from 'react'
 import { useSearchParams } from 'react-router'
 import { Code, Mail } from 'lucide-react'
+import { scrollToElementId } from '@/lib/scroll-to-element'
 
 /** Where the page's former tabs live now, so old links land on the content. */
 const SECTION_FOR_OLD_TAB: Record<string, string> = {
@@ -49,7 +50,7 @@ export function Email() {
   useEffect(() => {
     const section = tabParam ? SECTION_FOR_OLD_TAB[tabParam] : undefined
     if (section && sectionsKnown) {
-      document.getElementById(section)?.scrollIntoView?.()
+      scrollToElementId(section)
     }
   }, [tabParam, sectionsKnown])
 

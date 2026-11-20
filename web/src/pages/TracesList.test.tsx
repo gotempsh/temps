@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { afterEach, expect, test } from 'bun:test'
-import { cleanup, render, waitFor } from '@testing-library/react'
+import { cleanup, fireEvent, render, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter, useLocation } from 'react-router'
 import type { EnvironmentResponse, ProjectResponse } from '@/api/client'
@@ -13,10 +13,18 @@ import {
   type ProjectEnvironmentContextValue,
 } from '@/components/project-frame/project-environment-context'
 import { BreadcrumbProvider } from '@/contexts/BreadcrumbContext'
+import {
+  CONSOLE_MAX_SCROLL,
+  ConsoleShell,
+  NEAR_THE_END,
+  expectOnlyConsoleScrolled,
+} from '@/test/console-shell'
 import { installBrowserWindow } from '@/test/dom'
+import { installFakeScrollLayout } from '@/test/fake-scroll-layout'
 import TracesList from './TracesList'
 
 installBrowserWindow()
+const layout = installFakeScrollLayout()
 const originalConfig = client.getConfig()
 afterEach(() => {
   cleanup()
@@ -109,9 +117,11 @@ function renderWithTraces(entry: string) {
       <MemoryRouter initialEntries={[entry]}>
         <BreadcrumbProvider>
           <ProjectEnvironmentContext.Provider value={bar}>
-            <TracesList
-              project={{ id: 17, slug: 'synthetic' } as ProjectResponse}
-            />
+            <ConsoleShell>
+              <TracesList
+                project={{ id: 17, slug: 'synthetic' } as ProjectResponse}
+              />
+            </ConsoleShell>
           </ProjectEnvironmentContext.Provider>
         </BreadcrumbProvider>
       </MemoryRouter>
@@ -120,24 +130,24 @@ function renderWithTraces(entry: string) {
 }
 
 test('a link to #traces-setup opens the setup and scrolls to it even when traces exist', async () => {
-  const scrolled: string[] = []
-  // Stub where the method is defined, so restoring it leaves no copy on a
-  // subclass prototype that would hide other tests' stubs.
-  const original = Element.prototype.scrollIntoView
-  Element.prototype.scrollIntoView = function (this: Element) {
-    scrolled.push(this.id)
-  }
-  try {
-    const view = renderWithTraces('/traces#traces-setup')
-    await waitFor(() =>
-      expect(view.container.querySelector('#traces-setup')).not.toBeNull()
-    )
-    // The filter sync rewrites the URL without the hash on mount; the scroll
-    // still has to happen.
-    await waitFor(() => expect(scrolled).toContain('traces-setup'))
-  } finally {
-    Element.prototype.scrollIntoView = original
-  }
+  // The setup opens below the list, at the end of the page.
+  layout.place('#traces-setup', NEAR_THE_END)
+  const view = renderWithTraces('/traces#traces-setup')
+  await waitFor(() =>
+    expect(view.container.querySelector('#traces-setup')).not.toBeNull()
+  )
+  // The filter sync rewrites the URL without the hash on mount; the scroll
+  // still has to happen, in the page and not the shell.
+  await waitFor(() => expect(layout.scrolls.length).toBeGreaterThan(0))
+  expectOnlyConsoleScrolled(layout, CONSOLE_MAX_SCROLL)
+})
+
+test('Setup opens the setup and scrolls the page to it, not the shell', async () => {
+  layout.place('#traces-setup', NEAR_THE_END)
+  const view = renderWithTraces('/traces')
+  fireEvent.click(await view.findByRole('button', { name: 'Setup' }))
+  await waitFor(() => expect(layout.scrolls.length).toBeGreaterThan(0))
+  expectOnlyConsoleScrolled(layout, CONSOLE_MAX_SCROLL)
 })
 
 test('without the hash a service with traces keeps the setup closed', async () => {

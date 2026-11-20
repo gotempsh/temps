@@ -19641,7 +19641,7 @@
             ]
           },
           "cpu_limit": {
-            "description": "CPU cores, `[0.01, 16]` (lower if an administrator set a maximum).\nOmit for the operator's default.",
+            "description": "CPU cores, `[0.01, 16]`, bounded by the placement host and any\nadministrator maximum. Omit for the effective placement default.",
             "format": "double",
             "maximum": 16,
             "minimum": 0.01,
@@ -66997,6 +66997,97 @@
           "public"
         ],
         "type": "string"
+      },
+      "SandboxResourceHints": {
+        "properties": {
+          "agent_cpu": {
+            "description": "Configured agent-run defaults bounded by the host. Agent runs are\nexempt from the ceilings on sandbox API requests.",
+            "format": "double",
+            "type": "number"
+          },
+          "agent_memory_mb": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "cpu": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "host_cpu_cores": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "host_memory_mb": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "max_cpu": {
+            "format": "double",
+            "type": "number"
+          },
+          "max_memory_mb": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "max_pids": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "max_timeout_secs": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "memory_mb": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "node_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "pids": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "timeout_secs": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "agent_cpu",
+          "agent_memory_mb",
+          "max_cpu",
+          "max_memory_mb",
+          "max_pids",
+          "timeout_secs",
+          "max_timeout_secs"
+        ],
+        "type": "object"
       },
       "SandboxResponse": {
         "description": "`@vercel/sandbox` wraps every single-sandbox response as\n`{ sandbox: {...}, routes: [...] }`. The SDK reads both.",
@@ -185116,6 +185207,79 @@
           }
         ],
         "summary": "Destroy every live sandbox on a worker node, from all owners, so the node\ncan be removed. Works on a node that is offline for good: its sandboxes\nare marked destroyed even when the node cannot be reached. Admin only.",
+        "tags": [
+          "Sandboxes"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/v1/sandboxes/resource-defaults": {
+      "get": {
+        "operationId": "get_sandbox_resource_defaults",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "node",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "backend",
+            "required": false,
+            "schema": {
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/SandboxBackend"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SandboxResourceHints"
+                }
+              }
+            },
+            "description": "Effective sandbox defaults"
+          },
+          "400": {
+            "description": "Invalid placement or backend"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "description": "No eligible placement"
+          },
+          "500": {
+            "description": "Could not load sandbox settings"
+          },
+          "503": {
+            "description": "Host unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Effective resource defaults and input ceilings for the requested placement.",
         "tags": [
           "Sandboxes"
         ],
