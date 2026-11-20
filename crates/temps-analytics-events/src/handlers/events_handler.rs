@@ -1182,11 +1182,35 @@ pub async fn record_console_event(
         payload.event_name, project_id, payload.request_path
     );
 
+    // ADR 109 D3: a cookieless project keeps no visitor across days, so the
+    // ids a backend forwards (issued before the switch, or by an old tracker)
+    // are not stored. This path has no client address or user agent to derive
+    // a daily visitor from, so the event is recorded without one.
+    let cookieless = state
+        .cookieless_identity
+        .identity_mode(project_id)
+        .await
+        .map_err(|error| {
+            error!("{error}");
+            ErrorBuilder::new(StatusCode::SERVICE_UNAVAILABLE)
+                .title("Identity Mode Unavailable")
+                .detail(format!(
+                    "Could not read the identity mode of project {project_id}; retry shortly"
+                ))
+                .build()
+        })?
+        .is_cookieless();
+    let (forwarded_visitor, forwarded_session) = if cookieless {
+        (None, None)
+    } else {
+        (payload.visitor_id.as_deref(), payload.session_id.as_deref())
+    };
+
     // Decrypt the encrypted cookie values if provided.
     // Generate fallback UUIDs when cookies are absent or decryption fails,
     // because the events hypertable enforces NOT NULL on session_id.
-    let visitor_id = payload.visitor_id.as_deref().and_then(|encrypted| {
-        match state.cookie_crypto.decrypt(encrypted) {
+    let visitor_id =
+        forwarded_visitor.and_then(|encrypted| match state.cookie_crypto.decrypt(encrypted) {
             Ok(decrypted) => Some(decrypted),
             Err(e) => {
                 warn!(
@@ -1195,12 +1219,9 @@ pub async fn record_console_event(
                 );
                 None
             }
-        }
-    });
+        });
 
-    let session_id = payload
-        .session_id
-        .as_deref()
+    let session_id = forwarded_session
         .and_then(|encrypted| match state.cookie_crypto.decrypt(encrypted) {
             Ok(decrypted) => Some(decrypted),
             Err(e) => {
@@ -2049,6 +2070,81 @@ mod tests {
             .expect("Failed to query visitor")
             .expect("Visitor not found");
         assert!(updated_visitor.has_activity);
+
+        test_db.cleanup().await;
+    }
+
+    /// ADR 109 D3: a backend forwarding a visitor's old cookies to a
+    /// cookieless project does not bring that visitor back.
+    #[tokio::test]
+    async fn test_console_event_for_a_cookieless_project_stores_no_forwarded_ids() {
+        let mut test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let project = insert_test_project(db.as_ref()).await;
+        let environment = insert_test_environment(db.as_ref(), project.id).await;
+        let deployment = insert_test_deployment(db.as_ref(), project.id, environment.id).await;
+        use sea_orm::ConnectionTrait;
+        db.execute_unprepared(&format!(
+            "UPDATE projects SET analytics_identity_mode = 'cookieless' WHERE id = {}",
+            project.id
+        ))
+        .await
+        .expect("switch the project to cookieless");
+        let (app, _state, cookie_crypto) = setup_test_app(db.clone()).await;
+
+        let visitor_uuid = uuid::Uuid::new_v4().to_string();
+        temps_entities::visitor::ActiveModel {
+            visitor_id: Set(visitor_uuid.clone()),
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            first_seen: Set(chrono::Utc::now()),
+            last_seen: Set(chrono::Utc::now()),
+            has_activity: Set(false),
+            is_crawler: Set(false),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("Failed to insert test visitor");
+        let session_uuid = uuid::Uuid::new_v4().to_string();
+        let payload = serde_json::json!({
+            "event_name": "add_to_cart",
+            "visitor_id": cookie_crypto.encrypt(&visitor_uuid).unwrap(),
+            "session_id": cookie_crypto.encrypt(&session_uuid).unwrap(),
+            "environment_id": environment.id,
+            "deployment_id": deployment.id,
+            "request_path": "/products/widget"
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/projects/{}/events/ingest", project.id))
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&payload).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let events: Vec<temps_entities::events::Model> = temps_entities::events::Entity::find()
+            .filter(temps_entities::events::Column::ProjectId.eq(project.id))
+            .all(db.as_ref())
+            .await
+            .expect("Failed to query events");
+        assert_eq!(events.len(), 1);
+        assert!(
+            events[0].visitor_id.is_none(),
+            "the forwarded visitor is not stored"
+        );
+        assert_ne!(events[0].session_id.as_deref(), Some(session_uuid.as_str()));
 
         test_db.cleanup().await;
     }
