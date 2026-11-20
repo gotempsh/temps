@@ -6,6 +6,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { MemoryRouter } from 'react-router'
 
+import { getSandboxResourceDefaultsOptions } from '@/api/client/@tanstack/react-query.gen'
 import { AuthContext } from '@/contexts/AuthContext-shared'
 import { SandboxRuntimeSettings } from './SandboxRuntimeSettings'
 
@@ -25,6 +26,22 @@ test('settings already in the cache fill the form on the first render', () => {
       config_repo_allowlist: ['acme/shared-config', 'platform/*'],
     },
   })
+  client.setQueryData(
+    getSandboxResourceDefaultsOptions({ query: { backend: 'docker' } })
+      .queryKey,
+    {
+      cpu: 2,
+      max_cpu: 2,
+      host_cpu_cores: 2,
+      memory_mb: 1024,
+      max_memory_mb: 2048,
+      host_memory_mb: 2048,
+      pids: 256,
+      max_pids: 4096,
+      timeout_secs: 3600,
+      max_timeout_secs: 86400,
+    }
+  )
   const auth = {
     user: { id: 1, role: 'admin' },
     isLoading: false,
@@ -45,5 +62,7 @@ test('settings already in the cache fill the form on the first render', () => {
 
   expect(html).toContain('acme/shared-config')
   expect(html).toContain('platform/*')
+  expect(html).toContain('Default: 2 cores (host has 2) · Max: 2 cores')
+  expect(html).toContain('Default: 1024 MB (host has 2048) · Max: 2048 MB')
   expect(html).toContain('acme/global-config')
 })

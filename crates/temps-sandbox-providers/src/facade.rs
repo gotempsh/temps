@@ -296,6 +296,21 @@ fn stream_sink(cb: OnStreamEventCallback) -> temps_workload::ExecLineSink {
 
 #[async_trait]
 impl SandboxProvider for DriverSandboxProvider {
+    async fn host_capacity(
+        &self,
+        node_id: Option<i32>,
+        backend: Option<SandboxBackend>,
+    ) -> Result<Option<crate::SandboxHostCapacity>, AgentError> {
+        self.product.host_capacity(node_id, backend).await
+    }
+
+    fn default_resource_limits(
+        &self,
+        backend: Option<SandboxBackend>,
+    ) -> crate::DefaultResourceLimits {
+        self.product.default_resource_limits(backend)
+    }
+
     async fn service_access(
         &self,
         handle: &SandboxHandle,
@@ -884,6 +899,29 @@ pub(crate) mod tests {
 
     #[async_trait]
     impl SandboxProvider for FakeBackend {
+        async fn host_capacity(
+            &self,
+            _: Option<i32>,
+            backend: Option<SandboxBackend>,
+        ) -> Result<Option<crate::SandboxHostCapacity>, AgentError> {
+            Ok(
+                (backend == Some(self.backend)).then_some(crate::SandboxHostCapacity {
+                    cpu_cores: 2.0,
+                    memory_mb: 1024,
+                }),
+            )
+        }
+
+        fn default_resource_limits(
+            &self,
+            backend: Option<SandboxBackend>,
+        ) -> crate::DefaultResourceLimits {
+            crate::DefaultResourceLimits {
+                cpu_limit: (backend == Some(self.backend)).then_some(4.0),
+                ..Default::default()
+            }
+        }
+
         async fn service_access(
             &self,
             handle: &SandboxHandle,
@@ -1066,6 +1104,17 @@ pub(crate) mod tests {
             fc,
             msb,
         )
+    }
+
+    #[tokio::test]
+    async fn sandbox_host_capacity_and_defaults_reach_the_driver_facade() -> Result<(), AgentError>
+    {
+        let (facade, ..) = facade(SandboxBackend::Docker);
+        let backend = Some(SandboxBackend::Docker);
+        let host = facade.host_capacity(None, backend).await?;
+        assert_eq!(host.map(|h| (h.cpu_cores, h.memory_mb)), Some((2.0, 1024)));
+        assert_eq!(facade.default_resource_limits(backend).cpu_limit, Some(4.0));
+        Ok(())
     }
 
     #[tokio::test]

@@ -11,6 +11,7 @@ import { toast } from 'sonner'
 import {
   createSandboxMutation,
   getSandboxPlacementOptions,
+  getSandboxResourceDefaultsOptions,
   listSandboxesQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
 import { Alert, AlertDescription } from '@/components/ui/alert'
@@ -50,7 +51,9 @@ import {
   PREVIEW_PASSWORD_MIN_LEN,
   backendChoices,
   createSandboxFormDefaults,
-  createSandboxFormSchema,
+  placementSchema,
+  defaultHint,
+  SELECTABLE_BACKENDS,
   nodeRunsBackend,
   targetNode,
   toCreateSandboxBody,
@@ -60,6 +63,13 @@ import { SandboxBackendLogo } from './SandboxBackendLogo'
 import { SandboxCreationSteps } from './SandboxCreationSteps'
 import { useSandboxCreation } from './useSandboxCreation'
 import { creationUntracked, newCreationId } from './sandbox-creation'
+
+function resourceQuery(node: string, backend: string) {
+  return {
+    node: node === AUTO_NODE ? undefined : node,
+    backend: SELECTABLE_BACKENDS.find((value) => value === backend),
+  }
+}
 
 const LIFECYCLES = [
   {
@@ -121,7 +131,16 @@ export function CreateSandboxSheet({
   const queryClient = useQueryClient()
 
   const form = useForm<CreateSandboxFormValues>({
-    resolver: zodResolver(createSandboxFormSchema),
+    resolver: (values, context, options) =>
+      zodResolver(
+        placementSchema(
+          queryClient.getQueryData(
+            getSandboxResourceDefaultsOptions({
+              query: resourceQuery(values.node, values.backend),
+            }).queryKey
+          )
+        )
+      )(values, context, options),
     defaultValues: createSandboxFormDefaults,
   })
 
@@ -164,6 +183,13 @@ export function CreateSandboxSheet({
   const nodes = allNodes.filter((node) => node.eligible)
   const selectedNode = form.watch('node')
   const selectedBackend = form.watch('backend')
+  const { data: hints } = useQuery({
+    ...getSandboxResourceDefaultsOptions({
+      query: resourceQuery(selectedNode, selectedBackend),
+    }),
+    enabled: open && available,
+    retry: false,
+  })
   const backends = backendChoices(allNodes, selectedNode)
   const target = targetNode(allNodes, selectedNode)
 
@@ -316,7 +342,11 @@ export function CreateSandboxSheet({
                     <FormControl>
                       <Input
                         inputMode="numeric"
-                        placeholder="platform default"
+                        placeholder={defaultHint(
+                          hints && hints.timeout_secs / 60,
+                          'minutes',
+                          hints && hints.max_timeout_secs / 60
+                        )}
                         {...field}
                       />
                     </FormControl>
@@ -350,7 +380,12 @@ export function CreateSandboxSheet({
                     <FormControl>
                       <Input
                         inputMode="decimal"
-                        placeholder="platform default"
+                        placeholder={defaultHint(
+                          hints?.cpu,
+                          'cores',
+                          hints?.max_cpu,
+                          hints?.host_cpu_cores
+                        )}
                         {...field}
                       />
                     </FormControl>
@@ -367,7 +402,12 @@ export function CreateSandboxSheet({
                     <FormControl>
                       <Input
                         inputMode="numeric"
-                        placeholder="platform default"
+                        placeholder={defaultHint(
+                          hints?.memory_mb,
+                          'MB',
+                          hints?.max_memory_mb,
+                          hints?.host_memory_mb
+                        )}
                         {...field}
                       />
                     </FormControl>
@@ -384,7 +424,11 @@ export function CreateSandboxSheet({
                     <FormControl>
                       <Input
                         inputMode="numeric"
-                        placeholder="platform default"
+                        placeholder={defaultHint(
+                          hints?.pids,
+                          'processes',
+                          hints?.max_pids
+                        )}
                         {...field}
                       />
                     </FormControl>

@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { getSandboxResourceDefaultsOptions } from '@/api/client/@tanstack/react-query.gen'
+import { defaultHint } from '@/components/sandboxes/sandbox-create'
 import { SettingsLoadFailure } from '@/components/settings/SettingsLoadFailure'
 import { isForbiddenRead } from '@/lib/read-failure'
 import { useState } from 'react'
@@ -141,6 +143,17 @@ function getResourcePresetLabel(cpu: number, memory: number): string {
 
 export function SandboxRuntimeSettings() {
   const { data: settings, isLoading, error, refetch } = useSettingsPage()
+  const { data: hints } = useQuery(
+    getSandboxResourceDefaultsOptions({ query: { backend: 'docker' } })
+  )
+  const maxCpu = Math.min(
+    CPU_LIMIT_RANGE.max,
+    hints?.max_cpu ?? CPU_LIMIT_RANGE.max
+  )
+  const maxMemory = Math.min(
+    MEMORY_LIMIT_RANGE.max,
+    hints?.max_memory_mb ?? MEMORY_LIMIT_RANGE.max
+  )
   const updateSettings = useUpdateSettings()
 
   const [runtime, setRuntime] = useState('node')
@@ -280,11 +293,23 @@ export function SandboxRuntimeSettings() {
   const handleSave = async () => {
     // The boxes may be empty while editing; check them here and say which
     // one is wrong rather than rewriting what the user typed.
-    const limits = validateSandboxLimits({
-      cpuLimit,
-      memoryLimitMb,
-      workspaceFileLimits,
-    })
+    const limits = validateSandboxLimits(
+      {
+        cpuLimit,
+        memoryLimitMb,
+        workspaceFileLimits,
+      },
+      {
+        maxCpu:
+          cpuLimit === settings?.agent_sandbox?.cpu_limit
+            ? CPU_LIMIT_RANGE.max
+            : maxCpu,
+        maxMemory:
+          memoryLimitMb === settings?.agent_sandbox?.memory_limit_mb
+            ? MEMORY_LIMIT_RANGE.max
+            : maxMemory,
+      }
+    )
     if (!limits.ok) {
       toast.error(limits.message)
       return
@@ -709,7 +734,21 @@ export function SandboxRuntimeSettings() {
               Resources
             </CardTitle>
             <CardDescription>
-              CPU and memory limits per sandbox container.
+              CPU and memory limits per sandbox container. Automatic placement:{' '}
+              {defaultHint(
+                hints?.cpu,
+                'cores',
+                hints?.max_cpu,
+                hints?.host_cpu_cores
+              )}
+              .{' '}
+              {defaultHint(
+                hints?.memory_mb,
+                'MB',
+                hints?.max_memory_mb,
+                hints?.host_memory_mb
+              )}
+              .
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
@@ -744,7 +783,7 @@ export function SandboxRuntimeSettings() {
                   <NumberInput
                     id="cpu-limit"
                     min={CPU_LIMIT_RANGE.min}
-                    max={CPU_LIMIT_RANGE.max}
+                    max={maxCpu}
                     step={0.5}
                     value={cpuLimit}
                     onValueChange={(value) => {
@@ -759,7 +798,7 @@ export function SandboxRuntimeSettings() {
                     id="memory-limit"
                     inputMode="numeric"
                     min={MEMORY_LIMIT_RANGE.min}
-                    max={MEMORY_LIMIT_RANGE.max}
+                    max={maxMemory}
                     step={256}
                     value={memoryLimitMb}
                     onValueChange={(value) => {

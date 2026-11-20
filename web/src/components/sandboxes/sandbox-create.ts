@@ -7,6 +7,7 @@ import type {
   NodeBackend,
   PlacementNode,
   SandboxBackend,
+  SandboxResourceHints,
 } from '@/api/client'
 
 /** The API clamps the idle timeout to this range (seconds). */
@@ -128,9 +129,9 @@ export const createSandboxFormSchema = z.object({
     SANDBOX_TIMEOUT_MIN_SECS / 60,
     SANDBOX_TIMEOUT_MAX_SECS / 60
   ),
-  cpuLimit: optionalNumber('CPU limit', 0.1, 64),
-  memoryLimitMb: optionalInt('Memory limit', 64, 262_144),
-  pidsLimit: optionalInt('Process limit', 16, 1_000_000),
+  cpuLimit: optionalNumber('CPU limit', 0.01, 16),
+  memoryLimitMb: optionalInt('Memory limit', 6, 32768),
+  pidsLimit: optionalInt('Process limit', 1, 4096),
   ports: z
     .string()
     .trim()
@@ -150,6 +151,29 @@ export const createSandboxFormSchema = z.object({
       `Preview password must be ${PREVIEW_PASSWORD_MIN_LEN}-${PREVIEW_PASSWORD_MAX_LEN} characters`
     ),
 })
+
+export function placementSchema(hints?: SandboxResourceHints) {
+  if (!hints) return createSandboxFormSchema
+  return createSandboxFormSchema.extend({
+    cpuLimit: optionalNumber('CPU limit', 0.01, hints.max_cpu),
+    memoryLimitMb: optionalInt('Memory limit', 6, hints.max_memory_mb),
+    pidsLimit: optionalInt('Process limit', 1, hints.max_pids),
+    timeoutMinutes: optionalInt('Idle timeout', 1, hints.max_timeout_secs / 60),
+  })
+}
+
+export function defaultHint(
+  value: number | null | undefined,
+  unit: string,
+  max: number | undefined,
+  host?: number | null
+) {
+  if (max == null) return 'Placement limits unavailable'
+  const limit = `Max: ${max} ${unit}`.trim()
+  if (value == null) return limit
+  const capacity = host == null ? '' : ` (host has ${host})`
+  return `Default: ${value} ${unit}`.trim() + capacity + ` · ${limit}`
+}
 
 export type CreateSandboxFormValues = z.infer<typeof createSandboxFormSchema>
 
