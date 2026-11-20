@@ -12,9 +12,9 @@ export type FlagValueType = 'bool' | 'string' | 'number' | 'json';
 /**
  * Why an evaluation produced the value it did.
  *
- * `RULE_MATCH` and `PERCENTAGE_ROLLOUT` are declared because they are part of
- * the wire contract, but the server never emits them yet — targeting has not
- * shipped. Code that switches on `reason` should handle them from day one.
+ * `RULE_MATCH` means targeting rule `index` matched on its conditions;
+ * `PERCENTAGE_ROLLOUT` means the subject's bucket decided it (a rollout
+ * percentage or a variant split).
  */
 export type EvalReason =
   | { kind: 'FLAG_NOT_FOUND' }
@@ -25,6 +25,56 @@ export type EvalReason =
   | { kind: 'DEFAULT' }
   | { kind: 'ERROR' };
 
+export type AttributeValue = string | number | boolean;
+
+/** A named value a flag can serve. */
+export interface FlagVariant {
+  key: string;
+  value: unknown;
+  description?: string | null;
+}
+
+export type ConditionOperator =
+  | 'eq'
+  | 'neq'
+  | 'in'
+  | 'not_in'
+  | 'contains'
+  | 'not_contains'
+  | 'matches'
+  | 'gt'
+  | 'gte'
+  | 'lt'
+  | 'lte'
+  | 'exists'
+  | 'not_exists';
+
+export interface RuleCondition {
+  attribute: string;
+  operator: ConditionOperator;
+  /** Absent for `exists`/`not_exists`; a list for `in`/`not_in`. */
+  value?: AttributeValue | AttributeValue[] | null;
+}
+
+export interface VariantWeight {
+  variant: string;
+  weight: number;
+}
+
+export type RuleServe =
+  | { kind: 'value'; value: unknown }
+  | { kind: 'variant'; variant: string }
+  | { kind: 'split'; split: VariantWeight[] };
+
+/** `when <all conditions> [within rollout_percentage] serve <serve>`. */
+export interface FlagRule {
+  description?: string | null;
+  conditions?: RuleCondition[];
+  /** 0-100; absent means every matching subject. */
+  rollout_percentage?: number | null;
+  serve: RuleServe;
+}
+
 /** One flag, already resolved down to a single environment. */
 export interface FlagSnapshot {
   key: string;
@@ -34,6 +84,11 @@ export interface FlagSnapshot {
   enabled: boolean;
   /** `null` means "inherit `default_value`". */
   environment_value?: unknown | null;
+  /** Bucketing salt for rollouts and splits. Server-side only. */
+  salt?: string;
+  variants?: FlagVariant[];
+  /** Ordered targeting rules; first match wins. */
+  rules?: FlagRule[];
 }
 
 export interface FlagSnapshotResponse {
@@ -41,23 +96,20 @@ export interface FlagSnapshotResponse {
   flags: FlagSnapshot[];
 }
 
-/**
- * Everything you know about the subject being evaluated.
- *
- * Accepted and ignored today: targeting has not shipped. It is in the signature
- * now so that when it does, you add attributes to a call you have already
- * written instead of editing every call site.
- */
+/** Everything you know about the subject being evaluated. */
 export interface EvalContext {
-  /** Stable bucketing subject (user id, account id, device id). */
+  /**
+   * Stable bucketing subject (user id, account id, device id). Rules with a
+   * rollout percentage or a variant split are skipped without one.
+   */
   key?: string;
-  /** Targeting attributes, e.g. `{ plan: 'enterprise', region: 'eu' }`. */
-  attributes?: Record<string, string | number | boolean>;
+  /** Targeting attributes, e.g. `{ plan: 'enterprise', country: 'DE' }`. */
+  attributes?: Record<string, AttributeValue>;
 }
 
 export interface Evaluation<T> {
   value: T;
-  /** Named variant, once variants exist. Always `null` today. */
+  /** The variant a targeting rule served, or `null` for plain values. */
   variant: string | null;
   reason: EvalReason;
 }

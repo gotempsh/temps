@@ -11,6 +11,7 @@ import { EngagementTracker } from "./EngagementTracker";
 import { SessionRecorder } from "./SessionRecorder";
 import { SessionRecordingProvider, useSessionRecordingControl } from "./useSessionRecording";
 import { DEFAULT_BASE_PATH } from "./constants";
+import { FeatureFlags, exposureEventData } from "@temps-sdk/analytics-core";
 
 const AnalyticsContext = createContext<AnalyticsContextValue | undefined>(undefined);
 
@@ -30,6 +31,7 @@ export function TempsAnalyticsProvider({
   sessionRecordingConfig = {},
   domain,
   ingestKey,
+  flags: flagOptions,
   children,
 }: TempsAnalyticsProviderProps): ReactElement {
   const enabled = useMemo(() => {
@@ -238,9 +240,26 @@ export function TempsAnalyticsProvider({
   // Session recording control
   const { isEnabled: isRecordingEnabled } = useSessionRecordingControl(enableSessionRecording);
 
+  // One flags client for the provider's lifetime. Exposure events go
+  // through the latest `trackEvent`, so they respect `enabled` as it changes.
+  const trackEventRef = useRef(trackEvent);
+  trackEventRef.current = trackEvent;
+  const flagsRef = useRef<FeatureFlags | null>(null);
+  if (flagsRef.current === null) {
+    flagsRef.current = new FeatureFlags({
+      ...flagOptions,
+      basePath,
+      disabled,
+      onExposure: (exposure) => {
+        void trackEventRef.current("flag_exposure", exposureEventData(exposure));
+      },
+    });
+  }
+  const flags = flagsRef.current;
+
   const value = useMemo<AnalyticsContextValue>(
-    () => ({ trackEvent, identify, trackPageview, enabled }),
-    [trackEvent, identify, trackPageview, enabled]
+    () => ({ trackEvent, identify, trackPageview, enabled, flags }),
+    [trackEvent, identify, trackPageview, enabled, flags]
   );
 
   return (
