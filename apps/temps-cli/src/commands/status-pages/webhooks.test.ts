@@ -3,7 +3,14 @@
 
 import { describe, expect, it } from 'bun:test'
 import type { StatusPageWebhookResponse } from '../../api/types.gen.js'
-import { deliveryLine, passwordProblem, webhookUpdateBody, webhookUrlProblem } from './webhooks.js'
+import {
+  deliveryLine,
+  MAX_PASSWORD_STDIN_BYTES,
+  passwordProblem,
+  readFirstLine,
+  webhookUpdateBody,
+  webhookUrlProblem,
+} from './webhooks.js'
 
 function webhook(overrides: Partial<StatusPageWebhookResponse> = {}): StatusPageWebhookResponse {
   return {
@@ -65,5 +72,42 @@ describe('passwordProblem', () => {
     expect(passwordProblem('short')).toContain('at least 8')
     expect(passwordProblem('x'.repeat(257))).toContain('at most 256')
     expect(passwordProblem('tab\there')).toContain('control')
+  })
+})
+
+describe('readFirstLine', () => {
+  async function* chunks(...parts: string[]): AsyncGenerator<string> {
+    for (const part of parts) yield part
+  }
+
+  it('returns the first line, without its line ending, across chunks', async () => {
+    expect(await readFirstLine(chunks('correct ', 'horse\r\nsecond line\n'))).toBe('correct horse')
+    expect(await readFirstLine(chunks('no newline at all'))).toBe('no newline at all')
+    expect(await readFirstLine(chunks())).toBe('')
+  })
+
+  it('stops at the first newline instead of waiting for the stream to end', async () => {
+    let pulledAfterNewline = false
+    async function* endless(): AsyncGenerator<string> {
+      yield 'password\n'
+      pulledAfterNewline = true
+      for (;;) yield 'x'.repeat(1024)
+    }
+    expect(await readFirstLine(endless())).toBe('password')
+    expect(pulledAfterNewline).toBe(false)
+  })
+
+  it('refuses a first line longer than the limit without reading the rest', async () => {
+    let pulled = 0
+    async function* huge(): AsyncGenerator<string> {
+      for (;;) {
+        pulled += 1
+        yield 'x'.repeat(512)
+      }
+    }
+    expect(await readFirstLine(huge())).toBeNull()
+    expect(pulled).toBeLessThanOrEqual(Math.ceil(MAX_PASSWORD_STDIN_BYTES / 512) + 1)
+    expect(await readFirstLine(chunks('x'.repeat(10)), 9)).toBeNull()
+    expect(await readFirstLine(chunks('x'.repeat(9) + '\nmore'), 9)).toBe('x'.repeat(9))
   })
 })

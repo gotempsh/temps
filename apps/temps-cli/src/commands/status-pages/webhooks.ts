@@ -130,12 +130,29 @@ async function run<T>(label: string, call: () => Promise<{ data?: T; error?: unk
   })
 }
 
-async function readFirstLine(): Promise<string> {
+// A password of MAX_PASSWORD_CHARS characters is at most four UTF-8 bytes per
+// character, plus a line ending.
+export const MAX_PASSWORD_STDIN_BYTES = MAX_PASSWORD_CHARS * 4 + 2
+
+// The first line of `input`, read only up to its first newline: a large or
+// endless stream is never buffered. Returns null when no newline (or end of
+// input) arrives within `limit` bytes.
+export async function readFirstLine(
+  input: AsyncIterable<string | Uint8Array>,
+  limit = MAX_PASSWORD_STDIN_BYTES,
+): Promise<string | null> {
   const chunks: Buffer[] = []
-  for await (const chunk of process.stdin) {
-    chunks.push(Buffer.from(chunk))
+  let size = 0
+  for await (const chunk of input) {
+    const bytes = Buffer.from(chunk)
+    const newline = bytes.indexOf(0x0a)
+    const part = newline === -1 ? bytes : bytes.subarray(0, newline)
+    if (size + part.length > limit) return null
+    chunks.push(part)
+    size += part.length
+    if (newline !== -1) break
   }
-  return Buffer.concat(chunks).toString('utf8').split(/\r?\n/)[0] ?? ''
+  return Buffer.concat(chunks).toString('utf8').replace(/\r$/, '')
 }
 
 export function registerWebhookCommands(pages: Command): void {
@@ -311,7 +328,11 @@ export function registerWebhookCommands(pages: Command): void {
             warning('--password-stdin reads from stdin, but stdin is a terminal: pipe the password in')
             return
           }
-          value = await readFirstLine()
+          value = await readFirstLine(process.stdin)
+          if (value === null) {
+            warning(`The password on stdin is longer than ${MAX_PASSWORD_CHARS} characters`)
+            return
+          }
         } else {
           if (!process.stdin.isTTY) {
             warning('Not a terminal: pass --password-stdin and pipe the password in')
