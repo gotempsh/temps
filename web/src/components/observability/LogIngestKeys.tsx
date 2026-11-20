@@ -14,10 +14,7 @@ import {
   listLogIngestKeysQueryKey,
   revokeLogIngestKeyMutation,
 } from '@/api/client/@tanstack/react-query.gen'
-import type {
-  CreatedLogIngestKeyResponse,
-  LogIngestKeyResponse,
-} from '@/api/client/types.gen'
+import type { LogIngestKeyResponse } from '@/api/client/types.gen'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -32,6 +29,8 @@ import { CopyButton } from '@/components/ui/copy-button'
 import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import {
+  createdKeyFor,
+  type CreatedKeyFor,
   curlSnippet,
   fluentBitSnippet,
   LOG_INGEST_PATH,
@@ -81,39 +80,34 @@ export function LogIngestKeys({
           <DialogHeader>
             <DialogTitle>Send logs from outside Temps</DialogTitle>
           </DialogHeader>
-          {projectId ? (
-            <LogIngestKeysBody projectId={projectId} enabled={open} />
-          ) : (
-            <p className="text-sm text-muted-foreground">
-              Keys belong to a service. Filter by a service (type{' '}
-              <code>project:</code> in the search) to create one, then point
-              Vector, Fluent Bit or any HTTP client at it.
-            </p>
-          )}
+          <LogIngestKeysBody projectId={projectId} enabled={open} />
         </DialogContent>
       </Dialog>
     </>
   )
 }
 
-function LogIngestKeysBody({
+/**
+ * The dialog body. It stays mounted whatever the filter says; without a
+ * service it explains how to pick one, and its state is kept.
+ */
+export function LogIngestKeysBody({
   projectId,
   enabled,
 }: {
-  projectId: number
+  projectId: number | undefined
   enabled: boolean
 }) {
   const queryClient = useQueryClient()
-  const path = { project_id: projectId }
-  const [created, setCreated] = useState<CreatedLogIngestKeyResponse | null>(
-    null
-  )
+  const path = { project_id: projectId ?? 0 }
+  const [createdFor, setCreatedFor] = useState<CreatedKeyFor | null>(null)
+  const created = createdKeyFor(createdFor, projectId)
   const [revokeTarget, setRevokeTarget] = useState<LogIngestKeyResponse | null>(
     null
   )
   const keys = useQuery({
     ...listLogIngestKeysOptions({ path }),
-    enabled,
+    enabled: enabled && projectId !== undefined,
   })
   const invalidate = () =>
     queryClient.invalidateQueries({
@@ -126,9 +120,9 @@ function LogIngestKeysBody({
   const create = useMutation({
     ...createLogIngestKeyMutation(),
     meta: { errorTitle: 'Failed to create the ingest key' },
-    onSuccess: (key) => {
+    onSuccess: (key, variables) => {
       toast.success(`Created "${key.name}"`)
-      setCreated(key)
+      setCreatedFor({ projectId: variables.path.project_id, key })
       form.reset()
       void invalidate()
     },
@@ -142,18 +136,29 @@ function LogIngestKeysBody({
       void invalidate()
     },
   })
-  const submit = form.handleSubmit((values) =>
+  const submit = form.handleSubmit((values) => {
+    if (projectId === undefined) return
     create.mutate({
-      path,
+      path: { project_id: projectId },
       body: {
         name: values.name,
         default_service: values.default_service || null,
       },
     })
-  )
+  })
   const ingress = usePublicIngress()
   const url = ingress.baseUrl === null ? null : logIngestUrl(ingress.baseUrl)
   const active = (keys.data?.data ?? []).filter((key) => key.is_active)
+
+  if (projectId === undefined) {
+    return (
+      <p className="text-sm text-muted-foreground">
+        Keys belong to a service. Filter by a service (type{' '}
+        <code>project:</code> in the search) to create one, then point Vector,
+        Fluent Bit or any HTTP client at it.
+      </p>
+    )
+  }
 
   return (
     <div className="space-y-5">
@@ -179,7 +184,11 @@ function LogIngestKeysBody({
           ) : (
             <Snippets url={url} secret={created.key} />
           )}
-          <Button size="sm" variant="outline" onClick={() => setCreated(null)}>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => setCreatedFor(null)}
+          >
             Done
           </Button>
         </div>

@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { describe, expect, test } from 'bun:test'
+import type { CreatedLogIngestKeyResponse } from '@/api/client/types.gen'
 import {
+  createdKeyFor,
   curlSnippet,
   fluentBitSnippet,
   LOG_INGEST_PATH,
@@ -60,4 +62,18 @@ describe('log ingest snippets', () => {
     expect(plain).toContain('Port   8080')
     expect(plain).toContain('tls    Off')
   })
+})
+
+const createdKey = {
+  id: 3,
+  name: 'host Vector',
+  key: 'tlk_example_plaintext',
+} as CreatedLogIngestKeyResponse
+
+test('a created key is shown only on the service it was created for', () => {
+  const created = { projectId: 4, key: createdKey }
+  expect(createdKeyFor(created, 4)).toBe(createdKey)
+  expect(createdKeyFor(created, 5)).toBeNull()
+  expect(createdKeyFor(created, undefined)).toBeNull()
+  expect(createdKeyFor(null, 4)).toBeNull()
 })
