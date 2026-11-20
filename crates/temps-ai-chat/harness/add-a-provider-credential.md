@@ -66,7 +66,9 @@ for the other flags; do not call an operation that is not listed there.
   (`/config/webhook_url`), `create_notification_email_provider` /
   `update_notification_email_provider` (`/config/password`),
   `create_cloudflare_provider` / `update_cloudflare_provider`
-  (`/config/api_token`), `create_webhook_provider` / `update_webhook_provider`
+  (`/config/api_token`), `create_telegram_provider` /
+  `update_telegram_provider` (`/config/bot_token`; `/config/chat_id` is not a
+  secret), `create_webhook_provider` / `update_webhook_provider`
   (every header value, e.g. `/config/headers/Authorization`). Check:
   `test_notification_provider`.
 - **Project webhook** signing secret: `create_webhook` / `update_webhook` with

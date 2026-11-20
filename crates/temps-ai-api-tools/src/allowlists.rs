@@ -1226,7 +1226,7 @@ pub const AI_WRITE_ALLOWLIST: &[&str] = &[
     "update_alert",
     // ── Global notification control plane ──
     // Every credential here is a `SecretString` (`webhook_url`, `password`,
-    // `api_token`, each webhook header value), so the model passes a
+    // `api_token`, `bot_token`, each webhook header value), so the model passes a
     // `secret_ref:` handle from `request_secret` and never the value. The
     // generic `create_notification_provider` / `update_notification_provider`
     // take an untyped `config` the secret-slot layer cannot see into, so a
@@ -1243,6 +1243,8 @@ pub const AI_WRITE_ALLOWLIST: &[&str] = &[
     "update_webhook_provider",
     "create_cloudflare_provider",
     "update_cloudflare_provider",
+    "create_telegram_provider",
+    "update_telegram_provider",
     "test_notification_provider",
     "create_notification_route",
     "update_notification_route",
@@ -1755,6 +1757,8 @@ mod tests {
             "update_slack_provider",
             "create_webhook_provider",
             "update_webhook_provider",
+            "create_telegram_provider",
+            "update_telegram_provider",
             "create_s3_source",
             "update_s3_source",
         ] {
