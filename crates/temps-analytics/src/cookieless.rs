@@ -17,13 +17,17 @@
 //! whose entries expire after [`SESSION_IDLE`] without activity. A miss
 //! (first event, a restart, or another node) asks the database once for the
 //! visitor's last session inside the window, so a session survives both.
-//! When there is none, the new session's id is derived from the visitor and
-//! the 30-minute window it starts in, so two nodes that both see a visitor's
-//! first events before either is stored still pick the same session.
+//! When there is none, the node reserves a new session in
+//! `analytics_cookieless_sessions` with one atomic upsert: the first node to
+//! reserve wins, and a node that loses the race (even one whose clock is in
+//! the next 30-minute window) joins the reserved session instead of starting
+//! its own. A reservation older than [`SESSION_IDLE`] is replaced.
 //!
 //! Cost per event: one lock-free load of the in-memory salt, one hash and one
 //! cache lookup. The database is read once per node per day for the salt, and
-//! once per session start for the session.
+//! on a cache miss once for the session, plus one upsert when the visitor has
+//! no recent session. Reservations are deleted by the hourly sweep once they
+//! are past the session window.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -43,6 +47,11 @@ pub const COOKIELESS_VISITOR_PREFIX: &str = "cl_";
 /// Inactivity after which a cookieless visitor's next event starts a new
 /// session. The same 30 minutes as the persistent `_temps_sid` cookie.
 pub const SESSION_IDLE: Duration = Duration::from_secs(30 * 60);
+
+/// [`SESSION_IDLE`] as a chrono duration, for timestamp arithmetic.
+fn session_window() -> chrono::Duration {
+    chrono::Duration::seconds(SESSION_IDLE.as_secs() as i64)
+}
 
 /// Visitors whose current session is held in memory. At roughly 200 bytes
 /// per entry this caps the cache near 10 MB; past it the least recently seen
@@ -150,6 +159,51 @@ pub fn derive_session_id(
     uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, name.as_bytes()).to_string()
 }
 
+/// Reserve `candidate` as the session `visitor_id` starts at `now`, unless
+/// another node reserved one after `since`, and return the session that won.
+/// The upsert is atomic, so racing nodes always return the same id.
+async fn reserve_session(
+    db: &DatabaseConnection,
+    project_id: i32,
+    visitor_id: &str,
+    candidate: &str,
+    now: chrono::DateTime<Utc>,
+    since: chrono::DateTime<Utc>,
+) -> Result<String, sea_orm::DbErr> {
+    let row = db
+        .query_one(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "WITH reserved AS ( \
+                 INSERT INTO analytics_cookieless_sessions \
+                     (project_id, visitor_id, session_id, started_at) \
+                 VALUES ($1, $2, $3, $4) \
+                 ON CONFLICT (project_id, visitor_id) DO UPDATE \
+                     SET session_id = EXCLUDED.session_id, started_at = EXCLUDED.started_at \
+                     WHERE analytics_cookieless_sessions.started_at <= $5 \
+                 RETURNING session_id \
+             ) \
+             SELECT session_id FROM reserved \
+             UNION ALL \
+             SELECT session_id FROM analytics_cookieless_sessions \
+             WHERE project_id = $1 AND visitor_id = $2 AND NOT EXISTS (SELECT 1 FROM reserved) \
+             LIMIT 1",
+            [
+                project_id.into(),
+                visitor_id.into(),
+                candidate.into(),
+                now.into(),
+                since.into(),
+            ],
+        ))
+        .await?;
+    match row {
+        Some(row) => row.try_get("", "session_id"),
+        None => Err(sea_orm::DbErr::RecordNotFound(format!(
+            "cookieless session reservation for visitor {visitor_id} in project {project_id}"
+        ))),
+    }
+}
+
 impl CookielessIdentity {
     pub fn new(db: Arc<DatabaseConnection>, encryption: Arc<EncryptionService>) -> Self {
         Self {
@@ -176,7 +230,7 @@ impl CookielessIdentity {
         user_agent: &str,
     ) -> Result<CookielessVisit, CookielessIdentityError> {
         let visitor_id = self.visitor_id(project_id, client_ip, user_agent).await?;
-        let session_id = self.session_id(project_id, &visitor_id).await?;
+        let session_id = self.session_id(project_id, &visitor_id, Utc::now()).await?;
         Ok(CookielessVisit {
             visitor_id,
             session_id,
@@ -196,20 +250,22 @@ impl CookielessIdentity {
         ))
     }
 
-    /// The visitor's current session, or a new one after [`SESSION_IDLE`]
-    /// without activity. Concurrent first events of one visitor share the
-    /// one lookup instead of each starting a session.
+    /// The visitor's current session at `now`, or a new one after
+    /// [`SESSION_IDLE`] without activity. Concurrent first events of one
+    /// visitor on this node share one lookup; across nodes the reservation in
+    /// `analytics_cookieless_sessions` makes them agree.
     async fn session_id(
         &self,
         project_id: i32,
         visitor_id: &str,
+        now: chrono::DateTime<Utc>,
     ) -> Result<String, CookielessIdentityError> {
         let db = self.db.clone();
         let visitor = visitor_id.to_string();
-        let derived = derive_session_id(project_id, visitor_id, Utc::now());
+        let derived = derive_session_id(project_id, visitor_id, now);
         self.sessions
             .try_get_with((project_id, visitor_id.to_string()), async move {
-                let since = Utc::now() - chrono::Duration::minutes(30);
+                let since = now - session_window();
                 let row = db
                     .query_one(Statement::from_sql_and_values(
                         DatabaseBackend::Postgres,
@@ -217,14 +273,16 @@ impl CookielessIdentity {
                          JOIN events e ON e.visitor_id = v.id AND e.timestamp > $3 \
                          WHERE v.project_id = $1 AND v.visitor_id = $2 AND v.last_seen > $3 \
                          ORDER BY e.timestamp DESC LIMIT 1",
-                        [project_id.into(), visitor.into(), since.into()],
+                        [project_id.into(), visitor.clone().into(), since.into()],
                     ))
                     .await?;
-                let existing = match row {
+                if let Some(existing) = match row {
                     Some(row) => row.try_get::<Option<String>>("", "session_id")?,
                     None => None,
-                };
-                Ok::<_, sea_orm::DbErr>(existing.unwrap_or(derived))
+                } {
+                    return Ok(existing);
+                }
+                reserve_session(&db, project_id, &visitor, &derived, now, since).await
             })
             .await
             .map_err(|source| CookielessIdentityError::Session {
@@ -232,6 +290,29 @@ impl CookielessIdentity {
                 visitor_id: visitor_id.to_string(),
                 source,
             })
+    }
+
+    /// Delete session reservations that started before `before`: past the
+    /// session window they are replaced on the next visit anyway. Returns the
+    /// rows deleted.
+    pub async fn delete_sessions_before(
+        &self,
+        before: chrono::DateTime<Utc>,
+    ) -> Result<u64, CookielessIdentityError> {
+        let result = self
+            .db
+            .execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "DELETE FROM analytics_cookieless_sessions WHERE started_at < $1",
+                [before.into()],
+            ))
+            .await
+            .map_err(|source| CookielessIdentityError::Database {
+                day: before.date_naive(),
+                operation: "deleting session reservations before",
+                source,
+            })?;
+        Ok(result.rows_affected())
     }
 
     /// The identity mode of `project_id`, cached for [`MODE_CACHE_TTL`]. For
@@ -377,7 +458,8 @@ fn mode_from_stored(stored: Option<&str>) -> AnalyticsIdentityMode {
 }
 
 /// Start the hourly sweep that deletes salts of past days even when no
-/// cookieless event arrives to trigger the daily refresh.
+/// cookieless event arrives to trigger the daily refresh, and session
+/// reservations past the session window.
 pub fn spawn_salt_sweep(identity: Arc<CookielessIdentity>) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(3600));
@@ -392,6 +474,16 @@ pub fn spawn_salt_sweep(identity: Arc<CookielessIdentity>) {
                 }
                 Err(error) => {
                     tracing::warn!(error = %error, "Cookieless salt sweep failed; retrying next hour")
+                }
+            }
+            let expired = Utc::now() - session_window();
+            match identity.delete_sessions_before(expired).await {
+                Ok(0) => {}
+                Ok(deleted) => {
+                    tracing::debug!(deleted, "Deleted expired cookieless session reservations")
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, "Cookieless session sweep failed; retrying next hour")
                 }
             }
         }
@@ -565,6 +657,45 @@ mod tests {
             .expect("other visitor");
         assert_ne!(other.visitor_id, first.visitor_id);
         assert_ne!(other.session_id, first.session_id);
+
+        // Two nodes whose first events straddle a window boundary, before
+        // either event is stored, join the session the first one reserved.
+        use chrono::TimeZone;
+        let boundary = Utc
+            .with_ymd_and_hms(2020, 1, 1, 10, 30, 0)
+            .single()
+            .expect("valid time");
+        let before = boundary - chrono::Duration::seconds(1);
+        assert_ne!(
+            derive_session_id(7, "cl_boundary", before),
+            derive_session_id(7, "cl_boundary", boundary),
+            "the two instants derive different candidates"
+        );
+        let on_a = node_a
+            .session_id(7, "cl_boundary", before)
+            .await
+            .expect("node a reserves");
+        let on_b = node_b
+            .session_id(7, "cl_boundary", boundary)
+            .await
+            .expect("node b joins");
+        assert_eq!(on_a, on_b, "racing nodes must share one session");
+        // A visitor back after SESSION_IDLE starts a new session.
+        let node_c = CookielessIdentity::new(db.clone(), encryption.clone());
+        let later = node_c
+            .session_id(7, "cl_boundary", boundary + chrono::Duration::minutes(31))
+            .await
+            .expect("new session");
+        assert_ne!(later, on_a);
+        // The sweep removes reservations past the window.
+        assert_eq!(
+            node_a
+                .delete_sessions_before(boundary + chrono::Duration::minutes(32))
+                .await
+                .expect("sweep"),
+            1,
+            "only cl_boundary's reservation is past the window; today's visitors keep theirs"
+        );
 
         // An unknown project reads as persistent.
         assert_eq!(

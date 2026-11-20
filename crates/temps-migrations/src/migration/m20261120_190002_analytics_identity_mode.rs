@@ -12,6 +12,12 @@
 //!   instead of whenever something else happens to reload routes.
 //! - `analytics_identity_salts`: the daily salt cookieless ids are derived
 //!   from, one row per UTC day, encrypted at rest.
+//! - `analytics_cookieless_sessions`: the session each cookieless visitor
+//!   started most recently, reserved atomically so two ingest nodes that see a
+//!   visitor's first events before either is stored join one session. A row is
+//!   useless once it is older than the 30-minute session window, and the hourly
+//!   salt sweep deletes it. No foreign key: project deletion does not cascade
+//!   through telemetry, and the sweep removes a deleted project's rows.
 
 use sea_orm_migration::prelude::*;
 
@@ -80,6 +86,16 @@ CREATE TABLE IF NOT EXISTS analytics_identity_salts (
     salt TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+CREATE TABLE IF NOT EXISTS analytics_cookieless_sessions (
+    project_id INTEGER NOT NULL,
+    visitor_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    started_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (project_id, visitor_id)
+);
+CREATE INDEX IF NOT EXISTS idx_analytics_cookieless_sessions_started_at
+    ON analytics_cookieless_sessions (started_at);
 "#,
         )
         .await?;
@@ -93,6 +109,7 @@ CREATE TABLE IF NOT EXISTS analytics_identity_salts (
         db.execute_unprepared(&notify_function_sql("")).await?;
         db.execute_unprepared(
             r#"
+DROP TABLE IF EXISTS analytics_cookieless_sessions;
 DROP TABLE IF EXISTS analytics_identity_salts;
 ALTER TABLE projects DROP CONSTRAINT IF EXISTS ck_projects_analytics_identity_mode;
 ALTER TABLE projects DROP COLUMN IF EXISTS analytics_identity_mode;
