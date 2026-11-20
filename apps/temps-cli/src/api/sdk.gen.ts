@@ -6733,7 +6733,10 @@ export const searchGlobalLogs = <ThrowOnError extends boolean = false>(options: 
  *
  * One JSON object per line; see the logs documentation for the keys read.
  * A batch is parsed and charged to the budget whole before anything is
- * stored, so a malformed or over-budget batch stores nothing.
+ * stored, so a malformed or over-budget batch stores nothing. Storage is
+ * at least once: if storing fails part-way (a full disk), the lines before
+ * the failure are kept and counted against the key, the request fails, and
+ * a collector that resends the batch stores those lines again.
  */
 export const ingestLogs = <ThrowOnError extends boolean = false>(options: Options<IngestLogsData, ThrowOnError>): RequestResult<IngestLogsResponses, IngestLogsErrors, ThrowOnError> => (options.client ?? client).post<IngestLogsResponses, IngestLogsErrors, ThrowOnError>({
     security: [{ scheme: 'bearer', type: 'http' }],
