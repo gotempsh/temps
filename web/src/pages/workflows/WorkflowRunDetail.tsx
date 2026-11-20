@@ -22,6 +22,7 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { problemDetail } from '@/lib/api-problem'
 import { workflowTone } from './status'
+import { RunFailure } from './RunFailure'
 
 export function WorkflowRunDetail() {
   const params = useParams()
@@ -163,8 +164,15 @@ export function WorkflowRunDetail() {
               {run.data.blocked_reason}
             </p>
           )}
-          {run.data?.error_kind && (
-            <p className="text-sm text-destructive">{run.data.error_kind}</p>
+          {run.data?.status === 'failed' && (
+            <RunFailure
+              path={path}
+              run={run.data}
+              failedStep={[...(steps.data?.steps ?? [])]
+                .reverse()
+                .find((step) => step.status === 'failed')}
+              invalidate={[runOptions.queryKey, stepOptions.queryKey]}
+            />
           )}
           {steps.isError ? (
             <p role="alert">
@@ -173,6 +181,8 @@ export function WorkflowRunDetail() {
                 'Could not load the journal. Refresh to retry.'
               )}
             </p>
+          ) : steps.data && steps.data.steps.length === 0 ? (
+            <p className="text-sm text-muted-foreground">No steps ran.</p>
           ) : (
             <DataTable
               aria-label="Workflow journal"
