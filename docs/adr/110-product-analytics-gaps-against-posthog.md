@@ -1,9 +1,9 @@
-# ADR 110: What product analytics is missing to match PostHog
+# ADR-110: What product analytics is missing to match PostHog
 
-## Status
-
-Accepted — 2026-11-19. D3 implemented; D1 implemented 2026-11-20;
+**Status:** Accepted — 2026-11-19. D3 implemented; D1 implemented 2026-11-20;
 D2, D4–D9 proposed. See [Settled while implementing](#settled-while-implementing).
+
+**Amends:** [ADR-034](./034-feature-flags.md) (D3 implements its Phases 2 and 3; D2 revisits non-goal R8 for experiments)
 
 Related: ADR 034 (feature flags; its Phases 2 and 3 are D3 here, and its
 non-goal R8 is revisited by D2), ADR 012 (ClickHouse analytics backend),
@@ -237,8 +237,9 @@ wrong about the code:
   every write through `FlagService` drops the project's entries. A load that
   read the database before such a write is served but not cached (an
   invalidation generation), so it cannot put the old flags back. A change is
-  live on the next request on a single binary and within 5 s across split
-  console/proxy processes. ADR 034 R3.6 asked for < 2 s via NOTIFY; that is
+  live on the next request on a single binary. Across split console/proxy
+  processes it is live within the 5 s TTL plus the time one refresh takes,
+  since requests keep the previous set while that refresh runs. ADR 034 R3.6 asked for < 2 s via NOTIFY; that is
   deferred until a split topology needs it.
 - **The browser endpoint is `POST /api/_temps/flags`, resolved by `Host`**
   through the route table, like analytics ingest, with no key and no CORS. It

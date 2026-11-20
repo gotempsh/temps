@@ -46,6 +46,15 @@ export function FlagTestPanel({
   const [inputError, setInputError] = useState<string | null>(null)
 
   const evaluate = useMutation({ ...evaluateFlagMutation() })
+  // A result belongs to the inputs it was computed for. Changing any input
+  // clears it, and `reset` also detaches a request still in flight, so its
+  // answer never appears under different inputs.
+  const changed =
+    <T,>(set: (value: T) => void) =>
+    (value: T) => {
+      set(value)
+      evaluate.reset()
+    }
 
   const run = () => {
     const parsed = parseAttributeLines(attributes)
@@ -73,7 +82,10 @@ export function FlagTestPanel({
       <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
         <div className="space-y-2">
           <Label htmlFor="flag-test-environment">Environment</Label>
-          <Select value={environmentId} onValueChange={setEnvironmentId}>
+          <Select
+            value={environmentId}
+            onValueChange={changed(setEnvironmentId)}
+          >
             <SelectTrigger id="flag-test-environment" className="w-full">
               <SelectValue placeholder="Choose an environment" />
             </SelectTrigger>
@@ -91,7 +103,7 @@ export function FlagTestPanel({
           <Input
             id="flag-test-subject"
             value={subject}
-            onChange={(e) => setSubject(e.target.value)}
+            onChange={(e) => changed(setSubject)(e.target.value)}
             placeholder="user_1001"
             spellCheck={false}
           />
@@ -102,7 +114,7 @@ export function FlagTestPanel({
         <Textarea
           id="flag-test-attributes"
           value={attributes}
-          onChange={(e) => setAttributes(e.target.value)}
+          onChange={(e) => changed(setAttributes)(e.target.value)}
           rows={3}
           spellCheck={false}
           placeholder={'plan=pro\ncountry=ES'}

@@ -222,6 +222,24 @@ describe('drafts', () => {
     expect(back).toEqual({ ok: true, rule })
   })
 
+  test('an untouched operand is saved back exactly as stored', () => {
+    const rule: FlagRule = {
+      conditions: [
+        { attribute: 'flag', operator: 'eq', value: 'true' },
+        { attribute: 'team', operator: 'in', value: ['a,b', ' padded '] },
+      ],
+      serve: { kind: 'value', value: true },
+    }
+    const draft = toDraft(rule, 'bool')
+    const back = fromDraft(draft, 'bool', variants, 1)
+    expect(back.ok && back.rule.conditions).toEqual(rule.conditions)
+
+    // Once edited, the text is parsed as typed.
+    draft.conditions[0].text = 'false'
+    const edited = fromDraft(draft, 'bool', variants, 1)
+    expect(edited.ok && edited.rule.conditions[0].value).toBe(false)
+  })
+
   test('a split round-trips', () => {
     const rule: FlagRule = {
       conditions: [],

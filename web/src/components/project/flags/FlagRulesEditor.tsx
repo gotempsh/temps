@@ -47,7 +47,9 @@ import {
   asFlagValueType,
   environmentOverride,
   flagErrorMessage,
+  toEditableString,
 } from './flag-value'
+import { useDraftBaseline } from './draft-baseline'
 
 interface FlagRulesEditorProps {
   projectId: number
@@ -65,6 +67,13 @@ interface FlagRulesEditorProps {
  * state, so a successful save (or a reload after a conflict) re-seeds the
  * draft instead of syncing it in an effect.
  */
+/** A draft list's content, ignoring the client-only ids. */
+function rulesKey(drafts: DraftRule[]): string {
+  return JSON.stringify(drafts, (name, value: unknown) =>
+    name === 'id' ? undefined : value
+  )
+}
+
 export function FlagRulesEditor({
   projectId,
   flag,
@@ -81,6 +90,18 @@ export function FlagRulesEditor({
   )
   const [editing, setEditing] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  // Stays mounted across refetches (saving variants or an environment value
+  // refetches the flag), so an open edit survives; this is the row revision
+  // the drafts are based on.
+  const baseRevision = useDraftBaseline(
+    override?.updated_at ?? null,
+    stored,
+    (rules) =>
+      editing &&
+      rulesKey(drafts) !==
+        rulesKey(rules.map((rule) => toDraft(rule, valueType))),
+    (rules) => setDrafts(rules.map((rule) => toDraft(rule, valueType)))
+  )
 
   const save = useMutation({
     ...setFlagRulesMutation(),
@@ -136,9 +157,9 @@ export function FlagRulesEditor({
       },
       body: {
         rules: rules as never,
-        // Absent when the environment has no row yet: the server then
+        // Absent when the environment had no row yet: the server then
         // refuses the save if one appeared meanwhile.
-        expected_updated_at: override?.updated_at ?? null,
+        expected_updated_at: baseRevision,
       },
     })
   }
@@ -476,6 +497,15 @@ function RuleCard({
             const kind = next as DraftRule['serveKind']
             onChange({
               serveKind: kind,
+              // A boolean field shows "Off" for an empty draft, which would
+              // then fail to save; start from the flag's default instead.
+              ...(kind === 'value' &&
+              valueType === 'bool' &&
+              draft.valueText === ''
+                ? {
+                    valueText: toEditableString(flag.default_value, valueType),
+                  }
+                : {}),
               ...(kind === 'variant' && !draft.variant && variants[0]
                 ? { variant: variants[0].key }
                 : {}),

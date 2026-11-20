@@ -68,11 +68,16 @@ impl SlotRateLimiter {
         let mut current = slot.load(Ordering::Relaxed);
         loop {
             let same_owner = current >> 32 == owner_bits;
-            let same_window = (current >> COUNT_BITS) & WINDOW_MASK == window;
-            let count = if same_owner && same_window {
-                current & COUNT_MASK
+            let stored_window = (current >> COUNT_BITS) & WINDOW_MASK;
+            // A request that sampled the clock just before the minute turned
+            // and lost the race to newer ones is counted in the newer window
+            // rather than writing its older window back over that budget.
+            let ahead = stored_window.wrapping_sub(window) & WINDOW_MASK;
+            let stored_is_current = stored_window == window || ahead < WINDOW_MASK / 2;
+            let (window, count) = if same_owner && stored_is_current {
+                (stored_window, current & COUNT_MASK)
             } else {
-                0
+                (window, 0)
             };
             if count >= limit {
                 return false;
@@ -100,6 +105,20 @@ mod tests {
         assert!(
             limiter.check_at(7, 5, WINDOW_SECS),
             "a new window restores the budget"
+        );
+    }
+
+    #[test]
+    fn a_late_request_from_an_older_window_does_not_reset_the_newer_budget() {
+        let limiter = SlotRateLimiter::new();
+        assert!(limiter.check_at(7, 2, WINDOW_SECS));
+        assert!(
+            limiter.check_at(7, 2, WINDOW_SECS - 1),
+            "counted in the newer window"
+        );
+        assert!(
+            !limiter.check_at(7, 2, WINDOW_SECS),
+            "the newer budget is spent"
         );
     }
 

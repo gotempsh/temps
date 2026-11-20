@@ -7,13 +7,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use sea_orm::{
-    sea_query::Expr, ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection,
-    EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, TransactionTrait,
+    sea_query::Expr, AccessMode, ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait,
+    DatabaseConnection, EntityTrait, IsolationLevel, PaginatorTrait, QueryFilter, QueryOrder,
+    QuerySelect, TransactionTrait,
 };
 use temps_entities::{environments, feature_flag_environments, feature_flags};
 use tracing::{debug, info, warn};
 
-use super::delivery::{DeliveredFlag, EnvironmentFlags, FlagDeliveryCache, Lookup};
+use super::delivery::{DeliveredFlag, EnvironmentFlags, FlagDeliveryCache, Lookup, RefreshClaim};
 use super::validation::{
     referenced_variants, validate_exposure_sample_rate, validate_rules, validate_variants,
 };
@@ -45,6 +46,16 @@ const MAX_DESCRIPTION_LEN: usize = 512;
 /// A flag definition together with its per-environment overrides.
 #[derive(Debug, Clone)]
 pub struct FlagWithEnvironments {
+    pub flag: feature_flags::Model,
+    pub environments: Vec<feature_flag_environments::Model>,
+}
+
+/// What [`FlagService::update`] changed: the row as it was under the write
+/// lock (the audit's before-image), the row as written, and the flag's
+/// environments.
+#[derive(Debug, Clone)]
+pub struct UpdatedFlag {
+    pub before: feature_flags::Model,
     pub flag: feature_flags::Model,
     pub environments: Vec<feature_flag_environments::Model>,
 }
@@ -402,7 +413,7 @@ impl FlagService {
         project_id: i32,
         key: &str,
         request: UpdateFlag,
-    ) -> Result<feature_flags::Model, FlagError> {
+    ) -> Result<UpdatedFlag, FlagError> {
         let existing = self.get(project_id, key).await?;
 
         self.apply_update(key, existing, request).await
@@ -414,7 +425,7 @@ impl FlagService {
         key: &str,
         existing: FlagWithEnvironments,
         request: UpdateFlag,
-    ) -> Result<feature_flags::Model, FlagError> {
+    ) -> Result<UpdatedFlag, FlagError> {
         let FlagWithEnvironments {
             flag: existing,
             environments,
@@ -508,7 +519,11 @@ impl FlagService {
 
         info!(project_id, flag_key = %key, "Updated feature flag");
 
-        Ok(model)
+        Ok(UpdatedFlag {
+            before: locked,
+            flag: model,
+            environments,
+        })
     }
 
     /// Refuse a variant list that drops a variant some environment's rules
@@ -763,10 +778,11 @@ impl FlagService {
 
         let (before, after) = match existing {
             Some(row) => {
-                if let Some(expected) = request.expected_updated_at {
-                    if !same_revision(expected, row.updated_at) {
-                        return Err(stale());
-                    }
+                // An absent revision means the caller saw no row for this
+                // environment; a row now exists, so someone else wrote first.
+                match request.expected_updated_at {
+                    Some(expected) if same_revision(expected, row.updated_at) => {}
+                    _ => return Err(stale()),
                 }
                 let mut active: feature_flag_environments::ActiveModel = row.clone().into();
                 active.rules = Set(rules);
@@ -871,26 +887,30 @@ impl FlagService {
                 entry,
                 refresh: true,
             } => {
-                let generation = self.delivery.generation();
-                match self.load_environment(project_id, environment_id).await {
-                    Ok(fresh) => {
-                        let fresh = self.delivery.insert(fresh, generation);
-                        // The old entry is either replaced, or still cached
-                        // because an invalidation raced this load; in the second
-                        // case it must be refreshable again.
-                        self.delivery.release_refresh(&entry);
-                        fresh
-                    }
-                    Err(error) => {
-                        // Keep serving what we had; let a later request retry.
-                        warn!(
-                            project_id,
-                            environment_id,
-                            %error,
-                            "Failed to refresh cached feature flags; serving the previous set"
-                        );
-                        self.delivery.release_refresh(&entry);
-                        entry
+                // Released on every exit, including this request being
+                // cancelled mid-load, so the entry never stays claimed. The
+                // old entry is either replaced, or still cached because an
+                // invalidation raced the load; then it must be refreshable.
+                let _claim = RefreshClaim::new(entry.clone());
+                // Refreshes share the load budget with misses. With no permit
+                // free, serve what we have; a later request refreshes it.
+                match self.delivery.load_permit().try_acquire() {
+                    Err(_) => entry,
+                    Ok(_permit) => {
+                        let generation = self.delivery.generation();
+                        match self.load_environment(project_id, environment_id).await {
+                            Ok(fresh) => self.delivery.insert(fresh, generation),
+                            Err(error) => {
+                                // Keep serving what we had; let a later request retry.
+                                warn!(
+                                    project_id,
+                                    environment_id,
+                                    %error,
+                                    "Failed to refresh cached feature flags; serving the previous set"
+                                );
+                                entry
+                            }
+                        }
                     }
                 }
             }
@@ -902,9 +922,11 @@ impl FlagService {
                     }
                 })?;
                 // Another request may have loaded it while this one waited.
-                match self.delivery.lookup(environment_id) {
-                    Lookup::Hit { entry, .. } => entry,
-                    Lookup::Miss => {
+                // A peek, not a lookup: it must not claim a refresh this
+                // branch would never perform.
+                match self.delivery.peek(environment_id) {
+                    Some(entry) => entry,
+                    None => {
                         let generation = self.delivery.generation();
                         let fresh = self.load_environment(project_id, environment_id).await?;
                         self.delivery.insert(fresh, generation)
@@ -1057,8 +1079,32 @@ impl FlagService {
 
     /// Unarchived flags of a project with their override row for one
     /// environment, sorted by key.
+    ///
+    /// Both queries run in one read-only REPEATABLE READ transaction: read
+    /// separately, a variant added and a rule serving it saved in between
+    /// could pair the new rule with the old variant list, and every matching
+    /// subject would get `ERROR` until the next load.
     async fn live_flags(
         &self,
+        project_id: i32,
+        environment_id: i32,
+        client_visible_only: bool,
+    ) -> Result<Vec<(feature_flags::Model, Vec<feature_flag_environments::Model>)>, FlagError> {
+        let txn = self
+            .db
+            .begin_with_config(
+                Some(IsolationLevel::RepeatableRead),
+                Some(AccessMode::ReadOnly),
+            )
+            .await?;
+        let flags =
+            Self::live_flags_in(&txn, project_id, environment_id, client_visible_only).await?;
+        txn.commit().await?;
+        Ok(flags)
+    }
+
+    async fn live_flags_in<C: ConnectionTrait>(
+        conn: &C,
         project_id: i32,
         environment_id: i32,
         client_visible_only: bool,
@@ -1085,7 +1131,7 @@ impl FlagService {
         // Fetching the overrides separately makes that failure impossible.
         let flags = query
             .order_by_asc(feature_flags::Column::Key)
-            .all(self.db.as_ref())
+            .all(conn)
             .await?;
 
         if flags.is_empty() {
@@ -1096,7 +1142,7 @@ impl FlagService {
         let overrides = feature_flag_environments::Entity::find()
             .filter(feature_flag_environments::Column::FlagId.is_in(flag_ids))
             .filter(feature_flag_environments::Column::EnvironmentId.eq(environment_id))
-            .all(self.db.as_ref())
+            .all(conn)
             .await?;
 
         let mut by_flag: HashMap<i32, Vec<feature_flag_environments::Model>> = HashMap::new();
@@ -1677,6 +1723,41 @@ mod tests {
 
     /// The caller saw no row, but one exists now: someone else wrote first.
     #[tokio::test]
+    async fn set_rules_refuses_a_first_write_when_a_row_appeared() {
+        let row = override_model(1, 2, true, None);
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![string_flag_with_variants(1)]])
+            .append_query_results([Vec::<feature_flag_environments::Model>::new()])
+            .append_query_results([vec![environment_model(2, 1)]])
+            .append_query_results([vec![string_flag_with_variants(1)]])
+            .append_query_results([vec![row]]);
+
+        let result = service_with(db)
+            .set_rules(
+                1,
+                "checkout.v2",
+                2,
+                SetRules {
+                    rules: split_rules(),
+                    expected_updated_at: None,
+                },
+            )
+            .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(FlagError::StaleWrite {
+                    environment_id: Some(2),
+                    ..
+                })
+            ),
+            "{result:?}"
+        );
+    }
+
+    /// The caller saw a row that has since been deleted.
+    #[tokio::test]
     async fn set_rules_treats_an_expected_row_that_vanished_as_stale() {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results([vec![string_flag_with_variants(1)]])
@@ -1751,6 +1832,37 @@ mod tests {
                 if message.contains("'test'") && message.contains("environment 2")),
             "{result:?}"
         );
+    }
+
+    /// The before-image is the row read under the write lock, not the earlier
+    /// unlocked read, so the audit records the transition actually made.
+    #[tokio::test]
+    async fn update_returns_the_row_it_locked_as_the_before_image() {
+        let read = flag_model(1, 1, "checkout.v2", "bool");
+        let mut locked = read.clone();
+        locked.client_visible = true;
+        let mut written = locked.clone();
+        written.default_value = serde_json::json!(true);
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![read]])
+            .append_query_results([Vec::<feature_flag_environments::Model>::new()])
+            .append_query_results([vec![locked.clone()]])
+            .append_query_results([vec![written.clone()]]);
+
+        let updated = service_with(db)
+            .update(
+                1,
+                "checkout.v2",
+                UpdateFlag {
+                    default_value: Some(serde_json::json!(true)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("an unconditional update succeeds");
+
+        assert_eq!(updated.before, locked);
+        assert_eq!(updated.flag, written);
     }
 
     #[tokio::test]

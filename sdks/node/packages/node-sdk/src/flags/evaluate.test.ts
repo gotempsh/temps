@@ -277,5 +277,39 @@ describe('targeting rules', () => {
       { conditions: [{ attribute: 'a', operator: 'matches', value: '(open' }], serve: { kind: 'value', value: 'x' } },
     ]);
     expect(evaluate(badPattern, { attributes: { a: 'x' } }, 'fallback').reason).toEqual({ kind: 'ERROR' });
+
+    // Balances only against the anchoring wrapper; the server refuses it too.
+    const escapingPattern = variantFlag([
+      { conditions: [{ attribute: 'a', operator: 'matches', value: 'pro)|(?:team' }], serve: { kind: 'value', value: 'x' } },
+    ]);
+    expect(evaluate(escapingPattern, { attributes: { a: 'professional' } }, 'fallback').reason).toEqual({ kind: 'ERROR' });
+  });
+
+  it('reports a malformed split even behind a partial rollout', () => {
+    const flag = variantFlag([
+      {
+        rollout_percentage: 10,
+        serve: { kind: 'split', split: [{ variant: 'control', weight: 50 }, { variant: 'test', weight: 40 }] },
+      },
+    ]);
+    expect(evaluate(flag, {}, 'fallback').reason).toEqual({ kind: 'ERROR' });
+    for (const key of ['a', 'b', 'c', 'd', 'e']) {
+      expect(evaluate(flag, { key }, 'fallback').reason).toEqual({ kind: 'ERROR' });
+    }
+  });
+
+  it('reads only decimal numbers from strings, like the server', () => {
+    const gte = (attribute: string) =>
+      evaluate(
+        { ...snapshot(true, null), rules: [{ conditions: [{ attribute: 'a', operator: 'gte', value: 10 }], serve: { kind: 'value', value: true } }] },
+        { attributes: { a: attribute } },
+        false,
+      ).value === true;
+    expect(gte(' 16 ')).toBe(true);
+    expect(gte('1e2')).toBe(true);
+    expect(gte('+12.5')).toBe(true);
+    expect(gte('0x10')).toBe(false);
+    expect(gte('0b1111')).toBe(false);
+    expect(gte('Infinity')).toBe(false);
   });
 });

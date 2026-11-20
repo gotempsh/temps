@@ -51,6 +51,7 @@ import {
   flagErrorMessage,
   formatFlagValue,
   resolveEffectiveValue,
+  type ValueSource,
 } from './flag-value'
 
 interface ProjectFeatureFlagsProps {
@@ -484,11 +485,18 @@ function FlagRow({
   )
 }
 
-function SourceBadge({
-  source,
-}: {
-  source: 'override' | 'default' | 'disabled'
-}) {
+function SourceBadge({ source }: { source: ValueSource }) {
+  if (source === 'invalid-rules') {
+    return (
+      <Badge
+        variant="outline"
+        className="text-destructive"
+        title="This environment's stored rules cannot be read — the default value is served until they are replaced"
+      >
+        Rules unreadable
+      </Badge>
+    )
+  }
   if (source === 'disabled') {
     return (
       <Badge

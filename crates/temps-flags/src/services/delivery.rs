@@ -12,7 +12,8 @@
 //! - **Freshness**: an entry is reused for [`TTL`]. Every write through
 //!   [`super::FlagService`] drops the project's entries at once, so on a
 //!   single-process install a change is visible on the next request. Other
-//!   processes (split console/proxy topologies) converge within the TTL.
+//!   processes (split console/proxy topologies) converge within the TTL plus
+//!   one refresh, because the previous entry is served while it refreshes.
 //! - **Load is bounded**: at most [`MAX_CONCURRENT_LOADS`] environments load
 //!   at once, and while an entry is being refreshed every other request is
 //!   served the previous one instead of piling onto the database.
@@ -165,6 +166,11 @@ impl FlagDeliveryCache {
         }
     }
 
+    /// The cached entry, fresh or stale, without claiming its refresh.
+    pub fn peek(&self, environment_id: i32) -> Option<Arc<EnvironmentFlags>> {
+        self.entries.load().get(&environment_id).cloned()
+    }
+
     /// The load gate. Held across the database read only.
     pub fn load_permit(&self) -> &Semaphore {
         &self.loads
@@ -206,12 +212,6 @@ impl FlagDeliveryCache {
         entry
     }
 
-    /// Give up a refresh this caller won but could not complete, so the next
-    /// request tries again instead of the entry staying stale forever.
-    pub fn release_refresh(&self, entry: &EnvironmentFlags) {
-        entry.refreshing.store(false, Ordering::Release);
-    }
-
     /// Drop every cached environment of a project. Called after every flag
     /// write, so the next read sees it.
     pub fn invalidate_project(&self, project_id: i32) {
@@ -226,6 +226,24 @@ impl FlagDeliveryCache {
     #[cfg(test)]
     pub fn cached_environments(&self) -> usize {
         self.entries.load().len()
+    }
+}
+
+/// A won refresh claim on a stale entry. Dropping it releases the claim, on
+/// success, error and cancellation alike.
+pub struct RefreshClaim {
+    entry: Arc<EnvironmentFlags>,
+}
+
+impl RefreshClaim {
+    pub fn new(entry: Arc<EnvironmentFlags>) -> Self {
+        Self { entry }
+    }
+}
+
+impl Drop for RefreshClaim {
+    fn drop(&mut self) {
+        self.entry.refreshing.store(false, Ordering::Release);
     }
 }
 
@@ -294,7 +312,49 @@ mod tests {
             cache.lookup(10),
             Lookup::Hit { refresh: true, .. }
         ));
-        cache.release_refresh(&entry);
+        drop(RefreshClaim::new(entry.clone()));
+        assert!(matches!(
+            cache.lookup(10),
+            Lookup::Hit { refresh: true, .. }
+        ));
+    }
+
+    /// A refresh whose request is cancelled mid-load drops its claim with
+    /// it, so the next request refreshes instead of serving stale forever.
+    #[tokio::test]
+    async fn a_cancelled_refresh_releases_its_claim() {
+        let cache = FlagDeliveryCache::new();
+        let mut entry = EnvironmentFlags::new(1, 10, vec![flag("a", true)]);
+        entry.loaded_at = Instant::now() - TTL - Duration::from_secs(1);
+        let entry = cache.insert(entry, cache.generation());
+        assert!(matches!(
+            cache.lookup(10),
+            Lookup::Hit { refresh: true, .. }
+        ));
+
+        let pending = tokio::spawn(async move {
+            let _claim = RefreshClaim::new(entry);
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+        pending.abort();
+        let _ = pending.await;
+
+        assert!(matches!(
+            cache.lookup(10),
+            Lookup::Hit { refresh: true, .. }
+        ));
+    }
+
+    #[test]
+    fn peek_never_claims_a_refresh() {
+        let cache = FlagDeliveryCache::new();
+        let mut entry = EnvironmentFlags::new(1, 10, vec![flag("a", true)]);
+        entry.loaded_at = Instant::now() - TTL - Duration::from_secs(1);
+        cache.insert(entry, cache.generation());
+
+        assert!(cache.peek(10).is_some());
+        assert!(cache.peek(11).is_none());
         assert!(matches!(
             cache.lookup(10),
             Lookup::Hit { refresh: true, .. }
@@ -366,7 +426,7 @@ mod tests {
         let generation = cache.generation();
         cache.invalidate_project(2);
         cache.insert(EnvironmentFlags::new(1, 10, vec![]), generation);
-        cache.release_refresh(&stale);
+        drop(RefreshClaim::new(stale));
 
         assert!(matches!(
             cache.lookup(10),

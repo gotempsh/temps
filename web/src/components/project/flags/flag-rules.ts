@@ -375,6 +375,16 @@ export interface DraftCondition {
   attribute: string
   operator: ConditionOperator
   text: string
+  /**
+   * The stored operand this draft was opened with. Text cannot carry a
+   * string `"true"` or a list item containing a comma, so an operand the user
+   * did not edit is saved back exactly as stored rather than re-parsed.
+   */
+  stored?: {
+    operator: ConditionOperator
+    text: string
+    value: RuleCondition['value']
+  }
 }
 
 /** A rule as the editor holds it. */
@@ -405,6 +415,11 @@ export function toDraft(rule: FlagRule, type: FlagValueType): DraftRule {
       attribute: condition.attribute,
       operator: condition.operator,
       text: operandText(condition.value),
+      stored: {
+        operator: condition.operator,
+        text: operandText(condition.value),
+        value: condition.value,
+      },
     })),
     rollout:
       rule.rollout_percentage === null || rule.rollout_percentage === undefined
@@ -446,7 +461,13 @@ export function fromDraft(
         error: `Rule ${position}, condition ${index + 1}: choose an attribute.`,
       }
     }
-    const operand = parseOperand(condition.operator, condition.text)
+    const untouched =
+      condition.stored !== undefined &&
+      condition.stored.operator === condition.operator &&
+      condition.stored.text === condition.text
+    const operand = untouched
+      ? { ok: true as const, value: condition.stored?.value }
+      : parseOperand(condition.operator, condition.text)
     if (!operand.ok) {
       return {
         ok: false,

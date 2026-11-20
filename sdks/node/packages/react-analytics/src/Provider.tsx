@@ -264,6 +264,22 @@ export function TempsAnalyticsProvider({
   }
   const flags = flagsRef.current;
 
+  // The client is created once, so later prop changes are applied to it: a
+  // provider that starts disabled can be enabled, and a sign-in that changes
+  // `flags={{ key, attributes }}` re-evaluates with the new context.
+  useEffect(() => {
+    flags.setDisabled(disabled);
+  }, [flags, disabled]);
+  const flagContext = JSON.stringify({ key: flagOptions?.key, attributes: flagOptions?.attributes });
+  const appliedContext = useRef(flagContext);
+  useEffect(() => {
+    if (appliedContext.current === flagContext) return;
+    appliedContext.current = flagContext;
+    flags.setContext({ key: flagOptions?.key, attributes: flagOptions?.attributes });
+    // `flagContext` is the serialized form of the two options read here.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [flags, flagContext]);
+
   const value = useMemo<AnalyticsContextValue>(
     () => ({ trackEvent, identify, trackPageview, enabled, flags }),
     [trackEvent, identify, trackPageview, enabled, flags]
