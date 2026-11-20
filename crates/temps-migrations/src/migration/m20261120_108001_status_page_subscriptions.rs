@@ -4,7 +4,10 @@
 //! Email subscribers of a public status page (ADR 108 D2).
 //!
 //! `status_pages` gains the per-page switch and sender address, so the setting
-//! lives on the row it configures. `subscriptions_enabled_at` bounds what is
+//! lives on the row it configures, and whether a project-scoped token chose
+//! that sender (its domain grant is then checked again at delivery).
+//! `status_incident_updates.published_at` records when an update became
+//! public, so a draft published later is announced from then. `subscriptions_enabled_at` bounds what is
 //! announced: only updates published after subscriptions were switched on are
 //! ever sent, so enabling them never mails out the page's history.
 //!
@@ -37,8 +40,21 @@ impl MigrationTrait for Migration {
             ALTER TABLE status_pages
                 ADD COLUMN IF NOT EXISTS subscriptions_enabled BOOLEAN NOT NULL DEFAULT FALSE,
                 ADD COLUMN IF NOT EXISTS subscriptions_enabled_at TIMESTAMPTZ,
-                ADD COLUMN IF NOT EXISTS subscription_sender TEXT
+                ADD COLUMN IF NOT EXISTS subscription_sender TEXT,
+                ADD COLUMN IF NOT EXISTS subscription_sender_scoped BOOLEAN NOT NULL DEFAULT FALSE
             "#,
+        )
+        .await?;
+        // An update is announced from when it became public, which can be
+        // long after it was written as a private draft. Updates that are
+        // already public count as published when they were written.
+        db.execute_unprepared(
+            "ALTER TABLE status_incident_updates ADD COLUMN IF NOT EXISTS published_at TIMESTAMPTZ",
+        )
+        .await?;
+        db.execute_unprepared(
+            "UPDATE status_incident_updates SET published_at = created_at \
+             WHERE is_public AND published_at IS NULL",
         )
         .await?;
         db.execute_unprepared(
@@ -103,11 +119,16 @@ impl MigrationTrait for Migration {
         let db = manager.get_connection();
         db.execute_unprepared("DROP TABLE IF EXISTS status_page_notices")
             .await?;
+        db.execute_unprepared(
+            "ALTER TABLE status_incident_updates DROP COLUMN IF EXISTS published_at",
+        )
+        .await?;
         db.execute_unprepared("DROP TABLE IF EXISTS status_page_subscribers")
             .await?;
         db.execute_unprepared(
             r#"
             ALTER TABLE status_pages
+                DROP COLUMN IF EXISTS subscription_sender_scoped,
                 DROP COLUMN IF EXISTS subscription_sender,
                 DROP COLUMN IF EXISTS subscriptions_enabled_at,
                 DROP COLUMN IF EXISTS subscriptions_enabled

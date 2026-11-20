@@ -43,6 +43,10 @@ pub struct Model {
     pub subscriptions_enabled_at: Option<DBDateTime>,
     /// From address of subscriber mail, at a verified email domain.
     pub subscription_sender: Option<String>,
+    /// The sender was chosen by a project-scoped deployment token, so its
+    /// domain must stay authorized for every project of the page: delivery
+    /// checks the grant again before each batch.
+    pub subscription_sender_scoped: bool,
     /// Argon2id hash of the page's password (ADR 108 D2); `None` means
     /// anyone with the link can read the page. Never leaves the server.
     pub password_hash: Option<String>,

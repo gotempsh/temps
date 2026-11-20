@@ -140,10 +140,15 @@ pub fn maintenance_event(source: &MaintenanceSource<'_>) -> PageEvent {
 }
 
 /// A public incident together with the ids event keys are built from.
-/// `update_ids` is aligned with `incident.updates` (newest first).
+/// `update_ids` and `update_published_at` are aligned with
+/// `incident.updates` (newest first).
 pub struct IncidentSource<'a> {
     pub incident_id: i32,
     pub update_ids: &'a [i32],
+    /// When each update became public: a draft published later is an event
+    /// from then, not from when it was written. Missing entries fall back to
+    /// the update's own time.
+    pub update_published_at: &'a [UtcDateTime],
     pub incident: &'a PublicIncident,
 }
 
@@ -176,14 +181,19 @@ pub fn incident_events(source: &IncidentSource<'_>) -> Vec<PageEvent> {
             .updates
             .iter()
             .zip(source.update_ids)
-            .map(|(update, id)| PageEvent {
+            .enumerate()
+            .map(|(at, (update, id))| PageEvent {
                 key: format!("u{id}"),
                 kind: PageEventKind::IncidentUpdate,
                 title: incident.title.clone(),
                 status: update.status.into(),
                 message: Some(update.message.clone()),
                 affected_components: incident.affected_components.clone(),
-                published_at: update.created_at,
+                published_at: source
+                    .update_published_at
+                    .get(at)
+                    .copied()
+                    .unwrap_or(update.created_at),
                 window: None,
             }),
     );
@@ -248,12 +258,34 @@ mod tests {
         let events = incident_events(&IncidentSource {
             incident_id: 7,
             update_ids: &[12, 11],
+            update_published_at: &[],
             incident: &incident,
         });
         let keys: Vec<&str> = events.iter().map(|e| e.key.as_str()).collect();
         assert_eq!(keys, vec!["u12", "u11"]);
         assert_eq!(events[0].message.as_deref(), Some("update at 5"));
         assert_eq!(events[0].affected_components, vec!["API".to_string()]);
+    }
+
+    #[test]
+    fn a_draft_published_later_is_an_event_from_when_it_became_public() {
+        let incident = incident(
+            PublicIncidentStatus::Identified,
+            &[
+                (PublicIncidentStatus::Identified, 5),
+                (PublicIncidentStatus::Investigating, 2),
+            ],
+        );
+        // Written at 2:00 as a private draft, made public at 8:00.
+        let events = incident_events(&IncidentSource {
+            incident_id: 7,
+            update_ids: &[12, 11],
+            update_published_at: &[at(5), at(8)],
+            incident: &incident,
+        });
+        assert_eq!(events[0].published_at, at(5));
+        assert_eq!(events[1].key, "u11");
+        assert_eq!(events[1].published_at, at(8));
     }
 
     #[test]
@@ -265,6 +297,7 @@ mod tests {
         let events = incident_events(&IncidentSource {
             incident_id: 7,
             update_ids: &[11],
+            update_published_at: &[],
             incident: &incident,
         });
         assert_eq!(events[0].key, "r7");
@@ -285,6 +318,7 @@ mod tests {
         let events = incident_events(&IncidentSource {
             incident_id: 7,
             update_ids: &[13],
+            update_published_at: &[],
             incident: &with_update,
         });
         assert_eq!(
@@ -334,6 +368,7 @@ mod tests {
         let mut events = incident_events(&IncidentSource {
             incident_id: 7,
             update_ids: &[12, 11],
+            update_published_at: &[],
             incident: &incident,
         });
         events.reverse();

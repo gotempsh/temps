@@ -6,12 +6,16 @@
 //!
 //! [`TempsEmailMailer`] sends through the transactional email stack
 //! (`temps-email`), which applies the domain's suppression list on every
-//! send: an address that bounced or complained is dropped there.
+//! send: an address that bounced or complained is dropped there. Every mail
+//! carries a subscriber's own confirm or unsubscribe link, so it is sent
+//! without history: the email log keeps neither the address nor the content.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use temps_email::services::{DomainService, EmailService, ProviderService, SendEmailRequest};
+use temps_email::services::{
+    DomainService, EmailService, ProviderService, SendEmailRequest, SUPPRESSED_RECIPIENTS_ERROR,
+};
 
 use super::error::SubscriptionError;
 
@@ -46,12 +50,52 @@ pub struct OutgoingMail {
     pub html: String,
 }
 
+/// What became of one mail the provider took.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sent {
+    /// Handed to the provider (or possibly so: a send whose outcome is
+    /// unknown is not repeated, so nobody gets the same mail twice).
+    Delivered,
+    /// Not sent: the address is on the domain's suppression list after a
+    /// hard bounce or complaint. Never retried.
+    Suppressed,
+}
+
+/// The outcome of a send from the status the email stack recorded for it.
+/// A captured email that was not suppressed was not sent (no verified domain,
+/// no active provider, a provider error), so it is an error to retry.
+pub fn outcome_of(status: &str, error_message: Option<&str>) -> Result<Sent, String> {
+    match status {
+        "sent" | "delivery_unknown" => Ok(Sent::Delivered),
+        "captured"
+            if error_message
+                .is_some_and(|message| message.starts_with(SUPPRESSED_RECIPIENTS_ERROR)) =>
+        {
+            Ok(Sent::Suppressed)
+        }
+        "captured" => Err(format!(
+            "the email was captured instead of sent: {}",
+            error_message.unwrap_or("no verified domain or active provider")
+        )),
+        other => Err(format!("the email ended in status {other}, not sent")),
+    }
+}
+
 #[async_trait]
 pub trait SubscriberMailer: Send + Sync {
     /// Whether mail can be sent from `sender` (or, with `None`, whether any
     /// sender could work and which ones).
     async fn readiness(&self, sender: Option<&str>) -> Result<MailReadiness, SubscriptionError>;
-    async fn send(&self, mail: OutgoingMail) -> Result<(), SubscriptionError>;
+    /// Whether `sender`'s domain is authorized for every one of
+    /// `project_ids`: the grant a project-scoped deployment token needs to
+    /// send from it. `false` for an unknown domain or no project.
+    async fn sender_granted(
+        &self,
+        sender: &str,
+        project_ids: &[i32],
+    ) -> Result<bool, SubscriptionError>;
+    /// Send one mail. `Err` when it was not sent and should be retried.
+    async fn send(&self, mail: OutgoingMail) -> Result<Sent, SubscriptionError>;
 }
 
 /// The domain part of an address, lowercased.
@@ -151,10 +195,50 @@ impl SubscriberMailer for TempsEmailMailer {
         Ok(judge_sender(!active.is_empty(), verified, sender))
     }
 
-    async fn send(&self, mail: OutgoingMail) -> Result<(), SubscriptionError> {
+    async fn sender_granted(
+        &self,
+        sender: &str,
+        project_ids: &[i32],
+    ) -> Result<bool, SubscriptionError> {
+        let setup = |e: temps_email::EmailError| SubscriptionError::EmailSetup {
+            reason: e.to_string(),
+        };
+        let Some(domain) = sender_domain(sender) else {
+            return Ok(false);
+        };
+        let Some(domain) = self
+            .domains
+            .find_by_domain_name(&domain)
+            .await
+            .map_err(setup)?
+        else {
+            return Ok(false);
+        };
+        if project_ids.is_empty() {
+            return Ok(false);
+        }
+        for &project_id in project_ids {
+            if !self
+                .domains
+                .is_authorized_for_project(domain.id, project_id)
+                .await
+                .map_err(setup)?
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    async fn send(&self, mail: OutgoingMail) -> Result<Sent, SubscriptionError> {
         let subscriber_id = mail.subscriber_id;
-        self.email
-            .send(SendEmailRequest {
+        let failed = |reason: String| SubscriptionError::Send {
+            subscriber_id,
+            reason,
+        };
+        let response = self
+            .email
+            .send_without_history(SendEmailRequest {
                 from: mail.from,
                 from_name: Some(mail.from_name),
                 to: vec![mail.to],
@@ -172,17 +256,43 @@ impl SubscriberMailer for TempsEmailMailer {
                 track_clicks: false,
             })
             .await
-            .map(|_| ())
-            .map_err(|e| SubscriptionError::Send {
-                subscriber_id,
-                reason: e.to_string(),
-            })
+            .map_err(|e| failed(e.to_string()))?;
+        let error_message = if response.status == "captured" {
+            self.email
+                .get(response.id)
+                .await
+                .map_err(|e| failed(e.to_string()))?
+                .error_message
+        } else {
+            None
+        };
+        outcome_of(&response.status, error_message.as_deref()).map_err(failed)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_sent_or_suppressed_email_counts_as_done() {
+        assert_eq!(outcome_of("sent", None), Ok(Sent::Delivered));
+        assert_eq!(outcome_of("delivery_unknown", None), Ok(Sent::Delivered));
+        assert_eq!(
+            outcome_of(
+                "captured",
+                Some(&format!(
+                    "{SUPPRESSED_RECIPIENTS_ERROR} (previous hard bounce)"
+                ))
+            ),
+            Ok(Sent::Suppressed)
+        );
+        let unsent = outcome_of("captured", Some("Domain example.test is not verified"))
+            .expect_err("a capture is not a delivery");
+        assert!(unsent.contains("not verified"), "{unsent}");
+        assert!(outcome_of("captured", None).is_err());
+        assert!(outcome_of("failed", None).is_err());
+    }
 
     #[test]
     fn readiness_names_the_first_missing_piece() {

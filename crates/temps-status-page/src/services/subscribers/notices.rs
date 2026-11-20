@@ -229,6 +229,7 @@ mod tests {
         let source = IncidentSource {
             incident_id: 7,
             update_ids: &[31, 30],
+            update_published_at: &[],
             incident: &incident,
         };
         let notices = incident_notices("Acme Status", &source, at(3), at(10));
@@ -261,6 +262,7 @@ mod tests {
         let source = IncidentSource {
             incident_id: 7,
             update_ids: &[30],
+            update_published_at: &[],
             incident: &silent,
         };
         let notices = incident_notices("Acme", &source, at(0), at(10));
@@ -278,6 +280,7 @@ mod tests {
         let source = IncidentSource {
             incident_id: 7,
             update_ids: &[32],
+            update_published_at: &[],
             incident: &announced,
         };
         let keys: Vec<String> = incident_notices("Acme", &source, at(0), at(10))

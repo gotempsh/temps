@@ -26,7 +26,7 @@ use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
 use tower::ServiceExt;
 
 use super::dispatcher::DispatcherState;
-use super::mailer::{judge_sender, MailReadiness, OutgoingMail, SubscriberMailer};
+use super::mailer::{judge_sender, MailReadiness, OutgoingMail, Sent, SubscriberMailer};
 use super::{
     StatusPageSubscriberService, SubscriberListResponse, SubscriptionError,
     SubscriptionSettingsResponse, UpdateSubscriptionSettingsRequest,
@@ -51,23 +51,49 @@ const INTERNAL_TITLE: &str = "Internal incident title";
 const INTERNAL_MONITOR: &str = "internal-monitor-name";
 const SENDER: &str = "status@example.test";
 
+/// A one-shot async action a test runs from inside the mailer, to change the
+/// world while the code under test is between its read and its write.
+type Hook =
+    Box<dyn FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send>;
+
 #[derive(Default)]
 struct FakeMailer {
     not_ready: std::sync::atomic::AtomicBool,
     sent: Mutex<Vec<OutgoingMail>>,
+    /// Senders whose mail cannot go out.
+    broken_senders: Mutex<HashSet<String>>,
+    /// Sender domains granted to every project.
+    granted_domains: Mutex<HashSet<String>>,
+    /// Sends left to fail before sends succeed again.
+    failing_sends: std::sync::atomic::AtomicUsize,
+    /// Recipients on the suppression list.
+    suppressed: Mutex<HashSet<String>>,
+    /// Run once, before the next send is recorded.
+    before_send: Mutex<Option<Hook>>,
+    /// Run once, during the next readiness check.
+    during_readiness: Mutex<Option<Hook>>,
+    /// Pause in every send, so concurrent dispatchers interleave.
+    send_delay: Mutex<Option<std::time::Duration>>,
 }
 
 impl FakeMailer {
     fn sent(&self) -> Vec<OutgoingMail> {
         self.sent.lock().expect("mailer lock").clone()
     }
+
+    fn take(slot: &Mutex<Option<Hook>>) -> Option<Hook> {
+        slot.lock().expect("hook lock").take()
+    }
 }
 
 #[async_trait]
 impl SubscriberMailer for FakeMailer {
     async fn readiness(&self, sender: Option<&str>) -> Result<MailReadiness, SubscriptionError> {
+        if let Some(hook) = Self::take(&self.during_readiness) {
+            hook().await;
+        }
         let ready = !self.not_ready.load(std::sync::atomic::Ordering::SeqCst);
-        Ok(judge_sender(
+        let mut readiness = judge_sender(
             ready,
             if ready {
                 vec!["example.test".to_string()]
@@ -75,12 +101,73 @@ impl SubscriberMailer for FakeMailer {
                 Vec::new()
             },
             sender,
-        ))
+        );
+        if sender.is_some_and(|sender| {
+            self.broken_senders
+                .lock()
+                .expect("mailer lock")
+                .contains(sender)
+        }) {
+            readiness.problem = Some(super::mailer::MailProblem {
+                reason: "the sender's provider is down".to_string(),
+                setup_path: None,
+            });
+        }
+        Ok(readiness)
     }
 
-    async fn send(&self, mail: OutgoingMail) -> Result<(), SubscriptionError> {
+    async fn sender_granted(
+        &self,
+        sender: &str,
+        project_ids: &[i32],
+    ) -> Result<bool, SubscriptionError> {
+        let domain = super::mailer::sender_domain(sender).unwrap_or_default();
+        Ok(!project_ids.is_empty()
+            && self
+                .granted_domains
+                .lock()
+                .expect("mailer lock")
+                .contains(&domain))
+    }
+
+    async fn send(&self, mail: OutgoingMail) -> Result<Sent, SubscriptionError> {
+        if let Some(hook) = Self::take(&self.before_send) {
+            hook().await;
+        }
+        let delay = *self.send_delay.lock().expect("mailer lock");
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
+        let failing = loop {
+            use std::sync::atomic::Ordering::SeqCst;
+            let left = self.failing_sends.load(SeqCst);
+            if left == 0 {
+                break false;
+            }
+            if self
+                .failing_sends
+                .compare_exchange(left, left - 1, SeqCst, SeqCst)
+                .is_ok()
+            {
+                break true;
+            }
+        };
+        if failing {
+            return Err(SubscriptionError::Send {
+                subscriber_id: mail.subscriber_id,
+                reason: "the email was captured instead of sent: provider unavailable".to_string(),
+            });
+        }
+        if self
+            .suppressed
+            .lock()
+            .expect("mailer lock")
+            .contains(&mail.to)
+        {
+            return Ok(Sent::Suppressed);
+        }
         self.sent.lock().expect("mailer lock").push(mail);
-        Ok(())
+        Ok(Sent::Delivered)
     }
 }
 
@@ -117,11 +204,40 @@ struct Fx {
     page_id: i32,
     slug: String,
     incident_id: i32,
+    project_id: i32,
+    monitor_id: i32,
+    environment_id: i32,
+    config: Arc<ConfigService>,
 }
 
 fn admin() -> RequireAuth {
+    RequireAuth(AuthContext::new_session(test_user(), Role::Admin))
+}
+
+fn with_role(role: Role) -> RequireAuth {
+    RequireAuth(AuthContext::new_session(test_user(), role))
+}
+
+/// An API key with every permission of an admin, confined to `project_id`.
+fn project_scoped_key(project_id: i32) -> RequireAuth {
+    RequireAuth(
+        AuthContext::new_api_key(
+            test_user(),
+            Some(Role::Admin),
+            None,
+            "scoped key".to_string(),
+            9,
+        )
+        .with_api_key_scope(Some(temps_authz::ApiKeyScope {
+            project_id,
+            environment_id: None,
+        })),
+    )
+}
+
+fn test_user() -> users::Model {
     let now = chrono::Utc::now();
-    RequireAuth(AuthContext::new_session(
+    {
         users::Model {
             id: 1,
             name: "Test User".to_string(),
@@ -141,9 +257,8 @@ fn admin() -> RequireAuth {
             oidc_provider_id: None,
             created_at: now,
             updated_at: now,
-        },
-        Role::Admin,
-    ))
+        }
+    }
 }
 
 fn metadata() -> Extension<RequestMetadata> {
@@ -178,6 +293,7 @@ async fn fixture() -> Option<Fx> {
     )
     .expect("server config");
     let config_service = Arc::new(ConfigService::new(Arc::new(config), db.clone()));
+    let config = config_service.clone();
     config_service
         .update_setting_field(|settings| {
             settings.external_url = Some("https://status-host.example.test".to_string())
@@ -312,7 +428,90 @@ async fn fixture() -> Option<Fx> {
         page_id: page.id,
         slug,
         incident_id,
+        project_id,
+        monitor_id: monitor.id,
+        environment_id,
+        config,
     })
+}
+
+/// Subscribe `email` and mark it confirmed a minute ago; returns its id.
+async fn confirmed_subscriber(fx: &Fx, email: &str) -> i32 {
+    confirmed_subscriber_on(fx, &fx.slug, email).await
+}
+
+async fn confirmed_subscriber_on(fx: &Fx, slug: &str, email: &str) -> i32 {
+    let snapshot = fx.cache.get(slug).expect("published");
+    fx.subscribers
+        .subscribe(&snapshot, email)
+        .await
+        .expect("subscribe");
+    status_page_subscribers::Entity::update_many()
+        .col_expr(
+            status_page_subscribers::Column::State,
+            sea_orm::sea_query::Expr::value("confirmed"),
+        )
+        .col_expr(
+            status_page_subscribers::Column::ConfirmedAt,
+            sea_orm::sea_query::Expr::value(chrono::Utc::now() - chrono::Duration::minutes(1)),
+        )
+        .filter(status_page_subscribers::Column::Email.eq(email))
+        .exec(fx.db.as_ref())
+        .await
+        .expect("confirm");
+    status_page_subscribers::Entity::find()
+        .filter(status_page_subscribers::Column::Email.eq(email))
+        .one(fx.db.as_ref())
+        .await
+        .expect("subscriber")
+        .expect("subscriber exists")
+        .id
+}
+
+async fn tick(fx: &Fx, state: &mut DispatcherState) -> super::dispatcher::TickReport {
+    fx.subscribers
+        .dispatch_tick(state, chrono::Utc::now())
+        .await
+        .expect("tick")
+}
+
+async fn open_notices(fx: &Fx) -> u64 {
+    status_page_notices::Entity::find()
+        .filter(status_page_notices::Column::CompletedAt.is_null())
+        .count(fx.db.as_ref())
+        .await
+        .expect("count")
+}
+
+fn notice_recipients(fx: &Fx, text: &str) -> Vec<String> {
+    let mut to: Vec<String> = fx
+        .mailer
+        .sent()
+        .into_iter()
+        .filter(|mail| mail.text.contains(text))
+        .map(|mail| mail.to)
+        .collect();
+    to.sort();
+    to
+}
+
+async fn set_settings(
+    fx: &Fx,
+    auth: RequireAuth,
+    request: UpdateSubscriptionSettingsRequest,
+) -> Result<SubscriptionSettingsResponse, temps_core::problemdetails::Problem> {
+    match update_subscription_settings(
+        auth,
+        State(fx.admin_state.clone()),
+        metadata(),
+        Path(fx.page_id),
+        Json(request),
+    )
+    .await
+    {
+        Ok(response) => Ok(decode(response).await),
+        Err(problem) => Err(problem),
+    }
 }
 
 async fn enable(fx: &Fx) -> SubscriptionSettingsResponse {
@@ -386,6 +585,72 @@ async fn post_update(fx: &Fx, message: &str, is_public: bool) {
         .await
         .expect("incident update");
     fx.cache.refresh_page(fx.page_id).await.expect("refresh");
+}
+
+async fn post_update_on(fx: &Fx, incident_id: i32, message: &str, is_public: bool) {
+    fx.status
+        .incident_service()
+        .update_incident_status(
+            incident_id,
+            UpdateIncidentStatusRequest {
+                status: "identified".to_string(),
+                message: message.to_string(),
+                is_public,
+            },
+        )
+        .await
+        .expect("incident update");
+    fx.cache.refresh_page(fx.page_id).await.expect("refresh");
+}
+
+/// A second published page showing the fixture's monitor, subscriptions on
+/// with `sender`. Returns its id and slug.
+async fn second_page(fx: &Fx, sender: &str) -> (i32, String) {
+    let page = fx
+        .admin_state
+        .pages
+        .create(CreateStatusPageRequest {
+            title: "Second status".to_string(),
+            description: None,
+            monitors: vec![StatusPageMonitorInput {
+                monitor_id: fx.monitor_id,
+                display_name: "API".to_string(),
+                group_name: None,
+            }],
+            appearance: None,
+        })
+        .await
+        .expect("second page");
+    fx.admin_state
+        .pages
+        .publish(page.id)
+        .await
+        .expect("publish");
+    fx.subscribers
+        .update_settings(
+            page.id,
+            UpdateSubscriptionSettingsRequest {
+                enabled: Some(true),
+                sender: Some(sender.to_string()),
+            },
+            None,
+        )
+        .await
+        .expect("enable the second page");
+    let slug = status_pages::Entity::find_by_id(page.id)
+        .one(fx.db.as_ref())
+        .await
+        .expect("page row")
+        .expect("page exists")
+        .slug;
+    (page.id, slug)
+}
+
+fn hook<F>(future: F) -> Option<Hook>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    Some(Box::new(move || Box::pin(future)))
 }
 
 async fn subscriber_rows(fx: &Fx) -> Vec<status_page_subscribers::Model> {
@@ -919,4 +1184,497 @@ async fn a_protected_page_takes_subscriptions_only_from_visitors_who_unlocked_it
         .expect("router is infallible");
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(subscriber_rows(&fx).await.len(), 1);
+}
+
+#[tokio::test]
+async fn an_update_withdrawn_while_its_notice_is_sending_stops_the_rest_of_the_batch() {
+    let Some(fx) = fixture().await else {
+        return;
+    };
+    enable(&fx).await;
+    for email in ["a@example.test", "b@example.test", "c@example.test"] {
+        confirmed_subscriber(&fx, email).await;
+    }
+    post_update(&fx, PUBLIC_UPDATE, true).await;
+    // While the first mail is going out, the admin makes the update private.
+    let (db, cache, page_id, incident_id) =
+        (fx.db.clone(), fx.cache.clone(), fx.page_id, fx.incident_id);
+    *fx.mailer.before_send.lock().expect("hook") = hook(async move {
+        status_incident_updates::Entity::update_many()
+            .col_expr(
+                status_incident_updates::Column::IsPublic,
+                sea_orm::sea_query::Expr::value(false),
+            )
+            .filter(status_incident_updates::Column::IncidentId.eq(incident_id))
+            .exec(db.as_ref())
+            .await
+            .expect("make private");
+        cache.refresh_page(page_id).await.expect("refresh");
+    });
+    let report = tick(&fx, &mut DispatcherState::default()).await;
+    assert_eq!(report.notices_sent, 1, "{report:?}");
+    assert_eq!(report.notices_cancelled, 1, "{report:?}");
+    assert_eq!(notice_recipients(&fx, PUBLIC_UPDATE).len(), 1);
+    assert_eq!(open_notices(&fx).await, 0);
+}
+
+#[tokio::test]
+async fn a_subscriber_deleted_while_a_notice_is_sending_is_not_mailed() {
+    let Some(fx) = fixture().await else {
+        return;
+    };
+    enable(&fx).await;
+    confirmed_subscriber(&fx, "first@example.test").await;
+    let removed = confirmed_subscriber(&fx, "removed@example.test").await;
+    confirmed_subscriber(&fx, "third@example.test").await;
+    post_update(&fx, PUBLIC_UPDATE, true).await;
+    let db = fx.db.clone();
+    *fx.mailer.before_send.lock().expect("hook") = hook(async move {
+        status_page_subscribers::Entity::delete_by_id(removed)
+            .exec(db.as_ref())
+            .await
+            .expect("delete subscriber");
+    });
+    let report = tick(&fx, &mut DispatcherState::default()).await;
+    assert_eq!(report.notices_sent, 2, "{report:?}");
+    assert_eq!(
+        notice_recipients(&fx, PUBLIC_UPDATE),
+        vec![
+            "first@example.test".to_string(),
+            "third@example.test".to_string()
+        ]
+    );
+}
+
+#[tokio::test]
+async fn two_dispatchers_on_one_database_mail_each_subscriber_once() {
+    let Some(fx) = fixture().await else {
+        return;
+    };
+    enable(&fx).await;
+    let emails: Vec<String> = (0..6).map(|i| format!("r{i}@example.test")).collect();
+    for email in &emails {
+        confirmed_subscriber(&fx, email).await;
+    }
+    post_update(&fx, PUBLIC_UPDATE, true).await;
+    *fx.mailer.send_delay.lock().expect("delay") = Some(std::time::Duration::from_millis(30));
+    let other = StatusPageSubscriberService::new(
+        fx.db.clone(),
+        fx.cache.clone(),
+        Arc::new(EncryptionService::new_from_password("subscriber-tests")),
+        fx.mailer.clone(),
+        fx.config.clone(),
+    );
+    let (mut one, mut two) = (DispatcherState::default(), DispatcherState::default());
+    let now = chrono::Utc::now();
+    let (a, b) = tokio::join!(
+        fx.subscribers.dispatch_tick(&mut one, now),
+        other.dispatch_tick(&mut two, now)
+    );
+    let (a, b) = (a.expect("first tick"), b.expect("second tick"));
+    assert_eq!(a.notices_sent + b.notices_sent, emails.len(), "{a:?} {b:?}");
+    assert_eq!(notice_recipients(&fx, PUBLIC_UPDATE), emails);
+}
+
+#[tokio::test]
+async fn a_confirmation_that_failed_to_send_is_sent_on_the_next_tick() {
+    let Some(fx) = fixture().await else {
+        return;
+    };
+    enable(&fx).await;
+    let snapshot = fx.cache.get(&fx.slug).expect("published");
+    fx.subscribers
+        .subscribe(&snapshot, "visitor@example.test")
+        .await
+        .expect("subscribe");
+    fx.mailer
+        .failing_sends
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    let mut state = DispatcherState::default();
+    let report = tick(&fx, &mut state).await;
+    assert_eq!(report.failures, 1, "{report:?}");
+    assert_eq!(report.confirmations_sent, 0, "{report:?}");
+    let row = subscriber_rows(&fx).await.remove(0);
+    assert_eq!(row.confirmation_sent_at, None, "the claim is handed back");
+    assert_eq!(row.confirm_token_hash, None);
+
+    let report = tick(&fx, &mut state).await;
+    assert_eq!(report.confirmations_sent, 1, "{report:?}");
+    let mail = fx.mailer.sent().pop().expect("confirmation");
+    assert_eq!(mail.to, "visitor@example.test");
+    assert!(mail.text.contains("/confirm/"));
+}
+
+#[tokio::test]
+async fn a_page_whose_sender_is_broken_does_not_hold_back_another_pages_notices() {
+    let Some(fx) = fixture().await else {
+        return;
+    };
+    enable(&fx).await;
+    let (second_id, second_slug) = second_page(&fx, "status2@example.test").await;
+    confirmed_subscriber(&fx, "first-page@example.test").await;
+    confirmed_subscriber_on(&fx, &second_slug, "second-page@example.test").await;
+    post_update(&fx, PUBLIC_UPDATE, true).await;
+    fx.cache.refresh_page(second_id).await.expect("refresh");
+    fx.mailer
+        .broken_senders
+        .lock()
+        .expect("mailer")
+        .insert(SENDER.to_string());
+    // One notice per tick: the first page's notice comes first in the queue.
+    let mut state = DispatcherState::with_notices_per_tick(1);
+    let report = tick(&fx, &mut state).await;
+    assert_eq!(report.queued, 2, "{report:?}");
+    assert_eq!(report.notices_sent, 1, "{report:?}");
+    assert_eq!(
+        notice_recipients(&fx, PUBLIC_UPDATE),
+        vec!["second-page@example.test".to_string()]
+    );
+    assert_eq!(open_notices(&fx).await, 1, "the first page's notice waits");
+}
+
+#[tokio::test]
+async fn switching_subscriptions_off_cancels_the_pages_queued_notices() {
+    let Some(fx) = fixture().await else {
+        return;
+    };
+    enable(&fx).await;
+    confirmed_subscriber(&fx, "reader@example.test").await;
+    post_update(&fx, PUBLIC_UPDATE, true).await;
+    fx.mailer
+        .not_ready
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let mut state = DispatcherState::default();
+    assert_eq!(tick(&fx, &mut state).await.queued, 1);
+    assert_eq!(open_notices(&fx).await, 1);
+
+    // Switching off works even while the sender cannot send.
+    let settings = set_settings(
+        &fx,
+        admin(),
+        UpdateSubscriptionSettingsRequest {
+            enabled: Some(false),
+            sender: None,
+        },
+    )
+    .await
+    .map_err(|p| format!("{:?}", p.body))
+    .expect("switch off");
+    assert!(!settings.enabled);
+    fx.mailer
+        .not_ready
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let report = tick(&fx, &mut state).await;
+    assert_eq!(report.notices_cancelled, 1, "{report:?}");
+    assert_eq!(open_notices(&fx).await, 0);
+
+    // Switched back on, the old update is not mailed after all.
+    enable(&fx).await;
+    let report = tick(&fx, &mut state).await;
+    assert_eq!(report.notices_sent, 0, "{report:?}");
+    assert!(notice_recipients(&fx, PUBLIC_UPDATE).is_empty());
+}
+
+#[tokio::test]
+async fn notices_queued_together_go_out_in_the_order_they_were_published() {
+    let Some(fx) = fixture().await else {
+        return;
+    };
+    enable(&fx).await;
+    confirmed_subscriber(&fx, "reader@example.test").await;
+    // A second, later incident: the page lists it first.
+    let later = fx
+        .status
+        .incident_service()
+        .create_incident(
+            fx.project_id,
+            CreateIncidentRequest {
+                title: "Second internal title".to_string(),
+                description: None,
+                severity: "minor".to_string(),
+                environment_id: Some(fx.environment_id),
+                monitor_id: Some(fx.monitor_id),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("second incident")
+        .id;
+    post_update_on(&fx, fx.incident_id, "EARLIER-PUBLIC-UPDATE", true).await;
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    post_update_on(&fx, later, "LATER-PUBLIC-UPDATE", true).await;
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    post_update_on(&fx, fx.incident_id, "LATEST-PUBLIC-UPDATE", true).await;
+
+    tick(&fx, &mut DispatcherState::default()).await;
+    let order: Vec<&str> = fx
+        .mailer
+        .sent()
+        .iter()
+        .filter_map(|mail| {
+            [
+                "EARLIER-PUBLIC-UPDATE",
+                "LATER-PUBLIC-UPDATE",
+                "LATEST-PUBLIC-UPDATE",
+            ]
+            .into_iter()
+            .find(|text| mail.text.contains(text))
+        })
+        .collect();
+    assert_eq!(
+        order,
+        vec![
+            "EARLIER-PUBLIC-UPDATE",
+            "LATER-PUBLIC-UPDATE",
+            "LATEST-PUBLIC-UPDATE"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_draft_made_public_after_subscriptions_were_switched_on_is_announced() {
+    let Some(fx) = fixture().await else {
+        return;
+    };
+    const DRAFT: &str = "DRAFT-PUBLISHED-LATER";
+    post_update(&fx, DRAFT, false).await;
+    let draft = status_incident_updates::Entity::find()
+        .filter(status_incident_updates::Column::Message.eq(DRAFT))
+        .one(fx.db.as_ref())
+        .await
+        .expect("draft")
+        .expect("draft exists");
+    assert_eq!(draft.published_at, None, "a draft is not published");
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    enable(&fx).await;
+    confirmed_subscriber(&fx, "reader@example.test").await;
+
+    fx.status
+        .incident_service()
+        .set_incident_update_visibility(fx.incident_id, draft.id, true)
+        .await
+        .expect("publish the draft");
+    fx.cache.refresh_page(fx.page_id).await.expect("refresh");
+    let report = tick(&fx, &mut DispatcherState::default()).await;
+    assert_eq!(report.queued, 1, "{report:?}");
+    assert_eq!(
+        notice_recipients(&fx, DRAFT),
+        vec!["reader@example.test".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn a_full_page_answers_a_known_and_an_unknown_address_alike() {
+    let Some(fx) = fixture().await else {
+        return;
+    };
+    enable(&fx).await;
+    use sea_orm::ConnectionTrait;
+    fx.db
+        .execute(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "INSERT INTO status_page_subscribers \
+             (status_page_id, email, state, requested_at, unsubscribe_nonce, \
+              unsubscribe_token_hash, created_at, updated_at) \
+             SELECT $1, 'pending' || i || '@example.test', 'pending', now(), md5(i::text), \
+                    md5('u' || i::text || $2), now(), now() \
+             FROM generate_series(1, $3) AS i",
+            [
+                fx.page_id.into(),
+                fx.slug.clone().into(),
+                (super::service::MAX_PENDING_PER_PAGE as i64).into(),
+            ],
+        ))
+        .await
+        .expect("fill the page");
+    let snapshot = fx.cache.get(&fx.slug).expect("published");
+    for email in ["pending1@example.test", "stranger@example.test"] {
+        assert_eq!(
+            fx.subscribers
+                .subscribe(&snapshot, email)
+                .await
+                .expect("subscribe"),
+            super::types::PublicOutcome::Full,
+            "{email}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_sender_save_that_ends_after_a_switch_off_leaves_subscriptions_off() {
+    let Some(fx) = fixture().await else {
+        return;
+    };
+    enable(&fx).await;
+    // While the save checks the sender, another console switches off.
+    let (db, page_id) = (fx.db.clone(), fx.page_id);
+    *fx.mailer.during_readiness.lock().expect("hook") = hook(async move {
+        let switch_off = tokio::spawn(async move {
+            use sea_orm::ConnectionTrait;
+            db.execute(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "UPDATE status_pages SET subscriptions_enabled = false WHERE id = $1",
+                [page_id.into()],
+            ))
+            .await
+            .expect("switch off");
+        });
+        // It waits for the save's lock; do not wait for it here.
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(300), switch_off).await;
+    });
+    set_settings(
+        &fx,
+        admin(),
+        UpdateSubscriptionSettingsRequest {
+            enabled: None,
+            sender: Some("other@example.test".to_string()),
+        },
+    )
+    .await
+    .map_err(|p| format!("{:?}", p.body))
+    .expect("save the sender");
+    let mut row = None;
+    for _ in 0..50 {
+        let page = status_pages::Entity::find_by_id(fx.page_id)
+            .one(fx.db.as_ref())
+            .await
+            .expect("page")
+            .expect("page exists");
+        if !page.subscriptions_enabled {
+            row = Some(page);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let row = row.expect("the switch-off is not lost");
+    assert_eq!(
+        row.subscription_sender.as_deref(),
+        Some("other@example.test")
+    );
+}
+
+#[tokio::test]
+async fn a_project_scoped_key_sends_only_from_a_domain_granted_to_the_page() {
+    let Some(fx) = fixture().await else {
+        return;
+    };
+    let request = || UpdateSubscriptionSettingsRequest {
+        enabled: Some(true),
+        sender: Some(SENDER.to_string()),
+    };
+    let refused = set_settings(&fx, project_scoped_key(fx.project_id), request())
+        .await
+        .err()
+        .expect("an ungranted domain is refused");
+    assert_eq!(refused.status_code, StatusCode::BAD_REQUEST);
+    let page = status_pages::Entity::find_by_id(fx.page_id)
+        .one(fx.db.as_ref())
+        .await
+        .expect("page")
+        .expect("page exists");
+    assert!(!page.subscriptions_enabled && page.subscription_sender.is_none());
+
+    fx.mailer
+        .granted_domains
+        .lock()
+        .expect("mailer")
+        .insert("example.test".to_string());
+    let settings = set_settings(&fx, project_scoped_key(fx.project_id), request())
+        .await
+        .map_err(|p| format!("{:?}", p.body))
+        .expect("a granted domain is accepted");
+    assert!(settings.enabled);
+
+    // The grant is revoked: mail waits until it is back.
+    confirmed_subscriber(&fx, "reader@example.test").await;
+    post_update(&fx, PUBLIC_UPDATE, true).await;
+    fx.mailer.granted_domains.lock().expect("mailer").clear();
+    let mut state = DispatcherState::default();
+    let report = tick(&fx, &mut state).await;
+    assert_eq!(report.notices_sent, 0, "{report:?}");
+    fx.mailer
+        .granted_domains
+        .lock()
+        .expect("mailer")
+        .insert("example.test".to_string());
+    let report = tick(&fx, &mut state).await;
+    assert_eq!(report.notices_sent, 1, "{report:?}");
+
+    // An unscoped admin choosing the same sender lifts the check.
+    set_settings(&fx, admin(), request())
+        .await
+        .map_err(|p| format!("{:?}", p.body))
+        .expect("admin save");
+    let page = status_pages::Entity::find_by_id(fx.page_id)
+        .one(fx.db.as_ref())
+        .await
+        .expect("page")
+        .expect("page exists");
+    assert!(!page.subscription_sender_scoped);
+}
+
+#[tokio::test]
+async fn the_admin_routes_answer_403_without_write_access_to_the_page() {
+    let Some(fx) = fixture().await else {
+        return;
+    };
+    enable(&fx).await;
+    let id = confirmed_subscriber(&fx, "reader@example.test").await;
+    let other_project = fx.project_id + 10_000;
+    let state = || State(fx.admin_state.clone());
+    let callers: Vec<(&str, Box<dyn Fn() -> RequireAuth>)> = vec![
+        ("reader", Box::new(|| with_role(Role::Reader))),
+        ("api reader", Box::new(|| with_role(Role::ApiReader))),
+        (
+            "a key scoped to another project",
+            Box::new(move || project_scoped_key(other_project)),
+        ),
+    ];
+    for (who, auth) in &callers {
+        let list = list_subscribers(
+            auth(),
+            state(),
+            Path(fx.page_id),
+            Query(SubscriberListQuery {
+                page: None,
+                page_size: None,
+            }),
+        )
+        .await
+        .err()
+        .expect("list refused");
+        assert_eq!(list.status_code, StatusCode::FORBIDDEN, "{who} list");
+        let export = export_subscribers(auth(), state(), metadata(), Path(fx.page_id))
+            .await
+            .err()
+            .expect("export refused");
+        assert_eq!(export.status_code, StatusCode::FORBIDDEN, "{who} export");
+        let delete = delete_subscriber(auth(), state(), metadata(), Path((fx.page_id, id)))
+            .await
+            .err()
+            .expect("delete refused");
+        assert_eq!(delete.status_code, StatusCode::FORBIDDEN, "{who} delete");
+        let update = set_settings(
+            &fx,
+            auth(),
+            UpdateSubscriptionSettingsRequest {
+                enabled: Some(false),
+                sender: None,
+            },
+        )
+        .await
+        .err()
+        .expect("update refused");
+        assert_eq!(update.status_code, StatusCode::FORBIDDEN, "{who} update");
+    }
+    // Nothing changed: the subscriber is there and subscriptions are on.
+    assert_eq!(subscriber_rows(&fx).await.len(), 1);
+    assert!(
+        status_pages::Entity::find_by_id(fx.page_id)
+            .one(fx.db.as_ref())
+            .await
+            .expect("page")
+            .expect("page exists")
+            .subscriptions_enabled
+    );
 }

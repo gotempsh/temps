@@ -275,6 +275,8 @@ pub(crate) struct PublicUpdateRow {
     pub status: String,
     pub message: String,
     pub created_at: UtcDateTime,
+    /// When the update became public; announcements count from here.
+    pub published_at: UtcDateTime,
 }
 
 /// A maintenance window in progress or scheduled, with the page's monitors
@@ -950,9 +952,10 @@ async fn load_refresh_data(
         // never makes a refresh read its whole history.
         let sql = format!(
             r#"
-            SELECT incident_id, id, status, message, created_at
+            SELECT incident_id, id, status, message, created_at,
+                   COALESCE(published_at, created_at) AS published_at
             FROM (
-                SELECT incident_id, status, message, created_at, id,
+                SELECT incident_id, status, message, created_at, published_at, id,
                        ROW_NUMBER() OVER (
                            PARTITION BY incident_id ORDER BY created_at DESC, id DESC
                        ) AS rn
@@ -1180,6 +1183,7 @@ pub(crate) fn assemble_page(
                         &IncidentSource {
                             incident_id: incident.incident_id,
                             update_ids: &incident.update_ids,
+                            update_published_at: &incident.update_published_at,
                             incident: &incident.public,
                         },
                         since,
@@ -1204,6 +1208,7 @@ pub(crate) fn assemble_page(
                 incident_events(&IncidentSource {
                     incident_id: incident.incident_id,
                     update_ids: &incident.update_ids,
+                    update_published_at: &incident.update_published_at,
                     incident: &incident.public,
                 })
             })
@@ -1261,6 +1266,8 @@ struct AssembledIncident {
     incident_id: i32,
     /// Ids of `public.updates`, in the same order.
     update_ids: Vec<i32>,
+    /// When each of `public.updates` became public, in the same order.
+    update_published_at: Vec<UtcDateTime>,
     /// `None` when the incident concerns every component of the page.
     monitor_ids: Option<HashSet<i32>>,
     started_on: NaiveDate,
@@ -1403,6 +1410,8 @@ fn public_incidents(
                 };
             let rows = data.updates.get(&incident.id)?;
             let update_ids: Vec<i32> = rows.iter().map(|u| u.id).collect();
+            let update_published_at: Vec<UtcDateTime> =
+                rows.iter().map(|u| u.published_at).collect();
             let updates: Vec<PublicIncidentUpdate> = rows
                 .iter()
                 .map(|u| PublicIncidentUpdate {
@@ -1437,6 +1446,7 @@ fn public_incidents(
                 },
                 incident_id: incident.id,
                 update_ids,
+                update_published_at,
                 monitor_ids,
                 started_on: incident.started_at.date_naive(),
                 // A resolved incident without a timestamp ends the day it
@@ -1483,6 +1493,7 @@ mod tests {
             subscriptions_enabled: false,
             subscriptions_enabled_at: None,
             subscription_sender: None,
+            subscription_sender_scoped: false,
             password_hash: None,
             password_version: 0,
             created_at: now,
@@ -1529,6 +1540,7 @@ mod tests {
             status: "identified".to_string(),
             message: message.to_string(),
             created_at: now(),
+            published_at: now(),
         }
     }
 

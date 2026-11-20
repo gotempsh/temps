@@ -185,6 +185,31 @@ impl StatusPageSubscriberService {
         if locked.is_none() {
             return Ok(PublicOutcome::Full);
         }
+        // At either cap every address gets the same answer, known or not, so
+        // the difference cannot tell anyone which addresses are subscribed.
+        let counts = Counts::find_by_statement(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT count(*) AS total, count(*) FILTER (WHERE state = 'pending') AS pending \
+             FROM status_page_subscribers WHERE status_page_id = $1",
+            [page_id.into()],
+        ))
+        .one(&txn)
+        .await?
+        .unwrap_or(Counts {
+            total: 0,
+            pending: 0,
+        });
+        if counts.total.max(0) as u64 >= MAX_SUBSCRIBERS_PER_PAGE
+            || counts.pending.max(0) as u64 >= MAX_PENDING_PER_PAGE
+        {
+            tracing::warn!(
+                status_page_id = page_id,
+                total = counts.total,
+                pending = counts.pending,
+                "status page subscription refused: the page is at its subscriber limit"
+            );
+            return Ok(PublicOutcome::Full);
+        }
         let existing = status_page_subscribers::Entity::find()
             .filter(status_page_subscribers::Column::StatusPageId.eq(page_id))
             .filter(status_page_subscribers::Column::Email.eq(email.as_str()))
@@ -204,29 +229,6 @@ impl StatusPageSubscriberService {
                 }
             }
             None => {
-                let counts = Counts::find_by_statement(Statement::from_sql_and_values(
-                    DatabaseBackend::Postgres,
-                    "SELECT count(*) AS total, count(*) FILTER (WHERE state = 'pending') AS pending \
-                     FROM status_page_subscribers WHERE status_page_id = $1",
-                    [page_id.into()],
-                ))
-                .one(&txn)
-                .await?
-                .unwrap_or(Counts {
-                    total: 0,
-                    pending: 0,
-                });
-                if counts.total.max(0) as u64 >= MAX_SUBSCRIBERS_PER_PAGE
-                    || counts.pending.max(0) as u64 >= MAX_PENDING_PER_PAGE
-                {
-                    tracing::warn!(
-                        status_page_id = page_id,
-                        total = counts.total,
-                        pending = counts.pending,
-                        "status page subscription refused: the page is at its subscriber limit"
-                    );
-                    return Ok(PublicOutcome::Full);
-                }
                 let nonce = random_hex()?;
                 let unsubscribe_hash = token_hash(&unsubscribe_token(&self.encryption, &nonce));
                 status_page_subscribers::ActiveModel {
@@ -396,12 +398,28 @@ impl StatusPageSubscriberService {
     /// Change the settings. Switching subscriptions on needs a sender mail can
     /// go out from and an address for the links, so a visitor is never asked
     /// for an address that could not be confirmed.
+    ///
+    /// The page row is locked and read again inside the transaction that
+    /// writes it, and only the fields in `request` are written, so two saves
+    /// never undo each other: a sender change that finishes after a switch-off
+    /// leaves subscriptions off.
+    ///
+    /// `scoped_projects` is `Some` for a credential confined to projects (a
+    /// project-scoped API key): it may only choose a sender whose domain is
+    /// authorized for every one of them, and the page remembers that, so
+    /// delivery checks the grant again.
     pub async fn update_settings(
         &self,
         status_page_id: i32,
         request: UpdateSubscriptionSettingsRequest,
+        scoped_projects: Option<&[i32]>,
     ) -> Result<SubscriptionSettingsResponse, SubscriptionError> {
-        let page = self.find_page(status_page_id).await?;
+        let txn = self.db.begin().await?;
+        let page = status_pages::Entity::find_by_id(status_page_id)
+            .lock_exclusive()
+            .one(&txn)
+            .await?
+            .ok_or(SubscriptionError::StatusPageNotFound { status_page_id })?;
         let sender = match request.sender.as_deref().map(str::trim) {
             None => page.subscription_sender.clone(),
             Some("") => None,
@@ -432,6 +450,22 @@ impl StatusPageSubscriberService {
                     ),
                 });
             }
+            if let Some(project_ids) = scoped_projects {
+                if !self.mailer.sender_granted(sender, project_ids).await? {
+                    let projects = project_ids
+                        .iter()
+                        .map(i32::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Err(SubscriptionError::InvalidSender {
+                        sender: sender.clone(),
+                        reason: format!(
+                            "{domain} is not authorized for project {projects}; this credential \
+                             can only send from a domain granted to the page's projects"
+                        ),
+                    });
+                }
+            }
         }
         if enabled {
             let readiness = self.mailer.readiness(sender.as_deref()).await?;
@@ -450,13 +484,23 @@ impl StatusPageSubscriberService {
             }
         }
         let switching_on = enabled && !page.subscriptions_enabled;
-        let mut active: status_pages::ActiveModel = page.into();
-        active.subscriptions_enabled = Set(enabled);
-        active.subscription_sender = Set(sender);
-        if switching_on {
-            active.subscriptions_enabled_at = Set(Some(Utc::now()));
+        let mut active: status_pages::ActiveModel = page.clone().into();
+        if request.enabled.is_some() {
+            active.subscriptions_enabled = Set(enabled);
+            if switching_on {
+                active.subscriptions_enabled_at = Set(Some(Utc::now()));
+            }
         }
-        let page = active.update(self.db.as_ref()).await?;
+        if request.sender.is_some() {
+            active.subscription_sender_scoped = Set(sender.is_some() && scoped_projects.is_some());
+            active.subscription_sender = Set(sender);
+        }
+        let page = if active.is_changed() {
+            active.update(&txn).await?
+        } else {
+            page
+        };
+        txn.commit().await?;
         // The form appears or disappears with the snapshot. A failed rebuild
         // leaves the previous snapshot; the background refresh retries.
         if let Err(error) = self.cache.refresh_page(status_page_id).await {

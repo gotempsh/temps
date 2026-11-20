@@ -184,9 +184,16 @@ pub async fn update_subscription_settings(
     Json(request): Json<UpdateSubscriptionSettingsRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     let project_ids = page_access_guard!(auth, state, StatusPageWrite, status_page_id);
+    // A credential confined to a project may only pick a sender its projects
+    // were granted; an unscoped one picks any verified domain.
+    let scoped = auth.project_id().is_some();
     let settings = state
         .subscribers
-        .update_settings(status_page_id, request)
+        .update_settings(
+            status_page_id,
+            request,
+            scoped.then_some(project_ids.as_slice()),
+        )
         .await?;
     let mut entry = audit(
         &auth,
