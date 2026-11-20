@@ -40,6 +40,9 @@ export function describeActivity(entry: ErrorGroupActivityResponse): string {
       return `A new event${release} reopened this ${was} group`
     }
     case 'assigned':
+      if (details.ownership_rule && details.assignee) {
+        return `Ownership rule ${details.ownership_rule} assigned the new group to ${details.assignee_name ?? `user #${details.assignee.id}`}`
+      }
       if (!details.assignee) return 'unassigned the group'
       if (details.assignee.type === 'team') {
         return `assigned the group to ${details.assignee_name ?? `team #${details.assignee.id}`} (team)`
@@ -51,6 +54,10 @@ export function describeActivity(entry: ErrorGroupActivityResponse): string {
       return `took the merge with ${groupList(details.group_ids)} apart${fingerprints(details.fingerprints)}`
     case 'split':
       return `split fingerprints between this group and ${groupList(details.group_ids)}${fingerprints(details.fingerprints)}`
+    case 'issue_linked':
+      return `linked ${details.issue_title ?? details.issue_url ?? 'an issue'}`
+    case 'issue_unlinked':
+      return `unlinked ${details.issue_title ?? details.issue_url ?? 'an issue'}`
     default:
       return 'changed the group'
   }
@@ -61,6 +68,8 @@ export function activityActor(
   entry: ErrorGroupActivityResponse
 ): string | null {
   if (entry.kind === 'regressed') return null
+  // An ownership rule, not a person, assigned the group.
+  if (entry.kind === 'assigned' && entry.details?.ownership_rule) return null
   return entry.actor_name ?? 'Someone'
 }
 

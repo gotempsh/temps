@@ -89,6 +89,45 @@ describe('describeActivity', () => {
     ).toBe('assigned the group to Payments (team)')
     expect(activityActor(entry({ actor_name: null }))).toBe('Someone')
   })
+
+  it('credits an ownership rule, not a person, with assigning a new group', () => {
+    const byRule = entry({
+      kind: 'assigned',
+      actor_user_id: null,
+      actor_name: null,
+      details: {
+        assignee: { type: 'user', id: 7 },
+        assignee_name: 'Ana',
+        ownership_rule: 'src/billing/',
+      },
+    })
+    expect(describeActivity(byRule)).toBe(
+      'Ownership rule src/billing/ assigned the new group to Ana'
+    )
+    expect(activityActor(byRule)).toBeNull()
+  })
+
+  it('names the issue that was linked or unlinked', () => {
+    expect(
+      describeActivity(
+        entry({
+          kind: 'issue_linked',
+          details: {
+            issue_url: 'https://git.example.test/acme/shop/issues/3',
+            issue_title: 'Checkout fails',
+          },
+        })
+      )
+    ).toBe('linked Checkout fails')
+    expect(
+      describeActivity(
+        entry({
+          kind: 'issue_unlinked',
+          details: { issue_url: 'https://tracker.example.test/SHOP-1' },
+        })
+      )
+    ).toBe('unlinked https://tracker.example.test/SHOP-1')
+  })
 })
 
 describe('commentPreview', () => {
