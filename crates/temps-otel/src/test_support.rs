@@ -312,6 +312,15 @@ impl MockOtelStorage {
                         p99_ms: percentile(&durations, 0.99),
                     },
                     last_seen,
+                    query.apdex_threshold_ms.map(|threshold_ms| ApdexCounts {
+                        threshold_ms,
+                        satisfied: durations.iter().filter(|d| **d <= threshold_ms).count()
+                            as i64,
+                        tolerating: durations
+                            .iter()
+                            .filter(|d| **d > threshold_ms && **d <= threshold_ms * 4.0)
+                            .count() as i64,
+                    }),
                 )
             })
             .collect();

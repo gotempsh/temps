@@ -933,10 +933,15 @@ struct ChSpanStatsRow {
     p99_duration_ms: f64,
     /// Unix milliseconds (toUnixTimestamp64Milli)
     last_seen_ms: i64,
+    /// Spans at or under the Apdex threshold (0 when none was asked for).
+    satisfied_count: u64,
+    /// Spans over the threshold and at or under four times it.
+    tolerating_count: u64,
 }
 
-impl From<ChSpanStatsRow> for SpanStats {
-    fn from(r: ChSpanStatsRow) -> Self {
+impl ChSpanStatsRow {
+    fn into_stats(self, apdex_threshold_ms: Option<f64>) -> SpanStats {
+        let r = self;
         use chrono::TimeZone;
         let last_seen = chrono::Utc
             .timestamp_millis_opt(r.last_seen_ms)
@@ -962,6 +967,11 @@ impl From<ChSpanStatsRow> for SpanStats {
                 p99_ms: r.p99_duration_ms,
             },
             last_seen,
+            apdex_threshold_ms.map(|threshold_ms| crate::types::ApdexCounts {
+                threshold_ms,
+                satisfied: r.satisfied_count as i64,
+                tolerating: r.tolerating_count as i64,
+            }),
         )
     }
 }
@@ -2567,7 +2577,11 @@ impl OtelStorage for ClickHouseOtelStorage {
                 toFloat64(quantileTDigest(0.50)(duration_ms)) AS p50_duration_ms,
                 toFloat64(quantileTDigest(0.95)(duration_ms)) AS p95_duration_ms,
                 toFloat64(quantileTDigest(0.99)(duration_ms)) AS p99_duration_ms,
-                toUnixTimestamp64Milli(max(start_time)) AS last_seen_ms
+                toUnixTimestamp64Milli(max(start_time)) AS last_seen_ms,
+                -- Apdex counts, in the same pass: satisfied at or under T,
+                -- tolerating up to 4T (ADR 111, D2).
+                countIf(duration_ms <= ?) AS satisfied_count,
+                countIf(duration_ms > ? AND duration_ms <= ?) AS tolerating_count
             FROM spans
             WHERE {where_sql}
             GROUP BY project_id, service_name, name
@@ -2576,7 +2590,16 @@ impl OtelStorage for ClickHouseOtelStorage {
             LIMIT ? OFFSET ?"#
         );
 
-        let mut q = bind_all(self.read.query(&sql), binds);
+        // The SELECT placeholders come before the WHERE ones in the text, so
+        // they are bound first.
+        let threshold = query.apdex_threshold_ms.unwrap_or(0.0);
+        let q = self
+            .read
+            .query(&sql)
+            .bind(threshold)
+            .bind(threshold)
+            .bind(threshold * 4.0);
+        let mut q = bind_all(q, binds);
         q = q
             .bind(query.min_count as i64)
             .bind(limit as i64)
@@ -2587,7 +2610,10 @@ impl OtelStorage for ClickHouseOtelStorage {
             .await
             .map_err(|e| ch_query_err("query_span_stats", e))?;
 
-        Ok(rows.into_iter().map(SpanStats::from).collect())
+        Ok(rows
+            .into_iter()
+            .map(|row| row.into_stats(query.apdex_threshold_ms))
+            .collect())
     }
 
     async fn count_span_stats(&self, query: SpanStatsQuery) -> StorageResult<u64> {

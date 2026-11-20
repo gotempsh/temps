@@ -34090,6 +34090,16 @@ export type SpanRow = {
  * `(project, service, span name)` triple over the queried window.
  */
 export type SpanStats = {
+    /**
+     * Apdex for `apdex_threshold_ms`: `(satisfied + tolerating / 2) /
+     * count`, from 0 (everyone frustrated) to 1 (everyone satisfied).
+     * `None` when the query asked for no score.
+     */
+    apdex?: number | null;
+    /**
+     * The threshold `T` the score used, in milliseconds.
+     */
+    apdex_threshold_ms?: number | null;
     avg_duration_ms: number;
     /**
      * `stddev / avg`, or `0` when `avg` is zero.
@@ -34105,6 +34115,10 @@ export type SpanStats = {
      */
     error_rate: number;
     /**
+     * Spans over `4T`.
+     */
+    frustrated_count?: number | null;
+    /**
      * The most common span kind for this operation.
      */
     kind: SpanKind;
@@ -34118,6 +34132,10 @@ export type SpanStats = {
     p95_duration_ms: number;
     p99_duration_ms: number;
     project_id: number;
+    /**
+     * Spans at or under `T`.
+     */
+    satisfied_count?: number | null;
     service_name: string;
     /**
      * The span name, which is the operation identity: `GET /api/checkout`,
@@ -34132,6 +34150,10 @@ export type SpanStats = {
      * `p99 / p50`, or `0` when `p50` is zero.
      */
     tail_ratio: number;
+    /**
+     * Spans over `T` and at or under `4T`.
+     */
+    tolerating_count?: number | null;
     /**
      * `SUM(duration_ms)` — total wall-clock attributable to this operation.
      */
@@ -70633,6 +70655,10 @@ export type QuerySpanStatsData = {
          * Page offset
          */
         offset?: number;
+        /**
+         * Apdex threshold T in ms (default 500, at most 600000): at or under T satisfies, up to 4T tolerates
+         */
+        apdex_threshold_ms?: number;
     };
     url: '/otel/span-stats';
 };

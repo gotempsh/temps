@@ -36,6 +36,7 @@ interface SpanStatsOptions {
   attributes?: string
   minDurationMs?: string
   minCount?: string
+  apdexMs?: string
   sortBy?: string
   sortOrder?: string
   limit?: string
@@ -65,6 +66,30 @@ const SPAN_STATUSES = ['ok', 'error', 'unset']
 /** Server-side caps, mirrored so the CLI can explain them before a round trip. */
 const MAX_PROJECTS = 50
 export const MAX_WINDOW_DAYS = 31
+/** The server's Apdex threshold bounds, in milliseconds. */
+export const MAX_APDEX_THRESHOLD_MS = 600_000
+
+/**
+ * Parse `--apdex-ms`, which must be a positive number of milliseconds no
+ * larger than the server accepts. Returns the reason when it is not.
+ */
+export function parseApdexThreshold(
+  value: string,
+): { ok: true; ms: number } | { ok: false; error: string } {
+  const ms = Number(value)
+  if (!Number.isFinite(ms) || ms <= 0 || ms > MAX_APDEX_THRESHOLD_MS) {
+    return {
+      ok: false,
+      error: `Invalid --apdex-ms: ${value}. Use milliseconds greater than 0 and at most ${MAX_APDEX_THRESHOLD_MS}`,
+    }
+  }
+  return { ok: true, ms }
+}
+
+/** Apdex for a terminal column: two decimals, or a dash when unscored. */
+export function apdexLabel(score: number | null | undefined): string {
+  return score == null ? '-' : score.toFixed(2)
+}
 
 /**
  * Parse a relative duration like `30m`, `24h`, `7d` into milliseconds.
@@ -174,6 +199,7 @@ export function registerTracesCommands(program: Command): void {
     .option('--attributes <pairs>', 'Span attribute filters, e.g. db.system=postgresql')
     .option('--min-duration-ms <ms>', 'Ignore spans faster than this')
     .option('--min-count <n>', 'Drop operations with fewer samples than this')
+    .option('--apdex-ms <ms>', 'Apdex threshold: calls at or under this satisfy, up to 4x tolerate (default 500)')
     .option('--sort-by <field>', `Ranking (${SORT_FIELDS.join(', ')})`, 'total_time')
     .option('--sort-order <order>', 'asc or desc', 'desc')
     .option('--limit <n>', 'Rows to show (max 100)', '20')
@@ -200,6 +226,9 @@ Examples:
 
   # How slow are the failures specifically?
   $ temps traces span-stats --project-id 4 --status error --sort-by p95
+
+  # Score user satisfaction against a 200ms target
+  $ temps traces span-stats --project-id 4 --apdex-ms 200
 `,
     )
     .action(spanStatsAction)
@@ -233,6 +262,16 @@ async function spanStatsAction(options: SpanStatsOptions): Promise<void> {
     return
   }
 
+  let apdexMs: number | undefined
+  if (options.apdexMs) {
+    const parsed = parseApdexThreshold(options.apdexMs)
+    if (!parsed.ok) {
+      warning(parsed.error)
+      return
+    }
+    apdexMs = parsed.ms
+  }
+
   // Resolve the window client-side so `--since` is a real convenience rather
   // than a second, subtly different defaulting rule on the server.
   const window = resolveTimeWindow(options)
@@ -261,6 +300,7 @@ async function spanStatsAction(options: SpanStatsOptions): Promise<void> {
         ...(options.attributes && { attributes: options.attributes }),
         ...(options.minDurationMs && { min_duration_ms: parseFloat(options.minDurationMs) }),
         ...(options.minCount && { min_count: parseInt(options.minCount, 10) }),
+        ...(apdexMs !== undefined && { apdex_threshold_ms: apdexMs }),
         ...(options.sortBy && { sort_by: options.sortBy }),
         ...(options.sortOrder && { sort_order: options.sortOrder }),
         ...(options.limit && { limit: parseInt(options.limit, 10) }),
@@ -327,6 +367,14 @@ async function spanStatsAction(options: SpanStatsOptions): Promise<void> {
       // A tail ratio above 10 means the bad case is an order of magnitude
       // worse than the typical one — the thing this report exists to surface.
       color: (v, r) => (r.tail_ratio >= 10 ? colors.error(v) : r.tail_ratio >= 4 ? colors.warning(v) : v),
+    },
+    {
+      header: 'Apdex',
+      accessor: (r) => apdexLabel(r.apdex),
+      align: 'right',
+      // Under 0.70 is fair at best, under 0.50 unacceptable.
+      color: (v, r) =>
+        r.apdex == null ? colors.muted(v) : r.apdex < 0.5 ? colors.error(v) : r.apdex < 0.7 ? colors.warning(v) : v,
     },
     { header: 'Last Seen', accessor: (r) => formatRelativeTime(r.last_seen) },
   ]

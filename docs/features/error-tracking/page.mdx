@@ -1012,6 +1012,37 @@ const status = await fetch(
 ```
 </CodeGroup>
 
+## Operation Performance {{ anchor: true, id: 'operation-performance' }}
+
+**Traces → Operations** ranks every operation (span name per service) by time spent, latency percentiles, error rate and inconsistency. The sections below describe what it adds on top of the latency table.
+
+### Apdex {{ anchor: true, id: 'apdex' }}
+
+Each operation gets an Apdex score from 0 to 1 for a threshold `T` you pick: calls at or under `T` are *satisfied*, calls over `T` and up to `4T` are *tolerating* and count half, slower calls are *frustrated* and count nothing.
+
+```
+Apdex = (satisfied + tolerating / 2) / calls
+```
+
+The default threshold is 500 ms; the **Satisfied under** menu changes it, and the choice stays in the page address so a shared link keeps it. Scores under 0.70 are marked as a warning and under 0.50 as a problem (the conventional bands: 0.94 excellent, 0.85 good, 0.70 fair, 0.50 poor). Hover a score to see the three counts behind it. The counts are exact, computed in the same query as the percentiles.
+
+<CodeGroup title="Apdex">
+```bash {{ title: 'CLI' }}
+# Score operations against a 200 ms target
+temps traces span-stats --project-id 42 --apdex-ms 200
+```
+
+```typescript {{ title: 'API' }}
+const { data } = await fetch(
+  'https://your-temps-instance.com/api/otel/span-stats?project_id=42&apdex_threshold_ms=200',
+  { headers: { 'Authorization': `Bearer ${API_KEY}` } }
+).then(r => r.json());
+// data[0].apdex, data[0].satisfied_count, data[0].tolerating_count, data[0].frustrated_count
+```
+</CodeGroup>
+
+`apdex_threshold_ms` must be greater than 0 and at most 600000 (ten minutes); the API defaults it to 500.
+
 ## Additional Resources
 
 <div className="not-prose">

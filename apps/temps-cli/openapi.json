@@ -73524,6 +73524,22 @@
       "SpanStats": {
         "description": "Latency and error statistics for one operation, i.e. one\n`(project, service, span name)` triple over the queried window.",
         "properties": {
+          "apdex": {
+            "description": "Apdex for `apdex_threshold_ms`: `(satisfied + tolerating / 2) /\ncount`, from 0 (everyone frustrated) to 1 (everyone satisfied).\n`None` when the query asked for no score.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "apdex_threshold_ms": {
+            "description": "The threshold `T` the score used, in milliseconds.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
           "avg_duration_ms": {
             "format": "double",
             "type": "number"
@@ -73546,6 +73562,14 @@
             "description": "`error_count / count`, in `[0, 1]`.",
             "format": "double",
             "type": "number"
+          },
+          "frustrated_count": {
+            "description": "Spans over `4T`.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "kind": {
             "$ref": "#/components/schemas/SpanKind",
@@ -73580,6 +73604,14 @@
             "format": "int32",
             "type": "integer"
           },
+          "satisfied_count": {
+            "description": "Spans at or under `T`.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "service_name": {
             "type": "string"
           },
@@ -73596,6 +73628,14 @@
             "description": "`p99 / p50`, or `0` when `p50` is zero.",
             "format": "double",
             "type": "number"
+          },
+          "tolerating_count": {
+            "description": "Spans over `T` and at or under `4T`.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "total_duration_ms": {
             "description": "`SUM(duration_ms)` — total wall-clock attributable to this operation.",
@@ -138147,6 +138187,16 @@
               "format": "int64",
               "minimum": 0,
               "type": "integer"
+            }
+          },
+          {
+            "description": "Apdex threshold T in ms (default 500, at most 600000): at or under T satisfies, up to 4T tolerates",
+            "in": "query",
+            "name": "apdex_threshold_ms",
+            "required": false,
+            "schema": {
+              "format": "double",
+              "type": "number"
             }
           }
         ],

@@ -2459,6 +2459,7 @@ fn stats_query(project_ids: Vec<i32>, start: DateTime<Utc>, end: DateTime<Utc>) 
         sort_order: SortOrder::default(),
         limit: None,
         offset: None,
+        apdex_threshold_ms: None,
     }
 }
 
@@ -2543,6 +2544,26 @@ async fn test_span_stats_aggregates_percentiles_and_ratios() {
     // steady one is not meaningfully faster on average.
     assert!(erratic.tail_ratio > steady.tail_ratio);
     assert!(erratic.coefficient_of_variation > steady.coefficient_of_variation);
+    assert_eq!(erratic.apdex, None, "no threshold asked for, no score");
+
+    // Apdex with T = 100ms: steady has one satisfied call (100ms) and 19
+    // tolerating ones; erratic has 18 satisfied and the two 2s calls
+    // frustrate.
+    let scored = storage
+        .query_span_stats(SpanStatsQuery {
+            apdex_threshold_ms: Some(100.0),
+            ..stats_query(vec![1], window_start, now)
+        })
+        .await
+        .expect("query span stats with apdex");
+    let steady = scored.iter().find(|r| r.span_name == "steady").unwrap();
+    assert_eq!(steady.satisfied_count, Some(1));
+    assert_eq!(steady.tolerating_count, Some(19));
+    assert_eq!(steady.apdex, Some(0.525));
+    let erratic = scored.iter().find(|r| r.span_name == "erratic").unwrap();
+    assert_eq!(erratic.satisfied_count, Some(18));
+    assert_eq!(erratic.frustrated_count, Some(2));
+    assert_eq!(erratic.apdex, Some(0.9));
 }
 
 #[tokio::test]

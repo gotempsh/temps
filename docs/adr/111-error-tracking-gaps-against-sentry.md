@@ -6,8 +6,8 @@ Proposed — 2026-11-19. Being implemented in the order of the Decision
 section. D1.1 (bulk actions), D1.2 (merge and split), D1.3 (ignore
 until), D1.4 (inbound filters), D1.5 (resolve in the next release),
 D1.6 (assignment), D1.7 (comments and activity) and D1.8 (saved searches)
-have shipped, so D1 is complete. Of D2, D2.1 (performance issues) has
-shipped. The questions they settled
+have shipped, so D1 is complete. Of D2, D2.1 (performance issues) and
+D2.3 (Apdex) have shipped. The questions they settled
 are recorded under "Settled while implementing".
 
 Related: ADR 016 (ClickHouse traces backend), ADR 027 (cross-project trace
@@ -429,3 +429,23 @@ deploys, which is web services. It comes last and may never be worth building.
   `GET /projects/{project_id}/performance-issues/status` reports it with a
   `configured` flag, the reason when nothing has been checked, and the
   detector list, so the console can explain an empty list.
+
+### D2.3 Apdex
+
+- **On the existing report.** The score is a field of `/otel/span-stats`
+  rows, not a new endpoint: `apdex`, the threshold it used, and the
+  satisfied, tolerating and frustrated counts. Both backends count in the
+  same aggregate as the percentiles (`countIf` in ClickHouse, `FILTER` in
+  TimescaleDB), so the score is exact and costs no extra pass.
+- **Threshold per request, not per project.** `apdex_threshold_ms`
+  defaults to 500 ms and is validated (greater than 0, at most ten
+  minutes); a value out of range is a 400 that names the parameter. One
+  threshold per project, or per operation, would be a column; it is not
+  added until someone needs a stored target, because the console keeps the
+  chosen threshold in the page address.
+- **Tolerating means up to 4T**, the Apdex definition. The console marks
+  scores under 0.70 as a warning and under 0.50 as a problem.
+- **Not a sort key yet.** Ranking by Apdex needs a sort field in both
+  backends; the existing p95 and p99 rankings answer "who is slow" until
+  then.
+

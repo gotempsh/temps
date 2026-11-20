@@ -1944,9 +1944,11 @@ impl OtelStorage for TimescaleDbStorage {
         let min_count_param = param_idx;
         let limit_param = param_idx + 1;
         let offset_param = param_idx + 2;
+        let apdex_param = param_idx + 3;
         values.push((query.min_count as i64).into());
         values.push((limit as i64).into());
         values.push((offset as i64).into());
+        values.push(query.apdex_threshold_ms.unwrap_or(0.0).into());
 
         // The percentiles use `percentile_cont`, which is exact rather than
         // approximate: the window is bounded and the result is grouped, so the
@@ -1970,7 +1972,11 @@ impl OtelStorage for TimescaleDbStorage {
                 percentile_cont(0.50) WITHIN GROUP (ORDER BY s.duration_ms)::double precision AS p50_duration_ms,
                 percentile_cont(0.95) WITHIN GROUP (ORDER BY s.duration_ms)::double precision AS p95_duration_ms,
                 percentile_cont(0.99) WITHIN GROUP (ORDER BY s.duration_ms)::double precision AS p99_duration_ms,
-                MAX(s.start_time) AS last_seen
+                MAX(s.start_time) AS last_seen,
+                -- Apdex counts, in the same pass (ADR 111, D2).
+                COUNT(*) FILTER (WHERE s.duration_ms <= ${apdex_param})::bigint AS satisfied_count,
+                COUNT(*) FILTER (WHERE s.duration_ms > ${apdex_param}
+                    AND s.duration_ms <= ${apdex_param} * 4)::bigint AS tolerating_count
             FROM otel_spans s
             WHERE {where_sql}
             GROUP BY s.project_id, s.service_name, s.name
@@ -1989,7 +1995,10 @@ impl OtelStorage for TimescaleDbStorage {
             ))
             .await?;
 
-        Ok(results.iter().filter_map(parse_span_stats_row).collect())
+        Ok(results
+            .iter()
+            .filter_map(|row| parse_span_stats_row(row, query.apdex_threshold_ms))
+            .collect())
     }
 
     async fn count_span_stats(&self, query: SpanStatsQuery) -> StorageResult<u64> {
@@ -4118,7 +4127,10 @@ fn span_stats_order_expr(field: crate::types::SpanStatsSortField) -> &'static st
 /// Returns `None` for a row missing a required column, matching the read paths
 /// elsewhere in this backend: one malformed row is skipped rather than failing
 /// the whole report.
-fn parse_span_stats_row(row: &sea_orm::QueryResult) -> Option<SpanStats> {
+fn parse_span_stats_row(
+    row: &sea_orm::QueryResult,
+    apdex_threshold_ms: Option<f64>,
+) -> Option<SpanStats> {
     let project_id: i32 = row.try_get("", "project_id").ok()?;
     let service_name: String = row.try_get("", "service_name").ok()?;
     let span_name: String = row.try_get("", "span_name").ok()?;
@@ -4134,6 +4146,11 @@ fn parse_span_stats_row(row: &sea_orm::QueryResult) -> Option<SpanStats> {
     let p95_duration_ms: f64 = row.try_get("", "p95_duration_ms").unwrap_or(0.0);
     let p99_duration_ms: f64 = row.try_get("", "p99_duration_ms").unwrap_or(0.0);
     let last_seen: DateTime<Utc> = row.try_get("", "last_seen").ok()?;
+    let apdex = apdex_threshold_ms.map(|threshold_ms| crate::types::ApdexCounts {
+        threshold_ms,
+        satisfied: row.try_get("", "satisfied_count").unwrap_or(0),
+        tolerating: row.try_get("", "tolerating_count").unwrap_or(0),
+    });
 
     Some(crate::types::build_span_stats(
         crate::types::SpanStatsGroup {
@@ -4155,6 +4172,7 @@ fn parse_span_stats_row(row: &sea_orm::QueryResult) -> Option<SpanStats> {
             p99_ms: p99_duration_ms,
         },
         last_seen,
+        apdex,
     ))
 }
 

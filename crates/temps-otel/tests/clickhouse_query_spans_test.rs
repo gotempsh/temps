@@ -595,6 +595,7 @@ fn stats_query(project_ids: Vec<i32>, minutes: i64) -> SpanStatsQuery {
         sort_order: SortOrder::default(),
         limit: None,
         offset: None,
+        apdex_threshold_ms: None,
     }
 }
 
@@ -728,6 +729,33 @@ async fn span_stats_aggregates_and_scopes_to_the_requested_projects_and_window()
     let steady = rows.iter().find(|r| r.span_name == "steady").unwrap();
     assert!(erratic.tail_ratio > steady.tail_ratio);
     assert!(erratic.coefficient_of_variation > steady.coefficient_of_variation);
+    assert_eq!(erratic.apdex, None, "no threshold asked for, no score");
+}
+
+#[tokio::test]
+async fn span_stats_scores_apdex_from_exact_counts() {
+    let Some((storage, _probe, _c)) = seeded_stats().await else {
+        return;
+    };
+    let rows = storage
+        .query_span_stats(SpanStatsQuery {
+            apdex_threshold_ms: Some(100.0),
+            ..stats_query(vec![PROJECT], 60)
+        })
+        .await
+        .expect("query_span_stats");
+    // steady: 100ms satisfies, 101..119ms tolerate. erratic: 40..57ms
+    // satisfy, the two 2s calls frustrate.
+    let steady = rows.iter().find(|r| r.span_name == "steady").unwrap();
+    assert_eq!(steady.satisfied_count, Some(1));
+    assert_eq!(steady.tolerating_count, Some(19));
+    assert_eq!(steady.frustrated_count, Some(0));
+    assert_eq!(steady.apdex, Some(0.525));
+    let erratic = rows.iter().find(|r| r.span_name == "erratic").unwrap();
+    assert_eq!(erratic.satisfied_count, Some(18));
+    assert_eq!(erratic.frustrated_count, Some(2));
+    assert_eq!(erratic.apdex, Some(0.9));
+    assert_eq!(erratic.apdex_threshold_ms, Some(100.0));
 }
 
 #[tokio::test]

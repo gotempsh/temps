@@ -36,6 +36,13 @@ import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { useDebounce } from '@/hooks/useDebounce'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import {
+  APDEX_THRESHOLD_OPTIONS,
+  DEFAULT_APDEX_THRESHOLD,
+  apdexBreakdown,
+  apdexRating,
+  apdexThresholdFromParam,
+} from '@/lib/apdex'
+import {
   computeTracesTimeWindow,
   type TracesTimeRange,
 } from '@/lib/traces-time-window'
@@ -137,6 +144,41 @@ function tailRatioBadge(ratio: number) {
   return <span className="text-muted-foreground">{label}</span>
 }
 
+/**
+ * Apdex: the share of calls that satisfied users (at or under the threshold),
+ * with tolerating calls (up to four times it) counted half.
+ */
+function apdexCell(row: SpanStats) {
+  if (row.apdex == null) {
+    return <span className="text-muted-foreground">—</span>
+  }
+  const label = row.apdex.toFixed(2)
+  const rating = apdexRating(row.apdex)
+  const breakdown = apdexBreakdown(row)
+  const badge =
+    rating === 'unacceptable' || rating === 'poor' ? (
+      <Badge variant="destructive">{label}</Badge>
+    ) : rating === 'fair' ? (
+      <Badge variant="warning">{label}</Badge>
+    ) : (
+      <span className="text-muted-foreground">{label}</span>
+    )
+  return (
+    <Tooltip>
+      <TooltipTrigger
+        className="cursor-help"
+        aria-label={`Apdex ${label}, ${rating}`}
+      >
+        {badge}
+      </TooltipTrigger>
+      <TooltipContent>
+        {rating[0].toUpperCase() + rating.slice(1)}
+        {breakdown ? `: ${breakdown}` : ''}
+      </TooltipContent>
+    </Tooltip>
+  )
+}
+
 export default function TraceOperations({ project }: TraceOperationsProps) {
   const navigate = useNavigate()
   const [searchParams, setSearchParams] = useSearchParams()
@@ -159,6 +201,9 @@ export default function TraceOperations({ project }: TraceOperationsProps) {
   const [sortBy, setSortBy] = useState(searchParams.get('sort') || 'total_time')
   const [minCount, setMinCount] = useState(
     searchParams.get('min_count') || '10'
+  )
+  const [apdexThreshold, setApdexThreshold] = useState(() =>
+    apdexThresholdFromParam(searchParams.get('apdex'))
   )
   // The project bar picks the environment.
   const [environmentFilter] = useEnvironmentFilter()
@@ -191,6 +236,7 @@ export default function TraceOperations({ project }: TraceOperationsProps) {
         end_time: timeWindow.endTime,
         sort_by: sortBy,
         min_count: Number(minCount),
+        apdex_threshold_ms: Number(apdexThreshold),
         ...(debouncedSearch ? { name_pattern: debouncedSearch } : {}),
         ...(environmentId !== 'all'
           ? { environment_id: Number(environmentId) }
@@ -237,6 +283,14 @@ export default function TraceOperations({ project }: TraceOperationsProps) {
       setMinCount(v)
       setPage(1)
       updateParam('min_count', v, '10')
+    },
+    [updateParam]
+  )
+
+  const handleApdexChange = useCallback(
+    (v: string) => {
+      setApdexThreshold(v)
+      updateParam('apdex', v, DEFAULT_APDEX_THRESHOLD)
     },
     [updateParam]
   )
@@ -314,6 +368,22 @@ export default function TraceOperations({ project }: TraceOperationsProps) {
                 {MIN_COUNT_OPTIONS.map((value) => (
                   <SelectItem key={value} value={value}>
                     Min {value} call{value === '1' ? '' : 's'}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+
+            <Select value={apdexThreshold} onValueChange={handleApdexChange}>
+              <SelectTrigger
+                className="w-full sm:w-[190px]"
+                aria-label="Apdex threshold"
+              >
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {APDEX_THRESHOLD_OPTIONS.map((value) => (
+                  <SelectItem key={value} value={value}>
+                    Satisfied under {formatMs(Number(value))}
                   </SelectItem>
                 ))}
               </SelectContent>
@@ -419,6 +489,19 @@ export default function TraceOperations({ project }: TraceOperationsProps) {
                         </TooltipContent>
                       </Tooltip>
                     </TableHead>
+                    <TableHead className="text-right">
+                      <Tooltip>
+                        <TooltipTrigger className="cursor-help underline decoration-dotted underline-offset-4">
+                          Apdex
+                        </TooltipTrigger>
+                        <TooltipContent>
+                          User satisfaction from 0 to 1: calls under{' '}
+                          {formatMs(Number(apdexThreshold))} count fully, calls
+                          up to four times that count half, slower calls not at
+                          all.
+                        </TooltipContent>
+                      </Tooltip>
+                    </TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
@@ -472,6 +555,9 @@ export default function TraceOperations({ project }: TraceOperationsProps) {
                       </TableCell>
                       <TableCell className="text-right tabular-nums">
                         {tailRatioBadge(row.tail_ratio)}
+                      </TableCell>
+                      <TableCell className="text-right tabular-nums">
+                        {apdexCell(row)}
                       </TableCell>
                     </TableRow>
                   ))}

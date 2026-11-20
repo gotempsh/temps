@@ -149,6 +149,30 @@ pub struct SpanStatsQueryParams {
     pub sort_order: Option<String>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,
+    /// Apdex threshold `T` in milliseconds (default
+    /// [`DEFAULT_APDEX_THRESHOLD_MS`]): spans at or under `T` satisfy, up to
+    /// `4T` tolerate, slower ones frustrate.
+    pub apdex_threshold_ms: Option<f64>,
+}
+
+/// The Apdex threshold when the caller names none: half a second, the
+/// conventional default for a web request.
+pub const DEFAULT_APDEX_THRESHOLD_MS: f64 = 500.0;
+/// The largest Apdex threshold accepted: ten minutes.
+pub const MAX_APDEX_THRESHOLD_MS: f64 = 600_000.0;
+
+/// The Apdex threshold to score with, or a 400 naming the bad value.
+fn apdex_threshold(requested: Option<f64>) -> Result<f64, Problem> {
+    let threshold = requested.unwrap_or(DEFAULT_APDEX_THRESHOLD_MS);
+    if !threshold.is_finite() || threshold <= 0.0 || threshold > MAX_APDEX_THRESHOLD_MS {
+        return Err(temps_core::error_builder::bad_request()
+            .title("Invalid Apdex threshold")
+            .detail(format!(
+                "apdex_threshold_ms must be greater than 0 and at most {MAX_APDEX_THRESHOLD_MS}, got {threshold}"
+            ))
+            .build());
+    }
+    Ok(threshold)
 }
 
 /// Response for `GET /otel/span-stats`.
@@ -944,6 +968,7 @@ pub async fn query_trace_summaries(
         ("sort_order" = Option<String>, Query, description = "asc | desc (default)"),
         ("limit" = Option<u64>, Query, description = "Page size (default 20, max 100)"),
         ("offset" = Option<u64>, Query, description = "Page offset"),
+        ("apdex_threshold_ms" = Option<f64>, Query, description = "Apdex threshold T in ms (default 500, at most 600000): at or under T satisfies, up to 4T tolerates"),
     ),
     responses(
         (status = 200, description = "Per-operation latency statistics", body = SpanStatsResponse),
@@ -960,6 +985,7 @@ pub async fn query_span_stats(
     Query(params): Query<SpanStatsQueryParams>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, OtelRead);
+    let apdex_threshold_ms = apdex_threshold(params.apdex_threshold_ms)?;
 
     let (start_time, end_time) =
         discovery_window(params.start_time.as_deref(), params.end_time.as_deref());
@@ -1043,6 +1069,7 @@ pub async fn query_span_stats(
             .unwrap_or_default(),
         limit: params.limit,
         offset: params.offset,
+        apdex_threshold_ms: Some(apdex_threshold_ms),
     };
 
     // The count ignores limit/offset but must keep every other filter, or the
@@ -2198,6 +2225,25 @@ mod tests {
     use super::*;
 
     use crate::services::cross_project::{AnnotatedSpan, ProjectRef};
+
+    #[test]
+    fn apdex_threshold_defaults_to_half_a_second_and_rejects_nonsense() {
+        assert_eq!(apdex_threshold(None).unwrap(), DEFAULT_APDEX_THRESHOLD_MS);
+        assert_eq!(apdex_threshold(Some(250.0)).unwrap(), 250.0);
+        assert_eq!(
+            apdex_threshold(Some(MAX_APDEX_THRESHOLD_MS)).unwrap(),
+            MAX_APDEX_THRESHOLD_MS
+        );
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY, MAX_APDEX_THRESHOLD_MS + 1.0] {
+            let problem = apdex_threshold(Some(bad)).expect_err("rejected");
+            assert_eq!(problem.status_code, axum::http::StatusCode::BAD_REQUEST);
+            let detail = problem.body.get("detail").and_then(|d| d.as_str());
+            assert!(
+                detail.is_some_and(|d| d.contains("apdex_threshold_ms")),
+                "detail names the parameter: {detail:?}"
+            );
+        }
+    }
     use crate::types::{SpanKind, SpanRecord, SpanStatusCode};
     use std::collections::{BTreeMap, HashSet};
 
