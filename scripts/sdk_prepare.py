@@ -553,9 +553,21 @@ def set_lockfile_versions(edits, package, version, root, dependents=()):
         if directory == root or not lock.exists():
             return  # A standalone package's own lockfile does not record its version.
         workspace = (root / package['path']).relative_to(directory).as_posix()
-        edits.replace(lock.relative_to(root).as_posix(),
+        path = lock.relative_to(root).as_posix()
+        edits.replace(path,
                       rf'("{re.escape(workspace)}": \{{\s*"name": "{re.escape(name)}",\s*"version": "){re.escape(old)}(")',
                       rf'\g<1>{version}\g<2>', what=f'workspace entry for {name} {old}')
+        # A dependent's explicit range (`workspace:^0.0.6`) is recorded in its own entry
+        # too; keep it equal to the repinned package.json, as a fresh `bun install` writes.
+        for dependent in dependents:
+            try:
+                key = (root / dependent['path']).relative_to(directory).as_posix()
+            except ValueError:
+                continue  # Another lockfile's workspace.
+            entry = re.compile(rf'^(    "{re.escape(key)}": \{{\n)(.*?)(^    \}},)', re.M | re.S)
+            edits.files[path] = entry.sub(lambda match: match[1] + re.sub(
+                rf'("{re.escape(name)}": "workspace:[\^~]?)\d[^"]*(")', rf'\g<1>{version}\g<2>', match[2]) + match[3],
+                edits.text(path))
     elif kind == 'pypi':
         for lock in [f"{p['path']}/uv.lock" for p in [package, *dependents]]:
             if (root / lock).exists():

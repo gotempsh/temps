@@ -567,10 +567,14 @@ class PrepareTests(unittest.TestCase):
         return release.manifest(self.catalog[key], self.root)['version']
 
     def write_bun_lock(self):
-        entries = ''.join(
-            f'    "{p["path"].removeprefix("sdks/node/")}": {{\n      "name": "{p["name"]}",\n'
-            f'      "version": "{self.version(key)}",\n    }},\n'
-            for key, p in sorted(self.catalog.items()) if p['kind'] == 'npm')
+        """The workspaces section as bun writes it, dependency ranges included."""
+        def entry(key, package):
+            data = release.manifest(package, self.root)
+            deps = ''.join(f'        "{dep}": "{spec}",\n' for dep, spec in data.get('dependencies', {}).items())
+            return (f'    "{package["path"].removeprefix("sdks/node/")}": {{\n      "name": "{package["name"]}",\n'
+                    f'      "version": "{data["version"]}",\n'
+                    + (f'      "dependencies": {{\n{deps}      }},\n' if deps else '') + '    },\n')
+        entries = ''.join(entry(key, p) for key, p in sorted(self.catalog.items()) if p['kind'] == 'npm')
         self.write('sdks/node/bun.lock', '{\n  "lockfileVersion": 1,\n  "workspaces": {\n' + entries + '  },\n}\n')
 
     def write_cargo_lock(self):
@@ -862,6 +866,7 @@ class PrepareTests(unittest.TestCase):
             data = json.loads(self.read(path))
             data['dependencies'] = {'@temps-sdk/analytics-core': requirement}
             self.write(path, json.dumps(data, indent=2) + '\n')
+        self.write_bun_lock()
         for key in ('analytics-core', 'react-analytics', 'vue-analytics'):
             self.release_tag(key, self.version(key))
         self.change('analytics-core', 'fix: event')
@@ -870,6 +875,13 @@ class PrepareTests(unittest.TestCase):
         vue = json.loads(self.read('sdks/node/packages/vue-analytics/package.json'))
         self.assertEqual(react['dependencies'], {'@temps-sdk/analytics-core': 'workspace:^0.0.7'})
         self.assertEqual(vue['dependencies'], {'@temps-sdk/analytics-core': 'workspace:*'})
+        # bun.lock records each dependent's range; it stays equal to the manifest, as
+        # a fresh `bun install` would write it, and the new versions are recorded.
+        before = self.read('sdks/node/bun.lock')
+        self.write_bun_lock()
+        self.assertEqual(self.read('sdks/node/bun.lock'), before)
+        self.assertIn('"@temps-sdk/analytics-core": "workspace:^0.0.7",', before)
+        self.assertNotIn('workspace:^0.0.6', before)
 
     def test_go_version_qualified_replace_applies_only_to_its_version(self):
         self.add('go-core', 'go', '1.0.0', published={'1.0.0'})
