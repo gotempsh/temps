@@ -268,13 +268,13 @@ async fn probe_http(
         Err(error) if error.is_connect() => {
             return ProbeOutcome::down(
                 Some(started.elapsed()),
-                format!("could not connect: {}", error_chain(&error)),
+                format!("could not connect: {}", http_error(error)),
             )
         }
         Err(error) => {
             return ProbeOutcome::down(
                 Some(started.elapsed()),
-                format!("request failed: {}", error_chain(&error)),
+                format!("request failed: {}", http_error(error)),
             )
         }
     };
@@ -297,7 +297,7 @@ async fn probe_http(
                         Some(started.elapsed()),
                         format!(
                             "HTTP {status}, but reading the body failed: {}",
-                            error_chain(&error)
+                            http_error(error)
                         ),
                     )
                 }
@@ -308,6 +308,12 @@ async fn probe_http(
         None
     };
     judge_http(check, status, body.as_deref(), elapsed)
+}
+
+/// An HTTP failure without its URL: a monitor's URL may carry a token in
+/// its query, and this message is saved in the check history and logged.
+fn http_error(error: reqwest::Error) -> String {
+    error_chain(&error.without_url())
 }
 
 fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
@@ -808,6 +814,24 @@ mod tests {
             judge_dns(&any, "example.com", &answers, FAST).status,
             ProbeStatus::Operational
         );
+    }
+
+    #[tokio::test]
+    async fn http_failures_never_repeat_the_url_and_its_token() {
+        // A real connection failure, which reqwest reports with the URL.
+        let error = reqwest::Client::new()
+            .get("http://127.0.0.1:9/health?token=synthetic-secret")
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .expect_err("nothing listens on the discard port");
+        assert!(
+            error_chain(&error).contains("synthetic-secret"),
+            "the raw error carries the URL"
+        );
+        let message = http_error(error);
+        assert!(!message.contains("synthetic-secret"), "{message}");
+        assert!(!message.contains("127.0.0.1:9/health"), "{message}");
     }
 
     #[test]
