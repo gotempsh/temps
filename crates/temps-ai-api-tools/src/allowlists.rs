@@ -284,7 +284,7 @@ pub const AI_READ_ALLOWLIST: &[&str] = &[
     "get_funnel_metrics",
     "list_funnels",
     "get_unique_events",
-    // Conversion goals (ADR 071 D2): definitions the user wrote and
+    // Conversion goals (ADR 109 D2): definitions the user wrote and
     // aggregate counts per goal or per dimension value.
     "list_analytics_goals",
     "get_analytics_goal",

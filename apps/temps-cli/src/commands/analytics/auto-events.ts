@@ -3,7 +3,7 @@
 
 /**
  * `temps analytics outbound | downloads | not-found`: the events the tracker
- * records by itself (ADR 071 D1).
+ * records by itself (ADR 109 D1).
  *
  * - `outbound` and `downloads` rank the `url` property of the `outbound_click`
  *   and `file_download` events through `GET /analytics/event-properties`.

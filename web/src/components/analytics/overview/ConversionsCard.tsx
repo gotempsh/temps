@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 /**
- * Conversions on the analytics overview (ADR 071 D2).
+ * Conversions on the analytics overview (ADR 109 D2).
  *
  * Lists every conversion goal with its conversions, conversion rate and
  * revenue in the selected period. Selecting one shows which sources, pages,

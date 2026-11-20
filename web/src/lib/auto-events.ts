@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 /**
- * Data helpers for the events the tracker records by itself (ADR 071 D1):
+ * Data helpers for the events the tracker records by itself (ADR 109 D1):
  * outbound link clicks, file downloads and "not found" pages.
  *
  * Outbound links and downloads are ordinary events ranked by one of their

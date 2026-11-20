@@ -3427,7 +3427,7 @@ pub(crate) mod tests {
     }
 
     /// ClickHouse stores a missing `Referer` as `''`; it must group as null,
-    /// exactly as on TimescaleDB, for the not-found report (ADR 071 D1).
+    /// exactly as on TimescaleDB, for the not-found report (ADR 109 D1).
     #[test]
     fn traffic_query_groups_by_referrer_with_empty_values_as_null() {
         let request = TrafficAggregationRequest {

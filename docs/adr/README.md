@@ -126,6 +126,7 @@ the number of the ADR they belong to; they do not take a number of their own.
 | [105](./105-sandbox-internal-access.md) | A sandbox can call a project's internal address when that project allows it | Proposed | amends [101](./101-internal-access-grants.md) |
 | [106](./106-durable-workflows.md) | Durable workflows orchestrated by Temps | Proposed |  |
 | [107](./107-control-plane-tunnel-connectors.md) | The control plane runs tunnel connectors for the apps it serves | Proposed | amends [058](./058-ingress-modes-and-a-shared-app-domain.md) |
+| [109](./109-web-analytics-gaps-against-plausible.md) | What web analytics is missing to match Plausible | Proposed |  |
 
 ## Supporting documents
 

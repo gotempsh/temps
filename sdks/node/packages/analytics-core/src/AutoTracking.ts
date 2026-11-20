@@ -3,7 +3,7 @@
 
 /**
  * Events the tracker emits without any code from the site owner beyond
- * installing it (ADR 071 D1): clicks on links to other sites, clicks on file
+ * installing it (ADR 109 D1): clicks on links to other sites, clicks on file
  * downloads, and pages the site marks as "not found".
  *
  * They are ordinary events. They show up in the event list and event detail

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 /**
- * `temps analytics conversions ...`: conversion goals (ADR 071 D2).
+ * `temps analytics conversions ...`: conversion goals (ADR 109 D2).
  *
  * A conversion is an event (`--event signup`, optionally `--property plan=pro`)
  * or a page view (`--page /thank-you`, `*` as a wildcard). It applies to

@@ -1,10 +1,10 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Request, response and error types of conversion goals (ADR 071 D2).
+//! Request, response and error types of conversion goals (ADR 109 D2).
 //!
 //! These shapes are deliberately flat: a goal is `kind` plus the fields that
-//! kind uses, so other features (ADR 072 experiments) can store a goal id and
+//! kind uses, so other features (ADR 110 experiments) can store a goal id and
 //! read [`AnalyticsGoal`] without learning a tagged union.
 
 use chrono::{DateTime, Utc};

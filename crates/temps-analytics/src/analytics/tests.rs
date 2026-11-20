@@ -3250,6 +3250,7 @@ async fn test_get_page_path_visitors_flags_see_the_whole_session_within_its_life
 
     cleanup_test_analytics!(db);
     Ok(())
+}
 
 #[tokio::test]
 async fn test_get_event_properties_ranks_values_and_skips_crawlers() -> anyhow::Result<()> {

@@ -45,7 +45,7 @@ function readDataset(): AnalyticsOptions {
   if (ds.heartbeatInterval) opts.heartbeatInterval = Number(ds.heartbeatInterval);
   if (ds.inactivityTimeout) opts.inactivityTimeout = Number(ds.inactivityTimeout);
   if (ds.engagementThreshold) opts.engagementThreshold = Number(ds.engagementThreshold);
-  // Outbound links, file downloads and 404 markers (ADR 071 D1), on by default.
+  // Outbound links, file downloads and 404 markers (ADR 109 D1), on by default.
   if (ds.autoTrackOutboundLinks) opts.autoTrackOutboundLinks = ds.autoTrackOutboundLinks === "true";
   if (ds.autoTrackFileDownloads) opts.autoTrackFileDownloads = ds.autoTrackFileDownloads === "true";
   if (ds.fileDownloadExtensions) {

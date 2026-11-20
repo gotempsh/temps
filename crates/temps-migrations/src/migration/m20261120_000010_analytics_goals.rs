@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Conversion goals (ADR 071 D2): `analytics_goals`.
+//! Conversion goals (ADR 109 D2): `analytics_goals`.
 //!
 //! A goal is a named, per-project rule that says which events count as a
 //! conversion: either an event (name plus optional filters, the same filter

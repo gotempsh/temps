@@ -1,4 +1,4 @@
-# ADR 071: What web analytics is missing to match Plausible
+# ADR 109: What web analytics is missing to match Plausible
 
 ## Status
 
@@ -6,13 +6,13 @@ Proposed — 2026-11-19. D1 and D2 are implemented; what they settled is
 recorded under "Settled while implementing D1" and "... D2". D3 to D9 are
 not started.
 
-Related: ADR 012 (ClickHouse analytics backend), ADR 040 (analytics ingest
-keys), ADR 072 (product analytics gaps against PostHog; D2 here is the goal
+Related: ADR 012 (ClickHouse analytics backend), ADR 076 (analytics ingest
+keys), ADR 110 (product analytics gaps against PostHog; D2 here is the goal
 metric its experiments use, and the user id of D4 is what its cohorts and
 flag targeting key on).
 
-This is one of four gap ADRs (071 Plausible, 072 PostHog, 073 Better Stack,
-074 Sentry). Each one records what a comparable product offers that Temps does
+This is one of four gap ADRs (109 Plausible, 110 PostHog, 108 Better Stack,
+111 Sentry). Each one records what a comparable product offers that Temps does
 not, ranked from most to least important. The target is 90% of what a typical
 user of that product relies on, not feature-for-feature parity.
 
@@ -159,7 +159,7 @@ main selling point is that it does not.
 
 **Consequences the UI must state.** In cookieless mode a returning visitor is
 a new visitor the next day. Multi-day profiles of anonymous visitors,
-"returning visitors" and the retention insight of ADR 072 do not work, and
+"returning visitors" and the retention insight of ADR 110 do not work, and
 unique-visitor counts over a period are sums of daily uniques. Visitors who
 sign in and are identified (D4) are the exception: their user id joins their
 days together. The settings page says so next to the switch; the affected
@@ -188,7 +188,7 @@ Plausible rather than equal to it.
   sealed cookie, or the id the browser SDK forwards in a header) and calls
   enrichment with the injected deployment token. The developer passes the
   request and the user; nothing else. The same helper follows in other
-  languages as analytics SDKs appear (ADR 072 D9).
+  languages as analytics SDKs appear (ADR 110 D9).
 - **Fix or remove `getVisitorId()`.** Either the SDK exports it or the
   documentation stops showing it. With the two calls above, few apps need it.
 - **A user id on the visitor.** An indexed `user_id` column next to
@@ -330,7 +330,7 @@ they come last.
   `revenue_currency`. `AnalyticsGoalService::stats(project_id, start, end,
   environment_id)` returns per goal `unique_conversions`,
   `total_conversions`, `conversion_rate` and an optional revenue total and
-  average. ADR 072 experiments can store a goal id and call that.
+  average. ADR 110 experiments can store a goal id and call that.
 - **Matching.** Read time, never on the ingest path, so a new goal covers
   history and costs nothing per event. An event goal matches
   `COALESCE(event_name, event_type)`, as funnel steps do. A page goal

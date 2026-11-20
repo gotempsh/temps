@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 /**
- * Overview cards for the events the tracker records by itself (ADR 071 D1):
+ * Overview cards for the events the tracker records by itself (ADR 109 D1):
  * outbound link clicks, file downloads and pages visitors could not find.
  *
  * Each card renders whether or not there is data. An empty card says what it

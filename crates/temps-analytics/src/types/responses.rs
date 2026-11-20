@@ -938,7 +938,7 @@ pub struct EventBrowserStats {
 
 /// One event broken down by one of its custom properties, most frequent
 /// value first. Used for the outbound-link and file-download reports
-/// (ADR 071 D1), and for any `trackEvent()` property.
+/// (ADR 109 D1), and for any `trackEvent()` property.
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct EventPropertiesResponse {
     /// The event that was broken down

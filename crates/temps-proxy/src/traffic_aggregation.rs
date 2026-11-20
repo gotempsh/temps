@@ -51,7 +51,7 @@ pub enum TrafficDimension {
     CacheStatus,
     /// The `Referer` the request arrived with, as sent (full URL). Grouping
     /// by it answers "which page links here", e.g. for the not-found report
-    /// (ADR 071 D1). Empty referrers group as null.
+    /// (ADR 109 D1). Empty referrers group as null.
     Referrer,
 }
 

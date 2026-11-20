@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Conversion goals (ADR 071 D2): definitions and the reports built on them.
+//! Conversion goals (ADR 109 D2): definitions and the reports built on them.
 //!
 //! Goals are matched at query time, never on the ingest path, so they apply
 //! to history as soon as they are saved and cost nothing per event.
@@ -578,7 +578,7 @@ impl AnalyticsGoalService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use temps_database::test_utils::TestDatabase;
+    use temps_test_utils::TestDatabase;
     use temps_entities::{environments, events, projects, upstream_config::UpstreamList, visitor};
 
     fn event_input(name: &str, event_name: &str) -> AnalyticsGoalInput {

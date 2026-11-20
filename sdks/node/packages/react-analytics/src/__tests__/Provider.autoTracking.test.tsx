@@ -18,7 +18,7 @@ function sentEventNames(): string[] {
   return [...fromFetch, ...fromBeacon];
 }
 
-describe("TempsAnalyticsProvider auto-tracking (ADR 071 D1)", () => {
+describe("TempsAnalyticsProvider auto-tracking (ADR 109 D1)", () => {
   beforeEach(() => {
     window.location = {
       ...window.location,

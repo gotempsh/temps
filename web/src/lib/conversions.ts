@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 /**
- * Conversions (ADR 071 D2): the console's name for `analytics_goals`.
+ * Conversions (ADR 109 D2): the console's name for `analytics_goals`.
  *
  * A conversion is an event (by name, optionally narrowed by one custom
  * property) or a page view (by path, `*` as a wildcard). The form below edits

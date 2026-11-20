@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Conversion goals (ADR 071 D2). Called "Conversions" in the console.
+//! Conversion goals (ADR 109 D2). Called "Conversions" in the console.
 
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};

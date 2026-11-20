@@ -2253,7 +2253,7 @@ pub async fn get_event_entries(
 ///
 /// Ranks the values of one top-level key of an event's custom properties,
 /// e.g. the `url` of `outbound_click` or the `extension` of `file_download`
-/// (ADR 071 D1). Crawler traffic is excluded. A value is null when the event
+/// (ADR 109 D1). Crawler traffic is excluded. A value is null when the event
 /// was sent without that property.
 #[utoipa::path(
     tag = "Analytics",

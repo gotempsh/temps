@@ -75,7 +75,7 @@ export function TempsAnalyticsProvider({
     [trackEvent]
   );
 
-  // Looks for the `data-temps-404` marker after each page view (ADR 071 D1).
+  // Looks for the `data-temps-404` marker after each page view (ADR 109 D1).
   const notFoundWatcher = useMemo(
     () =>
       enabled && autoTrackNotFound
@@ -193,7 +193,7 @@ export function TempsAnalyticsProvider({
     return () => document.removeEventListener("click", onClick);
   }, [enabled, trackEvent]);
 
-  // Outbound links and file downloads: one delegated listener (ADR 071 D1).
+  // Outbound links and file downloads: one delegated listener (ADR 109 D1).
   // Beacon transport, because the click usually navigates away.
   const fileDownloadExtensionsKey = fileDownloadExtensions?.join(",");
   useEffect(() => {

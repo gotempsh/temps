@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! HTTP surface of conversion goals (ADR 071 D2), under
+//! HTTP surface of conversion goals (ADR 109 D2), under
 //! `/projects/{project_id}/analytics/goals`.
 
 use std::sync::Arc;
@@ -13,7 +13,7 @@ use axum::{
     Extension, Json, Router,
 };
 use serde::Serialize;
-use temps_auth::{
+use temps_authz::{
     deny_deployment_token, permission_guard, project_access_guard, project_scope_guard, RequireAuth,
 };
 use temps_core::{
@@ -121,8 +121,8 @@ impl AuditOperation for AnalyticsGoalAudit {
     fn user_agent(&self) -> &str {
         &self.user_agent
     }
-    fn serialize(&self) -> anyhow::Result<String> {
-        Ok(serde_json::to_string(self)?)
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 

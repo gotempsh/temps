@@ -982,7 +982,7 @@ mod tests {
         let _store = make_store();
     }
 
-    /// The not-found report (ADR 071 D1) groups 404s by path and by the page
+    /// The not-found report (ADR 109 D1) groups 404s by path and by the page
     /// that linked to them. An empty `Referer` must group as null so that
     /// "no referrer" can be filtered out rather than ranked as a source.
     #[test]
