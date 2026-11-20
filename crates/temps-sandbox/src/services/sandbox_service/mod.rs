@@ -50,6 +50,7 @@ use crate::services::row_status::{self, Expect};
 use crate::services::snapshot_service::SnapshotService;
 
 mod agent_run;
+mod application_resources;
 mod application_workspace;
 mod create;
 mod data_network;
@@ -398,6 +399,25 @@ const WAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 const MIN_TIMEOUT_SECS: u64 = 60;
 const MAX_TIMEOUT_SECS: u64 = 24 * 60 * 60; // 24 hours
 const DEFAULT_TIMEOUT_SECS: u64 = 60 * 60; // 1 hour
+
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct SandboxResourceHints {
+    /// Configured agent-run defaults bounded by the host. Agent runs are
+    /// exempt from the ceilings on sandbox API requests.
+    pub agent_cpu: f64,
+    pub agent_memory_mb: u64,
+    pub node_id: Option<i32>,
+    pub host_cpu_cores: Option<f64>,
+    pub host_memory_mb: Option<u64>,
+    pub cpu: Option<f64>,
+    pub max_cpu: f64,
+    pub memory_mb: Option<u64>,
+    pub max_memory_mb: u64,
+    pub pids: Option<i64>,
+    pub max_pids: i64,
+    pub timeout_secs: u64,
+    pub max_timeout_secs: u64,
+}
 
 pub struct SandboxService {
     db: Arc<DatabaseConnection>,

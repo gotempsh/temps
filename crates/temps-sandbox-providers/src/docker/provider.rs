@@ -1264,6 +1264,14 @@ impl SandboxProvider for DockerSandboxProvider {
         matches!(backend, super::SandboxBackend::Docker)
     }
 
+    async fn host_capacity(
+        &self,
+        _node_id: Option<i32>,
+        _backend: Option<SandboxBackend>,
+    ) -> Result<Option<crate::SandboxHostCapacity>, AgentError> {
+        self.capacity().await.map(Some)
+    }
+
     fn default_resource_limits(
         &self,
         _backend: Option<super::SandboxBackend>,

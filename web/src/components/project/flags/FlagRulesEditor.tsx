@@ -92,14 +92,16 @@ export function FlagRulesEditor({
   const [error, setError] = useState<string | null>(null)
   // Stays mounted across refetches (saving variants or an environment value
   // refetches the flag), so an open edit survives; this is the row revision
-  // the drafts are based on.
+  // the drafts are based on. A closed editor compares its drafts too: after
+  // "Discard and reload" they hold the rules from before the refetch, and
+  // must be replaced by the fetched ones rather than carried forward under
+  // the new revision.
   const baseRevision = useDraftBaseline(
     override?.updated_at ?? null,
     stored,
     (rules) =>
-      editing &&
       rulesKey(drafts) !==
-        rulesKey(rules.map((rule) => toDraft(rule, valueType))),
+      rulesKey(rules.map((rule) => toDraft(rule, valueType))),
     (rules) => setDrafts(rules.map((rule) => toDraft(rule, valueType)))
   )
 
@@ -181,7 +183,11 @@ export function FlagRulesEditor({
             type="button"
             size="sm"
             variant="ghost"
-            onClick={() => setEditing(true)}
+            onClick={() => {
+              // Always start from what is stored now.
+              setDrafts(stored.map((rule) => toDraft(rule, valueType)))
+              setEditing(true)
+            }}
           >
             {stored.length === 0 ? 'Add rules' : 'Edit rules'}
           </Button>

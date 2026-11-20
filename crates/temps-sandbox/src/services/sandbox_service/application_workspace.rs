@@ -22,8 +22,8 @@ pub struct ApplicationWorkspaceSandbox {
 pub struct ApplicationWorkspaceConfig {
     pub desired_state: String,
     pub image: Option<String>,
-    pub cpu_limit: f64,
-    pub memory_limit_mb: u64,
+    pub cpu_limit: Option<f64>,
+    pub memory_limit_mb: Option<u64>,
     pub pids_limit: i64,
     pub disk_limit_mb: u64,
     pub idle_timeout_secs: u64,
@@ -99,8 +99,8 @@ impl Default for ApplicationWorkspaceConfig {
             // treat that healthy row as configuration-mismatched and rebuild
             // the shared workspace container on every new chat.
             image: managed_application_workspace_image("node").map(str::to_string),
-            cpu_limit: 4.0,
-            memory_limit_mb: 8192,
+            cpu_limit: None,
+            memory_limit_mb: None,
             pids_limit: 512,
             disk_limit_mb: 10_240,
             idle_timeout_secs: 900,
@@ -115,8 +115,11 @@ impl From<&ai_application_workspaces::Model> for ApplicationWorkspaceConfig {
             image: value.image.clone().or_else(|| {
                 managed_application_workspace_image(&value.runtime).map(str::to_string)
             }),
-            cpu_limit: value.cpu_limit,
-            memory_limit_mb: value.memory_limit_mb.max(0) as u64,
+            cpu_limit: (value.cpu_limit_explicit || value.cpu_limit != Self::DEFAULT_CPU)
+                .then_some(value.cpu_limit),
+            memory_limit_mb: (value.memory_limit_explicit
+                || value.memory_limit_mb != Self::DEFAULT_MEMORY_MB as i64)
+                .then_some(value.memory_limit_mb.max(0) as u64),
             pids_limit: value.pids_limit,
             disk_limit_mb: value.disk_limit_mb.max(0) as u64,
             idle_timeout_secs: value.idle_timeout_secs.max(0) as u64,
@@ -413,8 +416,8 @@ impl SandboxService {
                         lifecycle: Some("workspace".to_string()),
                         project_id,
                         image: config.image,
-                        cpu_limit: Some(config.cpu_limit),
-                        memory_limit_mb: Some(config.memory_limit_mb),
+                        cpu_limit: config.cpu_limit,
+                        memory_limit_mb: config.memory_limit_mb,
                         pids_limit: Some(config.pids_limit),
                         disk_size_mb: Some(config.disk_limit_mb),
                         host_work_dir_override: Some(host_work_dir),
@@ -556,10 +559,17 @@ impl SandboxService {
             .map_err(|error| from_agent_error(sandbox_public_id, error))?;
         let mut previous_config = ApplicationWorkspaceConfig::from(&app_workspace);
         previous_config.image = Some(immutable_old_image);
-        let previous =
+        let mut previous =
             application_sandbox_create_config(&row, host_work_dir.clone(), &previous_config)?;
         let mut replacement =
             application_sandbox_create_config(&row, host_work_dir.clone(), &config)?;
+
+        self.apply_application_limits(&mut previous)
+            .await
+            .map_err(|e| from_agent_error(sandbox_public_id, e))?;
+        self.apply_application_limits(&mut replacement)
+            .await
+            .map_err(|e| from_agent_error(sandbox_public_id, e))?;
 
         let probe_id = hex::encode(rand::random::<[u8; 12]>());
         let probe_dir = std::env::temp_dir().join(format!("temps-runtime-probe-{probe_id}"));
@@ -572,7 +582,8 @@ impl SandboxService {
                     probe_dir.display()
                 ),
             })?;
-        let mut probe = application_sandbox_create_config(&row, probe_dir.clone(), &config)?;
+        let mut probe = replacement.clone();
+        probe.host_work_dir = probe_dir.clone();
         probe.container_name_override = Some(format!("runtime-probe-{probe_id}"));
         probe.workspace_volume = None;
         probe.network_mode = Some("none".to_string());
@@ -619,7 +630,12 @@ impl SandboxService {
         replacement.image = Some(candidate_identity);
         let handle = match self
             .registry
-            .replace_with_rollback(row.id, sandbox_public_id, replacement, previous)
+            .replace_with_rollback(
+                row.id,
+                sandbox_public_id,
+                replacement.clone(),
+                previous.clone(),
+            )
             .await
         {
             Ok(handle) => handle,
@@ -644,10 +660,8 @@ impl SandboxService {
             actual_compatibility,
             Ok(temps_sandbox_providers::RuntimeCompatibility::Compatible)
         ) {
-            let restore =
-                application_sandbox_create_config(&row, host_work_dir.clone(), &previous_config)?;
-            let mut retry =
-                application_sandbox_create_config(&row, host_work_dir.clone(), &config)?;
+            let restore = previous;
+            let mut retry = replacement;
             retry.image = Some(handle.image.clone());
             self.registry
                 .replace_with_rollback(row.id, sandbox_public_id, restore, retry)
@@ -665,10 +679,8 @@ impl SandboxService {
             .configure_application_data_network_locked(&row, authorized_project_ids)
             .await
         {
-            let restore =
-                application_sandbox_create_config(&row, host_work_dir.clone(), &previous_config)?;
-            let mut retry =
-                application_sandbox_create_config(&row, host_work_dir.clone(), &config)?;
+            let restore = previous;
+            let mut retry = replacement;
             retry.image = Some(handle.image.clone());
             self.registry.replace_with_rollback(row.id, sandbox_public_id, restore, retry).await
                 .map_err(|rollback_error| SandboxError::CreateFailed {
@@ -727,14 +739,7 @@ impl SandboxService {
                 });
             }
             Err(PersistError::Db(db_error)) => {
-                let restore = application_sandbox_create_config(
-                    &row,
-                    host_work_dir.clone(),
-                    &previous_config,
-                )?;
-                let replacement_for_rollback =
-                    application_sandbox_create_config(&row, host_work_dir, &config)?;
-                self.registry.replace_with_rollback(row.id, sandbox_public_id, restore, replacement_for_rollback).await
+                self.registry.replace_with_rollback(row.id, sandbox_public_id, previous, replacement).await
                     .map_err(|rollback_error| SandboxError::CreateFailed {
                         user_id,
                         reason: format!("runtime update for sandbox {sandbox_public_id} could not save image {image}: {db_error}; rollback failed: {rollback_error}"),
@@ -772,9 +777,12 @@ impl SandboxService {
     ) -> Result<SandboxSummary, SandboxError> {
         let row = self.find_by_public_id(sandbox_public_id, user_id).await?;
         ensure_not_agent_run(&row)?;
-        self.jobs.abort_all(row.id).await;
-        let create_config =
+        let mut create_config =
             application_sandbox_create_config(&row, host_work_dir.clone(), &config)?;
+        self.apply_application_limits(&mut create_config)
+            .await
+            .map_err(|e| from_agent_error(sandbox_public_id, e))?;
+        self.jobs.abort_all(row.id).await;
         let handle = self
             .registry
             .rebuild(row.id, sandbox_public_id, create_config)
@@ -813,6 +821,11 @@ impl SandboxService {
         let _workspace_mutation = self.lock_application_workspace(key).await;
         let row = self.find_by_public_id(sandbox_public_id, user_id).await?;
         ensure_not_agent_run(&row)?;
+        let mut create_config =
+            application_sandbox_create_config(&row, host_work_dir.clone(), &config)?;
+        self.apply_application_limits(&mut create_config)
+            .await
+            .map_err(|e| from_agent_error(sandbox_public_id, e))?;
         self.jobs.abort_all(row.id).await;
         let backup = host_work_dir
             .with_extension(format!("restore-backup-{}", Utc::now().timestamp_micros()));
@@ -829,8 +842,6 @@ impl SandboxService {
                 reason: format!("create empty workspace restore target: {source}"),
             });
         }
-        let create_config =
-            application_sandbox_create_config(&row, host_work_dir.clone(), &config)?;
         let restored = self
             .registry
             .restore(row.id, sandbox_public_id, artifact, create_config)
@@ -1004,23 +1015,40 @@ fn application_sandbox_create_config(
                 row.public_id
             ),
         })?;
-    Ok(SandboxCreateConfig {
-        node_id: None,
-        owner_user_id: None,
-        run_id: row.id,
-        container_name_override: Some(container_label_for(&row.public_id).to_string()),
+    Ok(config.compute_config(
+        row.id,
+        Some(container_label_for(&row.public_id).to_owned()),
         host_work_dir,
-        workspace_volume: None,
-        image: config.image.clone(),
-        cpu_limit: Some(config.cpu_limit),
-        memory_limit_mb: Some(config.memory_limit_mb),
-        pids_limit: Some(config.pids_limit),
-        disk_size_mb: Some(config.disk_limit_mb),
-        allow_docker: false,
-        egress_policy: Default::default(),
-        network_mode: None,
-        env_vars: HashMap::new(),
-        idle_timeout: Duration::from_secs(config.idle_timeout_secs),
         backend,
-    })
+    ))
+}
+
+impl ApplicationWorkspaceConfig {
+    pub(super) fn compute_config(
+        &self,
+        run_id: i32,
+        name: Option<String>,
+        host_work_dir: PathBuf,
+        backend: Option<temps_sandbox_providers::SandboxBackend>,
+    ) -> SandboxCreateConfig {
+        SandboxCreateConfig {
+            node_id: None,
+            owner_user_id: None,
+            run_id,
+            container_name_override: name,
+            host_work_dir,
+            workspace_volume: None,
+            image: self.image.clone(),
+            cpu_limit: self.cpu_limit,
+            memory_limit_mb: self.memory_limit_mb,
+            pids_limit: Some(self.pids_limit),
+            disk_size_mb: Some(self.disk_limit_mb),
+            allow_docker: false,
+            egress_policy: Default::default(),
+            network_mode: None,
+            env_vars: HashMap::new(),
+            idle_timeout: Duration::from_secs(self.idle_timeout_secs),
+            backend,
+        }
+    }
 }
