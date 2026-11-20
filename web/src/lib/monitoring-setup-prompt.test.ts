@@ -103,6 +103,49 @@ test('session replay prompt uses the camelCase batch fields and requires privacy
   expect(prompt).toContain('rr-block')
 })
 
+test('an environment-scoped OTLP prompt never suggests the generic endpoint', () => {
+  const projectScoped = signalFixture('traces')
+  // With an environment the server sends no base and path-based URLs.
+  const environmentScoped = {
+    ...projectScoped,
+    endpoints: [
+      {
+        ...projectScoped.endpoints[0],
+        url: 'https://temps.example.com/api/otel/v1/42/7/0/traces',
+      },
+    ],
+    auth: {
+      ...projectScoped.auth,
+      headers: projectScoped.auth.headers.filter(
+        (h) => h.name !== 'X-Temps-Project-Id'
+      ),
+    },
+    otlp_endpoint: null,
+  }
+  const prompt = monitoringSetupPrompt(
+    'traces',
+    project,
+    'https://console.example.com',
+    environmentScoped
+  )
+  expect(prompt).toContain('not OTEL_EXPORTER_OTLP_ENDPOINT')
+  expect(prompt).not.toContain('OTEL_EXPORTER_OTLP_ENDPOINT=')
+  expect(prompt).toContain(
+    'OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=https://temps.example.com/api/otel/v1/42/7/0/traces'
+  )
+
+  // Without an environment the base and its project header are offered.
+  const generic = monitoringSetupPrompt(
+    'traces',
+    project,
+    'https://console.example.com',
+    projectScoped
+  )
+  expect(generic).toContain(
+    'OTEL_EXPORTER_OTLP_ENDPOINT=https://temps.example.com/api/otel'
+  )
+})
+
 test('an unconfigured signal says what is missing first', () => {
   const prompt = monitoringSetupPrompt(
     'errors',

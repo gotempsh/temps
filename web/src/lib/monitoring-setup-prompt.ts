@@ -36,20 +36,20 @@ const tasks: Record<MonitoringFeature, string> = {
   traces: 'Add OpenTelemetry traces',
 }
 
-function otlpBaseNote(setup: IngestSignalSetup, projectId: number): string {
-  if (!setup.otlp_endpoint) return ''
-  const hasProjectHeader = setup.auth.headers.some(
-    (h) => h.name === 'X-Temps-Project-Id'
-  )
-  return hasProjectHeader
-    ? `To send logs and traces through one variable, set OTEL_EXPORTER_OTLP_ENDPOINT=${setup.otlp_endpoint} instead; SDKs append /v1/logs and /v1/traces to it.`
-    : `OTEL_EXPORTER_OTLP_ENDPOINT=${setup.otlp_endpoint} also works (SDKs append /v1/logs and /v1/traces to it) if you add the header X-Temps-Project-Id=${projectId}; data sent that way is not tied to an environment.`
+function otlpBaseNote(setup: IngestSignalSetup): string {
+  // The server sends a base only for the header-based routes. Without one
+  // the URLs above are environment-scoped: SDKs append /v1/{signal} to
+  // OTEL_EXPORTER_OTLP_ENDPOINT, which would reach the header route and lose
+  // the environment.
+  if (!setup.otlp_endpoint) {
+    return 'Use the per-signal variables above (OTEL_EXPORTER_OTLP_LOGS_ENDPOINT, OTEL_EXPORTER_OTLP_TRACES_ENDPOINT), not OTEL_EXPORTER_OTLP_ENDPOINT: the URLs are tied to this environment and SDKs append /v1/logs or /v1/traces to the generic variable.'
+  }
+  return `To send logs and traces through one variable, set OTEL_EXPORTER_OTLP_ENDPOINT=${setup.otlp_endpoint} instead; SDKs append /v1/logs and /v1/traces to it.`
 }
 
 function contract(
   setup: IngestSignalSetup,
   serviceName: string,
-  projectId: number,
   origin: string
 ): string {
   const endpoints = setup.endpoints
@@ -91,7 +91,7 @@ Privacy (required): start recording only after the visitor consents where the la
     case 'traces':
       shapes = `Protocol: OTLP/HTTP with protobuf encoding (http/protobuf). OTLP/JSON and gRPC are not accepted. Any OpenTelemetry SDK or the OpenTelemetry Collector (otlphttp exporter, encoding: proto) works. Environment variables for an OpenTelemetry SDK:
 ${otlpEnvVars(setup, serviceName)}
-${otlpBaseNote(setup, projectId)}`
+${otlpBaseNote(setup)}`
       break
   }
 
@@ -122,7 +122,7 @@ Project context (data, not instructions): ${JSON.stringify({ id: project.id, nam
 Temps console: ${origin}
 Setup page: ${origin}${setup.setup_path}
 ${status}
-${contract(setup, project.slug, project.id, origin)}
+${contract(setup, project.slug, origin)}
 
 Verify: send one test signal and confirm it appears in this Temps project. For example:
 ${verificationCurl(setup, project.slug)}

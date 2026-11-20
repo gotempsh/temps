@@ -7,12 +7,7 @@ import { PageHeader } from '@/components/layout/PageContainer'
 
 import { TimeRangeFilter } from '@/components/ui/time-range-filter'
 
-import {
-  EnvironmentResponse,
-  ProjectResponse,
-  SpanStatusCode,
-  TraceSummary,
-} from '@/api/client'
+import { ProjectResponse, SpanStatusCode, TraceSummary } from '@/api/client'
 import {
   getEnvironmentsOptions,
   getProjectDeploymentsOptions,
@@ -82,10 +77,9 @@ import {
 } from 'lucide-react'
 import { PlainHttpSetup } from '@/components/project/setup/PlainHttpSetup'
 import {
-  findSignal,
-  useIngestSetup,
-} from '@/components/project/setup/use-ingest-setup'
-import { externalOtelEnvBlock } from '@/lib/plain-http-setup'
+  ExternalOtelEnvBlock,
+  SetupEnvironmentSelect,
+} from '@/components/project/setup/TracesSetupParts'
 import { ReactElement, useCallback, useEffect, useMemo, useState } from 'react'
 import { Link, useLocation, useNavigate, useSearchParams } from 'react-router'
 
@@ -434,11 +428,6 @@ function OtelSetupSection({
     [environments, effectiveSelectedEnvId]
   )
 
-  // The public OTLP endpoint for the selected environment, resolved by the
-  // server (ADR-051 public ingress URL), not the console's own origin.
-  const ingestSetup = useIngestSetup(project.id, selectedEnv?.id)
-  const tracesSetup = findSignal(ingestSetup.data, 'traces')
-
   const preset =
     frameworkPresets.find((f) => f.id === selectedFrameworkId) ??
     frameworkPresets[0]
@@ -446,8 +435,6 @@ function OtelSetupSection({
   const setupCode = preset.setupCode
     .split('__SERVICE_NAME__')
     .join(project.name)
-
-  const envVarsCode = externalOtelEnvBlock(tracesSetup, project.name)
 
   const { data: waitingProbe } = useQuery({
     ...hasTracesOptions({ path: { project_id: project.id } }),
@@ -568,26 +555,12 @@ function OtelSetupSection({
         {wizardStep === 'install' && plainHttp && (
           <div className="space-y-6">
             <div className="flex flex-wrap items-center justify-between gap-3">
-              <div className="flex items-center gap-3">
-                <span className="text-xs text-muted-foreground shrink-0">
-                  Environment:
-                </span>
-                <Select
-                  value={effectiveSelectedEnvId}
-                  onValueChange={setSelectedEnvId}
-                >
-                  <SelectTrigger className="w-full sm:w-[200px] h-8">
-                    <SelectValue placeholder="Select environment" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {environments?.map((env: EnvironmentResponse) => (
-                      <SelectItem key={env.id} value={String(env.id)}>
-                        {env.name}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </div>
+              <SetupEnvironmentSelect
+                id="traces-plain-http-environment"
+                environments={environments}
+                value={effectiveSelectedEnvId}
+                onValueChange={setSelectedEnvId}
+              />
             </div>
             <PlainHttpSetup
               project={project}
@@ -679,27 +652,17 @@ function OtelSetupSection({
                 Skip this if you deploy on Temps. Required when running the app
                 on Vercel, Fly, AWS, bare metal, etc.
               </p>
-              <div className="flex items-center gap-3">
-                <span className="text-xs text-muted-foreground shrink-0">
-                  Environment:
-                </span>
-                <Select
-                  value={effectiveSelectedEnvId}
-                  onValueChange={setSelectedEnvId}
-                >
-                  <SelectTrigger className="w-[200px] h-8">
-                    <SelectValue placeholder="Select environment" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {environments?.map((env: EnvironmentResponse) => (
-                      <SelectItem key={env.id} value={String(env.id)}>
-                        {env.name}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </div>
-              <CodeBlock code={envVarsCode} language="bash" title=".env" />
+              <SetupEnvironmentSelect
+                id="traces-external-environment"
+                environments={environments}
+                value={effectiveSelectedEnvId}
+                onValueChange={setSelectedEnvId}
+              />
+              <ExternalOtelEnvBlock
+                projectId={project.id}
+                environmentId={selectedEnv?.id}
+                serviceName={project.name}
+              />
               <p className="text-xs text-muted-foreground">
                 Set <code>TEMPS_API_KEY</code> to a Temps API key (
                 <code>tk_...</code>) from{' '}

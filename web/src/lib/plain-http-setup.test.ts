@@ -200,5 +200,4 @@ test('the external .env block never puts a path-based URL in OTEL_EXPORTER_OTLP_
     'OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=https://temps.example.com/api/otel/v1/42/7/0/traces'
   )
   expect(block).not.toContain('<YOUR_API_KEY>')
-  expect(externalOtelEnvBlock(undefined, 'my-app')).toContain('Loading')
 })

@@ -32,7 +32,8 @@ export function ingestSetupFixture({
     query_param: null,
     browser_safe: false,
     credential_path: '/keys/new',
-    cli_command: 'temps apikeys create --name my-app-telemetry --role user',
+    cli_command:
+      'temps apikeys create --name my-app-telemetry --role custom --permissions otel:write --yes',
   }
   const analyticsReason = configured
     ? null
@@ -126,7 +127,10 @@ export function ingestSetupFixture({
       otlp_endpoint: `${base}/api/otel`,
       configured: true,
       reason: null,
-      setup_path: '/projects/my-app/traces#traces-setup',
+      setup_path:
+        signal === 'logs'
+          ? '/projects/my-app/telemetry-logs'
+          : '/projects/my-app/traces#traces-setup',
     })),
   ]
   return {

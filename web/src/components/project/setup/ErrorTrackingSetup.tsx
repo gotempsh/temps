@@ -849,7 +849,20 @@ ${platform.buildSnippet(platform.dsnExpression)}
           )}
 
           {plainHttp ? (
-            <PlainHttpSetup project={project} signal="errors" />
+            <div className="space-y-4">
+              {/* The examples read $SENTRY_DSN; show the DSN this page
+                  already loaded so they run without another trip. */}
+              {hasDsn && (
+                <CodeBlock
+                  defaultWrap
+                  language="bash"
+                  title=".env"
+                  code={`SENTRY_DSN=${dsn}`}
+                  showCopy
+                />
+              )}
+              <PlainHttpSetup project={project} signal="errors" />
+            </div>
           ) : (
             <>
               <div className="rounded-lg border border-primary/30 bg-primary/5 p-4">

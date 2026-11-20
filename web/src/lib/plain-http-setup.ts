@@ -323,14 +323,12 @@ export function otlpEnvVars(
  * `OTEL_EXPORTER_OTLP_ENDPOINT`, so a path-based URL there would 404.
  */
 export function externalOtelEnvBlock(
-  setup: IngestSignalSetup | undefined,
+  setup: IngestSignalSetup,
   serviceName: string
 ): string {
-  const header = `# Auto-injected on Temps deployments.
-# Set these manually when running on Vercel, Fly, AWS, bare metal, etc.`
-  return setup
-    ? `${header}\n${otlpEnvVars(setup, serviceName)}`
-    : `${header}\n# Loading this service's OTLP endpoint…`
+  return `# Auto-injected on Temps deployments.
+# Set these manually when running on Vercel, Fly, AWS, bare metal, etc.
+${otlpEnvVars(setup, serviceName)}`
 }
 
 /** An OTel Collector `otlphttp` exporter pointed at Temps. */

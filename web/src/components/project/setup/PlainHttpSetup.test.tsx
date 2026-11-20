@@ -3,9 +3,19 @@
 
 import { expect, test } from 'bun:test'
 import { renderToStaticMarkup } from 'react-dom/server'
+import { QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter } from 'react-router'
-import { signalFixture } from '@/lib/ingest-setup.fixture'
-import { PlainHttpSetupView } from './PlainHttpSetup'
+import { ingestSetupFixture, signalFixture } from '@/lib/ingest-setup.fixture'
+import {
+  FAILURE_DETAIL,
+  ingestSetupClient,
+  type IngestSetupCacheState,
+} from './ingest-setup-cache.test-helpers'
+import {
+  CopySetupPromptButton,
+  PlainHttpSetup,
+  PlainHttpSetupView,
+} from './PlainHttpSetup'
 
 const project = { id: 42, name: 'My app', slug: 'my-app' }
 
@@ -73,4 +83,60 @@ test('creating a credential invalidates every environment of the ingest setup', 
   })
   expect(client.getQueryState(scoped)?.isInvalidated).toBe(true)
   expect(client.getQueryState(other)?.isInvalidated).toBe(false)
+})
+
+function renderWithCache(state: IngestSetupCacheState, node: React.ReactNode) {
+  return renderToStaticMarkup(
+    <QueryClientProvider client={ingestSetupClient(state)}>
+      <MemoryRouter>{node}</MemoryRouter>
+    </QueryClientProvider>
+  )
+}
+
+test('every code block in the view wraps instead of scrolling sideways', () => {
+  for (const signal of ['analytics', 'errors', 'logs', 'traces'] as const) {
+    const html = render(signal)
+    expect(html).toContain('whitespace-pre-wrap')
+    // `whitespace-pre` alone is the unwrapped, horizontally scrolling mode.
+    expect(html).not.toMatch(/whitespace-pre(?!-wrap)/)
+  }
+})
+
+test('a failed refresh keeps the loaded setup visible with a Retry', () => {
+  const html = renderWithCache(
+    { kind: 'failed-after-load', data: ingestSetupFixture() },
+    <PlainHttpSetup project={project} signal="traces" />
+  )
+  expect(html).toContain('Could not refresh the ingest endpoints')
+  expect(html).toContain('Retry')
+  expect(html).toContain('https://temps.example.com/api/otel/v1/traces')
+  expect(html).toContain('Copy AI prompt')
+  expect(html).not.toContain('Could not load the ingest endpoints')
+})
+
+test('a failed first load blocks the view with what failed and a Retry', () => {
+  const html = renderWithCache(
+    { kind: 'failed' },
+    <PlainHttpSetup project={project} signal="traces" />
+  )
+  expect(html).toContain('Could not load the ingest endpoints')
+  expect(html).toContain(FAILURE_DETAIL)
+  expect(html).toContain('Retry')
+  expect(html).not.toContain('/api/otel/v1/traces')
+})
+
+test('the prompt button offers a retry when the setup failed to load', () => {
+  const failed = renderWithCache(
+    { kind: 'failed' },
+    <CopySetupPromptButton project={project} signal="logs" />
+  )
+  expect(failed).toContain('Retry prompt')
+  expect(failed).not.toContain('disabled=""')
+
+  const loaded = renderWithCache(
+    { kind: 'loaded', data: ingestSetupFixture() },
+    <CopySetupPromptButton project={project} signal="logs" />
+  )
+  expect(loaded).toContain('Copy AI prompt')
+  expect(loaded).not.toContain('Retry prompt')
 })
