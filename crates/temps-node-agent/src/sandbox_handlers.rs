@@ -275,7 +275,7 @@ fn provider_err(e: AgentError) -> ApiError {
         // sandbox is not reachable here, which the control plane already
         // reads as "gone" from a 404.
         AgentError::SandboxNotRunning { .. } => StatusCode::NOT_FOUND,
-        AgentError::Validation { .. }
+        AgentError::SandboxCpuLimit { .. } | AgentError::Validation { .. }
         | AgentError::ImmutableSandboxImageRebuild { .. }
         | AgentError::SnapshotSizeLimitExceeded { .. } => StatusCode::BAD_REQUEST,
         AgentError::SandboxUnsupportedOnNode { .. } => StatusCode::UNPROCESSABLE_ENTITY,
@@ -566,6 +566,31 @@ pub async fn create_sandbox(
             format!("sandbox '{}': {}", req.label, e),
         )
     })?;
+    let mut cpu_limit = req.cpu_limit;
+    let mut memory_limit_mb = req.memory_limit_mb;
+    if let Some(host) = host
+        .provider
+        .host_capacity(None, req.backend)
+        .await
+        .map_err(provider_err)?
+    {
+        if let Some(cpu) = cpu_limit {
+            cpu_limit = Some(
+                host.cpu_limit(req.run_id, (!req.cpu_is_default).then_some(cpu), cpu)
+                    .map_err(provider_err)?,
+            );
+        }
+        if let Some(memory) = memory_limit_mb {
+            memory_limit_mb = Some(
+                host.memory_limit(
+                    req.run_id,
+                    (!req.memory_is_default).then_some(memory),
+                    memory,
+                )
+                .map_err(provider_err)?,
+            );
+        }
+    }
     let claim = CreateClaim::acquire(&state, &req.label)?;
     let container_name = format!("{}{}", SANDBOX_CONTAINER_PREFIX, req.label);
     let replacing = match host.containers.find(&container_name).await {
@@ -646,8 +671,8 @@ pub async fn create_sandbox(
         host_work_dir: host_work_dir.clone(),
         workspace_volume: None,
         image: req.image,
-        cpu_limit: req.cpu_limit,
-        memory_limit_mb: req.memory_limit_mb,
+        cpu_limit,
+        memory_limit_mb,
         pids_limit: req.pids_limit,
         disk_size_mb: req.disk_size_mb,
         allow_docker: false,
@@ -1637,6 +1662,7 @@ pub async fn release_orphaned_sandbox_resources(
 pub async fn sandbox_status(State(state): HostState) -> ApiResult<RemoteStatusResponse> {
     let Some(SandboxHost { provider, .. }) = state.host.as_ref() else {
         return Ok(Json(RemoteStatusResponse {
+            capacity: None,
             available: false,
             image_ready: false,
             image: String::new(),
@@ -1651,6 +1677,14 @@ pub async fn sandbox_status(State(state): HostState) -> ApiResult<RemoteStatusRe
         }
     };
     Ok(Json(RemoteStatusResponse {
+        capacity: if available {
+            provider
+                .host_capacity(None, None)
+                .await
+                .map_err(provider_err)?
+        } else {
+            None
+        },
         available,
         image_ready,
         image,
@@ -2184,6 +2218,7 @@ mod tests {
     #[derive(Default)]
     struct FakeProvider {
         seen_ids: Mutex<Vec<String>>,
+        created_limits: tokio::sync::Mutex<Vec<(Option<f64>, Option<u64>)>>,
         destroyed: Mutex<Vec<(String, bool)>>,
         /// Labels `release_orphaned_resources` was asked to release.
         released: Mutex<Vec<String>>,
@@ -2221,6 +2256,17 @@ mod tests {
 
     #[async_trait::async_trait]
     impl SandboxProvider for FakeProvider {
+        async fn host_capacity(
+            &self,
+            _: Option<i32>,
+            _: Option<temps_sandbox_providers::SandboxBackend>,
+        ) -> Result<Option<temps_sandbox_providers::SandboxHostCapacity>, AgentError> {
+            Ok(Some(temps_sandbox_providers::SandboxHostCapacity {
+                cpu_cores: 1.0,
+                memory_mb: 1024,
+            }))
+        }
+
         async fn service_access(
             &self,
             handle: &SandboxHandle,
@@ -2238,6 +2284,10 @@ mod tests {
             )
         }
         async fn create(&self, config: SandboxCreateConfig) -> Result<SandboxHandle, AgentError> {
+            self.created_limits
+                .lock()
+                .await
+                .push((config.cpu_limit, config.memory_limit_mb));
             self.create_entered.notify_one();
             if let Some(gate) = &self.create_gate {
                 gate.notified().await;
@@ -2530,10 +2580,34 @@ mod tests {
         })
     }
 
+    #[tokio::test]
+    async fn sandbox_host_capacity_on_worker_distinguishes_defaults_from_overrides() {
+        let node = node();
+        let mut req = create_req("capacity-test");
+        req.cpu_limit = Some(4.0);
+        req.memory_limit_mb = Some(8192);
+        let Err((status, Json(error))) =
+            create_sandbox(State(node.state.clone()), req.clone()).await
+        else {
+            panic!("Worker accepted an explicit request above capacity");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(error.error.contains("0.01 to 1"));
+        req.cpu_is_default = true;
+        req.memory_is_default = true;
+        assert!(create_sandbox(State(node.state.clone()), req).await.is_ok());
+        assert_eq!(
+            *node.provider.created_limits.lock().await,
+            vec![(Some(1.0), Some(1024))]
+        );
+    }
+
     fn create_req(label: &str) -> Json<RemoteCreateRequest> {
         Json(RemoteCreateRequest {
             run_id: 1,
             label: label.into(),
+            cpu_is_default: false,
+            memory_is_default: false,
             image: None,
             cpu_limit: None,
             memory_limit_mb: None,

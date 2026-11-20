@@ -157,8 +157,14 @@ export function ApplicationWorkspaceSettingsPanel({
         path: { application_public_id: applicationPublicId },
         body: {
           runtime: form.runtime,
-          cpu_limit: Number(form.cpu_limit),
-          memory_limit_mb: Number(form.memory_limit_mb),
+          cpu_limit:
+            Number(form.cpu_limit) === workspace?.cpu_limit
+              ? undefined
+              : Number(form.cpu_limit),
+          memory_limit_mb:
+            Number(form.memory_limit_mb) === workspace?.memory_limit_mb
+              ? undefined
+              : Number(form.memory_limit_mb),
           pids_limit: Number(form.pids_limit),
           disk_limit_mb: Number(form.disk_limit_mb),
           idle_timeout_secs: Number(form.idle_timeout_secs),

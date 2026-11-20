@@ -136,6 +136,37 @@ test('an invalid value is reported and nothing is sent', async () => {
   api.restore()
 })
 
+test('shows the selected host limits and rejects an oversize override before creating', async () => {
+  const api = mockApi({
+    'GET /v1/sandboxes/placement': () => jsonResponse(PLACEMENT),
+    'GET /v1/sandboxes/resource-defaults': () =>
+      jsonResponse({
+        cpu: 2,
+        host_cpu_cores: 2,
+        max_cpu: 2,
+        memory_mb: 1024,
+        host_memory_mb: 2048,
+        max_memory_mb: 1536,
+        pids: 512,
+        max_pids: 1024,
+        timeout_secs: 3600,
+        max_timeout_secs: 86400,
+      }),
+  })
+  const view = renderSheet()
+  const cpu = await view.findByPlaceholderText(
+    'Default: 2 cores (host has 2) · Max: 2 cores'
+  )
+  view.getByPlaceholderText('Default: 1024 MB (host has 2048) · Max: 1536 MB')
+  view.getByPlaceholderText('Default: 512 processes · Max: 1024 processes')
+  view.getByPlaceholderText('Default: 60 minutes · Max: 1440 minutes')
+  fireEvent.change(cpu, { target: { value: '4' } })
+  fireEvent.click(view.getByRole('button', { name: 'Create sandbox' }))
+  await view.findByText('CPU limit must be a number between 0.01 and 2')
+  expect(api.called('POST', '/v1/sandboxes')).toBe(false)
+  api.restore()
+})
+
 test('a refused create keeps the sheet open and shows the reason', async () => {
   const api = mockApi({
     'GET /v1/sandboxes/placement': () => jsonResponse(PLACEMENT),

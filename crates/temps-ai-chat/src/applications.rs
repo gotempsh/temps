@@ -1918,8 +1918,10 @@ impl ApplicationService {
                 temps_sandbox::services::managed_application_workspace_image("node")
                     .map(str::to_string),
             ),
-            cpu_limit: Set(4.0),
-            memory_limit_mb: Set(8192),
+            cpu_limit: Set(temps_sandbox::services::ApplicationWorkspaceConfig::DEFAULT_CPU),
+            memory_limit_mb: Set(
+                temps_sandbox::services::ApplicationWorkspaceConfig::DEFAULT_MEMORY_MB as i64,
+            ),
             pids_limit: Set(512),
             disk_limit_mb: Set(10_240),
             idle_timeout_secs: Set(900),
@@ -2428,9 +2430,11 @@ impl ApplicationService {
             active.image = Set(value);
         }
         if let Some(value) = update.cpu_limit {
+            active.cpu_limit_explicit = Set(true);
             active.cpu_limit = Set(value);
         }
         if let Some(value) = update.memory_limit_mb {
+            active.memory_limit_explicit = Set(true);
             active.memory_limit_mb = Set(value);
         }
         if let Some(value) = update.pids_limit {
@@ -2944,8 +2948,9 @@ impl WorkspaceQuotaValues {
 impl Default for WorkspaceQuotaValues {
     fn default() -> Self {
         Self {
-            cpu: 4.0,
-            memory_mb: 8_192,
+            cpu: temps_sandbox::services::ApplicationWorkspaceConfig::DEFAULT_CPU,
+            memory_mb: temps_sandbox::services::ApplicationWorkspaceConfig::DEFAULT_MEMORY_MB
+                as i64,
             pids: 512,
             disk_mb: 10_240,
         }
@@ -3448,6 +3453,8 @@ mod tests {
             desired_state: "running".to_string(),
             runtime: "full".to_string(),
             image: None,
+            cpu_limit_explicit: false,
+            memory_limit_explicit: false,
             cpu_limit: 1.0,
             memory_limit_mb: 1024,
             pids_limit: 256,
@@ -3644,6 +3651,8 @@ mod tests {
             desired_state: "running".to_string(),
             runtime: "full".to_string(),
             image: None,
+            cpu_limit_explicit: false,
+            memory_limit_explicit: false,
             cpu_limit: 1.0,
             memory_limit_mb: 1024,
             pids_limit: 256,
