@@ -131719,6 +131719,16 @@
             },
             "description": "Missing or unknown key"
           },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The body did not arrive in time"
+          },
           "413": {
             "content": {
               "application/json": {

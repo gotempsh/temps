@@ -37,6 +37,12 @@ use crate::ingest::ndjson::MAX_BODY_BYTES;
 use crate::ingest::service::MAX_CONCURRENT_INGEST_REQUESTS;
 use crate::ingest::{LogIngestService, NewLogIngestKey};
 
+/// Longest an ingest request may take to deliver its body once it holds a
+/// slot. A 5 MiB batch arrives in well under a second on any link a
+/// collector ships logs over; a stalled upload must not keep one of the few
+/// slots every collector shares.
+pub const BODY_READ_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+
 /// Header a collector may use instead of `Authorization: Bearer`.
 pub const LOG_KEY_HEADER: &str = "x-temps-log-key";
 
@@ -241,6 +247,7 @@ fn presented_key(headers: &HeaderMap) -> Option<&str> {
         (status = 202, description = "Lines stored", body = LogIngestResponse),
         (status = 400, description = "A line is not a JSON object", body = ProblemDetails),
         (status = 401, description = "Missing or unknown key", body = ProblemDetails),
+        (status = 408, description = "The body did not arrive in time", body = ProblemDetails),
         (status = 413, description = "Body too large", body = ProblemDetails),
         (status = 415, description = "Compressed body", body = ProblemDetails),
         (status = 429, description = "The project's log ingestion budget is exhausted", body = ProblemDetails),
@@ -292,10 +299,21 @@ pub async fn ingest_logs(
     };
     // Reads the body under the route's `DefaultBodyLimit`, answering 413
     // past it exactly as the `Bytes` extractor would.
-    let body = match Bytes::from_request(request, &()).await {
-        Ok(body) => body,
-        Err(rejection) => return rejection.into_response(),
-    };
+    // A deadline on the read, so an upload that stalls gives its slot back.
+    let body =
+        match tokio::time::timeout(BODY_READ_DEADLINE, Bytes::from_request(request, &())).await {
+            Ok(Ok(body)) => body,
+            Ok(Err(rejection)) => return rejection.into_response(),
+            Err(_) => {
+                return temps_core::problemdetails::new(StatusCode::REQUEST_TIMEOUT)
+                    .with_title("Log Ingest Body Too Slow")
+                    .with_detail(format!(
+                        "The request body did not arrive within {}s; resend the batch",
+                        BODY_READ_DEADLINE.as_secs()
+                    ))
+                    .into_response();
+            }
+        };
     match ingest_service.ingest(key, &body).await {
         Ok(outcome) => (
             StatusCode::ACCEPTED,
@@ -479,4 +497,81 @@ pub async fn revoke_log_ingest_key(
         tracing::error!(error = %e, "Failed to audit a log ingest key revocation");
     }
     Ok(Json(LogIngestKeyResponse::from(model)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ingest::keys::AuthenticatedKey;
+    use crate::ingest::service::{IngestKeyResolver, IngestLineWriter};
+    use crate::services::{IngestBudget, IngestLimits};
+
+    struct OneKey;
+
+    #[async_trait::async_trait]
+    impl IngestKeyResolver for OneKey {
+        async fn resolve(&self, presented: &str) -> Result<AuthenticatedKey, LogAggregatorError> {
+            if presented == "good" {
+                Ok(AuthenticatedKey {
+                    key_id: 1,
+                    project_id: 2,
+                    environment_id: None,
+                    default_service: "edge".to_string(),
+                })
+            } else {
+                Err(LogAggregatorError::IngestKeyRejected)
+            }
+        }
+        fn record_usage(&self, _key_id: i32, _lines: u64, _at: DateTime<Utc>) {}
+    }
+
+    struct Discard;
+
+    #[async_trait::async_trait]
+    impl IngestLineWriter for Discard {
+        async fn write(&self, _line: crate::types::LogLine) -> Result<(), LogAggregatorError> {
+            Ok(())
+        }
+        async fn close_streams(&self, _prefix: &str) -> Result<usize, LogAggregatorError> {
+            Ok(0)
+        }
+    }
+
+    fn service() -> Arc<LogIngestService> {
+        Arc::new(LogIngestService::new(
+            Arc::new(OneKey),
+            Arc::new(Discard),
+            Arc::new(IngestBudget::new(IngestLimits::UNLIMITED)),
+        ))
+    }
+
+    fn stalled_upload(key: &str) -> Request {
+        let body = axum::body::Body::from_stream(futures::stream::pending::<
+            Result<Bytes, std::io::Error>,
+        >());
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/logs/ingest")
+            .header(header::AUTHORIZATION, format!("Bearer {key}"))
+            .body(body)
+            .expect("request")
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_upload_times_out_and_gives_its_slot_back() {
+        let service = service();
+        let response = ingest_logs(State(service.clone()), stalled_upload("good")).await;
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        let free: Vec<_> = (0..MAX_CONCURRENT_INGEST_REQUESTS)
+            .map(|_| service.try_admit_request())
+            .collect();
+        assert!(free.iter().all(Option::is_some), "every slot is free again");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unknown_key_is_refused_without_reading_the_body() {
+        // The body never arrives; only a refusal that skips the read returns.
+        let response = ingest_logs(State(service()), stalled_upload("bad")).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
 }

@@ -190,8 +190,10 @@ The gaps, most important first.
 - **The receiver reads a body only for a known key, four at a time.** The
   key is checked before the body is read, and at most four requests hold
   a body at once; a fifth is refused with `503` and `Retry-After: 1`,
-  which Vector and Fluent Bit retry. That bounds the receiver to about
-  four 5 MiB bodies and their parsed lines.
+  which Vector and Fluent Bit retry. A body must arrive within 20 seconds
+  of taking a slot, or the request ends with `408`, so a stalled upload
+  gives its slot back. That bounds the receiver to about four 5 MiB bodies
+  and their parsed lines.
 - **Console.** Saved searches and ingest keys are reached from the logs
   page header, scoped to the service the page is filtered to. A log alert
   is a choice in the existing alert form. There is no CLI for alert rules

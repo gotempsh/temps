@@ -924,7 +924,10 @@ impl MetricAlertService {
     /// Written only while the rule's `config_revision` is the one the tick
     /// read; returns `false` otherwise, so a tick that read the old
     /// configuration never overwrites the state an edit reset.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one guarded UPDATE of the rule row; each argument is a column it writes"
+    )]
     pub async fn persist_dynamic_evaluation_if_current(
         &self,
         evaluated: &Model,

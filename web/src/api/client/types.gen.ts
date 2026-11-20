@@ -67105,6 +67105,10 @@ export type IngestLogsErrors = {
      */
     401: ProblemDetails;
     /**
+     * The body did not arrive in time
+     */
+    408: ProblemDetails;
+    /**
      * Body too large
      */
     413: ProblemDetails;
