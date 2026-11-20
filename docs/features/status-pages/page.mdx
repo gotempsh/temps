@@ -255,10 +255,13 @@ Each event is a `POST` with a JSON body carrying only what the page shows:
 import { createHmac, timingSafeEqual } from 'node:crypto'
 
 function verify(secret, header, rawBody, toleranceSeconds = 300) {
-  const parts = Object.fromEntries(header.split(',').map((p) => p.split('=')))
-  if (Math.abs(Date.now() / 1000 - Number(parts.t)) > toleranceSeconds) return false
-  const expected = createHmac('sha256', secret).update(`${parts.t}.${rawBody}`).digest('hex')
-  return timingSafeEqual(Buffer.from(expected), Buffer.from(parts.v1 ?? ''))
+  const match = /^t=(\d+),v1=([0-9a-f]{64})$/.exec(header ?? '')
+  if (!match) return false
+  const [, t, v1] = match
+  if (Math.abs(Date.now() / 1000 - Number(t)) > toleranceSeconds) return false
+  const expected = createHmac('sha256', secret).update(`${t}.${rawBody}`).digest()
+  const given = Buffer.from(v1, 'hex')
+  return given.length === expected.length && timingSafeEqual(given, expected)
 }
 ```
 
