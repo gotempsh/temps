@@ -314,6 +314,10 @@ async fn setup_e2e_as_full(
     };
 
     let app_state = OtelAppState {
+        operation_trends: Arc::new(temps_otel::services::OperationTrendService::new(
+            db.clone(),
+            Arc::new(TimescaleDbStorage::new(db.clone(), None)),
+        )),
         otel_service,
         metrics_store: metrics_store.clone(),
         metrics_write_tx: None,
@@ -1491,5 +1495,101 @@ async fn test_e2e_trace_summaries_include_total_contract() {
         body.get("total").is_none(),
         "include_total=false must omit `total` entirely (a 0 would be read as \
          'no traces' by a client doing `total ?? 0`), got: {body}"
+    );
+}
+
+/// Operation trends and regressions (ADR 111, D2): 401 without a token, 403
+/// without `OtelRead`, a Problem 404 for a deployment the project does not
+/// have, and a 200 trend that explains an untracked project.
+#[tokio::test]
+async fn test_e2e_operation_trends_authorize_and_explain() {
+    async fn get(router: &axum::Router, uri: &str) -> (StatusCode, serde_json::Value) {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    let Some((_db, router, project_id)) = setup_e2e().await else {
+        return;
+    };
+    let trend_uri = format!(
+        "/otel/operations/trend?project_id={project_id}&service_name=checkout-api&span_name=GET%20%2Fcart"
+    );
+    let regressions_uri =
+        format!("/otel/operations/regressions?project_id={project_id}&deployment_id=987654");
+
+    let (status, body) = get(&router, &trend_uri).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["points"], serde_json::json!([]));
+    assert_eq!(body["tracking"]["configured"], false);
+    assert_eq!(body["tracking"]["setup_path"], "traces");
+
+    let (status, body) = get(&router, &regressions_uri).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert!(
+        body["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("987654")),
+        "the problem names the deployment: {body}"
+    );
+
+    let (status, _) = get(
+        &router,
+        &format!("/otel/operations/trend?project_id={project_id}&service_name=&span_name=x"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let breakdown_uri = format!(
+        "/otel/operations/breakdown?project_id={project_id}&service_name=checkout-api&span_name=GET%20%2Fcart"
+    );
+    let (status, body) = get(&router, &breakdown_uri).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["instances"], 0);
+    assert_eq!(body["sample"], "recent");
+    assert_eq!(body["max_traces"], 20);
+    let (status, body) = get(&router, &format!("{breakdown_uri}&sample=fastest")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("fastest")),
+        "{body}"
+    );
+
+    let Some((_db, anonymous, _)) = setup_e2e_as(None).await else {
+        return;
+    };
+    assert_eq!(
+        get(&anonymous, &trend_uri).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        get(&anonymous, &breakdown_uri).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    let Some((_db, ingest_only, _)) = setup_e2e_as(Some(temps_authz::Role::MetricsIngest)).await
+    else {
+        return;
+    };
+    assert_eq!(
+        get(&ingest_only, &regressions_uri).await.0,
+        StatusCode::FORBIDDEN
     );
 }

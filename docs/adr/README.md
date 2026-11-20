@@ -127,6 +127,7 @@ the number of the ADR they belong to; they do not take a number of their own.
 | [106](./106-durable-workflows.md) | Durable workflows orchestrated by Temps | Proposed |  |
 | [107](./107-control-plane-tunnel-connectors.md) | The control plane runs tunnel connectors for the apps it serves | Proposed | amends [058](./058-ingress-modes-and-a-shared-app-domain.md) |
 | [108](./108-uptime-and-logs-gaps-against-better-stack.md) | What logs, uptime and status pages are missing to match Better Stack | Proposed |  |
+| [111](./111-error-tracking-gaps-against-sentry.md) | What error tracking and performance are missing to match Sentry | Proposed |  |
 
 ## Supporting documents
 

@@ -103,7 +103,14 @@ import {
   type SignalFields,
 } from '@/lib/alert-signal'
 import { useForm, useWatch } from 'react-hook-form'
-import { Link, useLocation, useNavigate, useParams } from 'react-router'
+import {
+  Link,
+  useLocation,
+  useNavigate,
+  useParams,
+  useSearchParams,
+} from 'react-router'
+import { alertPresetFromParams } from '@/lib/release-health'
 import { useGoBack } from '@/hooks/useGoBack'
 import { NotificationCoverageNotice } from '@/components/monitoring/NotificationCoverageNotice'
 import {
@@ -283,6 +290,10 @@ function AlertFormBody({
   // Unsaved fields, new alert or edits to an existing one, survive a detour
   // to add a notification provider (which returns here via `returnTo`). The
   // key includes the alert ID so edits never land on a different alert.
+  const [searchParams] = useSearchParams()
+  // A link can open a prefilled new alert (`?preset=crash-free-sessions`
+  // from release health); a saved draft still wins over it.
+  const [preset] = useState(() => alertPresetFromParams(searchParams))
   const draftKey = `metric-alert:${project.id}:${isEditing ? id : 'new'}`
   // "Alert on this search" from the logs page opens a new rule with the
   // search already chosen.
@@ -370,8 +381,11 @@ function AlertFormBody({
         draft
       )
     }
-    return mergeFormDraft(emptyDefaults(fromSavedSearch), draft)
-  }, [existing, draft, fromSavedSearch])
+    return mergeFormDraft(
+      { ...emptyDefaults(fromSavedSearch), ...(preset ?? {}) },
+      draft
+    )
+  }, [existing, draft, fromSavedSearch, preset])
 
   // `defaultValues` (mount-once), not `values`: this body is remounted via `key`
   // when the edited rule loads, so the form never resets a Select post-mount.

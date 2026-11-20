@@ -220,6 +220,20 @@ async fn ingest_sentry_event(
         }
     };
 
+    // Inbound filters (ADR 111, D1.4) drop the event before anything is
+    // stored. It is acknowledged like a stored one, as Sentry does, so the
+    // SDK neither retries nor reports an error; the rule counts the drop.
+    if state
+        .error_tracking_service
+        .inbound_filter_drop(&parsed_event.error_data)
+        .is_some()
+    {
+        let response = SentryEventResponse {
+            id: parsed_event.event_id,
+        };
+        return (StatusCode::OK, Json(response)).into_response();
+    }
+
     // Fix #2: resolve the real client IP using proxy-trust logic.
     // XFF is honored only when the direct TCP peer is loopback (our trusted Pingora proxy).
     // An attacker connecting directly and setting X-Forwarded-For is ignored.
@@ -1159,7 +1173,7 @@ async fn process_parsed_envelope(
 ) -> Response {
     let request = super::inference::RequestInference::new(client_ip, headers);
     // Decode and validate all supported items before any durable writes.
-    let batch = match state.sentry_provider.parse_envelope_with_request(
+    let mut batch = match state.sentry_provider.parse_envelope_with_request(
         decompressed_body,
         auth,
         Some(&request),
@@ -1189,6 +1203,20 @@ async fn process_parsed_envelope(
             "A valid Sentry DSN is required for telemetry",
         )
             .into_response();
+    }
+    // Sessions count only once the envelope is acknowledged: they carry no
+    // id to deduplicate a retry, so an SDK resending after a failure would
+    // count them twice. A tunneled envelope without a DSN leaves them
+    // uncounted, as before release health (ADR 111, D3).
+    let sessions = std::mem::take(&mut batch.sessions);
+    let session_aggregates = std::mem::take(&mut batch.session_aggregates);
+    if !dsn_authenticated {
+        if !sessions.is_empty() {
+            *batch.unsupported.entry("session").or_insert(0) += sessions.len();
+        }
+        if !session_aggregates.is_empty() {
+            *batch.unsupported.entry("sessions").or_insert(0) += session_aggregates.len();
+        }
     }
     let unsupported = batch.unsupported.values().sum::<usize>();
     let unsupported_types = batch
@@ -1353,6 +1381,16 @@ async fn process_parsed_envelope(
     let mut errors_stored = 0;
     // Store each event using the error tracking service
     for mut event in batch.events {
+        // Inbound filters (ADR 111, D1.4): dropped before storage, counted
+        // per rule, and acknowledged so the SDK does not retry.
+        if state
+            .error_tracking_service
+            .inbound_filter_drop(&event.error_data)
+            .is_some()
+        {
+            domains.errors_filtered += 1;
+            continue;
+        }
         // Enrich with IP geolocation and visitor correlation
         enrich_error_event(
             &mut event.error_data,
@@ -1518,6 +1556,27 @@ async fn process_parsed_envelope(
         unsupported_items = unsupported,
         "Sentry envelope processed"
     );
+    if dsn_authenticated && (!sessions.is_empty() || !session_aggregates.is_empty()) {
+        let recorded = state.error_tracking_service.release_health.record_envelope(
+            auth.project_id,
+            &sessions,
+            &session_aggregates,
+        );
+        domains.sessions_queued = recorded.outcome.queued;
+        domains.sessions_dropped = recorded.outcome.dropped + recorded.outcome.rejected;
+        // Register the releases like those of events, so a release seen only
+        // in sessions is still ordered and tied to its deployment.
+        for release in &recorded.releases {
+            if let Err(error) = state
+                .error_tracking_service
+                .ingestion
+                .observe_release(auth.project_id, release, auth.deployment_id)
+                .await
+            {
+                tracing::warn!(project_id = auth.project_id, error = %error, "Could not register a session release");
+            }
+        }
+    }
     let mut response = domains.apply(with_check_ins(envelope_outcome(
         StatusCode::OK,
         errors_stored,
@@ -1542,10 +1601,13 @@ struct DomainReceipts {
     feedback: u64,
     feedback_duplicates: u64,
     errors_duplicates: u64,
+    errors_filtered: u64,
     spans: u64,
     metrics: u64,
     replay_segments: u64,
     replay_events: u64,
+    sessions_queued: u64,
+    sessions_dropped: u64,
 }
 impl DomainReceipts {
     fn apply(&self, mut response: Response) -> Response {
@@ -1564,6 +1626,7 @@ impl DomainReceipts {
                 self.feedback_duplicates,
             ),
             ("x-temps-sentry-errors-duplicates", self.errors_duplicates),
+            ("x-temps-sentry-errors-filtered", self.errors_filtered),
             ("x-temps-sentry-spans-stored", self.spans),
             ("x-temps-sentry-metrics-stored", self.metrics),
             (
@@ -1571,6 +1634,8 @@ impl DomainReceipts {
                 self.replay_segments,
             ),
             ("x-temps-sentry-replay-events-stored", self.replay_events),
+            ("x-temps-sentry-sessions-queued", self.sessions_queued),
+            ("x-temps-sentry-sessions-dropped", self.sessions_dropped),
         ] {
             if let Ok(value) = http::HeaderValue::from_str(&count.to_string()) {
                 response.headers_mut().insert(name, value);
@@ -1602,6 +1667,8 @@ fn envelope_outcome(
             ("x-temps-sentry-metrics-stored", "0".to_string()),
             ("x-temps-sentry-replay-segments-accepted", "0".to_string()),
             ("x-temps-sentry-replay-events-stored", "0".to_string()),
+            ("x-temps-sentry-sessions-queued", "0".to_string()),
+            ("x-temps-sentry-sessions-dropped", "0".to_string()),
             ("x-temps-sentry-errors-stored", errors.to_string()),
             ("x-temps-sentry-errors-duplicates", "0".to_string()),
             ("x-temps-sentry-logs-stored", logs.to_string()),
@@ -3935,6 +4002,79 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn an_inbound_filter_drops_a_matching_envelope_event_before_storage() {
+        use crate::services::inbound_filters::InboundFilterKind;
+        let ctx = create_test_context().await;
+        let tracking = ctx.app_state.error_tracking_service.clone();
+        let rule = tracking
+            .inbound_filters
+            .create(
+                ctx.project_id,
+                InboundFilterKind::ErrorMessage,
+                Some("Error: *noisy widget*".into()),
+                true,
+            )
+            .await
+            .unwrap();
+        let app = configure_routes().with_state(ctx.app_state.clone());
+        let server = TestServer::new(app);
+        let auth_header = format!("Sentry sentry_key={},sentry_version=7", ctx.dsn_key);
+        let send = |event_id: &'static str, message: &'static str| {
+            let body = format!(
+                "{{\"event_id\":\"{event_id}\"}}\n{{\"type\":\"event\"}}\n{{\"platform\":\"javascript\",\"level\":\"error\",\"exception\":{{\"values\":[{{\"type\":\"Error\",\"value\":\"{message}\"}}]}}}}\n"
+            );
+            server
+                .post(&format!("/{}/envelope/", ctx.project_id))
+                .content_type("application/octet-stream")
+                .add_header(
+                    HeaderName::from_static("x-sentry-auth"),
+                    HeaderValue::from_str(&auth_header).unwrap(),
+                )
+                .bytes(Bytes::from(body))
+        };
+
+        let filtered = send(
+            "6f1d2c3b4a5e6f708192a3b4c5d6e7f8",
+            "the noisy widget failed",
+        )
+        .await;
+        assert_eq!(
+            filtered.status_code(),
+            StatusCode::OK,
+            "acknowledged, not rejected"
+        );
+        assert_eq!(filtered.header("x-temps-sentry-errors-filtered"), "1");
+        let kept = send("1a2b3c4d5e6f708192a3b4c5d6e7f809", "checkout failed").await;
+        assert_eq!(kept.status_code(), StatusCode::OK);
+        assert_eq!(kept.header("x-temps-sentry-errors-filtered"), "0");
+
+        let (groups, total) = tracking
+            .list_error_groups(
+                ctx.project_id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(total, 1, "only the unfiltered event was stored");
+        assert!(groups[0].title.contains("checkout failed"));
+        let listed = tracking.inbound_filters.list(ctx.project_id).await.unwrap();
+        assert_eq!(listed[0].id, rule.id);
+        assert_eq!(
+            listed[0].dropped_count, 1,
+            "the drop is counted against the rule"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn test_envelope_endpoint_with_invalid_envelope() {
         let ctx = create_test_context().await;
         let app = configure_routes().with_state(ctx.app_state);
@@ -3962,30 +4102,45 @@ mod tests {
     #[serial_test::serial]
     async fn test_envelope_endpoint_with_session() {
         let ctx = create_test_context().await;
+        let release_health = ctx.app_state.error_tracking_service.release_health.clone();
         let app = configure_routes().with_state(ctx.app_state);
         let server = TestServer::new(app);
-
-        // Create a valid session envelope
-        let envelope_data = "{\"event_id\":\"a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6\"}\n{\"type\":\"session\"}\n{\"sid\":\"a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6\",\"init\":true,\"started\":\"2023-06-28T14:30:00.000Z\",\"status\":\"ok\",\"attrs\":{\"release\":\"1.0.0\",\"environment\":\"production\"}}\n";
         let auth_header = format!("Sentry sentry_key={},sentry_version=7", ctx.dsn_key);
-
-        let response = server
-            .post(&format!("/{}/envelope/", ctx.project_id))
-            .content_type("application/octet-stream")
-            .add_header(
-                HeaderName::from_static("x-sentry-auth"),
-                HeaderValue::from_str(&auth_header).unwrap(),
+        let envelope = |started: chrono::DateTime<chrono::Utc>| {
+            format!(
+                "{{\"event_id\":\"a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6\"}}\n{{\"type\":\"session\"}}\n\
+                 {{\"sid\":\"a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d\",\"init\":true,\"started\":\"{}\",\
+                 \"status\":\"ok\",\"attrs\":{{\"release\":\"1.0.0\",\"environment\":\"production\"}}}}\n",
+                started.to_rfc3339()
             )
-            .bytes(Bytes::from(envelope_data))
-            .await;
+        };
+        let post = |body: String| {
+            server
+                .post(&format!("/{}/envelope/", ctx.project_id))
+                .content_type("application/octet-stream")
+                .add_header(
+                    HeaderName::from_static("x-sentry-auth"),
+                    HeaderValue::from_str(&auth_header).unwrap(),
+                )
+                .bytes(Bytes::from(body))
+        };
 
-        // Session items are accepted but not processed yet (returns OK or validation error)
-        assert!(
-            response.status_code() == StatusCode::OK
-                || response.status_code() == StatusCode::BAD_REQUEST,
-            "Expected 200 or 400, got {}",
-            response.status_code()
-        );
+        // A session is counted into release health (ADR 111, D3), no longer
+        // reported as unsupported.
+        let response = post(envelope(chrono::Utc::now())).await;
+        assert_eq!(response.status_code(), StatusCode::OK);
+        assert_eq!(response.header("x-temps-sentry-sessions-queued"), "1");
+        assert_eq!(response.header("x-temps-sentry-sessions-dropped"), "0");
+        assert_eq!(response.header("x-temps-sentry-unsupported-items"), "0");
+
+        // One that started too long ago is acknowledged but not counted.
+        let response = post(envelope(chrono::Utc::now() - chrono::TimeDelta::days(30))).await;
+        assert_eq!(response.status_code(), StatusCode::OK);
+        assert_eq!(response.header("x-temps-sentry-sessions-queued"), "0");
+        assert_eq!(response.header("x-temps-sentry-sessions-dropped"), "1");
+        use std::sync::atomic::Ordering::Relaxed;
+        assert_eq!(release_health.recorder_stats().queued.load(Relaxed), 1);
+        assert_eq!(release_health.recorder_stats().rejected.load(Relaxed), 1);
     }
 
     #[tokio::test]

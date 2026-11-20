@@ -714,6 +714,10 @@ async fn test_delete_alert_rejects_cross_project_rule_id_before_touching_evaluat
         facet_cache,
     ));
     let app_state = OtelAppState {
+        operation_trends: Arc::new(temps_otel::services::OperationTrendService::new(
+            ctx.db.clone(),
+            ctx.storage.clone(),
+        )),
         otel_service: ctx.otel_service.clone(),
         metrics_store: None,
         metrics_write_tx: None,
