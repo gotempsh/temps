@@ -1607,6 +1607,7 @@ impl WorkflowStore for PgWorkflowStore {
     async fn global_workflow_summaries(
         &self,
         limit: u64,
+        projects: Option<&[i32]>,
     ) -> WorkflowResult<Vec<EnvironmentWorkflowSummary>> {
         #[derive(FromQueryResult)]
         struct Row {
@@ -1621,6 +1622,14 @@ impl WorkflowStore for PgWorkflowStore {
             last_run_at: Option<DateTime<Utc>>,
         }
         let limit = i64::try_from(limit.clamp(1, 1000)).unwrap_or(1000);
+        if projects.is_some_and(<[i32]>::is_empty) {
+            return Ok(Vec::new());
+        }
+        let (scope, mut values) = match projects {
+            Some(ids) => ("WHERE r.project_id = ANY($2) ", vec![ids.to_vec().into()]),
+            None => ("", Vec::new()),
+        };
+        values.insert(0, limit.into());
         let rows = Row::find_by_statement(stmt(
             &format!(
                 "SELECT r.project_id, r.environment_id, p.slug AS project_slug, \
@@ -1632,10 +1641,11 @@ impl WorkflowStore for PgWorkflowStore {
                  FROM workflow_runs r \
                  INNER JOIN environments e ON e.id = r.environment_id AND e.deleted_at IS NULL \
                  INNER JOIN projects p ON p.id = r.project_id AND p.deleted_at IS NULL \
+                 {scope}\
                  GROUP BY r.project_id, r.environment_id, p.slug, e.slug, r.workflow_name \
                  ORDER BY last_run_at DESC, r.workflow_name LIMIT $1"
             ),
-            vec![limit.into()],
+            values,
         ))
         .all(self.db.as_ref())
         .await
@@ -1658,6 +1668,24 @@ impl WorkflowStore for PgWorkflowStore {
                 },
             })
             .collect())
+    }
+
+    async fn workflow_project_ids(&self) -> WorkflowResult<Vec<i32>> {
+        #[derive(FromQueryResult)]
+        struct Row {
+            id: i32,
+        }
+        let rows = Row::find_by_statement(stmt(
+            "SELECT p.id FROM projects p WHERE p.deleted_at IS NULL \
+             AND EXISTS (SELECT 1 FROM workflow_runs r \
+             INNER JOIN environments e ON e.id = r.environment_id AND e.deleted_at IS NULL \
+             WHERE r.project_id = p.id)",
+            Vec::new(),
+        ))
+        .all(self.db.as_ref())
+        .await
+        .map_err(WorkflowError::db("listing projects with workflow runs"))?;
+        Ok(rows.into_iter().map(|row| row.id).collect())
     }
 
     async fn environment_names(

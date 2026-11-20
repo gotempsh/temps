@@ -110,6 +110,15 @@ impl WorkflowService {
     }
 }
 
+/// Whether the caller reads every project (an instance admin, or no access
+/// checker configured), so a listing needs no project scope.
+pub(super) fn listing_is_unrestricted(
+    auth: &AuthContext,
+    checker: Option<&dyn ProjectAccessChecker>,
+) -> bool {
+    checker.is_none() || auth.is_instance_admin()
+}
+
 pub(super) async fn visible_projects(
     auth: &AuthContext,
     checker: Option<&dyn ProjectAccessChecker>,

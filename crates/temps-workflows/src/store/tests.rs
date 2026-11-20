@@ -1542,7 +1542,7 @@ async fn workflow_summaries_and_names_are_one_joined_statement_each() {
     );
     let store = PgWorkflowStore::new(conn.clone());
     assert!(store
-        .global_workflow_summaries(5_000)
+        .global_workflow_summaries(5_000, None)
         .await
         .unwrap()
         .is_empty());
@@ -1583,4 +1583,70 @@ async fn workflow_summaries_and_names_are_one_joined_statement_each() {
         "{names}"
     );
     assert!(names.contains("e.id = ANY($1)"), "{names}");
+}
+
+/// A caller limited to some projects is bounded among their projects alone:
+/// the scope is a filter inside the grouped statement, ahead of the limit,
+/// and an empty scope reads nothing. Finding the projects with runs is one
+/// statement over projects, not one per run.
+#[tokio::test]
+async fn scoped_workflow_summaries_filter_projects_before_the_limit() {
+    use std::collections::BTreeMap;
+
+    use sea_orm::{DatabaseBackend, MockDatabase};
+
+    let empty = || Vec::<BTreeMap<&str, sea_orm::Value>>::new();
+    let conn = Arc::new(
+        MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([empty(), empty()])
+            .into_connection(),
+    );
+    let store = PgWorkflowStore::new(conn.clone());
+    assert!(store
+        .global_workflow_summaries(20, Some(&[7, 9]))
+        .await
+        .unwrap()
+        .is_empty());
+    // Nothing readable: no statement at all.
+    assert!(store
+        .global_workflow_summaries(20, Some(&[]))
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(store.workflow_project_ids().await.unwrap().is_empty());
+    drop(store);
+
+    let log = Arc::try_unwrap(conn)
+        .expect("the store was dropped")
+        .into_transaction_log();
+    assert_eq!(log.len(), 2, "{log:?}");
+    let summaries = &log[0].statements()[0];
+    let filter = summaries
+        .sql
+        .find("WHERE r.project_id = ANY($2)")
+        .unwrap_or_else(|| panic!("no project scope: {}", summaries.sql));
+    let group = summaries.sql.find("GROUP BY").expect("grouped");
+    let limit = summaries.sql.find("LIMIT $1").expect("limited");
+    assert!(filter < group && group < limit, "{}", summaries.sql);
+    assert_eq!(
+        summaries.values.as_ref().map(|values| values.0.clone()),
+        Some(vec![
+            sea_orm::Value::BigInt(Some(20)),
+            sea_orm::Value::Array(
+                sea_orm::sea_query::ArrayType::Int,
+                Some(Box::new(vec![
+                    sea_orm::Value::Int(Some(7)),
+                    sea_orm::Value::Int(Some(9)),
+                ])),
+            ),
+        ])
+    );
+    let projects = &log[1].statements()[0].sql;
+    for clause in [
+        "FROM projects p WHERE p.deleted_at IS NULL",
+        "EXISTS (SELECT 1 FROM workflow_runs r",
+        "e.deleted_at IS NULL",
+    ] {
+        assert!(projects.contains(clause), "{clause}: {projects}");
+    }
 }

@@ -181,7 +181,7 @@ pub async fn list_workflow_definitions(
     let total = definitions.len() as u64;
     let workflows = definitions
         .into_iter()
-        .skip(((page - 1) * page_size) as usize)
+        .skip(usize::try_from((page - 1).saturating_mul(page_size)).unwrap_or(usize::MAX))
         .take(page_size as usize)
         .map(Into::into)
         .collect();

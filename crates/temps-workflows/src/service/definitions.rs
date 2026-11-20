@@ -5,13 +5,16 @@
 //! environment has run or its executor declares, named by project and
 //! environment slug.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use chrono::{DateTime, Utc};
 use temps_authz::AuthContext;
 use temps_core::ProjectAccessChecker;
 
-use super::{global::visible_projects, WorkflowService};
+use super::{
+    global::{listing_is_unrestricted, visible_projects},
+    WorkflowService,
+};
 use crate::error::WorkflowResult;
 use crate::store::EnvironmentName;
 
@@ -47,19 +50,37 @@ pub struct WorkflowDefinition {
 impl WorkflowService {
     /// Workflows the caller may read across projects: one grouped query for
     /// run history, the in-memory manifests for what executors declare, one
-    /// query naming environments that have a manifest but no runs yet, and
-    /// one batched access check. Nothing is read per workflow or per
-    /// environment. Most recently run first, then never-run ones by name.
+    /// query naming the environments that have a manifest, and, for a caller
+    /// limited to some projects, one query for the projects with runs and one
+    /// batched access check. Nothing is read per workflow or per environment.
+    ///
+    /// A limited caller's readable projects are resolved before the history
+    /// is bounded, so other projects' workflows never crowd theirs out of the
+    /// list or its total. Most recently run first, then never-run ones by
+    /// name.
     pub async fn workflow_definitions(
         &self,
         auth: &AuthContext,
         checker: Option<&dyn ProjectAccessChecker>,
     ) -> WorkflowResult<Vec<WorkflowDefinition>> {
+        let manifests: BTreeMap<i32, _> = self.engine.cached_manifests().into_iter().collect();
+        let manifest_environments: Vec<i32> = manifests.keys().copied().collect();
+        let declaring = self.store.environment_names(&manifest_environments).await?;
+
+        let scope: Option<BTreeSet<i32>> = if listing_is_unrestricted(auth, checker) {
+            None
+        } else {
+            let mut candidates = self.store.workflow_project_ids().await?;
+            candidates.extend(declaring.iter().map(|environment| environment.project_id));
+            Some(visible_projects(auth, checker, &candidates).await?)
+        };
+        let scoped: Option<Vec<i32>> = scope.as_ref().map(|ids| ids.iter().copied().collect());
+        let in_scope = |project_id: i32| scope.as_ref().is_none_or(|ids| ids.contains(&project_id));
+
         let history = self
             .store
-            .global_workflow_summaries(MAX_WORKFLOW_DEFINITIONS)
+            .global_workflow_summaries(MAX_WORKFLOW_DEFINITIONS, scoped.as_deref())
             .await?;
-        let manifests: BTreeMap<i32, _> = self.engine.cached_manifests().into_iter().collect();
 
         let mut definitions: Vec<WorkflowDefinition> = Vec::with_capacity(history.len());
         let mut listed: HashSet<(i32, String)> = HashSet::with_capacity(history.len());
@@ -99,18 +120,11 @@ impl WorkflowService {
         }
 
         // Declared workflows that have never run.
-        let unnamed: Vec<i32> = manifests
-            .iter()
-            .filter(|(environment_id, manifest)| {
-                manifest
-                    .workflows
-                    .iter()
-                    .any(|workflow| !listed.contains(&(**environment_id, workflow.name.clone())))
-            })
-            .map(|(environment_id, _)| *environment_id)
-            .collect();
         let mut never_run = Vec::new();
-        for environment in self.store.environment_names(&unnamed).await? {
+        for environment in declaring {
+            if !in_scope(environment.project_id) {
+                continue;
+            }
             let Some(manifest) = manifests.get(&environment.environment_id) else {
                 continue;
             };
@@ -144,14 +158,8 @@ impl WorkflowService {
                 ))
         });
         definitions.extend(never_run);
+        definitions.retain(|definition| in_scope(definition.environment.project_id));
         definitions.truncate(MAX_WORKFLOW_DEFINITIONS as usize);
-
-        let project_ids: Vec<i32> = definitions
-            .iter()
-            .map(|definition| definition.environment.project_id)
-            .collect();
-        let visible = visible_projects(auth, checker, &project_ids).await?;
-        definitions.retain(|definition| visible.contains(&definition.environment.project_id));
         Ok(definitions)
     }
 }

@@ -490,10 +490,18 @@ pub trait WorkflowStore: Send + Sync {
     /// Run counts per workflow and environment across every live project, in
     /// one grouped query inner-joined to the environment and project for
     /// their slugs. Most recently run first, at most `limit` rows.
+    /// Workflow history across projects, most recently run first, at most
+    /// `limit` rows. With `projects`, only those projects are counted, so a
+    /// caller limited to some projects is bounded among theirs alone.
     async fn global_workflow_summaries(
         &self,
         limit: u64,
+        projects: Option<&[i32]>,
     ) -> WorkflowResult<Vec<EnvironmentWorkflowSummary>>;
+
+    /// Live projects with at least one workflow run: one row per project,
+    /// not per run.
+    async fn workflow_project_ids(&self) -> WorkflowResult<Vec<i32>>;
     /// Live environments among `environment_ids` with their project, in one
     /// joined query. Deleted environments and projects are absent.
     async fn environment_names(
