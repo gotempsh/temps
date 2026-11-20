@@ -1362,6 +1362,9 @@ mod tests {
             // sandbox permissions to the project whose resources they access.
             "temps-service-access",
             "temps-status-page",
+            // Surveys and their results belong to one project: every handler
+            // narrows `surveys:read`/`surveys:write` to that project.
+            "temps-surveys",
             // Workflow runs, events, settings and credentials (ADR-106) belong
             // to one project's environment: every handler narrows its
             // workflow permission to that project.

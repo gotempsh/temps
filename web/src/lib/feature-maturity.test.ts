@@ -13,6 +13,9 @@ describe('feature maturity route mapping', () => {
     expect(featureKeyForPath('/projects/shop/analytics/funnels/12')).toBe(
       'funnels'
     )
+    expect(featureKeyForPath('/projects/shop/analytics/surveys/3')).toBe(
+      'surveys'
+    )
   })
 
   test('maps shared platform routes', () => {

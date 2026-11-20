@@ -1052,10 +1052,51 @@ SDKs, Go workflows, the Rust protocol/plugin/workflow crates, and the TypeScript
 CLI (`cli` / `@temps-sdk/cli`). The CLI uses the same prepared-version selection,
 OIDC publisher, verification, retries, and package tags as the npm SDKs.
 
-Prepare SDK releases in a normal signed-off change **before** cutting the server
-tag: bump each selected package manifest, update lockfiles and local dependency
-requirements, then add its catalog key and exact version to the upcoming server
-tag. For example, this selection describes independently versioned packages:
+### Preparing SDK releases for a server tag
+
+Nobody picks SDK versions by hand. `python3 scripts/sdk_release.py prepare --tag
+<server-tag>` (logic in `scripts/sdk_prepare.py`) decides, for every catalog
+package, whether it ships with that tag and at which version, then bumps the
+manifests, the lockfiles (`sdks/node/bun.lock`, `sdks/python/uv.lock`,
+`Cargo.lock`) and in-catalog dependency pins, and writes the selection to
+`prepared.json`. It reads git and the public registries only; it never
+publishes, pushes or tags. It is deterministic and idempotent: the same history
+and registry contents produce the same files, and a second run changes nothing.
+
+- **Baseline.** The highest package tag (`sdk/<key>/v*`, or
+  `sdks/go/workflows/v*`). Packages released before package tags existed use the
+  commit that set their manifest to the newest version the registry has. A
+  package the registry has never seen is a first release of its manifest
+  version.
+- **Changes.** Non-merge commits since the baseline that touched the package
+  path or a declared `sources` entry in `packages.json` (`@temps-sdk/api` is
+  generated from `apps/temps-cli/openapi.json`; `build` runs its `generate`
+  script before testing and packing, as its `prepublishOnly` would, so it ships
+  the client for the tag's spec). A catalog package nested inside
+  another's path (`sdks/python/workflows` in `sdks/python`) counts only for the
+  inner one. A commit that touches no package selects nothing.
+- **Bump.** From Conventional Commit subjects and bodies: `fix`/`perf` patch,
+  `feat` minor, `!` or a `BREAKING CHANGE:` footer major; other types release
+  nothing. Before 1.0.0 everything shifts down one level (breaking minor, feature
+  patch). Prereleases increment like node-semver, so `1.3.0-beta.2` plus a
+  feature stays core `1.3.0`. An unpublished manifest version already ahead of
+  the computed one (a deliberate `1.0.0`) is kept.
+- **Channel.** A stable server tag selects stable versions and also graduates a
+  package whose last release is a prerelease. A prerelease server tag selects
+  `-beta.N` (Python `bN`), with N one above every beta of that core on the
+  registry or in package tags. Nightly tags are refused.
+- **Cascade.** A selected package re-releases its in-catalog dependents
+  (npm `workspace:` ranges, Cargo path dependencies, uv path sources, Go
+  `replace` directives) with at least a patch, transitively, and rewrites their
+  exact pins (the plugin SDK's `=` requirement on the protocol).
+- **Guards, failing closed.** A version already published or tagged, a registry
+  stable release ahead of the computed version, a stable package depending on a
+  prerelease sibling, a Go v2+ version, or a target tag that already exists.
+  The result must round-trip through `plan()`, which keeps its ordering
+  (analytics core before consumers, protocol before the plugin SDK).
+
+`prepared.json` holds only the upcoming tag; the tag's own commit retains its
+selection for release retries. It looks like:
 
 ```json
 {
@@ -1068,17 +1109,46 @@ tag. For example, this selection describes independently versioned packages:
 }
 ```
 
-Keep only upcoming selections in `prepared.json`; remove a completed selection
-when advancing its manifests. The release commit retains the old selection for
-retries. The initial file is deliberately empty: existing versions must not be
-silently republished with changed bytes. Stable server tags select stable SDK
-versions; prerelease server tags select prerelease SDK versions (SemVer
-`-alpha.N`, `-beta.N`, `-rc.N`; Python `aN`, `bN`, `rcN`). Nightlies select none.
-Include unpublished workspace dependencies in the same selection: analytics
-core precedes consumers, and the Rust protocol precedes the plugin SDK. Rust
-plugin/protocol versions are explicit rather than inherited from the server.
-Go's version is in `sdks/go/workflows/VERSION`; v2+ requires a new major-version
-module path and an updated catalog rather than blindly tagging the v1 module.
+**The SDK Release Prep workflow** (`.github/workflows/sdk-release-prep.yml`)
+runs `prepare`, `validate` and `build --tag <server-tag>` as a dry check, then
+opens or updates the signed-off PR `chore(release): prepare SDKs for
+<server-tag>` from branch `sdk-release-prep/<server-tag>`, with a per-package
+table of previous and next versions and the commits behind each bump. The job
+that builds packages has a read-only token; the job that pushes and opens the PR
+runs no package code and re-derives the change, refusing to continue if the
+bytes differ from what was dry-built. Neither has registry credentials or
+`id-token`. It only ever force-updates its own commits on its branch.
+
+It fits how beta and stable tags are cut today. `scripts/release.sh` makes the
+version-bump commit; it reaches main through a `release/v<version>` PR (the
+branch is pushed by hand, and every recent release PR used that name), and the
+tag goes on that PR's merge commit. Pushing a `release/v*` branch runs the
+workflow for `v<version>`. Preparation reads main, so it fails when the release
+branch changes SDK files main lacks (they would merge into the tag unversioned),
+whether in a commit, a merge resolution, a package added only on the branch or
+`.github/releases`: land those changes on main first. For any other path,
+dispatch it:
+`gh workflow run sdk-release-prep.yml -f tag=v<version>`. Merge the SDK PR into
+main **before** the release PR so the tag contains it.
+
+`release.sh` runs `prepare --check` before its bump commit. `--check` exits 1
+when files would change and 2 when the check itself failed (a registry lookup,
+an invalid manifest); a failed check stops the release. If the tag already has a
+selection that is now stale, it stops: publishing it would ship newer code under
+the selected versions. If nothing is selected yet, it asks before releasing the
+server without those SDK changes. Nightlies never publish SDKs, so
+`nightly-release.yml` does not run it.
+
+Commits can still land on main between `release.sh` and the tag. When a tag has
+a selection, `release.yml`'s validation job re-derives it on the tagged commit
+(`prepare --tag <tag> --check --at-tag`, read-only) and fails before anything
+publishes if the versions no longer match, because a published version cannot
+be replaced. Delete the tag, re-run the prep workflow for it, merge its PR and
+tag again. A re-run after part of the selection was published still verifies
+every package, and so does a fresh run at an older tag: the check hides this
+release's own package tags and registry versions, and those of later releases
+(package tags not on the tagged commit's history), so it re-derives from the
+state before the release.
 
 `release.yml` plans in its existing validation job and tests/packages in its
 existing web-assets job. A single isolated `publish-sdks` job waits for the test
@@ -1101,6 +1171,8 @@ permissions (`id-token: write`, package-tag `contents: write`) from builds.
 ```sh
 python3 scripts/sdk_release.py validate
 python3 scripts/test_sdk_release.py
+python3 scripts/sdk_release.py prepare --tag v1.2.0 --check   # print the selection, change nothing
+python3 scripts/sdk_release.py prepare --tag v1.2.0           # write manifests, lockfiles, prepared.json
 python3 scripts/sdk_release.py plan --tag v1.2.0
 python3 scripts/sdk_release.py build --all --kind npm --output sdk-artifacts/npm
 python3 scripts/sdk_release.py build --all --kind pypi --output sdk-artifacts/python
@@ -1134,37 +1206,131 @@ release notes records intent, not proof that registries succeeded. Expired build
 artifacts require a fresh validated run; changed bytes cannot overwrite an
 already uploaded version.
 
-### Registry setup and rollout blockers
+### Operator checklist: one-time registry setup
 
-Configure GitHub environments `sdk-stable` and `sdk-beta` with the intended tag
-restrictions/protection. For **each package**, configure the registry's trusted
-publisher for owner `gotempsh`, repository `temps`, workflow **`release.yml`** and
-its matching environment. This is the top-level workflow, not a reusable workflow.
-No long-lived registry secrets are used or printed by these jobs.
+The workflows cannot do these steps: they need registry accounts, 2FA and
+repository admin rights. Do them before the first server tag whose prepared
+selection publishes to that registry. A read-only check on 2026-11-19 found:
 
-- npm: configure the package's **Settings → Trusted publishing**; Node 24 supplies
-  a supported npm OIDC client. Enable direct `npm publish` in the publisher
-  permissions. New names need registry ownership/bootstrap setup
-  before release. See [npm trusted publishing](https://docs.npmjs.com/trusted-publishers/).
-- PyPI: configure a publisher for `temps-plugin-sdk` and `temps-workflows`, or a
-  pending publisher for a new project, with the same repository/workflow/environment.
-  See [PyPI publisher setup](https://docs.pypi.org/trusted-publishers/adding-a-publisher/).
-- crates.io: configure each crate's trusted publisher. A never-published crate
-  needs the registry's first-publication bootstrap before OIDC can be configured;
-  the workflow deliberately does not invent a token fallback. See
-  [Rust trusted publishing](https://blog.rust-lang.org/2025/07/11/crates-io-development-update-2025-07/).
-- Go: permit the workflow token to create the canonical subdirectory tags; check
-  repository rulesets for tag restrictions. There is no separate Go registry secret.
+- **Never published** (no package on the registry): `@temps-sdk/sandbox`,
+  `@temps-sdk/workflows`, `@temps-sdk/api`; PyPI `temps-plugin-sdk` and
+  `temps-workflows`; crates `temps-plugin-protocol`, `temps-plugin-sdk` and
+  `temps-workflows-sdk`.
+- **Published, but none of their latest versions carries npm provenance**, so
+  none was published by trusted publishing: `@temps-sdk/analytics-browser`,
+  `analytics-core`, `blob`, `kv`, `node-sdk`, `plugin`, `react-analytics`,
+  `svelte-analytics`, `vue-analytics` and `cli`. Publisher configuration is
+  private, so check each package's settings.
+- **No `sdk-beta` or `sdk-stable` environment** exists. The repository does
+  not let GitHub Actions open pull requests.
 
-Read-only inspection on 2026-11-14 found neither SDK environment configured.
-The current Python and Rust catalog versions and npm API/sandbox/workflows
-versions were absent from their public registries; absence of a version does not
-prove absence of the package or ownership. Publisher configuration is private and
-has not been verified. Several existing npm versions are already public: bump
-versions for changed package bytes before selecting them. No packages or tags
-were published during implementation. Rust package verification also reported
-existing locked yanked dependencies (`chacha20 0.10.0`, `spin 0.9.8`); dependency
-remediation remains separate from this lifecycle change.
+Re-check registry state before acting:
+
+```sh
+curl -s https://registry.npmjs.org/@temps-sdk%2Fsandbox | head -c 200
+curl -s -o /dev/null -w '%{http_code}\n' https://pypi.org/pypi/temps-workflows/json
+curl -s -o /dev/null -w '%{http_code}\n' -A 'temps-sdk-release' https://crates.io/api/v1/crates/temps-plugin-protocol
+```
+
+1. **Let the prep workflow open its PR** (or open it by hand from the pushed
+   branch each time):
+
+   ```sh
+   gh api --method PUT repos/gotempsh/temps/actions/permissions/workflow \
+     -f default_workflow_permissions=read -F can_approve_pull_request_reviews=true
+   ```
+
+   CI runs for a PR the workflow token opens or updates wait for approval: a
+   maintainer with write access selects **Approve workflows to run** in the
+   PR's merge box before merging it.
+
+2. **Create the environments.** `release.yml` refers to `sdk-${channel}`;
+   GitHub would otherwise create them on first use without protection.
+
+   ```sh
+   gh api --method PUT repos/gotempsh/temps/environments/sdk-beta \
+     -F 'deployment_branch_policy[protected_branches]=false' \
+     -F 'deployment_branch_policy[custom_branch_policies]=true'
+   gh api --method POST repos/gotempsh/temps/environments/sdk-beta/deployment-branch-policies \
+     -f name='v*-*' -f type=tag
+   ```
+
+   **Optional:** create `sdk-stable` the same way with tag pattern `v*.*.*`, and
+   require a reviewer, so a person approves each stable publication:
+
+   ```sh
+   gh api --method PUT repos/gotempsh/temps/environments/sdk-stable --input - <<'JSON'
+   {"reviewers": [{"type": "Team", "id": <maintainers-team-id>}],
+    "deployment_branch_policy": {"protected_branches": false, "custom_branch_policies": true}}
+   JSON
+   gh api --method POST repos/gotempsh/temps/environments/sdk-stable/deployment-branch-policies \
+     -f name='v*.*.*' -f type=tag
+   ```
+
+3. **PyPI pending publishers** (allowed before the first upload; a pending
+   publisher does not reserve the name, so do it shortly before the tag). In
+   PyPI, open **Your account → Publishing** and add a GitHub publisher for each of
+   `temps-plugin-sdk` and `temps-workflows`: owner `gotempsh`, repository
+   `temps`, workflow `release.yml`, environment `sdk-beta`. Add a second one with
+   environment `sdk-stable`. The first `release.yml` upload creates the project.
+
+4. **npm and crates.io trusted publishers for existing packages.** For each
+   package, open **Settings → Trusted publishing** on npmjs.com (or **Settings →
+   Trusted Publishing** on crates.io), choose GitHub Actions and enter owner
+   `gotempsh`, repository `temps`, workflow `release.yml` and environment
+   `sdk-beta` (and a separate entry for `sdk-stable`). npmjs.com accepts several
+   publishers per package, but `npm trust github` only manages one; with a
+   single entry, leave the environment empty rather than picking one channel.
+   An npm configuration expires unless it publishes within 2 days. Add a
+   channel's entry no more than 2 days before the first tag that publishes on
+   that channel, and recreate it if it expired.
+
+5. **First publishes of never-published npm packages and crates.** npm and
+   crates.io allow trusted publishing only on a package that already exists, so
+   each needs one token-based upload. Publish the release run's own tested
+   artifacts, never a local build, so the registry bytes match what
+   `publish-sdks` verifies. On the first tag that selects them, `publish-sdks`
+   stops at the first package without a publisher. That failure is expected.
+   Then:
+
+   ```sh
+   TAG=v0.1.0-beta.63        # the server tag being released
+   RUN=$(gh run list --workflow release.yml --branch "$TAG" --limit 1 --json databaseId --jq '.[0].databaseId')
+   git fetch --tags origin && git switch --detach "$TAG"
+   gh run download "$RUN" -n sdk-packages -D sdk-artifacts
+   python3 scripts/sdk_release.py plan --tag "$TAG"     # selected keys, versions and channels
+
+   # npm, as an account with 2FA and publish rights on @temps-sdk.
+   # Use --tag latest instead of --tag beta for a stable server tag.
+   npm login
+   for key in sandbox workflows api; do
+     npm publish "sdk-artifacts/$key/package.tgz" --access public --tag beta --ignore-scripts
+   done
+
+   # crates.io, with a token scoped to publish-new for the three crates. Run it
+   # on Linux with the pinned toolchain: it repackages, refuses bytes that differ
+   # from the tested archive, publishes in dependency order and verifies them.
+   CARGO_REGISTRY_TOKEN=<token> python3 scripts/sdk_release.py publish --tag "$TAG" --kind crate --output sdk-artifacts
+   ```
+
+   Only packages in that tag's selection have artifacts, so publish each one with
+   the first tag that selects it. Then configure their trusted publishers (step 4)
+   and resume the release, which skips the byte-identical uploads and creates the
+   package tags:
+
+   ```sh
+   gh run rerun "$RUN" --failed
+   ```
+
+   These token-published versions have no npm provenance; every later version
+   gets it from trusted publishing. Revoke the crates.io token afterwards.
+
+6. **Go.** No registry account is needed. The workflow token creates
+   `sdks/go/workflows/v<version>`; check repository rulesets do not block it.
+
+Rust package verification also reported existing locked yanked dependencies
+(`chacha20 0.10.0`, `spin 0.9.8`); remediating them is separate from this
+lifecycle.
 
 Integrate the independent workflow security fixes before preparing the next
 workflow SDK versions in all four languages. This lifecycle change does not

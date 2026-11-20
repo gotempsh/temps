@@ -353,6 +353,7 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
             "ofrep_public_single",
             "ofrep_server_bulk",
             "ofrep_server_single",
+            "public_surveys",
             "list_analytics_ingest_keys",
             "record_event_metrics",
             "record_speed_metrics",
@@ -365,6 +366,10 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
             "upload_artifact_chunk",
             "upload_release_file",
         ],
+    ),
+    (
+        "free text typed by the project's visitors (open-text survey answers); read in the console, not passed through the chat",
+        &["list_survey_responses"],
     ),
     (
         "reassigns every user's rollout and split bucket for a flag, which silently invalidates a running experiment; an operator decision made in the console or CLI",
@@ -414,6 +419,8 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
             "get_data_import",
             "get_data_import_availability",
             "get_event_entries",
+            // Raw property values of visitors' events, e.g. the URLs they clicked.
+            "get_event_properties",
             "get_ingest_errors",
             "get_log_context",
             "get_preview_gateway_logs",

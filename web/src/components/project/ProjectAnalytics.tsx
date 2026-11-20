@@ -10,6 +10,16 @@ import { PageHeader } from '@/components/layout/PageContainer'
 
 import { AnalyticsTrafficChart } from '@/components/analytics/overview/AnalyticsTrafficChart'
 import { AnalyticsBreakdowns } from '@/components/analytics/overview/AnalyticsBreakdowns'
+import {
+  FileDownloadsCard,
+  NotFoundCard,
+  OutboundLinksCard,
+} from '@/components/analytics/overview/AutoEventsCards'
+import { ConversionsCard } from '@/components/analytics/overview/ConversionsCard'
+import {
+  CookielessFactLine,
+  VisitorIdentityCard,
+} from '@/components/analytics/VisitorIdentityCard'
 
 import { DateTimeRange } from '@/components/ui/date-time-range'
 
@@ -75,6 +85,7 @@ import { ApiTrafficTab } from '@/components/analytics/ApiTraffic'
 import { AnalyticsTrafficSettings } from '@/components/analytics/AnalyticsTrafficSettings'
 import { FunnelDetail } from '@/components/funnel/FunnelDetail'
 import { FunnelManagement } from '@/components/funnel/FunnelManagement'
+import { ProjectSurveys } from '@/components/project/surveys/ProjectSurveys'
 import { LiveVisitors } from '@/pages/LiveVisitors'
 import { AnalyticsOnboardingGate } from '@/components/analytics/AnalyticsOnboardingGate'
 import { RequestLogsRedirect } from '@/components/analytics/RequestLogsRedirect'
@@ -1037,6 +1048,8 @@ function SessionReplaysTab({ project }: SessionReplaysTabProps) {
         onRefresh={advance}
       />
 
+      <CookielessFactLine project={project} view="replays" />
+
       {/* Session Replays Component */}
       <SessionReplays
         project={project}
@@ -1085,6 +1098,8 @@ function JourneyTab({ project }: JourneyTabProps) {
         onRefresh={advance}
       />
 
+      <CookielessFactLine project={project} view="journey" />
+
       <PageFlow
         project={project}
         startDate={startDate}
@@ -1112,6 +1127,7 @@ export function ProjectAnalytics({ project }: ProjectAnalyticsProps) {
         element={<RequestLogsRedirect projectSlug={project.slug} />}
       />
       <Route path="funnels/*" element={<FunnelAnalytics project={project} />} />
+      <Route path="surveys/*" element={<ProjectSurveys project={project} />} />
       <Route
         path="live-visitors"
         element={
@@ -1147,7 +1163,12 @@ export function ProjectAnalytics({ project }: ProjectAnalyticsProps) {
       <Route path="setup" element={<AnalyticsSetup project={project} />} />
       <Route
         path="settings"
-        element={<AnalyticsTrafficSettings project={project} />}
+        element={
+          <div className="space-y-6">
+            <AnalyticsTrafficSettings project={project} />
+            <VisitorIdentityCard project={project} />
+          </div>
+        }
       />
       <Route
         path="live"
@@ -1380,6 +1401,12 @@ export function ProjectAnalyticsOverview({
               />
             )}
           </div>
+          <ConversionsCard
+            project={project}
+            startDate={startDate}
+            endDate={endDate}
+            environment={selectedEnvironment}
+          />
           <AnalyticsBreakdowns
             traffic={
               <div className="grid min-w-0 grid-cols-1 gap-4 md:grid-cols-2">
@@ -1456,6 +1483,24 @@ export function ProjectAnalyticsOverview({
             events={
               <div className="grid min-w-0 grid-cols-1 gap-4 md:grid-cols-2">
                 <EventsChart
+                  project={project}
+                  startDate={startDate}
+                  endDate={endDate}
+                  environment={selectedEnvironment}
+                />
+                <NotFoundCard
+                  project={project}
+                  startDate={startDate}
+                  endDate={endDate}
+                  environment={selectedEnvironment}
+                />
+                <OutboundLinksCard
+                  project={project}
+                  startDate={startDate}
+                  endDate={endDate}
+                  environment={selectedEnvironment}
+                />
+                <FileDownloadsCard
                   project={project}
                   startDate={startDate}
                   endDate={endDate}
