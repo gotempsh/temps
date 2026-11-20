@@ -17,6 +17,7 @@ import {
   hasTelegramConfigChanges,
   parseTopicId,
   buildTelegramConfigUpdate,
+  telegramChatChanges,
   KEEP_STORED_SECRET,
   addTelegramProvider,
   updateTelegramProviderAction,
@@ -291,11 +292,31 @@ describe('telegram helpers', () => {
 
   test('buildTelegramConfigUpdate keeps the stored token when --bot-token is omitted', () => {
     const current = { bot_token: '***', chat_id: '-1001234567890', message_thread_id: 12 }
-    expect(buildTelegramConfigUpdate({ chatId: '@alerts' }, undefined, current)).toEqual({
+    expect(buildTelegramConfigUpdate({ chatId: '-1001234567890' }, undefined, current)).toEqual({
       bot_token: KEEP_STORED_SECRET,
-      chat_id: '@alerts',
+      chat_id: '-1001234567890',
       message_thread_id: 12,
     })
+  })
+
+  test('buildTelegramConfigUpdate clears the topic when --chat-id moves to another chat', () => {
+    const current = { bot_token: '***', chat_id: -1001234567890, message_thread_id: 12 }
+    expect(buildTelegramConfigUpdate({ chatId: '@alerts' }, undefined, current).message_thread_id).toBeNull()
+    // An explicit topic for the new chat is used as given.
+    expect(buildTelegramConfigUpdate({ chatId: '@alerts' }, 7, current).message_thread_id).toBe(7)
+    // Token-only and topic-only updates keep the stored chat's topic.
+    expect(buildTelegramConfigUpdate({ botToken: '123:new' }, undefined, current).message_thread_id).toBe(12)
+    expect(buildTelegramConfigUpdate({}, 9, current).message_thread_id).toBe(9)
+    // The same chat, numeric in storage and a string on the command line.
+    expect(buildTelegramConfigUpdate({ chatId: ' -1001234567890 ' }, undefined, current).message_thread_id).toBe(12)
+  })
+
+  test('telegramChatChanges only reports a different chat', () => {
+    const current = { bot_token: '***', chat_id: '-1001' }
+    expect(telegramChatChanges(undefined, current)).toBe(false)
+    expect(telegramChatChanges('-1001', current)).toBe(false)
+    expect(telegramChatChanges('-1002', current)).toBe(true)
+    expect(telegramChatChanges('-1002', null)).toBe(true)
   })
 
   test('buildTelegramConfigUpdate never echoes back a revealed token from the current config', () => {

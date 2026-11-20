@@ -315,20 +315,29 @@ export function parseTopicId(value: string | undefined): number | null | undefin
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : 'invalid'
 }
 
+/** Whether --chat-id names a different chat from the stored one. */
+export function telegramChatChanges(chatId: string | undefined, current: CurrentTelegramConfig | null): boolean {
+  if (chatId === undefined) return false
+  return chatId.trim() !== String(current?.chat_id ?? '').trim()
+}
+
 /**
  * Merges --bot-token/--chat-id/--topic-id over the provider's existing config.
  * The bot token is never read back: when --bot-token is omitted the masked
  * placeholder is sent, which the server resolves to the stored token.
+ * A topic ID only means something inside its own forum chat, so moving to
+ * another chat without --topic-id clears the stored topic.
  */
 export function buildTelegramConfigUpdate(
   options: { botToken?: string; chatId?: string },
   topicId: number | null | undefined,
   current: CurrentTelegramConfig | null,
 ): TelegramProviderConfig {
+  const keptTopic = telegramChatChanges(options.chatId, current) ? null : (current?.message_thread_id ?? null)
   return {
     bot_token: options.botToken ?? KEEP_STORED_SECRET,
     chat_id: options.chatId ?? (current?.chat_id !== undefined ? String(current.chat_id) : ''),
-    message_thread_id: topicId !== undefined ? topicId : (current?.message_thread_id ?? null),
+    message_thread_id: topicId !== undefined ? topicId : keptTopic,
   }
 }
 
@@ -1104,6 +1113,9 @@ export async function updateTelegramProviderAction(
   }
 
   success(`Telegram provider "${updated?.name ?? provider.name}" updated successfully`)
+  if (topicId === undefined && currentConfig?.message_thread_id != null && telegramChatChanges(options.chatId, currentConfig)) {
+    info(`Cleared forum topic ${currentConfig.message_thread_id}: it belonged to the previous chat. Pass --topic-id to post to a topic in the new one.`)
+  }
 }
 
 async function enableProvider(options: EnableDisableOptions): Promise<void> {
