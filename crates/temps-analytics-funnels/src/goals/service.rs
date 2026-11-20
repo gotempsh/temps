@@ -831,7 +831,9 @@ mod tests {
             false,
         )
         .await;
-        // Two purchases by one visitor, one with an unparseable amount.
+        // Three purchases by one visitor: one with an unparseable amount and
+        // one whose amount would overflow the sum, both counted as purchases
+        // without revenue rather than failing the report.
         let purchase = |amount: &str| Some(serde_json::json!({ "amount": amount }));
         create_event(
             db.as_ref(),
@@ -866,6 +868,19 @@ mod tests {
             Some("purchase"),
             "/checkout",
             purchase("19.5"),
+            false,
+        )
+        .await;
+        let huge = "9".repeat(400);
+        create_event(
+            db.as_ref(),
+            project_id,
+            env,
+            ads,
+            "custom",
+            Some("purchase"),
+            "/checkout",
+            purchase(&huge),
             false,
         )
         .await;
@@ -907,7 +922,7 @@ mod tests {
             stats.goals.iter().map(|g| (g.goal_id, g)).collect();
 
         let p = by_id[&purchase_goal.id];
-        assert_eq!((p.unique_conversions, p.total_conversions), (2, 3));
+        assert_eq!((p.unique_conversions, p.total_conversions), (2, 4));
         assert!((p.conversion_rate - 66.666).abs() < 0.01);
         assert_eq!(
             p.revenue,
@@ -960,7 +975,7 @@ mod tests {
             rows,
             // Equal unique conversions; the second purchase puts Paid Search first.
             vec![
-                (Some("Paid Search"), 1, 1, 2, 100.0),
+                (Some("Paid Search"), 1, 1, 3, 100.0),
                 (Some("Email"), 2, 1, 1, 50.0),
             ]
         );

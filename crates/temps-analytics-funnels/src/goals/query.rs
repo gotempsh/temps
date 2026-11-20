@@ -133,13 +133,15 @@ pub(crate) fn goal_condition(goal: &AnalyticsGoal, params: &mut Params) -> Optio
 }
 
 /// Numeric revenue of a row, `NULL` when the property is missing or is not a
-/// plain decimal number (so one malformed event cannot fail the report).
+/// plain decimal number of at most 15 integer and 6 decimal digits, so one
+/// malformed or absurdly large value (which would overflow the `float8` sum)
+/// cannot fail the report.
 pub(crate) fn revenue_expression(goal: &AnalyticsGoal, params: &mut Params) -> String {
     match &goal.revenue_property {
         Some(property) => {
             let key = params.push(property.clone());
             format!(
-                "CASE WHEN (e.props ->> {key}::text) ~ '^-?[0-9]+(\\.[0-9]+)?$' \
+                "CASE WHEN (e.props ->> {key}::text) ~ '^-?[0-9]{{1,15}}(\\.[0-9]{{1,6}})?$' \
                  THEN (e.props ->> {key}::text)::numeric END"
             )
         }
@@ -364,7 +366,7 @@ mod tests {
         g.revenue_currency = Some("EUR".into());
         let mut params = Params::default();
         let sql = revenue_expression(&g, &mut params);
-        assert!(sql.contains("(e.props ->> $1::text) ~ '^-?[0-9]+(\\.[0-9]+)?$'"));
+        assert!(sql.contains("(e.props ->> $1::text) ~ '^-?[0-9]{1,15}(\\.[0-9]{1,6})?$'"));
         assert_eq!(params.values, vec![Value::from("amount")]);
         assert_eq!(
             revenue_expression(&goal(AnalyticsGoalKind::Event), &mut Params::default()),
