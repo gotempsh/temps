@@ -169,6 +169,15 @@ The gaps, most important first.
   bucket counts only lines that carry the field, so no field is a gap, not
   zero. A scanned count stops at 5,000 lines and reports from when it
   counted, so a chart never draws zero for a period nobody counted.
+- **Edits during a tick.** A log rule acts on a breach only if the saved
+  search's query still has the fingerprint the count was taken under, so
+  a query edited mid-count neither fires nor starts a breach. A recovery
+  resolves its alarm only after "ok" is stored for the revision the tick
+  read. A resolve the database refuses is retried every cycle until it
+  lands or the alarm is gone. An edit drops the rule's cached anomaly
+  baselines with its breach timers; a currency check that fails keeps
+  them. Ingest authentication has a 30 s deadline, far inside the 5
+  minutes a revoked key's gate stays closed.
 - **Console.** Saved searches and ingest keys are reached from the logs
   page header, scoped to the service the page is filtered to. A log alert
   is a choice in the existing alert form. There is no CLI for alert rules

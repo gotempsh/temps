@@ -73,4 +73,14 @@ pub trait LogSeriesSource: Send + Sync {
         start: DateTime<Utc>,
         end: DateTime<Utc>,
     ) -> Result<LogSeriesSample, LogSeriesError>;
+
+    /// The [`LogSeriesSample::query_fingerprint`] the saved search has now,
+    /// without counting anything. The evaluator compares it with the sample
+    /// it is about to act on, so a query edited while lines were being
+    /// counted cannot fire on the old predicate.
+    async fn current_query_fingerprint(
+        &self,
+        project_id: i32,
+        saved_search_id: i32,
+    ) -> Result<u64, LogSeriesError>;
 }

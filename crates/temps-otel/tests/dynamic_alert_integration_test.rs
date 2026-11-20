@@ -834,6 +834,14 @@ impl temps_core::log_series::LogSeriesSource for FixedLogCount {
             query_fingerprint: 1,
         })
     }
+
+    async fn current_query_fingerprint(
+        &self,
+        _project_id: i32,
+        _saved_search_id: i32,
+    ) -> Result<u64, temps_core::log_series::LogSeriesError> {
+        Ok(1)
+    }
 }
 
 async fn seed_saved_search(db: &sea_orm::DatabaseConnection, project_id: i32, name: &str) -> i32 {
@@ -977,7 +985,7 @@ async fn test_log_alert_refuses_another_projects_saved_search() {
 /// A log counter that edits its rule while counting, the way a PATCH can
 /// land while the evaluator waits for the log store.
 struct EditingLogCount {
-    count: u64,
+    count: std::sync::atomic::AtomicU64,
     edit: tokio::sync::Mutex<Option<(Arc<MetricAlertService>, i32, i32)>>,
 }
 
@@ -1015,10 +1023,18 @@ impl temps_core::log_series::LogSeriesSource for EditingLogCount {
                 .expect("raise the threshold mid-tick");
         }
         Ok(temps_core::log_series::LogSeriesSample {
-            count: self.count,
+            count: self.count.load(std::sync::atomic::Ordering::Relaxed),
             saturated: false,
             query_fingerprint: 1,
         })
+    }
+
+    async fn current_query_fingerprint(
+        &self,
+        _project_id: i32,
+        _saved_search_id: i32,
+    ) -> Result<u64, temps_core::log_series::LogSeriesError> {
+        Ok(1)
     }
 }
 
@@ -1056,7 +1072,7 @@ async fn test_a_threshold_raised_mid_tick_does_not_fire_the_old_verdict() {
     let saved_search_id = seed_saved_search(&ctx.db, ctx.project_id, "Payment failures").await;
     let rule_id = create_log_rule(&ctx, saved_search_id).await;
     let counter = Arc::new(EditingLogCount {
-        count: 42,
+        count: std::sync::atomic::AtomicU64::new(42),
         edit: tokio::sync::Mutex::new(None),
     });
     ctx.evaluator.set_log_series(counter.clone());
@@ -1086,6 +1102,188 @@ async fn test_a_threshold_raised_mid_tick_does_not_fire_the_old_verdict() {
     assert!(alarms_for(&ctx.db, ctx.project_id).await.is_empty());
 }
 
+/// A recovery read before an edit must not resolve the alarm: the edit
+/// discards that tick's "ok", so resolving would leave the rule firing with
+/// no alarm behind it. The next tick, under the new configuration, resolves.
+#[tokio::test]
+async fn test_a_recovery_read_before_an_edit_does_not_resolve_the_alarm() {
+    let Some(ctx) = setup_evaluator().await else {
+        return;
+    };
+    let saved_search_id = seed_saved_search(&ctx.db, ctx.project_id, "Payment failures").await;
+    let rule_id = create_log_rule(&ctx, saved_search_id).await;
+    let counter = Arc::new(EditingLogCount {
+        count: std::sync::atomic::AtomicU64::new(42),
+        edit: tokio::sync::Mutex::new(None),
+    });
+    ctx.evaluator.set_log_series(counter.clone());
+
+    ctx.evaluator.run_cycle().await.expect("cycle 1 arms");
+    tokio::time::sleep(BREACH_PERSIST_WAIT).await;
+    ctx.evaluator.run_cycle().await.expect("cycle 2 fires");
+    let alarms = alarms_for(&ctx.db, ctx.project_id).await;
+    assert_eq!(alarms.len(), 1);
+    assert_eq!(alarms[0].status, AlarmStatus::Firing.as_str());
+
+    // The count falls back, and the rule is edited while it is counted.
+    counter.count.store(5, std::sync::atomic::Ordering::Relaxed);
+    *counter.edit.lock().await = Some((ctx.alert_service.clone(), ctx.project_id, rule_id));
+    ctx.evaluator
+        .run_cycle()
+        .await
+        .expect("cycle 3, stale recovery");
+    let alarms = alarms_for(&ctx.db, ctx.project_id).await;
+    assert_eq!(
+        alarms[0].status,
+        AlarmStatus::Firing.as_str(),
+        "a discarded recovery leaves the alarm open"
+    );
+    let rule = ctx
+        .alert_service
+        .get(ctx.project_id, rule_id)
+        .await
+        .expect("rule");
+    assert_eq!(rule.last_state, "firing", "state and alarm agree");
+
+    ctx.evaluator.run_cycle().await.expect("cycle 4 resolves");
+    let alarms = alarms_for(&ctx.db, ctx.project_id).await;
+    assert_eq!(alarms[0].status, AlarmStatus::Resolved.as_str());
+    let rule = ctx
+        .alert_service
+        .get(ctx.project_id, rule_id)
+        .await
+        .expect("rule");
+    assert_eq!(rule.last_state, "ok");
+}
+
+/// A resolve that fails (the database refuses the write) is retried on the
+/// next cycle, although the rule has already recorded "ok" and stopped
+/// tracking the alarm.
+#[tokio::test]
+async fn test_a_failed_resolve_is_retried_next_cycle() {
+    use sea_orm::ConnectionTrait;
+    let Some(ctx) = setup_evaluator().await else {
+        return;
+    };
+    let saved_search_id = seed_saved_search(&ctx.db, ctx.project_id, "Payment failures").await;
+    let rule_id = create_log_rule(&ctx, saved_search_id).await;
+    let counter = Arc::new(FixedLogCount(std::sync::atomic::AtomicU64::new(42)));
+    ctx.evaluator.set_log_series(counter.clone());
+
+    ctx.evaluator.run_cycle().await.expect("cycle 1 arms");
+    tokio::time::sleep(BREACH_PERSIST_WAIT).await;
+    ctx.evaluator.run_cycle().await.expect("cycle 2 fires");
+    assert_eq!(alarms_for(&ctx.db, ctx.project_id).await.len(), 1);
+
+    // Resolving is refused while this constraint exists. This test's schema
+    // is its own, so nothing else sees it.
+    ctx.db
+        .execute_unprepared(
+            "ALTER TABLE alarms ADD CONSTRAINT test_refuse_resolve \
+             CHECK (status <> 'resolved') NOT VALID",
+        )
+        .await
+        .expect("add constraint");
+    counter.0.store(5, std::sync::atomic::Ordering::Relaxed);
+    ctx.evaluator
+        .run_cycle()
+        .await
+        .expect("cycle 3, resolve fails");
+    let alarms = alarms_for(&ctx.db, ctx.project_id).await;
+    assert_eq!(alarms[0].status, AlarmStatus::Firing.as_str());
+    let rule = ctx
+        .alert_service
+        .get(ctx.project_id, rule_id)
+        .await
+        .expect("rule");
+    assert_eq!(rule.last_state, "ok", "the rule itself has recovered");
+
+    ctx.db
+        .execute_unprepared("ALTER TABLE alarms DROP CONSTRAINT test_refuse_resolve")
+        .await
+        .expect("drop constraint");
+    ctx.evaluator.run_cycle().await.expect("cycle 4 retries");
+    let alarms = alarms_for(&ctx.db, ctx.project_id).await;
+    assert_eq!(
+        alarms[0].status,
+        AlarmStatus::Resolved.as_str(),
+        "the failed resolve was retried"
+    );
+}
+
+/// A counter whose saved search is edited while it counts: the sample
+/// carries the fingerprint it counted, the search now has another.
+struct QueryEditedWhileCounting {
+    counted: std::sync::atomic::AtomicU64,
+    current: std::sync::atomic::AtomicU64,
+}
+
+#[async_trait::async_trait]
+impl temps_core::log_series::LogSeriesSource for QueryEditedWhileCounting {
+    async fn count_matching(
+        &self,
+        _project_id: i32,
+        _saved_search_id: i32,
+        _start: chrono::DateTime<Utc>,
+        _end: chrono::DateTime<Utc>,
+    ) -> Result<temps_core::log_series::LogSeriesSample, temps_core::log_series::LogSeriesError>
+    {
+        Ok(temps_core::log_series::LogSeriesSample {
+            count: 42,
+            saturated: false,
+            query_fingerprint: self.counted.load(std::sync::atomic::Ordering::Relaxed),
+        })
+    }
+
+    async fn current_query_fingerprint(
+        &self,
+        _project_id: i32,
+        _saved_search_id: i32,
+    ) -> Result<u64, temps_core::log_series::LogSeriesError> {
+        Ok(self.current.load(std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+/// A count taken under the old query must not fire once the query has
+/// changed; the new query has to hold for `for_duration` itself.
+#[tokio::test]
+async fn test_a_query_edited_while_counting_does_not_fire_the_old_count() {
+    let Some(ctx) = setup_evaluator().await else {
+        return;
+    };
+    let saved_search_id = seed_saved_search(&ctx.db, ctx.project_id, "Payment failures").await;
+    create_log_rule(&ctx, saved_search_id).await;
+    let counter = Arc::new(QueryEditedWhileCounting {
+        counted: std::sync::atomic::AtomicU64::new(1),
+        current: std::sync::atomic::AtomicU64::new(1),
+    });
+    ctx.evaluator.set_log_series(counter.clone());
+
+    ctx.evaluator.run_cycle().await.expect("cycle 1 arms");
+    tokio::time::sleep(BREACH_PERSIST_WAIT).await;
+    counter
+        .current
+        .store(2, std::sync::atomic::Ordering::Relaxed);
+    ctx.evaluator
+        .run_cycle()
+        .await
+        .expect("cycle 2, stale count");
+    assert!(
+        alarms_for(&ctx.db, ctx.project_id).await.is_empty(),
+        "the old query's count does not fire"
+    );
+
+    // Counting the new query restarts the breach.
+    counter
+        .counted
+        .store(2, std::sync::atomic::Ordering::Relaxed);
+    ctx.evaluator.run_cycle().await.expect("cycle 3 arms anew");
+    assert!(alarms_for(&ctx.db, ctx.project_id).await.is_empty());
+    tokio::time::sleep(BREACH_PERSIST_WAIT).await;
+    ctx.evaluator.run_cycle().await.expect("cycle 4 fires");
+    assert_eq!(alarms_for(&ctx.db, ctx.project_id).await.len(), 1);
+}
+
 /// A log counter whose saved-search query fingerprint the test controls.
 struct FingerprintedLogCount(std::sync::atomic::AtomicU64);
 
@@ -1104,6 +1302,14 @@ impl temps_core::log_series::LogSeriesSource for FingerprintedLogCount {
             saturated: false,
             query_fingerprint: self.0.load(std::sync::atomic::Ordering::Relaxed),
         })
+    }
+
+    async fn current_query_fingerprint(
+        &self,
+        _project_id: i32,
+        _saved_search_id: i32,
+    ) -> Result<u64, temps_core::log_series::LogSeriesError> {
+        Ok(self.0.load(std::sync::atomic::Ordering::Relaxed))
     }
 }
 

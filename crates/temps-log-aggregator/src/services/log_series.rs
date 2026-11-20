@@ -661,23 +661,7 @@ impl LogSeriesSource for LogSeriesService {
         start: DateTime<Utc>,
         end: DateTime<Utc>,
     ) -> Result<LogSeriesSample, LogSeriesError> {
-        let query = self
-            .saved_searches
-            .query_for(project_id, saved_search_id)
-            .await
-            .map_err(|e| match e {
-                LogAggregatorError::SavedSearchNotFound { .. } => {
-                    LogSeriesError::SavedSearchNotFound {
-                        project_id,
-                        saved_search_id,
-                    }
-                }
-                other => LogSeriesError::Query {
-                    project_id,
-                    saved_search_id,
-                    reason: other.to_string(),
-                },
-            })?;
+        let query = self.alert_query(project_id, saved_search_id).await?;
         let mut sample = self
             .count(project_id, &query, start, end)
             .await
@@ -695,6 +679,41 @@ impl LogSeriesSource for LogSeriesService {
             "counted a saved log search for an alert"
         );
         Ok(sample)
+    }
+
+    async fn current_query_fingerprint(
+        &self,
+        project_id: i32,
+        saved_search_id: i32,
+    ) -> Result<u64, LogSeriesError> {
+        let query = self.alert_query(project_id, saved_search_id).await?;
+        Ok(query_fingerprint(&query))
+    }
+}
+
+impl LogSeriesService {
+    /// The saved search an alert counts, with its errors in the alert's terms.
+    async fn alert_query(
+        &self,
+        project_id: i32,
+        saved_search_id: i32,
+    ) -> Result<SavedSearchQuery, LogSeriesError> {
+        self.saved_searches
+            .query_for(project_id, saved_search_id)
+            .await
+            .map_err(|e| match e {
+                LogAggregatorError::SavedSearchNotFound { .. } => {
+                    LogSeriesError::SavedSearchNotFound {
+                        project_id,
+                        saved_search_id,
+                    }
+                }
+                other => LogSeriesError::Query {
+                    project_id,
+                    saved_search_id,
+                    reason: other.to_string(),
+                },
+            })
     }
 }
 
@@ -1335,6 +1354,78 @@ mod tests {
             Arc::new(Coverage(false)),
             db,
         )
+    }
+
+    fn saved_search_service(
+        rows: Vec<temps_entities::log_saved_searches::Model>,
+    ) -> LogSeriesService {
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results([rows])
+                .into_connection(),
+        );
+        LogSeriesService::new(
+            Arc::new(crate::services::LogSavedSearchService::new(db.clone())),
+            Arc::new(ScriptedStore::new(vec![])),
+            Arc::new(NoLineIndex::new("no line index in this test")),
+            Arc::new(Coverage(false)),
+            db,
+        )
+    }
+
+    fn saved_search_row(query: serde_json::Value) -> temps_entities::log_saved_searches::Model {
+        temps_entities::log_saved_searches::Model {
+            id: 11,
+            project_id: 7,
+            name: "Payment failures".to_string(),
+            description: None,
+            query,
+            time_range: "1h".to_string(),
+            pinned: false,
+            created_by: None,
+            created_at: t0(),
+            updated_at: t0(),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_current_fingerprint_follows_the_query_not_the_name() {
+        let first = saved_search_service(vec![saved_search_row(
+            serde_json::json!({ "text": "payment failed" }),
+        )])
+        .current_query_fingerprint(7, 11)
+        .await
+        .expect("fingerprint");
+        let mut renamed = saved_search_row(serde_json::json!({ "text": "payment failed" }));
+        renamed.name = "Renamed".to_string();
+        renamed.pinned = true;
+        let same = saved_search_service(vec![renamed])
+            .current_query_fingerprint(7, 11)
+            .await
+            .expect("fingerprint");
+        let edited = saved_search_service(vec![saved_search_row(
+            serde_json::json!({ "text": "payment declined" }),
+        )])
+        .current_query_fingerprint(7, 11)
+        .await
+        .expect("fingerprint");
+        assert_eq!(first, same, "renaming or pinning keeps the fingerprint");
+        assert_ne!(first, edited, "editing the query changes it");
+    }
+
+    #[tokio::test]
+    async fn the_current_fingerprint_of_a_missing_search_names_it() {
+        let error = saved_search_service(vec![])
+            .current_query_fingerprint(7, 11)
+            .await
+            .expect_err("missing");
+        assert!(matches!(
+            error,
+            LogSeriesError::SavedSearchNotFound {
+                project_id: 7,
+                saved_search_id: 11,
+            }
+        ));
     }
 
     #[tokio::test]
