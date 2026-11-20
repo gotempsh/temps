@@ -226,11 +226,6 @@ impl LogSeriesService {
         }
     }
 
-    /// Count the lines of `query` in `[start, end)` for one project.
-    ///
-    /// The scope is built here, from the project alone: a saved search is
-    /// project-scoped, so counting it can never read another project's
-    /// lines even though no HTTP caller authorized this read.
     /// The project-scoped store query for a saved search over a window.
     ///
     /// The scope is built here, from the project alone: a saved search is
@@ -380,6 +375,17 @@ impl LogSeriesService {
             }
             if let Some(reason) = index_unavailable {
                 return Err(LogAggregatorError::LineIndex { reason });
+            }
+            // A chunk the index has not caught up with would silently drop
+            // its lines from every aggregate, and a numeric series cannot be
+            // scanned instead: say so until the reindexer catches up.
+            if self.index_incomplete(&log_query).await {
+                return Err(LogAggregatorError::LineIndex {
+                    reason: "some log chunks in this window are not indexed yet, so a numeric \
+                             series would leave their lines out; it is available again once \
+                             the line index catches up"
+                        .to_string(),
+                });
             }
             return self
                 .numeric_series(log_query, origin, end, bucket_secs, &metric)
@@ -1550,6 +1556,27 @@ mod tests {
             .parse()
             .expect("number");
         assert!(0.0 > floor, "a recorded zero still contributes");
+    }
+
+    #[tokio::test]
+    async fn a_numeric_series_is_refused_while_a_chunk_in_the_window_is_not_indexed() {
+        let index = FakeIndex {
+            histogram: vec![],
+            aggregates: std::sync::Mutex::new(vec![(4, 120.0)]),
+            seen: Default::default(),
+        };
+        let error = series_service_with(Arc::new(ScriptedStore::new(vec![])), Some(index), true)
+            .series(
+                7,
+                &SavedSearchQuery::default(),
+                request(1, Metric::P95("duration_ms".to_string())),
+            )
+            .await
+            .expect_err("an aggregate over part of the lines is not returned");
+        assert!(
+            matches!(&error, LogAggregatorError::LineIndex { reason } if reason.contains("not indexed yet")),
+            "{error}"
+        );
     }
 
     #[tokio::test]

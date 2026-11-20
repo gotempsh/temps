@@ -13171,7 +13171,11 @@ export const searchGlobalLogsMutation = (options?: Partial<Options<SearchGlobalL
  * Ingest newline-delimited JSON log lines with a log ingest key.
  *
  * One JSON object per line; see the logs documentation for the keys read.
- * A batch is stored whole or refused whole.
+ * A batch is parsed and charged to the budget whole before anything is
+ * stored, so a malformed or over-budget batch stores nothing. Storage is
+ * at least once: if storing fails part-way (a full disk), the lines before
+ * the failure are kept and counted against the key, the request fails, and
+ * a collector that resends the batch stores those lines again.
  */
 export const ingestLogsMutation = (options?: Partial<Options<IngestLogsData>>): UseMutationOptions<IngestLogsResponse, IngestLogsError, Options<IngestLogsData>> => {
     const mutationOptions: UseMutationOptions<IngestLogsResponse, IngestLogsError, Options<IngestLogsData>> = {

@@ -308,7 +308,7 @@ A dashboard tile can chart a saved search instead of a metric. In the dashboard 
 - **Matching lines** per bucket.
 - **Average**, **sum**, **maximum**, **p50**, **p95**, **p99** or **distinct values** of a numeric attribute, such as `duration_ms`.
 
-Counts come from the line index. A search with a text needle, or an install without a line index, is counted by scanning at most 5,000 lines, newest first; older buckets are left empty and the tile says from when it counted, so the chart never shows zero for a period nobody counted. A numeric attribute needs the line index and a search without a text needle.
+Counts come from the line index. A search with a text needle, or an install without a line index, is counted by scanning at most 5,000 lines, newest first; older buckets are left empty and the tile says from when it counted, so the chart never shows zero for a period nobody counted. A numeric attribute needs the line index and a search without a text needle. While some lines in the window are not indexed yet (the index fell behind and is catching up), counts are taken by scanning instead, and a numeric tile shows that it is unavailable rather than an average over part of the lines.
 
 ```bash
 # Matching lines per 5 minutes over the last day

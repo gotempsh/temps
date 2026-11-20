@@ -129301,7 +129301,7 @@
     },
     "/logs/ingest": {
       "post": {
-        "description": "One JSON object per line; see the logs documentation for the keys read.\nA batch is stored whole or refused whole.",
+        "description": "One JSON object per line; see the logs documentation for the keys read.\nA batch is parsed and charged to the budget whole before anything is\nstored, so a malformed or over-budget batch stores nothing. Storage is\nat least once: if storing fails part-way (a full disk), the lines before\nthe failure are kept and counted against the key, the request fails, and\na collector that resends the batch stores those lines again.",
         "operationId": "ingest_logs",
         "requestBody": {
           "content": {
