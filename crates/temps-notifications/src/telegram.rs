@@ -31,6 +31,9 @@ const TELEGRAM_API_BASE: &str = "https://api.telegram.org";
 
 const TELEGRAM_TIMEOUT_SECS: u64 = 30;
 
+/// Stands in for the bot token wherever response text would have shown it.
+const REDACTED_TOKEN: &str = "<redacted>";
+
 /// Visible-text budget. Telegram rejects messages longer than 4096 characters
 /// after entity parsing; these per-part bounds keep the worst case
 /// (title + message + every metadata row + link + severity line) under it.
@@ -217,6 +220,24 @@ impl TelegramProvider {
 
     fn method_url(&self, method: &str) -> String {
         format!("{}/bot{}/{}", self.api_base(), self.token(), method)
+    }
+
+    /// Remove the bot token from text Telegram (or a proxy in front of it)
+    /// sent back, before any of it reaches an error, a log or the console:
+    /// an error page can echo the request path, which carries the token.
+    fn redact_token(&self, text: &str) -> String {
+        let token = self.token();
+        let mut out = text.to_string();
+        if !token.is_empty() {
+            out = out.replace(token, REDACTED_TOKEN);
+        }
+        // The secret half alone is enough to use the bot.
+        if let Some((_, secret)) = token.split_once(':') {
+            if !secret.is_empty() {
+                out = out.replace(secret, REDACTED_TOKEN);
+            }
+        }
+        out
     }
 
     /// Check the configuration shape before anything is stored or sent.
@@ -451,6 +472,8 @@ impl TelegramProvider {
             };
             (error, RetryAdvice::Never)
         })?;
+        // Before parsing, so neither the excerpt nor `description` can carry it.
+        let body = self.redact_token(&body);
 
         let parsed: TelegramApiResponse = serde_json::from_str(&body).map_err(|e| {
             let error = TelegramError::InvalidResponse {
@@ -1091,6 +1114,44 @@ mod tests {
             ]
         );
         assert!(retry.max_delay <= std::time::Duration::from_secs(10));
+    }
+
+    #[tokio::test]
+    async fn response_text_that_echoes_the_token_is_redacted() {
+        // A gateway error page quoting the request path.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(404).set_body_string(format!(
+                "<html>Not Found: POST /bot{TOKEN}/sendMessage</html>"
+            )))
+            .mount(&server)
+            .await;
+        let message = mock_provider(&server, "123")
+            .send_test(&Notification::new("t", "m"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("HTTP 404"), "{message}");
+        assert!(message.contains("/bot<redacted>/sendMessage"), "{message}");
+        assert!(!message.contains("AAExampleSecretToken"), "{message}");
+
+        // Telegram's own description, quoting only the secret half.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(rejection(
+                400,
+                "Bad Request: chat not found (token AAExampleSecretToken_value-01)",
+            ))
+            .mount(&server)
+            .await;
+        let message = mock_provider(&server, "123")
+            .send_test(&Notification::new("t", "m"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("Bad Request: chat not found"), "{message}");
+        assert!(message.contains("Check the chat ID"), "{message}");
+        assert!(!message.contains("AAExampleSecretToken"), "{message}");
     }
 
     #[tokio::test]
