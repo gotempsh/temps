@@ -1043,6 +1043,40 @@ const { data } = await fetch(
 
 `apdex_threshold_ms` must be greater than 0 and at most 600000 (ten minutes); the API defaults it to 500.
 
+### Trends and Regressions After a Deployment {{ anchor: true, id: 'operation-trends' }}
+
+Every complete hour, Temps keeps one point per operation: calls, errors and the p50, p95 and p99 latency of that hour. The trend button at the end of each row of **Traces → Operations** draws the last 14 days of p95 and p50, with the deployments that went live in that time as markers.
+
+The **Did a deployment slow anything down?** card above the table picks a deployment (the latest one by default) and compares each operation's p95 in the day after it went live with the week before it:
+
+- The week before gives a band: the median of the hourly p95s and their spread, the same robust model the anomaly alert rules use.
+- An operation is **slower** when its median hourly p95 after the deployment is more than three spreads above the band and at least 20% higher; **faster** in the opposite case. A small wobble on a very steady operation is not reported.
+- The hour the deployment went live in belongs to neither side. An operation needs 8 hours of history before and 2 complete hours after to be judged; the card counts the ones still waiting.
+
+Span names are chosen by your code, so the history keeps at most 200 operations per project and hour, those with the most total time. How many did not fit in the last hour is shown under the trend; they still appear in the operations table, which reads spans directly. History is kept for 30 days and is rolled up every 10 minutes, one complete hour at a time, starting with the last 24 hours.
+
+<CodeGroup title="Trends and Regressions">
+```bash {{ title: 'CLI' }}
+# One operation, day by day, with deployments
+temps traces trend --project-id 42 --service checkout-api --operation "GET /cart"
+
+# What changed after deployment 812
+temps traces regressions --project-id 42 --deployment-id 812
+```
+
+```typescript {{ title: 'API' }}
+const trend = await fetch(
+  'https://your-temps-instance.com/api/otel/operations/trend?project_id=42&service_name=checkout-api&span_name=GET%20%2Fcart',
+  { headers: { 'Authorization': `Bearer ${API_KEY}` } }
+).then(r => r.json());
+
+const changes = await fetch(
+  'https://your-temps-instance.com/api/otel/operations/regressions?project_id=42&deployment_id=812',
+  { headers: { 'Authorization': `Bearer ${API_KEY}` } }
+).then(r => r.json());
+```
+</CodeGroup>
+
 ## Additional Resources
 
 <div className="not-prose">

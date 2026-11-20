@@ -6,8 +6,8 @@ Proposed — 2026-11-19. Being implemented in the order of the Decision
 section. D1.1 (bulk actions), D1.2 (merge and split), D1.3 (ignore
 until), D1.4 (inbound filters), D1.5 (resolve in the next release),
 D1.6 (assignment), D1.7 (comments and activity) and D1.8 (saved searches)
-have shipped, so D1 is complete. Of D2, D2.1 (performance issues) and
-D2.3 (Apdex) have shipped. The questions they settled
+have shipped, so D1 is complete. Of D2, D2.1 (performance issues), D2.2
+(trends and regressions after a deployment) and D2.3 (Apdex) have shipped. The questions they settled
 are recorded under "Settled while implementing".
 
 Related: ADR 016 (ClickHouse traces backend), ADR 027 (cross-project trace
@@ -448,4 +448,35 @@ deploys, which is web services. It comes last and may never be worth building.
 - **Not a sort key yet.** Ranking by Apdex needs a sort field in both
   backends; the existing p95 and p99 rankings answer "who is slow" until
   then.
+
+### D2.2 Trends and regressions after a deployment
+
+- **Hourly rollups in Postgres.** `operation_rollups` keeps one row per
+  project, service, operation and complete hour (calls, errors, average,
+  p50, p95, p99), written from the span-stats report by a background job
+  every 10 minutes. The job takes the 50 projects rolled up longest ago,
+  rolls at most 6 hours of each per tick, starts 24 hours back on the first
+  run or after a long outage, and waits 5 minutes after an hour ends so
+  late spans land. Rolling an hour again replaces its rows. Rows older than
+  30 days are deleted in batches of 5,000. The rollup is the same on both
+  span backends because it goes through the storage trait.
+- **Cap and overflow.** At most 200 operations per project and hour are
+  kept, those with the most total time. `operation_rollup_state` records
+  how many of the last hour did not fit; the trend and regression responses
+  report it, and the console says so under the trend. The cap bounds the
+  table at about 200 × 24 × 30 = 144,000 rows per project.
+- **Regression model.** The baseline is the week before the deployment went
+  live (`deployments.ready_at`); the after window is the next 24 complete
+  hours, clipped to now. The hour the deployment went live in is on
+  neither side. Each side's value is the median hourly p95; the baseline
+  band is `robust_band` (median and scaled MAD), the anomaly detectors'
+  model, with the scale floored at 5% of the median. An operation regressed
+  when the after value is more than 3 scales above the median and at least
+  20% higher, improved in the mirror case. Fewer than 8 baseline hours
+  (`MIN_BASELINE_SAMPLES`) or 2 after hours is reported as insufficient,
+  not judged. Thresholds are fixed; a column can make them per project.
+- **Deployment markers, not a deployment model.** Regressions are computed
+  on request for one deployment, not stored or alerted on. A deployment
+  that never went live is a 400 that says so; one from another project is a
+  404 naming both IDs.
 

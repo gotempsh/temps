@@ -108,6 +108,9 @@ pub struct OtelAppState {
     /// banner) and `GET /otel/global/traces/{trace_id}` (Phase 2 unified
     /// waterfall) query handlers.
     pub cross_project_service: std::sync::Arc<crate::services::CrossProjectTraceService>,
+    /// Per-operation hourly rollups, trends and regressions after a
+    /// deployment (ADR 111, D2).
+    pub operation_trends: std::sync::Arc<crate::services::OperationTrendService>,
     /// Bounded sender for fire-and-forget relay of decoded OTLP batches.
     ///
     /// After a successful decode in each `do_ingest_*` function, the handler

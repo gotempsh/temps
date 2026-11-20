@@ -7,6 +7,7 @@ import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
 import { querySpanStats } from '../../api/sdk.gen.js'
 import type { SpanStats } from '../../api/types.gen.js'
 import { withSpinner } from '../../ui/spinner.js'
+import { registerOperationTrendCommands } from './operations.js'
 import { printTable, type TableColumn } from '../../ui/table.js'
 import {
   newline,
@@ -232,6 +233,8 @@ Examples:
 `,
     )
     .action(spanStatsAction)
+
+  registerOperationTrendCommands(traces)
 }
 
 async function spanStatsAction(options: SpanStatsOptions): Promise<void> {

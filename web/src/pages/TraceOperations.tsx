@@ -9,6 +9,11 @@ import { querySpanStatsOptions } from '@/api/client/@tanstack/react-query.gen'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
+import { DeploymentRegressionsCard } from '@/components/traces/DeploymentRegressionsCard'
+import {
+  OperationTrendSheet,
+  type TrendTarget,
+} from '@/components/traces/OperationTrendSheet'
 import { EmptyState } from '@/components/ui/empty-state'
 import { Input } from '@/components/ui/input'
 import {
@@ -53,6 +58,7 @@ import {
   Gauge,
   RefreshCw,
   Search,
+  TrendingUp,
   Workflow,
 } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useState } from 'react'
@@ -221,6 +227,7 @@ export default function TraceOperations({ project }: TraceOperationsProps) {
   const [refreshKey, setRefreshKey] = useState(0)
 
   const debouncedSearch = useDebounce(search, 300)
+  const [trendTarget, setTrendTarget] = useState<TrendTarget | null>(null)
 
   const timeWindow = useMemo(
     () => computeTracesTimeWindow(timeRange, new Date()),
@@ -410,6 +417,15 @@ export default function TraceOperations({ project }: TraceOperationsProps) {
         </CardContent>
       </Card>
 
+      <DeploymentRegressionsCard
+        projectId={project.id}
+        projectSlug={project.slug}
+        environmentId={
+          environmentId !== 'all' ? Number(environmentId) : undefined
+        }
+        onOpenTrend={setTrendTarget}
+      />
+
       {/* Results */}
       <Card>
         <CardContent className="p-0">
@@ -502,6 +518,9 @@ export default function TraceOperations({ project }: TraceOperationsProps) {
                         </TooltipContent>
                       </Tooltip>
                     </TableHead>
+                    <TableHead className="w-10">
+                      <span className="sr-only">Trend</span>
+                    </TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
@@ -559,6 +578,23 @@ export default function TraceOperations({ project }: TraceOperationsProps) {
                       <TableCell className="text-right tabular-nums">
                         {apdexCell(row)}
                       </TableCell>
+                      <TableCell className="w-10 p-1">
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          aria-label={`Trend of ${row.span_name}`}
+                          title="Latency over the last 14 days"
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            setTrendTarget({
+                              serviceName: row.service_name,
+                              spanName: row.span_name,
+                            })
+                          }}
+                        >
+                          <TrendingUp className="h-4 w-4" />
+                        </Button>
+                      </TableCell>
                     </TableRow>
                   ))}
                 </TableBody>
@@ -567,6 +603,13 @@ export default function TraceOperations({ project }: TraceOperationsProps) {
           )}
         </CardContent>
       </Card>
+
+      <OperationTrendSheet
+        projectId={project.id}
+        projectSlug={project.slug}
+        target={trendTarget}
+        onClose={() => setTrendTarget(null)}
+      />
 
       {/* Pagination */}
       {totalPages > 1 && (

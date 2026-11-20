@@ -11157,6 +11157,16 @@ export type DeploymentListResponse = {
 };
 
 /**
+ * A deployment that went live.
+ */
+export type DeploymentMarkerResponse = {
+    deployment_id: number;
+    environment_id: number;
+    live_at: string;
+    slug: string;
+};
+
+/**
  * Deployment metadata - typed information about the deployment
  */
 export type DeploymentMetadata = {
@@ -11280,6 +11290,40 @@ export type DeploymentOperationDetails = {
  * replace each other in the merged OpenAPI document.
  */
 export type DeploymentOperationStatus = 'pending' | 'completed' | 'failed';
+
+/**
+ * The project's tracked operations compared across one deployment.
+ */
+export type DeploymentRegressionsResponse = {
+    after_end: string;
+    /**
+     * The first complete hour after the deployment went live.
+     */
+    after_start: string;
+    baseline_start: string;
+    /**
+     * Regressed operations first, largest change first; then improved
+     * ones. At most 50.
+     */
+    changes: Array<OperationChangeResponse>;
+    deployment: DeploymentMarkerResponse;
+    improved: number;
+    /**
+     * Operations with too few hours after it yet.
+     */
+    insufficient_after: number;
+    /**
+     * Operations with too little history before the deployment.
+     */
+    insufficient_baseline: number;
+    /**
+     * Complete hours after the deployment needed before it is judged.
+     */
+    min_after_hours: number;
+    regressed: number;
+    tracking: OperationTrackingResponse;
+    unchanged: number;
+};
 
 export type DeploymentResponse = {
     branch?: string | null;
@@ -23681,6 +23725,32 @@ export type OperatingSystemCount = {
 };
 
 /**
+ * One operation that changed after a deployment.
+ */
+export type OperationChangeResponse = {
+    after_hours: number;
+    /**
+     * The median hourly p95 after.
+     */
+    after_p95_ms?: number | null;
+    baseline_hours: number;
+    /**
+     * The median hourly p95 in the week before.
+     */
+    baseline_p95_ms?: number | null;
+    /**
+     * `regressed` or `improved`.
+     */
+    change: string;
+    /**
+     * `after / baseline - 1`: 0.4 is 40% slower, -0.3 is 30% faster.
+     */
+    change_ratio?: number | null;
+    service_name: string;
+    span_name: string;
+};
+
+/**
  * One operation in the feed.
  */
 export type OperationEntry = {
@@ -23775,6 +23845,76 @@ export type OperationStatus = 'queued' | 'running' | 'waiting' | 'succeeded' | '
  * Which slice of the feed to return.
  */
 export type OperationStatusFilter = 'running' | 'waiting' | 'finished' | 'all';
+
+/**
+ * Whether operations of the project are tracked, and how many did not fit.
+ */
+export type OperationTrackingResponse = {
+    /**
+     * True once the rollup job has run for the project.
+     */
+    configured: boolean;
+    last_error?: string | null;
+    last_run_at?: string | null;
+    /**
+     * Operations kept per project and hour, those with the most total time.
+     */
+    max_tracked_operations: number;
+    /**
+     * Operations of that hour over the cap, which have no history.
+     */
+    overflow_operations: number;
+    /**
+     * Why there is no history yet, when `configured` is false.
+     */
+    reason?: string | null;
+    /**
+     * Days of history kept.
+     */
+    retention_days: number;
+    /**
+     * Hours that start before this have been rolled up.
+     */
+    rolled_until?: string | null;
+    /**
+     * The console page, relative to the project, that sets up what is
+     * missing.
+     */
+    setup_path?: string | null;
+    /**
+     * Operations kept in the last hour rolled up.
+     */
+    tracked_operations: number;
+};
+
+/**
+ * One hour of one operation.
+ */
+export type OperationTrendPointResponse = {
+    avg_ms: number;
+    bucket_start: string;
+    count: number;
+    error_count: number;
+    p50_ms: number;
+    p95_ms: number;
+    p99_ms: number;
+};
+
+/**
+ * An operation's hourly series, with the deployments in the window.
+ */
+export type OperationTrendResponse = {
+    deployments: Array<DeploymentMarkerResponse>;
+    end_time: string;
+    /**
+     * Hours with calls, oldest first; hours without calls have no point.
+     */
+    points: Array<OperationTrendPointResponse>;
+    service_name: string;
+    span_name: string;
+    start_time: string;
+    tracking: OperationTrackingResponse;
+};
 
 /**
  * A page of the operations feed. Sorted by `created_at` descending (fixed).
@@ -70845,6 +70985,98 @@ export type QueryMetricsResponses = {
 };
 
 export type QueryMetricsResponse = QueryMetricsResponses[keyof QueryMetricsResponses];
+
+export type GetDeploymentRegressionsData = {
+    body?: never;
+    path?: never;
+    query: {
+        project_id: number;
+        deployment_id: number;
+    };
+    url: '/otel/operations/regressions';
+};
+
+export type GetDeploymentRegressionsErrors = {
+    /**
+     * The deployment never went live
+     */
+    400: unknown;
+    /**
+     * Not authenticated
+     */
+    401: unknown;
+    /**
+     * Missing otel:read or project access
+     */
+    403: unknown;
+    /**
+     * No such deployment in the project
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetDeploymentRegressionsResponses = {
+    /**
+     * Operations compared across the deployment
+     */
+    200: DeploymentRegressionsResponse;
+};
+
+export type GetDeploymentRegressionsResponse = GetDeploymentRegressionsResponses[keyof GetDeploymentRegressionsResponses];
+
+export type GetOperationTrendData = {
+    body?: never;
+    path?: never;
+    query: {
+        project_id: number;
+        service_name: string;
+        /**
+         * The operation (span name).
+         */
+        span_name: string;
+        /**
+         * Window start (RFC 3339); defaults to 14 days before `end_time`.
+         */
+        start_time?: string | null;
+        /**
+         * Window end (RFC 3339); defaults to now.
+         */
+        end_time?: string | null;
+    };
+    url: '/otel/operations/trend';
+};
+
+export type GetOperationTrendErrors = {
+    /**
+     * Missing operation, or a window over 30 days
+     */
+    400: unknown;
+    /**
+     * Not authenticated
+     */
+    401: unknown;
+    /**
+     * Missing otel:read or project access
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetOperationTrendResponses = {
+    /**
+     * Hourly series of the operation
+     */
+    200: OperationTrendResponse;
+};
+
+export type GetOperationTrendResponse = GetOperationTrendResponses[keyof GetOperationTrendResponses];
 
 export type GetPipelineHistoryData = {
     body?: never;

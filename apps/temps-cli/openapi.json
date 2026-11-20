@@ -23073,6 +23073,33 @@
         ],
         "type": "object"
       },
+      "DeploymentMarkerResponse": {
+        "description": "A deployment that went live.",
+        "properties": {
+          "deployment_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "environment_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "live_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "slug": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "deployment_id",
+          "slug",
+          "environment_id",
+          "live_at"
+        ],
+        "type": "object"
+      },
       "DeploymentMetadata": {
         "description": "Deployment metadata - typed information about the deployment",
         "properties": {
@@ -23300,6 +23327,79 @@
           "failed"
         ],
         "type": "string"
+      },
+      "DeploymentRegressionsResponse": {
+        "description": "The project's tracked operations compared across one deployment.",
+        "properties": {
+          "after_end": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "after_start": {
+            "description": "The first complete hour after the deployment went live.",
+            "format": "date-time",
+            "type": "string"
+          },
+          "baseline_start": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "changes": {
+            "description": "Regressed operations first, largest change first; then improved\nones. At most 50.",
+            "items": {
+              "$ref": "#/components/schemas/OperationChangeResponse"
+            },
+            "type": "array"
+          },
+          "deployment": {
+            "$ref": "#/components/schemas/DeploymentMarkerResponse"
+          },
+          "improved": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "insufficient_after": {
+            "description": "Operations with too few hours after it yet.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "insufficient_baseline": {
+            "description": "Operations with too little history before the deployment.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "min_after_hours": {
+            "description": "Complete hours after the deployment needed before it is judged.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "regressed": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "tracking": {
+            "$ref": "#/components/schemas/OperationTrackingResponse"
+          },
+          "unchanged": {
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "deployment",
+          "baseline_start",
+          "after_start",
+          "after_end",
+          "changes",
+          "regressed",
+          "improved",
+          "unchanged",
+          "insufficient_baseline",
+          "insufficient_after",
+          "min_after_hours",
+          "tracking"
+        ],
+        "type": "object"
       },
       "DeploymentResponse": {
         "properties": {
@@ -50880,6 +50980,61 @@
         ],
         "type": "object"
       },
+      "OperationChangeResponse": {
+        "description": "One operation that changed after a deployment.",
+        "properties": {
+          "after_hours": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "after_p95_ms": {
+            "description": "The median hourly p95 after.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "baseline_hours": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "baseline_p95_ms": {
+            "description": "The median hourly p95 in the week before.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "change": {
+            "description": "`regressed` or `improved`.",
+            "type": "string"
+          },
+          "change_ratio": {
+            "description": "`after / baseline - 1`: 0.4 is 40% slower, -0.3 is 30% faster.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "service_name": {
+            "type": "string"
+          },
+          "span_name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "service_name",
+          "span_name",
+          "change",
+          "baseline_hours",
+          "after_hours"
+        ],
+        "type": "object"
+      },
       "OperationEntry": {
         "description": "One operation in the feed.",
         "properties": {
@@ -51110,6 +51265,167 @@
           "all"
         ],
         "type": "string"
+      },
+      "OperationTrackingResponse": {
+        "description": "Whether operations of the project are tracked, and how many did not fit.",
+        "properties": {
+          "configured": {
+            "description": "True once the rollup job has run for the project.",
+            "type": "boolean"
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_run_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "max_tracked_operations": {
+            "description": "Operations kept per project and hour, those with the most total time.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "overflow_operations": {
+            "description": "Operations of that hour over the cap, which have no history.",
+            "format": "int32",
+            "type": "integer"
+          },
+          "reason": {
+            "description": "Why there is no history yet, when `configured` is false.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "retention_days": {
+            "description": "Days of history kept.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "rolled_until": {
+            "description": "Hours that start before this have been rolled up.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "setup_path": {
+            "description": "The console page, relative to the project, that sets up what is\nmissing.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tracked_operations": {
+            "description": "Operations kept in the last hour rolled up.",
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "configured",
+          "tracked_operations",
+          "overflow_operations",
+          "max_tracked_operations",
+          "retention_days"
+        ],
+        "type": "object"
+      },
+      "OperationTrendPointResponse": {
+        "description": "One hour of one operation.",
+        "properties": {
+          "avg_ms": {
+            "format": "double",
+            "type": "number"
+          },
+          "bucket_start": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "count": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "error_count": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "p50_ms": {
+            "format": "double",
+            "type": "number"
+          },
+          "p95_ms": {
+            "format": "double",
+            "type": "number"
+          },
+          "p99_ms": {
+            "format": "double",
+            "type": "number"
+          }
+        },
+        "required": [
+          "bucket_start",
+          "count",
+          "error_count",
+          "avg_ms",
+          "p50_ms",
+          "p95_ms",
+          "p99_ms"
+        ],
+        "type": "object"
+      },
+      "OperationTrendResponse": {
+        "description": "An operation's hourly series, with the deployments in the window.",
+        "properties": {
+          "deployments": {
+            "items": {
+              "$ref": "#/components/schemas/DeploymentMarkerResponse"
+            },
+            "type": "array"
+          },
+          "end_time": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "points": {
+            "description": "Hours with calls, oldest first; hours without calls have no point.",
+            "items": {
+              "$ref": "#/components/schemas/OperationTrendPointResponse"
+            },
+            "type": "array"
+          },
+          "service_name": {
+            "type": "string"
+          },
+          "span_name": {
+            "type": "string"
+          },
+          "start_time": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "tracking": {
+            "$ref": "#/components/schemas/OperationTrackingResponse"
+          }
+        },
+        "required": [
+          "service_name",
+          "span_name",
+          "start_time",
+          "end_time",
+          "points",
+          "deployments",
+          "tracking"
+        ],
+        "type": "object"
       },
       "OperationsListResponse": {
         "description": "A page of the operations feed. Sorted by `created_at` descending (fixed).",
@@ -137795,6 +138111,161 @@
         "summary": "Query metrics with time bucketing.",
         "tags": [
           "Telemetry Metrics"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/otel/operations/regressions": {
+      "get": {
+        "operationId": "get_deployment_regressions",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "deployment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeploymentRegressionsResponse"
+                }
+              }
+            },
+            "description": "Operations compared across the deployment"
+          },
+          "400": {
+            "description": "The deployment never went live"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Missing otel:read or project access"
+          },
+          "404": {
+            "description": "No such deployment in the project"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Which operations got slower or faster after a deployment",
+        "tags": [
+          "OpenTelemetry"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/otel/operations/trend": {
+      "get": {
+        "operationId": "get_operation_trend",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "service_name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The operation (span name).",
+            "in": "query",
+            "name": "span_name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Window start (RFC 3339); defaults to 14 days before `end_time`.",
+            "in": "query",
+            "name": "start_time",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Window end (RFC 3339); defaults to now.",
+            "in": "query",
+            "name": "end_time",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OperationTrendResponse"
+                }
+              }
+            },
+            "description": "Hourly series of the operation"
+          },
+          "400": {
+            "description": "Missing operation, or a window over 30 days"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Missing otel:read or project access"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Hourly latency of one operation over time",
+        "tags": [
+          "OpenTelemetry"
         ],
         "x-maturity": "beta"
       }
