@@ -135,6 +135,13 @@ pub const CLOSED_GATE_RETENTION: Duration = Duration::from_secs(300);
 /// gate with a key that is no longer active. This deadline keeps every
 /// authentication far inside that retention, whatever the database does.
 pub const AUTHENTICATION_DEADLINE: Duration = Duration::from_secs(30);
+fn authentication_timed_out() -> LogAggregatorError {
+    LogAggregatorError::OperationTimedOut {
+        operation: "authenticate log ingest key",
+        target: format!("deadline {}s", AUTHENTICATION_DEADLINE.as_secs()),
+    }
+}
+
 /// How often the gate registry is pruned, at most.
 const GATE_PRUNE_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -309,10 +316,7 @@ impl LogIngestService {
                     deadline_secs = AUTHENTICATION_DEADLINE.as_secs(),
                     "Authenticating a log ingest key timed out; the batch was refused"
                 );
-                Err(LogAggregatorError::OperationTimedOut {
-                    operation: "authenticate log ingest key",
-                    target: format!("deadline {}s", AUTHENTICATION_DEADLINE.as_secs()),
-                })
+                Err(authentication_timed_out())
             }
         }
     }
@@ -323,11 +327,19 @@ impl LogIngestService {
         presented: &str,
         body: &[u8],
     ) -> Result<IngestOutcome, LogAggregatorError> {
+        let started = tokio::time::Instant::now();
         let key = self.authenticate(presented).await?;
         let gate = self.gate(key.key_id);
         let closed = gate.read().await;
         if *closed {
             return Err(LogAggregatorError::IngestKeyRejected);
+        }
+        // The timeout above can still yield a key read before a revoke if
+        // this task was starved past the deadline. Checked after the gate
+        // was looked up: a revoke since `started` left a closed gate that
+        // outlives the deadline, so a fresh check means the lookup saw it.
+        if started.elapsed() >= AUTHENTICATION_DEADLINE {
+            return Err(authentication_timed_out());
         }
         if let Ok(mut last_used) = self.last_used.lock() {
             last_used.insert(key.key_id, tokio::time::Instant::now());
@@ -580,6 +592,35 @@ mod tests {
             std::future::pending().await
         }
         fn record_usage(&self, _key_id: i32, _lines: u64, _at: DateTime<Utc>) {}
+    }
+
+    /// A resolver that answers only once the deadline and a closed gate's
+    /// retention have both passed, as a starved task would.
+    struct LateKey(AuthenticatedKey);
+
+    #[async_trait::async_trait]
+    impl IngestKeyResolver for LateKey {
+        async fn resolve(&self, _presented: &str) -> Result<AuthenticatedKey, LogAggregatorError> {
+            tokio::time::advance(CLOSED_GATE_RETENTION + Duration::from_secs(1)).await;
+            Ok(self.0.clone())
+        }
+        fn record_usage(&self, _key_id: i32, _lines: u64, _at: DateTime<Utc>) {}
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_key_resolved_after_the_deadline_is_refused() {
+        let writer = Arc::new(Recorded::default());
+        let service = LogIngestService::new(
+            Arc::new(LateKey(key())),
+            writer.clone(),
+            Arc::new(IngestBudget::new(IngestLimits::UNLIMITED)),
+        );
+        let result = service.ingest("good", b"{\"msg\":\"a\"}").await;
+        assert!(matches!(
+            result,
+            Err(LogAggregatorError::OperationTimedOut { .. })
+        ));
+        assert!(writer.0.lock().expect("lines lock").is_empty());
     }
 
     #[tokio::test(start_paused = true)]

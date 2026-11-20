@@ -1214,6 +1214,7 @@ async fn test_a_failed_resolve_is_retried_next_cycle() {
 /// A counter whose saved search is edited while it counts: the sample
 /// carries the fingerprint it counted, the search now has another.
 struct QueryEditedWhileCounting {
+    count: std::sync::atomic::AtomicU64,
     counted: std::sync::atomic::AtomicU64,
     current: std::sync::atomic::AtomicU64,
 }
@@ -1229,7 +1230,7 @@ impl temps_core::log_series::LogSeriesSource for QueryEditedWhileCounting {
     ) -> Result<temps_core::log_series::LogSeriesSample, temps_core::log_series::LogSeriesError>
     {
         Ok(temps_core::log_series::LogSeriesSample {
-            count: 42,
+            count: self.count.load(std::sync::atomic::Ordering::Relaxed),
             saturated: false,
             query_fingerprint: self.counted.load(std::sync::atomic::Ordering::Relaxed),
         })
@@ -1254,6 +1255,7 @@ async fn test_a_query_edited_while_counting_does_not_fire_the_old_count() {
     let saved_search_id = seed_saved_search(&ctx.db, ctx.project_id, "Payment failures").await;
     create_log_rule(&ctx, saved_search_id).await;
     let counter = Arc::new(QueryEditedWhileCounting {
+        count: std::sync::atomic::AtomicU64::new(42),
         counted: std::sync::atomic::AtomicU64::new(1),
         current: std::sync::atomic::AtomicU64::new(1),
     });
@@ -1282,6 +1284,54 @@ async fn test_a_query_edited_while_counting_does_not_fire_the_old_count() {
     tokio::time::sleep(BREACH_PERSIST_WAIT).await;
     ctx.evaluator.run_cycle().await.expect("cycle 4 fires");
     assert_eq!(alarms_for(&ctx.db, ctx.project_id).await.len(), 1);
+}
+
+/// A recovery counted under the old query must not resolve the alarm: the
+/// new query has not been counted yet.
+#[tokio::test]
+async fn test_a_query_edited_while_counting_does_not_resolve_on_the_old_count() {
+    let Some(ctx) = setup_evaluator().await else {
+        return;
+    };
+    let saved_search_id = seed_saved_search(&ctx.db, ctx.project_id, "Payment failures").await;
+    create_log_rule(&ctx, saved_search_id).await;
+    let counter = Arc::new(QueryEditedWhileCounting {
+        count: std::sync::atomic::AtomicU64::new(42),
+        counted: std::sync::atomic::AtomicU64::new(1),
+        current: std::sync::atomic::AtomicU64::new(1),
+    });
+    ctx.evaluator.set_log_series(counter.clone());
+
+    ctx.evaluator.run_cycle().await.expect("cycle 1 arms");
+    tokio::time::sleep(BREACH_PERSIST_WAIT).await;
+    ctx.evaluator.run_cycle().await.expect("cycle 2 fires");
+    assert_eq!(
+        alarms_for(&ctx.db, ctx.project_id).await[0].status,
+        AlarmStatus::Firing.as_str()
+    );
+
+    counter.count.store(5, std::sync::atomic::Ordering::Relaxed);
+    counter
+        .current
+        .store(2, std::sync::atomic::Ordering::Relaxed);
+    ctx.evaluator
+        .run_cycle()
+        .await
+        .expect("cycle 3, stale recovery");
+    assert_eq!(
+        alarms_for(&ctx.db, ctx.project_id).await[0].status,
+        AlarmStatus::Firing.as_str(),
+        "the old query's recovery does not resolve"
+    );
+
+    counter
+        .counted
+        .store(2, std::sync::atomic::Ordering::Relaxed);
+    ctx.evaluator.run_cycle().await.expect("cycle 4 resolves");
+    assert_eq!(
+        alarms_for(&ctx.db, ctx.project_id).await[0].status,
+        AlarmStatus::Resolved.as_str()
+    );
 }
 
 /// A log counter whose saved-search query fingerprint the test controls.

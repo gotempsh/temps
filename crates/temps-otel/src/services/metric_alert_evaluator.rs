@@ -1439,34 +1439,32 @@ impl MetricAlertEvaluator {
             return Ok(());
         };
         // The count took a while; the saved search may have been edited
-        // meanwhile. A breach found under the old predicate must not fire or
-        // even start the new one's timer.
-        if breaching {
-            match log_series
-                .current_query_fingerprint(rule.project_id, saved_search_id)
-                .await
-            {
-                Ok(current) if current == sample.query_fingerprint => {}
-                Ok(current) => {
-                    debug!(
-                        rule_id = rule.id,
-                        saved_search_id,
-                        "Saved log search edited while counting; discarding this tick's count"
-                    );
-                    self.note_log_query(rule.id, current).await;
-                    self.persist_unchanged(&rule, now).await;
-                    return Ok(());
-                }
-                Err(e) => {
-                    warn!(
-                        rule_id = rule.id,
-                        saved_search_id,
-                        error = %e,
-                        "Could not confirm the saved log search is unchanged; state preserved"
-                    );
-                    self.persist_unchanged(&rule, now).await;
-                    return Ok(());
-                }
+        // meanwhile. A verdict reached under the old predicate must not fire,
+        // resolve, or start the new one's timer.
+        match log_series
+            .current_query_fingerprint(rule.project_id, saved_search_id)
+            .await
+        {
+            Ok(current) if current == sample.query_fingerprint => {}
+            Ok(current) => {
+                debug!(
+                    rule_id = rule.id,
+                    saved_search_id,
+                    "Saved log search edited while counting; discarding this tick's count"
+                );
+                self.note_log_query(rule.id, current).await;
+                self.persist_unchanged(&rule, now).await;
+                return Ok(());
+            }
+            Err(e) => {
+                warn!(
+                    rule_id = rule.id,
+                    saved_search_id,
+                    error = %e,
+                    "Could not confirm the saved log search is unchanged; state preserved"
+                );
+                self.persist_unchanged(&rule, now).await;
+                return Ok(());
             }
         }
         let details = FireDetails::log_breach(&rule, &sample, params);
