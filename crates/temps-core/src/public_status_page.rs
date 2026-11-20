@@ -66,6 +66,8 @@ pub enum StatusHostPath {
     Page,
     /// `/summary.json`: the JSON page.
     Summary,
+    /// `/feed.atom`: the page's Atom feed (ADR 108 D2).
+    Feed,
     /// `/subscribe`: the subscribe form's post (ADR 108 D2).
     Subscribe,
     /// `/confirm/{token}`: a subscription's confirmation link.
@@ -82,6 +84,7 @@ impl StatusHostPath {
         match path {
             "/" => return Some(Self::Page),
             "/summary.json" => return Some(Self::Summary),
+            "/feed.atom" => return Some(Self::Feed),
             "/subscribe" => return Some(Self::Subscribe),
             _ => {}
         }
@@ -99,7 +102,7 @@ impl StatusHostPath {
     /// that posts back to it.
     pub fn allows_method(&self, method: &str) -> bool {
         match self {
-            Self::Page | Self::Summary => matches!(method, "GET" | "HEAD"),
+            Self::Page | Self::Summary | Self::Feed => matches!(method, "GET" | "HEAD"),
             Self::Subscribe => method == "POST",
             Self::Confirm(_) | Self::Unsubscribe(_) => matches!(method, "GET" | "HEAD" | "POST"),
         }
@@ -111,6 +114,7 @@ impl StatusHostPath {
         match self {
             Self::Page => format!("/api/status/{slug}"),
             Self::Summary => format!("/api/status/{slug}/summary.json"),
+            Self::Feed => format!("/api/status/{slug}/feed.atom"),
             Self::Subscribe => format!("/api/status/{slug}/subscribe"),
             Self::Confirm(token) => format!("/api/status/{slug}/confirm/{token}"),
             Self::Unsubscribe(token) => format!("/api/status/{slug}/unsubscribe/{token}"),
@@ -161,7 +165,11 @@ mod tests {
     #[test]
     fn each_path_allows_only_its_methods() {
         let token = "b".repeat(SUBSCRIPTION_TOKEN_LEN);
-        for view in [StatusHostPath::Page, StatusHostPath::Summary] {
+        for view in [
+            StatusHostPath::Page,
+            StatusHostPath::Summary,
+            StatusHostPath::Feed,
+        ] {
             assert!(view.allows_method("GET") && view.allows_method("HEAD"));
             assert!(!view.allows_method("POST") && !view.allows_method("PUT"));
         }
@@ -189,7 +197,10 @@ mod tests {
             StatusHostPath::parse("/summary.json"),
             Some(StatusHostPath::Summary)
         );
+        assert_eq!(StatusHostPath::parse("/feed.atom"), Some(StatusHostPath::Feed));
         for path in [
+            "/feed.atom/",
+            "/feed.xml",
             "",
             "//",
             "/index.html",
@@ -214,6 +225,10 @@ mod tests {
         assert_eq!(
             StatusHostPath::Summary.console_path("ab12"),
             "/api/status/ab12/summary.json"
+        );
+        assert_eq!(
+            StatusHostPath::Feed.console_path("ab12"),
+            "/api/status/ab12/feed.atom"
         );
     }
 }

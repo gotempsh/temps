@@ -29,6 +29,7 @@ use axum::{
     Router,
 };
 
+use crate::services::public_pages::feed::ATOM_CONTENT_TYPE;
 use crate::services::public_pages::{
     is_well_formed_slug, render::NOT_FOUND_HTML, PublicStatusPageResponse, StatusSnapshotCache,
 };
@@ -370,6 +371,51 @@ pub async fn get_public_status_page_json(
     response
 }
 
+/// Public status page (Atom feed)
+///
+/// The page's public incident updates as an Atom feed, newest first, built
+/// with the page snapshot: it carries nothing the page does not show.
+#[utoipa::path(
+    get,
+    path = "/status/{slug}/feed.atom",
+    operation_id = "get_public_status_page_feed",
+    params(("slug" = String, Path, description = "Unguessable status page token")),
+    responses(
+        (status = 200, description = "Atom feed of the page's public updates", content_type = "application/atom+xml"),
+        (status = 404, description = "No published status page at this URL"),
+        (status = 429, description = "Rate limited"),
+    ),
+    tag = "Status Page"
+)]
+pub async fn get_public_status_page_feed(
+    State(state): State<Arc<PublicStatusState>>,
+    headers: HeaderMap,
+    slug: Result<Path<String>, PathRejection>,
+) -> Response {
+    let slug = slug.map(|Path(slug)| slug).unwrap_or_default();
+    let host = custom_host(&headers);
+    let snapshot = is_well_formed_slug(&slug)
+        .then(|| state.cache.get(&slug))
+        .flatten()
+        .filter(|snapshot| snapshot.serves_host(host.as_deref()));
+    let mut response = match snapshot {
+        Some(snapshot) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, ATOM_CONTENT_TYPE)],
+            snapshot.feed_for(host.as_deref()),
+        )
+            .into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            NOT_FOUND_HTML,
+        )
+            .into_response(),
+    };
+    harden(&mut response);
+    response
+}
+
 /// Router for the public status page endpoints, rate limit included.
 pub fn create_public_router(state: Arc<PublicStatusState>) -> Router {
     Router::new()
@@ -378,6 +424,7 @@ pub fn create_public_router(state: Arc<PublicStatusState>) -> Router {
             "/status/{slug}/summary.json",
             get(get_public_status_page_json),
         )
+        .route("/status/{slug}/feed.atom", get(get_public_status_page_feed))
         .layer(middleware::from_fn_with_state(state.clone(), rate_limit))
         .with_state(state)
 }

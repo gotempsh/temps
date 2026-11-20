@@ -2135,6 +2135,7 @@ pub(super) mod status_page_host_tests {
             )
         };
         for (request, expected) in [
+            (get("/feed.atom", HOST), format!("/api/status/{SLUG}/feed.atom")),
             (post("/subscribe"), format!("/api/status/{SLUG}/subscribe")),
             (
                 get(&format!("/confirm/{token}"), HOST),
@@ -2160,6 +2161,7 @@ pub(super) mod status_page_host_tests {
             }
         }
         for request in [
+            post("/feed.atom"),
             get("/subscribe", HOST),
             format!("DELETE /confirm/{token} HTTP/1.1\r\nHost: {HOST}\r\n\r\n"),
             post("/confirm/not-a-token"),

@@ -5,6 +5,8 @@
 //! public view (#1412).
 
 pub mod domains;
+pub mod events;
+pub mod feed;
 pub mod render;
 pub mod service;
 pub mod snapshot;

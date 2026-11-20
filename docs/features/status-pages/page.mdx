@@ -160,9 +160,15 @@ A background task checks every 20 seconds. It queues one notice per public updat
 
 ---
 
+## Atom feed
+
+Every published page has an Atom feed at `/api/status/<token>/feed.atom` (or `/feed.atom` on a custom domain), linked from the page's footer, so feed readers and chat integrations can follow it. It lists the newest 50 public incident updates and resolutions, with the same text the page shows; nothing private is ever in it. Like the page, it is served from memory and refreshed every minute.
+
+---
+
 ## Custom domains
 
-A page can also be served on your own hostname, such as `status.example.com`. The hostname serves **only** the page (`/`), its JSON (`/summary.json`) and, when subscriptions are on, the subscribe form (`/subscribe`) and the confirmation and unsubscribe links; every other path answers "not found", and the hostname never reaches the Temps console, its API, or any application.
+A page can also be served on your own hostname, such as `status.example.com`. The hostname serves **only** the page (`/`), its JSON (`/summary.json`), its feed (`/feed.atom`) and, when subscriptions are on, the subscribe form (`/subscribe`) and the confirmation and unsubscribe links; every other path answers "not found", and the hostname never reaches the Temps console, its API, or any application.
 
 1. Open the status page and, under **Custom domains**, enter the hostname. Choose how to prove you control it:
    - **HTTP**: the hostname already points at this Temps instance.

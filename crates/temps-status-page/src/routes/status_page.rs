@@ -23,7 +23,10 @@ use temps_core::{AuditLogger, DateTime, RequestMetadata};
 use utoipa::OpenApi;
 
 use super::audit::{StatusPageMutationAction, StatusPageMutationAudit};
-use super::public::{__path_get_public_status_page, __path_get_public_status_page_json};
+use super::public::{
+    __path_get_public_status_page, __path_get_public_status_page_feed,
+    __path_get_public_status_page_json,
+};
 use super::status_pages::{
     __path_add_status_page_domain, __path_create_status_page, __path_delete_status_page,
     __path_get_status_page, __path_list_status_page_domains, __path_list_status_pages,
@@ -104,6 +107,7 @@ pub trait StatusPageAppState: Send + Sync + 'static {
         remove_status_page_domain,
         get_public_status_page,
         get_public_status_page_json,
+        get_public_status_page_feed,
     ),
     components(
         schemas(

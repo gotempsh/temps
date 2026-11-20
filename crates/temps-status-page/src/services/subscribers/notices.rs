@@ -15,7 +15,7 @@ use std::fmt::Write as _;
 use temps_core::escape::escape_html;
 use temps_core::UtcDateTime;
 
-use crate::services::public_pages::{PublicIncident, PublicIncidentStatus};
+use crate::services::public_pages::events::{incident_events, IncidentSource, PageEvent};
 
 /// Only updates published within this window are announced. A notice row is
 /// pruned well after it, so an update can never be queued a second time after
@@ -34,79 +34,36 @@ pub struct PageNotice {
     pub body_text: String,
     /// HTML fragment; the per-recipient footer is added at send time.
     pub body_html: String,
+    /// What the notice announces, for channels that are not mail.
+    pub event: PageEvent,
 }
 
-/// A public incident together with the ids the notice keys are built from.
-/// `update_ids` is aligned with `incident.updates` (newest first).
-pub struct IncidentForNotice<'a> {
-    pub incident_id: i32,
-    pub update_ids: &'a [i32],
-    pub incident: &'a PublicIncident,
-}
-
-/// The notices for one incident whose update was published at or after
-/// `since` and no later than `now`: one per public update, plus one for the
-/// resolution when the incident was resolved without a public "resolved"
-/// update of its own.
+/// The notices for one incident whose events were published at or after
+/// `since` and no later than `now` (see [`incident_events`]).
 pub fn incident_notices(
     page_title: &str,
-    source: &IncidentForNotice<'_>,
+    source: &IncidentSource<'_>,
     since: UtcDateTime,
     now: UtcDateTime,
 ) -> Vec<PageNotice> {
-    let incident = source.incident;
-    let in_window = |at: UtcDateTime| at >= since && at <= now;
-    let mut notices: Vec<PageNotice> = incident
-        .updates
-        .iter()
-        .zip(source.update_ids)
-        .filter(|(update, _)| in_window(update.created_at))
-        .map(|(update, id)| {
-            render(
-                format!("u{id}"),
-                page_title,
-                incident,
-                update.status,
-                Some(update.message.as_str()),
-                update.created_at,
-            )
-        })
-        .collect();
-    let resolution_has_update = incident
-        .updates
-        .iter()
-        .any(|update| update.status == PublicIncidentStatus::Resolved);
-    if incident.status == PublicIncidentStatus::Resolved && !resolution_has_update {
-        if let Some(resolved_at) = incident.resolved_at.filter(|at| in_window(*at)) {
-            notices.push(render(
-                format!("r{}", source.incident_id),
-                page_title,
-                incident,
-                PublicIncidentStatus::Resolved,
-                None,
-                resolved_at,
-            ));
-        }
-    }
-    notices
+    incident_events(source)
+        .into_iter()
+        .rev()
+        .filter(|event| event.published_at >= since && event.published_at <= now)
+        .map(|event| notice_for(page_title, event))
+        .collect()
 }
 
-fn render(
-    key: String,
-    page_title: &str,
-    incident: &PublicIncident,
-    status: PublicIncidentStatus,
-    message: Option<&str>,
-    published_at: UtcDateTime,
-) -> PageNotice {
-    let label = status.label();
-    let when = published_at.format("%Y-%m-%d %H:%M UTC").to_string();
-    let subject = one_line(&format!("[{page_title}] {}: {label}", incident.title));
+/// The mail for one event.
+pub fn notice_for(page_title: &str, event: PageEvent) -> PageNotice {
+    let label = event.status.label();
+    let when = event.published_at.format("%Y-%m-%d %H:%M UTC").to_string();
+    let subject = one_line(&format!("[{page_title}] {}: {label}", event.title));
     let affected =
-        (!incident.affected_components.is_empty()).then(|| incident.affected_components.join(", "));
-    let message = message.unwrap_or("This incident has been resolved.");
+        (!event.affected_components.is_empty()).then(|| event.affected_components.join(", "));
+    let message = event.message_or_default();
 
-    let mut body_text = format!("{}\nStatus: {label}\n", incident.title);
+    let mut body_text = format!("{}\nStatus: {label}\n", event.title);
     if let Some(affected) = &affected {
         let _ = writeln!(body_text, "Affected: {affected}");
     }
@@ -115,7 +72,7 @@ fn render(
     let mut body_html = format!(
         "<h2 style=\"margin:0 0 8px;font-size:18px\">{}</h2>\
          <p style=\"margin:0;color:#52525b\">Status: <strong>{label}</strong></p>",
-        escape_html(&incident.title)
+        escape_html(&event.title)
     );
     if let Some(affected) = &affected {
         let _ = write!(
@@ -132,11 +89,12 @@ fn render(
     );
 
     PageNotice {
-        key,
-        published_at,
+        key: event.key.clone(),
+        published_at: event.published_at,
         subject,
         body_text,
         body_html,
+        event,
     }
 }
 
@@ -214,7 +172,9 @@ pub fn confirmation_message(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::public_pages::{PublicIncidentSeverity, PublicIncidentUpdate};
+    use crate::services::public_pages::{
+        PublicIncident, PublicIncidentSeverity, PublicIncidentStatus, PublicIncidentUpdate,
+    };
     use chrono::TimeZone;
 
     fn at(hour: u32) -> UtcDateTime {
@@ -255,7 +215,7 @@ mod tests {
                 (PublicIncidentStatus::Investigating, "Looking into it", 2),
             ],
         );
-        let source = IncidentForNotice {
+        let source = IncidentSource {
             incident_id: 7,
             update_ids: &[31, 30],
             incident: &incident,
@@ -287,7 +247,7 @@ mod tests {
             PublicIncidentStatus::Resolved,
             vec![(PublicIncidentStatus::Investigating, "Looking into it", 2)],
         );
-        let source = IncidentForNotice {
+        let source = IncidentSource {
             incident_id: 7,
             update_ids: &[30],
             incident: &silent,
@@ -304,7 +264,7 @@ mod tests {
             PublicIncidentStatus::Resolved,
             vec![(PublicIncidentStatus::Resolved, "All clear", 9)],
         );
-        let source = IncidentForNotice {
+        let source = IncidentSource {
             incident_id: 7,
             update_ids: &[32],
             incident: &announced,

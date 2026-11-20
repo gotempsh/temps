@@ -42,15 +42,15 @@ use temps_entities::{status_monitors, status_page_monitors, status_pages};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
-use super::render::render_public_page_html_with;
+use super::events::{incident_events, newest_events, IncidentSource, PageEvent};
+use super::feed::render_atom_feed;
+use super::render::{render_public_page_html_with, PageActions};
 use super::types::{
     PublicComponentStatus, PublicDayStatus, PublicIncident, PublicIncidentSeverity,
     PublicIncidentStatus, PublicIncidentUpdate, PublicStatusComponent, PublicStatusPageResponse,
     PublicUptimeDay, StatusPageAppearance, PUBLIC_HISTORY_DAYS,
 };
-use crate::services::subscribers::notices::{
-    incident_notices, IncidentForNotice, PageNotice, NOTICE_WINDOW,
-};
+use crate::services::subscribers::notices::{incident_notices, PageNotice, NOTICE_WINDOW};
 
 /// How often the background loop rebuilds every published snapshot.
 pub const REFRESH_INTERVAL: Duration = Duration::from_secs(60);
@@ -63,6 +63,8 @@ const RESOLVED_INCIDENT_RETENTION_DAYS: i64 = PUBLIC_HISTORY_DAYS as i64;
 const MAX_INCIDENTS_PER_PAGE: i64 = 50;
 /// Most public updates shown per incident.
 const MAX_UPDATES_PER_INCIDENT: usize = 20;
+/// Most entries in a page's Atom feed.
+pub const FEED_ENTRIES: usize = 50;
 /// Bound on bind parameters per `IN (...)` list; Postgres allows 65535.
 const MAX_IDS_PER_QUERY: usize = 1000;
 
@@ -94,6 +96,10 @@ pub struct PublishedSnapshot {
     /// The same page for a custom hostname: identical except that the
     /// subscribe form posts to the hostname's own path.
     pub html_custom_host: Bytes,
+    /// The page's Atom feed, for its slug URL and for a custom hostname
+    /// (only the links differ).
+    pub feed: Bytes,
+    pub feed_custom_host: Bytes,
 }
 
 impl PublishedSnapshot {
@@ -109,6 +115,16 @@ impl PublishedSnapshot {
             self.html_custom_host.clone()
         } else {
             self.html.clone()
+        }
+    }
+
+    /// The Atom feed to serve, by whether the request came through a custom
+    /// hostname.
+    pub fn feed_for(&self, custom_host: Option<&str>) -> Bytes {
+        if custom_host.is_some() {
+            self.feed_custom_host.clone()
+        } else {
+            self.feed.clone()
         }
     }
 
@@ -448,21 +464,33 @@ impl StatusSnapshotCache {
                 continue;
             }
             let project_ids: HashSet<i32> = page_selections.iter().map(|s| s.project_id).collect();
-            let AssembledPage { response, notices } =
-                assemble_page(page, &page_selections, &data, now);
+            let AssembledPage {
+                response,
+                notices,
+                events,
+            } = assemble_page(page, &page_selections, &data, now);
+            let base_path = format!("/api/status/{}", page.slug);
+            let feed = Bytes::from(render_atom_feed(&page.slug, &response, &events, &base_path));
+            let feed_custom_host =
+                Bytes::from(render_atom_feed(&page.slug, &response, &events, ""));
             let subscriptions_since = subscriptions_since(page);
-            let (html, html_custom_host) = if subscriptions_since.is_some() {
-                (
-                    Bytes::from(render_public_page_html_with(
-                        &response,
-                        Some(&format!("/api/status/{}/subscribe", page.slug)),
-                    )),
-                    Bytes::from(render_public_page_html_with(&response, Some("/subscribe"))),
-                )
-            } else {
-                let html = Bytes::from(render_public_page_html_with(&response, None));
-                (html.clone(), html)
-            };
+            let accepts = subscriptions_since.is_some();
+            let base_subscribe = format!("{base_path}/subscribe");
+            let base_feed = format!("{base_path}/feed.atom");
+            let html = Bytes::from(render_public_page_html_with(
+                &response,
+                PageActions {
+                    subscribe: accepts.then_some(base_subscribe.as_str()),
+                    feed: Some(&base_feed),
+                },
+            ));
+            let html_custom_host = Bytes::from(render_public_page_html_with(
+                &response,
+                PageActions {
+                    subscribe: accepts.then_some("/subscribe"),
+                    feed: Some("/feed.atom"),
+                },
+            ));
             match serde_json::to_vec(&response) {
                 Ok(json) => built.push((
                     page.slug.clone(),
@@ -478,6 +506,8 @@ impl StatusSnapshotCache {
                         json: Bytes::from(json),
                         html,
                         html_custom_host,
+                        feed,
+                        feed_custom_host,
                     }),
                 )),
                 Err(e) => error!(
@@ -863,6 +893,8 @@ fn subscriptions_since(page: &status_pages::Model) -> Option<UtcDateTime> {
 pub(crate) struct AssembledPage {
     pub response: PublicStatusPageResponse,
     pub notices: Vec<PageNotice>,
+    /// The newest [`FEED_ENTRIES`] events, for the Atom feed.
+    pub events: Vec<PageEvent>,
 }
 
 /// Build the public view of one page from pre-fetched data. Pure: everything
@@ -959,7 +991,7 @@ pub(crate) fn assemble_page(
                 .flat_map(|incident| {
                     incident_notices(
                         &page.title,
-                        &IncidentForNotice {
+                        &IncidentSource {
                             incident_id: incident.incident_id,
                             update_ids: &incident.update_ids,
                             incident: &incident.public,
@@ -972,6 +1004,19 @@ pub(crate) fn assemble_page(
         }
         None => Vec::new(),
     };
+    let events = newest_events(
+        incidents
+            .iter()
+            .flat_map(|incident| {
+                incident_events(&IncidentSource {
+                    incident_id: incident.incident_id,
+                    update_ids: &incident.update_ids,
+                    incident: &incident.public,
+                })
+            })
+            .collect(),
+        FEED_ENTRIES,
+    );
     let incidents: Vec<PublicIncident> = incidents.into_iter().map(|i| i.public).collect();
 
     let mut status = components
@@ -1005,6 +1050,7 @@ pub(crate) fn assemble_page(
             generated_at: now,
         },
         notices,
+        events,
     }
 }
 

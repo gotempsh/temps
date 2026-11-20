@@ -175,15 +175,25 @@ footer{color:var(--muted);font-size:13px;margin-top:40px;display:flex;justify-co
 
 /// Render the full HTML document for a public status page.
 pub fn render_public_page_html(page: &PublicStatusPageResponse) -> String {
-    render_public_page_html_with(page, None)
+    render_public_page_html_with(page, PageActions::default())
 }
 
-/// [`render_public_page_html`] with the subscribe form posting to
-/// `subscribe_action` when the page accepts email subscriptions (ADR 108 D2).
-/// The form is a plain HTML post: the page still runs no script.
+/// Where a page's own links point, which depends on whether it is served at
+/// its slug URL or on a custom hostname (ADR 108 D2).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PageActions<'a> {
+    /// The subscribe form posts here; `None` hides the form (subscriptions
+    /// are off). The form is a plain HTML post: the page runs no script.
+    pub subscribe: Option<&'a str>,
+    /// The page's Atom feed.
+    pub feed: Option<&'a str>,
+}
+
+/// [`render_public_page_html`] with the page's own links (see
+/// [`PageActions`]).
 pub fn render_public_page_html_with(
     page: &PublicStatusPageResponse,
-    subscribe_action: Option<&str>,
+    actions: PageActions<'_>,
 ) -> String {
     let mut html = String::with_capacity(32 * 1024);
     let title = escape_html(&page.title);
@@ -201,7 +211,18 @@ pub fn render_public_page_html_with(
          <meta name=\"robots\" content=\"noindex,nofollow\">\
          <meta name=\"referrer\" content=\"no-referrer\">\
          <meta http-equiv=\"refresh\" content=\"{AUTO_REFRESH_SECS}\">\
-         <title>{title}</title><style>:root{{--accent:{}}}{STYLE}</style></head><body>",
+         <title>{title}</title>",
+    );
+    if let Some(feed) = actions.feed {
+        let _ = write!(
+            html,
+            "<link rel=\"alternate\" type=\"application/atom+xml\" title=\"{title}\" href=\"{}\">",
+            escape_html(feed)
+        );
+    }
+    let _ = write!(
+        html,
+        "<style>:root{{--accent:{}}}{STYLE}</style></head><body>",
         accent(appearance.accent_color.as_deref())
     );
 
@@ -278,15 +299,19 @@ pub fn render_public_page_html_with(
 
     render_past_incidents(&mut html, page);
 
-    if let Some(action) = subscribe_action {
+    if let Some(action) = actions.subscribe {
         render_subscribe_form(&mut html, action);
     }
 
     let _ = write!(
         html,
-        "<footer><span>Last updated {}. This page refreshes every minute.</span><span>Times are in UTC.</span></footer></main></body></html>",
+        "<footer><span>Last updated {}. This page refreshes every minute.</span><span>Times are in UTC.",
         format_time(&page.generated_at)
     );
+    if let Some(feed) = actions.feed {
+        let _ = write!(html, " <a href=\"{}\">Atom feed</a>", escape_html(feed));
+    }
+    html.push_str("</span></footer></main></body></html>");
     html
 }
 
@@ -742,10 +767,33 @@ mod tests {
         let page = page_with("API", "Investigating", "Status");
         let without = render_public_page_html(&page);
         assert!(!without.contains("<form"));
-        let with = render_public_page_html_with(&page, Some("/api/status/ab\"cd/subscribe"));
+        let with = render_public_page_html_with(
+            &page,
+            PageActions {
+                subscribe: Some("/api/status/ab\"cd/subscribe"),
+                feed: None,
+            },
+        );
         assert!(with.contains("<form method=\"post\" action=\"/api/status/ab&quot;cd/subscribe\">"));
         assert!(with.contains("type=\"email\" name=\"email\" required"));
         assert!(!with.contains("<script"));
+    }
+
+    #[test]
+    fn the_feed_is_linked_from_the_head_and_the_footer() {
+        let page = page_with("API", "Investigating", "Status");
+        assert!(!render_public_page_html(&page).contains("application/atom+xml"));
+        let html = render_public_page_html_with(
+            &page,
+            PageActions {
+                subscribe: None,
+                feed: Some("/feed.atom"),
+            },
+        );
+        assert!(html.contains(
+            "<link rel=\"alternate\" type=\"application/atom+xml\" title=\"Status\" href=\"/feed.atom\">"
+        ));
+        assert!(html.contains("<a href=\"/feed.atom\">Atom feed</a>"));
     }
 
     #[test]
