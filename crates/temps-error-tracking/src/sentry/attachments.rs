@@ -39,7 +39,14 @@ impl AttachmentCollector {
             return false;
         }
         let text = |key: &str| header.other.get(key).and_then(|value| value.as_str());
-        let attachment_type = text("attachment_type").unwrap_or(STORED_ATTACHMENT_TYPE);
+        // Absent means a plain file; present but not a string is not one.
+        let attachment_type = match header.other.get("attachment_type") {
+            None => STORED_ATTACHMENT_TYPE,
+            Some(value) => match value.as_str() {
+                Some(kind) => kind,
+                None => return false,
+            },
+        };
         if attachment_type != STORED_ATTACHMENT_TYPE
             || payload.len() > MAX_ATTACHMENT_BYTES
             || self.items.len() >= MAX_ATTACHMENTS_PER_EVENT
@@ -136,6 +143,21 @@ mod tests {
         let mut collector = AttachmentCollector::default();
         for kind in ["event.minidump", "event.applecrashreport", "unreal.context"] {
             assert!(!collector.push(&header(&[("attachment_type", kind)], None), b"MDMP"));
+        }
+        assert_eq!(collector.finish(Some(EVENT), &[], &[]), Ok(None));
+    }
+
+    #[test]
+    fn an_attachment_type_that_is_not_a_string_is_not_kept() {
+        let mut collector = AttachmentCollector::default();
+        for value in [
+            serde_json::json!(null),
+            serde_json::json!(7),
+            serde_json::json!(["event.attachment"]),
+        ] {
+            let mut item = header(&[], None);
+            item.other.insert("attachment_type".to_string(), value);
+            assert!(!collector.push(&item, b"data"));
         }
         assert_eq!(collector.finish(Some(EVENT), &[], &[]), Ok(None));
     }

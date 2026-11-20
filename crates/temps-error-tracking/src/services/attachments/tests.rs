@@ -243,6 +243,8 @@ mod storage {
     fn batch(f: &Fixture, sdk_event_id: &str, files: Vec<IncomingAttachment>) -> AttachmentBatch {
         AttachmentBatch {
             project_id: f.project_id,
+            environment_id: None,
+            deployment_id: None,
             sdk_event_id: sdk_event_id.into(),
             attachments: files,
         }
@@ -306,8 +308,18 @@ mod storage {
             return;
         };
         event(&f, SDK_EVENT, chrono::Duration::minutes(5)).await;
-        let (previous, usage) = f.service.set_quota(f.project_id, 4).await.expect("quota");
-        assert_eq!((previous, usage.quota_bytes), (DEFAULT_QUOTA_BYTES, 4));
+        let previous = f.service.set_quota(f.project_id, 4).await.expect("quota");
+        assert_eq!(previous, DEFAULT_QUOTA_BYTES);
+        let usage = f.service.usage(f.project_id).await.expect("usage");
+        assert_eq!(usage.quota_bytes, 4);
+        assert_eq!(
+            f.service.set_quota(f.project_id, 5).await.expect("quota"),
+            4
+        );
+        assert_eq!(
+            f.service.set_quota(f.project_id, 4).await.expect("quota"),
+            5
+        );
 
         let outcome = f
             .service
@@ -481,6 +493,93 @@ mod storage {
     }
 
     #[tokio::test]
+    async fn a_replay_is_recognised_by_name_and_content_even_over_the_quota() {
+        let Some(f) = fixture("attachment replay identity test").await else {
+            return;
+        };
+        let event_id = event(&f, SDK_EVENT, chrono::Duration::minutes(5)).await;
+        let stored = f
+            .service
+            .store_batch(
+                f.store.as_ref(),
+                &batch(&f, SDK_EVENT, vec![file("a.txt", b"abc")]),
+            )
+            .await
+            .expect("store");
+        assert_eq!(stored.stored, 1, "{stored:?}");
+        f.service.set_quota(f.project_id, 3).await.expect("quota");
+
+        // The same file again, in another position: a replay, not over quota.
+        let replay = f
+            .service
+            .store_batch(
+                f.store.as_ref(),
+                &batch(
+                    &f,
+                    SDK_EVENT,
+                    vec![file("b.txt", b"x"), file("a.txt", b"abc")],
+                ),
+            )
+            .await
+            .expect("replay");
+        assert_eq!(
+            (replay.stored, replay.duplicates, replay.over_quota),
+            (0, 1, 1),
+            "{replay:?}"
+        );
+
+        // Same name, other content: a new file, stored once there is room.
+        f.service.set_quota(f.project_id, 6).await.expect("quota");
+        let changed = f
+            .service
+            .store_batch(
+                f.store.as_ref(),
+                &batch(&f, SDK_EVENT, vec![file("a.txt", b"xyz")]),
+            )
+            .await
+            .expect("changed");
+        assert_eq!(changed.stored, 1, "{changed:?}");
+        let listed = f
+            .service
+            .list(f.project_id, AttachmentOwner::Error(event_id))
+            .await
+            .expect("list");
+        let sizes: Vec<(&str, i64)> = listed
+            .iter()
+            .map(|a| (a.filename.as_str(), a.size_bytes))
+            .collect();
+        assert_eq!(sizes, [("a.txt", 3), ("a.txt", 3)]);
+        let (_, second) = f
+            .service
+            .content(f.project_id, listed[1].id)
+            .await
+            .expect("content");
+        assert_eq!(&second[..], b"xyz");
+    }
+
+    #[tokio::test]
+    async fn a_file_sent_under_another_scope_than_its_event_is_dropped() {
+        let Some(f) = fixture("attachment scope test").await else {
+            return;
+        };
+        event(&f, SDK_EVENT, chrono::Duration::minutes(5)).await;
+        // The event was stored by a DSN without environment or deployment.
+        let mut scoped = batch(&f, SDK_EVENT, vec![file("a.txt", b"abc")]);
+        scoped.deployment_id = Some(f.project_id + 1_000_000);
+        let outcome = f
+            .service
+            .store_batch(f.store.as_ref(), &scoped)
+            .await
+            .expect("store");
+        assert_eq!(
+            (outcome.stored, outcome.without_owner),
+            (0, 1),
+            "{outcome:?}"
+        );
+        assert!(f.store.keys(f.project_id).is_empty());
+    }
+
+    #[tokio::test]
     async fn the_uploader_and_sweeper_end_when_the_service_is_dropped() {
         let Some(f) = fixture("attachment task shutdown test").await else {
             return;
@@ -623,9 +722,9 @@ mod storage {
         f.db.execute(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
             "INSERT INTO error_attachments (project_id, owner_kind, owner_id, ordinal, event_time, \
-                 filename, content_type, attachment_type, size_bytes, created_at) \
+                 filename, content_type, attachment_type, size_bytes, content_sha256, created_at) \
              SELECT $1, 'error', $2, 5, timestamp, 'b.txt', 'text/plain', 'event.attachment', 2, \
-                 NOW() - INTERVAL '2 hours' FROM error_events WHERE id = $2",
+                 sha256('bb'::bytea), NOW() - INTERVAL '2 hours' FROM error_events WHERE id = $2",
             [f.project_id.into(), kept_event.into()],
         ))
         .await
@@ -634,12 +733,24 @@ mod storage {
         f.db.execute(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
             "INSERT INTO error_attachments (project_id, owner_kind, owner_id, ordinal, filename, \
-                 content_type, attachment_type, size_bytes, stored_at) \
-             VALUES ($1, 'feedback', 987654, 0, 'c.png', 'image/png', 'event.attachment', 1, NOW())",
+                 content_type, attachment_type, size_bytes, content_sha256, stored_at) \
+             VALUES ($1, 'feedback', 987654, 0, 'c.png', 'image/png', 'event.attachment', 1, \
+                 sha256('c'::bytea), NOW())",
             [f.project_id.into()],
         ))
         .await
         .expect("orphan row");
+        // Both were charged when they were reserved, as `reserve` does.
+        f.db.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "UPDATE error_attachment_usage SET bytes = bytes + 3, files = files + 2 \
+             WHERE project_id = $1",
+            [f.project_id.into()],
+        ))
+        .await
+        .expect("charge rows");
+        let charged = f.service.usage(f.project_id).await.expect("usage");
+        assert_eq!((charged.used_bytes, charged.files), (9, 4));
 
         let outcome = f
             .service
@@ -663,6 +774,9 @@ mod storage {
             .expect("list");
         assert_eq!(left.len(), 1);
         assert_eq!(f.store.keys(f.project_id).len(), 1);
+        // Each removal gave back exactly its own bytes and file.
+        let after = f.service.usage(f.project_id).await.expect("usage");
+        assert_eq!((after.used_bytes, after.files), (3, 1));
         // A second pass finds nothing more.
         assert_eq!(
             f.service

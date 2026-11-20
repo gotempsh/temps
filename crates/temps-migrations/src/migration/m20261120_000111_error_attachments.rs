@@ -10,6 +10,11 @@
 //! `stored_at` once the object is in place, so a crash between the two
 //! leaves a row the sweeper removes, never an unreferenced object.
 //!
+//! A file's replay identity is its owner, name and SHA-256: an SDK that
+//! resends an envelope adds nothing, while a different file sent later for
+//! the same owner is a new row. `ordinal` is the display order, assigned
+//! under the project's usage row lock.
+//!
 //! `error_attachment_usage` holds one row per project that has attachments:
 //! the bytes and files stored, and the per-project quota, which the admin
 //! can change. Neither table has a foreign key to `projects`: a deleted
@@ -39,9 +44,11 @@ impl MigrationTrait for Migration {
                  content_type TEXT NOT NULL, \
                  attachment_type TEXT NOT NULL, \
                  size_bytes BIGINT NOT NULL CHECK (size_bytes >= 0), \
+                 content_sha256 BYTEA NOT NULL CHECK (length(content_sha256) = 32), \
                  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), \
                  stored_at TIMESTAMPTZ, \
-                 UNIQUE (project_id, owner_kind, owner_id, ordinal))",
+                 UNIQUE (project_id, owner_kind, owner_id, ordinal), \
+                 UNIQUE (project_id, owner_kind, owner_id, filename, content_sha256))",
         )
         .await?;
         // The sweeper walks error attachments oldest event first.
@@ -59,7 +66,7 @@ impl MigrationTrait for Migration {
         .await?;
         db.execute_unprepared(
             "CREATE INDEX IF NOT EXISTS idx_error_attachments_unstored \
-             ON error_attachments (created_at) WHERE stored_at IS NULL",
+             ON error_attachments (id) WHERE stored_at IS NULL",
         )
         .await?;
         db.execute_unprepared(
@@ -76,10 +83,101 @@ impl MigrationTrait for Migration {
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let db = manager.get_connection();
+        // Dropping the rows of stored files would leave their objects in
+        // blob storage with nothing left to find or delete them, so the
+        // rollback refuses while any attachment is listed.
+        let present = db
+            .query_one(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT to_regclass('error_attachments') IS NOT NULL AS present".to_owned(),
+            ))
+            .await?
+            .map(|row| row.try_get::<bool>("", "present"))
+            .transpose()?
+            .unwrap_or(false);
+        if present {
+            let listed = db
+                .query_one(sea_orm::Statement::from_string(
+                    sea_orm::DatabaseBackend::Postgres,
+                    "SELECT EXISTS (SELECT 1 FROM error_attachments) AS listed".to_owned(),
+                ))
+                .await?
+                .map(|row| row.try_get::<bool>("", "listed"))
+                .transpose()?
+                .unwrap_or(false);
+            if listed {
+                return Err(DbErr::Migration(
+                    "error_attachments still lists files kept in blob storage; delete them \
+                     (temps errors attachments delete, or delete their projects and let the \
+                     sweeper run) before rolling back this migration"
+                        .to_owned(),
+                ));
+            }
+        }
         db.execute_unprepared("DROP TABLE IF EXISTS error_attachments")
             .await?;
         db.execute_unprepared("DROP TABLE IF EXISTS error_attachment_usage")
             .await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn the_rollback_refuses_while_files_are_listed_and_identity_is_name_and_content() {
+        if !temps_test_utils::external_database_configured()
+            && !temps_test_utils::docker_available().await
+        {
+            eprintln!("Skipping error attachments migration: database unavailable");
+            return;
+        }
+        let test = temps_test_utils::TestDatabase::new()
+            .await
+            .expect("test database");
+        let db = test.connection_arc();
+        let manager = SchemaManager::new(db.as_ref());
+        Migration.up(&manager).await.expect("up");
+        Migration.up(&manager).await.expect("up again");
+
+        let insert = |ordinal: i32, content: &str| {
+            format!(
+                "INSERT INTO error_attachments (project_id, owner_kind, owner_id, ordinal, \
+                     filename, content_type, attachment_type, size_bytes, content_sha256) \
+                 VALUES (7, 'error', 11, {ordinal}, 'a.txt', 'text/plain', 'event.attachment', \
+                     3, sha256('{content}'::bytea))"
+            )
+        };
+        db.execute_unprepared(&insert(0, "abc"))
+            .await
+            .expect("first file");
+        // The same name and content for the same owner is the same file.
+        assert!(db.execute_unprepared(&insert(1, "abc")).await.is_err());
+        db.execute_unprepared(&insert(1, "xyz"))
+            .await
+            .expect("same name, other content");
+        assert!(
+            db.execute_unprepared(
+                "INSERT INTO error_attachments (project_id, owner_kind, owner_id, ordinal, \
+                     filename, content_type, attachment_type, size_bytes, content_sha256) \
+                 VALUES (7, 'error', 11, 2, 'b.txt', 'text/plain', 'event.attachment', 1, '\\x00'::bytea)"
+            )
+            .await
+            .is_err(),
+            "a hash must be 32 bytes"
+        );
+
+        let refused = Migration.down(&manager).await;
+        assert!(
+            matches!(&refused, Err(DbErr::Migration(message)) if message.contains("still lists files")),
+            "{refused:?}"
+        );
+        db.execute_unprepared("DELETE FROM error_attachments")
+            .await
+            .expect("delete rows");
+        Migration.down(&manager).await.expect("down");
+        Migration.down(&manager).await.expect("down again");
     }
 }

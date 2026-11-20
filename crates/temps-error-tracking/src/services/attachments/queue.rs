@@ -34,6 +34,10 @@ pub struct IncomingAttachment {
 #[derive(Debug, Clone)]
 pub struct AttachmentBatch {
     pub project_id: i32,
+    /// The DSN's environment and deployment: a file only joins an event or
+    /// feedback stored under the same scope.
+    pub environment_id: Option<i32>,
+    pub deployment_id: Option<i32>,
     pub sdk_event_id: String,
     pub attachments: Vec<IncomingAttachment>,
 }
@@ -155,9 +159,16 @@ impl AttachmentQueue {
             return OfferOutcome::default();
         }
         let bytes = batch.bytes();
-        let before = self.queued_bytes.fetch_add(bytes, Ordering::AcqRel);
-        if before.saturating_add(bytes) > self.byte_budget {
-            self.queued_bytes.fetch_sub(bytes, Ordering::AcqRel);
+        // Reserve the bytes only if they fit, in one atomic step, so an
+        // offer that is refused never makes a concurrent one look over.
+        let budget = self.byte_budget;
+        let reserved =
+            self.queued_bytes
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
+                    let next = queued.checked_add(bytes)?;
+                    (next <= budget).then_some(next)
+                });
+        if reserved.is_err() {
             self.stats
                 .dropped_queue_full
                 .fetch_add(files, Ordering::Relaxed);
