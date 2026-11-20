@@ -22,7 +22,7 @@ use crate::error::SandboxError;
 use crate::handlers::sandboxes::{SandboxInner, SandboxResponse};
 use crate::handlers::SandboxAppState;
 use crate::services::placement::PlacementNode;
-use crate::services::sandbox_service::{node_cleanup_command, NodeEviction};
+use crate::services::sandbox_service::{node_cleanup_command, NodeEviction, SandboxResourceHints};
 
 /// Sandbox placement state: the operator allow-list and every node.
 #[derive(Debug, Serialize, ToSchema)]
@@ -215,17 +215,58 @@ pub async fn get_sandbox_placement(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<SandboxAppState>>,
 ) -> Result<impl IntoResponse, Problem> {
-    super::sandboxes::sandbox_permission_guard(
-        &auth,
-        Permission::SandboxesRead,
-        Permission::ProjectsRead,
-    )?;
+    require_placement_read(&auth)?;
     let allowed_node_ids = state.sandbox_service.allowed_node_ids().await?;
     let nodes = state.sandbox_service.placement_nodes().await?;
     Ok(Json(SandboxPlacementResponse {
         allowed_node_ids,
         nodes,
     }))
+}
+
+fn require_placement_read(auth: &temps_auth::context::AuthContext) -> Result<(), Problem> {
+    super::sandboxes::sandbox_permission_guard(
+        auth,
+        Permission::SandboxesRead,
+        Permission::ProjectsRead,
+    )
+}
+
+#[derive(Deserialize, utoipa::IntoParams)]
+pub struct ResourceHintsQuery {
+    pub node: Option<String>,
+    pub backend: Option<temps_sandbox_providers::SandboxBackend>,
+}
+
+/// Effective resource defaults and input ceilings for the requested placement.
+#[utoipa::path(
+    get,
+    tag = "Sandboxes",
+    path = "/v1/sandboxes/resource-defaults",
+    params(ResourceHintsQuery),
+    responses(
+        (status = 200, description = "Effective sandbox defaults", body = SandboxResourceHints),
+        (status = 400, description = "Invalid placement or backend"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 422, description = "No eligible placement"),
+        (status = 503, description = "Host unavailable"),
+        (status = 500, description = "Could not load sandbox settings")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_sandbox_resource_defaults(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<SandboxAppState>>,
+    Query(query): Query<ResourceHintsQuery>,
+) -> Result<impl IntoResponse, Problem> {
+    require_placement_read(&auth)?;
+    Ok(Json(
+        state
+            .sandbox_service
+            .resource_hints(auth.user_id(), query.node, query.backend)
+            .await?,
+    ))
 }
 
 /// Set which nodes may run new sandboxes. Admin only.

@@ -209,6 +209,13 @@ pub enum SandboxError {
     /// path, etc.). Mapped to HTTP 400.
     #[error("Validation error: {message}")]
     Validation { message: String },
+    #[error("Sandbox {sandbox_id} requested {requested} CPU cores on a host with {host} cores (allowed range 0.01 to {max})")]
+    CpuLimit {
+        sandbox_id: String,
+        requested: f64,
+        host: f64,
+        max: f64,
+    },
 
     /// The container runtime could not pull the sandbox image: the tag is
     /// not published, the registry is unreachable or access was denied.
@@ -563,6 +570,14 @@ pub fn from_agent_error(sandbox_id: &str, err: AgentError) -> SandboxError {
         },
         // A request the provider (or a worker node, ADR-048) rejected as
         // invalid is the caller's error, not a failed exec.
+        AgentError::SandboxCpuLimit {
+            requested, host, ..
+        } => SandboxError::CpuLimit {
+            sandbox_id: sandbox_id.into(),
+            requested,
+            host,
+            max: crate::services::create_policy::max_cpu_limit(None, Some(host)),
+        },
         AgentError::Validation { message } => SandboxError::Validation { message },
         AgentError::Io(e) => SandboxError::Io(e),
         // ADR-048: a feature sandboxes on worker nodes cannot serve yet — a
