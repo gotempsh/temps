@@ -412,6 +412,17 @@ impl TempsPlugin for ErrorTrackingPlugin {
                     "AlarmService not available - error tracking alarms will not be persisted"
                 );
             }
+            // Assignment emails (ADR 111, D1.6) go only to users who can
+            // open the project; registered by the teams plugin.
+            match context.get_service::<dyn temps_core::ProjectAccessChecker>() {
+                Some(checker) => context
+                    .require_service::<ErrorTrackingService>()
+                    .set_project_access_checker(checker),
+                None => tracing::debug!(
+                    "Project access checker not available - every assignee can access every \
+                     project, so every assignee is mailed"
+                ),
+            }
             // Release health (ADR 111, D3): the session flusher always runs;
             // crash-free rates are published as project metrics, for metric
             // alert rules, when the OTel metrics store is present.

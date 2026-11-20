@@ -126,15 +126,22 @@ impl AssigneeFilter {
     }
 }
 
+/// Someone to email about a new assignment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssignmentRecipient {
+    pub user_id: i32,
+    pub email: String,
+}
+
 /// What an assignment changed, and who to tell.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssignmentOutcome {
     pub previous: Option<Assignee>,
     pub current: Option<GroupAssignee>,
-    /// Emails of the new assignee (the user, or up to
-    /// [`MAX_ASSIGNMENT_RECIPIENTS`] team members). Empty when nothing
-    /// changed or the group was unassigned.
-    pub recipients: Vec<String>,
+    /// The new assignee (the user, or up to [`MAX_ASSIGNMENT_RECIPIENTS`]
+    /// team members). Empty when nothing changed or the group was
+    /// unassigned. The caller mails only those who can access the project.
+    pub recipients: Vec<AssignmentRecipient>,
     pub group_title: String,
 }
 
@@ -296,32 +303,35 @@ async fn describe<C: ConnectionTrait>(
     })
 }
 
-/// Emails to notify of a new assignment.
+/// Users to notify of a new assignment.
 async fn recipients<C: ConnectionTrait>(
     db: &C,
     assignee: Assignee,
-) -> Result<Vec<String>, ErrorTrackingError> {
+) -> Result<Vec<AssignmentRecipient>, ErrorTrackingError> {
     let statement = match assignee {
         Assignee::User(id) => Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
-            "SELECT email FROM users WHERE id = $1 AND deleted_at IS NULL",
+            "SELECT id, email FROM users WHERE id = $1 AND deleted_at IS NULL",
             [id.into()],
         ),
         Assignee::Team(id) => Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
-            "SELECT u.email FROM team_members m JOIN users u ON u.id = m.user_id \
+            "SELECT u.id, u.email FROM team_members m JOIN users u ON u.id = m.user_id \
              WHERE m.team_id = $1 AND u.deleted_at IS NULL ORDER BY u.id LIMIT $2",
             [id.into(), (MAX_ASSIGNMENT_RECIPIENTS as i64).into()],
         ),
     };
-    db.query_all(statement)
-        .await?
-        .into_iter()
-        .map(|row| Ok(row.try_get("", "email")?))
-        .filter(|email: &Result<String, ErrorTrackingError>| {
-            email.as_ref().map_or(true, |e| !e.trim().is_empty())
-        })
-        .collect()
+    let mut found = Vec::new();
+    for row in db.query_all(statement).await? {
+        let email: String = row.try_get("", "email")?;
+        if !email.trim().is_empty() {
+            found.push(AssignmentRecipient {
+                user_id: row.try_get("", "id")?,
+                email,
+            });
+        }
+    }
+    Ok(found)
 }
 
 /// Names of many assignees in at most two queries.

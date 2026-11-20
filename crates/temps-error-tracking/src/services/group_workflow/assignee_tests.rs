@@ -156,7 +156,13 @@ async fn an_assignee_survives_resolving_and_ignoring_the_group() {
         .expect("assign");
     assert_eq!(outcome.previous, None);
     assert_eq!(outcome.current.as_ref().map(|a| a.id), Some(user));
-    assert_eq!(outcome.recipients, vec![email_of(db.as_ref(), user).await]);
+    assert_eq!(
+        outcome.recipients,
+        vec![AssignmentRecipient {
+            user_id: user,
+            email: email_of(db.as_ref(), user).await
+        }]
+    );
 
     for action in [BulkGroupAction::Resolve, BulkGroupAction::Ignore] {
         service
@@ -247,7 +253,9 @@ async fn assigned_to_me_includes_my_teams_and_a_team_assignment_mails_its_member
         .set_assignee(project, my_team, Some(Assignee::Team(team)))
         .await
         .expect("assign team");
-    assert_eq!(team_outcome.recipients.len(), 2, "both members are told");
+    let mut told: Vec<i32> = team_outcome.recipients.iter().map(|r| r.user_id).collect();
+    told.sort_unstable();
+    assert_eq!(told, vec![me, teammate], "both members are candidates");
     assert_eq!(
         team_outcome.current.map(|a| a.kind),
         Some("team".to_string())

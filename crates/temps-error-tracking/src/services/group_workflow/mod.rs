@@ -39,8 +39,8 @@ pub(crate) mod tests;
 
 pub use activity::{ActivityDetails, ActivityEntry, ActivityKind, ActivityPage, MAX_COMMENT_CHARS};
 pub use assignee::{
-    Assignee, AssigneeCandidates, AssigneeFilter, AssignmentOutcome, GroupAssignee,
-    MAX_ASSIGNEE_OPTIONS,
+    Assignee, AssigneeCandidates, AssigneeFilter, AssignmentOutcome, AssignmentRecipient,
+    GroupAssignee, MAX_ASSIGNEE_OPTIONS,
 };
 pub use ignore::{IgnoreConditions, MAX_IGNORE_EVENT_COUNT, MAX_IGNORE_USER_COUNT};
 pub use merge::{
