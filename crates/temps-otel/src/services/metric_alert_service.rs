@@ -214,7 +214,8 @@ fn validate_log_rule(
     // rule look narrower than what it counts.
     if !label_filters.is_empty() {
         return Err(OtelError::Validation {
-            message: "A log alert counts what its saved search matches, so it takes no                       label_filters; put the filter in the saved search instead"
+            message: "A log alert counts what its saved search matches, so it takes no \
+                      label_filters; put the filter in the saved search instead"
                 .to_string(),
         });
     }
@@ -469,8 +470,11 @@ impl MetricAlertService {
     /// The evaluator's lookup is project-scoped too, so a foreign id could
     /// never read another project's lines; this refuses it at write time
     /// instead of storing a rule that silently never evaluates.
-    async fn ensure_saved_search_in_project(
-        &self,
+    ///
+    /// It runs on `conn`, so `update` reuses the connection its transaction
+    /// already holds instead of taking a second one from the pool.
+    async fn ensure_saved_search_in_project<C: sea_orm::ConnectionTrait>(
+        conn: &C,
         project_id: i32,
         source: AlertSeriesSource,
     ) -> Result<(), OtelError> {
@@ -480,7 +484,7 @@ impl MetricAlertService {
         };
         let found = log_saved_searches::Entity::find_by_id(saved_search_id)
             .filter(log_saved_searches::Column::ProjectId.eq(project_id))
-            .count(self.db.as_ref())
+            .count(conn)
             .await?;
         if found == 0 {
             return Err(OtelError::Validation {
@@ -554,8 +558,7 @@ impl MetricAlertService {
             grouped_notification_threshold,
             series_source,
         )?;
-        self.ensure_saved_search_in_project(project_id, series_source)
-            .await?;
+        Self::ensure_saved_search_in_project(self.db.as_ref(), project_id, series_source).await?;
 
         let model = ActiveModel {
             project_id: Set(project_id),
@@ -739,8 +742,7 @@ impl MetricAlertService {
             eff_source,
         )?;
         if series_source.is_some() {
-            self.ensure_saved_search_in_project(project_id, eff_source)
-                .await?;
+            Self::ensure_saved_search_in_project(&txn, project_id, eff_source).await?;
         }
 
         // A rule that now watches a different series (another source or
@@ -807,10 +809,23 @@ impl MetricAlertService {
         })
     }
 
-    /// Persist an evaluation only while the rule still watches the series
-    /// the evaluation read (same source, saved search, metric and
-    /// aggregation). Returns `false` when the rule changed underneath the
-    /// tick, so its result is stale and must not be written over the newer
+    /// Whether `evaluated` is still the rule's current configuration: the
+    /// row exists and its `config_revision` is the one the evaluation read.
+    /// Asked just before an alarm is opened, so an edit made while the
+    /// series was being read does not page anyone with the old verdict.
+    pub async fn is_current(&self, evaluated: &Model) -> Result<bool, OtelError> {
+        let found = Entity::find_by_id(evaluated.id)
+            .filter(Column::ConfigRevision.eq(evaluated.config_revision))
+            .count(self.db.as_ref())
+            .await?;
+        Ok(found > 0)
+    }
+
+    /// Persist an evaluation only while the rule still has the configuration
+    /// the evaluation read: the same `config_revision` (bumped by any edit
+    /// that changes a verdict, a threshold included) and the same series.
+    /// Returns `false` when the rule changed underneath the tick, so its
+    /// result is stale and must not be written over the newer
     /// configuration's state.
     pub async fn persist_evaluation_if_current(
         &self,
@@ -841,6 +856,7 @@ impl MetricAlertService {
                 sea_orm::sea_query::Expr::value(Utc::now()),
             )
             .filter(Column::Id.eq(evaluated.id))
+            .filter(Column::ConfigRevision.eq(evaluated.config_revision))
             .filter(Column::Source.eq(evaluated.source.clone()))
             .filter(saved_search)
             .filter(Column::MetricName.eq(evaluated.metric_name.clone()))
@@ -898,33 +914,42 @@ impl MetricAlertService {
     }
 
     /// Persist a DYNAMIC (per-series) rule's evaluation: the aggregate-view columns
-    /// (`last_state`/`last_value`/`last_evaluated_at`, exactly as
-    /// [`Self::persist_evaluation`]) PLUS the full per-series snapshot
+    /// (`last_state`/`last_value`/`last_evaluated_at`, as
+    /// [`Self::persist_evaluation_if_current`]) PLUS the full per-series snapshot
     /// (`series_states`) and the latest tick's cardinality-cap drop count
     /// (`last_dropped_series_count`). The static/aggregate path keeps using the
-    /// narrower `persist_evaluation`, so those two columns stay at their DB
-    /// defaults (`{}` / `0`) for non-dynamic rules.
-    pub async fn persist_dynamic_evaluation(
+    /// narrower write, so those two columns stay at their DB defaults (`{}` /
+    /// `0`) for non-dynamic rules.
+    ///
+    /// Written only while the rule's `config_revision` is the one the tick
+    /// read; returns `false` otherwise, so a tick that read the old
+    /// configuration never overwrites the state an edit reset.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn persist_dynamic_evaluation_if_current(
         &self,
-        id: i32,
+        evaluated: &Model,
         last_state: &str,
         last_value: Option<f64>,
         last_evaluated_at: DateTime<Utc>,
         series_states: serde_json::Value,
         dropped_series_count: i32,
-    ) -> Result<(), OtelError> {
-        let existing = Entity::find_by_id(id)
-            .one(self.db.as_ref())
-            .await?
-            .ok_or(OtelError::MetricAlertNotFound { rule_id: id })?;
-        let mut active: ActiveModel = existing.into();
-        active.last_state = Set(last_state.to_string());
-        active.last_value = Set(last_value);
-        active.last_evaluated_at = Set(Some(last_evaluated_at));
-        active.series_states = Set(series_states);
-        active.last_dropped_series_count = Set(dropped_series_count);
-        active.update(self.db.as_ref()).await?;
-        Ok(())
+    ) -> Result<bool, OtelError> {
+        use sea_orm::sea_query::Expr;
+        let result = Entity::update_many()
+            .col_expr(Column::LastState, Expr::value(last_state))
+            .col_expr(Column::LastValue, Expr::value(last_value))
+            .col_expr(Column::LastEvaluatedAt, Expr::value(last_evaluated_at))
+            .col_expr(Column::SeriesStates, Expr::value(series_states))
+            .col_expr(
+                Column::LastDroppedSeriesCount,
+                Expr::value(dropped_series_count),
+            )
+            .col_expr(Column::UpdatedAt, Expr::value(Utc::now()))
+            .filter(Column::Id.eq(evaluated.id))
+            .filter(Column::ConfigRevision.eq(evaluated.config_revision))
+            .exec(self.db.as_ref())
+            .await?;
+        Ok(result.rows_affected > 0)
     }
 }
 
@@ -978,6 +1003,7 @@ mod tests {
             last_value: None,
             series_states: serde_json::json!({}),
             last_dropped_series_count: 0,
+            config_revision: 0,
             last_evaluated_at: None,
             source: "metric".to_string(),
             saved_search_id: None,
@@ -1108,6 +1134,92 @@ mod tests {
             matches!(missing, Err(OtelError::ProjectNotFound { .. })),
             "{missing:?}"
         );
+    }
+
+    /// An operator may run with one database connection. Switching a rule to
+    /// a saved search checks the search inside the update's transaction, on
+    /// the connection it already holds, instead of waiting for a second one.
+    #[tokio::test]
+    async fn switching_to_a_saved_search_works_on_a_single_connection_pool() {
+        use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error) if is_container_runtime_unavailable(&error.to_string()) => {
+                eprintln!("Skipping single-pool metric alert test: {error}");
+                return;
+            }
+            Err(error) => panic!("single-pool metric alert test database setup failed: {error}"),
+        };
+        let mut options = sea_orm::ConnectOptions::new(test_db.database_url.clone());
+        options
+            .max_connections(1)
+            .min_connections(1)
+            .acquire_timeout(std::time::Duration::from_secs(5));
+        let single = Arc::new(
+            sea_orm::Database::connect(options)
+                .await
+                .expect("single-connection pool"),
+        );
+        let now = chrono::Utc::now();
+        let project = temps_entities::projects::ActiveModel {
+            name: Set("Single pool".to_string()),
+            repo_name: Set("repo".to_string()),
+            repo_owner: Set("owner".to_string()),
+            directory: Set("/".to_string()),
+            main_branch: Set("main".to_string()),
+            slug: Set(format!("single-pool-{}", uuid::Uuid::new_v4())),
+            preset: Set(temps_entities::preset::Preset::NextJs),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(single.as_ref())
+        .await
+        .expect("insert project");
+        let search = temps_entities::log_saved_searches::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("Errors".to_string()),
+            query: Set(serde_json::json!({})),
+            time_range: Set("1h".to_string()),
+            pinned: Set(false),
+            ..Default::default()
+        }
+        .insert(single.as_ref())
+        .await
+        .expect("insert saved search");
+        let service = MetricAlertService::new(single);
+        let rule = create_rule(&service, project.id, "Latency")
+            .await
+            .expect("metric rule");
+
+        let update = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            service.update(
+                project.id,
+                rule.id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(AlertSeriesSource::Logs {
+                    saved_search_id: search.id,
+                }),
+            ),
+        )
+        .await
+        .expect("the update finishes")
+        .expect("the rule switches to the saved search");
+        assert!(update.series_changed);
+        assert_eq!(update.model.saved_search_id, Some(search.id));
     }
 
     #[tokio::test]
@@ -1748,28 +1860,56 @@ mod tests {
 
     #[tokio::test]
     async fn test_persist_dynamic_evaluation() {
-        let db = MockDatabase::new(DatabaseBackend::Postgres)
-            // get-by-id load, then the update returns the row again
-            .append_query_results(vec![vec![sample_model(1)]])
-            .append_query_results(vec![vec![sample_model(1)]])
-            .into_connection();
-        let service = MetricAlertService::new(Arc::new(db));
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_exec_results([
+                    MockExecResult {
+                        last_insert_id: 0,
+                        rows_affected: 1,
+                    },
+                    MockExecResult {
+                        last_insert_id: 0,
+                        rows_affected: 0,
+                    },
+                ])
+                .into_connection(),
+        );
+        let service = MetricAlertService::new(db.clone());
 
         let series_states = serde_json::json!({
             "method=GET": {"state": "firing", "value": 12.5, "alarm_id": 259},
             "method=POST": {"state": "ok", "value": 3.1, "alarm_id": null},
         });
-        let result = service
-            .persist_dynamic_evaluation(
-                1,
+        let mut evaluated = sample_model(1);
+        evaluated.config_revision = 4;
+        let persist = |states: serde_json::Value| {
+            service.persist_dynamic_evaluation_if_current(
+                &evaluated,
                 "firing",
                 Some(12.5),
                 chrono::Utc::now(),
-                series_states,
+                states,
                 2,
             )
-            .await;
-        assert!(result.is_ok());
+        };
+        assert!(persist(series_states.clone()).await.expect("written"));
+        assert!(
+            !persist(series_states).await.expect("refused"),
+            "an edited rule refuses the stale snapshot"
+        );
+        drop(service);
+        let log = format!(
+            "{:?}",
+            Arc::try_unwrap(db)
+                .expect("sole owner")
+                .into_transaction_log()
+        )
+        .replace(['\\', '"'], "");
+        assert!(log.contains("config_revision = $"), "guarded: {log}");
+        assert!(
+            log.contains("BigInt(Some(4))"),
+            "by the read revision: {log}"
+        );
     }
 
     // ── Log alerts (ADR 108 D1) ─────────────────────────────────────────
@@ -1997,6 +2137,10 @@ mod tests {
         )
         .expect_err("a label filter on a log rule is refused");
         assert!(error.to_string().contains("saved search"), "{error}");
+        assert!(
+            !error.to_string().contains("  "),
+            "one message line: {error}"
+        );
     }
 
     fn log_model(id: i32) -> Model {

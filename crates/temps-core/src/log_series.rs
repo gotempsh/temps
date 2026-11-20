@@ -35,6 +35,11 @@ pub struct LogSeriesSample {
     /// own time budget ran out: the count is a lower bound, never an
     /// overstatement, so a rule never fires on a number that is too high.
     pub saturated: bool,
+    /// Identifies the saved search's query as counted. It changes when the
+    /// query is edited and not when the search is renamed or pinned, so the
+    /// evaluator can restart a breach that began under the old predicate.
+    /// Comparable within one process only.
+    pub query_fingerprint: u64,
 }
 
 /// Why a log series could not be produced.

@@ -112,6 +112,11 @@ pub struct Model {
     /// saved searches) removes its log rules too. The saved-search service
     /// refuses a direct delete while a rule counts the search.
     pub saved_search_id: Option<i32>,
+    /// Bumped by a database trigger whenever an edit changes what the rule
+    /// decides (series, detector, window, duration, enabled). The evaluator
+    /// writes a verdict only while the revision it read is current, so an
+    /// older result never lands over a newer configuration.
+    pub config_revision: i64,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
 }

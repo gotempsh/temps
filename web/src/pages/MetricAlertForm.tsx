@@ -97,7 +97,11 @@ import {
   SlidersHorizontal,
 } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { switchSignal, type SignalFields } from '@/lib/alert-signal'
+import {
+  parseStashedSignal,
+  switchSignal,
+  type SignalFields,
+} from '@/lib/alert-signal'
 import { useForm, useWatch } from 'react-hook-form'
 import { Link, useLocation, useNavigate, useParams } from 'react-router'
 import { useGoBack } from '@/hooks/useGoBack'
@@ -287,10 +291,17 @@ function AlertFormBody({
     const parsed = raw && /^\d+$/.test(raw) ? Number(raw) : undefined
     return !isEditing && parsed ? parsed : undefined
   })
+  // The metric settings kept aside while the log signal is shown travel
+  // with the draft, so they survive the trip to notification setup.
+  const stashKey = `${draftKey}:metric-signal`
   const [draft] = useState(() => readFormDraft(draftKey))
+  const [restoredStash] = useState(() =>
+    parseStashedSignal(readFormDraft(stashKey), AGGREGATION_VALUES)
+  )
   useEffect(() => {
     clearFormDraft(draftKey)
-  }, [draftKey])
+    clearFormDraft(stashKey)
+  }, [draftKey, stashKey])
 
   const namesQuery = useQuery({
     ...listMetricNamesOptions({ path: { project_id: project.id } }),
@@ -400,7 +411,7 @@ function AlertFormBody({
   // restored when the user returns to a metric.
   const stashedMetricFields = useRef<SignalFields<
     AlertFormData['aggregation']
-  > | null>(null)
+  > | null>(restoredStash)
   useEffect(() => {
     const values = form.getValues()
     const { apply, stashed } = switchSignal(
@@ -563,6 +574,7 @@ function AlertFormBody({
     onSuccess: () => {
       toast.success('Alert rule created')
       clearFormDraft(draftKey)
+      clearFormDraft(stashKey)
       queryClient.invalidateQueries({
         predicate: (query) =>
           (query.queryKey[0] as Record<string, unknown>)?._id === 'listAlerts',
@@ -577,6 +589,7 @@ function AlertFormBody({
     onSuccess: () => {
       toast.success('Alert rule updated')
       clearFormDraft(draftKey)
+      clearFormDraft(stashKey)
       queryClient.invalidateQueries({
         predicate: (query) => {
           const key = (query.queryKey[0] as Record<string, unknown>)?._id
@@ -801,7 +814,12 @@ function AlertFormBody({
 
       <NotificationCoverageNotice
         severity={watchedSeverity}
-        onLeave={() => saveFormDraft(draftKey, form.getValues())}
+        onLeave={() => {
+          saveFormDraft(draftKey, form.getValues())
+          if (stashedMetricFields.current) {
+            saveFormDraft(stashKey, stashedMetricFields.current)
+          }
+        }}
       />
 
       <Form {...form}>

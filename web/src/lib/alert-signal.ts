@@ -39,3 +39,45 @@ export function switchSignal<F extends SignalFields>(
   }
   return { apply: stashed, stashed: null }
 }
+
+/**
+ * The metric settings kept aside, read back from a saved draft. A form that
+ * leaves for notification setup while showing the log signal saves them
+ * beside its draft, so returning and switching back to the metric restores
+ * what the user had. Anything that is not a well-formed stash is `null`.
+ */
+export function parseStashedSignal<A extends string>(
+  raw: unknown,
+  aggregations: readonly A[]
+): SignalFields<A> | null {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return null
+  const value = raw as Record<string, unknown>
+  const aggregation = value.aggregation
+  const isAggregation =
+    aggregation === 'count' ||
+    (typeof aggregation === 'string' &&
+      (aggregations as readonly string[]).includes(aggregation))
+  const isFilter = (item: unknown) =>
+    typeof item === 'object' &&
+    item !== null &&
+    typeof (item as Record<string, unknown>).key === 'string' &&
+    typeof (item as Record<string, unknown>).value === 'string'
+  if (
+    !isAggregation ||
+    (value.detection_kind !== 'static' && value.detection_kind !== 'anomaly') ||
+    !Array.isArray(value.group_by) ||
+    !value.group_by.every((key) => typeof key === 'string') ||
+    !Array.isArray(value.label_filters) ||
+    !value.label_filters.every(isFilter) ||
+    typeof value.dynamic_alerts !== 'boolean'
+  ) {
+    return null
+  }
+  return {
+    aggregation: aggregation as A | 'count',
+    detection_kind: value.detection_kind,
+    group_by: value.group_by as string[],
+    label_filters: value.label_filters as SignalFields['label_filters'],
+    dynamic_alerts: value.dynamic_alerts,
+  }
+}

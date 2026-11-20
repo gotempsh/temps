@@ -107,7 +107,10 @@ pub struct LogSeries {
 /// partial bucket and label the rest one bucket early.
 fn grid_origin(start: DateTime<Utc>, bucket_secs: u32) -> DateTime<Utc> {
     let width = i64::from(bucket_secs.max(1));
-    start - chrono::Duration::seconds(start.timestamp().rem_euclid(width))
+    // Fractional seconds go too: a boundary is a whole multiple of the width.
+    start
+        - chrono::Duration::seconds(start.timestamp().rem_euclid(width))
+        - chrono::Duration::nanoseconds(i64::from(start.timestamp_subsec_nanos()))
 }
 
 /// The predicate selecting the lines that contribute to `metric`: a numeric
@@ -576,6 +579,8 @@ impl LogSeriesService {
         Ok(LogSeriesSample {
             count,
             saturated: false,
+            // Filled in by `count_matching`.
+            query_fingerprint: 0,
         })
     }
 
@@ -595,6 +600,8 @@ impl LogSeriesService {
                 return Ok(LogSeriesSample {
                     count,
                     saturated: true,
+                    // Filled in by `count_matching`.
+                    query_fingerprint: 0,
                 });
             }
             query.limit = u32::try_from(remaining.min(u64::from(COUNT_PAGE_SIZE)))
@@ -608,17 +615,35 @@ impl LogSeriesService {
                 return Ok(LogSeriesSample {
                     count,
                     saturated: true,
+                    // Filled in by `count_matching`.
+                    query_fingerprint: 0,
                 });
             }
             let Some(next) = page.next_cursor else {
                 return Ok(LogSeriesSample {
                     count,
                     saturated: false,
+                    // Filled in by `count_matching`.
+                    query_fingerprint: 0,
                 });
             };
             query.before = Some(next);
         }
     }
+}
+
+/// A hash of what a saved search selects, for
+/// [`LogSeriesSample::query_fingerprint`]. Computed from the decoded query,
+/// so renaming, describing or pinning the search leaves it unchanged.
+fn query_fingerprint(query: &SavedSearchQuery) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    // Serializing a plain struct of strings and numbers cannot fail; an
+    // error would only collapse every query onto one fingerprint.
+    serde_json::to_string(query)
+        .unwrap_or_default()
+        .hash(&mut hasher);
+    hasher.finish()
 }
 
 #[async_trait]
@@ -647,7 +672,7 @@ impl LogSeriesSource for LogSeriesService {
                     reason: other.to_string(),
                 },
             })?;
-        let sample = self
+        let mut sample = self
             .count(project_id, &query, start, end)
             .await
             .map_err(|e| LogSeriesError::Query {
@@ -655,6 +680,7 @@ impl LogSeriesSource for LogSeriesService {
                 saved_search_id,
                 reason: e.to_string(),
             })?;
+        sample.query_fingerprint = query_fingerprint(&query);
         debug!(
             project_id,
             saved_search_id,
@@ -1396,6 +1422,46 @@ mod tests {
                 (t0() + Duration::minutes(15), Some(1.0)),
             ],
             "buckets sit on the boundaries the index uses, none dropped"
+        );
+    }
+
+    #[test]
+    fn the_grid_origin_drops_fractional_seconds() {
+        let start = t0() + Duration::seconds(30) + Duration::milliseconds(500);
+        assert_eq!(grid_origin(start, 60), t0());
+        assert_eq!(grid_origin(t0() + Duration::minutes(2), 300), t0());
+        assert_eq!(
+            grid_origin(t0(), 300),
+            t0(),
+            "an aligned start is unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_index_series_keeps_its_first_bucket_when_start_has_fractional_seconds() {
+        let index = FakeIndex {
+            histogram: vec![HistogramBucket {
+                ts: t0(),
+                group: None,
+                count: 4,
+            }],
+            aggregates: std::sync::Mutex::new(vec![]),
+            seen: Default::default(),
+        };
+        let request = SeriesRequest {
+            start: t0() + Duration::seconds(30) + Duration::milliseconds(500),
+            end: t0() + Duration::minutes(2),
+            bucket_secs: 60,
+            metric: Metric::Count,
+        };
+        let series = series_service(Arc::new(ScriptedStore::new(vec![])), Some(index))
+            .series(7, &SavedSearchQuery::default(), request)
+            .await
+            .expect("series");
+        assert_eq!(
+            series.points.first().map(|p| (p.ts, p.value)),
+            Some((t0(), Some(4.0))),
+            "the index's 12:00:00 bucket is not dropped"
         );
     }
 

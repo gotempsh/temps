@@ -44,6 +44,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use tracing::{debug, error};
@@ -110,14 +111,72 @@ pub struct LogIngestService {
     budget: Arc<IngestBudget>,
     limiters: Mutex<HashMap<i32, IngestLimiter>>,
     services: Mutex<HashMap<i32, HashSet<String>>>,
-    /// One gate per key seen by this process. A batch holds it for reading
-    /// while it writes; revoking takes it for writing, so it waits for the
-    /// key's in-flight batches, marks it closed (`true`) and only then
-    /// closes its streams. A batch that authenticated just before the revoke
-    /// and reaches the gate after it is refused instead of reopening a
-    /// stream. Entries are one per key ever used here, which the per-project
-    /// key limit and the rate of revocations keep small.
-    gates: Mutex<HashMap<i32, Arc<tokio::sync::RwLock<bool>>>>,
+    /// The revocation gates; see [`GateRegistry`].
+    gates: Mutex<GateRegistry>,
+}
+
+/// How long a revoked key's closed gate is kept. Revoking drops the key from
+/// the resolver's cache at once, so only an authentication already in flight
+/// at the revoke can still reach the gate; this is far longer than one.
+pub const CLOSED_GATE_RETENTION: Duration = Duration::from_secs(300);
+/// How often the gate registry is pruned, at most.
+const GATE_PRUNE_INTERVAL: Duration = Duration::from_secs(60);
+
+type Gate = Arc<tokio::sync::RwLock<bool>>;
+
+/// One gate per key in use. A batch holds its key's gate for reading while
+/// it writes; revoking takes it for writing, so it waits for the key's
+/// in-flight batches, marks it closed (`true`) and only then closes its
+/// streams. A batch that authenticated just before the revoke and reaches
+/// the gate after it is refused instead of reopening a stream.
+///
+/// The map stays bounded however many keys are rotated: at most once per
+/// [`GATE_PRUNE_INTERVAL`], an open gate no batch holds is dropped (the next
+/// batch makes a new one, and an open gate carries no state), and a closed
+/// gate is dropped [`CLOSED_GATE_RETENTION`] after its revoke.
+struct GateRegistry {
+    gates: HashMap<i32, (Gate, Option<Instant>)>,
+    last_prune: Instant,
+}
+
+impl GateRegistry {
+    fn new(now: Instant) -> Self {
+        Self {
+            gates: HashMap::new(),
+            last_prune: now,
+        }
+    }
+
+    fn gate(&mut self, key_id: i32, now: Instant) -> Gate {
+        if now.duration_since(self.last_prune) >= GATE_PRUNE_INTERVAL {
+            self.prune(now);
+        }
+        self.gates.entry(key_id).or_default().0.clone()
+    }
+
+    /// Record that `gate`, now closed, belongs to a revoked key.
+    fn mark_closed(&mut self, key_id: i32, gate: &Gate, now: Instant) {
+        if let Some((current, closed_at)) = self.gates.get_mut(&key_id) {
+            if Arc::ptr_eq(current, gate) {
+                *closed_at = Some(now);
+            }
+        }
+    }
+
+    fn prune(&mut self, now: Instant) {
+        self.last_prune = now;
+        // The registry lock is held, so no batch can take a gate meanwhile:
+        // a strong count of one means nobody holds it.
+        self.gates.retain(|_, (gate, closed_at)| match closed_at {
+            Some(at) => now.duration_since(*at) < CLOSED_GATE_RETENTION,
+            None => Arc::strong_count(gate) > 1,
+        });
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.gates.len()
+    }
 }
 
 impl LogIngestService {
@@ -132,18 +191,19 @@ impl LogIngestService {
             budget,
             limiters: Mutex::new(HashMap::new()),
             services: Mutex::new(HashMap::new()),
-            gates: Mutex::new(HashMap::new()),
+            gates: Mutex::new(GateRegistry::new(Instant::now())),
         }
     }
 
-    fn gate(&self, key_id: i32) -> Arc<tokio::sync::RwLock<bool>> {
-        match self.gates.lock() {
-            Ok(mut gates) => gates.entry(key_id).or_default().clone(),
-            // The map holds no invariant a panic could have broken, so a
-            // poisoned lock is still used: a revoke must reach the same gate
-            // the key's batches hold.
-            Err(e) => e.into_inner().entry(key_id).or_default().clone(),
-        }
+    /// The registry, even if a panic poisoned its lock: it holds no
+    /// invariant a panic could have broken, and a revoke must reach the same
+    /// gate the key's batches hold.
+    fn gates(&self) -> std::sync::MutexGuard<'_, GateRegistry> {
+        self.gates.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn gate(&self, key_id: i32) -> Gate {
+        self.gates().gate(key_id, Instant::now())
     }
 
     /// After a key is revoked: wait for its in-flight batches, refuse any
@@ -153,6 +213,7 @@ impl LogIngestService {
         let gate = self.gate(key_id);
         let mut closed = gate.write().await;
         *closed = true;
+        self.gates().mark_closed(key_id, &gate, Instant::now());
         if let Ok(mut limiters) = self.limiters.lock() {
             limiters.remove(&key_id);
         }
@@ -426,6 +487,46 @@ mod tests {
         assert!(!closing.is_finished(), "the revoke did not wait");
         drop(in_flight);
         closing.await.expect("join").expect("closed");
+    }
+
+    #[tokio::test]
+    async fn a_closed_gate_refuses_until_it_is_retired() {
+        let start = Instant::now();
+        let mut registry = GateRegistry::new(start);
+        let gate = registry.gate(5, start);
+        *gate.write().await = true;
+        registry.mark_closed(5, &gate, start);
+        drop(gate);
+
+        // Pruned within the retention: the key's gate is still closed.
+        let soon = start + GATE_PRUNE_INTERVAL;
+        assert!(*registry.gate(5, soon).read().await, "still refused");
+        assert_eq!(registry.len(), 1);
+
+        // Pruned after it: the entry is gone, and a new gate is open.
+        let later = soon + CLOSED_GATE_RETENTION;
+        registry.prune(later);
+        assert_eq!(registry.len(), 0, "the revoked key's gate is retired");
+    }
+
+    #[test]
+    fn rotating_keys_does_not_grow_the_gate_registry() {
+        let start = Instant::now();
+        let mut registry = GateRegistry::new(start);
+        let held = registry.gate(1, start);
+        // Many keys each used once and let go, as rotations would.
+        for key_id in 2..1_000 {
+            drop(registry.gate(key_id, start));
+        }
+        assert_eq!(registry.len(), 999);
+        // The next lookup after the interval prunes: only the gate a batch
+        // still holds survives, plus the one just asked for.
+        let _again = registry.gate(2, start + GATE_PRUNE_INTERVAL);
+        assert_eq!(registry.len(), 2);
+        assert!(Arc::ptr_eq(
+            &held,
+            &registry.gate(1, start + GATE_PRUNE_INTERVAL)
+        ));
     }
 
     #[test]

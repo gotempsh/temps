@@ -115,9 +115,14 @@ The gaps, most important first.
   is not built; the dashboard can chart one. Pointing a rule at another
   source or saved search resets its state and resolves the alarms the old
   series left open; switching a log rule to a metric must name the metric.
-  Updates to a rule are serialized on its row, and an evaluation writes its
-  result only while the rule still watches the series it read, so a tick
-  that overlapped an edit never puts the old series' verdict back.
+  Updates to a rule are serialized on its row. A database trigger bumps the
+  rule's `config_revision` on every edit that changes a verdict (series,
+  detector, threshold, window, duration, enabled), from any writer. An
+  evaluation opens an alarm and writes its result only while the revision
+  it read is current, and resolves what it opened if the rule changed
+  before its write, so a tick that overlapped an edit never puts the old
+  configuration's verdict back, per-series rules included. A new revision,
+  or a new query in the rule's saved search, restarts the breach timer.
 - **Saved searches.** Per project, at most 100, `logs:read` to see and the
   new `logs:write` to change. The time range is one of `15m`, `1h`, `6h`,
   `24h`, `7d`, `30d`; a custom window from the logs page is saved as the
@@ -135,7 +140,8 @@ The gaps, most important first.
   Lookups are cached for 30 seconds; revoking through the API evicts the
   cached entry at once, and a lookup that overlapped the revoke is not
   cached. A revoke waits for the key's batches in flight, then seals and
-  closes its streams.
+  closes its streams. The revoked key's gate refuses late batches for five
+  minutes and is then forgotten, so rotating keys never grows memory.
 - **The receiver is on the public router** (ADR 051 D3): `POST
   /logs/ingest` authenticates by its key, never a session, and is reachable
   on the ingress listener when the console is gated. It is not added to the

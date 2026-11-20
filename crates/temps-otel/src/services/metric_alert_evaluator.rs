@@ -1081,6 +1081,14 @@ pub struct MetricAlertEvaluator {
     /// no log rule can be evaluated in this process, and each tick says so
     /// rather than treating the rule as healthy.
     log_series: std::sync::OnceLock<Arc<dyn LogSeriesSource>>,
+    /// rule_id -> the `config_revision` the last tick evaluated. A different
+    /// revision means the rule was edited in a way that changes its verdict,
+    /// so a breach that started under the old configuration restarts.
+    seen_revision: Arc<RwLock<HashMap<i32, i64>>>,
+    /// rule_id -> the saved-search query fingerprint the last tick counted,
+    /// for log rules: editing the search's query restarts the breach too,
+    /// since the search lives outside the rule's own revision.
+    seen_log_query: Arc<RwLock<HashMap<i32, u64>>>,
 }
 
 impl MetricAlertEvaluator {
@@ -1109,6 +1117,8 @@ impl MetricAlertEvaluator {
                 Some(source) => std::sync::OnceLock::from(source),
                 None => std::sync::OnceLock::new(),
             },
+            seen_revision: Arc::new(RwLock::new(HashMap::new())),
+            seen_log_query: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -1256,6 +1266,14 @@ impl MetricAlertEvaluator {
             .write()
             .await
             .retain(|(id, _), _| live.contains(id));
+        self.seen_revision
+            .write()
+            .await
+            .retain(|id, _| live.contains(id));
+        self.seen_log_query
+            .write()
+            .await
+            .retain(|id, _| live.contains(id));
 
         for rule in rules {
             let rule_id = rule.id;
@@ -1272,6 +1290,7 @@ impl MetricAlertEvaluator {
     /// set `group_by` runs the grouped path (collapse-to-max or, when
     /// `dynamic_alerts`, per-series). ADR-026 Phase 3.
     async fn evaluate_rule(&self, rule: AlertRule) -> Result<(), crate::error::OtelError> {
+        self.note_revision(&rule).await;
         // A log rule counts lines instead of reducing a metric bucket, so it
         // never reaches the metric query paths below (ADR 108 D1).
         match AlertSeriesSource::from_columns(&rule.source, rule.saved_search_id) {
@@ -1364,6 +1383,7 @@ impl MetricAlertEvaluator {
             }
         };
 
+        self.note_log_query(rule.id, sample.query_fingerprint).await;
         let value = sample.count as f64;
         let config = DetectionConfig::from_value(&rule.detection_config)?;
         let DetectionConfig::Static(params) = &config else {
@@ -1555,6 +1575,11 @@ impl MetricAlertEvaluator {
             AlertTransition::StayOk | AlertTransition::StartBreach => "ok",
             AlertTransition::StayFiring => "firing",
             AlertTransition::FireNow => {
+                // The series was read some time ago; page nobody with the
+                // verdict of a configuration that has since been edited.
+                if !self.still_current(rule).await {
+                    return;
+                }
                 self.fire(rule, fire_details).await;
                 "firing"
             }
@@ -1572,9 +1597,9 @@ impl MetricAlertEvaluator {
         {
             Ok(true) => {}
             Ok(false) => {
-                // The rule was pointed at another series while this tick
-                // read the old one: its verdict is stale. An alarm it just
-                // opened describes a series the rule no longer watches.
+                // The rule was edited while this tick read its series: its
+                // verdict is stale. An alarm it just opened answers a
+                // configuration the rule no longer has.
                 debug!(
                     rule_id = rule.id,
                     "Alert rule changed during evaluation; discarding this tick's decision"
@@ -1837,6 +1862,14 @@ impl MetricAlertEvaluator {
                 .remove(&(rule.id, ks));
         }
 
+        // The series were read some time ago; fire nothing for a
+        // configuration that has since been edited.
+        if !to_fire.is_empty() && !self.still_current(rule).await {
+            self.clear_series_breaches(rule.id).await;
+            return Ok(());
+        }
+        let mut fired_now: Vec<(String, i32)> = Vec::new();
+
         // Fire newly-breaching series. Notification grouping fallback: when more
         // than the rule's `grouped_notification_threshold` series fire in the same
         // tick, every series still gets its own alarm ROW (needed for per-series
@@ -1857,6 +1890,7 @@ impl MetricAlertEvaluator {
                         .await
                         .insert((rule.id, p.key_str.clone()), (p.key.clone(), alarm_id));
                     fired.push((p.label.clone(), p.value, alarm_id));
+                    fired_now.push((p.key_str.clone(), alarm_id));
                 }
             }
             if !fired.is_empty() {
@@ -1872,6 +1906,7 @@ impl MetricAlertEvaluator {
                         .write()
                         .await
                         .insert((rule.id, p.key_str.clone()), (p.key.clone(), alarm_id));
+                    fired_now.push((p.key_str.clone(), alarm_id));
                 }
             }
         }
@@ -1906,10 +1941,10 @@ impl MetricAlertEvaluator {
         let next_state = if any_firing { "firing" } else { "ok" };
         let series_states = serde_json::to_value(build_series_states(&kept, &final_firing))
             .unwrap_or_else(|_| json!({}));
-        if let Err(e) = self
+        match self
             .alert_service
-            .persist_dynamic_evaluation(
-                rule.id,
+            .persist_dynamic_evaluation_if_current(
+                rule,
                 next_state,
                 agg_value,
                 now,
@@ -1918,7 +1953,28 @@ impl MetricAlertEvaluator {
             )
             .await
         {
-            warn!(rule_id = rule.id, error = %e, "Failed to persist dynamic rule evaluation");
+            Ok(true) => {}
+            Ok(false) => {
+                // Edited between the check above and this write (switched to
+                // another source, say, after its alarms were resolved): the
+                // alarms this tick opened answer the old configuration, and
+                // nothing would evaluate them again. Resolve them and leave
+                // the state the edit wrote.
+                debug!(
+                    rule_id = rule.id,
+                    fired = fired_now.len(),
+                    "Dynamic alert rule changed during evaluation; discarding this tick"
+                );
+                for (key_str, alarm_id) in fired_now {
+                    self.resolve_series(rule.id, rule.project_id, alarm_id)
+                        .await;
+                    self.firing_series.write().await.remove(&(rule.id, key_str));
+                }
+                self.clear_series_breaches(rule.id).await;
+            }
+            Err(e) => {
+                warn!(rule_id = rule.id, error = %e, "Failed to persist dynamic rule evaluation");
+            }
         }
         Ok(())
     }
@@ -2496,6 +2552,68 @@ impl MetricAlertEvaluator {
     /// Drop any in-flight breach timer for a rule.
     async fn clear_breach(&self, rule_id: i32) {
         self.breach_start.write().await.remove(&rule_id);
+    }
+
+    /// Drop the breach timers of every series of `rule_id`.
+    async fn clear_series_breaches(&self, rule_id: i32) {
+        self.breach_start_series
+            .write()
+            .await
+            .retain(|(rid, _), _| *rid != rule_id);
+    }
+
+    /// Restart the rule's breach timers if it was edited since the last tick
+    /// in a way that changes its verdict (see `config_revision`): a breach
+    /// counted under the old threshold or series must not let the new one
+    /// fire before it has held for `for_duration` itself.
+    async fn note_revision(&self, rule: &AlertRule) {
+        let previous = self
+            .seen_revision
+            .write()
+            .await
+            .insert(rule.id, rule.config_revision);
+        if previous.is_some_and(|seen| seen != rule.config_revision) {
+            self.clear_breach(rule.id).await;
+            self.clear_series_breaches(rule.id).await;
+        }
+    }
+
+    /// The same for a log rule's saved search, whose query can be edited
+    /// without touching the rule.
+    async fn note_log_query(&self, rule_id: i32, fingerprint: u64) {
+        let previous = self
+            .seen_log_query
+            .write()
+            .await
+            .insert(rule_id, fingerprint);
+        if previous.is_some_and(|seen| seen != fingerprint) {
+            self.clear_breach(rule_id).await;
+        }
+    }
+
+    /// Whether `rule` still has the configuration this tick read. A stale
+    /// rule's breach restarts. When the check itself fails nothing fires this
+    /// tick, but the breach is kept, so the next tick can fire on time.
+    async fn still_current(&self, rule: &AlertRule) -> bool {
+        match self.alert_service.is_current(rule).await {
+            Ok(true) => true,
+            Ok(false) => {
+                debug!(
+                    rule_id = rule.id,
+                    "Alert rule changed during evaluation; not firing on the old configuration"
+                );
+                self.clear_breach(rule.id).await;
+                false
+            }
+            Err(e) => {
+                warn!(
+                    rule_id = rule.id,
+                    error = %e,
+                    "Could not confirm the alert rule is unchanged; not firing this tick"
+                );
+                false
+            }
+        }
     }
 
     /// Resolve every open alarm (aggregate or per-series) for a rule and drop its
@@ -3136,6 +3254,7 @@ mod tests {
             last_value: None,
             series_states: serde_json::json!({}),
             last_dropped_series_count: 0,
+            config_revision: 0,
             last_evaluated_at: None,
             source: "metric".to_string(),
             saved_search_id: None,
@@ -3330,7 +3449,11 @@ mod tests {
     }
 
     fn sample(count: u64, saturated: bool) -> LogSeriesSample {
-        LogSeriesSample { count, saturated }
+        LogSeriesSample {
+            count,
+            saturated,
+            query_fingerprint: 1,
+        }
     }
 
     #[test]
