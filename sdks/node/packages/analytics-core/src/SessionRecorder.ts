@@ -727,6 +727,16 @@ export class SessionRecorder {
     this.detachGlobalListeners();
   }
 
+  /**
+   * Stop for good and drop every event not uploaded yet, without sending a
+   * final batch: the page switched to cookieless mode, which keeps no replay.
+   */
+  public discard(): void {
+    this.pending = [];
+    this.inflight = null;
+    this.destroy();
+  }
+
   public getSessionId(): string | null {
     return this.sessionId || null;
   }

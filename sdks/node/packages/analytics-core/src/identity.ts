@@ -35,15 +35,40 @@ let cookieless = false;
  * ids. Called by `createAnalytics({ cookieless: true })`.
  */
 export function enableCookielessIdentity(): void {
+  const switched = !cookieless;
   cookieless = true;
   try {
-    if (typeof localStorage === "undefined") return;
-    localStorage.removeItem(VISITOR_ID_KEY);
-    localStorage.removeItem(SESSION_ID_KEY);
-    localStorage.removeItem(SESSION_LAST_SEEN_KEY);
+    if (typeof localStorage !== "undefined") {
+      localStorage.removeItem(VISITOR_ID_KEY);
+      localStorage.removeItem(SESSION_ID_KEY);
+      localStorage.removeItem(SESSION_LAST_SEEN_KEY);
+    }
   } catch {
     // Storage unusable: there is nothing stored to delete either.
   }
+  if (!switched) return;
+  for (const listener of Array.from(cookielessListeners)) {
+    try {
+      listener();
+    } catch (error) {
+      // eslint-disable-next-line no-console
+      console.error("[temps] cookieless switch listener failed:", error);
+    }
+  }
+}
+
+const cookielessListeners = new Set<() => void>();
+
+/**
+ * Run `listener` when the page switches to cookieless mode, so an analytics
+ * instance created earlier can stop what needs a stored id (session replay).
+ * Returns the unsubscribe function.
+ */
+export function onCookielessIdentity(listener: () => void): () => void {
+  cookielessListeners.add(listener);
+  return () => {
+    cookielessListeners.delete(listener);
+  };
 }
 
 /** Whether identity storage is off for this page (see `enableCookielessIdentity`). */

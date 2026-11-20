@@ -18,7 +18,7 @@ import {
   notFoundEventData,
   setupLinkTracking,
 } from "./AutoTracking";
-import { enableCookielessIdentity, isCookielessIdentity } from "./identity";
+import { enableCookielessIdentity, isCookielessIdentity, onCookielessIdentity } from "./identity";
 
 interface InternalCleanup {
   (): void;
@@ -190,6 +190,14 @@ export function createAnalytics(options: AnalyticsOptions = {}): AnalyticsApi {
 
   // Runtime-controlled recorder handle for enable/disable after init
   let runtimeRecorder: SessionRecorder | null = recorder;
+  // Another instance switching the page to cookieless ends this one's replay
+  // and drops what it has not uploaded yet.
+  cleanups.push(
+    onCookielessIdentity(() => {
+      runtimeRecorder?.discard();
+      runtimeRecorder = null;
+    })
+  );
 
   return {
     get enabled(): boolean {
