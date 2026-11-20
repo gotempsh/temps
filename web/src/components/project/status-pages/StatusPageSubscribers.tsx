@@ -51,12 +51,14 @@ import { Link } from 'react-router'
 import { toast } from 'sonner'
 import { operationQueries } from './status-page-form'
 import {
+  pageAfterRemoval,
   senderDomainProblem,
   senderAfterRefetch,
   settingsRequest,
   subscriptionBlockers,
   subscriptionSettingsSchema,
   SUBSCRIBERS_PAGE_SIZE,
+  switchRequest,
   type SubscriptionSettingsValues,
 } from './subscriptions'
 
@@ -115,8 +117,11 @@ function SubscriptionSettingsCard({
   const save = useMutation({
     ...updateStatusPageSubscriptionsMutation(),
     meta: { errorTitle: 'Failed to save subscription settings' },
-    onSuccess: async (saved) => {
-      form.reset({ sender: saved.sender ?? '' })
+    onSuccess: async (saved, variables) => {
+      // Switching off leaves an unsaved sender edit in the field.
+      if (variables.body.sender !== undefined) {
+        form.reset({ sender: saved.sender ?? '' })
+      }
       await queryClient.invalidateQueries(
         operationQueries('getStatusPageSubscriptions')
       )
@@ -145,28 +150,33 @@ function SubscriptionSettingsCard({
       })
     })()
 
+  const toggle = (next: boolean) => {
+    if (!next) {
+      save.mutate({
+        path: { status_page_id: page.id },
+        body: switchRequest(false, form.getValues()),
+      })
+      return
+    }
+    submit(true)
+  }
+
   const canEnable = blockers.length === 0 && Boolean(settings.sender)
 
   return (
     <Card>
       <CardContent className="space-y-4 p-4">
         <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-          <div className="space-y-1">
-            <h3 className="flex items-center gap-2 font-semibold">
-              <Mail className="size-4" />
-              Email updates for visitors
-            </h3>
-            <p className="text-sm text-muted-foreground">
-              Visitors subscribe on the public page and get an email for every
-              public incident update, e.g. “Elevated errors: Identified”.
-            </p>
-          </div>
+          <h3 className="flex items-center gap-2 font-semibold">
+            <Mail className="size-4" />
+            Email updates for visitors
+          </h3>
           <div className="flex items-center gap-2">
             <Switch
               id="subscriptions-enabled"
               checked={settings.enabled}
               disabled={save.isPending || (!settings.enabled && !canEnable)}
-              onCheckedChange={(next) => submit(next)}
+              onCheckedChange={toggle}
               aria-label="Let visitors subscribe by email"
             />
             <label htmlFor="subscriptions-enabled" className="text-sm">
@@ -258,6 +268,9 @@ function SubscriberList({
     ...deleteStatusPageSubscriberMutation(),
     meta: { errorTitle: 'Failed to delete subscriber' },
     onSuccess: async () => {
+      setPageNumber((current) =>
+        pageAfterRemoval(current, list.data?.total ?? 0, SUBSCRIBERS_PAGE_SIZE)
+      )
       await queryClient.invalidateQueries(
         operationQueries('listStatusPageSubscribers')
       )

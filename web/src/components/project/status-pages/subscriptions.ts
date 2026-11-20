@@ -65,6 +65,30 @@ export function settingsRequest(
 }
 
 /**
+ * The request the on/off switch sends. Switching off sends only the switch,
+ * so an unsaved or invalid sender edit never blocks turning mail off.
+ */
+export function switchRequest(
+  next: boolean,
+  values: SubscriptionSettingsValues
+): { enabled: boolean; sender?: string } {
+  return next ? settingsRequest(values, true) : { enabled: false }
+}
+
+/**
+ * The list page to show after deleting one subscriber, so deleting the last
+ * row of the last page moves back instead of leaving an empty page.
+ */
+export function pageAfterRemoval(
+  page: number,
+  totalBefore: number,
+  pageSize: number
+) {
+  const pages = Math.max(1, Math.ceil(Math.max(0, totalBefore - 1) / pageSize))
+  return Math.min(page, pages)
+}
+
+/**
  * The sender the form should show after the stored settings change, or
  * `null` to leave the field alone: a refetch never replaces what the user
  * is typing.

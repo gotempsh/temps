@@ -4,11 +4,13 @@
 import { describe, expect, it } from 'bun:test'
 import type { SubscriptionSettingsResponse } from '@/api/client'
 import {
+  pageAfterRemoval,
   senderAfterRefetch,
   senderDomainProblem,
   settingsRequest,
   subscriptionBlockers,
   subscriptionSettingsSchema,
+  switchRequest,
 } from './subscriptions'
 
 function settings(
@@ -103,5 +105,36 @@ describe('senderAfterRefetch', () => {
 
   it('never replaces an address the user is typing', () => {
     expect(senderAfterRefetch('status@example.com', true)).toBeNull()
+  })
+})
+
+describe('switchRequest', () => {
+  it('switches off without the sender, even an invalid edit', () => {
+    expect(switchRequest(false, { sender: 'not an address' })).toEqual({
+      enabled: false,
+    })
+  })
+
+  it('switches on with the trimmed sender', () => {
+    expect(switchRequest(true, { sender: ' status@example.test ' })).toEqual({
+      enabled: true,
+      sender: 'status@example.test',
+    })
+  })
+})
+
+describe('pageAfterRemoval', () => {
+  it('moves back when the last row of the last page is deleted', () => {
+    expect(pageAfterRemoval(2, 21, 20)).toBe(1)
+  })
+
+  it('stays on a page that still has rows', () => {
+    expect(pageAfterRemoval(2, 22, 20)).toBe(2)
+    expect(pageAfterRemoval(1, 5, 20)).toBe(1)
+  })
+
+  it('never goes below the first page', () => {
+    expect(pageAfterRemoval(1, 1, 20)).toBe(1)
+    expect(pageAfterRemoval(3, 0, 20)).toBe(1)
   })
 })
