@@ -118,7 +118,13 @@ function RevealableInput({
         {...inputProps}
         type={type === 'password' && isRevealed ? 'text' : type}
         value={value ?? ''}
-        onChange={(event) => onChange(event.target.value)}
+        onChange={(event) => {
+          // What the user types wins over a reveal still in flight: its
+          // response must not overwrite the replacement they are entering.
+          revealGuard.current.cancel(fieldPath)
+          setIsRevealing(false)
+          onChange(event.target.value)
+        }}
       />
       {canReveal && (
         <Button
