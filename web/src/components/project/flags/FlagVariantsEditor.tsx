@@ -81,7 +81,7 @@ export function FlagVariantsEditor({
   const [error, setError] = useState<string | null>(null)
   // Stays mounted across refetches; this is the revision the drafts are
   // based on, so a save never carries a newer one than they were made from.
-  const baseRevision = useDraftBaseline(
+  const [baseRevision, variantsSaved] = useDraftBaseline(
     flag.updated_at,
     stored,
     (variants) => draftsKey(drafts) !== draftsKey(seed(variants)),
@@ -92,6 +92,7 @@ export function FlagVariantsEditor({
     ...updateFlagMutation(),
     onSuccess: () => {
       toast.success('Variants saved')
+      variantsSaved()
       onChanged()
     },
     onError: (failure) => {

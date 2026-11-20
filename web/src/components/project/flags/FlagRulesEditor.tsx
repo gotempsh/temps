@@ -92,23 +92,24 @@ export function FlagRulesEditor({
   const [error, setError] = useState<string | null>(null)
   // Stays mounted across refetches (saving variants or an environment value
   // refetches the flag), so an open edit survives; this is the row revision
-  // the drafts are based on. A closed editor compares its drafts too: after
-  // "Discard and reload" they hold the rules from before the refetch, and
-  // must be replaced by the fetched ones rather than carried forward under
-  // the new revision.
-  const baseRevision = useDraftBaseline(
+  // the drafts are based on. A closed editor takes every fetched revision:
+  // after "Discard and reload" or a save its drafts hold rules from before
+  // the refetch, and must not be carried forward under the new revision.
+  const [baseRevision, rulesSaved] = useDraftBaseline(
     override?.updated_at ?? null,
     stored,
     (rules) =>
       rulesKey(drafts) !==
       rulesKey(rules.map((rule) => toDraft(rule, valueType))),
-    (rules) => setDrafts(rules.map((rule) => toDraft(rule, valueType)))
+    (rules) => setDrafts(rules.map((rule) => toDraft(rule, valueType))),
+    editing
   )
 
   const save = useMutation({
     ...setFlagRulesMutation(),
     onSuccess: () => {
       toast.success(`Rules saved for ${environment.name}`)
+      rulesSaved()
       setEditing(false)
       onChanged()
     },
