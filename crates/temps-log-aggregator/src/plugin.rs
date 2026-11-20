@@ -379,6 +379,7 @@ impl TempsPlugin for LogAggregatorPlugin {
                 Arc::new(chunk_writer.clone()),
                 ingest_budget.clone(),
             ));
+            context.register_service(ingest_service.clone());
 
             // App state for handlers
             let app_state = create_log_aggregator_app_state(
@@ -592,12 +593,18 @@ impl TempsPlugin for LogAggregatorPlugin {
             // the last tick, so ingest costs no database write per request.
             {
                 let ingest_keys = context.require_service::<crate::ingest::LogIngestKeyService>();
+                let idle_ingest = context.require_service::<crate::ingest::LogIngestService>();
+                // The same tick releases keys idle for a while (a deleted
+                // project's keys are never revoked), so their streams close.
                 tokio::spawn(async move {
                     let mut interval = tokio::time::interval(INGEST_KEY_USAGE_FLUSH_INTERVAL);
                     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                     loop {
                         interval.tick().await;
                         ingest_keys.flush_usage().await;
+                        idle_ingest
+                            .retire_idle_keys(crate::ingest::service::IDLE_KEY_RETIREMENT)
+                            .await;
                     }
                 });
             }

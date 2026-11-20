@@ -38,7 +38,7 @@ use temps_core::log_series::{
 };
 
 use crate::error::LogAggregatorError;
-use crate::index::analytics::{AttrOp, AttrPredicate, Metric};
+use crate::index::analytics::{AttrOp, AttrPredicate, HistogramBucket, Metric};
 use crate::index::LineIndex;
 use crate::services::saved_search::{LogSavedSearchService, SavedSearchQuery};
 use crate::store::{
@@ -52,6 +52,10 @@ pub const COUNT_PAGE_SIZE: u32 = 200;
 /// Most lines one dashboard series reads when it has to scan (a text
 /// needle, or no line index).
 pub const SERIES_SCAN_CAP: u64 = 5_000;
+/// Reads of the heads and the index tried before a count gives up on the
+/// index because a seal kept crossing them, and scans instead. A head seals
+/// every few minutes at most, so a second attempt almost always agrees.
+const CONSISTENT_COUNT_ATTEMPTS: usize = 3;
 /// Most points in a count series.
 pub const MAX_SERIES_BUCKETS: u32 = 240;
 /// Most points in a numeric series, each one indexed aggregate.
@@ -405,6 +409,37 @@ impl LogSeriesService {
             .await
     }
 
+    /// The index's buckets plus the heads', read so that no seal can make
+    /// a chunk count twice or not at all: heads first, then the index, then
+    /// a check that no head changed seal state meanwhile. `None` when a seal
+    /// crossed every attempt; the caller scans instead.
+    async fn index_and_heads(
+        &self,
+        query: &LogQuery,
+        bucket_secs: u32,
+    ) -> Result<Option<Vec<HistogramBucket>>, LogAggregatorError> {
+        let attrs = query.attrs.clone();
+        for _ in 0..CONSISTENT_COUNT_ATTEMPTS {
+            let unsealed = self
+                .store
+                .unsealed_histogram_before_index(query, bucket_secs)
+                .await?;
+            let mut buckets = self
+                .line_index
+                .histogram(query, &attrs, bucket_secs, None, 1)
+                .await?;
+            if self.store.heads_unchanged(&unsealed.heads).await {
+                buckets.extend(unsealed.buckets);
+                return Ok(Some(buckets));
+            }
+        }
+        debug!(
+            attempts = CONSISTENT_COUNT_ATTEMPTS,
+            "a head buffer sealed during every index count; scanning instead"
+        );
+        Ok(None)
+    }
+
     async fn count_series_by_index(
         &self,
         query: LogQuery,
@@ -412,17 +447,13 @@ impl LogSeriesService {
         end: DateTime<Utc>,
         bucket_secs: u32,
     ) -> Result<LogSeries, LogAggregatorError> {
-        let attrs = query.attrs.clone();
-        let indexed = self
-            .line_index
-            .histogram(&query, &attrs, bucket_secs, None, 1)
-            .await?;
-        let unsealed = self
-            .store
-            .unsealed_histogram(&query, bucket_secs, None)
-            .await?;
+        let Some(buckets) = self.index_and_heads(&query, bucket_secs).await? else {
+            return self
+                .count_series_by_scan(query, start, end, bucket_secs)
+                .await;
+        };
         let mut counts = vec![0_i64; bucket_count(start, end, bucket_secs)];
-        for bucket in indexed.iter().chain(unsealed.iter()) {
+        for bucket in &buckets {
             if let Some(slot) = bucket_slot(start, end, bucket_secs, bucket.ts) {
                 counts[slot] += bucket.count;
             }
@@ -557,13 +588,9 @@ impl LogSeriesService {
     async fn count_by_index(&self, query: LogQuery) -> Result<LogSeriesSample, LogAggregatorError> {
         let window_secs = (query.end_time - query.start_time).num_seconds().max(1);
         let bucket_secs = u32::try_from(window_secs).unwrap_or(u32::MAX);
-        let attrs = query.attrs.clone();
-        let indexed = match self
-            .line_index
-            .histogram(&query, &attrs, bucket_secs, None, 1)
-            .await
-        {
-            Ok(buckets) => buckets,
+        let buckets = match self.index_and_heads(&query, bucket_secs).await {
+            Ok(Some(buckets)) => buckets,
+            Ok(None) => return self.count_by_scan(query).await,
             Err(e) => {
                 warn!(
                     error = %e,
@@ -572,15 +599,7 @@ impl LogSeriesService {
                 return self.count_by_scan(query).await;
             }
         };
-        let unsealed = self
-            .store
-            .unsealed_histogram(&query, bucket_secs, None)
-            .await?;
-        let count: i64 = indexed
-            .iter()
-            .chain(unsealed.iter())
-            .map(|bucket| bucket.count)
-            .sum();
+        let count: i64 = buckets.iter().map(|bucket| bucket.count).sum();
         let count = u64::try_from(count).unwrap_or(0);
         Ok(LogSeriesSample {
             count,
@@ -738,6 +757,8 @@ mod tests {
         limits: std::sync::Mutex<Vec<u32>>,
         calls: AtomicUsize,
         unsealed: Vec<HistogramBucket>,
+        /// How many more index counts a seal crosses.
+        crossing_seals: AtomicUsize,
     }
 
     impl ScriptedStore {
@@ -747,7 +768,13 @@ mod tests {
                 limits: std::sync::Mutex::new(Vec::new()),
                 calls: AtomicUsize::new(0),
                 unsealed: Vec::new(),
+                crossing_seals: AtomicUsize::new(0),
             }
+        }
+
+        fn with_crossing_seals(self, n: usize) -> Self {
+            self.crossing_seals.store(n, Ordering::Relaxed);
+            self
         }
 
         fn with_unsealed(mut self, buckets: Vec<HistogramBucket>) -> Self {
@@ -853,6 +880,12 @@ mod tests {
             _group_by: Option<FacetField>,
         ) -> Result<Vec<HistogramBucket>, LogAggregatorError> {
             Ok(self.unsealed.clone())
+        }
+
+        async fn heads_unchanged(&self, _heads: &[(String, u64)]) -> bool {
+            self.crossing_seals
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+                .is_err()
         }
     }
 
@@ -1329,6 +1362,92 @@ mod tests {
         assert_eq!(values, vec![Some(3.0), Some(0.0), Some(7.0)]);
         assert_eq!(series.method, LogSeriesMethod::Index);
         assert_eq!(store.calls(), 0, "no message was read");
+    }
+
+    fn three_and_five() -> FakeIndex {
+        FakeIndex {
+            histogram: vec![
+                HistogramBucket {
+                    ts: t0(),
+                    group: None,
+                    count: 3,
+                },
+                HistogramBucket {
+                    ts: t0() + Duration::minutes(2),
+                    group: None,
+                    count: 5,
+                },
+            ],
+            aggregates: std::sync::Mutex::new(vec![]),
+            seen: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_seal_crossing_the_index_read_is_counted_again() {
+        let store = Arc::new(
+            ScriptedStore::new(vec![])
+                .with_unsealed(vec![HistogramBucket {
+                    ts: t0() + Duration::minutes(2),
+                    group: None,
+                    count: 2,
+                }])
+                .with_crossing_seals(CONSISTENT_COUNT_ATTEMPTS - 1),
+        );
+        let series = series_service(store.clone(), Some(three_and_five()))
+            .series(7, &SavedSearchQuery::default(), request(3, Metric::Count))
+            .await
+            .expect("series");
+        let values: Vec<Option<f64>> = series.points.iter().map(|p| p.value).collect();
+        assert_eq!(
+            values,
+            vec![Some(3.0), Some(0.0), Some(7.0)],
+            "only the agreeing attempt is summed, once"
+        );
+        assert_eq!(series.method, LogSeriesMethod::Index);
+        assert_eq!(store.calls(), 0, "no message was read");
+    }
+
+    #[tokio::test]
+    async fn seals_crossing_every_index_read_fall_back_to_a_scan() {
+        let store = Arc::new(
+            ScriptedStore::new(vec![LogPage {
+                lines: vec![at_minute(2), at_minute(0)],
+                next_cursor: None,
+                scanned_back_to: None,
+            }])
+            .with_crossing_seals(CONSISTENT_COUNT_ATTEMPTS),
+        );
+        let series = series_service(store.clone(), Some(three_and_five()))
+            .series(7, &SavedSearchQuery::default(), request(3, Metric::Count))
+            .await
+            .expect("series");
+        let values: Vec<Option<f64>> = series.points.iter().map(|p| p.value).collect();
+        assert_eq!(values, vec![Some(1.0), Some(0.0), Some(1.0)]);
+        assert_eq!(series.method, LogSeriesMethod::Scan);
+    }
+
+    #[tokio::test]
+    async fn an_alert_count_scans_when_seals_cross_every_index_read() {
+        let store = Arc::new(
+            ScriptedStore::new(vec![LogPage {
+                lines: vec![at_minute(2), at_minute(1), at_minute(0)],
+                next_cursor: None,
+                scanned_back_to: None,
+            }])
+            .with_crossing_seals(CONSISTENT_COUNT_ATTEMPTS),
+        );
+        let sample = series_service(store.clone(), Some(three_and_five()))
+            .count(
+                7,
+                &SavedSearchQuery::default(),
+                t0(),
+                t0() + Duration::minutes(3),
+            )
+            .await
+            .expect("count");
+        assert_eq!(sample.count, 3, "the scan's count, not the index's 8");
+        assert_eq!(store.calls(), 1);
     }
 
     fn service_with_links(links: &[i32]) -> LogSeriesService {

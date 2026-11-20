@@ -113,9 +113,17 @@ pub struct LogIngestService {
     budget: Arc<IngestBudget>,
     limiters: Mutex<HashMap<i32, IngestLimiter>>,
     services: Mutex<HashMap<i32, HashSet<String>>>,
+    /// When each key with state in this process last sent a batch, so
+    /// [`LogIngestService::retire_idle_keys`] can release keys nobody uses,
+    /// including those whose project or environment was deleted.
+    last_used: Mutex<HashMap<i32, tokio::time::Instant>>,
     /// The revocation gates; see [`GateRegistry`].
     gates: Mutex<GateRegistry>,
 }
+
+/// How long a key may send nothing before its streams are closed and its
+/// limiter and service names forgotten. The next batch reopens them.
+pub const IDLE_KEY_RETIREMENT: Duration = Duration::from_secs(30 * 60);
 
 /// How long a revoked key's closed gate is kept. Revoking drops the key from
 /// the resolver's cache at once, so only an authentication already in flight
@@ -199,6 +207,7 @@ impl LogIngestService {
             budget,
             limiters: Mutex::new(HashMap::new()),
             services: Mutex::new(HashMap::new()),
+            last_used: Mutex::new(HashMap::new()),
             gates: Mutex::new(GateRegistry::new(Instant::now())),
         }
     }
@@ -228,7 +237,66 @@ impl LogIngestService {
         if let Ok(mut services) = self.services.lock() {
             services.remove(&key_id);
         }
+        if let Ok(mut last_used) = self.last_used.lock() {
+            last_used.remove(&key_id);
+        }
         self.writer.close_streams(&stream_prefix(key_id)).await
+    }
+
+    /// Close the streams of every key that has sent nothing for `idle` and
+    /// forget its limiter and service names. A key whose project or
+    /// environment was deleted is never revoked, so without this its open
+    /// streams (a head buffer and WAL file each) would stay until restart.
+    /// Unlike a revoke the key stays usable: its next batch reopens them.
+    /// Returns how many keys were retired.
+    pub async fn retire_idle_keys(&self, idle: Duration) -> usize {
+        let now = tokio::time::Instant::now();
+        let due: Vec<i32> = match self.last_used.lock() {
+            Ok(last_used) => last_used
+                .iter()
+                .filter(|(_, at)| now.duration_since(**at) >= idle)
+                .map(|(key_id, _)| *key_id)
+                .collect(),
+            Err(_) => return 0,
+        };
+        let mut retired = 0;
+        for key_id in due {
+            let gate = self.gate(key_id);
+            // Waits for the key's batches in flight; one that arrives now
+            // waits for this and then reopens what it needs.
+            let _exclusive = gate.write().await;
+            let still_idle = self.last_used.lock().is_ok_and(|mut last_used| {
+                let idle_now = last_used
+                    .get(&key_id)
+                    .is_some_and(|at| now.duration_since(*at) >= idle);
+                if idle_now {
+                    last_used.remove(&key_id);
+                }
+                idle_now
+            });
+            if !still_idle {
+                continue;
+            }
+            if let Ok(mut limiters) = self.limiters.lock() {
+                limiters.remove(&key_id);
+            }
+            if let Ok(mut services) = self.services.lock() {
+                services.remove(&key_id);
+            }
+            match self.writer.close_streams(&stream_prefix(key_id)).await {
+                Ok(closed) => {
+                    debug!(
+                        key_id,
+                        closed, "Closed the streams of an idle log ingest key"
+                    );
+                    retired += 1;
+                }
+                Err(e) => {
+                    warn!(key_id, error = %e, "Closing an idle log ingest key's streams failed");
+                }
+            }
+        }
+        retired
     }
 
     /// Resolve the presented key within [`AUTHENTICATION_DEADLINE`]. A slow
@@ -260,6 +328,9 @@ impl LogIngestService {
         let closed = gate.read().await;
         if *closed {
             return Err(LogAggregatorError::IngestKeyRejected);
+        }
+        if let Ok(mut last_used) = self.last_used.lock() {
+            last_used.insert(key.key_id, tokio::time::Instant::now());
         }
         let now = Utc::now();
         let records = ndjson::parse_batch(body, now)?;
@@ -530,6 +601,55 @@ mod tests {
         assert!(started.elapsed() >= AUTHENTICATION_DEADLINE);
         assert!(started.elapsed() < CLOSED_GATE_RETENTION);
         assert!(writer.0.lock().expect("lines lock").is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_key_is_retired_and_can_send_again() {
+        let (service, writer) = service(IngestLimits::UNLIMITED);
+        service
+            .ingest("good", b"{\"msg\":\"a\"}")
+            .await
+            .expect("accepted");
+        assert_eq!(service.retire_idle_keys(IDLE_KEY_RETIREMENT).await, 0);
+        assert!(writer.1.lock().expect("closed lock").is_empty());
+
+        tokio::time::advance(IDLE_KEY_RETIREMENT).await;
+        assert_eq!(service.retire_idle_keys(IDLE_KEY_RETIREMENT).await, 1);
+        assert_eq!(
+            *writer.1.lock().expect("closed lock"),
+            vec!["ingest-5-".to_string()]
+        );
+        assert!(service.limiters.lock().expect("limiters").is_empty());
+        assert!(service.services.lock().expect("services").is_empty());
+        assert_eq!(
+            service.retire_idle_keys(IDLE_KEY_RETIREMENT).await,
+            0,
+            "a retired key is not retired twice"
+        );
+
+        // Not a revoke: the key's next batch is stored.
+        service
+            .ingest("good", b"{\"msg\":\"b\"}")
+            .await
+            .expect("accepted after retirement");
+        assert_eq!(writer.0.lock().expect("lines lock").len(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_key_in_use_is_not_retired() {
+        let (service, writer) = service(IngestLimits::UNLIMITED);
+        service
+            .ingest("good", b"{\"msg\":\"a\"}")
+            .await
+            .expect("accepted");
+        tokio::time::advance(IDLE_KEY_RETIREMENT / 2).await;
+        service
+            .ingest("good", b"{\"msg\":\"b\"}")
+            .await
+            .expect("accepted");
+        tokio::time::advance(IDLE_KEY_RETIREMENT / 2).await;
+        assert_eq!(service.retire_idle_keys(IDLE_KEY_RETIREMENT).await, 0);
+        assert!(writer.1.lock().expect("closed lock").is_empty());
     }
 
     #[tokio::test]

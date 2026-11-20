@@ -178,6 +178,15 @@ The gaps, most important first.
   baselines with its breach timers; a currency check that fails keeps
   them. Ingest authentication has a 30 s deadline, far inside the 5
   minutes a revoked key's gate stays closed.
+- **Counts that cross a seal.** A seal writes its chunk to the line index
+  while its lines are still readable in the head, so an index count plus
+  a head count can see one chunk twice or not at all. Alert counts and
+  count tiles read the heads first, leave out lines already indexed, read
+  the index, and keep the sum only if no head changed seal state
+  meanwhile; three crossed attempts fall back to the scan. A key that
+  sends nothing for 30 minutes has its streams closed and its limiter
+  forgotten (a deleted project's keys are never revoked); its next batch
+  reopens them.
 - **Console.** Saved searches and ingest keys are reached from the logs
   page header, scoped to the service the page is filtered to. A log alert
   is a choice in the existing alert form. There is no CLI for alert rules

@@ -576,6 +576,41 @@ pub trait LogLineStore: Send + Sync {
     ) -> Result<Vec<crate::index::analytics::HistogramBucket>, LogAggregatorError> {
         Ok(Vec::new())
     }
+
+    /// The unsealed counts for a total that adds the line index, taken
+    /// *before* the index is read, with what [`Self::heads_unchanged`]
+    /// needs to tell afterwards whether a seal crossed that read.
+    ///
+    /// A seal writes its chunk to the index while its lines are still in
+    /// the head, so reading one then the other can count a chunk twice or
+    /// not at all. Reading the heads first, leaving out lines already
+    /// indexed, and confirming no head changed seal state before the index
+    /// answered makes the sum exact.
+    async fn unsealed_histogram_before_index(
+        &self,
+        query: &LogQuery,
+        bucket_secs: u32,
+    ) -> Result<UnsealedCount, LogAggregatorError> {
+        Ok(UnsealedCount {
+            buckets: self.unsealed_histogram(query, bucket_secs, None).await?,
+            heads: Vec::new(),
+        })
+    }
+
+    /// Whether every head in `heads` is in the seal state it was in when
+    /// [`Self::unsealed_histogram_before_index`] read it.
+    async fn heads_unchanged(&self, _heads: &[(String, u64)]) -> bool {
+        true
+    }
+}
+
+/// Unsealed line counts read ahead of the line index; see
+/// [`LogLineStore::unsealed_histogram_before_index`].
+#[derive(Debug, Clone, Default)]
+pub struct UnsealedCount {
+    pub buckets: Vec<crate::index::analytics::HistogramBucket>,
+    /// `(container id, seal epoch)` of every head counted.
+    pub heads: Vec<(String, u64)>,
 }
 
 #[cfg(test)]
