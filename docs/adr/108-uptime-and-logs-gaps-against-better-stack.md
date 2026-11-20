@@ -3,9 +3,9 @@
 ## Status
 
 Proposed — 2026-11-19. D1 implemented — 2026-11-19 (see *Settled while
-implementing D1*). D2 email subscription implemented — 2026-11-20 (see
-*Settled while implementing D2*); its feed, webhooks, maintenance windows
-and page password are not started. D3 to D8 not started.
+implementing D1*). D2 implemented — 2026-11-20: the email subscription first, then the feed,
+webhooks, maintenance windows and page password (see *Settled while
+implementing D2*). D3 to D8 not started.
 
 Related: ADR 021 (multi-node log aggregation, humanized alert notifications),
 ADR 025 (unified alarm log), ADR 026 (metric alert label filters), ADR 045 to
@@ -259,6 +259,49 @@ maintenance windows and page password follow separately.
   applies, with open and click tracking off. No `List-Unsubscribe` header
   yet: the email service only passes `X-Temps-*` headers through, so adding
   it needs a change there first.
+
+The second part, settled the same way:
+
+- **Feed.** The newest 50 public updates, resolutions and maintenance
+  announcements, built with the snapshot, with opaque entry ids derived
+  from the page token and the event, so an id reveals no database key.
+- **Maintenance suppresses alerts at the source.** Instead of writing
+  `silenced_until` on each monitor, which an operator's own silence would
+  then have to be merged with and restored after, outage detection skips a
+  monitor while a running window covers it. A cancelled or ended window
+  needs no undo. Checks taken inside a window are left out of the uptime
+  of every page showing the monitor (only monitors still on that page
+  count), from the stored checks, so nothing is rewritten.
+- **Maintenance rules.** A window cannot be backdated (5 minutes of slack
+  for "now"), lasts at most 7 days, starts at most a year ahead, and a page
+  has at most 20 open ones. It is announced once, when scheduled; edits and
+  cancellations change the page but are not mailed, which avoids a mail per
+  typo. Once started, its start and monitors are fixed, so what was
+  excluded from uptime stays explainable. Cancelling a running window ends
+  it now.
+- **Password.** An argon2 hash on the page row and a signed cookie (an HMAC
+  under a key derived from the server key, binding the page, a password
+  version and an expiry of 7 days), so checking a visitor needs no query
+  and no per-visitor state. Every password change bumps the version and
+  signs everyone out. While protected, the feed is not served (a reader
+  cannot sign in) and the JSON is not shared cross-origin. Wrong passwords
+  are limited to 5 per client per 15 minutes and at most 2 verifications
+  run at once; a burst beyond that is told to retry rather than queued.
+  Confirmation and unsubscribe links work without the password, so nobody
+  is stuck on a list. A custom host forwards only a well-formed access
+  cookie, never the rest of the visitor's cookies.
+- **Webhooks.** Managed by the page owner (`status_page:write`), at most 10
+  per page, `https://` only, to a public address checked when saved and
+  again, pinned, on every delivery, with no redirects and a 10 second
+  timeout. The body carries only what the page shows. The signing secret
+  is shown once and stored encrypted; the signature is
+  `t=<unix seconds>,v1=<hex HMAC-SHA256 of "t.body">`. Three attempts, 1 and
+  10 minutes apart. A delivery is cancelled when the event leaves the page
+  or the webhook is paused; resuming catches up the last 24 hours. No test
+  send and no secret rotation yet: delete and re-add the webhook.
+- **Schema names.** The webhook types are `StatusPageWebhook*` because the
+  plugin OpenAPI merge keeps the last schema of a name, and a plain
+  `WebhookResponse` silently replaced the project webhooks' schema.
 
 ### D3. Check types
 

@@ -1531,6 +1531,7 @@ mod tests {
         // `public_ingress_url`: no address is invented, the page says why.
         assert_eq!(page.public_url, None);
         assert_eq!(page.public_json_url, None);
+        assert_eq!(page.public_feed_url, None);
         assert!(!page.public_url_status.configured);
         assert_eq!(
             page.public_url_status.setup_path.as_deref(),

@@ -239,6 +239,9 @@ pub struct StatusPageResponse {
     /// Machine-readable form of the public page. `None` exactly when
     /// `public_url` is.
     pub public_json_url: Option<String>,
+    /// Atom feed of the page's public updates. `None` when `public_url` is,
+    /// or while the page is password-protected (it has no feed then).
+    pub public_feed_url: Option<String>,
     /// Whether `public_url` exists, and if not (or if it will not open from
     /// outside this network) what to do about it.
     pub public_url_status: PublicUrlStatus,

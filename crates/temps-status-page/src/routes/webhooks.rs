@@ -27,8 +27,9 @@ use utoipa::OpenApi;
 use super::audit::{StatusPageWebhookAction, StatusPageWebhookAudit};
 use crate::services::webhooks::payload::{WebhookEvent, WebhookPage, WebhookPayload};
 use crate::services::webhooks::{
-    CreateWebhookRequest, StatusPageWebhookService, UpdateWebhookRequest, WebhookCreatedResponse,
-    WebhookError, WebhookListResponse, WebhookResponse,
+    CreateStatusPageWebhookRequest, StatusPageWebhookCreatedResponse,
+    StatusPageWebhookListResponse, StatusPageWebhookResponse, StatusPageWebhookService,
+    UpdateStatusPageWebhookRequest, WebhookError,
 };
 use crate::services::PublicStatusPageService;
 
@@ -125,7 +126,7 @@ async fn record(
     operation_id = "list_status_page_webhooks",
     params(("status_page_id" = i32, Path, description = "Status page ID"), WebhookListQuery),
     responses(
-        (status = 200, description = "Webhooks, newest first", body = WebhookListResponse),
+        (status = 200, description = "Webhooks, newest first", body = StatusPageWebhookListResponse),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Status page not found"),
@@ -164,9 +165,9 @@ pub async fn list_webhooks(
     path = "/status-pages/{status_page_id}/webhooks",
     operation_id = "create_status_page_webhook",
     params(("status_page_id" = i32, Path, description = "Status page ID")),
-    request_body = CreateWebhookRequest,
+    request_body = CreateStatusPageWebhookRequest,
     responses(
-        (status = 201, description = "Webhook registered; the secret is shown only now", body = WebhookCreatedResponse),
+        (status = 201, description = "Webhook registered; the secret is shown only now", body = StatusPageWebhookCreatedResponse),
         (status = 400, description = "Invalid URL or non-public address"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
@@ -182,7 +183,7 @@ pub async fn create_webhook(
     State(state): State<Arc<WebhookRoutesState>>,
     Extension(metadata): Extension<RequestMetadata>,
     Path(status_page_id): Path<i32>,
-    Json(request): Json<CreateWebhookRequest>,
+    Json(request): Json<CreateStatusPageWebhookRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     let project_ids = page_access_guard!(auth, state, StatusPageWrite, status_page_id);
     let created = state.webhooks.create(status_page_id, request).await?;
@@ -214,9 +215,9 @@ pub async fn create_webhook(
         ("status_page_id" = i32, Path, description = "Status page ID"),
         ("webhook_id" = i32, Path, description = "Webhook ID"),
     ),
-    request_body = UpdateWebhookRequest,
+    request_body = UpdateStatusPageWebhookRequest,
     responses(
-        (status = 200, description = "Webhook updated", body = WebhookResponse),
+        (status = 200, description = "Webhook updated", body = StatusPageWebhookResponse),
         (status = 400, description = "Invalid URL or non-public address"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
@@ -231,7 +232,7 @@ pub async fn update_webhook(
     State(state): State<Arc<WebhookRoutesState>>,
     Extension(metadata): Extension<RequestMetadata>,
     Path((status_page_id, webhook_id)): Path<(i32, i32)>,
-    Json(request): Json<UpdateWebhookRequest>,
+    Json(request): Json<UpdateStatusPageWebhookRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     let project_ids = page_access_guard!(auth, state, StatusPageWrite, status_page_id);
     let webhook = state
@@ -314,11 +315,11 @@ pub fn create_webhook_router(state: Arc<WebhookRoutesState>) -> Router {
 #[openapi(
     paths(list_webhooks, create_webhook, update_webhook, delete_webhook),
     components(schemas(
-        WebhookResponse,
-        WebhookListResponse,
-        WebhookCreatedResponse,
-        CreateWebhookRequest,
-        UpdateWebhookRequest,
+        StatusPageWebhookResponse,
+        StatusPageWebhookListResponse,
+        StatusPageWebhookCreatedResponse,
+        CreateStatusPageWebhookRequest,
+        UpdateStatusPageWebhookRequest,
         WebhookPayload,
         WebhookPage,
         WebhookEvent,

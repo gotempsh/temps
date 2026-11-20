@@ -18128,6 +18128,46 @@
         ],
         "type": "object"
       },
+      "CreateMaintenanceRequest": {
+        "properties": {
+          "description": {
+            "description": "Public description, at most 2000 characters.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ends_at": {
+            "description": "After `starts_at`, at most 7 days later.",
+            "format": "date-time",
+            "type": "string"
+          },
+          "monitor_ids": {
+            "description": "Monitors on this page the window covers; at least one.",
+            "items": {
+              "format": "int32",
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "starts_at": {
+            "description": "No earlier than a few minutes ago: a window cannot be backdated.",
+            "format": "date-time",
+            "type": "string"
+          },
+          "title": {
+            "description": "Public title, at most 120 characters.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "title",
+          "starts_at",
+          "ends_at",
+          "monitor_ids"
+        ],
+        "type": "object"
+      },
       "CreateMcpRequest": {
         "properties": {
           "config": {
@@ -19656,6 +19696,18 @@
         "required": [
           "title",
           "monitors"
+        ],
+        "type": "object"
+      },
+      "CreateStatusPageWebhookRequest": {
+        "properties": {
+          "url": {
+            "description": "`https://` URL with a public address, at most 2048 characters.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "url"
         ],
         "type": "object"
       },
@@ -44759,6 +44811,117 @@
         ],
         "type": "object"
       },
+      "MaintenanceListResponse": {
+        "properties": {
+          "items": {
+            "description": "Newest first.",
+            "items": {
+              "$ref": "#/components/schemas/MaintenanceResponse"
+            },
+            "type": "array"
+          },
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "items",
+          "total",
+          "page",
+          "page_size"
+        ],
+        "type": "object"
+      },
+      "MaintenanceResponse": {
+        "properties": {
+          "cancelled_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ends_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "monitor_ids": {
+            "description": "The page's monitors the window covers.",
+            "items": {
+              "format": "int32",
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "starts_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "state": {
+            "$ref": "#/components/schemas/MaintenanceState"
+          },
+          "status_page_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "title": {
+            "description": "Shown on the public page and in announcements.",
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "status_page_id",
+          "title",
+          "starts_at",
+          "ends_at",
+          "state",
+          "monitor_ids",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
+      },
+      "MaintenanceState": {
+        "description": "Where a window is in its life.",
+        "enum": [
+          "scheduled",
+          "in_progress",
+          "completed",
+          "cancelled"
+        ],
+        "type": "string"
+      },
       "ManagedBackupArchiveConflict": {
         "description": "A service whose continuous archive (Postgres WAL-G, MariaDB binlogs) is\npinned to a source other than the managed destination. The nightly Cloud\nschedule cannot back it up: archiving must not silently move between\nsources, so every run of that service fails until the operator repoints\nit to Cloud or points its own schedule at the pinned source.",
         "properties": {
@@ -51501,6 +51664,23 @@
           "hourly_data",
           "total_sessions",
           "hours"
+        ],
+        "type": "object"
+      },
+      "PagePasswordResponse": {
+        "description": "Whether a page needs a password. The password is never returned.",
+        "properties": {
+          "has_password": {
+            "type": "boolean"
+          },
+          "status_page_id": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "status_page_id",
+          "has_password"
         ],
         "type": "object"
       },
@@ -58383,6 +58563,7 @@
         "description": "Current state of a public component (one selected monitor), or of the page\nas a whole.",
         "enum": [
           "unknown",
+          "maintenance",
           "operational",
           "degraded",
           "outage"
@@ -59016,6 +59197,53 @@
         },
         "type": "object"
       },
+      "PublicMaintenance": {
+        "description": "A scheduled maintenance window as visitors see it (ADR 108 D2): the\npublic title and description the admin wrote for the page, its times, and\nthe display names of the components it covers.",
+        "properties": {
+          "affected_components": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ends_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "starts_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/PublicMaintenanceStatus"
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "title",
+          "status",
+          "starts_at",
+          "ends_at",
+          "affected_components"
+        ],
+        "type": "object"
+      },
+      "PublicMaintenanceStatus": {
+        "description": "Whether a public maintenance window has started.",
+        "enum": [
+          "scheduled",
+          "in_progress"
+        ],
+        "type": "string"
+      },
       "PublicPresetResponse": {
         "description": "Response for preset detection",
         "properties": {
@@ -59175,6 +59403,13 @@
             },
             "type": "array"
           },
+          "maintenances": {
+            "description": "Maintenance windows in progress or scheduled, soonest first.",
+            "items": {
+              "$ref": "#/components/schemas/PublicMaintenance"
+            },
+            "type": "array"
+          },
           "status": {
             "$ref": "#/components/schemas/PublicComponentStatus",
             "description": "Worst current state across components and active public incidents."
@@ -59189,6 +59424,7 @@
           "status",
           "components",
           "incidents",
+          "maintenances",
           "history_days",
           "generated_at"
         ],
@@ -70554,6 +70790,18 @@
         },
         "type": "object"
       },
+      "SetPagePasswordRequest": {
+        "description": "`password` set: protect the page with it (8 to 256 characters), ending\nevery visitor's session. `null`: remove the password.",
+        "properties": {
+          "password": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "SetPreviewPasswordBody": {
         "properties": {
           "password": {
@@ -74303,6 +74551,10 @@
               "null"
             ]
           },
+          "has_password": {
+            "description": "Visitors need a password to read the page (ADR 108 D2). The password\nitself is never returned.",
+            "type": "boolean"
+          },
           "id": {
             "format": "int32",
             "type": "integer"
@@ -74322,6 +74574,13 @@
               "$ref": "#/components/schemas/StatusPageProject"
             },
             "type": "array"
+          },
+          "public_feed_url": {
+            "description": "Atom feed of the page's public updates. `None` when `public_url` is,\nor while the page is password-protected (it has no feed then).",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "public_json_url": {
             "description": "Machine-readable form of the public page. `None` exactly when\n`public_url` is.",
@@ -74369,6 +74628,7 @@
           "public_url_status",
           "monitors",
           "appearance",
+          "has_password",
           "created_at",
           "updated_at"
         ],
@@ -74382,6 +74642,117 @@
           "dark"
         ],
         "type": "string"
+      },
+      "StatusPageWebhookCreatedResponse": {
+        "description": "The new webhook and its signing secret. The secret is shown only here.",
+        "properties": {
+          "secret": {
+            "description": "Verify `X-Temps-Signature` with it. Store it now: it is never shown\nagain.",
+            "type": "string"
+          },
+          "webhook": {
+            "$ref": "#/components/schemas/StatusPageWebhookResponse"
+          }
+        },
+        "required": [
+          "webhook",
+          "secret"
+        ],
+        "type": "object"
+      },
+      "StatusPageWebhookListResponse": {
+        "properties": {
+          "items": {
+            "description": "Newest first.",
+            "items": {
+              "$ref": "#/components/schemas/StatusPageWebhookResponse"
+            },
+            "type": "array"
+          },
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "items",
+          "total",
+          "page",
+          "page_size"
+        ],
+        "type": "object"
+      },
+      "StatusPageWebhookResponse": {
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "has_secret": {
+            "description": "The signing secret is stored encrypted and shown only when the\nwebhook is created.",
+            "type": "boolean"
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "last_attempt_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_failure_reason": {
+            "description": "Why the last delivery failed, until one succeeds.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_success_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status_page_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "url": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "status_page_id",
+          "url",
+          "enabled",
+          "has_secret",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
       },
       "StepConversionResponse": {
         "properties": {
@@ -80585,6 +80956,49 @@
         ],
         "type": "object"
       },
+      "UpdateMaintenanceRequest": {
+        "description": "Fields left out are unchanged. Once a window has started, only `title`,\n`description` and `ends_at` can change.",
+        "properties": {
+          "description": {
+            "description": "An empty string removes the description.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ends_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "monitor_ids": {
+            "items": {
+              "format": "int32",
+              "type": "integer"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "starts_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "title": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "UpdateManagedContainerName": {
         "description": "Request body of the container-name settings endpoints.",
         "properties": {
@@ -82007,6 +82421,24 @@
             ]
           },
           "title": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "UpdateStatusPageWebhookRequest": {
+        "description": "Fields left out are unchanged.",
+        "properties": {
+          "enabled": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "url": {
             "type": [
               "string",
               "null"
@@ -85097,6 +85529,91 @@
           "success",
           "attempt_number",
           "created_at"
+        ],
+        "type": "object"
+      },
+      "WebhookEvent": {
+        "description": "One public happening on the page.",
+        "properties": {
+          "affected_components": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "ends_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "description": "Stable per page and event, the same as the Atom entry id: use it to\ndrop a repeated delivery.",
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "published_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "starts_at": {
+            "description": "When a maintenance window starts; absent for incident events.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "title",
+          "status",
+          "message",
+          "affected_components",
+          "published_at"
+        ],
+        "type": "object"
+      },
+      "WebhookPage": {
+        "description": "The page an event belongs to.",
+        "properties": {
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "title"
+        ],
+        "type": "object"
+      },
+      "WebhookPayload": {
+        "description": "The JSON body of every webhook delivery.",
+        "properties": {
+          "event": {
+            "$ref": "#/components/schemas/WebhookEvent"
+          },
+          "page": {
+            "$ref": "#/components/schemas/WebhookPage"
+          },
+          "type": {
+            "description": "`incident_update`, `incident_resolved` or `maintenance_scheduled`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "page",
+          "event"
         ],
         "type": "object"
       },
@@ -179273,6 +179790,466 @@
         "x-maturity": "beta"
       }
     },
+    "/status-pages/{status_page_id}/maintenances": {
+      "get": {
+        "description": "Newest first, cancelled and completed ones included.",
+        "operationId": "list_status_page_maintenances",
+        "parameters": [
+          {
+            "description": "Status page ID",
+            "in": "path",
+            "name": "status_page_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Page number, starting at 1 (default 1).",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Items per page (default 20, max 100).",
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MaintenanceListResponse"
+                }
+              }
+            },
+            "description": "Maintenance windows, newest first"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Status page not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Maintenance windows of a status page",
+        "tags": [
+          "Status Page"
+        ],
+        "x-maturity": "beta"
+      },
+      "post": {
+        "description": "While it runs, the covered monitors show \"Under maintenance\", their\nchecks are left out of uptime and no outage incident or alert is raised\nfor them. It is announced once, now, through the page's feed and\nsubscriptions. It cannot start in the past.",
+        "operationId": "create_status_page_maintenance",
+        "parameters": [
+          {
+            "description": "Status page ID",
+            "in": "path",
+            "name": "status_page_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateMaintenanceRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MaintenanceResponse"
+                }
+              }
+            },
+            "description": "Maintenance window scheduled"
+          },
+          "400": {
+            "description": "Invalid window"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Status page not found"
+          },
+          "409": {
+            "description": "The page has too many open windows"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Schedule a maintenance window",
+        "tags": [
+          "Status Page"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/status-pages/{status_page_id}/maintenances/{maintenance_id}": {
+      "delete": {
+        "description": "A scheduled window never runs; one in progress ends now. Checks taken\nwhile it ran stay out of uptime. The window is kept, marked cancelled.",
+        "operationId": "cancel_status_page_maintenance",
+        "parameters": [
+          {
+            "description": "Status page ID",
+            "in": "path",
+            "name": "status_page_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Maintenance window ID",
+            "in": "path",
+            "name": "maintenance_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MaintenanceResponse"
+                }
+              }
+            },
+            "description": "Maintenance window cancelled"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Status page or window not found"
+          },
+          "409": {
+            "description": "The window was already cancelled or has ended"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Cancel a maintenance window",
+        "tags": [
+          "Status Page"
+        ],
+        "x-maturity": "beta"
+      },
+      "get": {
+        "operationId": "get_status_page_maintenance",
+        "parameters": [
+          {
+            "description": "Status page ID",
+            "in": "path",
+            "name": "status_page_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Maintenance window ID",
+            "in": "path",
+            "name": "maintenance_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MaintenanceResponse"
+                }
+              }
+            },
+            "description": "Maintenance window"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Status page or window not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "A maintenance window",
+        "tags": [
+          "Status Page"
+        ],
+        "x-maturity": "beta"
+      },
+      "patch": {
+        "description": "Before it starts every field can change; once it has started, only the\ntitle, description and end. A cancelled or completed window cannot\nchange. Changes are shown on the page but not announced again.",
+        "operationId": "update_status_page_maintenance",
+        "parameters": [
+          {
+            "description": "Status page ID",
+            "in": "path",
+            "name": "status_page_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Maintenance window ID",
+            "in": "path",
+            "name": "maintenance_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateMaintenanceRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MaintenanceResponse"
+                }
+              }
+            },
+            "description": "Maintenance window updated"
+          },
+          "400": {
+            "description": "Invalid window"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Status page or window not found"
+          },
+          "409": {
+            "description": "The window can no longer change that way"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Change a maintenance window",
+        "tags": [
+          "Status Page"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/status-pages/{status_page_id}/password": {
+      "get": {
+        "operationId": "get_status_page_password",
+        "parameters": [
+          {
+            "description": "Status page ID",
+            "in": "path",
+            "name": "status_page_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PagePasswordResponse"
+                }
+              }
+            },
+            "description": "Whether the page has a password"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Status page not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Whether a status page needs a password",
+        "tags": [
+          "Status Page"
+        ],
+        "x-maturity": "beta"
+      },
+      "put": {
+        "description": "With a password (8 to 256 characters), visitors must type it to read the\npage, its JSON or subscribe, and the page's Atom feed is not served.\n`null` makes the page open again. Any change signs every visitor out.",
+        "operationId": "set_status_page_password",
+        "parameters": [
+          {
+            "description": "Status page ID",
+            "in": "path",
+            "name": "status_page_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetPagePasswordRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PagePasswordResponse"
+                }
+              }
+            },
+            "description": "Password changed"
+          },
+          "400": {
+            "description": "Invalid password"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Status page not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Set, change or remove a status page's password",
+        "tags": [
+          "Status Page"
+        ],
+        "x-maturity": "beta"
+      }
+    },
     "/status-pages/{status_page_id}/preview": {
       "get": {
         "operationId": "preview_status_page",
@@ -179785,6 +180762,279 @@
         "x-maturity": "beta"
       }
     },
+    "/status-pages/{status_page_id}/webhooks": {
+      "get": {
+        "description": "Newest first, each with the outcome of its last delivery.",
+        "operationId": "list_status_page_webhooks",
+        "parameters": [
+          {
+            "description": "Status page ID",
+            "in": "path",
+            "name": "status_page_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Page number, starting at 1 (default 1).",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Items per page (default 20, max 100).",
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatusPageWebhookListResponse"
+                }
+              }
+            },
+            "description": "Webhooks, newest first"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Status page not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Webhooks of a status page",
+        "tags": [
+          "Status Page"
+        ],
+        "x-maturity": "beta"
+      },
+      "post": {
+        "description": "Each new public event of the page (an incident update or resolution, a\nscheduled maintenance window) is posted to the URL as JSON, signed in\n`X-Temps-Signature` with the secret returned here, once. The URL must be\n`https://` and resolve to a public address.",
+        "operationId": "create_status_page_webhook",
+        "parameters": [
+          {
+            "description": "Status page ID",
+            "in": "path",
+            "name": "status_page_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateStatusPageWebhookRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatusPageWebhookCreatedResponse"
+                }
+              }
+            },
+            "description": "Webhook registered; the secret is shown only now"
+          },
+          "400": {
+            "description": "Invalid URL or non-public address"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Status page not found"
+          },
+          "409": {
+            "description": "The page already has the most webhooks allowed"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Register a webhook on a status page",
+        "tags": [
+          "Status Page"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/status-pages/{status_page_id}/webhooks/{webhook_id}": {
+      "delete": {
+        "description": "Events still waiting for it are dropped.",
+        "operationId": "delete_status_page_webhook",
+        "parameters": [
+          {
+            "description": "Status page ID",
+            "in": "path",
+            "name": "status_page_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Webhook ID",
+            "in": "path",
+            "name": "webhook_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Webhook deleted"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Status page or webhook not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Delete a webhook",
+        "tags": [
+          "Status Page"
+        ],
+        "x-maturity": "beta"
+      },
+      "patch": {
+        "operationId": "update_status_page_webhook",
+        "parameters": [
+          {
+            "description": "Status page ID",
+            "in": "path",
+            "name": "status_page_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Webhook ID",
+            "in": "path",
+            "name": "webhook_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateStatusPageWebhookRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatusPageWebhookResponse"
+                }
+              }
+            },
+            "description": "Webhook updated"
+          },
+          "400": {
+            "description": "Invalid URL or non-public address"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Status page or webhook not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Change a webhook's URL or switch it on or off",
+        "tags": [
+          "Status Page"
+        ],
+        "x-maturity": "beta"
+      }
+    },
     "/status/{slug}": {
       "get": {
         "operationId": "get_public_status_page",
@@ -179805,6 +181055,12 @@
               "text/html": {}
             },
             "description": "Rendered status page"
+          },
+          "401": {
+            "content": {
+              "text/html": {}
+            },
+            "description": "The page is password-protected: the password form"
           },
           "404": {
             "description": "No published status page at this URL"
@@ -179903,6 +181159,42 @@
         "x-maturity": "beta"
       }
     },
+    "/status/{slug}/feed.atom": {
+      "get": {
+        "description": "The page's public incident updates and maintenance announcements as an\nAtom feed, newest first, built with the page snapshot: it carries nothing\nthe page does not show. A password-protected page has no feed.",
+        "operationId": "get_public_status_page_feed",
+        "parameters": [
+          {
+            "description": "Unguessable status page token",
+            "in": "path",
+            "name": "slug",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/atom+xml": {}
+            },
+            "description": "Atom feed of the page's public updates"
+          },
+          "404": {
+            "description": "No published status page at this URL"
+          },
+          "429": {
+            "description": "Rate limited"
+          }
+        },
+        "summary": "Public status page (Atom feed)",
+        "tags": [
+          "Status Page"
+        ],
+        "x-maturity": "beta"
+      }
+    },
     "/status/{slug}/subscribe": {
       "post": {
         "operationId": "status_page_subscribe",
@@ -179935,6 +181227,12 @@
               "text/html": {}
             },
             "description": "Not an email address"
+          },
+          "401": {
+            "content": {
+              "text/html": {}
+            },
+            "description": "The page is password-protected and not unlocked"
           },
           "404": {
             "description": "No published status page taking subscriptions at this URL"
@@ -179981,6 +181279,9 @@
             },
             "description": "Status page snapshot"
           },
+          "401": {
+            "description": "The page is password-protected and not unlocked"
+          },
           "404": {
             "description": "No published status page at this URL"
           },
@@ -179989,6 +181290,60 @@
           }
         },
         "summary": "Public status page (JSON)",
+        "tags": [
+          "Status Page"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/status/{slug}/unlock": {
+      "post": {
+        "description": "The password form's post. The right password sets a cookie that opens\nthe page for 7 days and redirects to it; a wrong one shows the form\nagain. Repeated wrong passwords from one client are refused for a while.",
+        "operationId": "unlock_public_status_page",
+        "parameters": [
+          {
+            "description": "Unguessable status page token",
+            "in": "path",
+            "name": "slug",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/x-www-form-urlencoded": {}
+          },
+          "description": "`password=<password>`"
+        },
+        "responses": {
+          "303": {
+            "description": "Unlocked: redirect to the page with the access cookie set"
+          },
+          "401": {
+            "content": {
+              "text/html": {}
+            },
+            "description": "Wrong password: the form again"
+          },
+          "404": {
+            "description": "No published status page at this URL"
+          },
+          "429": {
+            "content": {
+              "text/html": {}
+            },
+            "description": "Too many wrong passwords from this client"
+          },
+          "503": {
+            "content": {
+              "text/html": {}
+            },
+            "description": "Too many unlocks at once; retry"
+          }
+        },
+        "summary": "Unlock a password-protected status page",
         "tags": [
           "Status Page"
         ],

@@ -1005,6 +1005,11 @@ impl PublicStatusPageService {
             .map(|model| StatusPageResponse {
                 public_url: base.page_url(&model.slug),
                 public_json_url: base.json_url(&model.slug),
+                public_feed_url: if model.password_hash.is_some() {
+                    None
+                } else {
+                    base.feed_url(&model.slug)
+                },
                 public_url_status: base.status.clone(),
                 monitors: by_page.remove(&model.id).unwrap_or_default(),
                 projects: projects_by_page.remove(&model.id).unwrap_or_default(),
@@ -1096,6 +1101,12 @@ impl PublicUrlBase {
             .as_ref()
             .map(|base| format!("{base}/api/status/{slug}/summary.json"))
     }
+
+    fn feed_url(&self, slug: &str) -> Option<String> {
+        self.base
+            .as_ref()
+            .map(|base| format!("{base}/api/status/{slug}/feed.atom"))
+    }
 }
 
 #[async_trait::async_trait]
@@ -1164,6 +1175,7 @@ mod tests {
 
         assert_eq!(base.page_url(SLUG), None);
         assert_eq!(base.json_url(SLUG), None);
+        assert_eq!(base.feed_url(SLUG), None);
         assert!(!base.status.configured);
         assert_eq!(
             base.status.setup_path.as_deref(),
@@ -1197,6 +1209,10 @@ mod tests {
             Some(
                 "https://temps.example.com/api/status/0123456789abcdef0123456789abcdef/summary.json"
             )
+        );
+        assert_eq!(
+            base.feed_url(SLUG).as_deref(),
+            Some("https://temps.example.com/api/status/0123456789abcdef0123456789abcdef/feed.atom")
         );
         assert_eq!(
             base.status,

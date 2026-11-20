@@ -16,8 +16,8 @@ use tracing::info;
 use super::error::WebhookError;
 use super::transport::WebhookTransport;
 use super::types::{
-    CreateWebhookRequest, UpdateWebhookRequest, WebhookCreatedResponse, WebhookListResponse,
-    WebhookResponse,
+    CreateStatusPageWebhookRequest, StatusPageWebhookCreatedResponse,
+    StatusPageWebhookListResponse, StatusPageWebhookResponse, UpdateStatusPageWebhookRequest,
 };
 use crate::services::public_pages::StatusSnapshotCache;
 
@@ -74,7 +74,7 @@ fn new_secret() -> Result<String, WebhookError> {
         })
 }
 
-impl From<status_page_webhooks::Model> for WebhookResponse {
+impl From<status_page_webhooks::Model> for StatusPageWebhookResponse {
     fn from(model: status_page_webhooks::Model) -> Self {
         Self {
             id: model.id,
@@ -147,7 +147,7 @@ impl StatusPageWebhookService {
         status_page_id: i32,
         page: u64,
         page_size: u64,
-    ) -> Result<WebhookListResponse, WebhookError> {
+    ) -> Result<StatusPageWebhookListResponse, WebhookError> {
         let page = page.max(1);
         let page_size = page_size.clamp(1, 100);
         self.ensure_page(status_page_id).await?;
@@ -161,9 +161,9 @@ impl StatusPageWebhookService {
             .fetch_page(page - 1)
             .await?
             .into_iter()
-            .map(WebhookResponse::from)
+            .map(StatusPageWebhookResponse::from)
             .collect();
-        Ok(WebhookListResponse {
+        Ok(StatusPageWebhookListResponse {
             items,
             total,
             page,
@@ -174,8 +174,8 @@ impl StatusPageWebhookService {
     pub async fn create(
         &self,
         status_page_id: i32,
-        request: CreateWebhookRequest,
-    ) -> Result<WebhookCreatedResponse, WebhookError> {
+        request: CreateStatusPageWebhookRequest,
+    ) -> Result<StatusPageWebhookCreatedResponse, WebhookError> {
         let url = validate_url(status_page_id, &request.url)?;
         self.ensure_page(status_page_id).await?;
         self.check_address(status_page_id, &url).await?;
@@ -223,7 +223,7 @@ impl StatusPageWebhookService {
             webhook_id = model.id,
             "registered status page webhook"
         );
-        Ok(WebhookCreatedResponse {
+        Ok(StatusPageWebhookCreatedResponse {
             webhook: model.into(),
             secret,
         })
@@ -233,8 +233,8 @@ impl StatusPageWebhookService {
         &self,
         status_page_id: i32,
         webhook_id: i32,
-        request: UpdateWebhookRequest,
-    ) -> Result<WebhookResponse, WebhookError> {
+        request: UpdateStatusPageWebhookRequest,
+    ) -> Result<StatusPageWebhookResponse, WebhookError> {
         let model = self.find(status_page_id, webhook_id).await?;
         let url = match request.url.as_deref() {
             Some(raw) => {

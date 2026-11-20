@@ -30,8 +30,8 @@ use super::dispatcher::{WebhookDispatcherState, MAX_ATTEMPTS};
 use super::payload::{signature, WebhookPayload, SIGNATURE_HEADER};
 use super::service::MAX_WEBHOOKS_PER_PAGE;
 use super::{
-    CreateWebhookRequest, StatusPageWebhookService, UpdateWebhookRequest, WebhookError,
-    WebhookTransport,
+    CreateStatusPageWebhookRequest, StatusPageWebhookService, UpdateStatusPageWebhookRequest,
+    WebhookError, WebhookTransport,
 };
 use crate::routes::webhooks::{create_webhook, create_webhook_router, WebhookRoutesState};
 use crate::services::maintenance::{CreateMaintenanceRequest, StatusPageMaintenanceService};
@@ -312,7 +312,7 @@ async fn a_new_event_is_posted_once_signed_with_the_secret_shown_at_creation() {
         .webhooks
         .create(
             fx.page_id,
-            CreateWebhookRequest {
+            CreateStatusPageWebhookRequest {
                 url: URL.to_string(),
             },
         )
@@ -388,7 +388,7 @@ async fn failures_are_retried_then_marked_failed_with_the_reason_shown() {
     fx.webhooks
         .create(
             fx.page_id,
-            CreateWebhookRequest {
+            CreateStatusPageWebhookRequest {
                 url: URL.to_string(),
             },
         )
@@ -464,7 +464,7 @@ async fn a_disabled_webhook_gets_nothing_and_its_pending_events_are_cancelled() 
         .webhooks
         .create(
             fx.page_id,
-            CreateWebhookRequest {
+            CreateStatusPageWebhookRequest {
                 url: URL.to_string(),
             },
         )
@@ -482,7 +482,7 @@ async fn a_disabled_webhook_gets_nothing_and_its_pending_events_are_cancelled() 
         .update(
             fx.page_id,
             created.webhook.id,
-            UpdateWebhookRequest {
+            UpdateStatusPageWebhookRequest {
                 enabled: Some(false),
                 ..Default::default()
             },
@@ -512,7 +512,7 @@ async fn registration_is_validated_bounded_and_scoped_to_the_page() {
         .webhooks
         .create(
             fx.page_id,
-            CreateWebhookRequest {
+            CreateStatusPageWebhookRequest {
                 url: "http://hooks.example.test/".to_string(),
             },
         )
@@ -526,7 +526,7 @@ async fn registration_is_validated_bounded_and_scoped_to_the_page() {
         .webhooks
         .create(
             fx.page_id,
-            CreateWebhookRequest {
+            CreateStatusPageWebhookRequest {
                 url: URL.to_string(),
             },
         )
@@ -540,7 +540,7 @@ async fn registration_is_validated_bounded_and_scoped_to_the_page() {
         fx.webhooks
             .create(
                 9_999_999,
-                CreateWebhookRequest {
+                CreateStatusPageWebhookRequest {
                     url: URL.to_string()
                 }
             )
@@ -556,7 +556,7 @@ async fn registration_is_validated_bounded_and_scoped_to_the_page() {
             .webhooks
             .create(
                 fx.page_id,
-                CreateWebhookRequest {
+                CreateStatusPageWebhookRequest {
                     url: URL.to_string(),
                 },
             )
@@ -568,7 +568,7 @@ async fn registration_is_validated_bounded_and_scoped_to_the_page() {
         fx.webhooks
             .create(
                 fx.page_id,
-                CreateWebhookRequest {
+                CreateStatusPageWebhookRequest {
                     url: URL.to_string()
                 }
             )
@@ -599,7 +599,7 @@ async fn the_handlers_authorize_return_the_secret_once_and_audit_without_it() {
         State(fx.state.clone()),
         metadata(),
         Path(fx.page_id),
-        Json(CreateWebhookRequest {
+        Json(CreateStatusPageWebhookRequest {
             url: URL.to_string(),
         }),
     )
@@ -613,7 +613,7 @@ async fn the_handlers_authorize_return_the_secret_once_and_audit_without_it() {
         State(fx.state.clone()),
         metadata(),
         Path(fx.page_id),
-        Json(CreateWebhookRequest {
+        Json(CreateStatusPageWebhookRequest {
             url: URL.to_string(),
         }),
     )
@@ -632,7 +632,8 @@ async fn the_handlers_authorize_return_the_secret_once_and_audit_without_it() {
     let body = axum::body::to_bytes(response.into_body(), 1 << 20)
         .await
         .expect("body");
-    let created: super::WebhookCreatedResponse = serde_json::from_slice(&body).expect("json");
+    let created: super::StatusPageWebhookCreatedResponse =
+        serde_json::from_slice(&body).expect("json");
     assert!(created.secret.starts_with("whsec_"));
 
     let listed = serde_json::to_string(&fx.webhooks.list(fx.page_id, 1, 20).await.expect("list"))

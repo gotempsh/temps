@@ -162,13 +162,120 @@ A background task checks every 20 seconds. It queues one notice per public updat
 
 ## Atom feed
 
-Every published page has an Atom feed at `/api/status/<token>/feed.atom` (or `/feed.atom` on a custom domain), linked from the page's footer, so feed readers and chat integrations can follow it. It lists the newest 50 public incident updates and resolutions, with the same text the page shows; nothing private is ever in it. Like the page, it is served from memory and refreshed every minute.
+Every published page has an Atom feed at `/api/status/<token>/feed.atom` (or `/feed.atom` on a custom domain), linked from the page's footer and shown under **Notifications** in the console and by `temps status-pages show`, so feed readers and chat integrations can follow it. It lists the newest 50 public incident updates, resolutions and maintenance announcements, with the same text the page shows; nothing private is ever in it, and entry IDs are opaque. Like the page, it is served from memory and refreshed every minute. A password-protected page has no feed: a feed reader cannot sign in, and the feed answers "not found".
+
+---
+
+## Maintenance windows
+
+Announce planned work ahead of time, e.g. "Database upgrade, Sunday 22:00–23:00". Open the page's **Maintenance** tab, click **Schedule maintenance**, and give it a title, a start and an end (in your browser's time zone), the components it affects and, optionally, a description.
+
+- **Before it starts** the page lists it under "Scheduled maintenance". Subscribers and webhooks are told **once**, when you schedule it. Changing or cancelling it later updates the page but sends nothing.
+- **While it runs** its components show **Under maintenance**, **outage alerts for their monitors are paused**, and checks taken during the window are **left out of uptime**, on every page that shows the monitor. Monitoring itself keeps running.
+- **Once it has started** its start and components are fixed; the title, description and end can still change. **End now** cancels a running window early; checks taken until then stay out of uptime.
+
+A window cannot be backdated (a few minutes of slack allow for "now"), lasts at most 7 days, and starts at most a year ahead. A page has at most 20 scheduled or running windows.
+
+```bash
+temps status-pages maintenance schedule --id 1 --title "Database upgrade" \
+  --starts 2026-12-01T22:00:00Z --duration 1h --monitor 12 --monitor 15
+temps status-pages maintenance list --id 1
+temps status-pages maintenance update --id 1 --maintenance-id 4 --ends 2026-12-01T23:30:00Z
+temps status-pages maintenance cancel --id 1 --maintenance-id 4
+```
+
+Dates need a time zone (`Z` or `+01:00`) so a window is never scheduled in the wrong zone by accident.
+
+| Action | Endpoint |
+|---|---|
+| List | `GET /api/status-pages/{id}/maintenances` |
+| Schedule | `POST /api/status-pages/{id}/maintenances` |
+| Show | `GET /api/status-pages/{id}/maintenances/{maintenance_id}` |
+| Change | `PATCH /api/status-pages/{id}/maintenances/{maintenance_id}` |
+| Cancel or end now | `DELETE /api/status-pages/{id}/maintenances/{maintenance_id}` |
+
+---
+
+## Password protection
+
+A page can ask visitors for a password, for example a page only your customers should read. Set it under **Overview → Password**, or:
+
+```bash
+temps status-pages password set --id 1                       # prompts for it
+printf '%s\n' "$PAGE_PASSWORD" | temps status-pages password set --id 1 --password-stdin
+temps status-pages password set --id 1 --remove              # open the page again
+temps status-pages password show --id 1
+```
+
+- Visitors see a password form. After the right password the browser keeps a signed cookie for 7 days; nothing is stored per visitor.
+- While a password is set, the JSON at `…/summary.json` also needs the cookie and is not shared with other sites (no CORS header), the Atom feed is off, and subscribing needs the password. Confirmation and unsubscribe links in emails keep working, so nobody is stuck on a list.
+- Setting, changing or removing the password signs every visitor out.
+- Passwords are 8 to 256 characters and are stored only as an argon2 hash. Wrong passwords are limited to 5 per client per 15 minutes, and checking them never slows the rest of Temps down: a burst beyond what the server checks at once is asked to retry.
+
+| Action | Endpoint |
+|---|---|
+| Show whether a password is set | `GET /api/status-pages/{id}/password` |
+| Set, change or remove (`{"password": null}`) | `PUT /api/status-pages/{id}/password` |
+
+---
+
+## Webhooks
+
+Post every public update of a page to your own HTTPS endpoint, e.g. a chat channel relay. Add one under **Notifications → Webhooks** or with the CLI. The **signing secret** is shown once, when the webhook is added; store it then. To change it, delete the webhook and add it again.
+
+```bash
+temps status-pages webhooks add --id 1 --url https://hooks.example.com/status   # prints the secret once
+temps status-pages webhooks list --id 1
+temps status-pages webhooks update --id 1 --webhook-id 2 --disable             # pause
+temps status-pages webhooks remove --id 1 --webhook-id 2
+```
+
+Each event is a `POST` with a JSON body carrying only what the page shows:
+
+```json
+{
+  "type": "incident_update",
+  "page": { "title": "Example status" },
+  "event": {
+    "id": "3f9a…",
+    "title": "Partial outage",
+    "status": "identified",
+    "message": "We found the cause and are rolling out a fix.",
+    "affected_components": ["API"],
+    "published_at": "2026-11-20T10:05:00Z",
+    "starts_at": null,
+    "ends_at": null
+  }
+}
+```
+
+`type` is `incident_update`, `incident_resolved` or `maintenance_scheduled` (which sets `starts_at` and `ends_at`). `event.id` is stable for an event, so use it to drop duplicates. The headers are `X-Temps-Event` (the type), `X-Temps-Event-Id` and `X-Temps-Signature: t=<unix seconds>,v1=<hex>`, where `v1` is the HMAC-SHA256, keyed with the secret, of `<t>.<raw body>`. Verify it before trusting a request, and reject old timestamps:
+
+```js
+import { createHmac, timingSafeEqual } from 'node:crypto'
+
+function verify(secret, header, rawBody, toleranceSeconds = 300) {
+  const parts = Object.fromEntries(header.split(',').map((p) => p.split('=')))
+  if (Math.abs(Date.now() / 1000 - Number(parts.t)) > toleranceSeconds) return false
+  const expected = createHmac('sha256', secret).update(`${parts.t}.${rawBody}`).digest('hex')
+  return timingSafeEqual(Buffer.from(expected), Buffer.from(parts.v1 ?? ''))
+}
+```
+
+**Delivery.** A background task checks every 20 seconds and delivers events published since the webhook was added (at most the last 24 hours). Any `2xx` answer counts as delivered. Otherwise Temps retries after 1 minute and then 10 minutes, and gives up after 3 attempts; the console and `webhooks list` show the last failure. Requests time out after 10 seconds, redirects are not followed, and the URL must be `https://` and resolve to a public address, checked again on every delivery. An event that stops being public before it is delivered (made private, the page unpublished) is not sent. Pausing a webhook drops the deliveries still waiting for it; after you resume it, public updates from the last 24 hours that it was never sent are delivered.
+
+| Action | Endpoint |
+|---|---|
+| List | `GET /api/status-pages/{id}/webhooks` |
+| Add (returns the secret once) | `POST /api/status-pages/{id}/webhooks` |
+| Change the URL, pause or resume | `PATCH /api/status-pages/{id}/webhooks/{webhook_id}` |
+| Delete | `DELETE /api/status-pages/{id}/webhooks/{webhook_id}` |
 
 ---
 
 ## Custom domains
 
-A page can also be served on your own hostname, such as `status.example.com`. The hostname serves **only** the page (`/`), its JSON (`/summary.json`), its feed (`/feed.atom`) and, when subscriptions are on, the subscribe form (`/subscribe`) and the confirmation and unsubscribe links; every other path answers "not found", and the hostname never reaches the Temps console, its API, or any application.
+A page can also be served on your own hostname, such as `status.example.com`. The hostname serves **only** the page (`/`), its JSON (`/summary.json`), its feed (`/feed.atom`), the password form (`/unlock`), and, when subscriptions are on, the subscribe form (`/subscribe`) and the confirmation and unsubscribe links; every other path answers "not found", and the hostname never reaches the Temps console, its API, or any application.
 
 1. Open the status page and, under **Custom domains**, enter the hostname. Choose how to prove you control it:
    - **HTTP**: the hostname already points at this Temps instance.
@@ -215,7 +322,7 @@ Status-page hostnames are served by the control plane's proxy (single node, or `
 
 Creating a page needs `status_page:create`; changing it, publishing, unpublishing, replacing its link or changing an incident update's visibility need `status_page:write`; deleting needs `status_page:delete`. On projects with team access these start at the project **admin** role, so viewers and deployers cannot publish anything.
 
-Adding, verifying, renewing and removing custom domains needs `status_page:write`. Every change and every verification or renewal attempt is written to the audit log (`STATUS_PAGE_DOMAIN_ADDED`, `STATUS_PAGE_DOMAIN_VERIFIED`, `STATUS_PAGE_DOMAIN_VERIFICATION_ATTEMPTED`, `STATUS_PAGE_DOMAIN_RENEWAL_REQUESTED`, `STATUS_PAGE_DOMAIN_REMOVED`, `STATUS_PAGE_CREATED`, `STATUS_PAGE_UPDATED`, `STATUS_PAGE_PUBLISHED`, `STATUS_PAGE_UNPUBLISHED`, `STATUS_PAGE_URL_ROTATED`, `STATUS_PAGE_DELETED`, `STATUS_PAGE_INCIDENT_UPDATE_VISIBILITY_CHANGED`), including the exact list of monitors selected when the selection changes.
+Adding, verifying, renewing and removing custom domains, scheduling maintenance, setting the password and managing webhooks need `status_page:write`. Every change and every verification or renewal attempt is written to the audit log (`STATUS_PAGE_DOMAIN_ADDED`, `STATUS_PAGE_DOMAIN_VERIFIED`, `STATUS_PAGE_DOMAIN_VERIFICATION_ATTEMPTED`, `STATUS_PAGE_DOMAIN_RENEWAL_REQUESTED`, `STATUS_PAGE_DOMAIN_REMOVED`, `STATUS_PAGE_CREATED`, `STATUS_PAGE_UPDATED`, `STATUS_PAGE_PUBLISHED`, `STATUS_PAGE_UNPUBLISHED`, `STATUS_PAGE_URL_ROTATED`, `STATUS_PAGE_DELETED`, `STATUS_PAGE_INCIDENT_UPDATE_VISIBILITY_CHANGED`, `STATUS_PAGE_MAINTENANCE_SCHEDULED`, `STATUS_PAGE_MAINTENANCE_UPDATED`, `STATUS_PAGE_MAINTENANCE_CANCELLED`, `STATUS_PAGE_PASSWORD_SET`, `STATUS_PAGE_PASSWORD_REMOVED`, `STATUS_PAGE_WEBHOOK_CREATED`, `STATUS_PAGE_WEBHOOK_UPDATED`, `STATUS_PAGE_WEBHOOK_DELETED`), including the exact list of monitors selected when the selection changes.
 
 ---
 
@@ -235,3 +342,5 @@ Adding, verifying, renewing and removing custom domains needs `status_page:write
 - 30 custom-domain verifications or renewals per page per hour, and 60 across the instance.
 - Up to 5 custom domains per page.
 - 10,000 subscribers per page, of which at most 1,000 waiting for confirmation.
+- 20 scheduled or running maintenance windows per page, each at most 7 days long.
+- 10 webhooks per page.

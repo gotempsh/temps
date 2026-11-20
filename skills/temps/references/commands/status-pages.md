@@ -4,6 +4,23 @@
 
 Apply [the CLI runtime and safety contract](../cli-runtime.md) before executing a command. Runtime `--help` is authoritative.
 
+## Contents
+
+- [`status-pages list`](#status-pages-list)
+- [`status-pages create`](#status-pages-create)
+- [`status-pages show`](#status-pages-show)
+- [`status-pages update`](#status-pages-update)
+- [`status-pages publish`](#status-pages-publish)
+- [`status-pages unpublish`](#status-pages-unpublish)
+- [`status-pages rotate-url`](#status-pages-rotate-url)
+- [`status-pages delete`](#status-pages-delete)
+- [`status-pages domains`](#status-pages-domains)
+- [`status-pages subscriptions`](#status-pages-subscriptions)
+- [`status-pages subscribers`](#status-pages-subscribers)
+- [`status-pages maintenance`](#status-pages-maintenance)
+- [`status-pages webhooks`](#status-pages-webhooks)
+- [`status-pages password`](#status-pages-password)
+
 ## `status-pages` (alias: `status-page`)
 
 Publish public status pages showing monitors from any of your projects
@@ -21,6 +38,9 @@ Publish public status pages showing monitors from any of your projects
 - `domains` (`domain`) - Serve a status page on your own hostname
 - `subscriptions` - Let visitors subscribe to a status page by email
 - `subscribers` - List, export or delete the subscribers of a status page
+- `maintenance` - Schedule maintenance windows: shown on the page, no outage alerts, no downtime counted
+- `webhooks` - Post every public update of a status page to signed HTTPS webhooks
+- `password` - Protect a status page with a password
 
 ### `status-pages list` (alias: `ls`)
 
@@ -268,3 +288,168 @@ Delete a subscriber; the address gets no more mail
 | `--id <id>` | Status page ID | - | Yes |
 | `--subscriber-id <id>` | Subscriber ID (see `subscribers list`) | - | Yes |
 | `-y, --yes` | Skip the confirmation prompt | - | No |
+
+### `status-pages maintenance`
+
+Schedule maintenance windows: shown on the page, no outage alerts, no downtime counted
+
+**Subcommands:**
+
+- `list` (`ls`) - List maintenance windows, newest first
+- `schedule` - Schedule a window; subscribers and webhooks are told once
+- `update` - Change a window; once it has started only the title, description and end can change
+- `cancel` - Cancel a scheduled window, or end a running one now
+
+#### `status-pages maintenance list` (alias: `ls`)
+
+List maintenance windows, newest first
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Status page ID | - | Yes |
+| `--page <n>` | Page number | `1` | No |
+| `--page-size <n>` | Items per page (max 100) | `20` | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `status-pages maintenance schedule`
+
+Schedule a window; subscribers and webhooks are told once
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Status page ID | - | Yes |
+| `--title <title>` | Public title (at most 120 characters) | - | Yes |
+| `--description <text>` | Public description (at most 2000 characters) | - | No |
+| `--starts <when>` | now, or an ISO 8601 date with a zone | - | Yes |
+| `--ends <when>` | ISO 8601 date with a zone | - | No |
+| `--duration <span>` | Instead of --ends: 90m, 2h, 1d (at most 7d) | - | No |
+| `--monitor <id>` | Monitor on this page the window covers (repeat, or comma-separate) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `status-pages maintenance update`
+
+Change a window; once it has started only the title, description and end can change
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Status page ID | - | Yes |
+| `--maintenance-id <id>` | Maintenance ID (see `maintenance list`) | - | Yes |
+| `--title <title>` | Public title | - | No |
+| `--description <text>` | Public description ("" removes it) | - | No |
+| `--starts <when>` | now, or an ISO 8601 date with a zone | - | No |
+| `--ends <when>` | ISO 8601 date with a zone | - | No |
+| `--duration <span>` | With --starts, instead of --ends: 90m, 2h, 1d | - | No |
+| `--monitor <id>` | Replace the covered monitors (repeat, or comma-separate) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `status-pages maintenance cancel`
+
+Cancel a scheduled window, or end a running one now
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Status page ID | - | Yes |
+| `--maintenance-id <id>` | Maintenance ID (see `maintenance list`) | - | Yes |
+| `-y, --yes` | Skip the confirmation prompt | - | No |
+
+### `status-pages webhooks`
+
+Post every public update of a status page to signed HTTPS webhooks
+
+**Subcommands:**
+
+- `list` (`ls`) - List the webhooks of a status page and how deliveries are going
+- `add` - Add a webhook; its signing secret is printed once
+- `update` - Change the URL, or pause and resume deliveries
+- `remove` (`rm`) - Delete a webhook; events waiting for it are dropped
+
+#### `status-pages webhooks list` (alias: `ls`)
+
+List the webhooks of a status page and how deliveries are going
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Status page ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `status-pages webhooks add`
+
+Add a webhook; its signing secret is printed once
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Status page ID | - | Yes |
+| `--url <url>` | https:// URL with a public address | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `status-pages webhooks update`
+
+Change the URL, or pause and resume deliveries
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Status page ID | - | Yes |
+| `--webhook-id <id>` | Webhook ID (see `webhooks list`) | - | Yes |
+| `--url <url>` | New https:// URL | - | No |
+| `--enable` | Resume deliveries | - | No |
+| `--disable` | Pause deliveries; those still waiting are dropped | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `status-pages webhooks remove` (alias: `rm`)
+
+Delete a webhook; events waiting for it are dropped
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Status page ID | - | Yes |
+| `--webhook-id <id>` | Webhook ID (see `webhooks list`) | - | Yes |
+| `-y, --yes` | Skip the confirmation prompt | - | No |
+
+### `status-pages password`
+
+Protect a status page with a password
+
+**Subcommands:**
+
+- `show` - Show whether a status page is password-protected
+- `set` - Set or change the password (prompted, or read from stdin); signs every visitor out
+
+#### `status-pages password show`
+
+Show whether a status page is password-protected
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Status page ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `status-pages password set`
+
+Set or change the password (prompted, or read from stdin); signs every visitor out
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Status page ID | - | Yes |
+| `--password-stdin` | Read the password from the first line of stdin | - | No |
+| `--remove` | Remove the password and open the page again | - | No |
+| `--json` | Output in JSON format | - | No |
