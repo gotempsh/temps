@@ -3,7 +3,8 @@
 
 import { useEffect, useState } from 'react'
 import { Button } from '@/components/ui/button'
-import { Check, Copy, Hash, WrapText } from 'lucide-react'
+import { CopyButton } from '@/components/ui/copy-button'
+import { Hash, WrapText } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { scrollableRegionProps, useScrollableRegion } from './scrollable-region'
 import type { HighlighterCore } from 'shiki/core'
@@ -153,7 +154,6 @@ export function CodeBlock({
   defaultShowLineNumbers = false,
   disableWrapToggle = false,
 }: CodeBlockProps) {
-  const [copied, setCopied] = useState(false)
   const [wrapLines, setWrapLines] = useState(defaultWrap)
   const [showLineNumbers, setShowLineNumbers] = useState(defaultShowLineNumbers)
 
@@ -161,12 +161,6 @@ export function CodeBlock({
   // (only while it overflows) so keyboard users can reach the rest of the line.
   const { ref: scrollerRef, scrollable } = useScrollableRegion<HTMLDivElement>()
   const scrollerProps = scrollableRegionProps(scrollable)
-
-  const handleCopy = async () => {
-    await navigator.clipboard.writeText(code)
-    setCopied(true)
-    setTimeout(() => setCopied(false), 2000)
-  }
 
   const controls = (className: string) => (
     <div className={cn('flex items-center gap-0.5 opacity-100', className)}>
@@ -211,24 +205,17 @@ export function CodeBlock({
         </Button>
       )}
       {showCopy && (
-        <Button
-          size="icon"
-          variant="ghost"
+        // CopyButton falls back to a selection copy where the Clipboard API
+        // is missing (plain-http instances) and reports a failed copy.
+        <CopyButton
+          value={code}
+          label="Copy"
           className={cn(
-            'size-7 rounded-md',
+            'size-7 rounded-md [&>svg]:size-3.5',
             'text-muted-foreground hover:text-foreground',
             'hover:bg-zinc-200/70 dark:hover:bg-zinc-800/60'
           )}
-          onClick={handleCopy}
-          title={copied ? 'Copied' : 'Copy'}
-          aria-label={copied ? 'Copied' : 'Copy'}
-        >
-          {copied ? (
-            <Check className="size-3.5 text-emerald-600 dark:text-emerald-400" />
-          ) : (
-            <Copy className="size-3.5" />
-          )}
-        </Button>
+        />
       )}
     </div>
   )

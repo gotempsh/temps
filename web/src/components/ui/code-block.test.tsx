@@ -129,3 +129,31 @@ test('wrapped lines break at spaces before splitting a word', () => {
   expect(pre.className).toContain('[overflow-wrap:anywhere]')
   expect(pre.className).not.toContain('break-all')
 })
+
+// Self-hosted instances reached over plain http have no Clipboard API; the
+// copy control falls back to a selection copy instead of failing silently.
+test('copying works without the Clipboard API', async () => {
+  const clipboard = Object.getOwnPropertyDescriptor(navigator, 'clipboard')
+  const execCommand = document.execCommand
+  const copied: string[] = []
+  Object.defineProperty(navigator, 'clipboard', {
+    configurable: true,
+    value: undefined,
+  })
+  document.execCommand = ((command: string) => {
+    const field = document.querySelector('textarea')
+    if (command === 'copy' && field) copied.push(field.value)
+    return true
+  }) as typeof document.execCommand
+  try {
+    const view = render(<CodeBlock code="echo hi" language="bash" title="x" />)
+    await act(async () => {
+      fireEvent.click(view.getByRole('button', { name: 'Copy' }))
+    })
+    expect(copied).toEqual(['echo hi'])
+  } finally {
+    document.execCommand = execCommand
+    if (clipboard) Object.defineProperty(navigator, 'clipboard', clipboard)
+    else Reflect.deleteProperty(navigator, 'clipboard')
+  }
+})
