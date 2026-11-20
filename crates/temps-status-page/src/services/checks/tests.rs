@@ -219,6 +219,19 @@ fn auth(role: Role) -> RequireAuth {
     ))
 }
 
+/// An admin's API key bound to `project_id`.
+fn scoped_key(project_id: i32) -> RequireAuth {
+    let RequireAuth(session) = auth(Role::Admin);
+    let user = session.user.clone().expect("session user");
+    RequireAuth(
+        AuthContext::new_api_key(user, Some(Role::Admin), None, "scoped".to_string(), 77)
+            .with_api_key_scope(Some(temps_authz::ApiKeyScope {
+                project_id,
+                environment_id: None,
+            })),
+    )
+}
+
 fn metadata() -> Extension<RequestMetadata> {
     Extension(RequestMetadata {
         ip_address: "192.0.2.41".to_string(),
@@ -685,6 +698,111 @@ async fn handlers_check_permissions_and_audit_without_secrets() {
     assert!(
         !recorded.contains(SECRET) && !recorded.contains("token=abc"),
         "{recorded}"
+    );
+}
+
+#[tokio::test]
+async fn a_key_scoped_to_another_project_cannot_create_or_change_monitors() {
+    let Some(fx) = fixture().await else { return };
+    let audit = Arc::new(RecordingAudit::default());
+    let state = fx.routes(audit.clone());
+    let created = fx
+        .service()
+        .create(fx.project_id, http_request("https://api.example.test/"))
+        .await
+        .expect("create");
+
+    let create = create_target_monitor(
+        scoped_key(fx.other_project_id),
+        State(state.clone()),
+        metadata(),
+        Path(fx.project_id),
+        Json(http_request("https://api.example.test/other")),
+    )
+    .await;
+    let Err(problem) = create else {
+        panic!("a key scoped to another project must not create here")
+    };
+    assert_eq!(problem.status_code, StatusCode::FORBIDDEN);
+
+    let update = update_target_monitor(
+        scoped_key(fx.other_project_id),
+        State(state.clone()),
+        metadata(),
+        Path((fx.project_id, created.id)),
+        Json(UpdateTargetMonitorRequest {
+            name: Some("renamed".to_string()),
+            ..Default::default()
+        }),
+    )
+    .await;
+    let Err(problem) = update else {
+        panic!("a key scoped to another project must not change monitors here")
+    };
+    assert_eq!(problem.status_code, StatusCode::FORBIDDEN);
+
+    // The key's own project is allowed.
+    let own = create_target_monitor(
+        scoped_key(fx.project_id),
+        State(state),
+        metadata(),
+        Path(fx.project_id),
+        Json(http_request("https://api.example.test/own")),
+    )
+    .await;
+    assert!(own.is_ok(), "a key may manage its own project's monitors");
+    assert_eq!(audit.entries.lock().expect("audit").len(), 1);
+}
+
+#[tokio::test]
+async fn a_rename_computed_before_another_save_does_not_restore_old_settings() {
+    let Some(fx) = fixture().await else { return };
+    let service = fx.service();
+    let created = service
+        .create(fx.project_id, http_request("https://api.example.test/old"))
+        .await
+        .expect("create");
+    let stale = status_monitors::Entity::find_by_id(created.id)
+        .one(fx.db.as_ref())
+        .await
+        .expect("read")
+        .expect("row");
+
+    // Another request saves a new target after `stale` was read.
+    service
+        .update(
+            fx.project_id,
+            created.id,
+            UpdateTargetMonitorRequest {
+                target: Some("https://api.example.test/new".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("save the new target");
+
+    let rename = UpdateTargetMonitorRequest {
+        name: Some("renamed".to_string()),
+        ..Default::default()
+    };
+    let written = service
+        .update_from(fx.project_id, created.id, &rename, stale)
+        .await
+        .expect("no error");
+    assert!(
+        written.is_none(),
+        "a save computed from a stale row writes nothing"
+    );
+
+    let renamed = service
+        .update(fx.project_id, created.id, rename)
+        .await
+        .expect("rename");
+    assert_eq!(renamed.name, "renamed");
+    assert_eq!(
+        renamed.target.as_deref(),
+        Some("https://api.example.test/new"),
+        "the rename keeps the target saved meanwhile"
     );
 }
 

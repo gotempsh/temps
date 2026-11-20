@@ -38,4 +38,8 @@ pub enum TargetMonitorError {
     StoredCheck { monitor_id: i32, reason: String },
     #[error("project {project_id} already has {limit} monitors for targets outside Temps")]
     TooMany { project_id: i32, limit: u64 },
+    #[error(
+        "monitor {monitor_id} kept changing while it was being saved; reload it and try again"
+    )]
+    Concurrent { monitor_id: i32 },
 }

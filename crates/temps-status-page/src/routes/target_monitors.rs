@@ -17,7 +17,7 @@ use axum::{
     routing::{patch, post},
     Json, Router,
 };
-use temps_authz::{project_permission_guard, RequireAuth};
+use temps_authz::{project_permission_guard, project_scope_guard, RequireAuth};
 use temps_core::error_builder::{bad_request, internal_server_error, not_found, ErrorBuilder};
 use temps_core::problemdetails::Problem;
 use temps_core::{AuditLogger, RequestMetadata};
@@ -63,6 +63,10 @@ impl From<TargetMonitorError> for Problem {
                 .build(),
             TargetMonitorError::TooMany { .. } => ErrorBuilder::new(StatusCode::CONFLICT)
                 .title("Too Many Target Monitors")
+                .detail(error.to_string())
+                .build(),
+            TargetMonitorError::Concurrent { .. } => ErrorBuilder::new(StatusCode::CONFLICT)
+                .title("Monitor Changed")
                 .detail(error.to_string())
                 .build(),
             TargetMonitorError::Encryption { .. } | TargetMonitorError::StoredCheck { .. } => {
@@ -160,6 +164,8 @@ pub async fn create_target_monitor(
         project_id,
         state.project_access_checker.clone()
     );
+    // A project-scoped key may only manage its own project's monitors.
+    project_scope_guard!(auth, project_id);
     let monitor: MonitorResponse = state.monitors.create(project_id, request).await?.into();
     record(
         &state,
@@ -210,6 +216,8 @@ pub async fn update_target_monitor(
         project_id,
         state.project_access_checker.clone()
     );
+    // A project-scoped key may only manage its own project's monitors.
+    project_scope_guard!(auth, project_id);
     let monitor: MonitorResponse = state
         .monitors
         .update(project_id, monitor_id, request)

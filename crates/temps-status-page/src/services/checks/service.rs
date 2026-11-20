@@ -16,6 +16,10 @@ use temps_core::url_validation::{
 use temps_entities::{projects, status_monitors};
 use tracing::info;
 
+/// How many times a monitor save is recomputed when another save lands
+/// between its read and its write.
+const UPDATE_ATTEMPTS: usize = 3;
+
 use super::error::{CheckConfigError, TargetMonitorError};
 use super::runner::TargetChecks;
 use super::spec::{
@@ -213,17 +217,42 @@ impl TargetMonitorService {
         Ok(model)
     }
 
+    /// Change a target monitor. Every field left out keeps its saved value,
+    /// read in the same transaction that writes: a save computed from a row
+    /// that changed meanwhile is recomputed, so a rename or pause never
+    /// restores settings another request just saved.
     pub async fn update(
         &self,
         project_id: i32,
         monitor_id: i32,
         request: UpdateTargetMonitorRequest,
     ) -> Result<status_monitors::Model, TargetMonitorError> {
-        let model = status_monitors::Entity::find_by_id(monitor_id)
-            .filter(status_monitors::Column::ProjectId.eq(project_id))
-            .one(self.db.as_ref())
-            .await?
-            .ok_or(TargetMonitorError::NotFound { monitor_id })?;
+        for _ in 0..UPDATE_ATTEMPTS {
+            let read = status_monitors::Entity::find_by_id(monitor_id)
+                .filter(status_monitors::Column::ProjectId.eq(project_id))
+                .one(self.db.as_ref())
+                .await?
+                .ok_or(TargetMonitorError::NotFound { monitor_id })?;
+            if let Some(model) = self
+                .update_from(project_id, monitor_id, &request, read)
+                .await?
+            {
+                return Ok(model);
+            }
+        }
+        Err(TargetMonitorError::Concurrent { monitor_id })
+    }
+
+    /// Apply `request` on top of `model`, as read earlier. `None` when the
+    /// row changed since that read, and nothing was written.
+    pub(super) async fn update_from(
+        &self,
+        project_id: i32,
+        monitor_id: i32,
+        request: &UpdateTargetMonitorRequest,
+        model: status_monitors::Model,
+    ) -> Result<Option<status_monitors::Model>, TargetMonitorError> {
+        let request = request.clone();
         if MonitorCheckKind::from_stored(&model.check_kind) == MonitorCheckKind::Environment {
             return Err(TargetMonitorError::NotTargetMonitor { monitor_id });
         }
@@ -250,6 +279,7 @@ impl TargetMonitorService {
             self.encrypt(project_id, &check_request)?
         };
 
+        let read_at = model.updated_at;
         let mut active: status_monitors::ActiveModel = model.into();
         if let Some(name) = request.name.as_deref() {
             active.name = Set(validate_name(project_id, name)?);
@@ -269,13 +299,27 @@ impl TargetMonitorService {
         // `updated_at`, which discards a probe of the old settings still in
         // flight.
         active.next_check_at = Set(None);
-        let model = active.update(self.db.as_ref()).await?;
+        // The settings above were computed without a lock (checking a new
+        // target resolves it); write them only if the row is still the one
+        // they were computed from.
+        let txn = self.db.begin().await?;
+        let locked = status_monitors::Entity::find_by_id(monitor_id)
+            .filter(status_monitors::Column::ProjectId.eq(project_id))
+            .lock_exclusive()
+            .one(&txn)
+            .await?
+            .ok_or(TargetMonitorError::NotFound { monitor_id })?;
+        if locked.updated_at != read_at {
+            return Ok(None);
+        }
+        let model = active.update(&txn).await?;
+        txn.commit().await?;
         info!(
             project_id,
             monitor_id,
             kind = kind.as_str(),
             "updated a target monitor"
         );
-        Ok(model)
+        Ok(Some(model))
     }
 }
