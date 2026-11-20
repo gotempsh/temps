@@ -5,6 +5,7 @@ import {
   createAnalytics,
   type AnalyticsApi,
   type AnalyticsOptions,
+  type IdentifyResult,
   type JsonValue,
 } from "@temps-sdk/analytics-core";
 
@@ -61,6 +62,23 @@ export function trackPageview(): void {
  */
 export function trackNotFound(data?: Record<string, JsonValue>): Promise<void> {
   return getAnalytics().trackNotFound(data);
+}
+
+/**
+ * Attach your app's user id (and optional traits) to this visitor, e.g.
+ * after signup (`window.temps.identify(...)` from a script tag).
+ * Convenience wrapper — throws if uninitialized.
+ */
+export function identify(
+  userId: string,
+  traits?: Record<string, JsonValue>
+): Promise<IdentifyResult> {
+  return getAnalytics().identify(userId, traits);
+}
+
+/** Forget the identity on sign-out. Convenience wrapper — throws if uninitialized. */
+export function reset(): Promise<void> {
+  return getAnalytics().reset();
 }
 
 /** Tear down the instance and remove listeners. */

@@ -37,12 +37,9 @@ let cookieless = false;
 export function enableCookielessIdentity(): void {
   const switched = !cookieless;
   cookieless = true;
+  clearStoredIdentity();
   try {
-    if (typeof localStorage !== "undefined") {
-      localStorage.removeItem(VISITOR_ID_KEY);
-      localStorage.removeItem(SESSION_ID_KEY);
-      localStorage.removeItem(SESSION_LAST_SEEN_KEY);
-    }
+    if (typeof localStorage !== "undefined") localStorage.removeItem("temps_identified");
   } catch {
     // Storage unusable: there is nothing stored to delete either.
   }
@@ -54,6 +51,38 @@ export function enableCookielessIdentity(): void {
       // eslint-disable-next-line no-console
       console.error("[temps] cookieless switch listener failed:", error);
     }
+  }
+}
+
+/**
+ * Delete the stored visitor and session ids, so the next event starts a new
+ * visitor. Used by `reset()` on sign-out.
+ */
+export function clearStoredIdentity(): void {
+  try {
+    if (typeof localStorage !== "undefined") {
+      localStorage.removeItem(VISITOR_ID_KEY);
+      localStorage.removeItem(SESSION_ID_KEY);
+      localStorage.removeItem(SESSION_LAST_SEEN_KEY);
+    }
+  } catch {
+    // Storage unusable: nothing was stored.
+  }
+}
+
+/**
+ * The visitor id this tracker stored, without creating one. `undefined` in
+ * cookieless mode, before the first event, or when storage is blocked. On a
+ * site Temps serves, the server-side visitor is the `_temps_visitor_id`
+ * cookie instead, which the page cannot read (it is `HttpOnly`).
+ */
+export function getStoredVisitorId(): string | undefined {
+  if (cookieless) return undefined;
+  try {
+    if (typeof localStorage === "undefined") return undefined;
+    return localStorage.getItem(VISITOR_ID_KEY) ?? undefined;
+  } catch {
+    return undefined;
   }
 }
 
