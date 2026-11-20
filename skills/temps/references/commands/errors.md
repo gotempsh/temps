@@ -23,6 +23,9 @@ Apply [the CLI runtime and safety contract](../cli-runtime.md) before executing 
 - [`errors releases`](#errors-releases)
 - [`errors release`](#errors-release)
 - [`errors attachments`](#errors-attachments)
+- [`errors issues`](#errors-issues)
+- [`errors commits`](#errors-commits)
+- [`errors ownership`](#errors-ownership)
 - [`errors events`](#errors-events)
 - [`errors event`](#errors-event)
 - [`errors stats`](#errors-stats)
@@ -54,6 +57,9 @@ Manage error tracking and error groups
 - `releases` - Show the health of each release: crash-free sessions and users, adoption and deployment
 - `release` - Show one release's sessions and crash-free rate per hour
 - `attachments` - Files SDKs send with errors and feedback, kept in blob storage
+- `issues` - Issues that track an error group, in the project's repository or any tracker
+- `commits` - Show the commits that last touched the code an error group fails in
+- `ownership` - Rules that assign new error groups by the path of the failing code
 - `events` - List events in an error group
 - `event` - Show a specific error event
 - `stats` - Get error statistics for a project
@@ -461,6 +467,115 @@ Set how much attachment storage the project may use
 |------|-------------|---------|----------|
 | `--project-id <id>` | Project ID | - | Yes |
 | `--mib <n>` | Quota in MiB, 0 to 102400 | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `errors issues`
+
+Issues that track an error group, in the project's repository or any tracker
+
+**Subcommands:**
+
+- `list` (`ls`) - List the issues linked to an error group
+- `open` - Open an issue for an error group in the project's GitHub or GitLab repository
+- `link` - Link an existing issue from any tracker to an error group
+- `unlink` - Unlink an issue from an error group; the issue itself is left as it is
+
+#### `errors issues list` (alias: `ls`)
+
+List the issues linked to an error group
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--group-id <id>` | Error group ID | - | Yes |
+| `--refresh` | Read again whether each GitHub or GitLab issue is open | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `errors issues open`
+
+Open an issue for an error group in the project's GitHub or GitLab repository
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--group-id <id>` | Error group ID | - | Yes |
+| `--title <title>` | Issue title (default: the group's title) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `errors issues link`
+
+Link an existing issue from any tracker to an error group
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--group-id <id>` | Error group ID | - | Yes |
+| `--url <url>` | The issue URL | - | Yes |
+| `--title <title>` | What to call it (default: the issue's title, or its URL) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `errors issues unlink`
+
+Unlink an issue from an error group; the issue itself is left as it is
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--group-id <id>` | Error group ID | - | Yes |
+| `--link-id <id>` | Issue link ID (from `temps errors issues list`) | - | Yes |
+| `-y, --yes` | Skip confirmation | - | No |
+
+### `errors commits`
+
+Show the commits that last touched the code an error group fails in
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--group-id <id>` | Error group ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `errors ownership`
+
+Rules that assign new error groups by the path of the failing code
+
+**Subcommands:**
+
+- `list` (`ls`) - List the project's ownership rules in the order they are tried
+- `set` - Replace the ownership rules with those in a file: one "<pattern> <user-id>" per line
+
+#### `errors ownership list` (alias: `ls`)
+
+List the project's ownership rules in the order they are tried
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `errors ownership set`
+
+Replace the ownership rules with those in a file: one "<pattern> <user-id>" per line
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--file <path>` | Rules file; "-" reads standard input | - | No |
+| `--clear` | Remove every rule | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `errors events`
