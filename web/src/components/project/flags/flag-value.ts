@@ -61,6 +61,11 @@ export function environmentOverride(
  * SDK's `evaluate()` — same order, same precedence. If this drifts, the console
  * shows one value while the app sees another, which is worse than showing
  * nothing.
+ *
+ * Targeting rules are not evaluated here: they depend on who is asking. This
+ * is the value for a user who matches no rule, and the list marks flags with
+ * rules so it is never read as "what everyone gets". The sheet's test panel
+ * evaluates rules on the server for a given user.
  */
 export function resolveEffectiveValue(
   flag: FlagResponse,

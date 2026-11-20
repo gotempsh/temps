@@ -4,6 +4,7 @@
 import type { EnvironmentResponse, FlagResponse } from '@/api/client'
 import {
   archiveFlagMutation,
+  reshuffleFlagMutation,
   setFlagEnvironmentMutation,
   updateFlagMutation,
 } from '@/api/client/@tanstack/react-query.gen'
@@ -19,6 +20,7 @@ import {
 } from '@/components/ui/alert-dialog'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Separator } from '@/components/ui/separator'
 import {
@@ -31,11 +33,14 @@ import {
 import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
 import { useMutation } from '@tanstack/react-query'
-import { Archive, Loader2, RotateCcw } from 'lucide-react'
+import { Archive, Loader2, RotateCcw, Shuffle } from 'lucide-react'
 import { useState } from 'react'
 import { toast } from 'sonner'
 import { TimeAgo } from '@/components/utils/TimeAgo'
+import { FlagRulesEditor } from './FlagRulesEditor'
+import { FlagTestPanel } from './FlagTestPanel'
 import { FlagValueField } from './FlagValueField'
+import { FlagVariantsEditor } from './FlagVariantsEditor'
 import {
   asFlagValueType,
   environmentOverride,
@@ -106,7 +111,12 @@ function FlagDetailBody({
   )
   const [description, setDescription] = useState(flag.description ?? '')
   const [defaultError, setDefaultError] = useState<string | null>(null)
+  const [exposurePercent, setExposurePercent] = useState(() =>
+    String(Math.round((flag.exposure_sample_rate ?? 0) * 10000) / 100)
+  )
+  const [exposureError, setExposureError] = useState<string | null>(null)
   const [confirmArchive, setConfirmArchive] = useState(false)
+  const [confirmReshuffle, setConfirmReshuffle] = useState(false)
 
   const update = useMutation({
     ...updateFlagMutation(),
@@ -114,8 +124,25 @@ function FlagDetailBody({
       toast.success('Flag updated')
       onChanged()
     },
+    onError: (error) => {
+      const status = (error as { status?: number } | null)?.status
+      toast.error(
+        status === 409
+          ? 'The flag changed after you opened it. Close and reopen it, then apply your change again.'
+          : flagErrorMessage(error, 'Could not update the flag')
+      )
+    },
+  })
+
+  const reshuffle = useMutation({
+    ...reshuffleFlagMutation(),
+    onSuccess: () => {
+      toast.success('Rollout buckets reshuffled')
+      setConfirmReshuffle(false)
+      onChanged()
+    },
     onError: (error) =>
-      toast.error(flagErrorMessage(error, 'Could not update the flag')),
+      toast.error(flagErrorMessage(error, 'Could not reshuffle the flag')),
   })
 
   const setEnvironment = useMutation({
@@ -145,11 +172,25 @@ function FlagDetailBody({
     }
     setDefaultError(null)
 
+    const percent = Number(exposurePercent)
+    if (
+      exposurePercent.trim() === '' ||
+      !Number.isFinite(percent) ||
+      percent < 0 ||
+      percent > 100
+    ) {
+      setExposureError('Enter a percentage between 0 and 100.')
+      return
+    }
+    setExposureError(null)
+
     update.mutate({
       path: { project_id: projectId, key: flag.key },
       body: {
         default_value: parsed.value,
         description: description.trim() || null,
+        exposure_sample_rate: percent / 100,
+        expected_updated_at: flag.updated_at,
       },
     })
   }
@@ -157,7 +198,7 @@ function FlagDetailBody({
   const setClientVisible = (next: boolean) => {
     update.mutate({
       path: { project_id: projectId, key: flag.key },
-      body: { client_visible: next },
+      body: { client_visible: next, expected_updated_at: flag.updated_at },
     })
   }
 
@@ -247,6 +288,34 @@ function FlagDetailBody({
             />
           </div>
 
+          <div className="space-y-2 rounded-md border p-3">
+            <Label htmlFor="sheet-exposure-rate">
+              Record exposures (% of visitors)
+            </Label>
+            <Input
+              id="sheet-exposure-rate"
+              type="number"
+              min={0}
+              max={100}
+              step="any"
+              value={exposurePercent}
+              onChange={(e) => {
+                setExposurePercent(e.target.value)
+                if (exposureError) setExposureError(null)
+              }}
+              className="w-full tabular-nums sm:w-[120px]"
+            />
+            {exposureError ? (
+              <p className="text-xs text-destructive">{exposureError}</p>
+            ) : (
+              <p className="text-xs text-muted-foreground">
+                {flag.client_visible
+                  ? 'When above 0, browsers record a flag_exposure analytics event the first time this share of visitors reads the flag on a page. Off (0) by default.'
+                  : 'Applies once the flag is exposed to browsers: a flag_exposure analytics event per page for this share of visitors.'}
+              </p>
+            )}
+          </div>
+
           <Button
             type="button"
             size="sm"
@@ -263,6 +332,18 @@ function FlagDetailBody({
 
         <Separator />
 
+        <section>
+          <FlagVariantsEditor
+            // Re-seeded whenever the stored definition changes.
+            key={flag.updated_at}
+            projectId={projectId}
+            flag={flag}
+            onChanged={onChanged}
+          />
+        </section>
+
+        <Separator />
+
         {/* ---------------------------------------------------------- */}
         <section className="space-y-4">
           <div className="space-y-1">
@@ -271,34 +352,88 @@ function FlagDetailBody({
             </h3>
             <p className="text-sm text-muted-foreground">
               Disabling a flag makes it serve the default, ignoring any value
-              set here.
+              and rules set here. Rules run before the value: the first one that
+              matches decides.
             </p>
           </div>
 
           <div className="divide-y rounded-md border">
             {environments.map((environment) => (
-              <EnvironmentRow
-                // Keyed on the server state as well as the id: when a
-                // mutation lands, the row remounts and re-seeds its draft
-                // from the new value instead of syncing it in an effect.
-                key={environmentRowKey(flag, environment.id)}
-                flag={flag}
-                environment={environment}
-                projectId={projectId}
-                pending={setEnvironment.isPending}
-                onSet={(body) =>
-                  setEnvironment.mutate({
-                    path: {
-                      project_id: projectId,
-                      key: flag.key,
-                      environment_id: environment.id,
-                    },
-                    body,
-                  })
-                }
-              />
+              <div key={environment.id}>
+                <EnvironmentRow
+                  // Keyed on the server state as well as the id: when a
+                  // mutation lands, the row remounts and re-seeds its draft
+                  // from the new value instead of syncing it in an effect.
+                  key={environmentRowKey(flag, environment.id)}
+                  flag={flag}
+                  environment={environment}
+                  projectId={projectId}
+                  pending={setEnvironment.isPending}
+                  onSet={(body) =>
+                    setEnvironment.mutate({
+                      path: {
+                        project_id: projectId,
+                        key: flag.key,
+                        environment_id: environment.id,
+                      },
+                      body,
+                    })
+                  }
+                />
+                <div className="px-4 pb-4">
+                  <FlagRulesEditor
+                    key={rulesEditorKey(flag, environment.id)}
+                    projectId={projectId}
+                    flag={flag}
+                    environment={environment}
+                    onChanged={onChanged}
+                  />
+                </div>
+              </div>
             ))}
           </div>
+        </section>
+
+        <Separator />
+
+        <section className="space-y-4">
+          <div className="space-y-1">
+            <h3 className="text-base font-semibold tracking-tight">
+              Test this flag
+            </h3>
+            <p className="text-sm text-muted-foreground">
+              See what a user would get, and why, before you ship a rule.
+            </p>
+          </div>
+          <FlagTestPanel
+            projectId={projectId}
+            flag={flag}
+            environments={environments}
+          />
+        </section>
+
+        <Separator />
+
+        <section className="space-y-2">
+          <h3 className="text-base font-semibold tracking-tight">
+            Rollout buckets
+          </h3>
+          <p className="text-sm text-muted-foreground">
+            The same user always lands in the same percentage bucket and split
+            arm. Reshuffling draws a new assignment for every rollout and split
+            of this flag in every environment. Never do it during a running
+            experiment.
+          </p>
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            onClick={() => setConfirmReshuffle(true)}
+            disabled={reshuffle.isPending}
+          >
+            <Shuffle className="mr-1.5 h-4 w-4" />
+            Reshuffle
+          </Button>
         </section>
 
         <Separator />
@@ -322,6 +457,38 @@ function FlagDetailBody({
           </Button>
         </section>
       </div>
+
+      <AlertDialog open={confirmReshuffle} onOpenChange={setConfirmReshuffle}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Reshuffle {flag.key}?</AlertDialogTitle>
+            <AlertDialogDescription>
+              Users in a partial rollout or split may switch to a different
+              value on their next request. Results of an experiment running on
+              this flag become meaningless.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={reshuffle.isPending}>
+              Cancel
+            </AlertDialogCancel>
+            <AlertDialogAction
+              onClick={(event) => {
+                event.preventDefault()
+                reshuffle.mutate({
+                  path: { project_id: projectId, key: flag.key },
+                })
+              }}
+              disabled={reshuffle.isPending}
+            >
+              {reshuffle.isPending && (
+                <Loader2 className="mr-1.5 h-4 w-4 animate-spin" />
+              )}
+              Reshuffle
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
 
       <AlertDialog open={confirmArchive} onOpenChange={setConfirmArchive}>
         <AlertDialogContent>
@@ -371,6 +538,12 @@ function environmentRowKey(flag: FlagResponse, environmentId: number): string {
     JSON.stringify(override?.value ?? null),
     JSON.stringify(flag.default_value ?? null),
   ].join(':')
+}
+
+/** Re-seed the rules editor whenever the stored rules change. */
+function rulesEditorKey(flag: FlagResponse, environmentId: number): string {
+  const override = environmentOverride(flag, environmentId)
+  return `${environmentId}:${override?.updated_at ?? 'none'}:${flag.updated_at}`
 }
 
 interface EnvironmentRowProps {

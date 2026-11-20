@@ -396,6 +396,17 @@ function FlagRow({
                 Archived
               </Badge>
             )}
+            {enabled && (override?.rules?.length ?? 0) > 0 && (
+              <Badge
+                variant="outline"
+                className="shrink-0"
+                title="Some users get a different value: the value shown is for users who match no rule"
+              >
+                {override?.rules?.length === 1
+                  ? '1 rule'
+                  : `${override?.rules?.length} rules`}
+              </Badge>
+            )}
           </div>
           {flag.description && (
             <span className="truncate text-xs text-muted-foreground">
