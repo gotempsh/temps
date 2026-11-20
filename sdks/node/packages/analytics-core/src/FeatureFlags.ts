@@ -188,6 +188,9 @@ export class FeatureFlags {
     if (disabled === this.disabled) return;
     this.disabled = disabled;
     if (disabled) {
+      // A disabled client serves bootstrap values and fallbacks only, so
+      // what an earlier request fetched is dropped too.
+      this.results = new Map();
       this.generation += 1;
       this.inflight = null;
       if (this.currentStatus === "loading") this.currentStatus = "idle";
