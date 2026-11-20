@@ -910,6 +910,9 @@ pub const AI_READ_ALLOWLIST: &[&str] = &[
     "get_workflows_overview",
     "list_workflow_runs",
     "list_all_workflow_runs",
+    // Each workflow once per environment, by name, version and run counts;
+    // only projects the caller may read, and no payload.
+    "list_workflow_definitions",
     "list_workflow_project_keys",
     "list_workflow_grants",
     "get_workflow_run",
