@@ -12,6 +12,7 @@
 //! rule from the database and a project without rules costs one map lookup.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use arc_swap::ArcSwapOption;
@@ -106,17 +107,32 @@ fn segments_match(pattern: &str, path: &str) -> bool {
     match_segments(&pattern, &path)
 }
 
+/// Whether the segments of `pattern` match those of `path`, `**` standing
+/// for any number of segments. One row of reachable path prefixes per
+/// pattern segment, so the work is pattern segments × path segments however
+/// many `**` there are.
 fn match_segments(pattern: &[&str], path: &[&str]) -> bool {
-    match pattern.split_first() {
-        None => path.is_empty(),
-        Some((&"**", rest)) => (0..=path.len()).any(|skip| match_segments(rest, &path[skip..])),
-        Some((first, rest)) => match path.split_first() {
-            Some((segment, path_rest)) => {
-                glob(first.as_bytes(), segment.as_bytes()) && match_segments(rest, path_rest)
+    // reach[j]: the pattern so far matches the first j path segments.
+    let mut reach = vec![false; path.len() + 1];
+    reach[0] = true;
+    for segment in pattern {
+        if *segment == "**" {
+            let mut any = false;
+            for cell in reach.iter_mut() {
+                any |= *cell;
+                *cell = any;
             }
-            None => false,
-        },
+        } else {
+            for j in (1..=path.len()).rev() {
+                reach[j] = reach[j - 1] && glob(segment.as_bytes(), path[j - 1].as_bytes());
+            }
+            reach[0] = false;
+        }
+        if !reach.contains(&true) {
+            return false;
+        }
     }
+    reach[path.len()]
 }
 
 /// `*` and `?` within one segment, iteratively (no backtracking blow-up).
@@ -177,11 +193,20 @@ const RULE_SELECT: &str = "SELECT r.id, r.project_id, r.position, r.pattern, r.o
 
 type RuleMap = HashMap<i32, Arc<[OwnershipRule]>>;
 
+/// Every project's rules as one load read them.
+struct LoadedRules {
+    /// When the load started, in the order loads start.
+    generation: u64,
+    map: RuleMap,
+}
+
 /// Ownership rules of every project, and their matching at ingest.
 pub struct OwnershipService {
     db: Arc<DatabaseConnection>,
     /// Every project's rules; `None` until first loaded.
-    rules: ArcSwapOption<RuleMap>,
+    rules: ArcSwapOption<LoadedRules>,
+    /// The generation the next load takes.
+    next_generation: AtomicU64,
 }
 
 impl OwnershipService {
@@ -189,11 +214,32 @@ impl OwnershipService {
         Self {
             db,
             rules: ArcSwapOption::empty(),
+            next_generation: AtomicU64::new(1),
         }
     }
 
     /// Read every rule into memory.
+    ///
+    /// Two loads at once (two admins saving rules) may finish in either
+    /// order; the one that started last read every change committed before
+    /// either started, so a load that started earlier never replaces it.
     pub async fn reload(&self) -> Result<(), ErrorTrackingError> {
+        let generation = self.next_generation.fetch_add(1, Ordering::SeqCst);
+        let map = self.read_rules().await?;
+        self.publish(generation, map);
+        Ok(())
+    }
+
+    /// Keep `map` unless a load that started later is already in memory.
+    fn publish(&self, generation: u64, map: RuleMap) {
+        let loaded = Arc::new(LoadedRules { generation, map });
+        self.rules.rcu(|current| match current {
+            Some(current) if current.generation > generation => Some(current.clone()),
+            _ => Some(loaded.clone()),
+        });
+    }
+
+    async fn read_rules(&self) -> Result<RuleMap, ErrorTrackingError> {
         let rows = self
             .db
             .query_all(Statement::from_string(
@@ -206,16 +252,14 @@ impl OwnershipService {
             let rule = rule_from_row(row)?;
             map.entry(rule.project_id).or_default().push(rule);
         }
-        let map: RuleMap = map.into_iter().map(|(k, v)| (k, Arc::from(v))).collect();
-        self.rules.store(Some(Arc::new(map)));
-        Ok(())
+        Ok(map.into_iter().map(|(k, v)| (k, Arc::from(v))).collect())
     }
 
     /// Whether the project may have rules: true until rules are loaded, so
     /// nothing is missed before the first load.
     pub fn may_have_rules(&self, project_id: i32) -> bool {
         match self.rules.load().as_ref() {
-            Some(map) => map.contains_key(&project_id),
+            Some(loaded) => loaded.map.contains_key(&project_id),
             None => true,
         }
     }
@@ -231,7 +275,7 @@ impl OwnershipService {
             .rules
             .load()
             .as_ref()
-            .and_then(|map| map.get(&project_id).cloned())
+            .and_then(|loaded| loaded.map.get(&project_id).cloned())
             .unwrap_or_else(|| Arc::from(Vec::new())))
     }
 
@@ -350,11 +394,14 @@ impl OwnershipService {
                 None
             }
         };
-        let native = error_data
-            .exceptions
-            .first()
-            .and_then(|e| e.stack_trace.as_ref())
-            .or(error_data.stack_trace.as_ref());
+        // The stack source maps resolved, which for a Sentry event is the
+        // main (last) exception's, as stored with the event.
+        let native = error_data.stack_trace.as_ref().or_else(|| {
+            error_data
+                .exceptions
+                .last()
+                .and_then(|e| e.stack_trace.as_ref())
+        });
         let paths: Vec<String> =
             super::frames::app_frames_from(error_data.raw_sentry_event.as_ref(), native)
                 .iter()
@@ -455,6 +502,48 @@ mod tests {
         // A long pattern of stars does not backtrack exponentially.
         let stars = "*a".repeat(40);
         assert!(!pattern_matches(&stars, &"a".repeat(39)));
+    }
+
+    #[test]
+    fn double_stars_match_any_number_of_directories_in_bounded_time() {
+        assert!(pattern_matches("**/cart.ts", "cart.ts"));
+        assert!(pattern_matches("src/**", "src"));
+        assert!(pattern_matches("**/a/**/b/**", "x/a/y/z/b/w"));
+        assert!(!pattern_matches("**/a/**/b", "x/b/y/a"));
+
+        // Many `**` that cannot match a deep path: the recursive matcher
+        // tried every way to split the path between them.
+        let pattern = format!("{}/z", ["**/a"; 12].join("/"));
+        let path = ["a"; 80].join("/");
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done.send(pattern_matches(&pattern, &path));
+        });
+        assert_eq!(
+            finished.recv_timeout(std::time::Duration::from_secs(5)),
+            Ok(false),
+            "the match finishes, and finds no match"
+        );
+    }
+
+    #[test]
+    fn a_load_that_started_earlier_never_replaces_a_later_one() {
+        let service = OwnershipService::new(Arc::new(DatabaseConnection::Disconnected));
+        let older = service.next_generation.fetch_add(1, Ordering::SeqCst);
+        let newer = service.next_generation.fetch_add(1, Ordering::SeqCst);
+        let with_rules: RuleMap = HashMap::from([(1, Arc::from(vec![rule(1, "src/", 10)]))]);
+        // The later load read the new rule and finished first; the earlier
+        // one, which read no rules, finishes after it.
+        service.publish(newer, with_rules);
+        service.publish(older, RuleMap::new());
+        assert!(service.may_have_rules(1), "the later load is kept");
+
+        let latest = service.next_generation.fetch_add(1, Ordering::SeqCst);
+        service.publish(latest, RuleMap::new());
+        assert!(
+            !service.may_have_rules(1),
+            "a load that started later replaces it"
+        );
     }
 
     #[test]

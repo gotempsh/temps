@@ -37,6 +37,7 @@ import { readFailureServerDetail } from '@/lib/read-failure'
 import {
   MAX_OWNERSHIP_RULES,
   ownershipRulesSchema,
+  rulesFormReset,
   rulesToForm,
   type OwnershipRulesFormData,
 } from './source-control'
@@ -234,9 +235,11 @@ function RulesForm({
     defaultValues: rulesToForm(rules),
   })
   const { reset } = form
+  const { isDirty } = form.formState
   useEffect(() => {
-    reset(rulesToForm(rules))
-  }, [reset, rules])
+    const next = rulesFormReset(isDirty, rules)
+    if (next) reset(next)
+  }, [reset, rules, isDirty])
   const { fields, append, move, remove } = useFieldArray({
     control: form.control,
     name: 'rules',
@@ -246,6 +249,9 @@ function RulesForm({
     meta: { errorTitle: 'Failed to save the ownership rules' },
     onSuccess: (next) => {
       toast.success('Ownership rules saved')
+      // The saved rules are now the form's: clean again, so later
+      // changes from the server show.
+      reset(rulesToForm(next.data))
       queryClient.setQueryData(
         listErrorOwnershipRulesQueryKey({ path: { project_id: projectId } }),
         next

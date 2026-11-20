@@ -10,6 +10,7 @@ import {
   patternMatches,
   patternProblem,
   providerName,
+  rulesFormReset,
   shortSha,
 } from './source-control'
 
@@ -48,6 +49,23 @@ describe('ownership patterns', () => {
     expect(patternMatches('src/*/cart.ts', 'src/shop/v2/cart.ts')).toBe(false)
     expect(patternMatches('lib/pay?.rb', 'lib/pay1.rb')).toBe(true)
     expect(patternMatches('a.b', 'axb')).toBe(false)
+    expect(patternMatches('**/a/**/b/**', 'x/a/y/z/b/w')).toBe(true)
+    expect(patternMatches('**/a/**/b', 'x/b/y/a')).toBe(false)
+    expect(patternMatches('src/**', 'src')).toBe(true)
+  })
+
+  test('answer at once for patterns that cannot match', () => {
+    const started = performance.now()
+    // Many `**` against a deep path, and many `*` in one segment: tried
+    // every way to split the text before.
+    const doubleStars = `${Array.from({ length: 8 }, () => '**/a').join('/')}/z`
+    expect(patternMatches(doubleStars, Array(40).fill('a').join('/'))).toBe(
+      false
+    )
+    expect(patternMatches(`x/${'*a'.repeat(40)}`, `x/${'a'.repeat(39)}`)).toBe(
+      false
+    )
+    expect(performance.now() - started).toBeLessThan(1000)
   })
 
   test('say what is wrong with a pattern', () => {
@@ -89,5 +107,31 @@ describe('labels', () => {
     expect(shortSha('c0ffee1234')).toBe('c0ffee1')
     expect(providerName('gitlab')).toBe('GitLab')
     expect(providerName(undefined)).toBe('the repository')
+  })
+})
+
+describe('rulesFormReset', () => {
+  const saved = [
+    {
+      id: 1,
+      position: 0,
+      pattern: 'src/billing/',
+      owner_user_id: 4,
+      owner_name: 'Ana',
+      created_at: '2026-01-01T00:00:00Z',
+      updated_at: '2026-01-01T00:00:00Z',
+    },
+  ]
+
+  test('keeps rules someone is editing when the saved ones are read again', () => {
+    expect(rulesFormReset(true, saved)).toBeNull()
+  })
+
+  test('shows the saved rules in a form without edits', () => {
+    expect(rulesFormReset(false, saved)).toEqual({
+      rules: [
+        { pattern: 'src/billing/', owner_user_id: 4, owner_label: 'Ana' },
+      ],
+    })
   })
 })

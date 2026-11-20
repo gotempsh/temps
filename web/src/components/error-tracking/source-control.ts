@@ -111,24 +111,70 @@ export function patternMatches(pattern: string, path: string): boolean {
   return segmentsMatch(value, path)
 }
 
+/**
+ * One row of reachable path prefixes per pattern segment, so the work is
+ * pattern segments × path segments however many `**` a pattern has.
+ */
 function segmentsMatch(pattern: string, path: string): boolean {
   const p = pattern.split('/')
   const s = path.split('/')
-  const match = (i: number, j: number): boolean => {
-    if (i === p.length) return j === s.length
-    if (p[i] === '**') {
-      for (let k = j; k <= s.length; k++) if (match(i + 1, k)) return true
-      return false
+  // reach[j]: the pattern so far matches the first j path segments.
+  const reach: boolean[] = new Array(s.length + 1).fill(false)
+  reach[0] = true
+  for (const segment of p) {
+    if (segment === '**') {
+      let any = false
+      for (let j = 0; j <= s.length; j++) {
+        any = any || reach[j]
+        reach[j] = any
+      }
+    } else {
+      for (let j = s.length; j >= 1; j--) {
+        reach[j] = reach[j - 1] && glob(segment, s[j - 1])
+      }
+      reach[0] = false
     }
-    return j < s.length && glob(p[i], s[j]) && match(i + 1, j + 1)
+    if (!reach.includes(true)) return false
   }
-  return match(0, 0)
+  return reach[s.length]
 }
 
+/** `*` and `?` within one segment, without backtracking blow-up. */
 function glob(pattern: string, text: string): boolean {
-  const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&')
-  const source = escaped.replace(/\*/g, '[^/]*').replace(/\?/g, '[^/]')
-  return new RegExp(`^${source}$`).test(text)
+  let p = 0
+  let t = 0
+  let star = -1
+  let mark = 0
+  while (t < text.length) {
+    if (p < pattern.length && (pattern[p] === '?' || pattern[p] === text[t])) {
+      p++
+      t++
+    } else if (p < pattern.length && pattern[p] === '*') {
+      star = p
+      mark = t
+      p++
+    } else if (star >= 0) {
+      p = star + 1
+      mark++
+      t = mark
+    } else {
+      return false
+    }
+  }
+  while (p < pattern.length && pattern[p] === '*') p++
+  return p === pattern.length
+}
+
+/**
+ * What the rules form resets to when the saved rules change: the saved
+ * rules while it holds no edit, nothing while it does, so a refetch never
+ * discards rules someone is writing.
+ */
+export function rulesFormReset(
+  isDirty: boolean,
+  rules: OwnershipRuleView[]
+): OwnershipRulesFormData | null {
+  return isDirty ? null : rulesToForm(rules)
 }
 
 /** "acme/shop#12", or the host of a plain link. */
