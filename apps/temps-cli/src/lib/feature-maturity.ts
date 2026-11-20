@@ -12,6 +12,7 @@ export type { FeatureMaturity } from '../api/types.gen.js'
 const COMMAND_FEATURE_KEYS: Readonly<Record<string, string>> = {
   analytics: 'web-analytics',
   funnels: 'funnels',
+  surveys: 'surveys',
   errors: 'error-tracking',
   metrics: 'otel-traces-metrics',
   traces: 'otel-traces-metrics',
