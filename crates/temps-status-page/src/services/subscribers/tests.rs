@@ -1564,8 +1564,7 @@ async fn a_project_scoped_key_sends_only_from_a_domain_granted_to_the_page() {
     };
     let refused = set_settings(&fx, project_scoped_key(fx.project_id), request())
         .await
-        .err()
-        .expect("an ungranted domain is refused");
+        .expect_err("an ungranted domain is refused");
     assert_eq!(refused.status_code, StatusCode::BAD_REQUEST);
     let page = status_pages::Entity::find_by_id(fx.page_id)
         .one(fx.db.as_ref())
@@ -1622,7 +1621,8 @@ async fn the_admin_routes_answer_403_without_write_access_to_the_page() {
     let id = confirmed_subscriber(&fx, "reader@example.test").await;
     let other_project = fx.project_id + 10_000;
     let state = || State(fx.admin_state.clone());
-    let callers: Vec<(&str, Box<dyn Fn() -> RequireAuth>)> = vec![
+    type MakeAuth = Box<dyn Fn() -> RequireAuth>;
+    let callers: Vec<(&str, MakeAuth)> = vec![
         ("reader", Box::new(|| with_role(Role::Reader))),
         ("api reader", Box::new(|| with_role(Role::ApiReader))),
         (
@@ -1663,8 +1663,7 @@ async fn the_admin_routes_answer_403_without_write_access_to_the_page() {
             },
         )
         .await
-        .err()
-        .expect("update refused");
+        .expect_err("update refused");
         assert_eq!(update.status_code, StatusCode::FORBIDDEN, "{who} update");
     }
     // Nothing changed: the subscriber is there and subscriptions are on.
