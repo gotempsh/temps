@@ -1241,3 +1241,34 @@ fn location_results_round_trip_through_the_column() {
         results
     );
 }
+
+#[tokio::test]
+async fn a_save_waits_a_bounded_time_for_the_target_address() {
+    use super::service::address_problem_within;
+    use std::time::Duration;
+    use temps_core::url_validation::UrlValidationError;
+    let target = Target::HostPort {
+        host: "slow.example.test".to_string(),
+        port: 443,
+    };
+    let started = std::time::Instant::now();
+    let problem = address_problem_within(&target, Duration::from_millis(30), |_, _| {
+        std::future::pending::<Result<Vec<std::net::SocketAddr>, UrlValidationError>>()
+    })
+    .await;
+    assert_eq!(
+        problem, None,
+        "a slow lookup is saved like an unresolved name"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the save does not wait for the resolver"
+    );
+
+    // A lookup that answers in time is still judged.
+    let blocked = address_problem_within(&target, Duration::from_secs(5), |_, _| async {
+        Err(UrlValidationError::PrivateIp)
+    })
+    .await;
+    assert!(blocked.is_some(), "a private answer is still refused");
+}

@@ -5,6 +5,7 @@
 
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
@@ -14,7 +15,7 @@ use temps_core::url_validation::{
     resolve_and_validate_domain, validate_outbound_ip, UrlValidationError,
 };
 use temps_entities::{projects, status_monitors};
-use tracing::info;
+use tracing::{info, warn};
 
 /// How many times a monitor save is recomputed when another save lands
 /// between its read and its write.
@@ -66,9 +67,30 @@ fn validate_name(project_id: i32, name: &str) -> Result<String, TargetMonitorErr
     Ok(name.to_string())
 }
 
+/// How long a save waits for a target's address. A lookup that takes
+/// longer is treated like a name that does not resolve now: accepted, since
+/// every check looks the address up again and contacts only public ones.
+const SAVE_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Why `target` cannot be checked, if its address is not public. A name
 /// that does not resolve now is accepted: the monitor reports it.
 async fn address_problem(target: &Target) -> Option<String> {
+    address_problem_within(target, SAVE_LOOKUP_TIMEOUT, |host, port| async move {
+        resolve_and_validate_domain(&host, port).await
+    })
+    .await
+}
+
+/// [`address_problem`] with its deadline and lookup passed in, for tests.
+pub(super) async fn address_problem_within<F, Fut>(
+    target: &Target,
+    limit: Duration,
+    lookup: F,
+) -> Option<String>
+where
+    F: FnOnce(String, u16) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<std::net::SocketAddr>, UrlValidationError>>,
+{
     let (host, port) = match target {
         Target::Url(url) => (
             url.host_str()?.trim_matches(['[', ']']).to_string(),
@@ -80,9 +102,17 @@ async fn address_problem(target: &Target) -> Option<String> {
     if let Ok(ip) = host.parse::<IpAddr>() {
         return validate_outbound_ip(ip).err().map(|e| e.to_string());
     }
-    match resolve_and_validate_domain(&host, port).await {
-        Ok(_) | Err(UrlValidationError::DnsResolutionFailed(_)) => None,
-        Err(error) => Some(error.to_string()),
+    match tokio::time::timeout(limit, lookup(host.clone(), port)).await {
+        Ok(Ok(_)) | Ok(Err(UrlValidationError::DnsResolutionFailed(_))) => None,
+        Ok(Err(error)) => Some(error.to_string()),
+        Err(_) => {
+            warn!(
+                host = %host,
+                "looking up {host} took over {} s while saving a monitor; saved, and each check looks it up again",
+                limit.as_secs()
+            );
+            None
+        }
     }
 }
 
