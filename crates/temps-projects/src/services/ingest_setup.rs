@@ -196,8 +196,10 @@ impl IngestSetupService {
     ///
     /// `environment_id`, when given, must belong to the project. It scopes the
     /// credential checks (a key bound to another environment does not count)
-    /// and attributes OTLP data to that environment through the path-based
-    /// OTLP routes.
+    /// and the analytics key command. OTLP keeps the header-based routes: the
+    /// path-based ones store only the deployment from the path, so a
+    /// placeholder deployment would leave the data outside the environment's
+    /// filter.
     pub async fn get_ingest_setup(
         &self,
         project_id: i32,
@@ -363,20 +365,14 @@ fn build_setup(
         )
     };
 
-    let api_key_auth = |otlp_project_header: bool| {
+    let api_key_auth = || {
         IngestAuth {
         kind: IngestAuthKind::ApiKey,
         env_var: API_KEY_ENV_VAR.to_string(),
-        headers: {
-            let mut headers = vec![header(
-                "Authorization",
-                format!("Bearer ${API_KEY_ENV_VAR}"),
-            )];
-            if otlp_project_header {
-                headers.push(header("X-Temps-Project-Id", project_id.to_string()));
-            }
-            headers
-        },
+        headers: vec![
+            header("Authorization", format!("Bearer ${API_KEY_ENV_VAR}")),
+            header("X-Temps-Project-Id", project_id.to_string()),
+        ],
         query_param: None,
         browser_safe: false,
         // The console's API-key form, named like the key the CLI creates.
@@ -392,19 +388,16 @@ fn build_setup(
     }
     };
 
-    // With an environment, the path-based routes attribute data to it and
-    // need no project header; without one, the header-based routes take the
-    // project from `X-Temps-Project-Id`.
-    let otlp_signal_url = |signal: &str| match environment_id {
-        Some(env) => format!("{base}{OTLP_BASE_PATH}/v1/{project_id}/{env}/0/{signal}"),
-        None => format!("{base}{OTLP_BASE_PATH}/v1/{signal}"),
-    };
-    // `OTEL_EXPORTER_OTLP_ENDPOINT` only works for the header-based routes:
-    // SDKs append `/v1/{signal}` to it, which can't reach the environment's
-    // path-based routes. With an environment, callers use the per-signal URLs.
-    let otlp_base = environment_id
-        .is_none()
-        .then(|| format!("{base}{OTLP_BASE_PATH}"));
+    // The header-based routes take the project from `X-Temps-Project-Id`,
+    // with or without an environment. The path-based routes
+    // (`/v1/{project}/{environment}/{deployment}/{signal}`) are not used: span,
+    // log and metric storage keep only the deployment from the path, and the
+    // environment filter resolves environments through deployments, so a
+    // placeholder deployment would hide the data from that environment.
+    let otlp_signal_url = |signal: &str| format!("{base}{OTLP_BASE_PATH}/v1/{signal}");
+    // SDKs append `/v1/{signal}` to `OTEL_EXPORTER_OTLP_ENDPOINT`, which
+    // reaches the same header-based routes.
+    let otlp_base = Some(format!("{base}{OTLP_BASE_PATH}"));
     let otlp =
         |signal: IngestSignal, name: &str, path: &str, setup_path: String| IngestSignalSetup {
             signal,
@@ -414,7 +407,7 @@ fn build_setup(
                 otlp_signal_url(path),
                 "application/x-protobuf",
             )],
-            auth: api_key_auth(environment_id.is_none()),
+            auth: api_key_auth(),
             otlp_endpoint: otlp_base.clone(),
             // The credential is the caller's own API key, not project state, so
             // there is nothing project-side to check; `auth` always says how to
@@ -608,32 +601,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_environment_uses_the_path_based_otlp_routes() {
+    async fn an_environment_keeps_the_header_based_otlp_routes() {
         let setup = service(vec![row(true, true, true)])
             .get_ingest_setup(42, Some(7), "http://localhost:8080")
             .await
             .expect("setup resolves");
 
         assert_eq!(setup.environment_id, Some(7));
-        let traces = signal(&setup, IngestSignal::Traces);
-        assert_eq!(
-            traces.endpoints[0].url,
-            "http://localhost:8080/api/otel/v1/42/7/0/traces"
-        );
-        assert!(traces
-            .auth
-            .headers
-            .iter()
-            .all(|h| h.name != "X-Temps-Project-Id"));
+        // The path-based routes store only the deployment from the path, so a
+        // placeholder deployment would keep the data out of environment 7's
+        // filter. The setup never points at them.
+        for (otlp, path) in [
+            (IngestSignal::Logs, "logs"),
+            (IngestSignal::Traces, "traces"),
+        ] {
+            let setup = signal(&setup, otlp);
+            assert_eq!(
+                setup.endpoints[0].url,
+                format!("http://localhost:8080/api/otel/v1/{path}"),
+                "{otlp:?}"
+            );
+            assert!(
+                setup
+                    .auth
+                    .headers
+                    .iter()
+                    .any(|h| h.name == "X-Temps-Project-Id" && h.value == "42"),
+                "{otlp:?}"
+            );
+            assert_eq!(
+                setup.otlp_endpoint.as_deref(),
+                Some("http://localhost:8080/api/otel"),
+                "{otlp:?}"
+            );
+        }
         assert!(signal(&setup, IngestSignal::Analytics)
             .auth
             .cli_command
             .ends_with("--environment-id 7"));
-        // SDKs append /v1/{signal} to OTEL_EXPORTER_OTLP_ENDPOINT, which would
-        // reach the header-based route and lose the environment.
-        for otlp in [IngestSignal::Logs, IngestSignal::Traces] {
-            assert_eq!(signal(&setup, otlp).otlp_endpoint, None, "{otlp:?}");
-        }
     }
 
     #[tokio::test]
