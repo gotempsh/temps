@@ -403,6 +403,8 @@ const REVIEWED_FREE_FORM: &[(&str, &str)] = &[
     ("create_flag:variants.[].value", "feature flag variant value"),
     ("update_flag:variants.[].value", "feature flag variant value"),
     ("set_flag_rules:rules.[].serve.value", "feature flag value a rule serves"),
+    ("create_survey:targeting.flag.value", "feature flag value a survey is shown for"),
+    ("update_survey:targeting.flag.value", "feature flag value a survey is shown for"),
     (
         "evaluate_flag:attributes",
         "targeting attributes for a dry-run evaluation; nothing is stored",

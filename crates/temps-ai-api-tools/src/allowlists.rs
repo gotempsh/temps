@@ -652,6 +652,14 @@ pub const AI_READ_ALLOWLIST: &[&str] = &[
     "get_flag",
     "get_flag_snapshot",
     "list_flags",
+    // ── Surveys ──
+    // Definitions and aggregate results (counts, averages, NPS): no
+    // credentials and no free text. The individual responses
+    // (`list_survey_responses`) are withheld: open-text answers are typed by
+    // the project's visitors.
+    "list_surveys",
+    "get_survey",
+    "get_survey_results",
     // ── Project presets + templates ──
     // Built-in and community preset catalogue — no secrets.
     "list_presets",
@@ -1164,6 +1172,11 @@ pub const AI_WRITE_ALLOWLIST: &[&str] = &[
     // Replaces one environment's targeting rules; compare-and-set on the
     // flag's revision, like the console.
     "set_flag_rules",
+    // Launching a survey puts a question in front of the project's visitors,
+    // so each change is a confirmed write.
+    "create_survey",
+    "update_survey",
+    "delete_survey",
     "restore_flag",
     "archive_flag",
     "create_alert_rule",

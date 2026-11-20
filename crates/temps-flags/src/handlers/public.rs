@@ -175,7 +175,7 @@ pub struct OfrepBulkResponse {
 
 /// Reject a context the endpoints will not evaluate. Bounded so a public
 /// caller cannot make one request expensive.
-fn check_context(ctx: &EvalContext) -> Result<(), String> {
+pub fn check_context(ctx: &EvalContext) -> Result<(), String> {
     if ctx.attributes.len() > MAX_CONTEXT_ATTRIBUTES {
         return Err(format!(
             "{} attributes sent, maximum is {MAX_CONTEXT_ATTRIBUTES}",
@@ -478,6 +478,35 @@ async fn resolve_public_scope(
             )
         })?;
 
+    let implicit = implicit_context(
+        metadata,
+        host,
+        environment.id,
+        &environment.slug,
+        deployment_id,
+        state.geoip.as_deref(),
+    )
+    .await;
+
+    Ok(PublicScope {
+        environment: flags,
+        implicit,
+    })
+}
+
+/// The attributes a same-origin request carries without the page sending
+/// them: environment, deployment, host, visitor and session cookies, browser,
+/// OS and device from the user agent, and (with GeoIP) country. Also used by
+/// the surveys endpoint, so a survey's flag condition evaluates exactly as
+/// the flag does on `/api/_temps/flags`.
+pub async fn implicit_context(
+    metadata: &RequestMetadata,
+    host: &str,
+    environment_id: i32,
+    environment_slug: &str,
+    deployment_id: Option<i32>,
+    geoip: Option<&GeoIpService>,
+) -> EvalContext {
     let mut implicit = EvalContext {
         key: metadata.visitor_id_cookie.clone(),
         attributes: HashMap::new(),
@@ -485,11 +514,11 @@ async fn resolve_public_scope(
     let attributes = &mut implicit.attributes;
     attributes.insert(
         "environment".into(),
-        AttributeValue::String(environment.slug.clone()),
+        AttributeValue::String(environment_slug.to_string()),
     );
     attributes.insert(
         "environment_id".into(),
-        AttributeValue::Number(f64::from(environment.id)),
+        AttributeValue::Number(f64::from(environment_id)),
     );
     if let Some(id) = deployment_id {
         attributes.insert(
@@ -523,22 +552,18 @@ async fn resolve_public_scope(
             }
         }
     }
-    if let (Some(geoip), Ok(address)) = (&state.geoip, metadata.ip_address.parse::<IpAddr>()) {
+    if let (Some(geoip), Ok(address)) = (geoip, metadata.ip_address.parse::<IpAddr>()) {
         if let Ok(location) = geoip.geolocate(address).await {
             if let Some(code) = location.country_code {
                 attributes.insert("country".into(), AttributeValue::String(code));
             }
         }
     }
-
-    Ok(PublicScope {
-        environment: flags,
-        implicit,
-    })
+    implicit
 }
 
 /// Explicit context over implicit (ADR 034 R2.5).
-fn merge(mut implicit: EvalContext, explicit: EvalContext) -> EvalContext {
+pub fn merge(mut implicit: EvalContext, explicit: EvalContext) -> EvalContext {
     if let Some(key) = explicit.key.filter(|k| !k.is_empty()) {
         implicit.key = Some(key);
     }
