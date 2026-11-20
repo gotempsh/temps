@@ -28,7 +28,6 @@ use temps_core::{AuditLogger, RequestMetadata};
 use utoipa::OpenApi;
 
 use super::audit::{StatusPageSubscriberAction, StatusPageSubscriberAudit};
-use super::status_page::map_error;
 use crate::services::subscribers::{
     StatusPageSubscriberService, SubscriberListResponse, SubscriberResponse, SubscriberState,
     SubscriptionCapability, SubscriptionError, SubscriptionSettingsResponse,
@@ -92,25 +91,6 @@ pub struct SubscriberListQuery {
     pub page: Option<u64>,
     /// Items per page (default 20, max 100).
     pub page_size: Option<u64>,
-}
-
-/// Instance permission, then the page's projects. Expands to an early return.
-macro_rules! page_access_guard {
-    ($auth:expr, $state:expr, $permission:ident, $status_page_id:expr) => {{
-        permission_guard!($auth, $permission);
-        let project_ids = $state
-            .pages
-            .page_project_ids($status_page_id)
-            .await
-            .map_err(map_error)?;
-        page_projects_guard!(
-            $auth,
-            $permission,
-            project_ids,
-            $state.project_access_checker.clone()
-        );
-        project_ids
-    }};
 }
 
 async fn record(state: &SubscriberRoutesState, audit: StatusPageSubscriberAudit) {

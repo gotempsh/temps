@@ -1406,7 +1406,12 @@ mod tests {
             audit_service: audit.clone(),
             checker: checker(project_a),
         });
-        let public = create_public_router(Arc::new(PublicStatusState::new(cache)));
+        let access = Arc::new(crate::services::page_access::PageAccessService::new(
+            db.clone(),
+            cache.clone(),
+            &temps_core::EncryptionService::new_from_password("status-page-route-tests"),
+        ));
+        let public = create_public_router(Arc::new(PublicStatusState::new(cache, access)));
         Some(Fx {
             certs,
             _db: test_db,
@@ -1526,6 +1531,7 @@ mod tests {
         // `public_ingress_url`: no address is invented, the page says why.
         assert_eq!(page.public_url, None);
         assert_eq!(page.public_json_url, None);
+        assert_eq!(page.public_feed_url, None);
         assert!(!page.public_url_status.configured);
         assert_eq!(
             page.public_url_status.setup_path.as_deref(),
@@ -1586,6 +1592,12 @@ mod tests {
             "total_checks",
             "failed_checks",
             "degraded_checks",
+            // Scheduled maintenance windows: admin-written public title and
+            // description, times, and the components' display names.
+            "maintenances",
+            "description",
+            "starts_at",
+            "ends_at",
         ]
         .iter()
         .map(|k| k.to_string())

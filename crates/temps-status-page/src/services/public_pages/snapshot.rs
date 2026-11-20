@@ -42,14 +42,19 @@ use temps_entities::{status_monitors, status_page_monitors, status_pages};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
-use super::render::render_public_page_html_with;
+use super::events::{
+    incident_events, maintenance_event, newest_events, IncidentSource, MaintenanceSource, PageEvent,
+};
+use super::feed::render_atom_feed;
+use super::render::{render_public_page_html_with, render_unlock_page, PageActions};
 use super::types::{
     PublicComponentStatus, PublicDayStatus, PublicIncident, PublicIncidentSeverity,
-    PublicIncidentStatus, PublicIncidentUpdate, PublicStatusComponent, PublicStatusPageResponse,
-    PublicUptimeDay, StatusPageAppearance, PUBLIC_HISTORY_DAYS,
+    PublicIncidentStatus, PublicIncidentUpdate, PublicMaintenance, PublicMaintenanceStatus,
+    PublicStatusComponent, PublicStatusPageResponse, PublicUptimeDay, StatusPageAppearance,
+    PUBLIC_HISTORY_DAYS,
 };
 use crate::services::subscribers::notices::{
-    incident_notices, IncidentForNotice, PageNotice, NOTICE_WINDOW,
+    incident_notices, notice_for, PageNotice, NOTICE_WINDOW,
 };
 
 /// How often the background loop rebuilds every published snapshot.
@@ -63,8 +68,19 @@ const RESOLVED_INCIDENT_RETENTION_DAYS: i64 = PUBLIC_HISTORY_DAYS as i64;
 const MAX_INCIDENTS_PER_PAGE: i64 = 50;
 /// Most public updates shown per incident.
 const MAX_UPDATES_PER_INCIDENT: usize = 20;
+/// Most entries in a page's Atom feed.
+pub const FEED_ENTRIES: usize = 50;
 /// Bound on bind parameters per `IN (...)` list; Postgres allows 65535.
 const MAX_IDS_PER_QUERY: usize = 1000;
+
+/// The password of a protected page (ADR 108 D2), as the public routes
+/// need it: the version signed into access cookies and the argon2 hash the
+/// unlock form is checked against.
+#[derive(Debug, Clone)]
+pub struct PageGate {
+    pub version: i32,
+    pub hash: String,
+}
 
 /// A published page, ready to serve.
 #[derive(Debug)]
@@ -94,9 +110,40 @@ pub struct PublishedSnapshot {
     /// The same page for a custom hostname: identical except that the
     /// subscribe form posts to the hostname's own path.
     pub html_custom_host: Bytes,
+    /// The page's Atom feed, for its slug URL and for a custom hostname
+    /// (only the links differ).
+    pub feed: Bytes,
+    pub feed_custom_host: Bytes,
+    /// Set when the page needs a password.
+    pub(crate) gate: Option<PageGate>,
+    /// The newest [`FEED_ENTRIES`] public events, for the feed and webhooks.
+    pub(crate) events: Vec<PageEvent>,
+    /// The password form a protected page shows instead, for its slug URL
+    /// and for a custom hostname. Empty for an open page.
+    pub locked_html: Bytes,
+    pub locked_html_custom_host: Bytes,
 }
 
 impl PublishedSnapshot {
+    pub fn status_page_id(&self) -> i32 {
+        self.status_page_id
+    }
+
+    /// The page's password, when it has one.
+    pub fn gate(&self) -> Option<&PageGate> {
+        self.gate.as_ref()
+    }
+
+    /// The password form to serve, by whether the request came through a
+    /// custom hostname.
+    pub fn locked_html_for(&self, custom_host: Option<&str>) -> Bytes {
+        if custom_host.is_some() {
+            self.locked_html_custom_host.clone()
+        } else {
+            self.locked_html.clone()
+        }
+    }
+
     /// Whether the page shows the subscribe form.
     pub fn accepts_subscriptions(&self) -> bool {
         self.subscriptions_since.is_some()
@@ -109,6 +156,16 @@ impl PublishedSnapshot {
             self.html_custom_host.clone()
         } else {
             self.html.clone()
+        }
+    }
+
+    /// The Atom feed to serve, by whether the request came through a custom
+    /// hostname.
+    pub fn feed_for(&self, custom_host: Option<&str>) -> Bytes {
+        if custom_host.is_some() {
+            self.feed_custom_host.clone()
+        } else {
+            self.feed.clone()
         }
     }
 
@@ -220,6 +277,31 @@ pub(crate) struct PublicUpdateRow {
     pub created_at: UtcDateTime,
 }
 
+/// A maintenance window in progress or scheduled, with the page's monitors
+/// it covers (only those still on the page).
+#[derive(Debug, Clone)]
+pub(crate) struct MaintenanceRow {
+    pub id: i32,
+    pub title: String,
+    pub description: Option<String>,
+    pub starts_at: UtcDateTime,
+    pub ends_at: UtcDateTime,
+    pub created_at: UtcDateTime,
+    pub monitor_ids: Vec<i32>,
+}
+
+#[derive(Debug, FromQueryResult)]
+struct MaintenanceMonitorRow {
+    status_page_id: i32,
+    id: i32,
+    title: String,
+    description: Option<String>,
+    starts_at: UtcDateTime,
+    ends_at: UtcDateTime,
+    created_at: UtcDateTime,
+    monitor_id: i32,
+}
+
 #[derive(Debug, FromQueryResult)]
 struct DayRow {
     monitor_id: i32,
@@ -249,6 +331,9 @@ pub(crate) struct RefreshData {
     pub incidents: HashMap<i32, Vec<IncidentRow>>,
     /// Public updates per incident, newest first.
     pub updates: HashMap<i32, Vec<PublicUpdateRow>>,
+    /// Maintenance windows in progress or scheduled per status page,
+    /// soonest first.
+    pub maintenances: HashMap<i32, Vec<MaintenanceRow>>,
 }
 
 pub struct StatusSnapshotCache {
@@ -303,6 +388,15 @@ impl StatusSnapshotCache {
     /// visibility).
     pub async fn refresh_project(&self, project_id: i32) -> Result<usize, DbErr> {
         self.rebuild(Scope::Project(project_id)).await
+    }
+
+    /// Drop the cached completed-day uptime of `monitor_ids`, so the next
+    /// rebuild recomputes it (a maintenance window changed what counts).
+    pub async fn forget_history(&self, monitor_ids: &[i32]) {
+        let mut state = self.writer.lock().await;
+        for monitor_id in monitor_ids {
+            state.history.remove(monitor_id);
+        }
     }
 
     /// Stop serving a page. Infallible: no database access.
@@ -448,20 +542,58 @@ impl StatusSnapshotCache {
                 continue;
             }
             let project_ids: HashSet<i32> = page_selections.iter().map(|s| s.project_id).collect();
-            let AssembledPage { response, notices } =
-                assemble_page(page, &page_selections, &data, now);
+            let AssembledPage {
+                response,
+                notices,
+                events,
+            } = assemble_page(page, &page_selections, &data, now);
+            let base_path = format!("/api/status/{}", page.slug);
+            let feed = Bytes::from(render_atom_feed(&page.slug, &response, &events, &base_path));
+            let events_for_snapshot = events.clone();
+            let feed_custom_host =
+                Bytes::from(render_atom_feed(&page.slug, &response, &events, ""));
             let subscriptions_since = subscriptions_since(page);
-            let (html, html_custom_host) = if subscriptions_since.is_some() {
-                (
-                    Bytes::from(render_public_page_html_with(
-                        &response,
-                        Some(&format!("/api/status/{}/subscribe", page.slug)),
-                    )),
-                    Bytes::from(render_public_page_html_with(&response, Some("/subscribe"))),
-                )
+            let accepts = subscriptions_since.is_some();
+            let gate = page.password_hash.clone().map(|hash| PageGate {
+                version: page.password_version,
+                hash,
+            });
+            // A protected page has no feed: a feed reader cannot type the
+            // password, so the link is not offered.
+            let open = gate.is_none();
+            let base_subscribe = format!("{base_path}/subscribe");
+            let base_feed = format!("{base_path}/feed.atom");
+            let html = Bytes::from(render_public_page_html_with(
+                &response,
+                PageActions {
+                    subscribe: accepts.then_some(base_subscribe.as_str()),
+                    feed: open.then_some(base_feed.as_str()),
+                },
+            ));
+            let html_custom_host = Bytes::from(render_public_page_html_with(
+                &response,
+                PageActions {
+                    subscribe: accepts.then_some("/subscribe"),
+                    feed: open.then_some("/feed.atom"),
+                },
+            ));
+            let (locked_html, locked_html_custom_host) = if open {
+                (Bytes::new(), Bytes::new())
             } else {
-                let html = Bytes::from(render_public_page_html_with(&response, None));
-                (html.clone(), html)
+                (
+                    Bytes::from(render_unlock_page(
+                        &response.title,
+                        &response.appearance,
+                        &format!("{base_path}/unlock"),
+                        None,
+                    )),
+                    Bytes::from(render_unlock_page(
+                        &response.title,
+                        &response.appearance,
+                        "/unlock",
+                        None,
+                    )),
+                )
             };
             match serde_json::to_vec(&response) {
                 Ok(json) => built.push((
@@ -478,6 +610,12 @@ impl StatusSnapshotCache {
                         json: Bytes::from(json),
                         html,
                         html_custom_host,
+                        feed,
+                        feed_custom_host,
+                        gate,
+                        events: events_for_snapshot,
+                        locked_html,
+                        locked_html_custom_host,
                     }),
                 )),
                 Err(e) => error!(
@@ -579,10 +717,24 @@ async fn load_day_counts(
                        COUNT(response_time_ms) FILTER (
                            WHERE status NOT IN ('down', 'major_outage')
                        ) AS latency_samples
-                FROM status_checks
-                WHERE monitor_id IN ({})
-                  AND checked_at >= ${}
-                  AND checked_at < ${}
+                FROM status_checks c
+                WHERE c.monitor_id IN ({})
+                  AND c.checked_at >= ${}
+                  AND c.checked_at < ${}
+                  -- Checks taken during a maintenance window of a page that
+                  -- still shows the monitor are not counted (ADR 108 D2). A
+                  -- cancelled window counts until it was cancelled.
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM status_page_maintenance_monitors mm
+                      JOIN status_page_maintenances m ON m.id = mm.maintenance_id
+                      JOIN status_page_monitors spm
+                        ON spm.status_page_id = m.status_page_id
+                       AND spm.monitor_id = mm.monitor_id
+                      WHERE mm.monitor_id = c.monitor_id
+                        AND c.checked_at >= m.starts_at
+                        AND c.checked_at < LEAST(m.ends_at, COALESCE(m.cancelled_at, m.ends_at))
+                  )
                 GROUP BY monitor_id, bucket
             ) sub
             "#,
@@ -827,6 +979,52 @@ async fn load_refresh_data(
         }
     }
 
+    for chunk in page_ids.chunks(MAX_IDS_PER_QUERY) {
+        let n = chunk.len();
+        // At most `MAX_OPEN_PER_PAGE` windows per page, each over at most the
+        // page's monitors.
+        let sql = format!(
+            r#"
+            SELECT m.status_page_id, m.id, m.title, m.description, m.starts_at, m.ends_at,
+                   m.created_at, mm.monitor_id
+            FROM status_page_maintenances m
+            JOIN status_page_maintenance_monitors mm ON mm.maintenance_id = m.id
+            JOIN status_page_monitors spm
+              ON spm.status_page_id = m.status_page_id AND spm.monitor_id = mm.monitor_id
+            WHERE m.status_page_id IN ({})
+              AND m.cancelled_at IS NULL
+              AND m.ends_at > ${}
+            ORDER BY m.status_page_id, m.starts_at, m.id, mm.monitor_id
+            "#,
+            placeholders(1, n),
+            n + 1
+        );
+        let mut values = id_values(chunk);
+        values.push(now.into());
+        for row in MaintenanceMonitorRow::find_by_statement(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            &sql,
+            values,
+        ))
+        .all(db)
+        .await?
+        {
+            let windows = data.maintenances.entry(row.status_page_id).or_default();
+            match windows.last_mut() {
+                Some(window) if window.id == row.id => window.monitor_ids.push(row.monitor_id),
+                _ => windows.push(MaintenanceRow {
+                    id: row.id,
+                    title: row.title,
+                    description: row.description,
+                    starts_at: row.starts_at,
+                    ends_at: row.ends_at,
+                    created_at: row.created_at,
+                    monitor_ids: vec![row.monitor_id],
+                }),
+            }
+        }
+    }
+
     Ok(data)
 }
 
@@ -863,6 +1061,8 @@ fn subscriptions_since(page: &status_pages::Model) -> Option<UtcDateTime> {
 pub(crate) struct AssembledPage {
     pub response: PublicStatusPageResponse,
     pub notices: Vec<PageNotice>,
+    /// The newest [`FEED_ENTRIES`] events, for the Atom feed.
+    pub events: Vec<PageEvent>,
 }
 
 /// Build the public view of one page from pre-fetched data. Pure: everything
@@ -889,6 +1089,12 @@ pub(crate) fn assemble_page(
     let today = now.date_naive();
     let first_day = today - chrono::Days::new(u64::from(PUBLIC_HISTORY_DAYS - 1));
     let incidents = public_incidents(page.id, selections, data, now);
+    let maintenances = public_maintenances(page.id, selections, data, now);
+    let in_maintenance: HashSet<i32> = maintenances
+        .iter()
+        .filter(|m| m.public.status == PublicMaintenanceStatus::InProgress)
+        .flat_map(|m| m.monitor_ids.iter().copied())
+        .collect();
 
     let empty_days = HashMap::new();
     let components: Vec<PublicStatusComponent> = selections
@@ -931,7 +1137,9 @@ pub(crate) fn assemble_page(
                     }
                 })
                 .collect();
-            let status = if selection.is_active {
+            let status = if selection.is_active && in_maintenance.contains(&selection.monitor_id) {
+                PublicComponentStatus::Maintenance
+            } else if selection.is_active {
                 data.latest_status
                     .get(&selection.monitor_id)
                     .map(|s| PublicComponentStatus::from_check_status(s))
@@ -951,15 +1159,25 @@ pub(crate) fn assemble_page(
         })
         .collect();
 
+    let maintenance_events: Vec<PageEvent> = maintenances
+        .iter()
+        .map(|m| {
+            maintenance_event(&MaintenanceSource {
+                maintenance_id: m.id,
+                created_at: m.created_at,
+                maintenance: &m.public,
+            })
+        })
+        .collect();
     let notices = match subscriptions_since(page) {
         Some(since) => {
             let since = since.max(now - NOTICE_WINDOW);
-            incidents
+            let mut notices: Vec<PageNotice> = incidents
                 .iter()
                 .flat_map(|incident| {
                     incident_notices(
                         &page.title,
-                        &IncidentForNotice {
+                        &IncidentSource {
                             incident_id: incident.incident_id,
                             update_ids: &incident.update_ids,
                             incident: &incident.public,
@@ -968,11 +1186,33 @@ pub(crate) fn assemble_page(
                         now,
                     )
                 })
-                .collect()
+                .collect();
+            notices.extend(
+                maintenance_events
+                    .iter()
+                    .filter(|e| e.published_at >= since && e.published_at <= now)
+                    .map(|e| notice_for(&page.title, e.clone())),
+            );
+            notices
         }
         None => Vec::new(),
     };
+    let events = newest_events(
+        incidents
+            .iter()
+            .flat_map(|incident| {
+                incident_events(&IncidentSource {
+                    incident_id: incident.incident_id,
+                    update_ids: &incident.update_ids,
+                    incident: &incident.public,
+                })
+            })
+            .chain(maintenance_events)
+            .collect(),
+        FEED_ENTRIES,
+    );
     let incidents: Vec<PublicIncident> = incidents.into_iter().map(|i| i.public).collect();
+    let maintenances: Vec<PublicMaintenance> = maintenances.into_iter().map(|m| m.public).collect();
 
     let mut status = components
         .iter()
@@ -1001,10 +1241,12 @@ pub(crate) fn assemble_page(
             status,
             components,
             incidents,
+            maintenances,
             history_days: PUBLIC_HISTORY_DAYS,
             generated_at: now,
         },
         notices,
+        events,
     }
 }
 
@@ -1035,6 +1277,64 @@ impl AssembledIncident {
     fn overlaps(&self, day: NaiveDate, today: NaiveDate) -> bool {
         self.started_on <= day && day <= self.resolved_on.unwrap_or(today)
     }
+}
+
+/// A public maintenance window plus the ids behind it.
+struct AssembledMaintenance {
+    public: PublicMaintenance,
+    id: i32,
+    created_at: UtcDateTime,
+    monitor_ids: Vec<i32>,
+}
+
+/// The page's open maintenance windows, soonest first, naming only the
+/// covered components this page shows. A window none of whose monitors is
+/// on the page any more is left out.
+fn public_maintenances(
+    status_page_id: i32,
+    selections: &[SelectionRow],
+    data: &RefreshData,
+    now: UtcDateTime,
+) -> Vec<AssembledMaintenance> {
+    let Some(windows) = data.maintenances.get(&status_page_id) else {
+        return Vec::new();
+    };
+    windows
+        .iter()
+        .filter(|window| window.ends_at > now)
+        .filter_map(|window| {
+            let covered: HashSet<i32> = window.monitor_ids.iter().copied().collect();
+            let mut affected: Vec<String> = Vec::new();
+            for selection in selections
+                .iter()
+                .filter(|s| covered.contains(&s.monitor_id))
+            {
+                if !affected.contains(&selection.display_name) {
+                    affected.push(selection.display_name.clone());
+                }
+            }
+            if affected.is_empty() {
+                return None;
+            }
+            Some(AssembledMaintenance {
+                public: PublicMaintenance {
+                    title: window.title.clone(),
+                    description: window.description.clone(),
+                    status: if window.starts_at <= now {
+                        PublicMaintenanceStatus::InProgress
+                    } else {
+                        PublicMaintenanceStatus::Scheduled
+                    },
+                    starts_at: window.starts_at,
+                    ends_at: window.ends_at,
+                    affected_components: affected,
+                },
+                id: window.id,
+                created_at: window.created_at,
+                monitor_ids: window.monitor_ids.clone(),
+            })
+        })
+        .collect()
 }
 
 /// Incidents selected for `status_page_id` that concern this page's selection
@@ -1183,6 +1483,8 @@ mod tests {
             subscriptions_enabled: false,
             subscriptions_enabled_at: None,
             subscription_sender: None,
+            password_hash: None,
+            password_version: 0,
             created_at: now,
             updated_at: now,
         }

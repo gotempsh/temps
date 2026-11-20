@@ -25,11 +25,37 @@ macro_rules! page_projects_guard {
     }};
 }
 
+/// Instance permission, then the permission on every project of the page.
+/// `$state` has `pages: Arc<PublicStatusPageService>` and
+/// `project_access_checker`. Expands to an early return; evaluates to the
+/// page's project ids.
+macro_rules! page_access_guard {
+    ($auth:expr, $state:expr, $permission:ident, $status_page_id:expr) => {{
+        permission_guard!($auth, $permission);
+        let project_ids = $state
+            .pages
+            .page_project_ids($status_page_id)
+            .await
+            .map_err($crate::routes::status_page::map_error)?;
+        page_projects_guard!(
+            $auth,
+            $permission,
+            project_ids,
+            $state.project_access_checker.clone()
+        );
+        project_ids
+    }};
+}
+
 mod audit;
+pub mod maintenance;
+pub mod page_password;
 pub mod public;
 pub mod public_subscriptions;
 pub mod status_page;
 pub mod status_pages;
 pub mod subscribers;
+pub mod target_monitors;
+pub mod webhooks;
 
 pub use status_page::*;

@@ -1,0 +1,775 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+//! Database-backed tests of status page webhooks (ADR 108 D2): registration,
+//! delivery, retries and cancellation, and the admin handlers.
+
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
+
+use async_trait::async_trait;
+use axum::body::Body;
+use axum::extract::{Extension, Path, State};
+use axum::http::{header, Request, StatusCode};
+use axum::response::IntoResponse;
+use axum::Json;
+use chrono::{Duration, Utc};
+use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
+use temps_authz::permissions::Role;
+use temps_authz::{AuthContext, RequireAuth};
+use temps_config::ConfigService;
+use temps_core::{AuditLogger, AuditOperation, EncryptionService, RequestMetadata};
+use temps_entities::{
+    environments, projects, status_page_webhook_deliveries, status_page_webhooks,
+    upstream_config::UpstreamList, users,
+};
+use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
+use tower::ServiceExt;
+
+use super::dispatcher::{WebhookDispatcherState, MAX_ATTEMPTS};
+use super::payload::{signature, WebhookPayload, SIGNATURE_HEADER};
+use super::service::MAX_WEBHOOKS_PER_PAGE;
+use super::{
+    CreateStatusPageWebhookRequest, StatusPageWebhookService, TransportError,
+    UpdateStatusPageWebhookRequest, WebhookError, WebhookTransport,
+};
+use crate::routes::webhooks::{create_webhook, create_webhook_router, WebhookRoutesState};
+use crate::services::maintenance::{
+    CreateMaintenanceRequest, StatusPageMaintenanceService, UpdateMaintenanceRequest,
+};
+use crate::services::public_pages::{
+    CreateStatusPageRequest, PublicStatusPageService, StatusPageMonitorInput, StatusSnapshotCache,
+};
+use crate::services::{CreateMonitorRequest, StatusPageService};
+
+const URL: &str = "https://hooks.example.test/status";
+
+#[derive(Clone, Debug)]
+struct Sent {
+    url: String,
+    headers: Vec<(&'static str, String)>,
+    body: String,
+}
+
+#[derive(Default)]
+struct FakeTransport {
+    /// Statuses to answer with, in order; 204 once empty.
+    answers: Mutex<VecDeque<Result<u16, TransportError>>>,
+    refuse_check: std::sync::atomic::AtomicBool,
+    sent: Mutex<Vec<Sent>>,
+}
+
+impl FakeTransport {
+    fn sent(&self) -> Vec<Sent> {
+        self.sent.lock().expect("lock").clone()
+    }
+
+    fn answer(&self, answer: Result<u16, TransportError>) {
+        self.answers.lock().expect("lock").push_back(answer);
+    }
+}
+
+#[async_trait]
+impl WebhookTransport for FakeTransport {
+    async fn check(&self, _url: &str) -> Result<(), TransportError> {
+        if self.refuse_check.load(std::sync::atomic::Ordering::SeqCst) {
+            Err(TransportError::NonPublic {
+                reason: "10.0.0.5".to_string(),
+            })
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn post(
+        &self,
+        url: &str,
+        headers: Vec<(&'static str, String)>,
+        body: String,
+    ) -> Result<u16, TransportError> {
+        self.sent.lock().expect("lock").push(Sent {
+            url: url.to_string(),
+            headers,
+            body,
+        });
+        self.answers
+            .lock()
+            .expect("lock")
+            .pop_front()
+            .unwrap_or(Ok(204))
+    }
+}
+
+#[derive(Default)]
+struct RecordingAudit {
+    entries: Mutex<Vec<(String, String)>>,
+}
+
+#[async_trait]
+impl AuditLogger for RecordingAudit {
+    async fn create_audit_log(
+        &self,
+        operation: &dyn AuditOperation,
+    ) -> temps_core::AuditResult<()> {
+        self.entries
+            .lock()
+            .expect("audit lock")
+            .push((operation.operation_type(), operation.serialize()?));
+        Ok(())
+    }
+}
+
+struct Fx {
+    _db: TestDatabase,
+    db: Arc<sea_orm::DatabaseConnection>,
+    webhooks: Arc<StatusPageWebhookService>,
+    maintenance: StatusPageMaintenanceService,
+    transport: Arc<FakeTransport>,
+    audit: Arc<RecordingAudit>,
+    state: Arc<WebhookRoutesState>,
+    page_id: i32,
+    monitor_id: i32,
+}
+
+fn auth(role: Role) -> RequireAuth {
+    let now = Utc::now();
+    RequireAuth(AuthContext::new_session(
+        users::Model {
+            id: 1,
+            name: "Test User".to_string(),
+            email: "admin@example.test".to_string(),
+            password_hash: None,
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            must_change_password: false,
+            deleted_at: None,
+            mfa_secret: None,
+            mfa_enabled: false,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: now,
+            updated_at: now,
+        },
+        role,
+    ))
+}
+
+fn metadata() -> Extension<RequestMetadata> {
+    Extension(RequestMetadata {
+        ip_address: "192.0.2.43".to_string(),
+        user_agent: "webhook-test".to_string(),
+        headers: axum::http::HeaderMap::new(),
+        visitor_id_cookie: None,
+        session_id_cookie: None,
+        base_url: "http://localhost".to_string(),
+        scheme: "http".to_string(),
+        host: "localhost".to_string(),
+        is_secure: false,
+    })
+}
+
+async fn fixture() -> Option<Fx> {
+    let test_db = match TestDatabase::with_migrations().await {
+        Ok(db) => db,
+        Err(e) if is_container_runtime_unavailable(&e.to_string()) => {
+            println!("Docker not available, skipping status page webhook test");
+            return None;
+        }
+        Err(e) => panic!("test database setup failed: {e}"),
+    };
+    let db = test_db.connection_arc();
+    let config = temps_config::ServerConfig::new(
+        "127.0.0.1:3000".to_string(),
+        "postgres://test:test@localhost/test".to_string(),
+        None,
+        None,
+    )
+    .expect("server config");
+    let config_service = Arc::new(ConfigService::new(Arc::new(config), db.clone()));
+    let nanos = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+    let slug = format!("hook-{nanos}");
+    let project_id = projects::ActiveModel {
+        name: Set("Internal Project Name".to_string()),
+        slug: Set(slug.clone()),
+        directory: Set(slug.clone()),
+        main_branch: Set("main".to_string()),
+        preset: Set(temps_entities::preset::Preset::Nixpacks),
+        repo_name: Set("repo".to_string()),
+        repo_owner: Set("owner".to_string()),
+        ..Default::default()
+    }
+    .insert(db.as_ref())
+    .await
+    .expect("project")
+    .id;
+    let environment_id = environments::ActiveModel {
+        project_id: Set(project_id),
+        name: Set(slug.clone()),
+        slug: Set(slug.clone()),
+        subdomain: Set(slug.clone()),
+        host: Set("internal.example.test".to_string()),
+        upstreams: Set(UpstreamList::default()),
+        ..Default::default()
+    }
+    .insert(db.as_ref())
+    .await
+    .expect("environment")
+    .id;
+    let status = StatusPageService::new(db.clone(), config_service.clone());
+    let monitor = status
+        .monitor_service()
+        .create_monitor(
+            project_id,
+            CreateMonitorRequest {
+                name: "internal-monitor".to_string(),
+                monitor_type: "web".to_string(),
+                environment_id,
+                check_interval_seconds: Some(60),
+                check_path: Some("/healthz".to_string()),
+            },
+        )
+        .await
+        .expect("monitor");
+    let cache = Arc::new(StatusSnapshotCache::new(db.clone()));
+    let pages = Arc::new(PublicStatusPageService::new(
+        db.clone(),
+        config_service,
+        cache.clone(),
+    ));
+    let page = pages
+        .create(CreateStatusPageRequest {
+            title: "Example status".to_string(),
+            description: None,
+            monitors: vec![StatusPageMonitorInput {
+                monitor_id: monitor.id,
+                display_name: "API".to_string(),
+                group_name: None,
+            }],
+            appearance: None,
+        })
+        .await
+        .expect("page");
+    pages.publish(page.id).await.expect("publish");
+    let transport = Arc::new(FakeTransport::default());
+    let webhooks = Arc::new(StatusPageWebhookService::new(
+        db.clone(),
+        cache.clone(),
+        Arc::new(EncryptionService::new_from_password("webhook-tests")),
+        transport.clone(),
+    ));
+    let audit = Arc::new(RecordingAudit::default());
+    let state = Arc::new(WebhookRoutesState {
+        webhooks: webhooks.clone(),
+        pages,
+        audit: audit.clone(),
+        project_access_checker: None,
+    });
+    Some(Fx {
+        _db: test_db,
+        maintenance: StatusPageMaintenanceService::new(db.clone(), cache),
+        db,
+        webhooks,
+        transport,
+        audit,
+        state,
+        page_id: page.id,
+        monitor_id: monitor.id,
+    })
+}
+
+async fn schedule(fx: &Fx, title: &str) {
+    let starts_at = Utc::now() + Duration::hours(2);
+    fx.maintenance
+        .create(
+            fx.page_id,
+            CreateMaintenanceRequest {
+                title: title.to_string(),
+                description: None,
+                starts_at,
+                ends_at: starts_at + Duration::hours(1),
+                monitor_ids: vec![fx.monitor_id],
+            },
+        )
+        .await
+        .expect("schedule");
+}
+
+async fn deliveries(fx: &Fx) -> Vec<status_page_webhook_deliveries::Model> {
+    status_page_webhook_deliveries::Entity::find()
+        .all(fx.db.as_ref())
+        .await
+        .expect("deliveries")
+}
+
+#[tokio::test]
+async fn a_new_event_is_posted_once_signed_with_the_secret_shown_at_creation() {
+    let Some(fx) = fixture().await else {
+        return;
+    };
+    // An event from before the webhook existed is never sent to it.
+    schedule(&fx, "Earlier work").await;
+    let created = fx
+        .webhooks
+        .create(
+            fx.page_id,
+            CreateStatusPageWebhookRequest {
+                url: URL.to_string(),
+            },
+        )
+        .await
+        .expect("create");
+    let stored = status_page_webhooks::Entity::find_by_id(created.webhook.id)
+        .one(fx.db.as_ref())
+        .await
+        .expect("row")
+        .expect("exists");
+    assert_ne!(stored.secret_encrypted, created.secret, "encrypted at rest");
+    assert!(!stored.secret_encrypted.contains(&created.secret));
+
+    schedule(&fx, "Database upgrade").await;
+    let mut state = WebhookDispatcherState::default();
+    let report = fx
+        .webhooks
+        .dispatch_tick(&mut state, Utc::now())
+        .await
+        .expect("tick");
+    assert_eq!(report.queued, 1, "{report:?}");
+    assert_eq!(report.delivered, 1, "{report:?}");
+    let sent = fx.transport.sent();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].url, URL);
+    let payload: WebhookPayload = serde_json::from_str(&sent[0].body).expect("typed body");
+    assert_eq!(payload.kind, "maintenance_scheduled");
+    assert_eq!(payload.event.title, "Database upgrade");
+    assert_eq!(payload.event.affected_components, vec!["API".to_string()]);
+    assert!(!sent[0].body.contains("internal-monitor"));
+    let header = sent[0]
+        .headers
+        .iter()
+        .find(|(name, _)| *name == SIGNATURE_HEADER)
+        .map(|(_, value)| value.clone())
+        .expect("signed");
+    let timestamp: i64 = header
+        .trim_start_matches("t=")
+        .split(',')
+        .next()
+        .and_then(|t| t.parse().ok())
+        .expect("timestamp");
+    assert_eq!(header, signature(&created.secret, timestamp, &sent[0].body));
+
+    // Later ticks send nothing more.
+    let again = fx
+        .webhooks
+        .dispatch_tick(&mut state, Utc::now())
+        .await
+        .expect("tick");
+    assert_eq!(again.delivered, 0);
+    let mut fresh = WebhookDispatcherState::default();
+    fx.webhooks
+        .dispatch_tick(&mut fresh, Utc::now())
+        .await
+        .expect("tick after a restart");
+    assert_eq!(fx.transport.sent().len(), 1, "a restart re-sends nothing");
+    let hook = fx
+        .webhooks
+        .list(fx.page_id, 1, 20)
+        .await
+        .expect("list")
+        .items
+        .remove(0);
+    assert!(hook.last_success_at.is_some() && hook.last_failure_reason.is_none());
+}
+
+#[tokio::test]
+async fn failures_are_retried_then_marked_failed_with_the_reason_shown() {
+    let Some(fx) = fixture().await else {
+        return;
+    };
+    fx.webhooks
+        .create(
+            fx.page_id,
+            CreateStatusPageWebhookRequest {
+                url: URL.to_string(),
+            },
+        )
+        .await
+        .expect("create");
+    schedule(&fx, "Database upgrade").await;
+    for _ in 0..MAX_ATTEMPTS {
+        fx.transport.answer(Ok(500));
+    }
+    let mut state = WebhookDispatcherState::default();
+    let mut now = Utc::now();
+    let first = fx
+        .webhooks
+        .dispatch_tick(&mut state, now)
+        .await
+        .expect("tick");
+    assert_eq!(first.retried, 1, "{first:?}");
+    let not_yet = fx
+        .webhooks
+        .dispatch_tick(&mut state, now)
+        .await
+        .expect("tick");
+    assert_eq!(
+        fx.transport.sent().len(),
+        1,
+        "waits for the retry delay: {not_yet:?}"
+    );
+    now += Duration::minutes(2);
+    fx.webhooks
+        .dispatch_tick(&mut state, now)
+        .await
+        .expect("tick");
+    now += Duration::minutes(11);
+    let last = fx
+        .webhooks
+        .dispatch_tick(&mut state, now)
+        .await
+        .expect("tick");
+    assert_eq!(last.failed, 1, "{last:?}");
+    assert_eq!(fx.transport.sent().len(), MAX_ATTEMPTS as usize);
+    let rows = deliveries(&fx).await;
+    assert_eq!(rows[0].attempts, MAX_ATTEMPTS);
+    assert!(rows[0].failed_at.is_some());
+    let hook = fx
+        .webhooks
+        .list(fx.page_id, 1, 20)
+        .await
+        .expect("list")
+        .items
+        .remove(0);
+    assert_eq!(
+        hook.last_failure_reason.as_deref(),
+        Some("the endpoint answered HTTP 500")
+    );
+    now += Duration::hours(1);
+    fx.webhooks
+        .dispatch_tick(&mut state, now)
+        .await
+        .expect("tick");
+    assert_eq!(
+        fx.transport.sent().len(),
+        MAX_ATTEMPTS as usize,
+        "no more attempts"
+    );
+}
+
+#[tokio::test]
+async fn a_backlog_larger_than_one_insert_is_queued_and_sent_in_full() {
+    let Some(fx) = fixture().await else {
+        return;
+    };
+    fx.webhooks
+        .create(
+            fx.page_id,
+            CreateStatusPageWebhookRequest {
+                url: URL.to_string(),
+            },
+        )
+        .await
+        .expect("create");
+    let windows = super::dispatcher::INSERT_CHUNK * 2 + 1;
+    for index in 0..windows {
+        schedule(&fx, &format!("Upgrade {index}")).await;
+    }
+    let mut state = WebhookDispatcherState::default();
+    let report = fx
+        .webhooks
+        .dispatch_tick(&mut state, Utc::now())
+        .await
+        .expect("tick");
+    assert_eq!(report.queued, windows, "{report:?}");
+    assert_eq!(deliveries(&fx).await.len(), windows);
+    assert_eq!(fx.transport.sent().len(), windows);
+}
+
+#[tokio::test]
+async fn a_retry_sends_the_event_as_the_page_shows_it_now() {
+    let Some(fx) = fixture().await else {
+        return;
+    };
+    fx.webhooks
+        .create(
+            fx.page_id,
+            CreateStatusPageWebhookRequest {
+                url: URL.to_string(),
+            },
+        )
+        .await
+        .expect("create");
+    let starts_at = Utc::now() + Duration::hours(2);
+    let window = fx
+        .maintenance
+        .create(
+            fx.page_id,
+            CreateMaintenanceRequest {
+                title: "Database upgrade".to_string(),
+                description: None,
+                starts_at,
+                ends_at: starts_at + Duration::hours(1),
+                monitor_ids: vec![fx.monitor_id],
+            },
+        )
+        .await
+        .expect("schedule");
+    fx.transport.answer(Ok(500));
+    let mut state = WebhookDispatcherState::default();
+    let mut now = Utc::now();
+    fx.webhooks
+        .dispatch_tick(&mut state, now)
+        .await
+        .expect("first attempt");
+
+    fx.maintenance
+        .update(
+            fx.page_id,
+            window.id,
+            UpdateMaintenanceRequest {
+                title: Some("Database upgrade, moved to Sunday".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("edit");
+    now += Duration::minutes(2);
+    fx.webhooks
+        .dispatch_tick(&mut state, now)
+        .await
+        .expect("retry");
+
+    let sent = fx.transport.sent();
+    assert_eq!(sent.len(), 2);
+    assert!(
+        sent[0].body.contains("\"Database upgrade\""),
+        "{}",
+        sent[0].body
+    );
+    assert!(
+        sent[1].body.contains("Database upgrade, moved to Sunday"),
+        "the retry carries the edited title: {}",
+        sent[1].body
+    );
+}
+
+#[tokio::test]
+async fn a_disabled_webhook_gets_nothing_and_its_pending_events_are_cancelled() {
+    let Some(fx) = fixture().await else {
+        return;
+    };
+    let created = fx
+        .webhooks
+        .create(
+            fx.page_id,
+            CreateStatusPageWebhookRequest {
+                url: URL.to_string(),
+            },
+        )
+        .await
+        .expect("create");
+    schedule(&fx, "Database upgrade").await;
+    fx.transport.answer(Err(TransportError::Connect));
+    let mut state = WebhookDispatcherState::default();
+    let now = Utc::now();
+    fx.webhooks
+        .dispatch_tick(&mut state, now)
+        .await
+        .expect("tick");
+    fx.webhooks
+        .update(
+            fx.page_id,
+            created.webhook.id,
+            UpdateStatusPageWebhookRequest {
+                enabled: Some(false),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("disable");
+    let report = fx
+        .webhooks
+        .dispatch_tick(&mut state, now + Duration::minutes(5))
+        .await
+        .expect("tick");
+    assert_eq!(report.cancelled, 1, "{report:?}");
+    assert_eq!(fx.transport.sent().len(), 1);
+    let rows = deliveries(&fx).await;
+    assert_eq!(
+        rows[0].last_error.as_deref(),
+        Some("the webhook was disabled")
+    );
+}
+
+#[tokio::test]
+async fn registration_is_validated_bounded_and_scoped_to_the_page() {
+    let Some(fx) = fixture().await else {
+        return;
+    };
+    let err = fx
+        .webhooks
+        .create(
+            fx.page_id,
+            CreateStatusPageWebhookRequest {
+                url: "http://hooks.example.test/".to_string(),
+            },
+        )
+        .await
+        .expect_err("plain http");
+    assert!(matches!(err, WebhookError::Validation { .. }));
+    fx.transport
+        .refuse_check
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let err = fx
+        .webhooks
+        .create(
+            fx.page_id,
+            CreateStatusPageWebhookRequest {
+                url: URL.to_string(),
+            },
+        )
+        .await
+        .expect_err("non-public address");
+    assert!(err.to_string().contains("not public"), "{err}");
+    fx.transport
+        .refuse_check
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    assert!(matches!(
+        fx.webhooks
+            .create(
+                9_999_999,
+                CreateStatusPageWebhookRequest {
+                    url: URL.to_string()
+                }
+            )
+            .await,
+        Err(WebhookError::StatusPageNotFound {
+            status_page_id: 9_999_999
+        })
+    ));
+
+    let mut first = None;
+    for _ in 0..MAX_WEBHOOKS_PER_PAGE {
+        let created = fx
+            .webhooks
+            .create(
+                fx.page_id,
+                CreateStatusPageWebhookRequest {
+                    url: URL.to_string(),
+                },
+            )
+            .await
+            .expect("within the limit");
+        first.get_or_insert(created.webhook.id);
+    }
+    assert!(matches!(
+        fx.webhooks
+            .create(
+                fx.page_id,
+                CreateStatusPageWebhookRequest {
+                    url: URL.to_string()
+                }
+            )
+            .await,
+        Err(WebhookError::TooMany { limit: 10, .. })
+    ));
+    let first = first.expect("created");
+    assert!(matches!(
+        fx.webhooks.delete(fx.page_id + 1, first).await,
+        Err(WebhookError::NotFound { .. })
+    ));
+    fx.webhooks.delete(fx.page_id, first).await.expect("delete");
+    let remaining = status_page_webhooks::Entity::find()
+        .filter(status_page_webhooks::Column::StatusPageId.eq(fx.page_id))
+        .all(fx.db.as_ref())
+        .await
+        .expect("rows");
+    assert_eq!(remaining.len() as u64, MAX_WEBHOOKS_PER_PAGE - 1);
+}
+
+#[tokio::test]
+async fn the_handlers_authorize_return_the_secret_once_and_audit_without_it() {
+    let Some(fx) = fixture().await else {
+        return;
+    };
+    let forbidden = create_webhook(
+        auth(Role::Reader),
+        State(fx.state.clone()),
+        metadata(),
+        Path(fx.page_id),
+        Json(CreateStatusPageWebhookRequest {
+            url: URL.to_string(),
+        }),
+    )
+    .await
+    .err()
+    .expect("a reader cannot register");
+    assert_eq!(forbidden.status_code, StatusCode::FORBIDDEN);
+
+    let response = create_webhook(
+        auth(Role::Admin),
+        State(fx.state.clone()),
+        metadata(),
+        Path(fx.page_id),
+        Json(CreateStatusPageWebhookRequest {
+            url: URL.to_string(),
+        }),
+    )
+    .await
+    .map_err(|p| format!("{:?}", p.body))
+    .expect("admin registers")
+    .into_response();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok()),
+        Some("no-store")
+    );
+    let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .expect("body");
+    let created: super::StatusPageWebhookCreatedResponse =
+        serde_json::from_slice(&body).expect("json");
+    assert!(created.secret.starts_with("whsec_"));
+
+    let listed = serde_json::to_string(&fx.webhooks.list(fx.page_id, 1, 20).await.expect("list"))
+        .expect("json");
+    assert!(!listed.contains(&created.secret), "never listed again");
+    let entries = fx.audit.entries.lock().expect("audit").clone();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].0, "STATUS_PAGE_WEBHOOK_CREATED");
+    assert!(!entries[0].1.contains(&created.secret));
+    assert!(entries[0].1.contains(URL));
+
+    let router = create_webhook_router(fx.state.clone());
+    let base = format!("/status-pages/{}/webhooks", fx.page_id);
+    for (method, path) in [
+        ("GET", base.clone()),
+        ("POST", base.clone()),
+        ("PATCH", format!("{base}/1")),
+        ("DELETE", format!("{base}/1")),
+    ] {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(&path)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .expect("request"),
+            )
+            .await
+            .expect("router is infallible");
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "{method} {path}"
+        );
+    }
+}

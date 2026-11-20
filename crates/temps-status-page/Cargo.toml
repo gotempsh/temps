@@ -32,6 +32,11 @@ url = { workspace = true }
 reqwest = { workspace = true }
 arc-swap = { workspace = true }
 hex = { workspace = true }
+hmac = { workspace = true }
+argon2 = { workspace = true }
+# Target monitor check specs and probes (ADR 108 D3 to D5).
+temps-uptime-probe = { path = "../temps-uptime-probe" }
+futures = { workspace = true }
 rand = { workspace = true }
 sha2 = { workspace = true }
 async-trait = { workspace = true }

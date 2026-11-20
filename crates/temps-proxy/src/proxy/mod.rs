@@ -1601,7 +1601,9 @@ impl LoadBalancer {
         ctx: &mut ProxyContext,
         route: temps_routes::StatusPageHostRoute,
     ) -> Result<bool> {
-        use temps_core::public_status_page::{StatusHostPath, STATUS_HOST_HEADER};
+        use temps_core::public_status_page::{
+            is_well_formed_access_cookie, StatusHostPath, STATUS_ACCESS_COOKIE, STATUS_HOST_HEADER,
+        };
 
         let host = temps_routes::normalize_route_hostname(&ctx.host).into_owned();
         ctx.routing_status = "status_page_host".to_string();
@@ -1692,8 +1694,17 @@ impl LoadBalancer {
         let header = session.req_header_mut();
         header.set_raw_path(target.as_bytes())?;
         // Credentials and caller-chosen forwarding headers never reach the
-        // public listener from a custom hostname.
+        // public listener from a custom hostname. The one exception is a
+        // well-formed status page access cookie (ADR 108 D2): it only proves
+        // the visitor typed this page's password, and the console checks its
+        // signature against this page.
+        let access_cookie = find_request_cookie(header, STATUS_ACCESS_COOKIE, |value| {
+            is_well_formed_access_cookie(value).then(|| value.to_string())
+        });
         header.remove_header("cookie");
+        if let Some(value) = access_cookie {
+            header.insert_header("cookie", format!("{STATUS_ACCESS_COOKIE}={value}"))?;
+        }
         header.remove_header("authorization");
         header.remove_header("x-forwarded-host");
         strip_untrusted_client_ip_headers(header, self.loopback_ja4_header.load().as_deref());

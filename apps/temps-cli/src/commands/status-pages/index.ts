@@ -33,6 +33,8 @@ import {
   keyValue, formatDate,
 } from '../../ui/output.js'
 import { registerSubscriberCommands } from './subscribers.js'
+import { registerMaintenanceCommands } from './maintenance.js'
+import { registerWebhookCommands } from './webhooks.js'
 
 interface ListOptions {
   projectId?: string
@@ -189,6 +191,12 @@ function printPage(page: StatusPageResponse): void {
   keyValue('Public URL', publicUrlLabel(page))
   if (page.public_json_url) {
     keyValue('JSON', page.public_json_url)
+  }
+  if (page.public_feed_url) {
+    keyValue('Atom feed', page.public_feed_url)
+  }
+  if (page.has_password) {
+    keyValue('Access', 'password required (no feed)')
   }
   const urlNote = publicUrlNote(page)
   if (urlNote) {
@@ -650,4 +658,6 @@ export function registerStatusPagesCommands(program: Command): void {
 
   registerDomainCommands(pages)
   registerSubscriberCommands(pages)
+  registerMaintenanceCommands(pages)
+  registerWebhookCommands(pages)
 }
