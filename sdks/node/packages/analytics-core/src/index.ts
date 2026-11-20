@@ -25,7 +25,7 @@ export {
   type LinkLike,
   type ClassifyLinkOptions,
 } from "./AutoTracking";
-export { enableCookielessIdentity, isCookielessIdentity } from "./identity";
+export { enableCookielessIdentity, isCookielessIdentity, onCookielessIdentity } from "./identity";
 export { createAnalytics } from "./Analytics";
 export {
   FeatureFlags,
