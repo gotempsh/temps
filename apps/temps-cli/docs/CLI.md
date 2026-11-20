@@ -2,7 +2,7 @@
 
 > Auto-generated documentation for the Temps CLI.
 >
-> Generated on: 2026-11-18
+> Generated on: 2026-11-20
 
 ## Installation
 
@@ -1915,7 +1915,7 @@ View runtime container logs (use -f to follow in real-time)
 
 ## `notifications` (alias: `notify`)
 
-Manage notification providers (Slack, Email, Webhook, etc.)
+Manage notification providers (Slack, Email, Webhook, Telegram, etc.)
 
 **Subcommands:**
 
@@ -1947,7 +1947,7 @@ Add a new notification provider
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-t, --type <type>` | Provider type (slack, email, webhook) | - | No |
+| `-t, --type <type>` | Provider type (slack, email, webhook, telegram) | - | No |
 | `-n, --name <name>` | Provider name | - | No |
 | `-w, --webhook-url <url>` | Webhook URL (for slack) | - | No |
 | `-c, --channel <channel>` | Channel name (for slack, optional) | - | No |
@@ -1961,6 +1961,9 @@ Add a new notification provider
 | `--url <url>` | Webhook URL (for webhook) | - | No |
 | `--method <method>` | HTTP method: POST, PUT, PATCH (for webhook, default: POST) | - | No |
 | `--header <header>` | Request header "Name: value" (for webhook, repeatable) | - | No |
+| `--bot-token <token>` | Bot token from @BotFather (for telegram) | - | No |
+| `--chat-id <id>` | Chat ID, e.g. -1001234567890 or @channelname (for telegram) | - | No |
+| `--topic-id <id>` | Forum topic ID (for telegram, optional) | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 
 ### `notifications update`
@@ -1986,6 +1989,9 @@ Update a notification provider
 | `--url <url>` | Webhook URL (for webhook) | - | No |
 | `--method <method>` | HTTP method: POST, PUT, PATCH (for webhook) | - | No |
 | `--header <header>` | Request header "Name: value" (for webhook, repeatable; replaces the stored headers) | - | No |
+| `--bot-token <token>` | Bot token from @BotFather (for telegram) | - | No |
+| `--chat-id <id>` | Chat ID, e.g. -1001234567890 or @channelname (for telegram) | - | No |
+| `--topic-id <id>` | Forum topic ID (for telegram; empty string clears it) | - | No |
 | `--json` | Output in JSON format | - | No |
 | `-y, --yes` | Skip confirmation prompts | - | No |
 
