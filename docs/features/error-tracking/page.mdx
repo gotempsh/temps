@@ -1157,10 +1157,11 @@ Files an SDK sends with an error, such as a log excerpt or the state of a form, 
 
 Attachments live in the project's blob storage, so **Blob storage must be enabled** (Storage in the console). Until it is, the event page and the Attachments page say so and link there, and attachments SDKs send are dropped.
 
-- **What is kept.** Plain files (`attachment_type` `event.attachment`, the default): up to 2 MiB each, and 4 MiB or 8 files per event or feedback. Minidumps and other native crash files are reported unsupported. A file that is too large or has no event or feedback to belong to never rejects the envelope; it is counted in `x-temps-sentry-unsupported-items`.
+- **What is kept.** Plain files (`attachment_type` `event.attachment`, the default): up to 2 MiB each, and 4 MiB or 8 files per event or feedback, counting files sent in earlier envelopes. Minidumps and other native crash files are reported unsupported. A file that is too large or has no event or feedback to belong to never rejects the envelope; it is counted in `x-temps-sentry-unsupported-items`.
 - **Quota.** Each project may store 256 MiB of attachments until you change it (0 to 100 GiB). Past the quota, new attachments are dropped; lowering it deletes nothing.
 - **When they are written.** After the envelope is answered, by a background task, so an SDK retry stores nothing twice. When the upload queue (256 envelopes, 16 MiB) is full, attachments are dropped and `x-temps-sentry-attachments-dropped` says how many; `x-temps-sentry-attachments-queued` counts the rest.
-- **How long they are kept.** As long as what they came with: attachments of expired events, deleted feedback and deleted projects are deleted within about ten minutes. Deleting an attachment returns its space to the quota.
+- **How long they are kept.** As long as what they came with: attachments of expired events, deleted feedback and deleted projects are deleted within about ten minutes. Deleting an attachment returns its space to the quota. A file whose write failed keeps counting against the quota until its object is confirmed deleted.
+- **Files arrive just after their event.** An event or feedback opened right after it arrived re-reads its empty attachment list every few seconds for about a minute.
 - **Downloads are safe to open.** PNG, JPEG, GIF and WebP are shown inline; any other type, HTML and SVG included, is served as a file to save, never rendered in the console.
 
 <CodeGroup title="Attachments">

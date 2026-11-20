@@ -618,7 +618,9 @@ deploys, which is web services. It comes last and may never be worth building.
   its envelope: one that is too large, past the count, or has no event or
   feedback to belong to is reported unsupported, and the events are stored.
 - **Limits.** 2 MiB per file and 4 MiB or 8 files per event or feedback, under
-  the envelope's own 2 MiB body and 10 MiB decompressed limits. Each project
+  the envelope's own 2 MiB body and 10 MiB decompressed limits. The 4 MiB
+  counts files earlier envelopes stored for the same owner, so a retry that
+  adds files cannot pass it. Each project
   has a quota of 256 MiB of attachments until the admin changes it (0 to
   100 GiB, a column on `error_attachment_usage`, audited). Lowering it deletes
   nothing: new attachments are dropped until use falls under it.
@@ -640,7 +642,11 @@ deploys, which is web services. It comes last and may never be worth building.
   writes that never finished (after an hour), attachments of deleted feedback,
   and every attachment of a deleted project (soft-deleted counts). Deleting a
   feedback deletes its attachments. An object that cannot be deleted keeps its
-  row, so the next pass retries. Without blob storage nothing is stored, and
+  row, so the next pass retries, and a pass stops when it can delete nothing.
+  A write that failed or timed out deletes its object before its row, since a
+  store may have kept a file it never acknowledged; until then the row counts
+  against the quota and the sweeper retries it as an unfinished write. The
+  uploader and sweeper hold the service weakly and end when it is dropped. Without blob storage nothing is stored, and
   the usage endpoint says so and links `/storage`.
 - **Serving.** PNG, JPEG, GIF and WebP are served inline so the console can
   show a feedback screenshot. Everything else is served as

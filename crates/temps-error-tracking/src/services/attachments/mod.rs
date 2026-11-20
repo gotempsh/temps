@@ -156,6 +156,9 @@ pub struct StoreOutcome {
     pub stored: u64,
     pub duplicates: u64,
     pub over_quota: u64,
+    /// Would have taken the event or feedback past
+    /// [`MAX_EVENT_ATTACHMENT_BYTES`] with files an earlier envelope stored.
+    pub over_event_limit: u64,
     pub without_owner: u64,
     pub failed: u64,
 }
@@ -171,12 +174,13 @@ pub struct SweepOutcome {
 }
 
 /// A row to remove: its object first, then the row, whose size goes back
-/// to the quota.
+/// to the quota. The row stays until its object is known to be gone, even
+/// for a write that failed, since a store can keep a file whose `put` it
+/// never answered.
 #[derive(Debug, Clone, FromQueryResult)]
 struct RemovalRow {
     id: i64,
     project_id: i32,
-    stored: bool,
 }
 
 /// Attachments: ingest hand-off, storage, reads and the sweeper.
@@ -186,6 +190,16 @@ pub struct AttachmentService {
     receiver: Mutex<Option<AttachmentReceiver>>,
     stats: Arc<AttachmentStats>,
     store: OnceLock<Arc<dyn PayloadBlobStore>>,
+    /// Dropped with the service, which tells the sweeper to stop. The
+    /// uploader stops when the queue's sender, also held here, is dropped.
+    stop: tokio::sync::watch::Sender<()>,
+}
+
+/// The uploader and sweeper tasks [`AttachmentService::start`] spawned.
+/// Both hold the service weakly and end once it is dropped.
+pub struct AttachmentTasks {
+    pub uploader: tokio::task::JoinHandle<()>,
+    pub sweeper: tokio::task::JoinHandle<()>,
 }
 
 impl AttachmentService {
@@ -199,6 +213,7 @@ impl AttachmentService {
             receiver: Mutex::new(Some(receiver)),
             stats,
             store: OnceLock::new(),
+            stop: tokio::sync::watch::channel(()).0,
         }
     }
 
@@ -217,19 +232,18 @@ impl AttachmentService {
     }
 
     /// Start the uploader and the sweeper. Does nothing the second time,
-    /// or when no blob store was set.
-    pub fn start(self: &Arc<Self>) {
-        let Some(store) = self.store().cloned() else {
-            return;
-        };
-        let receiver = self.receiver.lock().ok().and_then(|mut slot| slot.take());
-        let Some(mut receiver) = receiver else {
-            return;
-        };
-        let uploader = self.clone();
+    /// or when no blob store was set. The tasks hold the service weakly:
+    /// dropping it closes the queue and the stop signal, and both end.
+    pub fn start(self: &Arc<Self>) -> Option<AttachmentTasks> {
+        let store = self.store().cloned()?;
+        let mut receiver = self.receiver.lock().ok().and_then(|mut slot| slot.take())?;
+        let service = Arc::downgrade(self);
         let uploader_store = store.clone();
-        tokio::spawn(async move {
+        let uploader_task = tokio::spawn(async move {
             while let Some(queued) = receiver.next().await {
+                let Some(uploader) = service.upgrade() else {
+                    break;
+                };
                 let project_id = queued.batch.project_id;
                 if let Err(error) = uploader
                     .store_batch(uploader_store.as_ref(), &queued.batch)
@@ -247,12 +261,20 @@ impl AttachmentService {
                 }
             }
         });
-        let sweeper = self.clone();
-        tokio::spawn(async move {
+        let service = Arc::downgrade(self);
+        let mut stop = self.stop.subscribe();
+        let sweeper_task = tokio::spawn(async move {
             let mut interval = tokio::time::interval(SWEEP_INTERVAL);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
-                interval.tick().await;
+                tokio::select! {
+                    _ = interval.tick() => {}
+                    // Only ever an error: the sender is dropped with the service.
+                    _ = stop.changed() => break,
+                }
+                let Some(sweeper) = service.upgrade() else {
+                    break;
+                };
                 match sweeper.sweep(store.as_ref(), Utc::now()).await {
                     Ok(outcome) if outcome != SweepOutcome::default() => tracing::info!(
                         expired = outcome.expired,
@@ -270,6 +292,10 @@ impl AttachmentService {
                 }
             }
         });
+        Some(AttachmentTasks {
+            uploader: uploader_task,
+            sweeper: sweeper_task,
+        })
     }
 
     /// Offer an envelope's attachments to the uploader (hot path: one
@@ -418,7 +444,15 @@ impl AttachmentService {
                     if marked == 0 {
                         // The sweeper removed the row while the object was
                         // being written (its event expired meanwhile).
-                        let _ = store.delete_prefix(project_id, &object_prefix(id)).await;
+                        if let Err(error) =
+                            store.delete_prefix(project_id, &object_prefix(id)).await
+                        {
+                            tracing::warn!(
+                                project_id,
+                                attachment_id = id,
+                                "attachment {id} of project {project_id} expired while it was written, and its object could not be deleted: {error}"
+                            );
+                        }
                         outcome.failed += 1;
                         continue;
                     }
@@ -434,12 +468,11 @@ impl AttachmentService {
                         attachment_id = id,
                         "could not write attachment {id} of project {project_id} to blob storage: {reason}"
                     );
-                    self.remove_rows(&[RemovalRow {
-                        id,
-                        project_id,
-                        stored: false,
-                    }])
-                    .await?;
+                    // The object may exist anyway. Deleting it confirms it
+                    // does not; otherwise the row (and its quota) stays as
+                    // an unfinished write the sweeper retries.
+                    self.remove(store, vec![RemovalRow { id, project_id }])
+                        .await?;
                     outcome.failed += 1;
                 }
             }
@@ -483,6 +516,36 @@ impl AttachmentService {
             .ok_or(ErrorTrackingError::ProjectNotFound)?;
         let used: i64 = usage.try_get("", "bytes")?;
         let quota: i64 = usage.try_get("", "quota_bytes")?;
+        // The per-event limit covers every envelope for the owner, not just
+        // this one: a retry may resend positions already stored and add new
+        // ones. The project row lock above serialises this sum. The same
+        // position is left out so a resent file is counted as a duplicate.
+        let owner_bytes: i64 = tx
+            .query_one(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT COALESCE(SUM(size_bytes), 0)::BIGINT AS bytes FROM error_attachments \
+                 WHERE project_id = $1 AND owner_kind = $2 AND owner_id = $3 AND ordinal <> $4",
+                [
+                    project_id.into(),
+                    owner.kind().into(),
+                    owner.id().into(),
+                    ordinal.into(),
+                ],
+            ))
+            .await?
+            .map(|row| row.try_get("", "bytes"))
+            .transpose()?
+            .unwrap_or(0);
+        if owner_bytes.saturating_add(size) > MAX_EVENT_ATTACHMENT_BYTES as i64 {
+            outcome.over_event_limit += 1;
+            tracing::debug!(
+                project_id,
+                "{} {} already has {owner_bytes} attachment bytes; an attachment of {size} bytes would pass the {MAX_EVENT_ATTACHMENT_BYTES}-byte limit and is dropped",
+                owner.kind(),
+                owner.id()
+            );
+            return Ok(None);
+        }
         if used.saturating_add(size) > quota {
             outcome.over_quota += 1;
             tracing::debug!(
@@ -535,6 +598,7 @@ impl AttachmentService {
         add(&self.stats.stored, outcome.stored);
         add(&self.stats.duplicates, outcome.duplicates);
         add(&self.stats.over_quota, outcome.over_quota);
+        add(&self.stats.over_event_limit, outcome.over_event_limit);
         add(&self.stats.without_owner, outcome.without_owner);
         add(&self.stats.failed, outcome.failed);
     }
@@ -593,15 +657,6 @@ impl AttachmentService {
             match deleted {
                 Ok(Ok(_)) => gone.push(row),
                 Ok(Err(PayloadBlobError::NotFound { .. })) => gone.push(row),
-                Ok(Err(error)) if !row.stored => {
-                    // A reservation never written may have no object at all.
-                    tracing::debug!(
-                        project_id = row.project_id,
-                        "attachment {} was never stored; removing its row ({error})",
-                        row.id
-                    );
-                    gone.push(row);
-                }
                 Ok(Err(error)) => tracing::warn!(
                     project_id = row.project_id,
                     attachment_id = row.id,
@@ -639,7 +694,7 @@ impl AttachmentService {
         for _ in 0..MAX_SWEEP_BATCHES {
             let rows = RemovalRow::find_by_statement(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
-                "SELECT a.id, a.project_id, a.stored_at IS NOT NULL AS stored \
+                "SELECT a.id, a.project_id \
                  FROM (SELECT id, project_id, stored_at, owner_id, event_time \
                        FROM error_attachments WHERE owner_kind = 'error' \
                        ORDER BY event_time, id LIMIT $1) a \
@@ -652,7 +707,12 @@ impl AttachmentService {
             if rows.is_empty() {
                 break;
             }
-            outcome.expired += self.remove(store, rows).await?;
+            let removed = self.remove(store, rows).await?;
+            outcome.expired += removed;
+            // Storage is not deleting: the same rows would come back.
+            if removed == 0 {
+                break;
+            }
         }
 
         let stale_before = now
@@ -660,7 +720,7 @@ impl AttachmentService {
         for _ in 0..MAX_SWEEP_BATCHES {
             let rows = RemovalRow::find_by_statement(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
-                "SELECT id, project_id, FALSE AS stored FROM error_attachments \
+                "SELECT id, project_id FROM error_attachments \
                  WHERE stored_at IS NULL AND created_at < $1 ORDER BY created_at LIMIT $2",
                 [stale_before.into(), (SWEEP_BATCH as i64).into()],
             ))
@@ -670,8 +730,9 @@ impl AttachmentService {
                 break;
             }
             let found = rows.len();
-            outcome.stale += self.remove(store, rows).await?;
-            if found < SWEEP_BATCH as usize {
+            let removed = self.remove(store, rows).await?;
+            outcome.stale += removed;
+            if removed == 0 || found < SWEEP_BATCH as usize {
                 break;
             }
         }
@@ -681,7 +742,7 @@ impl AttachmentService {
         for _ in 0..MAX_SWEEP_BATCHES {
             let rows = RemovalRow::find_by_statement(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
-                "SELECT a.id, a.project_id, a.stored_at IS NOT NULL AS stored \
+                "SELECT a.id, a.project_id \
                  FROM error_attachments a WHERE a.owner_kind = 'feedback' \
                    AND NOT EXISTS (SELECT 1 FROM project_feedback f \
                                    WHERE f.id = a.owner_id AND f.project_id = a.project_id) \
@@ -694,8 +755,9 @@ impl AttachmentService {
                 break;
             }
             let found = rows.len();
-            outcome.orphaned_feedback += self.remove(store, rows).await?;
-            if found < SWEEP_BATCH as usize {
+            let removed = self.remove(store, rows).await?;
+            outcome.orphaned_feedback += removed;
+            if removed == 0 || found < SWEEP_BATCH as usize {
                 break;
             }
         }
@@ -854,7 +916,6 @@ impl AttachmentService {
                 vec![RemovalRow {
                     id: view.id,
                     project_id,
-                    stored: true,
                 }],
             )
             .await?;
@@ -880,7 +941,7 @@ impl AttachmentService {
     ) -> Result<u64, ErrorTrackingError> {
         let rows = RemovalRow::find_by_statement(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
-            "SELECT id, project_id, stored_at IS NOT NULL AS stored \
+            "SELECT id, project_id \
              FROM error_attachments WHERE project_id = $1 AND owner_kind = $2 AND owner_id = $3",
             [project_id.into(), owner.kind().into(), owner.id().into()],
         ))
