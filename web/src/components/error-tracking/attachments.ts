@@ -71,6 +71,11 @@ export function bytesToMib(bytes: number): number {
   return Math.round(bytes / MIB)
 }
 
+/** Whether `bytes` shows exactly as a number of MiB in the quota form. */
+export function isWholeMib(bytes: number): boolean {
+  return bytes % MIB === 0
+}
+
 export function mibToBytes(mib: number): number {
   return mib * MIB
 }

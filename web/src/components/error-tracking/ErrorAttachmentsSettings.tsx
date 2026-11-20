@@ -26,6 +26,7 @@ import { formatBytesBinary } from '@/lib/server-monitoring'
 import {
   ATTACHMENT_EXAMPLE,
   bytesToMib,
+  isWholeMib,
   MAX_QUOTA_MIB,
   mibToBytes,
   quotaFormSchema,
@@ -91,7 +92,7 @@ export function AttachmentUsageSummary({ usage }: { usage: AttachmentUsage }) {
   )
 }
 
-function QuotaForm({
+export function QuotaForm({
   projectId,
   usage,
 }: {
@@ -104,13 +105,16 @@ function QuotaForm({
     defaultValues: { quota_mib: bytesToMib(usage.quota_bytes) },
   })
   const { reset } = form
+  const { isDirty } = form.formState
+  // A refresh brings the saved quota in, but never over an unsaved edit.
   useEffect(() => {
-    reset({ quota_mib: bytesToMib(usage.quota_bytes) })
-  }, [reset, usage.quota_bytes])
+    if (!isDirty) reset({ quota_mib: bytesToMib(usage.quota_bytes) })
+  }, [reset, isDirty, usage.quota_bytes])
   const save = useMutation({
     ...setErrorAttachmentQuotaMutation(),
     meta: { errorTitle: 'Failed to change the attachment quota' },
     onSuccess: (next) => {
+      reset({ quota_mib: bytesToMib(next.quota_bytes) })
       toast.success(
         `Attachment quota set to ${formatBytesBinary(next.quota_bytes)}`
       )
@@ -121,6 +125,7 @@ function QuotaForm({
     },
   })
   const error = form.formState.errors.quota_mib?.message
+  const exact = isWholeMib(usage.quota_bytes)
   return (
     <form
       noValidate
@@ -143,12 +148,19 @@ function QuotaForm({
           className="w-full sm:w-40"
           aria-invalid={error ? true : undefined}
           aria-describedby={error ? 'attachment-quota-error' : undefined}
+          disabled={save.isPending}
           {...form.register('quota_mib', { valueAsNumber: true })}
         />
       </div>
-      <Button type="submit" disabled={save.isPending}>
+      <Button type="submit" disabled={save.isPending || (exact && !isDirty)}>
         {save.isPending ? 'Saving…' : 'Save quota'}
       </Button>
+      {!exact && (
+        <p className="text-xs text-muted-foreground sm:basis-full">
+          The current quota, {formatBytesBinary(usage.quota_bytes)}, is not a
+          whole number of MiB; saving replaces it with the value above.
+        </p>
+      )}
       {error && (
         <p
           id="attachment-quota-error"
@@ -182,9 +194,20 @@ export function ErrorAttachmentsSettings({ projectId }: { projectId: number }) {
             </div>
           ) : usage.isError ? (
             <Alert variant="destructive">
-              <AlertDescription>
-                {readFailureServerDetail(usage.error) ??
-                  'Attachment usage could not be loaded. Retry.'}
+              <AlertDescription className="space-y-2">
+                <p>
+                  {readFailureServerDetail(usage.error) ??
+                    'Attachment usage could not be loaded.'}
+                </p>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  disabled={usage.isFetching}
+                  onClick={() => void usage.refetch()}
+                >
+                  {usage.isFetching ? 'Retrying…' : 'Retry'}
+                </Button>
               </AlertDescription>
             </Alert>
           ) : (

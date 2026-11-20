@@ -5,6 +5,7 @@ import { describe, expect, test } from 'bun:test'
 import {
   attachmentContentUrl,
   bytesToMib,
+  isWholeMib,
   isInlineImage,
   MAX_QUOTA_MIB,
   mibToBytes,
@@ -66,6 +67,9 @@ describe('attachments', () => {
 
   test('converts between bytes and MiB', () => {
     expect(bytesToMib(268_435_456)).toBe(256)
+    expect(isWholeMib(268_435_456)).toBe(true)
+    expect(isWholeMib(1)).toBe(false)
+    expect(isWholeMib(0)).toBe(true)
     expect(mibToBytes(256)).toBe(268_435_456)
   })
 
