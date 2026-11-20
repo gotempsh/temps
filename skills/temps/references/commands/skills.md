@@ -47,6 +47,8 @@ Create a new skill definition. Use @path for content from a file, directory, or 
 
 Update an existing skill definition
 
+**Usage:** `skills update <slug> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -61,6 +63,8 @@ Update an existing skill definition
 
 Delete a skill definition
 
+**Usage:** `skills delete <slug> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -73,6 +77,8 @@ Delete a skill definition
 ### `skills import`
 
 Import a skill from a public GitHub repository (skills.sh-compatible). Source: <owner>/<repo> or <owner>/<repo>/<skill-name>
+
+**Usage:** `skills import <source> [options]`
 
 **Options:**
 

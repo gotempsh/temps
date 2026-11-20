@@ -43,6 +43,8 @@ List feature flags
 
 Show a feature flag and its per-environment values
 
+**Usage:** `flags get <key> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -53,6 +55,8 @@ Show a feature flag and its per-environment values
 ### `flags create`
 
 Create a feature flag
+
+**Usage:** `flags create <key> [options]`
 
 **Options:**
 
@@ -68,6 +72,8 @@ Create a feature flag
 ### `flags update`
 
 Update a flag definition (default value, description, visibility)
+
+**Usage:** `flags update <key> [options]`
 
 **Options:**
 
@@ -96,6 +102,8 @@ Targeting rules: serve a different value to some users, or to a percentage of th
 
 Show the ordered rules of a flag in one environment
 
+**Usage:** `flags rules list <key> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -107,6 +115,8 @@ Show the ordered rules of a flag in one environment
 #### `flags rules set`
 
 Replace the rules of a flag in one environment, from a JSON array (or @path to a file, or - for stdin)
+
+**Usage:** `flags rules set <key> <rules> [options]`
 
 **Options:**
 
@@ -120,6 +130,8 @@ Replace the rules of a flag in one environment, from a JSON array (or @path to a
 
 Remove every rule of a flag in one environment
 
+**Usage:** `flags rules clear <key> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -130,6 +142,8 @@ Remove every rule of a flag in one environment
 ### `flags evaluate` (alias: `eval`)
 
 Show what a user would get, and why, in one environment
+
+**Usage:** `flags evaluate <key> [options]`
 
 **Options:**
 
@@ -145,6 +159,8 @@ Show what a user would get, and why, in one environment
 
 Draw new rollout buckets for every rollout and split of this flag (never during an experiment)
 
+**Usage:** `flags reshuffle <key> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -155,6 +171,8 @@ Draw new rollout buckets for every rollout and split of this flag (never during 
 ### `flags set`
 
 Set a flag value in one environment
+
+**Usage:** `flags set <key> <value> [options]`
 
 **Options:**
 
@@ -168,6 +186,8 @@ Set a flag value in one environment
 
 Clear a flag override so the environment inherits the default
 
+**Usage:** `flags clear <key> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -178,6 +198,8 @@ Clear a flag override so the environment inherits the default
 ### `flags disable`
 
 Kill switch: serve the default in this environment, ignoring any override
+
+**Usage:** `flags disable <key> [options]`
 
 **Options:**
 
@@ -190,6 +212,8 @@ Kill switch: serve the default in this environment, ignoring any override
 
 Re-enable a flag in this environment after a kill switch
 
+**Usage:** `flags enable <key> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -201,6 +225,8 @@ Re-enable a flag in this environment after a kill switch
 
 Restore an archived flag
 
+**Usage:** `flags restore <key> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -210,6 +236,8 @@ Restore an archived flag
 ### `flags archive`
 
 Archive a flag (callers fall back to their own default)
+
+**Usage:** `flags archive <key> [options]`
 
 **Options:**
 

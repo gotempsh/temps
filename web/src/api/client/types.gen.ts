@@ -334,6 +334,43 @@ export type ActivityDay = {
 };
 
 /**
+ * The specifics of an entry; which fields are set depends on the kind.
+ */
+export type ActivityDetails = {
+    assignee?: Assignee | null;
+    /**
+     * `assigned`: the assignee's name when the entry was written.
+     */
+    assignee_name?: string | null;
+    /**
+     * `status_changed`: the change came from a bulk request.
+     */
+    bulk?: boolean;
+    /**
+     * `merged`, `unmerged`, `split`: how many fingerprints moved.
+     */
+    fingerprints?: number | null;
+    /**
+     * `merged`: the groups merged in. `unmerged`, `split`: the group on the
+     * other side (both groups get an entry).
+     */
+    group_ids?: Array<number>;
+    /**
+     * `status_changed`: resolved in the next release.
+     */
+    in_next_release?: boolean;
+    /**
+     * `regressed`: the release of the event that reopened the group.
+     */
+    release?: string | null;
+    /**
+     * `status_changed`: the new status. `regressed`: the status the group
+     * had before the event reopened it (`resolved` or `ignored`).
+     */
+    status?: string | null;
+};
+
+/**
  * A single activity event for the real-time activity feed
  */
 export type ActivityEvent = {
@@ -477,6 +514,11 @@ export type ActivityGraphResponse = {
      */
     total_count: number;
 };
+
+/**
+ * What happened to the group.
+ */
+export type ActivityKind = 'comment' | 'status_changed' | 'regressed' | 'assigned' | 'merged' | 'unmerged' | 'split';
 
 export type ActivityPreview = {
     report: ActivityReport;
@@ -3093,6 +3135,17 @@ export type AssignRoleRequest = {
     user_id: number;
 };
 
+/**
+ * Who a group is assigned to.
+ */
+export type Assignee = {
+    id: number;
+    type: 'user';
+} | {
+    id: number;
+    type: 'team';
+};
+
 export type AttachEnvironmentVolumeRequest = {
     mount_path: string;
     read_only?: boolean;
@@ -3169,6 +3222,21 @@ export type AttrPredicate = {
 
 export type AttributeKeysResponse = {
     keys: Array<FacetValue>;
+};
+
+/**
+ * One value of the requested attribute.
+ */
+export type AttributeSliceResponse = {
+    avg_ms: number;
+    calls: number;
+    max_ms: number;
+    share: number;
+    total_ms: number;
+    /**
+     * Null for calls without the attribute.
+     */
+    value?: string | null;
 };
 
 /**
@@ -3625,6 +3693,18 @@ export type AvailablePermissions = {
 };
 
 /**
+ * One backend request that served the page.
+ */
+export type BackendRequestResponse = {
+    duration_ms: number;
+    error: boolean;
+    service_name: string;
+    span_name: string;
+    start_time: string;
+    trace_id: string;
+};
+
+/**
  * Response body for the list-backup-alerts endpoint.
  */
 export type BackupAlertListResponse = {
@@ -4016,6 +4096,40 @@ export type BranchInfo = {
 
 export type BranchListResponse = {
     branches: Array<BranchInfo>;
+};
+
+/**
+ * One downstream call inside the operation.
+ */
+export type BreakdownGroupResponse = {
+    /**
+     * Exclusive time per call.
+     */
+    avg_ms: number;
+    calls: number;
+    /**
+     * Calls per sampled call of the operation.
+     */
+    calls_per_instance: number;
+    /**
+     * `database`, `http`, `messaging`, `rpc`, `client`, `server`,
+     * `internal`, or `other` for the summed remainder.
+     */
+    category: string;
+    /**
+     * Empty for the summed remainder.
+     */
+    service_name: string;
+    /**
+     * `total_ms` over the operation's total time. Parallel calls can add
+     * up to more than 1.
+     */
+    share: number;
+    span_name: string;
+    /**
+     * Exclusive time, summed over the sample.
+     */
+    total_ms: number;
 };
 
 export type BrowserCount = {
@@ -4434,6 +4548,85 @@ export type BulkAlarmResponse = {
     updated: number;
     /**
      * IDs of the alarms that changed state.
+     */
+    updated_ids: Array<number>;
+};
+
+/**
+ * Status transition a bulk request applies.
+ */
+export type BulkErrorGroupAction = 'resolve' | 'unresolve' | 'ignore';
+
+/**
+ * Filters selecting "every group matching", with the same meaning they have
+ * on the list endpoint. `{}` selects every group of the project that is not
+ * already in the target status.
+ */
+export type BulkErrorGroupFilter = {
+    /**
+     * With `start_date`: only groups with at least one event in the window.
+     */
+    end_date?: string | null;
+    /**
+     * Only groups first seen in this environment.
+     */
+    environment_id?: number | null;
+    /**
+     * Case-insensitive substring of the title, error type or message.
+     * Wildcards are matched literally.
+     */
+    search?: string | null;
+    /**
+     * With `end_date`: only groups with at least one event in the window.
+     */
+    start_date?: string | null;
+    /**
+     * Only groups currently in this status.
+     */
+    status?: string | null;
+};
+
+/**
+ * Request body for `POST .../error-groups/bulk`. Provide exactly one of
+ * `group_ids` or `filter`.
+ */
+export type BulkErrorGroupRequest = {
+    action: BulkErrorGroupAction;
+    filter?: BulkErrorGroupFilter | null;
+    /**
+     * Explicit groups to update; every one must be in this project.
+     */
+    group_ids?: Array<number> | null;
+    ignore?: IgnoreConditionsRequest | null;
+    /**
+     * With `status: resolved` (or `action: resolve`): resolved in the next
+     * release. Events from the project's newest release at this moment, or
+     * an older one, or with no release, keep it resolved; an event from a
+     * newer release reopens it. Fails when the project has no release yet.
+     */
+    in_next_release?: boolean;
+};
+
+/**
+ * Result of a bulk group update.
+ */
+export type BulkErrorGroupResponse = {
+    action: BulkErrorGroupAction;
+    /**
+     * Matching groups left for a follow-up request because this one hit the
+     * per-request limit. Always 0 when `group_ids` was used.
+     */
+    remaining: number;
+    /**
+     * Selected groups already in the target status.
+     */
+    skipped: number;
+    /**
+     * Number of groups whose status changed.
+     */
+    updated: number;
+    /**
+     * Ids of the groups whose status changed.
      */
     updated_ids: Array<number>;
 };
@@ -8339,6 +8532,18 @@ export type CreateEnvironmentVolumeRequest = {
     size_mb?: number | null;
 };
 
+export type CreateErrorSavedSearchRequest = {
+    filters?: SavedSearchFilters;
+    /**
+     * At most 100 characters, unique among your saved searches in the project.
+     */
+    name: string;
+    /**
+     * Share with everyone who can open the project.
+     */
+    shared?: boolean;
+};
+
 export type CreateExternalServiceRequest = {
     /**
      * Cluster member specifications for topology "cluster". Optional: when
@@ -8552,6 +8757,18 @@ export type CreateGroupRouteRequest = {
      * The service that serves requests under the prefix.
      */
     target_project_id: number;
+};
+
+export type CreateInboundFilterRequest = {
+    /**
+     * Defaults to true.
+     */
+    enabled?: boolean | null;
+    kind: InboundFilterKind;
+    /**
+     * Required for `error_message` and `release`, refused for the others.
+     */
+    pattern?: string | null;
 };
 
 export type CreateIncidentRequest = {
@@ -11055,6 +11272,16 @@ export type DeploymentListResponse = {
 };
 
 /**
+ * A deployment that went live.
+ */
+export type DeploymentMarkerResponse = {
+    deployment_id: number;
+    environment_id: number;
+    live_at: string;
+    slug: string;
+};
+
+/**
  * Deployment metadata - typed information about the deployment
  */
 export type DeploymentMetadata = {
@@ -11178,6 +11405,40 @@ export type DeploymentOperationDetails = {
  * replace each other in the merged OpenAPI document.
  */
 export type DeploymentOperationStatus = 'pending' | 'completed' | 'failed';
+
+/**
+ * The project's tracked operations compared across one deployment.
+ */
+export type DeploymentRegressionsResponse = {
+    after_end: string;
+    /**
+     * The first complete hour after the deployment went live.
+     */
+    after_start: string;
+    baseline_start: string;
+    /**
+     * Regressed operations first, largest change first; then improved
+     * ones. At most 50.
+     */
+    changes: Array<OperationChangeResponse>;
+    deployment: DeploymentMarkerResponse;
+    improved: number;
+    /**
+     * Operations with too few hours after it yet.
+     */
+    insufficient_after: number;
+    /**
+     * Operations with too little history before the deployment.
+     */
+    insufficient_baseline: number;
+    /**
+     * Complete hours after the deployment needed before it is judged.
+     */
+    min_after_hours: number;
+    regressed: number;
+    tracking: OperationTrackingResponse;
+    unchanged: number;
+};
 
 export type DeploymentResponse = {
     branch?: string | null;
@@ -14214,11 +14475,95 @@ export type ErrorEventResponse = {
     timestamp: string;
 };
 
+export type ErrorGroupActivityPageResponse = {
+    /**
+     * Newest first.
+     */
+    data: Array<ErrorGroupActivityResponse>;
+    page: number;
+    page_size: number;
+    total_count: number;
+};
+
+/**
+ * One entry of a group's activity log.
+ */
+export type ErrorGroupActivityResponse = {
+    actor_name?: string | null;
+    /**
+     * Who did it; `None` for an event that reopened the group, or a user
+     * who has since been deleted.
+     */
+    actor_user_id?: number | null;
+    /**
+     * The comment text, for `comment` entries.
+     */
+    body?: string | null;
+    created_at: string;
+    details: ActivityDetails;
+    edited_at?: string | null;
+    group_id: number;
+    id: number;
+    kind: ActivityKind;
+};
+
+export type ErrorGroupAssigneeOptionsResponse = {
+    /**
+     * Teams, at most 20.
+     */
+    teams: Array<GroupAssignee>;
+    /**
+     * Users who can access the project, at most 20.
+     */
+    users: Array<GroupAssignee>;
+};
+
+export type ErrorGroupAssigneeResponse = {
+    assignee?: GroupAssignee | null;
+    /**
+     * Whether the assignee changed. Assigning the current assignee again
+     * changes nothing and notifies nobody.
+     */
+    changed: boolean;
+    group_id: number;
+};
+
+export type ErrorGroupCommentRequest = {
+    /**
+     * The comment, at most 10,000 characters; Markdown is shown as text.
+     */
+    body: string;
+};
+
 export type ErrorGroupDeploymentResponse = {
     branch?: string | null;
     commit_hash?: string | null;
     commit_message?: string | null;
     id: number;
+};
+
+/**
+ * One fingerprint routing to a group.
+ */
+export type ErrorGroupFingerprintResponse = {
+    fingerprint_hash: string;
+    /**
+     * Set when a merge moved this fingerprint here; unmerging that group
+     * moves it back, and a split cannot take it.
+     */
+    merged_from_group_id?: number | null;
+};
+
+/**
+ * The fingerprints of one group.
+ */
+export type ErrorGroupFingerprintsResponse = {
+    fingerprints: Array<ErrorGroupFingerprintResponse>;
+    group_id: number;
+    /**
+     * Groups merged into this one.
+     */
+    merged_group_ids: Array<number>;
 };
 
 export type ErrorGroupResponse = {
@@ -14227,7 +14572,12 @@ export type ErrorGroupResponse = {
      * Present only when `start_date` and `end_date` were supplied on the list request.
      */
     affected_users?: number | null;
+    /**
+     * Deprecated: a free-text assignee from before assignees were users or
+     * teams, kept read-only when it matched no user. Use `assignee`.
+     */
     assigned_to?: string | null;
+    assignee?: GroupAssignee | null;
     created_at: string;
     deployment?: ErrorGroupDeploymentResponse | null;
     deployment_id?: number | null;
@@ -14240,9 +14590,23 @@ export type ErrorGroupResponse = {
     events_in_range?: number | null;
     first_seen: string;
     id: number;
+    ignore?: GroupIgnoreState | null;
+    /**
+     * `error`, or `performance` for an issue a trace detector filed: an
+     * N+1 query, a slow database query, consecutive HTTP calls or an
+     * oversized payload.
+     */
+    issue_type: string;
     last_seen: string;
+    /**
+     * Set when this group was merged into another one. Its events and count
+     * stay with it so the merge can be undone, it is left out of lists, and
+     * its future events land in the group named here.
+     */
+    merged_into_group_id?: number | null;
     message_template?: string | null;
     project_id: number;
+    resolution?: GroupResolutionState | null;
     status: string;
     title: string;
     total_count: number;
@@ -14274,6 +14638,38 @@ export type ErrorRow = {
     stacktrace_truncated: boolean;
     trace_id?: string | null;
     ts: string;
+};
+
+export type ErrorSavedSearchPageResponse = {
+    /**
+     * Yours and the shared ones, newest first.
+     */
+    data: Array<ErrorSavedSearchResponse>;
+    page: number;
+    page_size: number;
+    total_count: number;
+};
+
+/**
+ * A saved search: a name and the list filters it applies.
+ */
+export type ErrorSavedSearchResponse = {
+    created_at: string;
+    filters: SavedSearchFilters;
+    id: number;
+    /**
+     * Whether the caller owns it, and so may change it.
+     */
+    is_owner: boolean;
+    name: string;
+    owner_name?: string | null;
+    owner_user_id: number;
+    project_id: number;
+    /**
+     * Visible to everyone who can open the project, not only its owner.
+     */
+    shared: boolean;
+    updated_at: string;
 };
 
 export type ErrorTimeSeriesDataResponse = {
@@ -17335,6 +17731,25 @@ export type GoalResponse = {
 export type GrantEnforcement = 'not_requested' | 'pending' | 'active' | 'stopping' | 'stopped';
 
 /**
+ * An assignee with what a reader needs to show it.
+ */
+export type GroupAssignee = {
+    /**
+     * The user's email; `None` for a team.
+     */
+    email?: string | null;
+    id: number;
+    /**
+     * The user's or team's name.
+     */
+    name: string;
+    /**
+     * `user` or `team`.
+     */
+    type: string;
+};
+
+/**
  * A group variable as returned by the API. `value` is `"***"` in lists,
  * plaintext only in the create/update response of a non-secret variable,
  * and always `null` for secrets.
@@ -17351,6 +17766,32 @@ export type GroupEnvVarResponse = {
     key: string;
     updated_at: string;
     value?: string | null;
+};
+
+/**
+ * The ignore conditions of an ignored group and how far along they are.
+ */
+export type GroupIgnoreState = {
+    /**
+     * Stays ignored whatever happens.
+     */
+    forever: boolean;
+    /**
+     * Stays ignored until this time.
+     */
+    until?: string | null;
+    /**
+     * Reopens when `total_count` reaches this value.
+     */
+    until_event_count?: number | null;
+    /**
+     * Reopens when this many new distinct users are affected.
+     */
+    until_user_count?: number | null;
+    /**
+     * New distinct users seen since it was ignored.
+     */
+    user_count: number;
 };
 
 /**
@@ -17403,6 +17844,25 @@ export type GroupRepository = {
 
 export type GroupRepositoryResponse = {
     repository?: GroupRepository | null;
+};
+
+/**
+ * A group resolved in the next release (ADR 111, D1.5).
+ */
+export type GroupResolutionState = {
+    /**
+     * That release's version, filled in on the single-group read.
+     */
+    after_release?: string | null;
+    /**
+     * Id of the release the group was resolved after; events from a newer
+     * release reopen it.
+     */
+    after_release_id?: number | null;
+    /**
+     * Always true; the field exists so clients can test one value.
+     */
+    in_next_release: boolean;
 };
 
 /**
@@ -18289,6 +18749,30 @@ export type HttpChecksCapabilities = {
 export type HttpPolicy = 'https_only' | 'allow_http' | 'allow_all';
 
 /**
+ * When an ignored error group comes back. With no field set the next event
+ * reopens it; with fields set it stays ignored until any one is met.
+ */
+export type IgnoreConditionsRequest = {
+    /**
+     * Stay ignored for this many more occurrences (1 to 1,000,000).
+     */
+    event_count?: number | null;
+    /**
+     * Stay ignored whatever happens. Excludes the other fields.
+     */
+    forever?: boolean;
+    /**
+     * Stay ignored until this time (at most 366 days ahead).
+     */
+    until?: string | null;
+    /**
+     * Stay ignored until this many new distinct users are affected
+     * (1 to 10,000).
+     */
+    user_count?: number | null;
+};
+
+/**
  * Runtime configuration baked into an image, read on the node that owns it.
  *
  * A worker build returns this so the control plane never needs a local copy
@@ -18912,6 +19396,48 @@ export type ImportedHostVerdict = {
      * Whether the cert was written (or would be written on `dry_run: false`).
      */
     success: boolean;
+};
+
+/**
+ * What a rule drops.
+ */
+export type InboundFilterKind = 'browser_extensions' | 'web_crawlers' | 'localhost' | 'error_message' | 'release';
+
+/**
+ * One inbound filter rule.
+ */
+export type InboundFilterResponse = {
+    created_at: string;
+    /**
+     * Events this rule dropped since it was created.
+     */
+    dropped_count: number;
+    enabled: boolean;
+    id: number;
+    kind: InboundFilterKind;
+    last_dropped_at?: string | null;
+    /**
+     * Glob for `error_message` (matched against `Type: message`) and
+     * `release`; `*` matches any run of characters, `?` one. Case-insensitive.
+     */
+    pattern?: string | null;
+    project_id: number;
+    updated_at: string;
+};
+
+/**
+ * Every inbound filter of a project. Bounded by `limit`, so not paginated.
+ */
+export type InboundFiltersResponse = {
+    filters: Array<InboundFilterResponse>;
+    /**
+     * Most rules a project may hold.
+     */
+    limit: number;
+    /**
+     * Longest pattern a rule may hold, in characters.
+     */
+    max_pattern_chars: number;
 };
 
 export type IncidentBucket = {
@@ -20221,10 +20747,23 @@ export type ListErrorEventsQuery = {
 };
 
 export type ListErrorGroupsQuery = {
+    /**
+     * Only groups with this assignee: `me` (you, or a team you are in),
+     * `none`, `user:<id>` or `team:<id>`.
+     */
+    assignee?: string | null;
     end_date?: string | null;
     environment_id?: number | null;
+    /**
+     * `error` or `performance`; omitted for both.
+     */
+    issue_type?: string | null;
     page?: number;
     page_size?: number;
+    /**
+     * Case-insensitive text in the title, error type or message.
+     */
+    search?: string | null;
     sort_by?: string | null;
     sort_order?: string;
     start_date?: string | null;
@@ -21007,6 +21546,37 @@ export type MemberSyncResult = {
     name: string;
     project_id: number;
     slug: string;
+};
+
+/**
+ * Request body for `POST .../error-groups/{group_id}/merge`. The path group
+ * is the one that survives.
+ */
+export type MergeErrorGroupsRequest = {
+    /**
+     * Groups to merge into the path group; at most 50 per request.
+     */
+    source_group_ids: Array<number>;
+};
+
+/**
+ * Result of a merge.
+ */
+export type MergeErrorGroupsResponse = {
+    merged_group_ids: Array<number>;
+    /**
+     * Fingerprints now routing to the surviving group.
+     */
+    moved_fingerprints: number;
+    /**
+     * The group that survived; future events of every merged fingerprint
+     * land here.
+     */
+    target_group_id: number;
+    /**
+     * Events the surviving group accounts for after the merge.
+     */
+    total_count: number;
 };
 
 /**
@@ -23462,6 +24032,77 @@ export type OperatingSystemCount = {
 };
 
 /**
+ * Where the time of an operation goes, from a sample of its calls.
+ */
+export type OperationBreakdownResponse = {
+    /**
+     * The attribute the calls were split by, if any.
+     */
+    attribute?: string | null;
+    /**
+     * Largest total time first, at most 20 values (the rest summed).
+     */
+    by_attribute: Array<AttributeSliceResponse>;
+    end_time: string;
+    /**
+     * Largest exclusive time first, at most 25 (the rest summed).
+     */
+    groups: Array<BreakdownGroupResponse>;
+    /**
+     * Calls of the operation found in them.
+     */
+    instances: number;
+    max_traces: number;
+    /**
+     * `recent` or `slow`.
+     */
+    sample: string;
+    /**
+     * The operation's own exclusive time.
+     */
+    self_ms: number;
+    self_share: number;
+    service_name: string;
+    /**
+     * The p95 a `slow` sample started from.
+     */
+    slow_threshold_ms?: number | null;
+    span_name: string;
+    start_time: string;
+    total_ms: number;
+    /**
+     * Traces read; at most `max_traces`.
+     */
+    traces: number;
+};
+
+/**
+ * One operation that changed after a deployment.
+ */
+export type OperationChangeResponse = {
+    after_hours: number;
+    /**
+     * The median hourly p95 after.
+     */
+    after_p95_ms?: number | null;
+    baseline_hours: number;
+    /**
+     * The median hourly p95 in the week before.
+     */
+    baseline_p95_ms?: number | null;
+    /**
+     * `regressed` or `improved`.
+     */
+    change: string;
+    /**
+     * `after / baseline - 1`: 0.4 is 40% slower, -0.3 is 30% faster.
+     */
+    change_ratio?: number | null;
+    service_name: string;
+    span_name: string;
+};
+
+/**
  * One operation in the feed.
  */
 export type OperationEntry = {
@@ -23556,6 +24197,76 @@ export type OperationStatus = 'queued' | 'running' | 'waiting' | 'succeeded' | '
  * Which slice of the feed to return.
  */
 export type OperationStatusFilter = 'running' | 'waiting' | 'finished' | 'all';
+
+/**
+ * Whether operations of the project are tracked, and how many did not fit.
+ */
+export type OperationTrackingResponse = {
+    /**
+     * True once the rollup job has run for the project.
+     */
+    configured: boolean;
+    last_error?: string | null;
+    last_run_at?: string | null;
+    /**
+     * Operations kept per project and hour, those with the most total time.
+     */
+    max_tracked_operations: number;
+    /**
+     * Operations of that hour over the cap, which have no history.
+     */
+    overflow_operations: number;
+    /**
+     * Why there is no history yet, when `configured` is false.
+     */
+    reason?: string | null;
+    /**
+     * Days of history kept.
+     */
+    retention_days: number;
+    /**
+     * Hours that start before this have been rolled up.
+     */
+    rolled_until?: string | null;
+    /**
+     * The console page, relative to the project, that sets up what is
+     * missing.
+     */
+    setup_path?: string | null;
+    /**
+     * Operations kept in the last hour rolled up.
+     */
+    tracked_operations: number;
+};
+
+/**
+ * One hour of one operation.
+ */
+export type OperationTrendPointResponse = {
+    avg_ms: number;
+    bucket_start: string;
+    count: number;
+    error_count: number;
+    p50_ms: number;
+    p95_ms: number;
+    p99_ms: number;
+};
+
+/**
+ * An operation's hourly series, with the deployments in the window.
+ */
+export type OperationTrendResponse = {
+    deployments: Array<DeploymentMarkerResponse>;
+    end_time: string;
+    /**
+     * Hours with calls, oldest first; hours without calls have no point.
+     */
+    points: Array<OperationTrendPointResponse>;
+    service_name: string;
+    span_name: string;
+    start_time: string;
+    tracking: OperationTrackingResponse;
+};
 
 /**
  * A page of the operations feed. Sorted by `created_at` descending (fixed).
@@ -23905,6 +24616,50 @@ export type PageActivityBucket = {
      * Number of unique visitors in this bucket
      */
     visitors: number;
+};
+
+/**
+ * A page's web vitals next to the backend requests for its path.
+ */
+export type PageBackendResponse = {
+    /**
+     * Backend p75 over the page's p75 time to first byte: the part of the
+     * wait the backend explains. Null without both.
+     */
+    backend_share_of_ttfb?: number | null;
+    /**
+     * True when backend requests for the path were found.
+     */
+    configured: boolean;
+    end_time: string;
+    errors: number;
+    p50_ms?: number | null;
+    p75_ms?: number | null;
+    p95_ms?: number | null;
+    path: string;
+    /**
+     * Why none were, when `configured` is false.
+     */
+    reason?: string | null;
+    /**
+     * Backend requests found; at most 500 per attribute are read.
+     */
+    requests: number;
+    /**
+     * Services that served the path, most requests first.
+     */
+    services: Array<ServiceRequestsResponse>;
+    /**
+     * The console page, relative to the project, that sets up what is
+     * missing.
+     */
+    setup_path?: string | null;
+    /**
+     * Slowest first, at most 10, each linking to its trace.
+     */
+    slowest: Array<BackendRequestResponse>;
+    start_time: string;
+    vitals: PageVitalsResponse;
 };
 
 /**
@@ -24353,6 +25108,17 @@ export type PageVisitorSession = {
     visitor_uuid: string;
 };
 
+/**
+ * The 75th percentiles of a page's web vitals.
+ */
+export type PageVitalsResponse = {
+    fcp_p75_ms?: number | null;
+    inp_p75_ms?: number | null;
+    lcp_p75_ms?: number | null;
+    page_loads: number;
+    ttfb_p75_ms?: number | null;
+};
+
 export type PagesComparisonResponse = {
     comparisons: Array<PageSessionComparison>;
     page_paths: Array<string>;
@@ -24619,6 +25385,62 @@ export type PendingChanges = {
     service_id: number;
     service_name: string;
     support: WorkloadSupport;
+};
+
+/**
+ * One detector and what it looks for.
+ */
+export type PerformanceDetectorResponse = {
+    description: string;
+    /**
+     * `n_plus_one_query`, `slow_db_query`, `sequential_http` or
+     * `oversized_payload`.
+     */
+    key: string;
+    /**
+     * The issue type it files, e.g. `N+1 Query`.
+     */
+    title: string;
+};
+
+/**
+ * Whether traces of the project are checked for performance issues, and
+ * what the last check did.
+ */
+export type PerformanceIssueStatusResponse = {
+    /**
+     * Minutes between checks.
+     */
+    check_interval_minutes: number;
+    /**
+     * True once a check has read at least one trace of the project.
+     */
+    configured: boolean;
+    detectors: Array<PerformanceDetectorResponse>;
+    issues_found: number;
+    /**
+     * The last check's failure, if it failed.
+     */
+    last_error?: string | null;
+    last_run_at?: string | null;
+    /**
+     * Why nothing is detected yet, when `configured` is false.
+     */
+    reason?: string | null;
+    /**
+     * Traces started before this have been considered.
+     */
+    scanned_until?: string | null;
+    /**
+     * The console page, relative to the project, that sets up what is
+     * missing.
+     */
+    setup_path?: string | null;
+    /**
+     * Traces checked per project per check, the slowest first.
+     */
+    traces_per_check: number;
+    traces_scanned: number;
 };
 
 export type PerformanceMetricsQuery = SpeedSegmentFilters & {
@@ -28867,6 +29689,102 @@ export type ReleaseCheckResult = {
     update_available: boolean;
 };
 
+/**
+ * The deployment a release was first shipped by, when Temps deployed it.
+ */
+export type ReleaseDeployment = {
+    commit_message?: string | null;
+    deployment_id: number;
+    environment_id: number;
+    environment_name?: string | null;
+    ready_at?: string | null;
+};
+
+export type ReleaseHealth = {
+    abnormal_sessions: number;
+    /**
+     * This release's share of the sessions started in the last 24 hours,
+     * in the same environment filter.
+     */
+    adoption?: number | null;
+    /**
+     * `1 - crashed / sessions`; absent without sessions.
+     */
+    crash_free_sessions?: number | null;
+    /**
+     * `1 - crashed users / users`; absent when no session named a user.
+     */
+    crash_free_users?: number | null;
+    crashed_sessions: number;
+    crashed_users: number;
+    deployment?: ReleaseDeployment | null;
+    /**
+     * Sessions with at least one error, crashes included (an estimate for
+     * single sessions, exact for aggregates).
+     */
+    errored_sessions: number;
+    first_session_hour: string;
+    last_session_hour: string;
+    release: string;
+    /**
+     * When Temps first saw or deployed this release (the order "resolve in
+     * the next release" uses).
+     */
+    released_at?: string | null;
+    sessions: number;
+    sessions_last_24h: number;
+    /**
+     * Distinct users, estimated (about 6.5% standard error).
+     */
+    users: number;
+};
+
+export type ReleaseHealthPage = {
+    end_time: string;
+    /**
+     * SDK environments with sessions in the window, for the filter.
+     */
+    environments: Array<string>;
+    items: Array<ReleaseHealth>;
+    page: number;
+    per_page: number;
+    start_time: string;
+    total: number;
+    tracking: ReleaseHealthTracking;
+};
+
+export type ReleaseHealthPoint = {
+    abnormal_sessions: number;
+    bucket_start: string;
+    crash_free_sessions?: number | null;
+    crashed_sessions: number;
+    errored_sessions: number;
+    sessions: number;
+};
+
+export type ReleaseHealthSeries = {
+    end_time: string;
+    environment?: string | null;
+    /**
+     * One point per hour with sessions, oldest first.
+     */
+    points: Array<ReleaseHealthPoint>;
+    release: string;
+    start_time: string;
+};
+
+/**
+ * Whether the project has sent any session, and what to do if not.
+ */
+export type ReleaseHealthTracking = {
+    configured: boolean;
+    reason?: string | null;
+    /**
+     * Project-relative console path that shows how to set it up.
+     */
+    setup_path?: string | null;
+};
+
 export type ReleaseListResponse = {
     releases: Array<string>;
 };
@@ -31069,6 +31987,37 @@ export type SaveHttpCheck = {
     spec?: HttpCheckSpec | null;
 };
 
+/**
+ * The list filters a saved search applies. Every field is optional; an
+ * empty set is "all groups, newest first".
+ */
+export type SavedSearchFilters = {
+    /**
+     * `me`, `none`, `user:<id>` or `team:<id>`.
+     */
+    assignee?: string | null;
+    /**
+     * An environment of the project.
+     */
+    environment_id?: number | null;
+    /**
+     * Text in the title, error type or message.
+     */
+    search?: string | null;
+    /**
+     * `last_seen` (default), `first_seen`, `total_count` or `events_in_range`.
+     */
+    sort_by?: string | null;
+    /**
+     * `asc` or `desc` (default).
+     */
+    sort_order?: string | null;
+    /**
+     * `unresolved`, `resolved` or `ignored`; omitted for every status.
+     */
+    status?: string | null;
+};
+
 export type ScalewayCredentialsRequest = {
     api_key: SecretString;
     project_id: string;
@@ -32496,6 +33445,14 @@ export type ServiceReadiness = {
 };
 
 /**
+ * How many of a page's backend requests one service served.
+ */
+export type ServiceRequestsResponse = {
+    requests: number;
+    service_name: string;
+};
+
+/**
  * Optional cgroup resource limits applied to a service container.
  *
  * All fields are `Option<i64>`: `None` means "no limit" (the kernel default),
@@ -33025,6 +33982,15 @@ export type SetEnvironmentHostsRequest = {
      */
     confirm?: string | null;
     enabled: boolean;
+};
+
+/**
+ * Who to assign the group to. Set one of the two ids, or neither to
+ * unassign.
+ */
+export type SetErrorGroupAssigneeRequest = {
+    team_id?: number | null;
+    user_id?: number | null;
 };
 
 export type SetFlagEnvironmentRequest = {
@@ -34293,6 +35259,16 @@ export type SpanRow = {
  * `(project, service, span name)` triple over the queried window.
  */
 export type SpanStats = {
+    /**
+     * Apdex for `apdex_threshold_ms`: `(satisfied + tolerating / 2) /
+     * count`, from 0 (everyone frustrated) to 1 (everyone satisfied).
+     * `None` when the query asked for no score.
+     */
+    apdex?: number | null;
+    /**
+     * The threshold `T` the score used, in milliseconds.
+     */
+    apdex_threshold_ms?: number | null;
     avg_duration_ms: number;
     /**
      * `stddev / avg`, or `0` when `avg` is zero.
@@ -34308,6 +35284,10 @@ export type SpanStats = {
      */
     error_rate: number;
     /**
+     * Spans over `4T`.
+     */
+    frustrated_count?: number | null;
+    /**
      * The most common span kind for this operation.
      */
     kind: SpanKind;
@@ -34321,6 +35301,10 @@ export type SpanStats = {
     p95_duration_ms: number;
     p99_duration_ms: number;
     project_id: number;
+    /**
+     * Spans at or under `T`.
+     */
+    satisfied_count?: number | null;
     service_name: string;
     /**
      * The span name, which is the operation identity: `GET /api/checkout`,
@@ -34335,6 +35319,10 @@ export type SpanStats = {
      * `p99 / p50`, or `0` when `p50` is zero.
      */
     tail_ratio: number;
+    /**
+     * Spans over `T` and at or under `4T`.
+     */
+    tolerating_count?: number | null;
     /**
      * `SUM(duration_ms)` — total wall-clock attributable to this operation.
      */
@@ -34474,6 +35462,34 @@ export type SpeedSegmentFilters = {
      * Geolocation region (matches `ip_geolocations.region`)
      */
     filter_region?: string | null;
+};
+
+/**
+ * Request body for `POST .../error-groups/{group_id}/split`.
+ */
+export type SplitErrorGroupRequest = {
+    /**
+     * Fingerprints to move out; at most 200 per request, and the group must
+     * keep at least one.
+     */
+    fingerprints: Array<string>;
+    /**
+     * Title for the new group. Defaults to the original title with
+     * "(split)" appended.
+     */
+    title?: string | null;
+};
+
+/**
+ * Result of a split.
+ */
+export type SplitErrorGroupResponse = {
+    group_id: number;
+    moved_fingerprints: number;
+    /**
+     * The new group; future events of the moved fingerprints land here.
+     */
+    new_group_id: number;
 };
 
 export type StaleSlot = {
@@ -37179,6 +38195,18 @@ export type UniqueCountsResponse = {
 };
 
 /**
+ * Result of taking a group back out of a merge.
+ */
+export type UnmergeErrorGroupResponse = {
+    group_id: number;
+    moved_fingerprints: number;
+    /**
+     * The group it had been merged into.
+     */
+    target_group_id: number;
+};
+
+/**
  * A feature from the source platform that cannot be migrated
  */
 export type UnsupportedFeature = {
@@ -37946,13 +38974,31 @@ export type UpdateEnvironmentVariableRequest = {
 
 export type UpdateErrorGroupRequest = {
     /**
-     * Assignee (email by convention).
-     * - `Some("user@example.com")` — sets the assignee.
-     * - `Some("")` (empty string) — clears the current assignment (sets to null).
-     * - `null` / field omitted — leaves the existing value unchanged.
+     * Deprecated: assign by email. Prefer
+     * `PUT /projects/{project_id}/error-groups/{group_id}/assignee`.
+     * - `Some("user@example.com")`: assigns the user with that email; an
+     * email that is no user's is refused.
+     * - `Some("")` (empty string): unassigns the group.
+     * - `null` / field omitted: leaves the assignee unchanged.
+     *
+     * The status `assigned` is accepted and stored as `unresolved`.
      */
     assigned_to?: string | null;
+    ignore?: IgnoreConditionsRequest | null;
+    /**
+     * With `status: resolved` (or `action: resolve`): resolved in the next
+     * release. Events from the project's newest release at this moment, or
+     * an older one, or with no release, keep it resolved; an event from a
+     * newer release reopens it. Fails when the project has no release yet.
+     */
+    in_next_release?: boolean;
     status: string;
+};
+
+export type UpdateErrorSavedSearchRequest = {
+    filters?: SavedSearchFilters | null;
+    name?: string | null;
+    shared?: boolean | null;
 };
 
 export type UpdateExternalServiceRequest = {
@@ -38026,6 +39072,11 @@ export type UpdateHostImagePreparationBody = {
      * upgrade changes the default. `false` stops that; it removes nothing.
      */
     keep_prepared: boolean;
+};
+
+export type UpdateInboundFilterRequest = {
+    enabled?: boolean | null;
+    pattern?: string | null;
 };
 
 /**
@@ -71052,6 +72103,207 @@ export type QueryMetricsResponses = {
 
 export type QueryMetricsResponse = QueryMetricsResponses[keyof QueryMetricsResponses];
 
+export type GetOperationBreakdownData = {
+    body?: never;
+    path?: never;
+    query: {
+        project_id: number;
+        service_name: string;
+        /**
+         * The operation (span name).
+         */
+        span_name: string;
+        /**
+         * Window start (RFC 3339); defaults to 24 hours before `end_time`.
+         */
+        start_time?: string | null;
+        /**
+         * Window end (RFC 3339); defaults to now.
+         */
+        end_time?: string | null;
+        /**
+         * `recent` (default): the latest calls. `slow`: the latest calls at or
+         * over the window's p95.
+         */
+        sample?: string | null;
+        /**
+         * Also split the calls by the value of this attribute of the
+         * operation's own spans, e.g. `http.route` or `tenant.id`.
+         */
+        attribute?: string | null;
+    };
+    url: '/otel/operations/breakdown';
+};
+
+export type GetOperationBreakdownErrors = {
+    /**
+     * Missing operation, unknown sample, or a window over 7 days
+     */
+    400: unknown;
+    /**
+     * Not authenticated
+     */
+    401: unknown;
+    /**
+     * Missing otel:read or project access
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetOperationBreakdownResponses = {
+    /**
+     * Downstream calls by exclusive time
+     */
+    200: OperationBreakdownResponse;
+};
+
+export type GetOperationBreakdownResponse = GetOperationBreakdownResponses[keyof GetOperationBreakdownResponses];
+
+export type GetDeploymentRegressionsData = {
+    body?: never;
+    path?: never;
+    query: {
+        project_id: number;
+        deployment_id: number;
+    };
+    url: '/otel/operations/regressions';
+};
+
+export type GetDeploymentRegressionsErrors = {
+    /**
+     * The deployment never went live
+     */
+    400: unknown;
+    /**
+     * Not authenticated
+     */
+    401: unknown;
+    /**
+     * Missing otel:read or project access
+     */
+    403: unknown;
+    /**
+     * No such deployment in the project
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetDeploymentRegressionsResponses = {
+    /**
+     * Operations compared across the deployment
+     */
+    200: DeploymentRegressionsResponse;
+};
+
+export type GetDeploymentRegressionsResponse = GetDeploymentRegressionsResponses[keyof GetDeploymentRegressionsResponses];
+
+export type GetOperationTrendData = {
+    body?: never;
+    path?: never;
+    query: {
+        project_id: number;
+        service_name: string;
+        /**
+         * The operation (span name).
+         */
+        span_name: string;
+        /**
+         * Window start (RFC 3339); defaults to 14 days before `end_time`.
+         */
+        start_time?: string | null;
+        /**
+         * Window end (RFC 3339); defaults to now.
+         */
+        end_time?: string | null;
+    };
+    url: '/otel/operations/trend';
+};
+
+export type GetOperationTrendErrors = {
+    /**
+     * Missing operation, or a window over 30 days
+     */
+    400: unknown;
+    /**
+     * Not authenticated
+     */
+    401: unknown;
+    /**
+     * Missing otel:read or project access
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetOperationTrendResponses = {
+    /**
+     * Hourly series of the operation
+     */
+    200: OperationTrendResponse;
+};
+
+export type GetOperationTrendResponse = GetOperationTrendResponses[keyof GetOperationTrendResponses];
+
+export type GetPageBackendData = {
+    body?: never;
+    path?: never;
+    query: {
+        project_id: number;
+        /**
+         * The page path, as the analytics SDK records it, e.g. `/checkout`.
+         */
+        path: string;
+        /**
+         * Window start (RFC 3339); defaults to 24 hours before `end_time`.
+         */
+        start_time?: string | null;
+        /**
+         * Window end (RFC 3339); defaults to now.
+         */
+        end_time?: string | null;
+    };
+    url: '/otel/pages/backend';
+};
+
+export type GetPageBackendErrors = {
+    /**
+     * A path not starting with /, or a window over 7 days
+     */
+    400: unknown;
+    /**
+     * Not authenticated
+     */
+    401: unknown;
+    /**
+     * Missing otel:read or project access
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetPageBackendResponses = {
+    /**
+     * Web vitals and backend timing of the page
+     */
+    200: PageBackendResponse;
+};
+
+export type GetPageBackendResponse = GetPageBackendResponses[keyof GetPageBackendResponses];
+
 export type GetPipelineHistoryData = {
     body?: never;
     path?: never;
@@ -71245,6 +72497,10 @@ export type QuerySpanStatsData = {
          * Page offset
          */
         offset?: number;
+        /**
+         * Apdex threshold T in ms (default 500, at most 600000): at or under T satisfies, up to 4T tolerates
+         */
+        apdex_threshold_ms?: number;
     };
     url: '/otel/span-stats';
 };
@@ -85015,6 +86271,52 @@ export type GetErrorDashboardStatsResponses = {
 
 export type GetErrorDashboardStatsResponse = GetErrorDashboardStatsResponses[keyof GetErrorDashboardStatsResponses];
 
+export type SearchErrorGroupAssigneesData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: {
+        /**
+         * Text in the user's name or email, or the team's name. Empty lists the
+         * first candidates alphabetically.
+         */
+        q?: string;
+    };
+    url: '/projects/{project_id}/error-group-assignees';
+};
+
+export type SearchErrorGroupAssigneesErrors = {
+    /**
+     * Search text too long
+     */
+    400: unknown;
+    /**
+     * Not authenticated
+     */
+    401: unknown;
+    /**
+     * Missing error_tracking:write or project access
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type SearchErrorGroupAssigneesResponses = {
+    /**
+     * Assignee candidates
+     */
+    200: ErrorGroupAssigneeOptionsResponse;
+};
+
+export type SearchErrorGroupAssigneesResponse = SearchErrorGroupAssigneesResponses[keyof SearchErrorGroupAssigneesResponses];
+
 export type ListErrorGroupsData = {
     body?: never;
     path: {
@@ -85032,6 +86334,19 @@ export type ListErrorGroupsData = {
         end_date?: string | null;
         sort_by?: string | null;
         sort_order?: string;
+        /**
+         * Only groups with this assignee: `me` (you, or a team you are in),
+         * `none`, `user:<id>` or `team:<id>`.
+         */
+        assignee?: string | null;
+        /**
+         * Case-insensitive text in the title, error type or message.
+         */
+        search?: string | null;
+        /**
+         * `error` or `performance`; omitted for both.
+         */
+        issue_type?: string | null;
     };
     url: '/projects/{project_id}/error-groups';
 };
@@ -85051,6 +86366,50 @@ export type ListErrorGroupsResponses = {
 };
 
 export type ListErrorGroupsResponse = ListErrorGroupsResponses[keyof ListErrorGroupsResponses];
+
+export type BulkUpdateErrorGroupsData = {
+    body: BulkErrorGroupRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/error-groups/bulk';
+};
+
+export type BulkUpdateErrorGroupsErrors = {
+    /**
+     * Invalid selection or filter
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * A group in group_ids is not in this project
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type BulkUpdateErrorGroupsResponses = {
+    /**
+     * Groups updated
+     */
+    200: BulkErrorGroupResponse;
+};
+
+export type BulkUpdateErrorGroupsResponse = BulkUpdateErrorGroupsResponses[keyof BulkUpdateErrorGroupsResponses];
 
 export type GetErrorGroupData = {
     body?: never;
@@ -85121,6 +86480,255 @@ export type UpdateErrorGroupResponses = {
      */
     200: unknown;
 };
+
+export type ListErrorGroupActivityData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Error group ID
+         */
+        group_id: number;
+    };
+    query?: {
+        /**
+         * Page number, from 1.
+         */
+        page?: number;
+        /**
+         * Entries per page, 1 to 100.
+         */
+        page_size?: number;
+    };
+    url: '/projects/{project_id}/error-groups/{group_id}/activity';
+};
+
+export type ListErrorGroupActivityErrors = {
+    /**
+     * Not authenticated
+     */
+    401: unknown;
+    /**
+     * Missing error_tracking:read or project access
+     */
+    403: unknown;
+    /**
+     * Error group not found in the project
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListErrorGroupActivityResponses = {
+    /**
+     * A page of the activity log
+     */
+    200: ErrorGroupActivityPageResponse;
+};
+
+export type ListErrorGroupActivityResponse = ListErrorGroupActivityResponses[keyof ListErrorGroupActivityResponses];
+
+export type SetErrorGroupAssigneeData = {
+    body: SetErrorGroupAssigneeRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Error group ID
+         */
+        group_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/error-groups/{group_id}/assignee';
+};
+
+export type SetErrorGroupAssigneeErrors = {
+    /**
+     * Both ids set, an unknown user or team, or a user without access to the project
+     */
+    400: unknown;
+    /**
+     * Not authenticated
+     */
+    401: unknown;
+    /**
+     * Missing error_tracking:write or project access
+     */
+    403: unknown;
+    /**
+     * Error group not found in the project
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type SetErrorGroupAssigneeResponses = {
+    /**
+     * Assignee set
+     */
+    200: ErrorGroupAssigneeResponse;
+};
+
+export type SetErrorGroupAssigneeResponse = SetErrorGroupAssigneeResponses[keyof SetErrorGroupAssigneeResponses];
+
+export type CreateErrorGroupCommentData = {
+    body: ErrorGroupCommentRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Error group ID
+         */
+        group_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/error-groups/{group_id}/comments';
+};
+
+export type CreateErrorGroupCommentErrors = {
+    /**
+     * Empty or longer than 10,000 characters
+     */
+    400: unknown;
+    /**
+     * Not authenticated
+     */
+    401: unknown;
+    /**
+     * Missing error_tracking:write or project access
+     */
+    403: unknown;
+    /**
+     * Error group not found in the project
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type CreateErrorGroupCommentResponses = {
+    /**
+     * Comment added
+     */
+    201: ErrorGroupActivityResponse;
+};
+
+export type CreateErrorGroupCommentResponse = CreateErrorGroupCommentResponses[keyof CreateErrorGroupCommentResponses];
+
+export type DeleteErrorGroupCommentData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Error group ID
+         */
+        group_id: number;
+        /**
+         * Comment ID
+         */
+        comment_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/error-groups/{group_id}/comments/{comment_id}';
+};
+
+export type DeleteErrorGroupCommentErrors = {
+    /**
+     * Not authenticated
+     */
+    401: unknown;
+    /**
+     * Neither the author nor an administrator
+     */
+    403: unknown;
+    /**
+     * Comment not found on the group
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type DeleteErrorGroupCommentResponses = {
+    /**
+     * Comment deleted
+     */
+    204: void;
+};
+
+export type DeleteErrorGroupCommentResponse = DeleteErrorGroupCommentResponses[keyof DeleteErrorGroupCommentResponses];
+
+export type UpdateErrorGroupCommentData = {
+    body: ErrorGroupCommentRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Error group ID
+         */
+        group_id: number;
+        /**
+         * Comment ID
+         */
+        comment_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/error-groups/{group_id}/comments/{comment_id}';
+};
+
+export type UpdateErrorGroupCommentErrors = {
+    /**
+     * Empty or longer than 10,000 characters
+     */
+    400: unknown;
+    /**
+     * Not authenticated
+     */
+    401: unknown;
+    /**
+     * Not the comment's author, or missing error_tracking:write
+     */
+    403: unknown;
+    /**
+     * Comment not found on the group
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UpdateErrorGroupCommentResponses = {
+    /**
+     * Comment changed
+     */
+    200: ErrorGroupActivityResponse;
+};
+
+export type UpdateErrorGroupCommentResponse = UpdateErrorGroupCommentResponses[keyof UpdateErrorGroupCommentResponses];
 
 export type ListErrorEventsData = {
     body?: never;
@@ -85213,6 +86821,603 @@ export type GetErrorEventResponses = {
 };
 
 export type GetErrorEventResponse = GetErrorEventResponses[keyof GetErrorEventResponses];
+
+export type ListErrorGroupFingerprintsData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Error group ID
+         */
+        group_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/error-groups/{group_id}/fingerprints';
+};
+
+export type ListErrorGroupFingerprintsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * The group is not in this project
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListErrorGroupFingerprintsResponses = {
+    /**
+     * Fingerprints of the group
+     */
+    200: ErrorGroupFingerprintsResponse;
+};
+
+export type ListErrorGroupFingerprintsResponse = ListErrorGroupFingerprintsResponses[keyof ListErrorGroupFingerprintsResponses];
+
+export type MergeErrorGroupsData = {
+    body: MergeErrorGroupsRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Surviving error group ID
+         */
+        group_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/error-groups/{group_id}/merge';
+};
+
+export type MergeErrorGroupsErrors = {
+    /**
+     * Invalid selection
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * A named group is not in this project
+     */
+    404: unknown;
+    /**
+     * A named group is already merged, or has groups merged into it
+     */
+    409: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type MergeErrorGroupsResponses = {
+    /**
+     * Groups merged
+     */
+    200: MergeErrorGroupsResponse;
+};
+
+export type MergeErrorGroupsResponse2 = MergeErrorGroupsResponses[keyof MergeErrorGroupsResponses];
+
+export type SplitErrorGroupData = {
+    body: SplitErrorGroupRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Error group ID
+         */
+        group_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/error-groups/{group_id}/split';
+};
+
+export type SplitErrorGroupErrors = {
+    /**
+     * Invalid selection
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * The group or a fingerprint is not in this project
+     */
+    404: unknown;
+    /**
+     * The group is merged into another group
+     */
+    409: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type SplitErrorGroupResponses = {
+    /**
+     * Fingerprints split out
+     */
+    200: SplitErrorGroupResponse;
+};
+
+export type SplitErrorGroupResponse2 = SplitErrorGroupResponses[keyof SplitErrorGroupResponses];
+
+export type UnmergeErrorGroupData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Merged-away error group ID
+         */
+        group_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/error-groups/{group_id}/unmerge';
+};
+
+export type UnmergeErrorGroupErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * The group is not in this project
+     */
+    404: unknown;
+    /**
+     * The group is not merged into another group
+     */
+    409: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UnmergeErrorGroupResponses = {
+    /**
+     * Group taken out of the merge
+     */
+    200: UnmergeErrorGroupResponse;
+};
+
+export type UnmergeErrorGroupResponse2 = UnmergeErrorGroupResponses[keyof UnmergeErrorGroupResponses];
+
+export type ListErrorInboundFiltersData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/error-inbound-filters';
+};
+
+export type ListErrorInboundFiltersErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListErrorInboundFiltersResponses = {
+    /**
+     * The project's inbound filters
+     */
+    200: InboundFiltersResponse;
+};
+
+export type ListErrorInboundFiltersResponse = ListErrorInboundFiltersResponses[keyof ListErrorInboundFiltersResponses];
+
+export type CreateErrorInboundFilterData = {
+    body: CreateInboundFilterRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/error-inbound-filters';
+};
+
+export type CreateErrorInboundFilterErrors = {
+    /**
+     * Invalid kind or pattern, or the project's limit is reached
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * The project already has this built-in filter
+     */
+    409: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type CreateErrorInboundFilterResponses = {
+    /**
+     * Filter created
+     */
+    201: InboundFilterResponse;
+};
+
+export type CreateErrorInboundFilterResponse = CreateErrorInboundFilterResponses[keyof CreateErrorInboundFilterResponses];
+
+export type DeleteErrorInboundFilterData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Inbound filter ID
+         */
+        filter_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/error-inbound-filters/{filter_id}';
+};
+
+export type DeleteErrorInboundFilterErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * No such filter in this project
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type DeleteErrorInboundFilterResponses = {
+    /**
+     * Filter deleted
+     */
+    204: void;
+};
+
+export type DeleteErrorInboundFilterResponse = DeleteErrorInboundFilterResponses[keyof DeleteErrorInboundFilterResponses];
+
+export type UpdateErrorInboundFilterData = {
+    body: UpdateInboundFilterRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Inbound filter ID
+         */
+        filter_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/error-inbound-filters/{filter_id}';
+};
+
+export type UpdateErrorInboundFilterErrors = {
+    /**
+     * Invalid pattern
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * No such filter in this project
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UpdateErrorInboundFilterResponses = {
+    /**
+     * Filter updated
+     */
+    200: InboundFilterResponse;
+};
+
+export type UpdateErrorInboundFilterResponse = UpdateErrorInboundFilterResponses[keyof UpdateErrorInboundFilterResponses];
+
+export type ListErrorSavedSearchesData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: {
+        /**
+         * Page number, from 1.
+         */
+        page?: number;
+        /**
+         * Searches per page, 1 to 100.
+         */
+        page_size?: number;
+    };
+    url: '/projects/{project_id}/error-saved-searches';
+};
+
+export type ListErrorSavedSearchesErrors = {
+    /**
+     * Not authenticated
+     */
+    401: unknown;
+    /**
+     * Missing error_tracking:read or project access
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListErrorSavedSearchesResponses = {
+    /**
+     * A page of saved searches
+     */
+    200: ErrorSavedSearchPageResponse;
+};
+
+export type ListErrorSavedSearchesResponse = ListErrorSavedSearchesResponses[keyof ListErrorSavedSearchesResponses];
+
+export type CreateErrorSavedSearchData = {
+    body: CreateErrorSavedSearchRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/error-saved-searches';
+};
+
+export type CreateErrorSavedSearchErrors = {
+    /**
+     * An invalid name or filter, or 50 saved searches already
+     */
+    400: unknown;
+    /**
+     * Not authenticated
+     */
+    401: unknown;
+    /**
+     * Missing error_tracking:write or project access
+     */
+    403: unknown;
+    /**
+     * You already have a saved search with that name
+     */
+    409: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type CreateErrorSavedSearchResponses = {
+    /**
+     * Search saved
+     */
+    201: ErrorSavedSearchResponse;
+};
+
+export type CreateErrorSavedSearchResponse = CreateErrorSavedSearchResponses[keyof CreateErrorSavedSearchResponses];
+
+export type DeleteErrorSavedSearchData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Saved search ID
+         */
+        saved_search_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/error-saved-searches/{saved_search_id}';
+};
+
+export type DeleteErrorSavedSearchErrors = {
+    /**
+     * Not authenticated
+     */
+    401: unknown;
+    /**
+     * Neither its owner nor an administrator
+     */
+    403: unknown;
+    /**
+     * No such saved search you can see in the project
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type DeleteErrorSavedSearchResponses = {
+    /**
+     * Saved search deleted
+     */
+    204: void;
+};
+
+export type DeleteErrorSavedSearchResponse = DeleteErrorSavedSearchResponses[keyof DeleteErrorSavedSearchResponses];
+
+export type GetErrorSavedSearchData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Saved search ID
+         */
+        saved_search_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/error-saved-searches/{saved_search_id}';
+};
+
+export type GetErrorSavedSearchErrors = {
+    /**
+     * Not authenticated
+     */
+    401: unknown;
+    /**
+     * Missing error_tracking:read or project access
+     */
+    403: unknown;
+    /**
+     * No such saved search you can see in the project
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetErrorSavedSearchResponses = {
+    /**
+     * The saved search
+     */
+    200: ErrorSavedSearchResponse;
+};
+
+export type GetErrorSavedSearchResponse = GetErrorSavedSearchResponses[keyof GetErrorSavedSearchResponses];
+
+export type UpdateErrorSavedSearchData = {
+    body: UpdateErrorSavedSearchRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Saved search ID
+         */
+        saved_search_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/error-saved-searches/{saved_search_id}';
+};
+
+export type UpdateErrorSavedSearchErrors = {
+    /**
+     * An invalid name or filter
+     */
+    400: unknown;
+    /**
+     * Not authenticated
+     */
+    401: unknown;
+    /**
+     * Not its owner, or missing error_tracking:write
+     */
+    403: unknown;
+    /**
+     * No such saved search you can see in the project
+     */
+    404: unknown;
+    /**
+     * You already have a saved search with that name
+     */
+    409: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UpdateErrorSavedSearchResponses = {
+    /**
+     * Saved search changed
+     */
+    200: ErrorSavedSearchResponse;
+};
+
+export type UpdateErrorSavedSearchResponse = UpdateErrorSavedSearchResponses[keyof UpdateErrorSavedSearchResponses];
 
 export type GetErrorStatsData = {
     body?: never;
@@ -88655,6 +90860,146 @@ export type ObservabilityFullEventResponses = {
 };
 
 export type ObservabilityFullEventResponse = ObservabilityFullEventResponses[keyof ObservabilityFullEventResponses];
+
+export type GetPerformanceIssueStatusData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/performance-issues/status';
+};
+
+export type GetPerformanceIssueStatusErrors = {
+    /**
+     * Not authenticated
+     */
+    401: unknown;
+    /**
+     * Missing error_tracking:read or project access
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetPerformanceIssueStatusResponses = {
+    /**
+     * Detection status
+     */
+    200: PerformanceIssueStatusResponse;
+};
+
+export type GetPerformanceIssueStatusResponse = GetPerformanceIssueStatusResponses[keyof GetPerformanceIssueStatusResponses];
+
+export type ListReleaseHealthData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: {
+        /**
+         * SDK environment (as the SDK sent it); absent reads all of them.
+         */
+        environment?: string | null;
+        /**
+         * Window in days, 1 to 14; default 7.
+         */
+        days?: number | null;
+        page?: number | null;
+        /**
+         * 1 to 100; default 20.
+         */
+        per_page?: number | null;
+    };
+    url: '/projects/{project_id}/release-health';
+};
+
+export type ListReleaseHealthErrors = {
+    /**
+     * Invalid window, page or environment
+     */
+    400: unknown;
+    /**
+     * Authentication required
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Release health could not be read
+     */
+    500: unknown;
+};
+
+export type ListReleaseHealthResponses = {
+    /**
+     * Release health of the project
+     */
+    200: ReleaseHealthPage;
+};
+
+export type ListReleaseHealthResponse = ListReleaseHealthResponses[keyof ListReleaseHealthResponses];
+
+export type GetReleaseHealthSeriesData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query: {
+        /**
+         * The release, exactly as the SDK sent it.
+         */
+        release: string;
+        environment?: string | null;
+        /**
+         * Window in days, 1 to 14; default 7.
+         */
+        days?: number | null;
+    };
+    url: '/projects/{project_id}/release-health/series';
+};
+
+export type GetReleaseHealthSeriesErrors = {
+    /**
+     * Invalid release, window or environment
+     */
+    400: unknown;
+    /**
+     * Authentication required
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Release health could not be read
+     */
+    500: unknown;
+};
+
+export type GetReleaseHealthSeriesResponses = {
+    /**
+     * Hourly health of the release
+     */
+    200: ReleaseHealthSeries;
+};
+
+export type GetReleaseHealthSeriesResponse = GetReleaseHealthSeriesResponses[keyof GetReleaseHealthSeriesResponses];
 
 export type DeleteReleaseSourceFilesData = {
     body?: never;

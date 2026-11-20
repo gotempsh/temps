@@ -176,7 +176,7 @@ export class FeatureFlags {
    * client stays lazy.
    */
   setContext(context: FlagContext): void {
-    this.context = { key: context.key, attributes: context.attributes };
+    this.replaceContext({ key: context.key, attributes: context.attributes });
     if (this.currentStatus !== "idle") void this.load();
   }
 
@@ -224,10 +224,10 @@ export class FeatureFlags {
    * over the previous ones; pass `key` to change the bucketing subject.
    */
   reload(context: FlagContext = {}): Promise<void> {
-    this.context = {
+    this.replaceContext({
       key: context.key ?? this.context.key,
       attributes: { ...this.context.attributes, ...context.attributes },
-    };
+    });
     return this.load();
   }
 
@@ -236,6 +236,24 @@ export class FeatureFlags {
     return () => {
       this.listeners.delete(listener);
     };
+  }
+
+  /**
+   * Values evaluated for another subject or other attributes must not be
+   * read under the new ones: after a sign-out they would be the previous
+   * user's, and would stay if the new request failed. A change therefore
+   * drops the results, the bootstrap values (rendered for the old context)
+   * and the exposures already recorded; an unchanged context keeps the last
+   * good values while it refreshes.
+   */
+  private replaceContext(next: FlagContext): void {
+    const changed = contextKey(next) !== contextKey(this.context);
+    this.context = next;
+    if (!changed) return;
+    this.results = new Map();
+    this.bootstrap.clear();
+    this.exposed.clear();
+    this.notify();
   }
 
   private ensureLoaded(): void {
@@ -333,4 +351,10 @@ function compatible(value: unknown, fallback: unknown): boolean {
 /** Event data for a `flag_exposure` analytics event. */
 export function exposureEventData(exposure: FlagExposure): Record<string, JsonValue> {
   return { flag_key: exposure.flag_key, variant: exposure.variant, reason: exposure.reason };
+}
+
+/** A context as a value: attributes compared by content, not key order. */
+function contextKey(context: FlagContext): string {
+  const attributes = Object.entries(context.attributes ?? {}).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  return JSON.stringify([context.key ?? null, attributes]);
 }

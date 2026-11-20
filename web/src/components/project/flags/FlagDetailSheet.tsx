@@ -118,7 +118,7 @@ function FlagDetailBody({
   const [exposureError, setExposureError] = useState<string | null>(null)
   // The definition draft stays mounted across refetches (another section's
   // save refetches the flag); this is the revision it is based on.
-  const definitionRevision = useDraftBaseline(
+  const [definitionRevision, definitionSaved] = useDraftBaseline(
     flag.updated_at,
     {
       default_value: flag.default_value,
@@ -208,19 +208,24 @@ function FlagDetailBody({
     const trimmedDescription = description.trim()
     setDescription(trimmedDescription)
 
-    update.mutate({
-      path: { project_id: projectId, key: flag.key },
-      body: {
-        default_value: parsed.value,
-        description: trimmedDescription || null,
-        // Sent only when edited: the field shows a rounded percentage, and
-        // saving that back would change a rate nobody touched.
-        ...(exposurePercent === exposureText(flag.exposure_sample_rate)
-          ? {}
-          : { exposure_sample_rate: percent / 100 }),
-        expected_updated_at: definitionRevision,
+    update.mutate(
+      {
+        path: { project_id: projectId, key: flag.key },
+        body: {
+          default_value: parsed.value,
+          description: trimmedDescription || null,
+          // Sent only when edited: the field shows a rounded percentage, and
+          // saving that back would change a rate nobody touched.
+          ...(exposurePercent === exposureText(flag.exposure_sample_rate)
+            ? {}
+            : { exposure_sample_rate: percent / 100 }),
+          expected_updated_at: definitionRevision,
+        },
       },
-    })
+      // The server may store the value normalised (`2.0` as `2`), so the
+      // draft is replaced by what the refetch returns.
+      { onSuccess: () => definitionSaved() }
+    )
   }
 
   const setClientVisible = (next: boolean) => {

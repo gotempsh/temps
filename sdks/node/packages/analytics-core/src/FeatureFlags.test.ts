@@ -163,6 +163,44 @@ describe("FeatureFlags", () => {
     expect(bodies[1]).toEqual({ key: "user-2", attributes: { plan: "team" } });
   });
 
+  it("drops the previous subject's values when the context changes", async () => {
+    let status = 200;
+    const fetch = vi.fn(async () =>
+      new Response(JSON.stringify({ flags: [checkout] }), { status, headers: { "Content-Type": "application/json" } })
+    );
+    const flags = new FeatureFlags({
+      fetch,
+      key: "user-1",
+      bootstrap: { "checkout.v2": true },
+      onError: () => undefined,
+    });
+    await flags.ready();
+    expect(flags.get("checkout.v2", false)).toBe(true);
+
+    // Sign-out: the next request fails, and nothing of user-1's remains.
+    status = 429;
+    flags.setContext({});
+    expect(flags.peek("checkout.v2", false)).toBe(false);
+    await flags.ready();
+    expect(flags.get("checkout.v2", false)).toBe(false);
+
+    // A refresh with the same context keeps the last good values.
+    status = 200;
+    await flags.reload();
+    expect(flags.get("checkout.v2", false)).toBe(true);
+    status = 503;
+    await flags.reload({ attributes: {} });
+    expect(flags.get("checkout.v2", false)).toBe(true);
+  });
+
+  it("treats attributes in another order as the same context", async () => {
+    const fetch = served([checkout]);
+    const flags = new FeatureFlags({ fetch, attributes: { a: 1, b: 2 } });
+    await flags.ready();
+    flags.setContext({ attributes: { b: 2, a: 1 } });
+    expect(flags.peek("checkout.v2", false)).toBe(true);
+  });
+
   it("can be disabled and re-enabled after construction", async () => {
     const fetch = served([checkout]);
     const flags = new FeatureFlags({ fetch, disabled: true });

@@ -1022,6 +1022,69 @@
         ],
         "type": "object"
       },
+      "ActivityDetails": {
+        "description": "The specifics of an entry; which fields are set depends on the kind.",
+        "properties": {
+          "assignee": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Assignee",
+                "description": "`assigned`: the new assignee; `None` when unassigned."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "assignee_name": {
+            "description": "`assigned`: the assignee's name when the entry was written.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "bulk": {
+            "description": "`status_changed`: the change came from a bulk request.",
+            "type": "boolean"
+          },
+          "fingerprints": {
+            "description": "`merged`, `unmerged`, `split`: how many fingerprints moved.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "group_ids": {
+            "description": "`merged`: the groups merged in. `unmerged`, `split`: the group on the\nother side (both groups get an entry).",
+            "items": {
+              "format": "int32",
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "in_next_release": {
+            "description": "`status_changed`: resolved in the next release.",
+            "type": "boolean"
+          },
+          "release": {
+            "description": "`regressed`: the release of the event that reopened the group.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "description": "`status_changed`: the new status. `regressed`: the status the group\nhad before the event reopened it (`resolved` or `ignored`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "ActivityEvent": {
         "description": "A single activity event for the real-time activity feed",
         "properties": {
@@ -1315,6 +1378,19 @@
           "end_date"
         ],
         "type": "object"
+      },
+      "ActivityKind": {
+        "description": "What happened to the group.",
+        "enum": [
+          "comment",
+          "status_changed",
+          "regressed",
+          "assigned",
+          "merged",
+          "unmerged",
+          "split"
+        ],
+        "type": "string"
       },
       "ActivityPreview": {
         "properties": {
@@ -6636,6 +6712,49 @@
         ],
         "type": "object"
       },
+      "Assignee": {
+        "description": "Who a group is assigned to.",
+        "oneOf": [
+          {
+            "properties": {
+              "id": {
+                "format": "int32",
+                "type": "integer"
+              },
+              "type": {
+                "enum": [
+                  "user"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "id": {
+                "format": "int32",
+                "type": "integer"
+              },
+              "type": {
+                "enum": [
+                  "team"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "type"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "AttachEnvironmentVolumeRequest": {
         "properties": {
           "mount_path": {
@@ -6778,6 +6897,47 @@
         },
         "required": [
           "keys"
+        ],
+        "type": "object"
+      },
+      "AttributeSliceResponse": {
+        "description": "One value of the requested attribute.",
+        "properties": {
+          "avg_ms": {
+            "format": "double",
+            "type": "number"
+          },
+          "calls": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "max_ms": {
+            "format": "double",
+            "type": "number"
+          },
+          "share": {
+            "format": "double",
+            "type": "number"
+          },
+          "total_ms": {
+            "format": "double",
+            "type": "number"
+          },
+          "value": {
+            "description": "Null for calls without the attribute.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "calls",
+          "total_ms",
+          "share",
+          "avg_ms",
+          "max_ms"
         ],
         "type": "object"
       },
@@ -7903,6 +8063,40 @@
         ],
         "type": "object"
       },
+      "BackendRequestResponse": {
+        "description": "One backend request that served the page.",
+        "properties": {
+          "duration_ms": {
+            "format": "double",
+            "type": "number"
+          },
+          "error": {
+            "type": "boolean"
+          },
+          "service_name": {
+            "type": "string"
+          },
+          "span_name": {
+            "type": "string"
+          },
+          "start_time": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "trace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "trace_id",
+          "span_name",
+          "service_name",
+          "start_time",
+          "duration_ms",
+          "error"
+        ],
+        "type": "object"
+      },
       "BackupAlertListResponse": {
         "description": "Response body for the list-backup-alerts endpoint.",
         "properties": {
@@ -8744,6 +8938,58 @@
         ],
         "type": "object"
       },
+      "BreakdownGroupResponse": {
+        "description": "One downstream call inside the operation.",
+        "properties": {
+          "avg_ms": {
+            "description": "Exclusive time per call.",
+            "format": "double",
+            "type": "number"
+          },
+          "calls": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "calls_per_instance": {
+            "description": "Calls per sampled call of the operation.",
+            "format": "double",
+            "type": "number"
+          },
+          "category": {
+            "description": "`database`, `http`, `messaging`, `rpc`, `client`, `server`,\n`internal`, or `other` for the summed remainder.",
+            "type": "string"
+          },
+          "service_name": {
+            "description": "Empty for the summed remainder.",
+            "type": "string"
+          },
+          "share": {
+            "description": "`total_ms` over the operation's total time. Parallel calls can add\nup to more than 1.",
+            "format": "double",
+            "type": "number"
+          },
+          "span_name": {
+            "type": "string"
+          },
+          "total_ms": {
+            "description": "Exclusive time, summed over the sample.",
+            "format": "double",
+            "type": "number"
+          }
+        },
+        "required": [
+          "service_name",
+          "span_name",
+          "category",
+          "total_ms",
+          "share",
+          "calls",
+          "calls_per_instance",
+          "avg_ms"
+        ],
+        "type": "object"
+      },
       "BrowserCount": {
         "properties": {
           "browser": {
@@ -9531,6 +9777,150 @@
           },
           "updated_ids": {
             "description": "IDs of the alarms that changed state.",
+            "items": {
+              "format": "int32",
+              "type": "integer"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "action",
+          "updated",
+          "updated_ids",
+          "skipped",
+          "remaining"
+        ],
+        "type": "object"
+      },
+      "BulkErrorGroupAction": {
+        "description": "Status transition a bulk request applies.",
+        "enum": [
+          "resolve",
+          "unresolve",
+          "ignore"
+        ],
+        "type": "string"
+      },
+      "BulkErrorGroupFilter": {
+        "description": "Filters selecting \"every group matching\", with the same meaning they have\non the list endpoint. `{}` selects every group of the project that is not\nalready in the target status.",
+        "properties": {
+          "end_date": {
+            "description": "With `start_date`: only groups with at least one event in the window.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "environment_id": {
+            "description": "Only groups first seen in this environment.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "search": {
+            "description": "Case-insensitive substring of the title, error type or message.\nWildcards are matched literally.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "start_date": {
+            "description": "With `end_date`: only groups with at least one event in the window.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "description": "Only groups currently in this status.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "BulkErrorGroupRequest": {
+        "description": "Request body for `POST .../error-groups/bulk`. Provide exactly one of\n`group_ids` or `filter`.",
+        "properties": {
+          "action": {
+            "$ref": "#/components/schemas/BulkErrorGroupAction"
+          },
+          "filter": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/BulkErrorGroupFilter",
+                "description": "Update every group matching these filters, up to 1000 per request."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "group_ids": {
+            "description": "Explicit groups to update; every one must be in this project.",
+            "items": {
+              "format": "int32",
+              "type": "integer"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "ignore": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/IgnoreConditionsRequest",
+                "description": "With `action: ignore`: when the groups come back. Omitted, the next\nevent reopens them."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "in_next_release": {
+            "description": "With `status: resolved` (or `action: resolve`): resolved in the next\nrelease. Events from the project's newest release at this moment, or\nan older one, or with no release, keep it resolved; an event from a\nnewer release reopens it. Fails when the project has no release yet.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "type": "object"
+      },
+      "BulkErrorGroupResponse": {
+        "description": "Result of a bulk group update.",
+        "properties": {
+          "action": {
+            "$ref": "#/components/schemas/BulkErrorGroupAction"
+          },
+          "remaining": {
+            "description": "Matching groups left for a follow-up request because this one hit the\nper-request limit. Always 0 when `group_ids` was used.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "skipped": {
+            "description": "Selected groups already in the target status.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "updated": {
+            "description": "Number of groups whose status changed.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "updated_ids": {
+            "description": "Ids of the groups whose status changed.",
             "items": {
               "format": "int32",
               "type": "integer"
@@ -17526,6 +17916,25 @@
         ],
         "type": "object"
       },
+      "CreateErrorSavedSearchRequest": {
+        "properties": {
+          "filters": {
+            "$ref": "#/components/schemas/SavedSearchFilters"
+          },
+          "name": {
+            "description": "At most 100 characters, unique among your saved searches in the project.",
+            "type": "string"
+          },
+          "shared": {
+            "description": "Share with everyone who can open the project.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
       "CreateExternalServiceRequest": {
         "properties": {
           "members": {
@@ -17921,6 +18330,31 @@
           "source_project_id",
           "path_prefix",
           "target_project_id"
+        ],
+        "type": "object"
+      },
+      "CreateInboundFilterRequest": {
+        "properties": {
+          "enabled": {
+            "description": "Defaults to true.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "kind": {
+            "$ref": "#/components/schemas/InboundFilterKind"
+          },
+          "pattern": {
+            "description": "Required for `error_message` and `release`, refused for the others.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "kind"
         ],
         "type": "object"
       },
@@ -22910,6 +23344,33 @@
         ],
         "type": "object"
       },
+      "DeploymentMarkerResponse": {
+        "description": "A deployment that went live.",
+        "properties": {
+          "deployment_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "environment_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "live_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "slug": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "deployment_id",
+          "slug",
+          "environment_id",
+          "live_at"
+        ],
+        "type": "object"
+      },
       "DeploymentMetadata": {
         "description": "Deployment metadata - typed information about the deployment",
         "properties": {
@@ -23137,6 +23598,79 @@
           "failed"
         ],
         "type": "string"
+      },
+      "DeploymentRegressionsResponse": {
+        "description": "The project's tracked operations compared across one deployment.",
+        "properties": {
+          "after_end": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "after_start": {
+            "description": "The first complete hour after the deployment went live.",
+            "format": "date-time",
+            "type": "string"
+          },
+          "baseline_start": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "changes": {
+            "description": "Regressed operations first, largest change first; then improved\nones. At most 50.",
+            "items": {
+              "$ref": "#/components/schemas/OperationChangeResponse"
+            },
+            "type": "array"
+          },
+          "deployment": {
+            "$ref": "#/components/schemas/DeploymentMarkerResponse"
+          },
+          "improved": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "insufficient_after": {
+            "description": "Operations with too few hours after it yet.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "insufficient_baseline": {
+            "description": "Operations with too little history before the deployment.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "min_after_hours": {
+            "description": "Complete hours after the deployment needed before it is judged.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "regressed": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "tracking": {
+            "$ref": "#/components/schemas/OperationTrackingResponse"
+          },
+          "unchanged": {
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "deployment",
+          "baseline_start",
+          "after_start",
+          "after_end",
+          "changes",
+          "regressed",
+          "improved",
+          "unchanged",
+          "insufficient_baseline",
+          "insufficient_after",
+          "min_after_hours",
+          "tracking"
+        ],
+        "type": "object"
       },
       "DeploymentResponse": {
         "properties": {
@@ -30205,6 +30739,162 @@
         ],
         "type": "object"
       },
+      "ErrorGroupActivityPageResponse": {
+        "properties": {
+          "data": {
+            "description": "Newest first.",
+            "items": {
+              "$ref": "#/components/schemas/ErrorGroupActivityResponse"
+            },
+            "type": "array"
+          },
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total_count": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "data",
+          "page",
+          "page_size",
+          "total_count"
+        ],
+        "type": "object"
+      },
+      "ErrorGroupActivityResponse": {
+        "description": "One entry of a group's activity log.",
+        "properties": {
+          "actor_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "actor_user_id": {
+            "description": "Who did it; `None` for an event that reopened the group, or a user\nwho has since been deleted.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "body": {
+            "description": "The comment text, for `comment` entries.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "details": {
+            "$ref": "#/components/schemas/ActivityDetails"
+          },
+          "edited_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "group_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/ActivityKind"
+          }
+        },
+        "required": [
+          "id",
+          "group_id",
+          "kind",
+          "details",
+          "created_at"
+        ],
+        "type": "object"
+      },
+      "ErrorGroupAssigneeOptionsResponse": {
+        "properties": {
+          "teams": {
+            "description": "Teams, at most 20.",
+            "items": {
+              "$ref": "#/components/schemas/GroupAssignee"
+            },
+            "type": "array"
+          },
+          "users": {
+            "description": "Users who can access the project, at most 20.",
+            "items": {
+              "$ref": "#/components/schemas/GroupAssignee"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "users",
+          "teams"
+        ],
+        "type": "object"
+      },
+      "ErrorGroupAssigneeResponse": {
+        "properties": {
+          "assignee": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/GroupAssignee",
+                "description": "The new assignee; `None` when the group was unassigned."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "changed": {
+            "description": "Whether the assignee changed. Assigning the current assignee again\nchanges nothing and notifies nobody.",
+            "type": "boolean"
+          },
+          "group_id": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "group_id",
+          "changed"
+        ],
+        "type": "object"
+      },
+      "ErrorGroupCommentRequest": {
+        "properties": {
+          "body": {
+            "description": "The comment, at most 10,000 characters; Markdown is shown as text.",
+            "maxLength": 10000,
+            "type": "string"
+          }
+        },
+        "required": [
+          "body"
+        ],
+        "type": "object"
+      },
       "ErrorGroupDeploymentResponse": {
         "properties": {
           "branch": {
@@ -30235,6 +30925,55 @@
         ],
         "type": "object"
       },
+      "ErrorGroupFingerprintResponse": {
+        "description": "One fingerprint routing to a group.",
+        "properties": {
+          "fingerprint_hash": {
+            "type": "string"
+          },
+          "merged_from_group_id": {
+            "description": "Set when a merge moved this fingerprint here; unmerging that group\nmoves it back, and a split cannot take it.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "fingerprint_hash"
+        ],
+        "type": "object"
+      },
+      "ErrorGroupFingerprintsResponse": {
+        "description": "The fingerprints of one group.",
+        "properties": {
+          "fingerprints": {
+            "items": {
+              "$ref": "#/components/schemas/ErrorGroupFingerprintResponse"
+            },
+            "type": "array"
+          },
+          "group_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "merged_group_ids": {
+            "description": "Groups merged into this one.",
+            "items": {
+              "format": "int32",
+              "type": "integer"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "group_id",
+          "fingerprints",
+          "merged_group_ids"
+        ],
+        "type": "object"
+      },
       "ErrorGroupResponse": {
         "properties": {
           "affected_users": {
@@ -30246,9 +30985,21 @@
             ]
           },
           "assigned_to": {
+            "description": "Deprecated: a free-text assignee from before assignees were users or\nteams, kept read-only when it matched no user. Use `assignee`.",
             "type": [
               "string",
               "null"
+            ]
+          },
+          "assignee": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/GroupAssignee",
+                "description": "The user or team the group is assigned to."
+              },
+              {
+                "type": "null"
+              }
             ]
           },
           "created_at": {
@@ -30297,8 +31048,31 @@
             "format": "int32",
             "type": "integer"
           },
+          "ignore": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/GroupIgnoreState",
+                "description": "While the group is ignored with conditions: when it comes back."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "issue_type": {
+            "description": "`error`, or `performance` for an issue a trace detector filed: an\nN+1 query, a slow database query, consecutive HTTP calls or an\noversized payload.",
+            "type": "string"
+          },
           "last_seen": {
             "type": "string"
+          },
+          "merged_into_group_id": {
+            "description": "Set when this group was merged into another one. Its events and count\nstay with it so the merge can be undone, it is left out of lists, and\nits future events land in the group named here.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "message_template": {
             "type": [
@@ -30309,6 +31083,17 @@
           "project_id": {
             "format": "int32",
             "type": "integer"
+          },
+          "resolution": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/GroupResolutionState",
+                "description": "While the group is resolved in the next release: the release it was\nresolved after."
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "status": {
             "type": "string"
@@ -30339,6 +31124,7 @@
           "last_seen",
           "total_count",
           "status",
+          "issue_type",
           "project_id",
           "created_at",
           "updated_at"
@@ -30448,6 +31234,96 @@
           "error_class",
           "stacktrace_preview",
           "stacktrace_truncated"
+        ],
+        "type": "object"
+      },
+      "ErrorSavedSearchPageResponse": {
+        "properties": {
+          "data": {
+            "description": "Yours and the shared ones, newest first.",
+            "items": {
+              "$ref": "#/components/schemas/ErrorSavedSearchResponse"
+            },
+            "type": "array"
+          },
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total_count": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "data",
+          "page",
+          "page_size",
+          "total_count"
+        ],
+        "type": "object"
+      },
+      "ErrorSavedSearchResponse": {
+        "description": "A saved search: a name and the list filters it applies.",
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "filters": {
+            "$ref": "#/components/schemas/SavedSearchFilters"
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "is_owner": {
+            "description": "Whether the caller owns it, and so may change it.",
+            "type": "boolean"
+          },
+          "name": {
+            "type": "string"
+          },
+          "owner_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "owner_user_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "shared": {
+            "description": "Visible to everyone who can open the project, not only its owner.",
+            "type": "boolean"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "project_id",
+          "name",
+          "shared",
+          "owner_user_id",
+          "is_owner",
+          "filters",
+          "created_at",
+          "updated_at"
         ],
         "type": "object"
       },
@@ -37278,6 +38154,36 @@
         ],
         "type": "string"
       },
+      "GroupAssignee": {
+        "description": "An assignee with what a reader needs to show it.",
+        "properties": {
+          "email": {
+            "description": "The user's email; `None` for a team.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "name": {
+            "description": "The user's or team's name.",
+            "type": "string"
+          },
+          "type": {
+            "description": "`user` or `team`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "id",
+          "name"
+        ],
+        "type": "object"
+      },
       "GroupEnvVarResponse": {
         "description": "A group variable as returned by the API. `value` is `\"***\"` in lists,\nplaintext only in the create/update response of a non-secret variable,\nand always `null` for secrets.",
         "properties": {
@@ -37325,6 +38231,49 @@
           "include_in_preview",
           "created_at",
           "updated_at"
+        ],
+        "type": "object"
+      },
+      "GroupIgnoreState": {
+        "description": "The ignore conditions of an ignored group and how far along they are.",
+        "properties": {
+          "forever": {
+            "description": "Stays ignored whatever happens.",
+            "type": "boolean"
+          },
+          "until": {
+            "description": "Stays ignored until this time.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "until_event_count": {
+            "description": "Reopens when `total_count` reaches this value.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "until_user_count": {
+            "description": "Reopens when this many new distinct users are affected.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "user_count": {
+            "description": "New distinct users seen since it was ignored.",
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "user_count",
+          "forever"
         ],
         "type": "object"
       },
@@ -37441,6 +38390,34 @@
             ]
           }
         },
+        "type": "object"
+      },
+      "GroupResolutionState": {
+        "description": "A group resolved in the next release (ADR 111, D1.5).",
+        "properties": {
+          "after_release": {
+            "description": "That release's version, filled in on the single-group read.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "after_release_id": {
+            "description": "Id of the release the group was resolved after; events from a newer\nrelease reopen it.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "in_next_release": {
+            "description": "Always true; the field exists so clients can test one value.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "in_next_release"
+        ],
         "type": "object"
       },
       "GroupRouteEnvironment": {
@@ -39352,6 +40329,40 @@
         ],
         "type": "string"
       },
+      "IgnoreConditionsRequest": {
+        "description": "When an ignored error group comes back. With no field set the next event\nreopens it; with fields set it stays ignored until any one is met.",
+        "properties": {
+          "event_count": {
+            "description": "Stay ignored for this many more occurrences (1 to 1,000,000).",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "forever": {
+            "description": "Stay ignored whatever happens. Excludes the other fields.",
+            "type": "boolean"
+          },
+          "until": {
+            "description": "Stay ignored until this time (at most 366 days ahead).",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "user_count": {
+            "description": "Stay ignored until this many new distinct users are affected\n(1 to 10,000).",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "ImageConfig": {
         "description": "Runtime configuration baked into an image, read on the node that owns it.\n\nA worker build returns this so the control plane never needs a local copy\nof the image to learn which port it listens on.",
         "properties": {
@@ -40396,6 +41407,101 @@
           "host",
           "success",
           "sans"
+        ],
+        "type": "object"
+      },
+      "InboundFilterKind": {
+        "description": "What a rule drops.",
+        "enum": [
+          "browser_extensions",
+          "web_crawlers",
+          "localhost",
+          "error_message",
+          "release"
+        ],
+        "type": "string"
+      },
+      "InboundFilterResponse": {
+        "description": "One inbound filter rule.",
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "dropped_count": {
+            "description": "Events this rule dropped since it was created.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/InboundFilterKind"
+          },
+          "last_dropped_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "pattern": {
+            "description": "Glob for `error_message` (matched against `Type: message`) and\n`release`; `*` matches any run of characters, `?` one. Case-insensitive.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "project_id",
+          "kind",
+          "enabled",
+          "dropped_count",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
+      },
+      "InboundFiltersResponse": {
+        "description": "Every inbound filter of a project. Bounded by `limit`, so not paginated.",
+        "properties": {
+          "filters": {
+            "items": {
+              "$ref": "#/components/schemas/InboundFilterResponse"
+            },
+            "type": "array"
+          },
+          "limit": {
+            "description": "Most rules a project may hold.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "max_pattern_chars": {
+            "description": "Longest pattern a rule may hold, in characters.",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "filters",
+          "limit",
+          "max_pattern_chars"
         ],
         "type": "object"
       },
@@ -43505,6 +44611,13 @@
       },
       "ListErrorGroupsQuery": {
         "properties": {
+          "assignee": {
+            "description": "Only groups with this assignee: `me` (you, or a team you are in),\n`none`, `user:<id>` or `team:<id>`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "end_date": {
             "format": "date-time",
             "type": [
@@ -43519,6 +44632,13 @@
               "null"
             ]
           },
+          "issue_type": {
+            "description": "`error` or `performance`; omitted for both.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "page": {
             "format": "int64",
             "minimum": 0,
@@ -43528,6 +44648,13 @@
             "format": "int64",
             "minimum": 0,
             "type": "integer"
+          },
+          "search": {
+            "description": "Case-insensitive text in the title, error type or message.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "sort_by": {
             "type": [
@@ -45374,6 +46501,58 @@
           "project_id",
           "name",
           "slug"
+        ],
+        "type": "object"
+      },
+      "MergeErrorGroupsRequest": {
+        "description": "Request body for `POST .../error-groups/{group_id}/merge`. The path group\nis the one that survives.",
+        "properties": {
+          "source_group_ids": {
+            "description": "Groups to merge into the path group; at most 50 per request.",
+            "items": {
+              "format": "int32",
+              "type": "integer"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "source_group_ids"
+        ],
+        "type": "object"
+      },
+      "MergeErrorGroupsResponse": {
+        "description": "Result of a merge.",
+        "properties": {
+          "merged_group_ids": {
+            "items": {
+              "format": "int32",
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "moved_fingerprints": {
+            "description": "Fingerprints now routing to the surviving group.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "target_group_id": {
+            "description": "The group that survived; future events of every merged fingerprint\nland here.",
+            "format": "int32",
+            "type": "integer"
+          },
+          "total_count": {
+            "description": "Events the surviving group accounts for after the merge.",
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "target_group_id",
+          "merged_group_ids",
+          "moved_fingerprints",
+          "total_count"
         ],
         "type": "object"
       },
@@ -50464,6 +51643,157 @@
         ],
         "type": "object"
       },
+      "OperationBreakdownResponse": {
+        "description": "Where the time of an operation goes, from a sample of its calls.",
+        "properties": {
+          "attribute": {
+            "description": "The attribute the calls were split by, if any.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "by_attribute": {
+            "description": "Largest total time first, at most 20 values (the rest summed).",
+            "items": {
+              "$ref": "#/components/schemas/AttributeSliceResponse"
+            },
+            "type": "array"
+          },
+          "end_time": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "groups": {
+            "description": "Largest exclusive time first, at most 25 (the rest summed).",
+            "items": {
+              "$ref": "#/components/schemas/BreakdownGroupResponse"
+            },
+            "type": "array"
+          },
+          "instances": {
+            "description": "Calls of the operation found in them.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "max_traces": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "sample": {
+            "description": "`recent` or `slow`.",
+            "type": "string"
+          },
+          "self_ms": {
+            "description": "The operation's own exclusive time.",
+            "format": "double",
+            "type": "number"
+          },
+          "self_share": {
+            "format": "double",
+            "type": "number"
+          },
+          "service_name": {
+            "type": "string"
+          },
+          "slow_threshold_ms": {
+            "description": "The p95 a `slow` sample started from.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "span_name": {
+            "type": "string"
+          },
+          "start_time": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "total_ms": {
+            "format": "double",
+            "type": "number"
+          },
+          "traces": {
+            "description": "Traces read; at most `max_traces`.",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "service_name",
+          "span_name",
+          "start_time",
+          "end_time",
+          "sample",
+          "traces",
+          "max_traces",
+          "instances",
+          "total_ms",
+          "self_ms",
+          "self_share",
+          "groups",
+          "by_attribute"
+        ],
+        "type": "object"
+      },
+      "OperationChangeResponse": {
+        "description": "One operation that changed after a deployment.",
+        "properties": {
+          "after_hours": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "after_p95_ms": {
+            "description": "The median hourly p95 after.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "baseline_hours": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "baseline_p95_ms": {
+            "description": "The median hourly p95 in the week before.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "change": {
+            "description": "`regressed` or `improved`.",
+            "type": "string"
+          },
+          "change_ratio": {
+            "description": "`after / baseline - 1`: 0.4 is 40% slower, -0.3 is 30% faster.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "service_name": {
+            "type": "string"
+          },
+          "span_name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "service_name",
+          "span_name",
+          "change",
+          "baseline_hours",
+          "after_hours"
+        ],
+        "type": "object"
+      },
       "OperationEntry": {
         "description": "One operation in the feed.",
         "properties": {
@@ -50694,6 +52024,167 @@
           "all"
         ],
         "type": "string"
+      },
+      "OperationTrackingResponse": {
+        "description": "Whether operations of the project are tracked, and how many did not fit.",
+        "properties": {
+          "configured": {
+            "description": "True once the rollup job has run for the project.",
+            "type": "boolean"
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_run_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "max_tracked_operations": {
+            "description": "Operations kept per project and hour, those with the most total time.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "overflow_operations": {
+            "description": "Operations of that hour over the cap, which have no history.",
+            "format": "int32",
+            "type": "integer"
+          },
+          "reason": {
+            "description": "Why there is no history yet, when `configured` is false.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "retention_days": {
+            "description": "Days of history kept.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "rolled_until": {
+            "description": "Hours that start before this have been rolled up.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "setup_path": {
+            "description": "The console page, relative to the project, that sets up what is\nmissing.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tracked_operations": {
+            "description": "Operations kept in the last hour rolled up.",
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "configured",
+          "tracked_operations",
+          "overflow_operations",
+          "max_tracked_operations",
+          "retention_days"
+        ],
+        "type": "object"
+      },
+      "OperationTrendPointResponse": {
+        "description": "One hour of one operation.",
+        "properties": {
+          "avg_ms": {
+            "format": "double",
+            "type": "number"
+          },
+          "bucket_start": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "count": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "error_count": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "p50_ms": {
+            "format": "double",
+            "type": "number"
+          },
+          "p95_ms": {
+            "format": "double",
+            "type": "number"
+          },
+          "p99_ms": {
+            "format": "double",
+            "type": "number"
+          }
+        },
+        "required": [
+          "bucket_start",
+          "count",
+          "error_count",
+          "avg_ms",
+          "p50_ms",
+          "p95_ms",
+          "p99_ms"
+        ],
+        "type": "object"
+      },
+      "OperationTrendResponse": {
+        "description": "An operation's hourly series, with the deployments in the window.",
+        "properties": {
+          "deployments": {
+            "items": {
+              "$ref": "#/components/schemas/DeploymentMarkerResponse"
+            },
+            "type": "array"
+          },
+          "end_time": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "points": {
+            "description": "Hours with calls, oldest first; hours without calls have no point.",
+            "items": {
+              "$ref": "#/components/schemas/OperationTrendPointResponse"
+            },
+            "type": "array"
+          },
+          "service_name": {
+            "type": "string"
+          },
+          "span_name": {
+            "type": "string"
+          },
+          "start_time": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "tracking": {
+            "$ref": "#/components/schemas/OperationTrackingResponse"
+          }
+        },
+        "required": [
+          "service_name",
+          "span_name",
+          "start_time",
+          "end_time",
+          "points",
+          "deployments",
+          "tracking"
+        ],
+        "type": "object"
       },
       "OperationsListResponse": {
         "description": "A page of the operations feed. Sorted by `created_at` descending (fixed).",
@@ -51406,6 +52897,107 @@
           "visitors",
           "page_views",
           "avg_time_seconds"
+        ],
+        "type": "object"
+      },
+      "PageBackendResponse": {
+        "description": "A page's web vitals next to the backend requests for its path.",
+        "properties": {
+          "backend_share_of_ttfb": {
+            "description": "Backend p75 over the page's p75 time to first byte: the part of the\nwait the backend explains. Null without both.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "configured": {
+            "description": "True when backend requests for the path were found.",
+            "type": "boolean"
+          },
+          "end_time": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "errors": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "p50_ms": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "p75_ms": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "p95_ms": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "path": {
+            "type": "string"
+          },
+          "reason": {
+            "description": "Why none were, when `configured` is false.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "requests": {
+            "description": "Backend requests found; at most 500 per attribute are read.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "services": {
+            "description": "Services that served the path, most requests first.",
+            "items": {
+              "$ref": "#/components/schemas/ServiceRequestsResponse"
+            },
+            "type": "array"
+          },
+          "setup_path": {
+            "description": "The console page, relative to the project, that sets up what is\nmissing.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "slowest": {
+            "description": "Slowest first, at most 10, each linking to its trace.",
+            "items": {
+              "$ref": "#/components/schemas/BackendRequestResponse"
+            },
+            "type": "array"
+          },
+          "start_time": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "vitals": {
+            "$ref": "#/components/schemas/PageVitalsResponse"
+          }
+        },
+        "required": [
+          "path",
+          "start_time",
+          "end_time",
+          "vitals",
+          "configured",
+          "requests",
+          "errors",
+          "services",
+          "slowest"
         ],
         "type": "object"
       },
@@ -52363,6 +53955,47 @@
         ],
         "type": "object"
       },
+      "PageVitalsResponse": {
+        "description": "The 75th percentiles of a page's web vitals.",
+        "properties": {
+          "fcp_p75_ms": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "inp_p75_ms": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "lcp_p75_ms": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "page_loads": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "ttfb_p75_ms": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "page_loads"
+        ],
+        "type": "object"
+      },
       "PagesComparisonResponse": {
         "properties": {
           "comparisons": {
@@ -53066,6 +54699,108 @@
           "changes",
           "fingerprint",
           "computed_at"
+        ],
+        "type": "object"
+      },
+      "PerformanceDetectorResponse": {
+        "description": "One detector and what it looks for.",
+        "properties": {
+          "description": {
+            "type": "string"
+          },
+          "key": {
+            "description": "`n_plus_one_query`, `slow_db_query`, `sequential_http` or\n`oversized_payload`.",
+            "type": "string"
+          },
+          "title": {
+            "description": "The issue type it files, e.g. `N+1 Query`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "key",
+          "title",
+          "description"
+        ],
+        "type": "object"
+      },
+      "PerformanceIssueStatusResponse": {
+        "description": "Whether traces of the project are checked for performance issues, and\nwhat the last check did.",
+        "properties": {
+          "check_interval_minutes": {
+            "description": "Minutes between checks.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "configured": {
+            "description": "True once a check has read at least one trace of the project.",
+            "type": "boolean"
+          },
+          "detectors": {
+            "items": {
+              "$ref": "#/components/schemas/PerformanceDetectorResponse"
+            },
+            "type": "array"
+          },
+          "issues_found": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "last_error": {
+            "description": "The last check's failure, if it failed.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_run_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reason": {
+            "description": "Why nothing is detected yet, when `configured` is false.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "scanned_until": {
+            "description": "Traces started before this have been considered.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "setup_path": {
+            "description": "The console page, relative to the project, that sets up what is\nmissing.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "traces_per_check": {
+            "description": "Traces checked per project per check, the slowest first.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "traces_scanned": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "configured",
+          "traces_scanned",
+          "issues_found",
+          "traces_per_check",
+          "check_interval_minutes",
+          "detectors"
         ],
         "type": "object"
       },
@@ -61336,6 +63071,295 @@
         ],
         "type": "object"
       },
+      "ReleaseDeployment": {
+        "description": "The deployment a release was first shipped by, when Temps deployed it.",
+        "properties": {
+          "commit_message": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "deployment_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "environment_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "environment_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ready_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "deployment_id",
+          "environment_id"
+        ],
+        "type": "object"
+      },
+      "ReleaseHealth": {
+        "properties": {
+          "abnormal_sessions": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "adoption": {
+            "description": "This release's share of the sessions started in the last 24 hours,\nin the same environment filter.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "crash_free_sessions": {
+            "description": "`1 - crashed / sessions`; absent without sessions.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "crash_free_users": {
+            "description": "`1 - crashed users / users`; absent when no session named a user.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "crashed_sessions": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "crashed_users": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "deployment": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ReleaseDeployment"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "errored_sessions": {
+            "description": "Sessions with at least one error, crashes included (an estimate for\nsingle sessions, exact for aggregates).",
+            "format": "int64",
+            "type": "integer"
+          },
+          "first_session_hour": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "last_session_hour": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "release": {
+            "type": "string"
+          },
+          "released_at": {
+            "description": "When Temps first saw or deployed this release (the order \"resolve in\nthe next release\" uses).",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sessions": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "sessions_last_24h": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "users": {
+            "description": "Distinct users, estimated (about 6.5% standard error).",
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "release",
+          "sessions",
+          "errored_sessions",
+          "crashed_sessions",
+          "abnormal_sessions",
+          "users",
+          "crashed_users",
+          "sessions_last_24h",
+          "first_session_hour",
+          "last_session_hour"
+        ],
+        "type": "object"
+      },
+      "ReleaseHealthPage": {
+        "properties": {
+          "end_time": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "environments": {
+            "description": "SDK environments with sessions in the window, for the filter.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/ReleaseHealth"
+            },
+            "type": "array"
+          },
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "per_page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "start_time": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "total": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "tracking": {
+            "$ref": "#/components/schemas/ReleaseHealthTracking"
+          }
+        },
+        "required": [
+          "items",
+          "total",
+          "page",
+          "per_page",
+          "environments",
+          "start_time",
+          "end_time",
+          "tracking"
+        ],
+        "type": "object"
+      },
+      "ReleaseHealthPoint": {
+        "properties": {
+          "abnormal_sessions": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "bucket_start": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "crash_free_sessions": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "crashed_sessions": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "errored_sessions": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "sessions": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "bucket_start",
+          "sessions",
+          "errored_sessions",
+          "crashed_sessions",
+          "abnormal_sessions"
+        ],
+        "type": "object"
+      },
+      "ReleaseHealthSeries": {
+        "properties": {
+          "end_time": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "environment": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "points": {
+            "description": "One point per hour with sessions, oldest first.",
+            "items": {
+              "$ref": "#/components/schemas/ReleaseHealthPoint"
+            },
+            "type": "array"
+          },
+          "release": {
+            "type": "string"
+          },
+          "start_time": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "release",
+          "points",
+          "start_time",
+          "end_time"
+        ],
+        "type": "object"
+      },
+      "ReleaseHealthTracking": {
+        "description": "Whether the project has sent any session, and what to do if not.",
+        "properties": {
+          "configured": {
+            "type": "boolean"
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "setup_path": {
+            "description": "Project-relative console path that shows how to set it up.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "configured"
+        ],
+        "type": "object"
+      },
       "ReleaseListResponse": {
         "properties": {
           "releases": {
@@ -66407,6 +68431,55 @@
         ],
         "type": "object"
       },
+      "SavedSearchFilters": {
+        "description": "The list filters a saved search applies. Every field is optional; an\nempty set is \"all groups, newest first\".",
+        "properties": {
+          "assignee": {
+            "description": "`me`, `none`, `user:<id>` or `team:<id>`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "environment_id": {
+            "description": "An environment of the project.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "search": {
+            "description": "Text in the title, error type or message.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sort_by": {
+            "description": "`last_seen` (default), `first_seen`, `total_count` or `events_in_range`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sort_order": {
+            "description": "`asc` or `desc` (default).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "description": "`unresolved`, `resolved` or `ignored`; omitted for every status.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "ScalewayCredentialsRequest": {
         "properties": {
           "api_key": {
@@ -69262,6 +71335,23 @@
         ],
         "type": "object"
       },
+      "ServiceRequestsResponse": {
+        "description": "How many of a page's backend requests one service served.",
+        "properties": {
+          "requests": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "service_name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "service_name",
+          "requests"
+        ],
+        "type": "object"
+      },
       "ServiceResourceLimits": {
         "description": "Optional cgroup resource limits applied to a service container.\n\nAll fields are `Option<i64>`: `None` means \"no limit\" (the kernel default),\nmatching Docker's behavior when the corresponding `HostConfig` field is\nleft at zero. Operators opt in to limits explicitly through the\n`PATCH /external-services/{id}/resources` endpoint or by writing the\n`resources` block into `ServiceConfig::parameters` at create time.\n\nThese map directly onto bollard fields:\n- `memory_mb`     → `HostConfig.memory`        (bytes)\n- `memory_swap_mb`→ `HostConfig.memory_swap`   (bytes; ≥ memory)\n- `nano_cpus`     → `HostConfig.nano_cpus`     (1e9 = 1 full CPU)\n- `cpu_shares`    → `HostConfig.cpu_shares`    (relative weight, default 1024)\n- `shm_size_mb`   → `HostConfig.shm_size`      (bytes; default 64 MiB)\n\nIMPORTANT: enabling hard memory limits causes the kernel OOM killer to\nterminate the container when the working set exceeds the limit. The\ncontainer will restart (RestartPolicy::ALWAYS) but in-flight queries\nfail. Surface this clearly in any UI that lets users set limits.",
         "properties": {
@@ -70748,6 +72838,26 @@
         "required": [
           "enabled"
         ],
+        "type": "object"
+      },
+      "SetErrorGroupAssigneeRequest": {
+        "description": "Who to assign the group to. Set one of the two ids, or neither to\nunassign.",
+        "properties": {
+          "team_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "user_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
         "type": "object"
       },
       "SetFlagEnvironmentRequest": {
@@ -73376,6 +75486,22 @@
       "SpanStats": {
         "description": "Latency and error statistics for one operation, i.e. one\n`(project, service, span name)` triple over the queried window.",
         "properties": {
+          "apdex": {
+            "description": "Apdex for `apdex_threshold_ms`: `(satisfied + tolerating / 2) /\ncount`, from 0 (everyone frustrated) to 1 (everyone satisfied).\n`None` when the query asked for no score.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "apdex_threshold_ms": {
+            "description": "The threshold `T` the score used, in milliseconds.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
           "avg_duration_ms": {
             "format": "double",
             "type": "number"
@@ -73398,6 +75524,14 @@
             "description": "`error_count / count`, in `[0, 1]`.",
             "format": "double",
             "type": "number"
+          },
+          "frustrated_count": {
+            "description": "Spans over `4T`.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "kind": {
             "$ref": "#/components/schemas/SpanKind",
@@ -73432,6 +75566,14 @@
             "format": "int32",
             "type": "integer"
           },
+          "satisfied_count": {
+            "description": "Spans at or under `T`.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "service_name": {
             "type": "string"
           },
@@ -73448,6 +75590,14 @@
             "description": "`p99 / p50`, or `0` when `p50` is zero.",
             "format": "double",
             "type": "number"
+          },
+          "tolerating_count": {
+            "description": "Spans over `T` and at or under `4T`.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "total_duration_ms": {
             "description": "`SUM(duration_ms)` — total wall-clock attributable to this operation.",
@@ -73693,6 +75843,54 @@
             ]
           }
         },
+        "type": "object"
+      },
+      "SplitErrorGroupRequest": {
+        "description": "Request body for `POST .../error-groups/{group_id}/split`.",
+        "properties": {
+          "fingerprints": {
+            "description": "Fingerprints to move out; at most 200 per request, and the group must\nkeep at least one.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "title": {
+            "description": "Title for the new group. Defaults to the original title with\n\"(split)\" appended.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "fingerprints"
+        ],
+        "type": "object"
+      },
+      "SplitErrorGroupResponse": {
+        "description": "Result of a split.",
+        "properties": {
+          "group_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "moved_fingerprints": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "new_group_id": {
+            "description": "The new group; future events of the moved fingerprints land here.",
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "group_id",
+          "new_group_id",
+          "moved_fingerprints"
+        ],
         "type": "object"
       },
       "StaleSlot": {
@@ -79375,6 +81573,31 @@
         ],
         "type": "object"
       },
+      "UnmergeErrorGroupResponse": {
+        "description": "Result of taking a group back out of a merge.",
+        "properties": {
+          "group_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "moved_fingerprints": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "target_group_id": {
+            "description": "The group it had been merged into.",
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "group_id",
+          "target_group_id",
+          "moved_fingerprints"
+        ],
+        "type": "object"
+      },
       "UnsupportedFeature": {
         "description": "A feature from the source platform that cannot be migrated",
         "properties": {
@@ -80914,11 +83137,26 @@
       "UpdateErrorGroupRequest": {
         "properties": {
           "assigned_to": {
-            "description": "Assignee (email by convention).\n- `Some(\"user@example.com\")` — sets the assignee.\n- `Some(\"\")` (empty string) — clears the current assignment (sets to null).\n- `null` / field omitted — leaves the existing value unchanged.",
+            "description": "Deprecated: assign by email. Prefer\n`PUT /projects/{project_id}/error-groups/{group_id}/assignee`.\n- `Some(\"user@example.com\")`: assigns the user with that email; an\n  email that is no user's is refused.\n- `Some(\"\")` (empty string): unassigns the group.\n- `null` / field omitted: leaves the assignee unchanged.\n\nThe status `assigned` is accepted and stored as `unresolved`.",
             "type": [
               "string",
               "null"
             ]
+          },
+          "ignore": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/IgnoreConditionsRequest",
+                "description": "With `status: ignored`: when the group comes back. Omitted, the next\nevent reopens it."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "in_next_release": {
+            "description": "With `status: resolved` (or `action: resolve`): resolved in the next\nrelease. Events from the project's newest release at this moment, or\nan older one, or with no release, keep it resolved; an event from a\nnewer release reopens it. Fails when the project has no release yet.",
+            "type": "boolean"
           },
           "status": {
             "type": "string"
@@ -80927,6 +83165,34 @@
         "required": [
           "status"
         ],
+        "type": "object"
+      },
+      "UpdateErrorSavedSearchRequest": {
+        "properties": {
+          "filters": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/SavedSearchFilters",
+                "description": "Replaces every filter when present."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "shared": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
         "type": "object"
       },
       "UpdateExternalServiceRequest": {
@@ -81099,6 +83365,23 @@
         "required": [
           "keep_prepared"
         ],
+        "type": "object"
+      },
+      "UpdateInboundFilterRequest": {
+        "properties": {
+          "enabled": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "pattern": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
         "type": "object"
       },
       "UpdateIncidentRequest": {
@@ -138266,6 +140549,363 @@
         "x-maturity": "beta"
       }
     },
+    "/otel/operations/breakdown": {
+      "get": {
+        "operationId": "get_operation_breakdown",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "service_name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The operation (span name).",
+            "in": "query",
+            "name": "span_name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Window start (RFC 3339); defaults to 24 hours before `end_time`.",
+            "in": "query",
+            "name": "start_time",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Window end (RFC 3339); defaults to now.",
+            "in": "query",
+            "name": "end_time",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "`recent` (default): the latest calls. `slow`: the latest calls at or\nover the window's p95.",
+            "in": "query",
+            "name": "sample",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Also split the calls by the value of this attribute of the\noperation's own spans, e.g. `http.route` or `tenant.id`.",
+            "in": "query",
+            "name": "attribute",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OperationBreakdownResponse"
+                }
+              }
+            },
+            "description": "Downstream calls by exclusive time"
+          },
+          "400": {
+            "description": "Missing operation, unknown sample, or a window over 7 days"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Missing otel:read or project access"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Where the time inside one operation goes",
+        "tags": [
+          "OpenTelemetry"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/otel/operations/regressions": {
+      "get": {
+        "operationId": "get_deployment_regressions",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "deployment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeploymentRegressionsResponse"
+                }
+              }
+            },
+            "description": "Operations compared across the deployment"
+          },
+          "400": {
+            "description": "The deployment never went live"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Missing otel:read or project access"
+          },
+          "404": {
+            "description": "No such deployment in the project"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Which operations got slower or faster after a deployment",
+        "tags": [
+          "OpenTelemetry"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/otel/operations/trend": {
+      "get": {
+        "operationId": "get_operation_trend",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "service_name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The operation (span name).",
+            "in": "query",
+            "name": "span_name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Window start (RFC 3339); defaults to 14 days before `end_time`.",
+            "in": "query",
+            "name": "start_time",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Window end (RFC 3339); defaults to now.",
+            "in": "query",
+            "name": "end_time",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OperationTrendResponse"
+                }
+              }
+            },
+            "description": "Hourly series of the operation"
+          },
+          "400": {
+            "description": "Missing operation, or a window over 30 days"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Missing otel:read or project access"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Hourly latency of one operation over time",
+        "tags": [
+          "OpenTelemetry"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/otel/pages/backend": {
+      "get": {
+        "operationId": "get_page_backend",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The page path, as the analytics SDK records it, e.g. `/checkout`.",
+            "in": "query",
+            "name": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Window start (RFC 3339); defaults to 24 hours before `end_time`.",
+            "in": "query",
+            "name": "start_time",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Window end (RFC 3339); defaults to now.",
+            "in": "query",
+            "name": "end_time",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PageBackendResponse"
+                }
+              }
+            },
+            "description": "Web vitals and backend timing of the page"
+          },
+          "400": {
+            "description": "A path not starting with /, or a window over 7 days"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Missing otel:read or project access"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "A page's web vitals next to the backend requests that served it",
+        "tags": [
+          "OpenTelemetry"
+        ],
+        "x-maturity": "beta"
+      }
+    },
     "/otel/pipeline-history": {
       "get": {
         "description": "`/otel/pipeline-stats` gives lifetime totals and `/otel/ingest-errors`\ngives failure reasons; this gives the shape over time — whether drops are a\npast incident that already recovered or an ongoing bleed, which a\ncumulative counter can never show.\n\nReads the delta series the background sampler writes to the shared metrics\nstore (`SourceKind::Node`, node 0). Values are **mean deltas per sample\ninterval**, not bucket totals — `sample_interval_seconds` in the response\ncarries the unit so the client can label them.\n\nSystem-scoped like the other two pipeline endpoints: these counters are\nprocess-wide, so there is no project parameter to scope by.",
@@ -138654,6 +141294,16 @@
               "format": "int64",
               "minimum": 0,
               "type": "integer"
+            }
+          },
+          {
+            "description": "Apdex threshold T in ms (default 500, at most 600000): at or under T satisfies, up to 4T tolerates",
+            "in": "query",
+            "name": "apdex_threshold_ms",
+            "required": false,
+            "schema": {
+              "format": "double",
+              "type": "number"
             }
           }
         ],
@@ -161041,6 +163691,67 @@
         "x-maturity": "beta"
       }
     },
+    "/projects/{project_id}/error-group-assignees": {
+      "get": {
+        "description": "Returns at most 20 users who can access the project and 20 teams whose\nname (or a user's email) contains `q`.",
+        "operationId": "search_error_group_assignees",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Text in the user's name or email, or the team's name. Empty lists the\nfirst candidates alphabetically.",
+            "in": "query",
+            "name": "q",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorGroupAssigneeOptionsResponse"
+                }
+              }
+            },
+            "description": "Assignee candidates"
+          },
+          "400": {
+            "description": "Search text too long"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Missing error_tracking:write or project access"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Search users and teams to assign an error group to",
+        "tags": [
+          "error-tracking"
+        ],
+        "x-maturity": "beta"
+      }
+    },
     "/projects/{project_id}/error-groups": {
       "get": {
         "operationId": "list_error_groups",
@@ -161140,6 +163851,42 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "Only groups with this assignee: `me` (you, or a team you are in),\n`none`, `user:<id>` or `team:<id>`.",
+            "in": "query",
+            "name": "assignee",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Case-insensitive text in the title, error type or message.",
+            "in": "query",
+            "name": "search",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "`error` or `performance`; omitted for both.",
+            "in": "query",
+            "name": "issue_type",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
           }
         ],
         "responses": {
@@ -161158,6 +163905,70 @@
           }
         },
         "summary": "List error groups for a project",
+        "tags": [
+          "error-tracking"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/projects/{project_id}/error-groups/bulk": {
+      "post": {
+        "operationId": "bulkUpdateErrorGroups",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BulkErrorGroupRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BulkErrorGroupResponse"
+                }
+              }
+            },
+            "description": "Groups updated"
+          },
+          "400": {
+            "description": "Invalid selection or filter"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "A group in group_ids is not in this project"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Resolve, reopen or ignore many error groups of a project at once — either\nthe explicit `group_ids` or every group matching `filter`.",
         "tags": [
           "error-tracking"
         ],
@@ -161259,6 +164070,385 @@
           }
         },
         "summary": "Update error group status",
+        "tags": [
+          "error-tracking"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/projects/{project_id}/error-groups/{group_id}/activity": {
+      "get": {
+        "operationId": "list_error_group_activity",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Error group ID",
+            "in": "path",
+            "name": "group_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Page number, from 1.",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Entries per page, 1 to 100.",
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorGroupActivityPageResponse"
+                }
+              }
+            },
+            "description": "A page of the activity log"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Missing error_tracking:read or project access"
+          },
+          "404": {
+            "description": "Error group not found in the project"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "List a group's comments and activity, newest first",
+        "tags": [
+          "error-tracking"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/projects/{project_id}/error-groups/{group_id}/assignee": {
+      "put": {
+        "description": "The assignee is independent of the status: an assigned group can be\nresolved or ignored and keeps its assignee. A new assignee is emailed\nwhen an email provider is configured, and `status_change` alert rules\nthat list `assigned` fire.",
+        "operationId": "set_error_group_assignee",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Error group ID",
+            "in": "path",
+            "name": "group_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetErrorGroupAssigneeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorGroupAssigneeResponse"
+                }
+              }
+            },
+            "description": "Assignee set"
+          },
+          "400": {
+            "description": "Both ids set, an unknown user or team, or a user without access to the project"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Missing error_tracking:write or project access"
+          },
+          "404": {
+            "description": "Error group not found in the project"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Assign an error group to a user or a team, or unassign it",
+        "tags": [
+          "error-tracking"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/projects/{project_id}/error-groups/{group_id}/comments": {
+      "post": {
+        "operationId": "create_error_group_comment",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Error group ID",
+            "in": "path",
+            "name": "group_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ErrorGroupCommentRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorGroupActivityResponse"
+                }
+              }
+            },
+            "description": "Comment added"
+          },
+          "400": {
+            "description": "Empty or longer than 10,000 characters"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Missing error_tracking:write or project access"
+          },
+          "404": {
+            "description": "Error group not found in the project"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Comment on an error group",
+        "tags": [
+          "error-tracking"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/projects/{project_id}/error-groups/{group_id}/comments/{comment_id}": {
+      "delete": {
+        "description": "Its author may delete it, and so may an administrator.",
+        "operationId": "delete_error_group_comment",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Error group ID",
+            "in": "path",
+            "name": "group_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Comment ID",
+            "in": "path",
+            "name": "comment_id",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Comment deleted"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Neither the author nor an administrator"
+          },
+          "404": {
+            "description": "Comment not found on the group"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Delete a comment on an error group",
+        "tags": [
+          "error-tracking"
+        ],
+        "x-maturity": "beta"
+      },
+      "patch": {
+        "operationId": "update_error_group_comment",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Error group ID",
+            "in": "path",
+            "name": "group_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Comment ID",
+            "in": "path",
+            "name": "comment_id",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ErrorGroupCommentRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorGroupActivityResponse"
+                }
+              }
+            },
+            "description": "Comment changed"
+          },
+          "400": {
+            "description": "Empty or longer than 10,000 characters"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Not the comment's author, or missing error_tracking:write"
+          },
+          "404": {
+            "description": "Comment not found on the group"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Edit your comment on an error group",
         "tags": [
           "error-tracking"
         ],
@@ -161427,6 +164617,843 @@
           }
         },
         "summary": "Get a specific error event",
+        "tags": [
+          "error-tracking"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/projects/{project_id}/error-groups/{group_id}/fingerprints": {
+      "get": {
+        "operationId": "listErrorGroupFingerprints",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Error group ID",
+            "in": "path",
+            "name": "group_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorGroupFingerprintsResponse"
+                }
+              }
+            },
+            "description": "Fingerprints of the group"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "The group is not in this project"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "The fingerprints routing to this group, and the groups merged into it.",
+        "tags": [
+          "error-tracking"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/projects/{project_id}/error-groups/{group_id}/merge": {
+      "post": {
+        "description": "Stored events keep the group they were ingested into, so nothing is\nrewritten and unmerging restores both groups exactly.",
+        "operationId": "mergeErrorGroups",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Surviving error group ID",
+            "in": "path",
+            "name": "group_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MergeErrorGroupsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MergeErrorGroupsResponse"
+                }
+              }
+            },
+            "description": "Groups merged"
+          },
+          "400": {
+            "description": "Invalid selection"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "A named group is not in this project"
+          },
+          "409": {
+            "description": "A named group is already merged, or has groups merged into it"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Merge other groups into this one: their fingerprints route here, so their\nfuture events land here, and their counts are added to this group's.",
+        "tags": [
+          "error-tracking"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/projects/{project_id}/error-groups/{group_id}/split": {
+      "post": {
+        "operationId": "splitErrorGroup",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Error group ID",
+            "in": "path",
+            "name": "group_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SplitErrorGroupRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SplitErrorGroupResponse"
+                }
+              }
+            },
+            "description": "Fingerprints split out"
+          },
+          "400": {
+            "description": "Invalid selection"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "The group or a fingerprint is not in this project"
+          },
+          "409": {
+            "description": "The group is merged into another group"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Split named fingerprints out of this group into a new one, so their future\nevents are tracked separately. Stored events stay with this group.",
+        "tags": [
+          "error-tracking"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/projects/{project_id}/error-groups/{group_id}/unmerge": {
+      "post": {
+        "operationId": "unmergeErrorGroup",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Merged-away error group ID",
+            "in": "path",
+            "name": "group_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnmergeErrorGroupResponse"
+                }
+              }
+            },
+            "description": "Group taken out of the merge"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "The group is not in this project"
+          },
+          "409": {
+            "description": "The group is not merged into another group"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Take this group back out of the merge it is part of: its fingerprints\nroute to it again and the count it contributed is subtracted from the\ngroup it was merged into.",
+        "tags": [
+          "error-tracking"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/projects/{project_id}/error-inbound-filters": {
+      "get": {
+        "operationId": "listErrorInboundFilters",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InboundFiltersResponse"
+                }
+              }
+            },
+            "description": "The project's inbound filters"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "List a project's inbound filters and how many events each dropped.",
+        "tags": [
+          "error-tracking"
+        ],
+        "x-maturity": "beta"
+      },
+      "post": {
+        "operationId": "createErrorInboundFilter",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateInboundFilterRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InboundFilterResponse"
+                }
+              }
+            },
+            "description": "Filter created"
+          },
+          "400": {
+            "description": "Invalid kind or pattern, or the project's limit is reached"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "409": {
+            "description": "The project already has this built-in filter"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Add an inbound filter. It applies to the next event.",
+        "tags": [
+          "error-tracking"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/projects/{project_id}/error-inbound-filters/{filter_id}": {
+      "delete": {
+        "operationId": "deleteErrorInboundFilter",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Inbound filter ID",
+            "in": "path",
+            "name": "filter_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Filter deleted"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "No such filter in this project"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Delete an inbound filter. Matching events are stored again from the next\none.",
+        "tags": [
+          "error-tracking"
+        ],
+        "x-maturity": "beta"
+      },
+      "patch": {
+        "operationId": "updateErrorInboundFilter",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Inbound filter ID",
+            "in": "path",
+            "name": "filter_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateInboundFilterRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InboundFilterResponse"
+                }
+              }
+            },
+            "description": "Filter updated"
+          },
+          "400": {
+            "description": "Invalid pattern"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "No such filter in this project"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Change an inbound filter's pattern or switch it on or off.",
+        "tags": [
+          "error-tracking"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/projects/{project_id}/error-saved-searches": {
+      "get": {
+        "operationId": "list_error_saved_searches",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Page number, from 1.",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Searches per page, 1 to 100.",
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorSavedSearchPageResponse"
+                }
+              }
+            },
+            "description": "A page of saved searches"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Missing error_tracking:read or project access"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "List your saved searches and the shared ones, newest first",
+        "tags": [
+          "error-tracking"
+        ],
+        "x-maturity": "beta"
+      },
+      "post": {
+        "operationId": "create_error_saved_search",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateErrorSavedSearchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorSavedSearchResponse"
+                }
+              }
+            },
+            "description": "Search saved"
+          },
+          "400": {
+            "description": "An invalid name or filter, or 50 saved searches already"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Missing error_tracking:write or project access"
+          },
+          "409": {
+            "description": "You already have a saved search with that name"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Save a search over the project's error groups",
+        "tags": [
+          "error-tracking"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/projects/{project_id}/error-saved-searches/{saved_search_id}": {
+      "delete": {
+        "description": "Its owner may, and an administrator may delete a shared one.",
+        "operationId": "delete_error_saved_search",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Saved search ID",
+            "in": "path",
+            "name": "saved_search_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Saved search deleted"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Neither its owner nor an administrator"
+          },
+          "404": {
+            "description": "No such saved search you can see in the project"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Delete a saved search",
+        "tags": [
+          "error-tracking"
+        ],
+        "x-maturity": "beta"
+      },
+      "get": {
+        "operationId": "get_error_saved_search",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Saved search ID",
+            "in": "path",
+            "name": "saved_search_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorSavedSearchResponse"
+                }
+              }
+            },
+            "description": "The saved search"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Missing error_tracking:read or project access"
+          },
+          "404": {
+            "description": "No such saved search you can see in the project"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Get one saved search: yours, or a shared one",
+        "tags": [
+          "error-tracking"
+        ],
+        "x-maturity": "beta"
+      },
+      "patch": {
+        "operationId": "update_error_saved_search",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Saved search ID",
+            "in": "path",
+            "name": "saved_search_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateErrorSavedSearchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorSavedSearchResponse"
+                }
+              }
+            },
+            "description": "Saved search changed"
+          },
+          "400": {
+            "description": "An invalid name or filter"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Not its owner, or missing error_tracking:write"
+          },
+          "404": {
+            "description": "No such saved search you can see in the project"
+          },
+          "409": {
+            "description": "You already have a saved search with that name"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Rename, share or change the filters of your saved search",
         "tags": [
           "error-tracking"
         ],
@@ -166989,6 +171016,240 @@
         "summary": "Fetch the un-truncated form of one event by `(kind, id)`. Side panel\n\"Show full\" action calls this — the list response carries truncated\npreviews + a `*_truncated` flag to let the UI decide whether to fetch.",
         "tags": [
           "Observability"
+        ]
+      }
+    },
+    "/projects/{project_id}/performance-issues/status": {
+      "get": {
+        "operationId": "get_performance_issue_status",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PerformanceIssueStatusResponse"
+                }
+              }
+            },
+            "description": "Detection status"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Missing error_tracking:read or project access"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Whether performance issues are detected for a project",
+        "tags": [
+          "error-tracking"
+        ]
+      }
+    },
+    "/projects/{project_id}/release-health": {
+      "get": {
+        "operationId": "list_release_health",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "SDK environment (as the SDK sent it); absent reads all of them.",
+            "in": "query",
+            "name": "environment",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Window in days, 1 to 14; default 7.",
+            "in": "query",
+            "name": "days",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "1 to 100; default 20.",
+            "in": "query",
+            "name": "per_page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReleaseHealthPage"
+                }
+              }
+            },
+            "description": "Release health of the project"
+          },
+          "400": {
+            "description": "Invalid window, page or environment"
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "description": "Release health could not be read"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Releases with sessions in the window, the most recently active first.",
+        "tags": [
+          "releases"
+        ]
+      }
+    },
+    "/projects/{project_id}/release-health/series": {
+      "get": {
+        "operationId": "get_release_health_series",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The release, exactly as the SDK sent it.",
+            "in": "query",
+            "name": "release",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "environment",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Window in days, 1 to 14; default 7.",
+            "in": "query",
+            "name": "days",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReleaseHealthSeries"
+                }
+              }
+            },
+            "description": "Hourly health of the release"
+          },
+          "400": {
+            "description": "Invalid release, window or environment"
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "description": "Release health could not be read"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "One release's sessions and crash-free rate per hour.",
+        "tags": [
+          "releases"
         ]
       }
     },
@@ -187371,6 +191632,34 @@
     {
       "description": "Release correlation across native telemetry",
       "name": "releases"
+    },
+    {
+      "description": "Release health from SDK sessions",
+      "name": "releases"
+    },
+    {
+      "description": "Error tracking issue workflow endpoints",
+      "name": "error-tracking"
+    },
+    {
+      "description": "Error tracking inbound filters",
+      "name": "error-tracking"
+    },
+    {
+      "description": "Error group assignment",
+      "name": "error-tracking"
+    },
+    {
+      "description": "Error group comments and activity",
+      "name": "error-tracking"
+    },
+    {
+      "description": "Saved searches over error groups",
+      "name": "error-tracking"
+    },
+    {
+      "description": "Performance issues",
+      "name": "error-tracking"
     },
     {
       "description": "Approximate SDK-reported telemetry discards",

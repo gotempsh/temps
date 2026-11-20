@@ -66,6 +66,7 @@ import ProjectFeedback from './ProjectFeedback'
 import TelemetryReleases from './TelemetryReleases'
 import ClientOutcomes from './ClientOutcomes'
 import { SourceMapArtifacts, SourceMapCredentials } from './SourceMapArtifacts'
+import { InboundFilters } from '@/components/error-tracking/InboundFilters'
 import { ProjectMonitors } from '@/components/project/ProjectMonitors'
 import {
   LegacyStatusPageRedirect,
@@ -602,6 +603,10 @@ export function ProjectDetail() {
                     element={<SourceMapCredentials project={project} />}
                   />
                   <Route
+                    path="errors/inbound-filters"
+                    element={<InboundFilters projectId={project.id} />}
+                  />
+                  <Route
                     path="errors/:errorGroupId"
                     element={<ErrorGroupDetail project={project} />}
                   />
@@ -1088,6 +1093,10 @@ export function ProjectDetail() {
                 <Route
                   path="errors/source-maps/credentials"
                   element={<SourceMapCredentials project={project} />}
+                />
+                <Route
+                  path="errors/inbound-filters"
+                  element={<InboundFilters projectId={project.id} />}
                 />
                 <Route
                   path="errors/:errorGroupId"

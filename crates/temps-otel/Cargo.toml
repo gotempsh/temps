@@ -83,6 +83,10 @@ arc-swap = { workspace = true }
 [build-dependencies]
 prost-build = { workspace = true }
 
+[features]
+# The in-memory `MockOtelStorage`, for other crates' tests.
+test-support = []
+
 [dev-dependencies]
 temps-schema = { path = "../temps-schema" }
 temps-test-utils = { path = "../temps-test-utils" }

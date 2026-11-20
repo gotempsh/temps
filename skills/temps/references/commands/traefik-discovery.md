@@ -50,6 +50,8 @@ List every route discovered from Traefik labels, including the labelled containe
 
 Restore a previously suppressed discovered route
 
+**Usage:** `traefik-discovery routes enable <host> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -59,6 +61,8 @@ Restore a previously suppressed discovered route
 #### `traefik-discovery routes disable`
 
 Stop routing one discovered host without touching the container labels; the route stays listed so you can see what was found
+
+**Usage:** `traefik-discovery routes disable <host> [options]`
 
 **Options:**
 
@@ -80,6 +84,8 @@ Manage HTTPS certificates for Traefik-discovered routes (ADR-041). A discovered 
 
 Authorize Temps to obtain a Let's Encrypt certificate for a discovered route (Path A). The certificate renews automatically using the declared challenge type.
 
+**Usage:** `traefik-discovery tls request <host> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -92,6 +98,8 @@ Authorize Temps to obtain a Let's Encrypt certificate for a discovered route (Pa
 
 Remove TLS authorization for a discovered route. Stops Temps from attempting renewal. Does NOT delete the certificate — use `temps domains delete <host>` to remove the certificate itself.
 
+**Usage:** `traefik-discovery tls revoke <host> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -101,6 +109,8 @@ Remove TLS authorization for a discovered route. Stops Temps from attempting ren
 #### `traefik-discovery tls import`
 
 Import certificates from a Traefik acme.json file (Path B). Use this to get HTTPS immediately at cutover — Traefik already holds the cert, so there is no outage window. Each host is validated (8-step X.509 chain) and a per-host result is returned. Add --dry-run to preview without writing.
+
+**Usage:** `traefik-discovery tls import <acme-json-file> [options]`
 
 **Options:**
 

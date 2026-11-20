@@ -44,6 +44,8 @@ Create a new team
 
 Show a team with its members and projects
 
+**Usage:** `teams show <team> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -53,6 +55,8 @@ Show a team with its members and projects
 ### `teams update`
 
 Update a team name or description
+
+**Usage:** `teams update <team> [options]`
 
 **Options:**
 
@@ -65,6 +69,8 @@ Update a team name or description
 ### `teams delete` (alias: `rm`)
 
 Delete a team (removes its members and project grants)
+
+**Usage:** `teams delete <team> [options]`
 
 **Options:**
 
@@ -87,6 +93,8 @@ Manage team membership
 
 List a team's members
 
+**Usage:** `teams members list <team> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -96,6 +104,8 @@ List a team's members
 #### `teams members add`
 
 Add a user to a team
+
+**Usage:** `teams members add <team> [options]`
 
 **Options:**
 
@@ -109,6 +119,8 @@ Add a user to a team
 
 Change a member's role in the team
 
+**Usage:** `teams members set-role <team> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -120,6 +132,8 @@ Change a member's role in the team
 #### `teams members remove` (alias: `rm`)
 
 Remove a user from a team
+
+**Usage:** `teams members remove <team> [options]`
 
 **Options:**
 

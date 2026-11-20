@@ -242,6 +242,11 @@ export const PROJECT_NAV_GROUPS: ProjectNavGroup[] = [
           { title: 'Feedback', icon: MessageSquare, url: 'errors/feedback' },
           { title: 'Releases', icon: Tag, url: 'releases' },
           { title: 'Source maps', icon: FileCode, url: 'errors/source-maps' },
+          {
+            title: 'Inbound filters',
+            icon: ListFilter,
+            url: 'errors/inbound-filters',
+          },
           { title: 'SDK health', icon: HeartPulse, url: 'client-outcomes' },
           { title: 'Setup', icon: Plug, url: 'errors/setup' },
         ],
