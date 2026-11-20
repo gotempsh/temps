@@ -64,7 +64,10 @@ impl AnalyticsIdentitySettings {
             mode,
             sdk_option: cookieless.then(|| "cookieless: true".to_string()),
             limitations: if cookieless {
-                COOKIELESS_LIMITATIONS.iter().map(|s| s.to_string()).collect()
+                COOKIELESS_LIMITATIONS
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect()
             } else {
                 Vec::new()
             },

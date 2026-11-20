@@ -578,8 +578,8 @@ impl AnalyticsGoalService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use temps_test_utils::TestDatabase;
     use temps_entities::{environments, events, projects, upstream_config::UpstreamList, visitor};
+    use temps_test_utils::TestDatabase;
 
     fn event_input(name: &str, event_name: &str) -> AnalyticsGoalInput {
         AnalyticsGoalInput {

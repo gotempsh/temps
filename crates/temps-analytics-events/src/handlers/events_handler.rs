@@ -814,124 +814,123 @@ pub async fn record_event_metrics(
     // keyed event look like it happened on the analytics backend, and
     // `get_channel` would classify the customer's real internal navigation as
     // "Referral" instead of a self-referral.
-    let (project_id, environment_id, deployment_id, site_hostname, branch, identity_mode) = if let Some(key) =
-        extract_analytics_key(&headers, raw_query.as_deref())
-    {
-        let origin = headers
-            .get(header::ORIGIN)
-            .and_then(|value| value.to_str().ok());
-        match resolve_keyed_ingest_scope(
-            state.ingest_key_service.as_ref(),
-            state.ingest_rate_limiter.as_ref(),
-            &key,
-            origin,
-        )
-        .await
-        {
-            Ok(scope) => {
-                info!(
-                    "Resolved analytics ingest key {} to project={}, env={:?}, deploy={:?}",
-                    scope.key_id, scope.project_id, scope.environment_id, scope.deployment_id
-                );
-                // No route-table entry carries this project's row, so its
-                // identity mode comes from a short-lived cache.
-                let identity_mode = match state
-                    .cookieless_identity
-                    .identity_mode(scope.project_id)
-                    .await
-                {
-                    Ok(mode) => mode,
-                    Err(e) => {
-                        error!("{}", e);
-                        return identity_unavailable_response(scope.project_id, &e);
-                    }
-                };
-                // No site hostname from this branch — see above. The service
-                // falls back to what the SDK put in the payload.
-                (
-                    scope.project_id,
-                    scope.environment_id,
-                    scope.deployment_id,
-                    None,
-                    IngestBranch::keyed(&headers),
-                    identity_mode,
-                )
-            }
-            Err(problem) => return problem.into_response(),
-        }
-    } else {
-        if host.is_empty() {
-            error!("Missing Host header");
-            return StatusCode::BAD_REQUEST.into_response();
-        }
-
-        // Look up project/environment/deployment from route table o(1)
-        match state.route_table.get_route(&host) {
-            Some(route_info) => {
-                // A route without a project is a sandbox/orphaned route — we can't
-                // attribute the event to anything, so silently drop it (204) rather
-                // than falling back to project_id=1 which FK-violates on insert.
-                let Some(project) = route_info.project.as_ref() else {
+    let (project_id, environment_id, deployment_id, site_hostname, branch, identity_mode) =
+        if let Some(key) = extract_analytics_key(&headers, raw_query.as_deref()) {
+            let origin = headers
+                .get(header::ORIGIN)
+                .and_then(|value| value.to_str().ok());
+            match resolve_keyed_ingest_scope(
+                state.ingest_key_service.as_ref(),
+                state.ingest_rate_limiter.as_ref(),
+                &key,
+                origin,
+            )
+            .await
+            {
+                Ok(scope) => {
                     info!(
+                        "Resolved analytics ingest key {} to project={}, env={:?}, deploy={:?}",
+                        scope.key_id, scope.project_id, scope.environment_id, scope.deployment_id
+                    );
+                    // No route-table entry carries this project's row, so its
+                    // identity mode comes from a short-lived cache.
+                    let identity_mode = match state
+                        .cookieless_identity
+                        .identity_mode(scope.project_id)
+                        .await
+                    {
+                        Ok(mode) => mode,
+                        Err(e) => {
+                            error!("{}", e);
+                            return identity_unavailable_response(scope.project_id, &e);
+                        }
+                    };
+                    // No site hostname from this branch — see above. The service
+                    // falls back to what the SDK put in the payload.
+                    (
+                        scope.project_id,
+                        scope.environment_id,
+                        scope.deployment_id,
+                        None,
+                        IngestBranch::keyed(&headers),
+                        identity_mode,
+                    )
+                }
+                Err(problem) => return problem.into_response(),
+            }
+        } else {
+            if host.is_empty() {
+                error!("Missing Host header");
+                return StatusCode::BAD_REQUEST.into_response();
+            }
+
+            // Look up project/environment/deployment from route table o(1)
+            match state.route_table.get_route(&host) {
+                Some(route_info) => {
+                    // A route without a project is a sandbox/orphaned route — we can't
+                    // attribute the event to anything, so silently drop it (204) rather
+                    // than falling back to project_id=1 which FK-violates on insert.
+                    let Some(project) = route_info.project.as_ref() else {
+                        info!(
                             "Dropping event for host {} — route has no associated project (sandbox/orphan)",
                             host
                         );
-                    return StatusCode::NO_CONTENT.into_response();
-                };
+                        return StatusCode::NO_CONTENT.into_response();
+                    };
 
-                let project_id = project.id;
-                let environment_id = route_info.environment.as_ref().map(|e| e.id);
-                let deployment_id = route_info.deployment.as_ref().map(|d| d.id);
+                    let project_id = project.id;
+                    let environment_id = route_info.environment.as_ref().map(|e| e.id);
+                    let deployment_id = route_info.deployment.as_ref().map(|d| d.id);
 
-                info!(
-                    "Resolved host {} to project={}, env={:?}, deploy={:?}",
-                    host, project_id, environment_id, deployment_id
-                );
-
-                // Without a limit here, anyone who sets `Host` to a tracked
-                // hostname could inject events at an unbounded rate. Checked
-                // before the geolocation lookup and the insert, so a rejected
-                // request costs no DB work; lock-free, so it never serializes
-                // ingest across projects.
-                if !state
-                    .host_ingest_rate_limiter
-                    .check(project_id, HOST_RESOLVED_INGEST_RATE_LIMIT_PER_MINUTE)
-                {
-                    tracing::warn!(
-                        project_id,
-                        host = %host,
-                        limit_per_minute = HOST_RESOLVED_INGEST_RATE_LIMIT_PER_MINUTE,
-                        "Host-resolved analytics ingest rate limit exceeded; dropping event"
+                    info!(
+                        "Resolved host {} to project={}, env={:?}, deploy={:?}",
+                        host, project_id, environment_id, deployment_id
                     );
-                    return ErrorBuilder::new(StatusCode::TOO_MANY_REQUESTS)
-                        .title("Analytics ingest rate limit exceeded")
-                        .detail(format!(
-                            "Analytics ingest for project {} via host '{}' exceeded {} events \
-                             per minute.",
-                            project_id, host, HOST_RESOLVED_INGEST_RATE_LIMIT_PER_MINUTE
-                        ))
-                        .build()
-                        .into_response();
-                }
 
-                // Unchanged: on this branch the Host header *is* the tracked
-                // site, so it stays the site hostname exactly as before.
-                (
-                    project_id,
-                    environment_id,
-                    deployment_id,
-                    (!host.is_empty()).then(|| host.clone()),
-                    IngestBranch::HostResolved,
-                    project.analytics_identity_mode,
-                )
+                    // Without a limit here, anyone who sets `Host` to a tracked
+                    // hostname could inject events at an unbounded rate. Checked
+                    // before the geolocation lookup and the insert, so a rejected
+                    // request costs no DB work; lock-free, so it never serializes
+                    // ingest across projects.
+                    if !state
+                        .host_ingest_rate_limiter
+                        .check(project_id, HOST_RESOLVED_INGEST_RATE_LIMIT_PER_MINUTE)
+                    {
+                        tracing::warn!(
+                            project_id,
+                            host = %host,
+                            limit_per_minute = HOST_RESOLVED_INGEST_RATE_LIMIT_PER_MINUTE,
+                            "Host-resolved analytics ingest rate limit exceeded; dropping event"
+                        );
+                        return ErrorBuilder::new(StatusCode::TOO_MANY_REQUESTS)
+                            .title("Analytics ingest rate limit exceeded")
+                            .detail(format!(
+                                "Analytics ingest for project {} via host '{}' exceeded {} events \
+                             per minute.",
+                                project_id, host, HOST_RESOLVED_INGEST_RATE_LIMIT_PER_MINUTE
+                            ))
+                            .build()
+                            .into_response();
+                    }
+
+                    // Unchanged: on this branch the Host header *is* the tracked
+                    // site, so it stays the site hostname exactly as before.
+                    (
+                        project_id,
+                        environment_id,
+                        deployment_id,
+                        (!host.is_empty()).then(|| host.clone()),
+                        IngestBranch::HostResolved,
+                        project.analytics_identity_mode,
+                    )
+                }
+                None => {
+                    error!("Host {} not found in route table", host);
+                    // Return 404 or BAD_REQUEST since we can't track events for unknown hosts
+                    return StatusCode::NOT_FOUND.into_response();
+                }
             }
-            None => {
-                error!("Host {} not found in route table", host);
-                // Return 404 or BAD_REQUEST since we can't track events for unknown hosts
-                return StatusCode::NOT_FOUND.into_response();
-            }
-        }
-    };
+        };
 
     // Extract user agent and referrer from headers
     let user_agent = headers
@@ -3666,7 +3665,10 @@ mod tests {
         assert_eq!(events.len(), 3);
         for event in &events {
             let session = event.session_id.as_deref().unwrap_or_default();
-            assert_ne!(session, "sdk-session-0003", "the payload id must be ignored");
+            assert_ne!(
+                session, "sdk-session-0003",
+                "the payload id must be ignored"
+            );
             assert_ne!(session, "cookie-session-0003", "the cookie must be ignored");
         }
         let mut by_time = events.clone();

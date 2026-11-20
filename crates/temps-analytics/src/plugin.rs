@@ -165,15 +165,18 @@ impl TempsPlugin for AnalyticsPlugin {
                         context.get_service::<dyn temps_core::ProjectAccessChecker>(),
                 },
             )))
-            .merge(crate::identity_settings::routes().with_state(Arc::new(
-                crate::identity_settings::AnalyticsIdentityState {
-                    service: context
-                        .require_service::<crate::identity_settings::AnalyticsIdentityService>(),
-                    audit: context.require_service::<dyn temps_core::AuditLogger>(),
-                    project_access_checker:
-                        context.get_service::<dyn temps_core::ProjectAccessChecker>(),
-                },
-            )));
+            .merge(
+                crate::identity_settings::routes().with_state(Arc::new(
+                    crate::identity_settings::AnalyticsIdentityState {
+                        service: context
+                            .require_service::<crate::identity_settings::AnalyticsIdentityService>(
+                            ),
+                        audit: context.require_service::<dyn temps_core::AuditLogger>(),
+                        project_access_checker: context
+                            .get_service::<dyn temps_core::ProjectAccessChecker>(),
+                    },
+                )),
+            );
 
         Some(PluginRoutes::new(routes))
     }

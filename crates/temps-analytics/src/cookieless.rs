@@ -165,7 +165,9 @@ impl CookielessIdentity {
         user_agent: &str,
     ) -> Result<String, CookielessIdentityError> {
         let salt = self.salt_for(Utc::now().date_naive()).await?;
-        Ok(derive_visitor_id(&salt.key, project_id, client_ip, user_agent))
+        Ok(derive_visitor_id(
+            &salt.key, project_id, client_ip, user_agent,
+        ))
     }
 
     /// The visitor's current session, or a new one after [`SESSION_IDLE`]
@@ -267,14 +269,14 @@ impl CookielessIdentity {
     /// both then read that one back.
     async fn load_or_create(&self, day: NaiveDate) -> Result<DailySalt, CookielessIdentityError> {
         let fresh: [u8; SALT_BYTES] = rand::random();
-        let sealed = self
-            .encryption
-            .encrypt(&fresh)
-            .map_err(|e| CookielessIdentityError::Crypto {
-                day,
-                operation: "encrypted",
-                reason: e.to_string(),
-            })?;
+        let sealed =
+            self.encryption
+                .encrypt(&fresh)
+                .map_err(|e| CookielessIdentityError::Crypto {
+                    day,
+                    operation: "encrypted",
+                    reason: e.to_string(),
+                })?;
         let db_error = |operation| {
             move |source| CookielessIdentityError::Database {
                 day,
@@ -302,14 +304,14 @@ impl CookielessIdentity {
             .map_err(db_error("reading"))?
             .ok_or(CookielessIdentityError::Missing { day })?;
         let stored: String = row.try_get("", "salt").map_err(db_error("decoding"))?;
-        let bytes = self
-            .encryption
-            .decrypt(&stored)
-            .map_err(|e| CookielessIdentityError::Crypto {
-                day,
-                operation: "decrypted",
-                reason: e.to_string(),
-            })?;
+        let bytes =
+            self.encryption
+                .decrypt(&stored)
+                .map_err(|e| CookielessIdentityError::Crypto {
+                    day,
+                    operation: "decrypted",
+                    reason: e.to_string(),
+                })?;
         let key: [u8; SALT_BYTES] =
             bytes
                 .try_into()
@@ -383,10 +385,16 @@ mod tests {
         let today = [1u8; SALT_BYTES];
         let tomorrow = [2u8; SALT_BYTES];
         let a = derive_visitor_id(&today, 7, "203.0.113.9", "Mozilla/5.0");
-        assert_eq!(a, derive_visitor_id(&today, 7, "203.0.113.9", "Mozilla/5.0"));
+        assert_eq!(
+            a,
+            derive_visitor_id(&today, 7, "203.0.113.9", "Mozilla/5.0")
+        );
         assert!(a.starts_with(COOKIELESS_VISITOR_PREFIX));
         assert_eq!(a.len(), COOKIELESS_VISITOR_PREFIX.len() + 32);
-        assert_ne!(a, derive_visitor_id(&tomorrow, 7, "203.0.113.9", "Mozilla/5.0"));
+        assert_ne!(
+            a,
+            derive_visitor_id(&tomorrow, 7, "203.0.113.9", "Mozilla/5.0")
+        );
     }
 
     #[test]

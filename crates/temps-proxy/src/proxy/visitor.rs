@@ -450,7 +450,10 @@ mod visitor_tests {
         let lb = load_balancer(dir.path())?;
         let expired =
             lb.build_cookie_string(VISITOR_ID_COOKIE, "", cookie::time::Duration::ZERO, true);
-        assert!(expired.starts_with(&format!("{VISITOR_ID_COOKIE}=;")), "{expired}");
+        assert!(
+            expired.starts_with(&format!("{VISITOR_ID_COOKIE}=;")),
+            "{expired}"
+        );
         assert!(expired.contains("Max-Age=0"), "{expired}");
         assert!(expired.contains("Path=/"), "{expired}");
         Ok(())

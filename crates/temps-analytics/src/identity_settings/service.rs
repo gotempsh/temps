@@ -77,15 +77,13 @@ impl AnalyticsIdentityService {
         let mut active: projects::ActiveModel = project.into();
         active.analytics_identity_mode = Set(mode);
         active.updated_at = Set(Utc::now());
-        let updated =
-            active
-                .update(self.db.as_ref())
-                .await
-                .map_err(|source| AnalyticsIdentityError::Database {
-                    project_id,
-                    operation: "update project identity mode",
-                    source,
-                })?;
+        let updated = active.update(self.db.as_ref()).await.map_err(|source| {
+            AnalyticsIdentityError::Database {
+                project_id,
+                operation: "update project identity mode",
+                source,
+            }
+        })?;
         self.cookieless.forget_identity_mode(project_id).await;
         Ok(AnalyticsIdentityChange {
             previous,
