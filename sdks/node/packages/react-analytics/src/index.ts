@@ -12,7 +12,14 @@ export * from "./useSpeedAnalytics";
 export * from "./useEngagementTracking";
 export * from "./useScrollVisibility";
 export * from "./useFlag";
+export * from "./TempsSurveys";
 export type { FlagContext, FlagEvaluation, FlagExposure } from "@temps-sdk/analytics-core";
+export {
+  Surveys,
+  type Survey,
+  type SurveyAnswers,
+  type SurveyQuestion,
+} from "@temps-sdk/analytics-core";
 export { EngagementTracker, type EngagementTrackerOptions, type EngagementData } from "./EngagementTracker";
 export {
   SessionRecorder,

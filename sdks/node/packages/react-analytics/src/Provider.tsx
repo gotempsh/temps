@@ -13,6 +13,9 @@ import { SessionRecordingProvider, useSessionRecordingControl } from "./useSessi
 import { DEFAULT_BASE_PATH } from "./constants";
 import { FeatureFlags, exposureEventData } from "@temps-sdk/analytics-core";
 
+/** Window event dispatched for every tracked custom event, `{ detail: { name } }`. */
+export const TRACK_EVENT = "temps:track";
+
 const AnalyticsContext = createContext<AnalyticsContextValue | undefined>(undefined);
 
 export function TempsAnalyticsProvider({
@@ -49,6 +52,10 @@ export function TempsAnalyticsProvider({
   const trackEvent = useCallback<AnalyticsContextValue["trackEvent"]>(
     async (eventName, data = {}) => {
       if (!enabled) return;
+      // Lets <TempsSurveys /> show a survey triggered by this event.
+      if (!eventName.startsWith("survey_")) {
+        window.dispatchEvent(new CustomEvent(TRACK_EVENT, { detail: { name: eventName } }));
+      }
       await sendAnalytics("event", {
         event_name: eventName,
         request_query: window.location.search,

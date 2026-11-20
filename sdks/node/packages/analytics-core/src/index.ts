@@ -18,3 +18,18 @@ export {
   type FlagReason,
   type FlagsStatus,
 } from "./FeatureFlags";
+export {
+  Surveys,
+  pathMatches,
+  validateAnswers,
+  MAX_OPEN_TEXT_LENGTH,
+  type Survey,
+  type SurveyAnswer,
+  type SurveyAnswers,
+  type SurveyDisplay,
+  type SurveyQuestion,
+  type SurveyQuestionKind,
+  type SurveysOptions,
+  type SurveysStatus,
+} from "./Surveys";
+export { renderSurveyWidget, type SurveyWidgetHandlers } from "./SurveyWidget";

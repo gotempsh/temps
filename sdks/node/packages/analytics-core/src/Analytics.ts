@@ -13,6 +13,8 @@ import { EngagementTracker } from "./EngagementTracker";
 import { SpeedTracker } from "./SpeedTracker";
 import { SessionRecorder } from "./SessionRecorder";
 import { exposureEventData, FeatureFlags } from "./FeatureFlags";
+import { Surveys, type Survey } from "./Surveys";
+import { renderSurveyWidget } from "./SurveyWidget";
 
 interface InternalCleanup {
   (): void;
@@ -40,6 +42,7 @@ export function createAnalytics(options: AnalyticsOptions = {}): AnalyticsApi {
     enableSessionRecording = false,
     sessionRecordingConfig = {},
     flags: flagOptions = {},
+    surveys: surveyOptions = {},
   } = options;
 
   const cleanups: InternalCleanup[] = [];
@@ -49,7 +52,7 @@ export function createAnalytics(options: AnalyticsOptions = {}): AnalyticsApi {
   const resolveDomain = (): string =>
     domain || (typeof window !== "undefined" ? window.location.hostname : "");
 
-  const trackEvent: AnalyticsApi["trackEvent"] = async (eventName, data = {}) => {
+  const sendEvent = async (eventName: string, data: Record<string, JsonValue> = {}): Promise<void> => {
     if (!enabled) return;
     await sendAnalytics(
       "event",
@@ -97,9 +100,54 @@ export function createAnalytics(options: AnalyticsOptions = {}): AnalyticsApi {
     basePath,
     disabled,
     onExposure: (exposure) => {
-      if (enabled) void trackEvent("flag_exposure", exposureEventData(exposure));
+      if (enabled) void sendEvent("flag_exposure", exposureEventData(exposure));
     },
   });
+
+  // Surveys record answers as analytics events, so they need analytics on.
+  const surveysEnabled = enabled && surveyOptions.enabled === true;
+  const autoShowSurveys = surveysEnabled && surveyOptions.autoShow !== false;
+  const surveys = new Surveys({
+    basePath,
+    key: surveyOptions.key,
+    attributes: surveyOptions.attributes,
+    onError: surveyOptions.onError,
+    disabled: !surveysEnabled,
+    onEvent: (name, data) => {
+      void sendEvent(name, data);
+    },
+  });
+  let openSurvey: (() => void) | null = null;
+  const showSurvey = async (event?: string): Promise<void> => {
+    if (!autoShowSurveys || openSurvey) return;
+    await surveys.load();
+    if (openSurvey) return;
+    const next: Survey | undefined = surveys.eligible(window.location.pathname, event)[0];
+    if (!next) return;
+    surveys.markShown(next);
+    const close = renderSurveyWidget(next, {
+      onSubmit: (answers) => {
+        const result = surveys.submit(next, answers);
+        if (result.ok) openSurvey = null;
+        return result.ok ? null : result.errors;
+      },
+      onDismiss: () => {
+        openSurvey = null;
+        surveys.dismiss(next);
+      },
+    });
+    openSurvey = () => {
+      openSurvey = null;
+      close();
+    };
+  };
+  if (autoShowSurveys) cleanups.push(() => openSurvey?.());
+
+  const trackEvent: AnalyticsApi["trackEvent"] = async (eventName, data = {}) => {
+    // A survey triggered by this event is shown without waiting for the send.
+    if (!eventName.startsWith("survey_")) void showSurvey(eventName);
+    await sendEvent(eventName, data);
+  };
 
   const identify: AnalyticsApi["identify"] = async () => {
     // Placeholder for SDK parity; implement when identity endpoint is available.
@@ -107,7 +155,12 @@ export function createAnalytics(options: AnalyticsOptions = {}): AnalyticsApi {
 
   if (enabled) {
     if (autoTrackPageviews) {
-      cleanups.push(setupPageviewTracking(trackPageview));
+      cleanups.push(
+        setupPageviewTracking(() => {
+          trackPageview();
+          void showSurvey();
+        })
+      );
     }
 
     if (autoTrackEngagement) {
@@ -130,6 +183,9 @@ export function createAnalytics(options: AnalyticsOptions = {}): AnalyticsApi {
     }
 
     cleanups.push(setupClickDelegation(trackEvent));
+
+    // Without automatic pageviews, surveys are still offered on load.
+    if (!autoTrackPageviews) void showSurvey();
   }
 
   const recorder =
@@ -153,6 +209,7 @@ export function createAnalytics(options: AnalyticsOptions = {}): AnalyticsApi {
     },
     ingestKey,
     flags,
+    surveys,
     trackEvent,
     trackPageview,
     identify,
