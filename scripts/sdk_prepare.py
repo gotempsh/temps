@@ -144,9 +144,17 @@ class GitHistory:
         return [dict(zip(('sha', 'subject', 'body'), record.split('\x1f', 2))) for record in records]
 
     def changed_files(self, candidate, paths, excludes):
-        """Paths whose content `candidate` changes since its merge base with HEAD."""
+        """Paths `candidate` changed since its merge base with HEAD and still differ from HEAD.
+
+        A fix landed on both branches (cherry-picked to main) has identical content and
+        is not reported; a change made only on `candidate`, merge resolutions included, is.
+        """
         spec = [*paths, *(f':(exclude){path}' for path in excludes)]
-        return self.git('diff', '--name-only', f'HEAD...{candidate}', '--', *spec).split()
+        changed = self.git('diff', '--name-only', f'HEAD...{candidate}', '--', *spec).split()
+        if not changed:
+            return []
+        differ = set(self.git('diff', '--name-only', 'HEAD', candidate, '--', *changed).split())
+        return [path for path in changed if path in differ]
 
     def revisions(self, path):
         return self.git('log', '--format=%H', '--', path).split()
@@ -714,20 +722,22 @@ def verify_tag(tag, root=release.ROOT, *, history=None, published=None):
     released = [entry['key'] for entry in planned if history.tag_exists(entry['tag'])
                 or Version.parse(entry['version'], entry['kind']) in parse_all(published(entry), entry['kind'])]
     hidden_tags = {entry['tag'] for entry in planned}
-    hidden = {entry['name']: {Version.parse(entry['version'], entry['kind'])} for entry in planned}
+    # By catalog key: packages on different registries can share a name (the Python and
+    # Rust plugin SDKs are both `temps-plugin-sdk`).
+    hidden = {entry['key']: {Version.parse(entry['version'], entry['kind'])} for entry in planned}
     reachable = history.reachable_tags()
     for package in release.catalog_packages(root):
         prefix = release.package_tag(package['key'], package, '')
         for later in (tag for tag in history.tags(prefix) if tag not in reachable):
             hidden_tags.add(later)
             try:
-                hidden.setdefault(package['name'], set()).add(Version.parse(later.removeprefix(prefix), package['kind']))
+                hidden.setdefault(package['key'], set()).add(Version.parse(later.removeprefix(prefix), package['kind']))
             except ValueError:
                 continue
 
     def before_release(package):
         versions = published(package)
-        return {text for text in versions if registry_version(text, package['kind']) not in hidden.get(package['name'], ())}
+        return {text for text in versions if registry_version(text, package['kind']) not in hidden.get(package['key'], ())}
 
     _, files = prepare(tag, root, history=BeforeRelease(history, hidden_tags), published=before_release,
                        write=False, at_tag=True)

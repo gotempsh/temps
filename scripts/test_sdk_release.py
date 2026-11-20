@@ -1082,6 +1082,26 @@ class PrepareTests(unittest.TestCase):
         self.history.unreachable.add('sdk/analytics-core/v0.0.8')
         self.assertEqual(self.verify(), ([], ['analytics-core']))
 
+    def test_packages_sharing_a_name_on_different_registries_are_verified_separately(self):
+        # The Python and Rust plugin SDKs are both `temps-plugin-sdk`, on PyPI and crates.io.
+        self.add('python-plugin', 'pypi', '1.0.0', name='temps-plugin-sdk', path='sdks/python-plugin')
+        self.add('temps-plugin-sdk', 'crate', '2.0.0', name='temps-plugin-sdk')
+        registry = {'pypi': {'1.0.0'}, 'crate': {'2.0.0'}}
+        published = lambda package: registry[package['kind']]
+        for key in ('python-plugin', 'temps-plugin-sdk'):
+            self.release_tag(key, self.version(key))
+        self.history.commit('fix(plugin): python', ['sdks/python-plugin/plugin.py'])
+        self.history.commit('fix(plugin): rust', ['crates/temps-plugin-sdk/src/lib.rs'])
+        report, files = sdk_prepare.prepare('v9.0.0', self.root, history=self.history, published=published)
+        self.assertEqual({e['key']: e['version'] for e in report}, {'python-plugin': '1.0.1', 'temps-plugin-sdk': '2.0.1'})
+        self.history.commit('chore(release): prepare SDKs for v9.0.0', {path: self.read(path) for path in files})
+        self.history.tag('v9.0.0')
+        # Only the Python package was published before the run stopped.
+        registry['pypi'].add('1.0.1')
+        self.release_tag('python-plugin', '1.0.1')
+        self.assertEqual(sdk_prepare.verify_tag('v9.0.0', self.root, history=self.history, published=published),
+                         ([], ['python-plugin']))
+
     def test_server_only_tag_has_nothing_to_verify(self):
         self.add('analytics-core', 'npm', '0.0.6', published={'0.0.6'})
         self.release_tag('analytics-core', '0.0.6')
@@ -1260,6 +1280,18 @@ class GitHistoryTests(unittest.TestCase):
         self.git('add', '-A')
         self.git('commit', '-q', '-m', "Merge branch 'main' into release/v9.0.0")
         self.assertEqual(self.branch_changes(history), [('kv', ['sdks/node/packages/kv/src/index.ts'])])
+
+    def test_a_branch_fix_also_cherry_picked_onto_main_is_not_reported(self):
+        history = self.release_branch_repo()
+        self.git('switch', '-q', 'release/v9.0.0')
+        fix = self.commit('sdks/node/packages/kv/src/scan.ts', 'fixed', 'fix(kv): on the branch first')
+        self.git('switch', '-q', 'main')
+        self.git('cherry-pick', fix)
+        self.assertEqual(self.branch_changes(history), [])
+        # Content that differs again on the branch is reported.
+        self.git('switch', '-q', 'release/v9.0.0')
+        self.commit('sdks/node/packages/kv/src/scan.ts', 'fixed differently', 'fix(kv): branch only')
+        self.assertEqual(self.branch_changes(history), [('kv', ['sdks/node/packages/kv/src/scan.ts'])])
 
     def test_packages_and_release_metadata_added_only_on_the_branch_are_found(self):
         history = self.release_branch_repo()
