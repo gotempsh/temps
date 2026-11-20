@@ -22,6 +22,11 @@ impl SentryProvider {
     }
 }
 
+/// Session updates counted from one envelope; SDKs send one or two.
+pub const MAX_SESSIONS_PER_ENVELOPE: usize = 100;
+/// Aggregate rows (one per minute and user) counted from one envelope.
+pub const MAX_SESSION_AGGREGATES_PER_ENVELOPE: usize = 1_000;
+
 /// Fully validated dispatch result. No writes happen until every supported item
 /// has been decoded. Unsupported names are collapsed to the fixed ItemType set.
 pub struct ParsedSentryEnvelope {
@@ -33,6 +38,10 @@ pub struct ParsedSentryEnvelope {
     pub replay: Option<crate::sentry::replay::ReplaySegment>,
     pub client_outcomes: Vec<crate::sentry::client_reports::ClientReport>,
     pub check_ins: Vec<temps_monitoring::cron_monitors::MonitorCheckIn>,
+    /// Session updates, counted into release health (ADR 111, D3).
+    pub sessions: Vec<relay_event_schema::protocol::SessionUpdate>,
+    /// Pre-aggregated sessions of server-mode SDKs.
+    pub session_aggregates: Vec<relay_event_schema::protocol::SessionAggregates>,
     pub unsupported: std::collections::BTreeMap<&'static str, usize>,
 }
 
@@ -68,6 +77,9 @@ impl SentryProvider {
         let mut statsd_bytes = 0usize;
         let mut replay_event = None;
         let mut replay_recording = None;
+        let mut sessions = Vec::new();
+        let mut session_aggregates = Vec::new();
+        let mut session_aggregate_items = 0usize;
 
         let envelope_id = envelope.event_id();
         // Process each item in the envelope
@@ -420,6 +432,33 @@ impl SentryProvider {
                             .map_err(|e| ProviderError::Validation(e.to_string()))?,
                     );
                 }
+                // Sessions count into release health (ADR 111, D3). A
+                // malformed one, or one past the per-envelope bounds, is left
+                // uncounted and reported as unsupported, never rejected: it
+                // rides along with events that must still be stored.
+                EnvelopeItem::Unsupported(payload)
+                    if matches!(header.ty, crate::sentry::envelope::ItemType::Session)
+                        && sessions.len() < MAX_SESSIONS_PER_ENVELOPE =>
+                {
+                    match relay_event_schema::protocol::SessionUpdate::parse(payload) {
+                        Ok(session) => sessions.push(session),
+                        Err(_) => *unsupported.entry(header.ty.name()).or_insert(0) += 1,
+                    }
+                }
+                EnvelopeItem::Unsupported(payload)
+                    if matches!(header.ty, crate::sentry::envelope::ItemType::Sessions) =>
+                {
+                    match relay_event_schema::protocol::SessionAggregates::parse(payload) {
+                        Ok(aggregates)
+                            if session_aggregate_items + aggregates.aggregates.len()
+                                <= MAX_SESSION_AGGREGATES_PER_ENVELOPE =>
+                        {
+                            session_aggregate_items += aggregates.aggregates.len();
+                            session_aggregates.push(aggregates);
+                        }
+                        _ => *unsupported.entry(header.ty.name()).or_insert(0) += 1,
+                    }
+                }
                 _ => {
                     *unsupported.entry(header.ty.name()).or_insert(0) += 1;
                 }
@@ -454,6 +493,8 @@ impl SentryProvider {
             feedback,
             check_ins,
             client_outcomes,
+            sessions,
+            session_aggregates,
             unsupported,
         })
     }
@@ -777,5 +818,57 @@ mod tests {
             bytes.push(b'\n');
         }
         assert!(provider.parse_envelope(&bytes, &auth).is_err());
+    }
+
+    #[test]
+    fn sessions_and_aggregates_ride_along_and_bad_ones_never_reject_the_envelope() {
+        let db = sea_orm::DatabaseConnection::Disconnected;
+        let provider = SentryProvider::new(Arc::new(DSNService::new(Arc::new(db))));
+        let auth = AuthContext {
+            project_id: 7,
+            environment_id: None,
+            deployment_id: None,
+            rate_limit_per_minute: None,
+        };
+        let started = chrono::Utc::now().to_rfc3339();
+        let mut items = vec![
+            (
+                "event",
+                serde_json::json!({"event_id":"00112233445546778899aabbccddeeff","message":"Synthetic error"}),
+            ),
+            (
+                "session",
+                serde_json::json!({"sid":"00112233-4455-4677-8899-aabbccddeeff","init":true,"started":started,"timestamp":started,"status":"ok","attrs":{"release":"synthetic@1"}}),
+            ),
+            ("session", serde_json::json!({"not":"a session"})),
+            (
+                "sessions",
+                serde_json::json!({"aggregates":[{"started":started,"exited":4,"crashed":1}],"attrs":{"release":"synthetic@1"}}),
+            ),
+        ];
+        let too_many: Vec<_> = (0..MAX_SESSION_AGGREGATES_PER_ENVELOPE + 1)
+            .map(|_| serde_json::json!({"started":started,"exited":1}))
+            .collect();
+        items.push((
+            "sessions",
+            serde_json::json!({"aggregates":too_many,"attrs":{"release":"synthetic@1"}}),
+        ));
+        let mut bytes = b"{}\n".to_vec();
+        for (kind, payload) in items {
+            let payload = serde_json::to_vec(&payload).unwrap();
+            bytes.extend(
+                serde_json::to_vec(&serde_json::json!({"type":kind,"length":payload.len()}))
+                    .unwrap(),
+            );
+            bytes.push(b'\n');
+            bytes.extend(payload);
+            bytes.push(b'\n');
+        }
+        let parsed = provider.parse_envelope(&bytes, &auth).unwrap();
+        assert_eq!(parsed.events.len(), 1);
+        assert_eq!(parsed.sessions.len(), 1);
+        assert_eq!(parsed.session_aggregates.len(), 1);
+        assert_eq!(parsed.unsupported.get("session"), Some(&1));
+        assert_eq!(parsed.unsupported.get("sessions"), Some(&1));
     }
 }

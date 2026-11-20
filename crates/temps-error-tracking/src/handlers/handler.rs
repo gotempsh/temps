@@ -61,7 +61,14 @@ pub struct ErrorTrackingApiDoc;
 pub fn configure_routes() -> Router<Arc<AppState>> {
     Router::new()
         .merge(super::feedback_handler::routes())
+        .merge(super::group_workflow_handler::routes())
+        .merge(super::assignee_handler::routes())
+        .merge(super::activity_handler::routes())
+        .merge(super::saved_search_handler::routes())
+        .merge(super::performance_handler::routes())
+        .merge(super::inbound_filter_handler::routes())
         .merge(super::release_handler::routes())
+        .merge(super::release_health_handler::routes())
         .merge(super::client_outcome_handler::routes())
         .route("/error-groups", get(list_global_error_groups))
         .route(
@@ -110,6 +117,13 @@ pub struct ListErrorGroupsQuery {
     pub sort_by: Option<String>,
     #[serde(default = "default_sort_order")]
     pub sort_order: String,
+    /// Only groups with this assignee: `me` (you, or a team you are in),
+    /// `none`, `user:<id>` or `team:<id>`.
+    pub assignee: Option<String>,
+    /// Case-insensitive text in the title, error type or message.
+    pub search: Option<String>,
+    /// `error` or `performance`; omitted for both.
+    pub issue_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize, ToSchema, IntoParams)]
@@ -128,11 +142,24 @@ pub struct ListErrorEventsQuery {
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct UpdateErrorGroupRequest {
     pub status: String,
-    /// Assignee (email by convention).
-    /// - `Some("user@example.com")` — sets the assignee.
-    /// - `Some("")` (empty string) — clears the current assignment (sets to null).
-    /// - `null` / field omitted — leaves the existing value unchanged.
+    /// Deprecated: assign by email. Prefer
+    /// `PUT /projects/{project_id}/error-groups/{group_id}/assignee`.
+    /// - `Some("user@example.com")`: assigns the user with that email; an
+    ///   email that is no user's is refused.
+    /// - `Some("")` (empty string): unassigns the group.
+    /// - `null` / field omitted: leaves the assignee unchanged.
+    ///
+    /// The status `assigned` is accepted and stored as `unresolved`.
     pub assigned_to: Option<String>,
+    /// With `status: ignored`: when the group comes back. Omitted, the next
+    /// event reopens it.
+    pub ignore: Option<super::group_workflow_handler::IgnoreConditionsRequest>,
+    /// With `status: resolved` (or `action: resolve`): resolved in the next
+    /// release. Events from the project's newest release at this moment, or
+    /// an older one, or with no release, keep it resolved; an event from a
+    /// newer release reopens it. Fails when the project has no release yet.
+    #[serde(default)]
+    pub in_next_release: bool,
 }
 
 #[derive(Debug, Deserialize, ToSchema, IntoParams)]
@@ -194,7 +221,24 @@ pub struct ErrorGroupResponse {
     pub last_seen: String,
     pub total_count: i32,
     pub status: String,
+    /// Deprecated: a free-text assignee from before assignees were users or
+    /// teams, kept read-only when it matched no user. Use `assignee`.
     pub assigned_to: Option<String>,
+    /// The user or team the group is assigned to.
+    pub assignee: Option<crate::services::group_workflow::GroupAssignee>,
+    /// Set when this group was merged into another one. Its events and count
+    /// stay with it so the merge can be undone, it is left out of lists, and
+    /// its future events land in the group named here.
+    pub merged_into_group_id: Option<i32>,
+    /// While the group is ignored with conditions: when it comes back.
+    pub ignore: Option<crate::services::types::GroupIgnoreState>,
+    /// While the group is resolved in the next release: the release it was
+    /// resolved after.
+    pub resolution: Option<crate::services::types::GroupResolutionState>,
+    /// `error`, or `performance` for an issue a trace detector filed: an
+    /// N+1 query, a slow database query, consecutive HTTP calls or an
+    /// oversized payload.
+    pub issue_type: String,
     pub project_id: i32,
     pub environment_id: Option<i32>,
     pub deployment_id: Option<i32>,
@@ -284,6 +328,11 @@ impl From<ErrorGroupDomain> for ErrorGroupResponse {
             total_count: group.total_count,
             status: group.status,
             assigned_to: group.assigned_to,
+            assignee: group.assignee,
+            merged_into_group_id: group.merged_into_group_id,
+            ignore: group.ignore,
+            resolution: group.resolution,
+            issue_type: group.issue_type,
             project_id: group.project_id,
             environment_id: group.environment_id,
             deployment_id: group.deployment_id,
@@ -332,6 +381,155 @@ impl From<ErrorTrackingError> for temps_core::problemdetails::Problem {
             | ErrorTrackingError::ProjectNotFound => problemdetails::new(StatusCode::NOT_FOUND)
                 .with_title("Not Found")
                 .with_detail(err.to_string()),
+            ErrorTrackingError::GroupsNotFound {
+                project_id,
+                ref group_ids,
+            } => temps_core::error_builder::ErrorBuilder::new(StatusCode::NOT_FOUND)
+                .type_("https://temps.sh/probs/error-groups-not-found")
+                .title("Error Groups Not Found")
+                .detail(err.to_string())
+                .value("project_id", project_id)
+                .value("group_ids", group_ids.clone())
+                .build(),
+            ErrorTrackingError::GroupNotInProject {
+                project_id,
+                group_id,
+            } => temps_core::error_builder::ErrorBuilder::new(StatusCode::NOT_FOUND)
+                .type_("https://temps.sh/probs/error-group-not-found")
+                .title("Error Group Not Found")
+                .detail(err.to_string())
+                .value("project_id", project_id)
+                .value("group_id", group_id)
+                .build(),
+            ErrorTrackingError::CommentNotFound {
+                group_id,
+                comment_id,
+            } => temps_core::error_builder::ErrorBuilder::new(StatusCode::NOT_FOUND)
+                .type_("https://temps.sh/probs/error-group-comment-not-found")
+                .title("Comment Not Found")
+                .detail(err.to_string())
+                .value("group_id", group_id)
+                .value("comment_id", comment_id)
+                .build(),
+            ErrorTrackingError::NotCommentAuthor {
+                group_id,
+                comment_id,
+                ..
+            } => temps_core::error_builder::ErrorBuilder::new(StatusCode::FORBIDDEN)
+                .type_("https://temps.sh/probs/not-comment-author")
+                .title("Not The Comment's Author")
+                .detail(err.to_string())
+                .value("group_id", group_id)
+                .value("comment_id", comment_id)
+                .build(),
+            ErrorTrackingError::SavedSearchNotFound {
+                project_id,
+                saved_search_id,
+            } => temps_core::error_builder::ErrorBuilder::new(StatusCode::NOT_FOUND)
+                .type_("https://temps.sh/probs/error-saved-search-not-found")
+                .title("Saved Search Not Found")
+                .detail(err.to_string())
+                .value("project_id", project_id)
+                .value("saved_search_id", saved_search_id)
+                .build(),
+            ErrorTrackingError::FingerprintsNotInGroup {
+                group_id,
+                ref fingerprints,
+            } => temps_core::error_builder::ErrorBuilder::new(StatusCode::NOT_FOUND)
+                .type_("https://temps.sh/probs/fingerprints-not-in-error-group")
+                .title("Fingerprints Not In Error Group")
+                .detail(err.to_string())
+                .value("group_id", group_id)
+                .value("fingerprints", fingerprints.clone())
+                .build(),
+            ErrorTrackingError::GroupAlreadyMerged {
+                group_id,
+                merged_into_group_id,
+            } => temps_core::error_builder::ErrorBuilder::new(StatusCode::CONFLICT)
+                .type_("https://temps.sh/probs/error-group-already-merged")
+                .title("Error Group Already Merged")
+                .detail(err.to_string())
+                .value("group_id", group_id)
+                .value("merged_into_group_id", merged_into_group_id)
+                .build(),
+            ErrorTrackingError::InboundFilterNotFound {
+                project_id,
+                filter_id,
+            } => temps_core::error_builder::ErrorBuilder::new(StatusCode::NOT_FOUND)
+                .type_("https://temps.sh/probs/error-inbound-filter-not-found")
+                .title("Inbound Filter Not Found")
+                .detail(err.to_string())
+                .value("project_id", project_id)
+                .value("filter_id", filter_id)
+                .build(),
+            ErrorTrackingError::NotSavedSearchOwner {
+                project_id,
+                saved_search_id,
+                ..
+            } => temps_core::error_builder::ErrorBuilder::new(StatusCode::FORBIDDEN)
+                .type_("https://temps.sh/probs/not-saved-search-owner")
+                .title("Not The Saved Search's Owner")
+                .detail(err.to_string())
+                .value("project_id", project_id)
+                .value("saved_search_id", saved_search_id)
+                .build(),
+            ErrorTrackingError::SavedSearchExists {
+                project_id,
+                ref name,
+            } => temps_core::error_builder::ErrorBuilder::new(StatusCode::CONFLICT)
+                .type_("https://temps.sh/probs/error-saved-search-exists")
+                .title("Saved Search Already Exists")
+                .detail(err.to_string())
+                .value("project_id", project_id)
+                .value("name", name.clone())
+                .build(),
+            ErrorTrackingError::SavedSearchLimit {
+                project_id,
+                user_id,
+                limit,
+            } => temps_core::error_builder::ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                .type_("https://temps.sh/probs/error-saved-search-limit")
+                .title("Saved Search Limit Reached")
+                .detail(err.to_string())
+                .value("project_id", project_id)
+                .value("user_id", user_id)
+                .value("limit", limit)
+                .build(),
+            ErrorTrackingError::InboundFilterExists {
+                project_id,
+                ref kind,
+            } => temps_core::error_builder::ErrorBuilder::new(StatusCode::CONFLICT)
+                .type_("https://temps.sh/probs/error-inbound-filter-exists")
+                .title("Inbound Filter Already Exists")
+                .detail(err.to_string())
+                .value("project_id", project_id)
+                .value("kind", kind.clone())
+                .build(),
+            ErrorTrackingError::InboundFilterLimit { project_id, limit } => {
+                temps_core::error_builder::ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                    .type_("https://temps.sh/probs/error-inbound-filter-limit")
+                    .title("Inbound Filter Limit Reached")
+                    .detail(err.to_string())
+                    .value("project_id", project_id)
+                    .value("limit", limit)
+                    .build()
+            }
+            ErrorTrackingError::GroupIsMergeTarget { group_id } => {
+                temps_core::error_builder::ErrorBuilder::new(StatusCode::CONFLICT)
+                    .type_("https://temps.sh/probs/error-group-is-merge-target")
+                    .title("Error Group Is A Merge Target")
+                    .detail(err.to_string())
+                    .value("group_id", group_id)
+                    .build()
+            }
+            ErrorTrackingError::GroupNotMerged { group_id } => {
+                temps_core::error_builder::ErrorBuilder::new(StatusCode::CONFLICT)
+                    .type_("https://temps.sh/probs/error-group-not-merged")
+                    .title("Error Group Is Not Merged")
+                    .detail(err.to_string())
+                    .value("group_id", group_id)
+                    .build()
+            }
             ErrorTrackingError::InvalidFingerprint | ErrorTrackingError::Validation(_) => {
                 problemdetails::new(StatusCode::BAD_REQUEST)
                     .with_title("Validation Error")
@@ -369,6 +567,29 @@ impl axum::response::IntoResponse for ErrorTrackingError {
             ),
             ErrorTrackingError::GroupNotFound => {
                 (StatusCode::NOT_FOUND, "Error group not found".to_string())
+            }
+            ErrorTrackingError::NotCommentAuthor { .. }
+            | ErrorTrackingError::NotSavedSearchOwner { .. } => {
+                (StatusCode::FORBIDDEN, self.to_string())
+            }
+            ErrorTrackingError::GroupsNotFound { .. }
+            | ErrorTrackingError::GroupNotInProject { .. }
+            | ErrorTrackingError::CommentNotFound { .. }
+            | ErrorTrackingError::SavedSearchNotFound { .. }
+            | ErrorTrackingError::InboundFilterNotFound { .. }
+            | ErrorTrackingError::FingerprintsNotInGroup { .. } => {
+                (StatusCode::NOT_FOUND, self.to_string())
+            }
+            ErrorTrackingError::GroupAlreadyMerged { .. }
+            | ErrorTrackingError::GroupIsMergeTarget { .. }
+            | ErrorTrackingError::GroupNotMerged { .. }
+            | ErrorTrackingError::InboundFilterExists { .. }
+            | ErrorTrackingError::SavedSearchExists { .. } => {
+                (StatusCode::CONFLICT, self.to_string())
+            }
+            ErrorTrackingError::InboundFilterLimit { .. }
+            | ErrorTrackingError::SavedSearchLimit { .. } => {
+                (StatusCode::BAD_REQUEST, self.to_string())
             }
             ErrorTrackingError::EventNotFound => {
                 (StatusCode::NOT_FOUND, "Error event not found".to_string())
@@ -441,6 +662,16 @@ pub async fn list_error_groups(
     project_access_guard!(auth, project_id, state.project_access_checker);
     let page = query.page;
     let page_size = query.page_size.clamp(1, 100);
+    let refine = crate::services::types::GroupListRefinement {
+        assignee: query
+            .assignee
+            .as_deref()
+            .filter(|a| !a.trim().is_empty())
+            .map(|a| crate::services::group_workflow::AssigneeFilter::parse(a, auth.user_id()))
+            .transpose()?,
+        search: query.search,
+        issue_type: query.issue_type.filter(|t| !t.trim().is_empty()),
+    };
 
     let (groups, total_count) = state
         .error_tracking_service
@@ -454,6 +685,7 @@ pub async fn list_error_groups(
             Some(query.sort_order),
             query.start_date.map(|d| d.into()),
             query.end_date.map(|d| d.into()),
+            &refine,
         )
         .await?;
 
@@ -531,15 +763,50 @@ pub async fn update_error_group(
     permission_guard!(auth, ErrorTrackingWrite);
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
+    // Legacy assignee by email (ADR 111, D1.6): resolved to a user and set
+    // through the assignee route, so it is checked and audited the same way.
+    if let Some(assigned_to) = request.assigned_to.as_deref() {
+        let assignee = if assigned_to.trim().is_empty() {
+            None
+        } else {
+            Some(
+                state
+                    .error_tracking_service
+                    .workflow
+                    .user_by_email(assigned_to)
+                    .await?,
+            )
+        };
+        super::assignee_handler::assign_and_audit(
+            &state, &auth, &metadata, project_id, group_id, assignee,
+        )
+        .await?;
+    }
     state
         .error_tracking_service
         .update_error_group_status(
             group_id,
             project_id,
             request.status.clone(),
-            request.assigned_to.clone(),
+            request.ignore.clone().map(Into::into),
+            request.in_next_release,
         )
         .await?;
+    super::activity_handler::record_activity(
+        &state,
+        project_id,
+        &[group_id],
+        crate::services::group_workflow::ActivityKind::StatusChanged,
+        auth.user_id_opt(),
+        crate::services::group_workflow::ActivityDetails {
+            status: crate::services::error_crud_service::canonical_group_status(&request.status)
+                .ok()
+                .map(str::to_string),
+            in_next_release: request.in_next_release,
+            ..Default::default()
+        },
+    )
+    .await;
 
     let audit = ErrorGroupUpdatedAudit {
         context: AuditContext {
@@ -551,6 +818,8 @@ pub async fn update_error_group(
         group_id,
         status: request.status,
         assigned_to: request.assigned_to,
+        ignore: request.ignore,
+        in_next_release: request.in_next_release,
     };
     if let Err(e) = state.audit_service.create_audit_log(&audit).await {
         tracing::error!(
@@ -1097,8 +1366,10 @@ mod tests {
             Path((project_id, group_id)),
             Extension(metadata()),
             Json(UpdateErrorGroupRequest {
+                ignore: None,
+                in_next_release: false,
                 status: "resolved".to_string(),
-                assigned_to: Some("owner@example.com".to_string()),
+                assigned_to: Some(String::new()),
             }),
         )
         .await
@@ -1114,16 +1385,40 @@ mod tests {
 
         {
             let entries = recorder.entries.lock().expect("lock");
-            assert_eq!(entries.len(), 1, "exactly one audit event per update");
-            let (op, user_id, payload) = &entries[0];
+            // The legacy assignee field is applied through the assignee
+            // route, which audits it on its own.
+            assert_eq!(entries.len(), 2, "the assignment, then the update");
+            assert_eq!(entries[0].0, "ERROR_GROUP_ASSIGNED");
+            let (op, user_id, payload) = &entries[1];
             assert_eq!(op, "ERROR_GROUP_UPDATED");
             assert_eq!(*user_id, Some(5));
             assert_eq!(payload["project_id"], project_id);
             assert_eq!(payload["group_id"], group_id);
             assert_eq!(payload["status"], "resolved");
-            assert_eq!(payload["assigned_to"], "owner@example.com");
+            assert_eq!(payload["assigned_to"], "");
             assert_eq!(payload["context"]["ip_address"], "203.0.113.9");
         }
+
+        // An email that is no user's is refused before anything is written.
+        let unknown = update_error_group(
+            State(state.clone()),
+            RequireAuth(auth.clone()),
+            Path((project_id, group_id)),
+            Extension(metadata()),
+            Json(UpdateErrorGroupRequest {
+                ignore: None,
+                in_next_release: false,
+                status: "unresolved".to_string(),
+                assigned_to: Some("nobody@example.com".to_string()),
+            }),
+        )
+        .await
+        .expect_err("an unknown email is refused");
+        assert_eq!(
+            axum::response::IntoResponse::into_response(unknown).status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(recorder.entries.lock().expect("lock").len(), 2);
 
         // A group from another project is not found: no write, no audit event.
         let missing = update_error_group(
@@ -1132,6 +1427,8 @@ mod tests {
             Path((project_id + 10_000, group_id)),
             Extension(metadata()),
             Json(UpdateErrorGroupRequest {
+                ignore: None,
+                in_next_release: false,
                 status: "ignored".to_string(),
                 assigned_to: None,
             }),
@@ -1140,7 +1437,7 @@ mod tests {
         assert!(missing.is_err(), "cross-project update must fail");
         assert_eq!(
             recorder.entries.lock().expect("lock").len(),
-            1,
+            2,
             "a failed update must not emit an audit event"
         );
     }

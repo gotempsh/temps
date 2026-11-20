@@ -41,13 +41,19 @@ Add a new instance
 
 Remove an instance
 
+**Usage:** `instances remove <name>`
+
 ### `instances switch` (alias: `use`)
 
 Switch to a different instance
 
+**Usage:** `instances switch <name>`
+
 ### `instances show`
 
 Show instance details (or current instance)
+
+**Usage:** `instances show [name] [options]`
 
 **Options:**
 

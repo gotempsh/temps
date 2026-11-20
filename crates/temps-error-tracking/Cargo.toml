@@ -57,6 +57,7 @@ sourcemap = { workspace = true }
 flate2 = { workspace = true }  # For gzip decompression
 
 [dev-dependencies]
+temps-otel = { path = "../temps-otel", features = ["test-support"] }
 temps-test-utils = { path = "../temps-test-utils" }
 temps-migrations = { path = "../temps-migrations" }
 axum-test = { workspace = true }

@@ -245,6 +245,21 @@ pub trait OtelStorage: Send + Sync {
     /// Get all spans for a single trace ID.
     async fn get_trace(&self, project_id: i32, trace_id: &str) -> StorageResult<Vec<SpanRecord>>;
 
+    /// The first `max_spans` spans of a trace by start time, for background
+    /// readers that must not load a huge trace whole (ADR 111, D2). Backends
+    /// that can bound the read in their query override this; the default
+    /// truncates [`Self::get_trace`].
+    async fn get_trace_spans(
+        &self,
+        project_id: i32,
+        trace_id: &str,
+        max_spans: usize,
+    ) -> StorageResult<Vec<SpanRecord>> {
+        let mut spans = self.get_trace(project_id, trace_id).await?;
+        spans.truncate(max_spans);
+        Ok(spans)
+    }
+
     /// Fetch a trace in a bounded window. Local backends filter their existing
     /// trace lookup; the Cloud router applies the bounds in SQL.
     async fn get_trace_in_window(

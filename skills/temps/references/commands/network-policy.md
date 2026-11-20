@@ -44,6 +44,8 @@ List network policy rules
 
 Show one network policy rule
 
+**Usage:** `network-policy rules show <ruleId> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -74,6 +76,8 @@ Create a network policy rule
 
 Delete a network policy rule (link rules are removed by unlinking instead)
 
+**Usage:** `network-policy rules rm <ruleId> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -84,6 +88,8 @@ Delete a network policy rule (link rules are removed by unlinking instead)
 ### `network-policy effective`
 
 Show the policy in force for a workload: profile, rules, inbound links and where it is enforced. <kind> is one of deployment, sandbox, service, function, job; <id> is the environment id for a deployment
+
+**Usage:** `network-policy effective <kind> <id> [options]`
 
 **Options:**
 
@@ -102,6 +108,8 @@ Manage a workload's egress and ingress profile
 #### `network-policy profile set`
 
 Set a workload's profile. Each direction is open, restricted, none; a direction left out is reset to the kind's default
+
+**Usage:** `network-policy profile set <kind> <id> [options]`
 
 **Options:**
 

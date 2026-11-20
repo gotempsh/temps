@@ -83,6 +83,8 @@ Update a project secret (a redeploy is required for running containers to pick i
 
 Delete a project secret
 
+**Usage:** `projects secrets delete <key> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -229,6 +231,8 @@ Show or change how a service is deployed (primary source, and whether it also ac
 ### `projects hosting`
 
 Show or set whether Temps runs the app (hosted) or it runs elsewhere (external, labelled External and never deployed)
+
+**Usage:** `projects hosting [hosting] [options]`
 
 **Options:**
 

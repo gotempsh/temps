@@ -25,6 +25,8 @@ Manage the AI CLIs (Claude Code, Codex) Temps runs on this server
 
 Sign an AI CLI in to your subscription. Prints a link to open, then asks for the code (Claude) or shows a device code (Codex)
 
+**Usage:** `ai provider login <provider-id> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -34,6 +36,8 @@ Sign an AI CLI in to your subscription. Prints a link to open, then asks for the
 ### `ai readiness`
 
 Show which AI prerequisites this project meets, and how to fix the rest
+
+**Usage:** `ai readiness [project] [options]`
 
 **Options:**
 

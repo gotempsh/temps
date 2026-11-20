@@ -145,6 +145,8 @@ Show analytics dashboard overview
 
 Show breakdown by dimension: pages, referrers, browsers, os, devices, countries, regions, cities, channels, events, languages, utm_source, utm_medium, utm_campaign
 
+**Usage:** `analytics top <dimension> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -225,6 +227,8 @@ Show pages crawled by AI agents, with distinct-agent counts
 
 Show which agents/providers crawled a single page (e.g. /docs)
 
+**Usage:** `analytics ai-page <path> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -288,6 +292,8 @@ Show top API callers by client IP from /api-analytics/callers
 
 Show routes called by one client IP with latency and error analytics
 
+**Usage:** `analytics api-ip <ip> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -305,6 +311,8 @@ Show routes called by one client IP with latency and error analytics
 ### `analytics api-path`
 
 Show client IPs calling one path with latency and error analytics
+
+**Usage:** `analytics api-path <path> [options]`
 
 **Options:**
 
@@ -357,6 +365,8 @@ Show an AI-generated summary of API traffic from /api-analytics/summary (require
 ### `analytics enrich`
 
 Attach identity or attributes to a visitor (merges into custom_data; a null value removes a key)
+
+**Usage:** `analytics enrich <visitor-id> [options]`
 
 **Options:**
 
