@@ -4499,8 +4499,21 @@ Manage error tracking and error groups
 **Subcommands:**
 
 - `list` (`ls`) - List error groups for a project
+- `assign` - Assign an error group to a user or team, or unassign it
 - `show` - Show error group details
 - `update` - Update error group status
+- `bulk` - Resolve, reopen or ignore many error groups in one request
+- `merge` - Merge other error groups into one surviving group
+- `unmerge` - Take an error group back out of the merge it is part of
+- `split` - Split fingerprints out of an error group into a new one
+- `fingerprints` - List the fingerprints routing to an error group
+- `filters` - Drop noisy error events before they are stored (browser extensions, crawlers, localhost, message or release patterns)
+- `comment` - Comment on an error group, or edit or delete a comment
+- `activity` - Show the comments and history of an error group, newest first
+- `searches` - Saved searches over error groups
+- `performance` - Show whether traces are checked for performance issues, and what is detected
+- `releases` - Show the health of each release: crash-free sessions and users, adoption and deployment
+- `release` - Show one release's sessions and crash-free rate per hour
 - `events` - List events in an error group
 - `event` - Show a specific error event
 - `stats` - Get error statistics for a project
@@ -4526,6 +4539,26 @@ List error groups for a project
 | `--end-date <date>` | Filter by end date (ISO 8601) | - | No |
 | `--sort-by <field>` | Sort by field (e.g., total_count, last_seen, first_seen) | - | No |
 | `--sort-order <order>` | Sort order: asc or desc | - | No |
+| `--assignee <who>` | Only groups assigned to: me (you or your teams), none, user:<id> or team:<id> | - | No |
+| `--search <text>` | Only groups whose title, type or message contains this text | - | No |
+| `--saved-search <id>` | Apply a saved search; flags given here override its filters | - | No |
+| `--type <type>` | Only errors, or only performance issues found in traces: error or performance | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `errors assign`
+
+Assign an error group to a user or team, or unassign it
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--group-id <id>` | Error group ID | - | Yes |
+| `--user-id <id>` | Assign to this user | - | No |
+| `--team-id <id>` | Assign to this team | - | No |
+| `--me` | Assign to yourself | - | No |
+| `--none` | Unassign the group | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `errors show`
@@ -4551,7 +4584,268 @@ Update error group status
 | `--project-id <id>` | Project ID | - | Yes |
 | `--group-id <id>` | Error group ID | - | Yes |
 | `--status <status>` | New status (unresolved, resolved, ignored) | - | Yes |
-| `--assigned-to <user>` | Assign to user | - | No |
+| `--assigned-to <email>` | Assign to the user with this email ("" unassigns); see also errors assign | - | No |
+| `--ignore-for <duration>` | With ignore: come back after this long (30m, 12h, 7d, 2w) | - | No |
+| `--ignore-until <date>` | With ignore: come back at this time (ISO 8601) | - | No |
+| `--ignore-count <n>` | With ignore: come back after this many more occurrences | - | No |
+| `--ignore-users <n>` | With ignore: come back once this many new users are affected | - | No |
+| `--ignore-forever` | With ignore: never come back on its own | - | No |
+| `--in-next-release` | With resolve: stay resolved until an event arrives from a release newer than the current one | - | No |
+
+### `errors bulk`
+
+Resolve, reopen or ignore many error groups in one request
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--action <action>` | Transition to apply (resolve, unresolve, ignore) | - | Yes |
+| `--group-ids <ids>` | Comma-separated group IDs (at most 1000) | - | No |
+| `--status <status>` | Select every group in this status instead of listing IDs | - | No |
+| `--environment-id <id>` | Select every group of this environment | - | No |
+| `--start-date <date>` | With --end-date: only groups with events in the window (ISO 8601) | - | No |
+| `--end-date <date>` | With --start-date: only groups with events in the window (ISO 8601) | - | No |
+| `--search <text>` | Select groups whose title, type or message contains this text | - | No |
+| `--json` | Output in JSON format | - | No |
+| `--ignore-for <duration>` | With ignore: come back after this long (30m, 12h, 7d, 2w) | - | No |
+| `--ignore-until <date>` | With ignore: come back at this time (ISO 8601) | - | No |
+| `--ignore-count <n>` | With ignore: come back after this many more occurrences | - | No |
+| `--ignore-users <n>` | With ignore: come back once this many new users are affected | - | No |
+| `--ignore-forever` | With ignore: never come back on its own | - | No |
+| `--in-next-release` | With resolve: stay resolved until an event arrives from a release newer than the current one | - | No |
+
+### `errors merge`
+
+Merge other error groups into one surviving group
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--group-id <id>` | Surviving error group ID | - | Yes |
+| `--source-group-ids <ids>` | Comma-separated group IDs to merge in (at most 50) | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `errors unmerge`
+
+Take an error group back out of the merge it is part of
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--group-id <id>` | Merged-away error group ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `errors split`
+
+Split fingerprints out of an error group into a new one
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--group-id <id>` | Error group ID | - | Yes |
+| `--fingerprints <hashes>` | Comma-separated fingerprint hashes to move out | - | Yes |
+| `--title <title>` | Title for the new group | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `errors fingerprints`
+
+List the fingerprints routing to an error group
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--group-id <id>` | Error group ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `errors filters`
+
+Drop noisy error events before they are stored (browser extensions, crawlers, localhost, message or release patterns)
+
+**Subcommands:**
+
+- `list` - List a project's inbound filters and how many events each dropped
+- `add` - Add an inbound filter
+- `update` - Change a filter's pattern, or switch it on or off
+- `remove` (`delete`) - Delete an inbound filter; matching events are stored again
+
+#### `errors filters list`
+
+List a project's inbound filters and how many events each dropped
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `errors filters add`
+
+Add an inbound filter
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--kind <kind>` | browser-extensions, web-crawlers, localhost, error-message or release | - | Yes |
+| `--pattern <glob>` | For error-message and release: a case-insensitive glob, * and ? wildcards | - | No |
+| `--disabled` | Create the filter switched off | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `errors filters update`
+
+Change a filter's pattern, or switch it on or off
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--filter-id <id>` | Filter ID | - | Yes |
+| `--pattern <glob>` | New pattern | - | No |
+| `--enable` | Switch the filter on | - | No |
+| `--disable` | Switch the filter off | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `errors filters remove` (alias: `delete`)
+
+Delete an inbound filter; matching events are stored again
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--filter-id <id>` | Filter ID | - | Yes |
+
+### `errors comment`
+
+Comment on an error group, or edit or delete a comment
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--group-id <id>` | Error group ID | - | Yes |
+| `--body <text>` | The comment (at most 10,000 characters) | - | No |
+| `--edit <comment-id>` | Replace the text of your comment with --body | - | No |
+| `--delete <comment-id>` | Delete a comment (yours, or any as an administrator) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `errors activity`
+
+Show the comments and history of an error group, newest first
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--group-id <id>` | Error group ID | - | Yes |
+| `--page <n>` | Page number | `1` | No |
+| `--page-size <n>` | Entries per page (max 100) | `20` | No |
+| `--json` | Output in JSON format | - | No |
+
+### `errors searches`
+
+Saved searches over error groups
+
+**Subcommands:**
+
+- `list` (`ls`) - List your saved searches and the ones shared with the project
+- `save` - Save a set of list filters under a name
+- `delete` - Delete a saved search (yours, or a shared one as an administrator)
+
+#### `errors searches list` (alias: `ls`)
+
+List your saved searches and the ones shared with the project
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `errors searches save`
+
+Save a set of list filters under a name
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--name <name>` | Name, unique among your saved searches in the project | - | Yes |
+| `--shared` | Share with everyone who can open the project | - | No |
+| `--status <status>` | unresolved, resolved or ignored | - | No |
+| `--environment-id <id>` | An environment of the project | - | No |
+| `--assignee <who>` | me, none, user:<id> or team:<id> | - | No |
+| `--search <text>` | Text in the title, type or message | - | No |
+| `--sort-by <field>` | last_seen, first_seen, total_count or events_in_range | - | No |
+| `--sort-order <order>` | asc or desc | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `errors searches delete`
+
+Delete a saved search (yours, or a shared one as an administrator)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--id <id>` | Saved search ID | - | Yes |
+
+### `errors performance`
+
+Show whether traces are checked for performance issues, and what is detected
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `errors releases`
+
+Show the health of each release: crash-free sessions and users, adoption and deployment
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--environment <name>` | SDK environment (as the SDK sends it) | - | No |
+| `--days <n>` | Window in days, 1 to 14 | `7` | No |
+| `--page <n>` | Page | `1` | No |
+| `--json` | Output in JSON format | - | No |
+
+### `errors release`
+
+Show one release's sessions and crash-free rate per hour
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--environment <name>` | SDK environment (as the SDK sends it) | - | No |
+| `--days <n>` | Window in days, 1 to 14 | `7` | No |
+| `--json` | Output in JSON format | - | No |
 
 ### `errors events`
 
@@ -4863,6 +5157,10 @@ Inspect distributed traces and operation latency
 **Subcommands:**
 
 - `span-stats` (`operations`, `ops`) - Rank operations by time spent, latency percentiles, or inconsistency
+- `trend` - Show how one operation's latency moved, day by day, with deployments
+- `regressions` - List the operations that got slower or faster after a deployment
+- `breakdown` - Show where the time inside one operation goes: queries, downstream calls, its own code
+- `page` - Compare a page's web vitals with the backend requests that served it
 
 ### `traces span-stats` (alias: `operations`, `ops`)
 
@@ -4887,10 +5185,64 @@ Rank operations by time spent, latency percentiles, or inconsistency
 | `--attributes <pairs>` | Span attribute filters, e.g. db.system=postgresql | - | No |
 | `--min-duration-ms <ms>` | Ignore spans faster than this | - | No |
 | `--min-count <n>` | Drop operations with fewer samples than this | - | No |
+| `--apdex-ms <ms>` | Apdex threshold: calls at or under this satisfy, up to 4x tolerate (default 500) | - | No |
 | `--sort-by <field>` | Ranking (total_time, p50, p95, p99, max, avg, stddev, count, errors, error_rate, variability, tail_ratio) | `total_time` | No |
 | `--sort-order <order>` | asc or desc | `desc` | No |
 | `--limit <n>` | Rows to show (max 100) | `20` | No |
 | `--offset <n>` | Page offset | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `traces trend`
+
+Show how one operation's latency moved, day by day, with deployments
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | No |
+| `--service <name>` | Service of the operation | - | No |
+| `--operation <name>` | The operation (span name) | - | No |
+| `--days <n>` | Days to show (max 30) | `14` | No |
+| `--json` | Output the hourly points in JSON format | - | No |
+
+### `traces regressions`
+
+List the operations that got slower or faster after a deployment
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | No |
+| `--deployment-id <id>` | Deployment to compare across | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `traces breakdown`
+
+Show where the time inside one operation goes: queries, downstream calls, its own code
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | No |
+| `--service <name>` | Service of the operation | - | No |
+| `--operation <name>` | The operation (span name) | - | No |
+| `--sample <kind>` | Calls to sample (recent, slow) | `recent` | No |
+| `--attribute <key>` | Also split the calls by this attribute, e.g. http.route | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `traces page`
+
+Compare a page's web vitals with the backend requests that served it
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | No |
+| `--path <path>` | The page path, e.g. /checkout | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ## `facets`
