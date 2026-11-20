@@ -131,8 +131,7 @@ export function StatusPageWebhooks({ page }: { page: StatusPageResponse }) {
             Webhooks
           </h3>
           <p className="text-sm text-muted-foreground">
-            Post every public update to your own endpoint, e.g. a chat channel
-            relay. Each request is signed with X-Temps-Signature.
+            Post every public update to your own endpoint.
           </p>
         </div>
 
@@ -140,6 +139,9 @@ export function StatusPageWebhooks({ page }: { page: StatusPageResponse }) {
           <Alert variant="warning">
             <AlertTitle>Signing secret: shown once</AlertTitle>
             <AlertDescription className="space-y-2">
+              <p>
+                Every request carries an X-Temps-Signature header made with it.
+              </p>
               <div className="flex items-center gap-2">
                 <code className="min-w-0 flex-1 rounded bg-muted px-2 py-1 text-xs [overflow-wrap:anywhere]">
                   {secret}

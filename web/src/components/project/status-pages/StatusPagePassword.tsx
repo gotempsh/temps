@@ -10,6 +10,7 @@ import {
   Form,
   FormControl,
   FormField,
+  FormDescription,
   FormItem,
   FormLabel,
   FormMessage,
@@ -60,9 +61,7 @@ export function StatusPagePassword({ page }: { page: StatusPageResponse }) {
               Password
             </h3>
             <p className="text-sm text-muted-foreground">
-              Ask visitors for a password, e.g. for a page only your customers
-              should read. A protected page has no feed and its JSON is not
-              shared with other sites.
+              Ask visitors for a password before they see the page.
             </p>
           </div>
           <Badge
@@ -95,6 +94,10 @@ export function StatusPagePassword({ page }: { page: StatusPageResponse }) {
                       {...field}
                     />
                   </FormControl>
+                  <FormDescription>
+                    A protected page has no feed, and its JSON is not shared
+                    with other sites.
+                  </FormDescription>
                   <FormMessage />
                 </FormItem>
               )}

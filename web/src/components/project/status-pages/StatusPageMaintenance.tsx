@@ -57,6 +57,7 @@ import {
   MAINTENANCE_PAGE_SIZE,
   MAINTENANCE_STATE_LABELS,
   maintenanceSchema,
+  hasStarted,
   maintenanceValues,
   MAX_MAINTENANCE_TITLE_CHARS,
   newMaintenanceValues,
@@ -136,9 +137,7 @@ export function StatusPageMaintenance({ page }: { page: StatusPageResponse }) {
               Scheduled maintenance
             </h3>
             <p className="text-sm text-muted-foreground">
-              Announce planned work, e.g. “Database upgrade, Sunday
-              22:00–23:00”. While it runs its components show as under
-              maintenance, outage alerts pause and uptime is not charged.
+              Announce planned work before it starts.
             </p>
           </div>
           <Button
@@ -325,7 +324,9 @@ function MaintenanceDialog({
   onOpenChange: (open: boolean) => void
 }) {
   const queryClient = useQueryClient()
-  const started = editing?.state === 'in_progress'
+  // Read from the clock, not from the state loaded with the list: a window
+  // left open past its start has begun even if the list still says scheduled.
+  const started = editing ? hasStarted(editing, new Date()) : false
   const schema = useMemo(
     () => maintenanceSchema(() => new Date(), started),
     [started]
@@ -377,7 +378,7 @@ function MaintenanceDialog({
           <DialogDescription>
             {started
               ? 'It has started: only the title, description and end can change.'
-              : `Times are in your browser's time zone (${Intl.DateTimeFormat().resolvedOptions().timeZone}).`}
+              : `While it runs, its components show as under maintenance, outage alerts pause and uptime is not charged. Times are in your browser's time zone (${Intl.DateTimeFormat().resolvedOptions().timeZone}).`}
           </DialogDescription>
         </DialogHeader>
         <Form {...form}>
@@ -390,7 +391,11 @@ function MaintenanceDialog({
                     status_page_id: page.id,
                     maintenance_id: editing.id,
                   },
-                  body: updateMaintenanceRequest(values, started),
+                  body: updateMaintenanceRequest(
+                    values,
+                    maintenanceValues(editing),
+                    hasStarted(editing, new Date())
+                  ),
                 })
               } else {
                 create.mutate({
