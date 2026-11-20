@@ -254,14 +254,32 @@ export async function startReplay() {
       language: navigator.language, viewportWidth: innerWidth, viewportHeight: innerHeight }),
   });
   let buffer = [];
+  let pending = null; // kept, with the same batchId, until the server accepts it
+  let sending = false;
   record({ emit: (event) => buffer.push(event), maskAllInputs: true });
   setInterval(async () => {
-    if (!buffer.length) return;
-    const batch = buffer; buffer = [];
-    await fetch(${JSON.stringify(endpointUrl(setup, 'events'))}, {
-      method: 'POST', headers, keepalive: true,
-      body: JSON.stringify({ sessionId, batchId: crypto.randomUUID(), events: await pack(batch) }),
-    });
+    if (sending) return;
+    if (!pending && buffer.length) {
+      pending = { batchId: crypto.randomUUID(), events: buffer };
+      buffer = [];
+    }
+    if (!pending) return;
+    sending = true;
+    try {
+      // No keepalive: browsers cap keepalive bodies at 64 KiB, and a DOM
+      // snapshot can be larger.
+      const res = await fetch(${JSON.stringify(endpointUrl(setup, 'events'))}, {
+        method: 'POST', headers,
+        body: JSON.stringify({ sessionId, batchId: pending.batchId, events: await pack(pending.events) }),
+      });
+      // Retry server errors and 429 with the same batchId (the server
+      // de-duplicates it); other 4xx answers will not change on retry.
+      if (res.ok || (res.status < 500 && res.status !== 429)) pending = null;
+    } catch {
+      // Network error: keep the batch and retry on the next tick.
+    } finally {
+      sending = false;
+    }
   }, 5000);
 }`,
     },

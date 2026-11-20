@@ -285,3 +285,70 @@ describe('library examples', () => {
     expect(JSON.parse(inflated)).toEqual(events)
   })
 })
+
+test('the rrweb example keeps a batch until the server accepts it, without keepalive', async () => {
+  const { inflateSync } = await import('node:zlib')
+  const code = sessionReplayExamples(signalFixture('session_replay'))[1]
+    .code.replace(/^import .*$/m, '')
+    .replace('export async function', 'async function')
+  let emit: (event: unknown) => void = () => {}
+  let tick: () => Promise<void> = async () => {}
+  const requests: { url: string; init: RequestInit }[] = []
+  const answers = [201, 503, 200, 200] // init, failed batch, its retry, next batch
+  const fetchStub = async (url: string, init: RequestInit) => {
+    requests.push({ url, init })
+    const status = answers.shift() ?? 200
+    return { ok: status < 300, status }
+  }
+  const startReplay = new Function(
+    'record',
+    'fetch',
+    'setInterval',
+    'sessionStorage',
+    'localStorage',
+    'location',
+    'navigator',
+    'innerWidth',
+    'innerHeight',
+    `${code}\nreturn startReplay;`
+  )(
+    (options: { emit: (event: unknown) => void }) => {
+      emit = options.emit
+    },
+    fetchStub,
+    (fn: () => Promise<void>) => {
+      tick = fn
+    },
+    {},
+    {},
+    { href: 'https://apps.example.com/' },
+    { userAgent: 'test', language: 'en' },
+    1280,
+    800
+  ) as () => Promise<void>
+
+  await startReplay()
+  emit({ type: 4, n: 1 })
+  await tick() // 503: the batch stays
+  emit({ type: 3, n: 2 })
+  await tick() // retry: same batch, same id
+  await tick() // the event recorded meanwhile goes in a new batch
+
+  const batches = requests
+    .filter((r) => r.url.endsWith('/session-replay/events'))
+    .map((r) => {
+      expect(r.init.keepalive).toBeUndefined()
+      const body = JSON.parse(String(r.init.body))
+      return {
+        batchId: body.batchId,
+        events: JSON.parse(
+          inflateSync(Buffer.from(body.events, 'base64')).toString()
+        ),
+      }
+    })
+  expect(batches).toHaveLength(3)
+  expect(batches[1]).toEqual(batches[0])
+  expect(batches[0].events).toEqual([{ type: 4, n: 1 }])
+  expect(batches[2].batchId).not.toBe(batches[0].batchId)
+  expect(batches[2].events).toEqual([{ type: 3, n: 2 }])
+})
