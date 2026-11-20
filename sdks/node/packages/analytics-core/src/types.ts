@@ -3,6 +3,7 @@
 
 import type { AutoTrackOptions } from "./AutoTracking";
 import type { FeatureFlags, FeatureFlagsOptions } from "./FeatureFlags";
+import type { Surveys, SurveysOptions } from "./Surveys";
 
 export type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
@@ -133,6 +134,20 @@ export interface AnalyticsOptions extends AnalyticsClientOptions, AutoTrackOptio
    * lazily from `{basePath}/flags`; see `AnalyticsApi.flags`.
    */
   flags?: Pick<FeatureFlagsOptions, "key" | "attributes" | "bootstrap" | "onError">;
+  /**
+   * In-app surveys defined in the Temps console (ADR 110 D1). Off unless
+   * `enabled` is true, so sites without surveys make no extra request. Needs
+   * analytics to be on: answers are recorded as analytics events.
+   */
+  surveys?: Pick<SurveysOptions, "key" | "attributes" | "onError"> & {
+    enabled?: boolean;
+    /**
+     * Render the built-in widget when a survey's conditions are met: on load,
+     * on client-side navigation and on a triggering `trackEvent`. Defaults to
+     * true. Set false to draw your own UI with `analytics.surveys`.
+     */
+    autoShow?: boolean;
+  };
   /** Auto track pageviews on route changes. Defaults to true. */
   autoTrackPageviews?: boolean;
   /** Auto track page leave events. Defaults to true. */
@@ -162,6 +177,12 @@ export interface AnalyticsApi {
    * until the flags arrive; nothing is fetched until the first read.
    */
   readonly flags: FeatureFlags;
+  /**
+   * Surveys this visitor may see. Disabled (empty) unless
+   * `surveys.enabled` was set; with `autoShow` off, render them yourself
+   * from `eligible()` and record answers with `submit()`.
+   */
+  readonly surveys: Surveys;
   /** Whether analytics are currently enabled. */
   readonly enabled: boolean;
   /**

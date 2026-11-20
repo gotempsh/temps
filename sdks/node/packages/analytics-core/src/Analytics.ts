@@ -20,6 +20,8 @@ import {
 } from "./AutoTracking";
 import { enableCookielessIdentity, isCookielessIdentity, onCookielessIdentity } from "./identity";
 import { exposureEventData, FeatureFlags } from "./FeatureFlags";
+import { Surveys, type Survey } from "./Surveys";
+import { renderSurveyWidget } from "./SurveyWidget";
 
 interface InternalCleanup {
   (): void;
@@ -52,6 +54,7 @@ export function createAnalytics(options: AnalyticsOptions = {}): AnalyticsApi {
     autoTrackNotFound = true,
     cookieless = false,
     flags: flagOptions = {},
+    surveys: surveyOptions = {},
   } = options;
 
   const cleanups: InternalCleanup[] = [];
@@ -70,7 +73,7 @@ export function createAnalytics(options: AnalyticsOptions = {}): AnalyticsApi {
   const resolveDomain = (): string =>
     domain || (typeof window !== "undefined" ? window.location.hostname : "");
 
-  const trackEvent: AnalyticsApi["trackEvent"] = async (eventName, data = {}) => {
+  const sendEvent = async (eventName: string, data: Record<string, JsonValue> = {}): Promise<void> => {
     if (!enabled) return;
     await sendAnalytics(
       "event",
@@ -129,9 +132,62 @@ export function createAnalytics(options: AnalyticsOptions = {}): AnalyticsApi {
     basePath,
     disabled,
     onExposure: (exposure) => {
-      if (enabled) void trackEvent("flag_exposure", exposureEventData(exposure));
+      if (enabled) void sendEvent("flag_exposure", exposureEventData(exposure));
     },
   });
+
+  // Surveys record answers as analytics events, so they need analytics on.
+  const surveysEnabled = enabled && surveyOptions.enabled === true;
+  const autoShowSurveys = surveysEnabled && surveyOptions.autoShow !== false;
+  const surveys = new Surveys({
+    basePath,
+    key: surveyOptions.key,
+    attributes: surveyOptions.attributes,
+    onError: surveyOptions.onError,
+    disabled: !surveysEnabled,
+    onEvent: (name, data) => {
+      void sendEvent(name, data);
+    },
+  });
+  let openSurvey: (() => void) | null = null;
+  // Set by destroy(): a delivery request still in flight must not open a
+  // widget after cleanup has run.
+  let destroyed = false;
+  const showSurvey = async (event?: string): Promise<void> => {
+    if (!autoShowSurveys || openSurvey || destroyed) return;
+    await surveys.load();
+    if (openSurvey || destroyed) return;
+    const next: Survey | undefined = surveys.eligible(window.location.pathname, event)[0];
+    if (!next) return;
+    surveys.markShown(next);
+    // The card stays owned until it has left the page, thank-you message
+    // included, so a later event cannot open a second one over it and
+    // `destroy()` can still remove it.
+    let closed = false;
+    const close = renderSurveyWidget(next, {
+      onSubmit: (answers) => {
+        const result = surveys.submit(next, answers);
+        return result.ok ? null : result.errors;
+      },
+      onDismiss: () => surveys.dismiss(next),
+      onClosed: () => {
+        closed = true;
+        if (openSurvey === closeThis) openSurvey = null;
+      },
+    });
+    const closeThis = (): void => close();
+    if (!closed) openSurvey = closeThis;
+  };
+  cleanups.push(() => {
+    destroyed = true;
+    openSurvey?.();
+  });
+
+  const trackEvent: AnalyticsApi["trackEvent"] = async (eventName, data = {}) => {
+    // A survey triggered by this event is shown without waiting for the send.
+    if (!eventName.startsWith("survey_")) void showSurvey(eventName);
+    await sendEvent(eventName, data);
+  };
 
   const identify: AnalyticsApi["identify"] = async () => {
     // Placeholder for SDK parity; implement when identity endpoint is available.
@@ -139,7 +195,12 @@ export function createAnalytics(options: AnalyticsOptions = {}): AnalyticsApi {
 
   if (enabled) {
     if (autoTrackPageviews) {
-      cleanups.push(setupPageviewTracking(trackPageview));
+      cleanups.push(
+        setupPageviewTracking(() => {
+          trackPageview();
+          void showSurvey();
+        })
+      );
     }
 
     if (autoTrackEngagement) {
@@ -182,6 +243,9 @@ export function createAnalytics(options: AnalyticsOptions = {}): AnalyticsApi {
         }
       )
     );
+
+    // Without automatic pageviews, surveys are still offered on load.
+    if (!autoTrackPageviews) void showSurvey();
   }
 
   if (!recordingAllowed() && enableSessionRecording) {
@@ -219,6 +283,7 @@ export function createAnalytics(options: AnalyticsOptions = {}): AnalyticsApi {
     },
     ingestKey,
     flags,
+    surveys,
     trackEvent,
     trackPageview,
     trackNotFound,

@@ -2149,6 +2149,19 @@ export type AnomalyPreviewResponse = {
     sufficient: boolean;
 };
 
+export type AnswerCount = {
+    count: number;
+    /**
+     * The choice, or the score as text.
+     */
+    value: string;
+};
+
+/**
+ * An answer as the responses list shows it.
+ */
+export type AnswerValue = string | number | Array<string>;
+
 /**
  * A single caller entry in the top-callers breakdown.
  */
@@ -9921,6 +9934,17 @@ export type CreateStatusPageRequest = {
     title: string;
 };
 
+export type CreateSurveyRequest = {
+    description?: string | null;
+    name: string;
+    questions?: Array<SurveyQuestion>;
+    /**
+     * Defaults to `draft`: nothing is shown until the survey is activated.
+     */
+    status?: SurveyStatus;
+    targeting?: SurveyTargeting;
+};
+
 export type CreateTeamMemberRequest = {
     role: TeamRole;
     user_id: number;
@@ -10800,6 +10824,11 @@ export type DeleteBlobResponse = {
 
 export type DeleteResponse = {
     deleted: number;
+};
+
+export type DeleteSurveyResponse = {
+    deleted: boolean;
+    id: number;
 };
 
 export type DeletedEnvironmentVolumeResponse = {
@@ -23838,6 +23867,25 @@ export type NpmRelease = {
     version: string;
 };
 
+export type NpsSummary = {
+    /**
+     * Answers of 0 to 6.
+     */
+    detractors: number;
+    /**
+     * Answers of 7 or 8.
+     */
+    passives: number;
+    /**
+     * Answers of 9 or 10.
+     */
+    promoters: number;
+    /**
+     * `(promoters - detractors) / answers * 100`, from -100 to 100.
+     */
+    score: number;
+};
+
 export type NumericRule = {
     comparison: Comparison;
     critical?: number | null;
@@ -28924,6 +28972,50 @@ export type PublicStatusPageResponse = {
     title: string;
 };
 
+export type PublicSurvey = {
+    display: PublicSurveyDisplay;
+    id: number;
+    name: string;
+    questions: Array<SurveyQuestion>;
+};
+
+/**
+ * The conditions the browser applies before showing a survey.
+ */
+export type PublicSurveyDisplay = {
+    once_per_visitor: boolean;
+    /**
+     * Page path pattern (`*` matches any run of characters); absent for
+     * every page.
+     */
+    path_pattern?: string | null;
+    /**
+     * Show after the app tracks this event; absent to show on page load.
+     */
+    trigger_event?: string | null;
+};
+
+/**
+ * Body of `POST /api/_temps/surveys`. Both fields are optional.
+ */
+export type PublicSurveysRequest = {
+    /**
+     * Attributes for the flag conditions. Override the implicit ones.
+     */
+    attributes?: {
+        [key: string]: AttributeValue;
+    };
+    /**
+     * Stable subject for sampling and flag conditions, e.g. a signed-in
+     * user id. Defaults to the Temps visitor cookie.
+     */
+    key?: string | null;
+};
+
+export type PublicSurveysResponse = {
+    surveys: Array<PublicSurvey>;
+};
+
 export type PublicUptimeDay = {
     /**
      * Mean response time of that day's checks in milliseconds, `null` when
@@ -29091,6 +29183,33 @@ export type QueryDataResponse = {
      * complete one, by a human, a script, or a model reading a tool result.
      */
     truncated: boolean;
+};
+
+export type QuestionKind = 'open_text' | 'rating' | 'nps' | 'single_choice' | 'multiple_choice';
+
+export type QuestionResults = {
+    /**
+     * Responses that answered this question.
+     */
+    answered: number;
+    /**
+     * Mean score of `rating` and `nps` answers.
+     */
+    average?: number | null;
+    /**
+     * Count per choice (declared order) or per score (ascending), zeros
+     * included. Empty for open-text questions: read those in the responses
+     * list.
+     */
+    distribution: Array<AnswerCount>;
+    kind: QuestionKind;
+    nps?: NpsSummary | null;
+    /**
+     * Answers that are not a declared choice or an in-range score.
+     */
+    other: number;
+    prompt: string;
+    question_id: string;
 };
 
 export type QuotaResponse = {
@@ -36352,6 +36471,169 @@ export type SuggestionModeSource = 'chat' | 'default';
  */
 export type SupervisorKind = 'systemd' | 'launchd' | 'container' | 'none';
 
+export type SurveyAnswerListResponse = {
+    page: number;
+    page_size: number;
+    responses: Array<SurveyAnswerSet>;
+    total: number;
+    total_pages: number;
+};
+
+export type SurveyAnswerSet = {
+    /**
+     * Answers by question id. Only declared questions, in the shape their
+     * kind allows.
+     */
+    answers: {
+        [key: string]: AnswerValue;
+    };
+    environment_id?: number | null;
+    /**
+     * Analytics event id of the `survey_sent` event.
+     */
+    event_id: number;
+    /**
+     * Page the survey was answered on.
+     */
+    pathname: string;
+    /**
+     * Session the answer was given in; links to its replay when recorded.
+     */
+    session_id?: string | null;
+    timestamp: string;
+    /**
+     * Visitor who answered; open their profile from the console.
+     */
+    visitor_id?: number | null;
+};
+
+/**
+ * Show the survey only to visitors for whom a feature flag serves a value.
+ */
+export type SurveyFlagCondition = {
+    /**
+     * Flag key in the same project.
+     */
+    key: string;
+    /**
+     * The value the flag must serve. Defaults to `true`.
+     */
+    value?: unknown;
+};
+
+export type SurveyListResponse = {
+    page: number;
+    page_size: number;
+    surveys: Array<SurveyResponse>;
+    total: number;
+    total_pages: number;
+};
+
+/**
+ * One question of a survey.
+ */
+export type SurveyQuestion = {
+    /**
+     * Options for `single_choice` and `multiple_choice`: 2-20, unique.
+     */
+    choices?: Array<string>;
+    /**
+     * Stable id the answer is recorded under: `[a-z0-9_]`, 1-32 characters,
+     * unique within the survey. Keep it when rewording a question so its
+     * answers stay together.
+     */
+    id: string;
+    kind: QuestionKind;
+    /**
+     * Label under the low end of a `rating` or `nps` scale.
+     */
+    lower_label?: string | null;
+    /**
+     * When true the visitor may skip it.
+     */
+    optional?: boolean;
+    prompt: string;
+    /**
+     * Top of a `rating` scale: 3, 5, 7 or 10. Defaults to 5.
+     */
+    scale?: number | null;
+    /**
+     * Label under the high end of a `rating` or `nps` scale.
+     */
+    upper_label?: string | null;
+};
+
+export type SurveyResponse = {
+    created_at: string;
+    description?: string | null;
+    id: number;
+    name: string;
+    project_id: number;
+    questions: Array<SurveyQuestion>;
+    status: SurveyStatus;
+    targeting: SurveyTargeting;
+    /**
+     * Send back as `expected_updated_at` to guard an update.
+     */
+    updated_at: string;
+};
+
+export type SurveyResultsResponse = {
+    /**
+     * `survey_dismissed` events in the window.
+     */
+    dismissed: number;
+    end_date: string;
+    questions: Array<QuestionResults>;
+    /**
+     * `sent / shown`; absent before the survey was shown.
+     */
+    response_rate?: number | null;
+    /**
+     * `survey_sent` events (submitted responses) in the window.
+     */
+    sent: number;
+    /**
+     * `survey_shown` events in the window.
+     */
+    shown: number;
+    start_date: string;
+    survey_id: number;
+};
+
+/**
+ * Where a survey is in its life. Only `active` surveys reach browsers.
+ */
+export type SurveyStatus = 'draft' | 'active' | 'paused' | 'completed';
+
+/**
+ * When a browser shows the survey. Every condition set must hold.
+ */
+export type SurveyTargeting = {
+    flag?: SurveyFlagCondition | null;
+    /**
+     * Never show the survey again to a visitor who saw it. Defaults to true.
+     */
+    once_per_visitor?: boolean;
+    /**
+     * Page path the survey appears on, e.g. `/checkout*`. `*` matches any
+     * run of characters; the pattern must match the whole path. Omit for
+     * every page.
+     */
+    path_pattern?: string | null;
+    /**
+     * Share of visitors, `0..=1`, who may see it. Below 1 the visitor must be
+     * identifiable (the Temps visitor cookie or an explicit key), so the
+     * decision is the same on every page.
+     */
+    sample_rate?: number;
+    /**
+     * Show only after the app tracks an analytics event with this name
+     * (`trackEvent("checkout_completed")`). Omit to show on page load.
+     */
+    trigger_event?: string | null;
+};
+
 export type SyncedRepositoryListQuery = {
     direction?: string | null;
     git_provider_connection_id?: number | null;
@@ -39792,6 +40074,26 @@ export type UpdateStatusResponse = {
     update_available: boolean;
 };
 
+export type UpdateSurveyRequest = {
+    /**
+     * `null` clears the description.
+     */
+    description?: string | null;
+    /**
+     * `updated_at` as last read. When sent, the update is refused with 409
+     * if the survey changed since.
+     */
+    expected_updated_at?: string | null;
+    name?: string | null;
+    /**
+     * Replaces every question. Keep a question's `id` to keep its answers
+     * together.
+     */
+    questions?: Array<SurveyQuestion> | null;
+    status?: SurveyStatus | null;
+    targeting?: SurveyTargeting | null;
+};
+
 export type UpdateTeamRequest = {
     description?: string | null;
     name?: string | null;
@@ -43157,6 +43459,41 @@ export type UpdateSpeedMetricsResponses = {
 };
 
 export type UpdateSpeedMetricsResponse = UpdateSpeedMetricsResponses[keyof UpdateSpeedMetricsResponses];
+
+export type PublicSurveysData = {
+    body: PublicSurveysRequest;
+    path?: never;
+    query?: never;
+    url: '/_temps/surveys';
+};
+
+export type PublicSurveysErrors = {
+    /**
+     * Malformed or oversized context
+     */
+    400: unknown;
+    /**
+     * No environment serves this host
+     */
+    404: unknown;
+    /**
+     * Rate limit exceeded
+     */
+    429: unknown;
+    /**
+     * Surveys could not be loaded
+     */
+    503: unknown;
+};
+
+export type PublicSurveysResponses = {
+    /**
+     * Surveys this visitor may see
+     */
+    200: PublicSurveysResponse;
+};
+
+export type PublicSurveysResponse2 = PublicSurveysResponses[keyof PublicSurveysResponses];
 
 export type ListAccessServicesGeneralData = {
     body?: never;
@@ -93561,6 +93898,373 @@ export type GetStatusOverviewResponses = {
 };
 
 export type GetStatusOverviewResponse = GetStatusOverviewResponses[keyof GetStatusOverviewResponses];
+
+export type ListSurveysData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: {
+        /**
+         * Only surveys in this status.
+         */
+        status?: SurveyStatus;
+        /**
+         * Page number, from 1. Default 1.
+         */
+        page?: number;
+        /**
+         * Surveys per page. Default 20, maximum 100.
+         */
+        page_size?: number;
+    };
+    url: '/projects/{project_id}/surveys';
+};
+
+export type ListSurveysErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions (requires surveys:read)
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListSurveysResponses = {
+    /**
+     * Surveys, newest first
+     */
+    200: SurveyListResponse;
+};
+
+export type ListSurveysResponse = ListSurveysResponses[keyof ListSurveysResponses];
+
+export type CreateSurveyData = {
+    body: CreateSurveyRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/surveys';
+};
+
+export type CreateSurveyErrors = {
+    /**
+     * Invalid survey
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions (requires surveys:write)
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type CreateSurveyResponses = {
+    /**
+     * Survey created
+     */
+    201: SurveyResponse;
+};
+
+export type CreateSurveyResponse = CreateSurveyResponses[keyof CreateSurveyResponses];
+
+export type DeleteSurveyData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Survey ID
+         */
+        survey_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/surveys/{survey_id}';
+};
+
+export type DeleteSurveyErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions (requires surveys:write)
+     */
+    403: unknown;
+    /**
+     * Survey not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type DeleteSurveyResponses = {
+    /**
+     * Survey deleted; its answers stay in analytics
+     */
+    200: DeleteSurveyResponse;
+};
+
+export type DeleteSurveyResponse2 = DeleteSurveyResponses[keyof DeleteSurveyResponses];
+
+export type GetSurveyData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Survey ID
+         */
+        survey_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/surveys/{survey_id}';
+};
+
+export type GetSurveyErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions (requires surveys:read)
+     */
+    403: unknown;
+    /**
+     * Survey not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetSurveyResponses = {
+    /**
+     * The survey
+     */
+    200: SurveyResponse;
+};
+
+export type GetSurveyResponse = GetSurveyResponses[keyof GetSurveyResponses];
+
+export type UpdateSurveyData = {
+    body: UpdateSurveyRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Survey ID
+         */
+        survey_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/surveys/{survey_id}';
+};
+
+export type UpdateSurveyErrors = {
+    /**
+     * Invalid survey
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions (requires surveys:write)
+     */
+    403: unknown;
+    /**
+     * Survey not found
+     */
+    404: unknown;
+    /**
+     * The survey changed since expected_updated_at
+     */
+    409: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UpdateSurveyResponses = {
+    /**
+     * Survey updated
+     */
+    200: SurveyResponse;
+};
+
+export type UpdateSurveyResponse = UpdateSurveyResponses[keyof UpdateSurveyResponses];
+
+export type ListSurveyResponsesData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Survey ID
+         */
+        survey_id: number;
+    };
+    query?: {
+        /**
+         * Start of the window, RFC 3339. Default: 30 days before `end_date`.
+         */
+        start_date?: string;
+        /**
+         * End of the window (exclusive), RFC 3339. Default: now.
+         */
+        end_date?: string;
+        /**
+         * Only answers recorded in this environment.
+         */
+        environment_id?: number;
+        /**
+         * Responses list only: page number, from 1.
+         */
+        page?: number;
+        /**
+         * Responses list only: responses per page, default 20, maximum 100.
+         */
+        page_size?: number;
+    };
+    url: '/projects/{project_id}/surveys/{survey_id}/responses';
+};
+
+export type ListSurveyResponsesErrors = {
+    /**
+     * Invalid time window
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions (requires surveys:read)
+     */
+    403: unknown;
+    /**
+     * Survey not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListSurveyResponsesResponses = {
+    /**
+     * Submitted responses, newest first
+     */
+    200: SurveyAnswerListResponse;
+};
+
+export type ListSurveyResponsesResponse = ListSurveyResponsesResponses[keyof ListSurveyResponsesResponses];
+
+export type GetSurveyResultsData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Survey ID
+         */
+        survey_id: number;
+    };
+    query?: {
+        /**
+         * Start of the window, RFC 3339. Default: 30 days before `end_date`.
+         */
+        start_date?: string;
+        /**
+         * End of the window (exclusive), RFC 3339. Default: now.
+         */
+        end_date?: string;
+        /**
+         * Only answers recorded in this environment.
+         */
+        environment_id?: number;
+        /**
+         * Responses list only: page number, from 1.
+         */
+        page?: number;
+        /**
+         * Responses list only: responses per page, default 20, maximum 100.
+         */
+        page_size?: number;
+    };
+    url: '/projects/{project_id}/surveys/{survey_id}/results';
+};
+
+export type GetSurveyResultsErrors = {
+    /**
+     * Invalid time window
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions (requires surveys:read)
+     */
+    403: unknown;
+    /**
+     * Survey not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetSurveyResultsResponses = {
+    /**
+     * Response rate and per-question results
+     */
+    200: SurveyResultsResponse;
+};
+
+export type GetSurveyResultsResponse = GetSurveyResultsResponses[keyof GetSurveyResultsResponses];
 
 export type ListTelemetryReleasesData = {
     body?: never;

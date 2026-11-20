@@ -50,6 +50,7 @@ import { registerOtelForwardCommands } from './commands/otel-forward/index.js'
 import { registerOtelCommands } from './commands/otel/index.js'
 import { registerKvCommands } from './commands/kv/index.js'
 import { registerFlagsCommands } from './commands/flags/index.js'
+import { registerSurveysCommands } from './commands/surveys/index.js'
 import { registerDataCommands } from './commands/data/index.js'
 import { registerBlobCommands } from './commands/blob/index.js'
 import { registerDsnCommands } from './commands/dsn/index.js'
@@ -216,6 +217,7 @@ export function createProgram(): Command {
   registerOtelCommands(program)
   registerKvCommands(program)
   registerFlagsCommands(program)
+  registerSurveysCommands(program)
   registerDataCommands(program)
   registerBlobCommands(program)
   registerDsnCommands(program)

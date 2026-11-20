@@ -47,6 +47,7 @@ syntax may have changed.
 - [`otel-forward`](otel-forward.md)
 - [`otel`](otel.md)
 - [`flags`](flags.md)
+- [`surveys`](surveys.md)
 - [`data`](data.md)
 - [`dsn`](dsn.md)
 - [`scans`](scans.md)

@@ -21,6 +21,7 @@ export function featureKeyForPath(pathname: string): string | undefined {
 
   if (projectRoute.startsWith('analytics/replays')) return 'session-replay'
   if (projectRoute.startsWith('analytics/funnels')) return 'funnels'
+  if (projectRoute.startsWith('analytics/surveys')) return 'surveys'
   if (projectRoute.startsWith('analytics')) return 'web-analytics'
   if (projectRoute.startsWith('errors')) return 'error-tracking'
   if (

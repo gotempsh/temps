@@ -4821,6 +4821,44 @@
         ],
         "type": "object"
       },
+      "AnswerCount": {
+        "properties": {
+          "count": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "value": {
+            "description": "The choice, or the score as text.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "value",
+          "count"
+        ],
+        "type": "object"
+      },
+      "AnswerValue": {
+        "description": "An answer as the responses list shows it.",
+        "oneOf": [
+          {
+            "description": "Open text or a single choice.",
+            "type": "string"
+          },
+          {
+            "description": "A rating or NPS score.",
+            "format": "double",
+            "type": "number"
+          },
+          {
+            "description": "Multiple-choice selections.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        ]
+      },
       "ApiCallerEntry": {
         "description": "A single caller entry in the top-callers breakdown.",
         "properties": {
@@ -20441,6 +20479,36 @@
         ],
         "type": "object"
       },
+      "CreateSurveyRequest": {
+        "properties": {
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "questions": {
+            "items": {
+              "$ref": "#/components/schemas/SurveyQuestion"
+            },
+            "type": "array"
+          },
+          "status": {
+            "$ref": "#/components/schemas/SurveyStatus",
+            "description": "Defaults to `draft`: nothing is shown until the survey is activated."
+          },
+          "targeting": {
+            "$ref": "#/components/schemas/SurveyTargeting"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
       "CreateTeamMemberRequest": {
         "properties": {
           "role": {
@@ -22467,6 +22535,22 @@
           }
         },
         "required": [
+          "deleted"
+        ],
+        "type": "object"
+      },
+      "DeleteSurveyResponse": {
+        "properties": {
+          "deleted": {
+            "type": "boolean"
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
           "deleted"
         ],
         "type": "object"
@@ -51292,6 +51376,37 @@
         ],
         "type": "object"
       },
+      "NpsSummary": {
+        "properties": {
+          "detractors": {
+            "description": "Answers of 0 to 6.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "passives": {
+            "description": "Answers of 7 or 8.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "promoters": {
+            "description": "Answers of 9 or 10.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "score": {
+            "description": "`(promoters - detractors) / answers * 100`, from -100 to 100.",
+            "format": "double",
+            "type": "number"
+          }
+        },
+        "required": [
+          "promoters",
+          "passives",
+          "detractors",
+          "score"
+        ],
+        "type": "object"
+      },
       "NumericRule": {
         "properties": {
           "comparison": {
@@ -61601,6 +61716,96 @@
         ],
         "type": "object"
       },
+      "PublicSurvey": {
+        "properties": {
+          "display": {
+            "$ref": "#/components/schemas/PublicSurveyDisplay"
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "questions": {
+            "items": {
+              "$ref": "#/components/schemas/SurveyQuestion"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "questions",
+          "display"
+        ],
+        "type": "object"
+      },
+      "PublicSurveyDisplay": {
+        "description": "The conditions the browser applies before showing a survey.",
+        "properties": {
+          "once_per_visitor": {
+            "type": "boolean"
+          },
+          "path_pattern": {
+            "description": "Page path pattern (`*` matches any run of characters); absent for\nevery page.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "trigger_event": {
+            "description": "Show after the app tracks this event; absent to show on page load.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "once_per_visitor"
+        ],
+        "type": "object"
+      },
+      "PublicSurveysRequest": {
+        "description": "Body of `POST /api/_temps/surveys`. Both fields are optional.",
+        "properties": {
+          "attributes": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/AttributeValue"
+            },
+            "description": "Attributes for the flag conditions. Override the implicit ones.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "key": {
+            "description": "Stable subject for sampling and flag conditions, e.g. a signed-in\nuser id. Defaults to the Temps visitor cookie.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "PublicSurveysResponse": {
+        "properties": {
+          "surveys": {
+            "items": {
+              "$ref": "#/components/schemas/PublicSurvey"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "surveys"
+        ],
+        "type": "object"
+      },
       "PublicUptimeDay": {
         "properties": {
           "avg_response_time_ms": {
@@ -61906,6 +62111,73 @@
           "returned_count",
           "execution_time_ms",
           "truncated"
+        ],
+        "type": "object"
+      },
+      "QuestionKind": {
+        "enum": [
+          "open_text",
+          "rating",
+          "nps",
+          "single_choice",
+          "multiple_choice"
+        ],
+        "type": "string"
+      },
+      "QuestionResults": {
+        "properties": {
+          "answered": {
+            "description": "Responses that answered this question.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "average": {
+            "description": "Mean score of `rating` and `nps` answers.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "distribution": {
+            "description": "Count per choice (declared order) or per score (ascending), zeros\nincluded. Empty for open-text questions: read those in the responses\nlist.",
+            "items": {
+              "$ref": "#/components/schemas/AnswerCount"
+            },
+            "type": "array"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/QuestionKind"
+          },
+          "nps": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/NpsSummary"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "other": {
+            "description": "Answers that are not a declared choice or an in-range score.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "prompt": {
+            "type": "string"
+          },
+          "question_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "question_id",
+          "kind",
+          "prompt",
+          "answered",
+          "distribution",
+          "other"
         ],
         "type": "object"
       },
@@ -77689,6 +77961,362 @@
         ],
         "type": "string"
       },
+      "SurveyAnswerListResponse": {
+        "properties": {
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "responses": {
+            "items": {
+              "$ref": "#/components/schemas/SurveyAnswerSet"
+            },
+            "type": "array"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total_pages": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "responses",
+          "total",
+          "page",
+          "page_size",
+          "total_pages"
+        ],
+        "type": "object"
+      },
+      "SurveyAnswerSet": {
+        "properties": {
+          "answers": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/AnswerValue"
+            },
+            "description": "Answers by question id. Only declared questions, in the shape their\nkind allows.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "environment_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "event_id": {
+            "description": "Analytics event id of the `survey_sent` event.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "pathname": {
+            "description": "Page the survey was answered on.",
+            "type": "string"
+          },
+          "session_id": {
+            "description": "Session the answer was given in; links to its replay when recorded.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "timestamp": {
+            "type": "string"
+          },
+          "visitor_id": {
+            "description": "Visitor who answered; open their profile from the console.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "event_id",
+          "timestamp",
+          "pathname",
+          "answers"
+        ],
+        "type": "object"
+      },
+      "SurveyFlagCondition": {
+        "description": "Show the survey only to visitors for whom a feature flag serves a value.",
+        "properties": {
+          "key": {
+            "description": "Flag key in the same project.",
+            "type": "string"
+          },
+          "value": {
+            "description": "The value the flag must serve. Defaults to `true`."
+          }
+        },
+        "required": [
+          "key"
+        ],
+        "type": "object"
+      },
+      "SurveyListResponse": {
+        "properties": {
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "surveys": {
+            "items": {
+              "$ref": "#/components/schemas/SurveyResponse"
+            },
+            "type": "array"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total_pages": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "surveys",
+          "total",
+          "page",
+          "page_size",
+          "total_pages"
+        ],
+        "type": "object"
+      },
+      "SurveyQuestion": {
+        "description": "One question of a survey.",
+        "properties": {
+          "choices": {
+            "description": "Options for `single_choice` and `multiple_choice`: 2-20, unique.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "id": {
+            "description": "Stable id the answer is recorded under: `[a-z0-9_]`, 1-32 characters,\nunique within the survey. Keep it when rewording a question so its\nanswers stay together.",
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/QuestionKind"
+          },
+          "lower_label": {
+            "description": "Label under the low end of a `rating` or `nps` scale.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "optional": {
+            "description": "When true the visitor may skip it.",
+            "type": "boolean"
+          },
+          "prompt": {
+            "type": "string"
+          },
+          "scale": {
+            "description": "Top of a `rating` scale: 3, 5, 7 or 10. Defaults to 5.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "upper_label": {
+            "description": "Label under the high end of a `rating` or `nps` scale.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "kind",
+          "prompt"
+        ],
+        "type": "object"
+      },
+      "SurveyResponse": {
+        "properties": {
+          "created_at": {
+            "type": "string"
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "questions": {
+            "items": {
+              "$ref": "#/components/schemas/SurveyQuestion"
+            },
+            "type": "array"
+          },
+          "status": {
+            "$ref": "#/components/schemas/SurveyStatus"
+          },
+          "targeting": {
+            "$ref": "#/components/schemas/SurveyTargeting"
+          },
+          "updated_at": {
+            "description": "Send back as `expected_updated_at` to guard an update.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "project_id",
+          "name",
+          "status",
+          "questions",
+          "targeting",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
+      },
+      "SurveyResultsResponse": {
+        "properties": {
+          "dismissed": {
+            "description": "`survey_dismissed` events in the window.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "end_date": {
+            "type": "string"
+          },
+          "questions": {
+            "items": {
+              "$ref": "#/components/schemas/QuestionResults"
+            },
+            "type": "array"
+          },
+          "response_rate": {
+            "description": "`sent / shown`; absent before the survey was shown.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "sent": {
+            "description": "`survey_sent` events (submitted responses) in the window.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "shown": {
+            "description": "`survey_shown` events in the window.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "start_date": {
+            "type": "string"
+          },
+          "survey_id": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "survey_id",
+          "start_date",
+          "end_date",
+          "shown",
+          "dismissed",
+          "sent",
+          "questions"
+        ],
+        "type": "object"
+      },
+      "SurveyStatus": {
+        "description": "Where a survey is in its life. Only `active` surveys reach browsers.",
+        "enum": [
+          "draft",
+          "active",
+          "paused",
+          "completed"
+        ],
+        "type": "string"
+      },
+      "SurveyTargeting": {
+        "description": "When a browser shows the survey. Every condition set must hold.",
+        "properties": {
+          "flag": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/SurveyFlagCondition",
+                "description": "Show only where a feature flag serves a value."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "once_per_visitor": {
+            "description": "Never show the survey again to a visitor who saw it. Defaults to true.",
+            "type": "boolean"
+          },
+          "path_pattern": {
+            "description": "Page path the survey appears on, e.g. `/checkout/*`. `*` matches any\nrun of characters; the pattern must match the whole path. Omit for\nevery page.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sample_rate": {
+            "description": "Share of visitors, `0..=1`, who may see it. Below 1 the visitor must be\nidentifiable (the Temps visitor cookie or an explicit key), so the\ndecision is the same on every page.",
+            "format": "double",
+            "type": "number"
+          },
+          "trigger_event": {
+            "description": "Show only after the app tracks an analytics event with this name\n(`trackEvent(\"checkout_completed\")`). Omit to show on page load.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "SyncedRepositoryListQuery": {
         "properties": {
           "direction": {
@@ -84913,6 +85541,61 @@
         ],
         "type": "object"
       },
+      "UpdateSurveyRequest": {
+        "properties": {
+          "description": {
+            "description": "`null` clears the description.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "expected_updated_at": {
+            "description": "`updated_at` as last read. When sent, the update is refused with 409\nif the survey changed since.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "questions": {
+            "description": "Replaces every question. Keep a question's `id` to keep its answers\ntogether.",
+            "items": {
+              "$ref": "#/components/schemas/SurveyQuestion"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "status": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/SurveyStatus"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "targeting": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/SurveyTargeting"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "type": "object"
+      },
       "UpdateTeamRequest": {
         "properties": {
           "description": {
@@ -91590,6 +92273,51 @@
         "tags": [
           "Performance"
         ]
+      }
+    },
+    "/_temps/surveys": {
+      "post": {
+        "description": "Unauthenticated: the project comes from the `Host` the browser called.\nAnswers are recorded through the analytics event endpoint as\n`survey_shown`, `survey_dismissed` and `survey_sent`.",
+        "operationId": "public_surveys",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PublicSurveysRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicSurveysResponse"
+                }
+              }
+            },
+            "description": "Surveys this visitor may see"
+          },
+          "400": {
+            "description": "Malformed or oversized context"
+          },
+          "404": {
+            "description": "No environment serves this host"
+          },
+          "429": {
+            "description": "Rate limit exceeded"
+          },
+          "503": {
+            "description": "Surveys could not be loaded"
+          }
+        },
+        "summary": "The active surveys the visitor making this request may see.",
+        "tags": [
+          "Surveys"
+        ],
+        "x-maturity": "beta"
       }
     },
     "/access-services": {
@@ -175309,6 +176037,560 @@
         ]
       }
     },
+    "/projects/{project_id}/surveys": {
+      "get": {
+        "operationId": "list_surveys",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Only surveys in this status.",
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/SurveyStatus"
+            }
+          },
+          {
+            "description": "Page number, from 1. Default 1.",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Surveys per page. Default 20, maximum 100.",
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SurveyListResponse"
+                }
+              }
+            },
+            "description": "Surveys, newest first"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions (requires surveys:read)"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Surveys"
+        ],
+        "x-maturity": "beta"
+      },
+      "post": {
+        "operationId": "create_survey",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateSurveyRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SurveyResponse"
+                }
+              }
+            },
+            "description": "Survey created"
+          },
+          "400": {
+            "description": "Invalid survey"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions (requires surveys:write)"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Surveys"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/projects/{project_id}/surveys/{survey_id}": {
+      "delete": {
+        "operationId": "delete_survey",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Survey ID",
+            "in": "path",
+            "name": "survey_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeleteSurveyResponse"
+                }
+              }
+            },
+            "description": "Survey deleted; its answers stay in analytics"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions (requires surveys:write)"
+          },
+          "404": {
+            "description": "Survey not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Surveys"
+        ],
+        "x-maturity": "beta"
+      },
+      "get": {
+        "operationId": "get_survey",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Survey ID",
+            "in": "path",
+            "name": "survey_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SurveyResponse"
+                }
+              }
+            },
+            "description": "The survey"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions (requires surveys:read)"
+          },
+          "404": {
+            "description": "Survey not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Surveys"
+        ],
+        "x-maturity": "beta"
+      },
+      "patch": {
+        "operationId": "update_survey",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Survey ID",
+            "in": "path",
+            "name": "survey_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateSurveyRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SurveyResponse"
+                }
+              }
+            },
+            "description": "Survey updated"
+          },
+          "400": {
+            "description": "Invalid survey"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions (requires surveys:write)"
+          },
+          "404": {
+            "description": "Survey not found"
+          },
+          "409": {
+            "description": "The survey changed since expected_updated_at"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Surveys"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/projects/{project_id}/surveys/{survey_id}/responses": {
+      "get": {
+        "operationId": "list_survey_responses",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Survey ID",
+            "in": "path",
+            "name": "survey_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Start of the window, RFC 3339. Default: 30 days before `end_date`.",
+            "in": "query",
+            "name": "start_date",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "End of the window (exclusive), RFC 3339. Default: now.",
+            "in": "query",
+            "name": "end_date",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Only answers recorded in this environment.",
+            "in": "query",
+            "name": "environment_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Responses list only: page number, from 1.",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Responses list only: responses per page, default 20, maximum 100.",
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SurveyAnswerListResponse"
+                }
+              }
+            },
+            "description": "Submitted responses, newest first"
+          },
+          "400": {
+            "description": "Invalid time window"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions (requires surveys:read)"
+          },
+          "404": {
+            "description": "Survey not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Surveys"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/projects/{project_id}/surveys/{survey_id}/results": {
+      "get": {
+        "operationId": "get_survey_results",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Survey ID",
+            "in": "path",
+            "name": "survey_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Start of the window, RFC 3339. Default: 30 days before `end_date`.",
+            "in": "query",
+            "name": "start_date",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "End of the window (exclusive), RFC 3339. Default: now.",
+            "in": "query",
+            "name": "end_date",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Only answers recorded in this environment.",
+            "in": "query",
+            "name": "environment_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Responses list only: page number, from 1.",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Responses list only: responses per page, default 20, maximum 100.",
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SurveyResultsResponse"
+                }
+              }
+            },
+            "description": "Response rate and per-question results"
+          },
+          "400": {
+            "description": "Invalid time window"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions (requires surveys:read)"
+          },
+          "404": {
+            "description": "Survey not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Surveys"
+        ],
+        "x-maturity": "beta"
+      }
+    },
     "/projects/{project_id}/telemetry-releases": {
       "get": {
         "operationId": "list_telemetry_releases",
@@ -191771,6 +193053,10 @@
     {
       "description": "Runtime configuration that changes without a redeploy",
       "name": "Feature Flags"
+    },
+    {
+      "description": "In-app surveys shown by the browser SDK; answers are analytics events",
+      "name": "Surveys"
     },
     {
       "description": "Ingress connectors: tunnels into the cluster (ADR 058)",

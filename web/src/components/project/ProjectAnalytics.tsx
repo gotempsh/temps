@@ -84,6 +84,7 @@ import { ApiTrafficTab } from '@/components/analytics/ApiTraffic'
 import { AnalyticsTrafficSettings } from '@/components/analytics/AnalyticsTrafficSettings'
 import { FunnelDetail } from '@/components/funnel/FunnelDetail'
 import { FunnelManagement } from '@/components/funnel/FunnelManagement'
+import { ProjectSurveys } from '@/components/project/surveys/ProjectSurveys'
 import { LiveVisitors } from '@/pages/LiveVisitors'
 import { AnalyticsOnboardingGate } from '@/components/analytics/AnalyticsOnboardingGate'
 import { RequestLogsRedirect } from '@/components/analytics/RequestLogsRedirect'
@@ -1123,6 +1124,7 @@ export function ProjectAnalytics({ project }: ProjectAnalyticsProps) {
         element={<RequestLogsRedirect projectSlug={project.slug} />}
       />
       <Route path="funnels/*" element={<FunnelAnalytics project={project} />} />
+      <Route path="surveys/*" element={<ProjectSurveys project={project} />} />
       <Route
         path="live-visitors"
         element={
