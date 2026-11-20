@@ -149,12 +149,18 @@ class GitHistory:
         A fix landed on both branches (cherry-picked to main) has identical content and
         is not reported; a change made only on `candidate`, merge resolutions included, is.
         """
+        # --no-renames reports both sides of a rename (a deleted source must not hide
+        # behind an identical destination); -z keeps names with spaces whole.
         spec = [*paths, *(f':(exclude){path}' for path in excludes)]
-        changed = self.git('diff', '--name-only', f'HEAD...{candidate}', '--', *spec).split()
+        changed = self.names('diff', '--no-renames', '--name-only', '-z', f'HEAD...{candidate}', '--', *spec)
         if not changed:
             return []
-        differ = set(self.git('diff', '--name-only', 'HEAD', candidate, '--', *changed).split())
+        differ = set(self.names('diff', '--no-renames', '--name-only', '-z', 'HEAD', candidate, '--',
+                                *changed))
         return [path for path in changed if path in differ]
+
+    def names(self, *args):
+        return [name for name in self.git(*args).split('\0') if name]
 
     def revisions(self, path):
         return self.git('log', '--format=%H', '--', path).split()

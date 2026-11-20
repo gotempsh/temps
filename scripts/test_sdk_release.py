@@ -1293,6 +1293,31 @@ class GitHistoryTests(unittest.TestCase):
         self.commit('sdks/node/packages/kv/src/scan.ts', 'fixed differently', 'fix(kv): branch only')
         self.assertEqual(self.branch_changes(history), [('kv', ['sdks/node/packages/kv/src/scan.ts'])])
 
+    def test_a_branch_rename_reports_its_source_unless_main_made_the_same_rename(self):
+        history = self.release_branch_repo()
+        old, new = 'sdks/node/packages/kv/src/old.ts', 'sdks/node/packages/kv/src/new.ts'
+        self.commit(old, 'client', 'feat(kv): client')
+        self.git('switch', '-q', 'release/v9.0.0')
+        self.git('merge', '-q', '--no-edit', 'main')
+        self.git('mv', old, new)
+        self.git('commit', '-q', '-m', 'refactor(kv): rename on the branch')
+        rename = self.git('rev-parse', 'HEAD').strip()
+        self.git('switch', '-q', 'main')
+        # main copies the file instead: the branch's deletion of the source is branch-only.
+        self.commit(new, 'client', 'chore(kv): copy')
+        self.assertEqual(self.branch_changes(history), [('kv', [old])])
+        # The same rename cherry-picked onto main leaves nothing branch-only.
+        self.git('rm', '-q', new)
+        self.git('commit', '-q', '-m', 'chore(kv): undo the copy')
+        self.git('cherry-pick', rename)
+        self.assertEqual(self.branch_changes(history), [])
+
+    def test_branch_only_file_names_with_spaces_are_kept_whole(self):
+        history = self.release_branch_repo()
+        self.git('switch', '-q', 'release/v9.0.0')
+        self.commit('sdks/node/packages/kv/src/legacy client [v1].ts', 'x', 'fix(kv): legacy client')
+        self.assertEqual(self.branch_changes(history), [('kv', ['sdks/node/packages/kv/src/legacy client [v1].ts'])])
+
     def test_packages_and_release_metadata_added_only_on_the_branch_are_found(self):
         history = self.release_branch_repo()
         self.git('switch', '-q', 'release/v9.0.0')
