@@ -31,21 +31,6 @@ async fn application_workspace_response(
             )
         })?;
     let config = temps_sandbox::services::ApplicationWorkspaceConfig::from(&desired);
-    let capacity = sandboxes
-        .application_workspace_capacity(
-            &application.application.public_id,
-            &config,
-            summary.as_ref().and_then(|s| s.backend.as_deref()),
-        )
-        .await
-        .map_err(|error| {
-            application_workspace_provider_problem(
-                error,
-                &application.application.public_id,
-                "inspect workspace capacity",
-            )
-        })?;
-    let (cpu_limit, memory_limit_mb) = config.display_limits(capacity);
     let mut diagnostic = desired.last_error.clone();
     let usage = if let Some(summary) = summary
         .as_ref()
@@ -63,8 +48,9 @@ async fn application_workspace_response(
                     error = %error,
                     "Could not read application workspace resource usage"
                 );
-                diagnostic =
-                    Some("Workspace resource usage is temporarily unavailable.".to_string());
+                diagnostic.get_or_insert_with(|| {
+                    "Workspace resource usage is temporarily unavailable.".to_string()
+                });
                 temps_sandbox::services::ApplicationWorkspaceUsage::default()
             }
         }
@@ -85,8 +71,9 @@ async fn application_workspace_response(
                     error = %error,
                     "Could not inspect application database topology"
                 );
-                diagnostic =
-                    Some("The workspace database topology is temporarily unavailable.".to_string());
+                diagnostic.get_or_insert_with(|| {
+                    "The workspace database topology is temporarily unavailable.".to_string()
+                });
                 0
             }
         };
@@ -143,6 +130,20 @@ async fn application_workspace_response(
             && summary.backend.as_deref() == Some("docker")
             && target_image.is_some()
     });
+    let capacity = sandboxes
+        .application_workspace_capacity(
+            &application.application.public_id,
+            &config,
+            summary.as_ref().and_then(|s| s.backend.as_deref()),
+        )
+        .await;
+    let (cpu_limit, memory_limit_mb) = workspace_status_limits(
+        &application.application.public_id,
+        &config,
+        capacity,
+        &mut diagnostic,
+    );
+
     Ok(ApplicationWorkspaceResponse {
         state: state_name.to_string(),
         desired_state: desired.desired_state,

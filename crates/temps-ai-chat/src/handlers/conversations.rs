@@ -677,21 +677,6 @@ pub async fn get_global_ai_workspace(
             application_workspace_provider_problem(error, &workspace_id, "inspect global workspace")
         })?;
     let defaults = temps_sandbox::services::ApplicationWorkspaceConfig::default();
-    let capacity = sandboxes
-        .application_workspace_capacity(
-            &workspace_id,
-            &defaults,
-            summary.as_ref().and_then(|s| s.backend.as_deref()),
-        )
-        .await
-        .map_err(|error| {
-            application_workspace_provider_problem(
-                error,
-                &workspace_id,
-                "inspect workspace capacity",
-            )
-        })?;
-    let (cpu_limit, memory_limit_mb) = defaults.display_limits(capacity);
     let mut diagnostic = None;
     let usage = if let Some(summary) = summary
         .as_ref()
@@ -709,8 +694,9 @@ pub async fn get_global_ai_workspace(
                     error = %error,
                     "Could not read global workspace resource usage"
                 );
-                diagnostic =
-                    Some("Workspace resource usage is temporarily unavailable.".to_string());
+                diagnostic.get_or_insert_with(|| {
+                    "Workspace resource usage is temporarily unavailable.".to_string()
+                });
                 temps_sandbox::services::ApplicationWorkspaceUsage::default()
             }
         }
@@ -727,6 +713,16 @@ pub async fn get_global_ai_workspace(
     let persistent_volume_healthy = tokio::fs::metadata(volume_path)
         .await
         .is_ok_and(|metadata| metadata.is_dir());
+
+    let capacity = sandboxes
+        .application_workspace_capacity(
+            &workspace_id,
+            &defaults,
+            summary.as_ref().and_then(|s| s.backend.as_deref()),
+        )
+        .await;
+    let (cpu_limit, memory_limit_mb) =
+        workspace_status_limits(&workspace_id, &defaults, capacity, &mut diagnostic);
 
     Ok(Json(ApplicationWorkspaceResponse {
         state: state_name.to_string(),

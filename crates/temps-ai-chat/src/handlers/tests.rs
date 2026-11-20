@@ -767,6 +767,36 @@ fn application_workspace_image_pull_failure_is_a_503() {
 }
 
 #[test]
+fn workspace_status_preserves_configured_limits_and_diagnostics_during_capacity_outage() {
+    let configured = temps_sandbox::services::ApplicationWorkspaceConfig {
+        cpu_limit: Some(1.5),
+        ..Default::default()
+    };
+    let mut diagnostic = Some("Workspace startup failed.".into());
+    let unavailable = || {
+        Err(temps_sandbox::error::SandboxError::Unavailable {
+            reason: "provider connection detail".into(),
+        })
+    };
+    assert_eq!(
+        workspace_status_limits("workspace", &configured, unavailable(), &mut diagnostic),
+        (1.5, 8192)
+    );
+    assert_eq!(diagnostic.as_deref(), Some("Workspace startup failed. Host capacity is temporarily unavailable. Showing configured workspace limits."));
+    let mut global_diagnostic = None;
+    assert_eq!(
+        workspace_status_limits(
+            "global",
+            &Default::default(),
+            unavailable(),
+            &mut global_diagnostic
+        ),
+        (4.0, 8192)
+    );
+    assert!(global_diagnostic.is_some());
+}
+
+#[test]
 fn application_workspace_cpu_override_explains_host_range() {
     let problem =
         application_workspace_failure_problem(temps_sandbox::error::SandboxError::CpuLimit {

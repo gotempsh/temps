@@ -6,6 +6,33 @@
 
 use super::*;
 
+/// Status remains readable while the runtime is down. Preserve startup
+/// diagnostics and keep a capacity warning separate from the lifecycle state.
+pub(super) fn workspace_status_limits(
+    workspace: &str,
+    config: &temps_sandbox::services::ApplicationWorkspaceConfig,
+    capacity: Result<
+        Option<temps_sandbox_providers::SandboxHostCapacity>,
+        temps_sandbox::error::SandboxError,
+    >,
+    diagnostic: &mut Option<String>,
+) -> (f64, u64) {
+    match capacity {
+        Ok(host) => config.display_limits(host),
+        Err(error) => {
+            tracing::warn!(workspace, %error, "Could not read workspace host capacity");
+            let message = diagnostic.get_or_insert_with(String::new);
+            if !message.is_empty() {
+                message.push(' ');
+            }
+            message.push_str(
+                "Host capacity is temporarily unavailable. Showing configured workspace limits.",
+            );
+            config.display_limits(None)
+        }
+    }
+}
+
 pub(super) fn application_workspace_failure_detail(
     error: &temps_sandbox::error::SandboxError,
 ) -> &'static str {
