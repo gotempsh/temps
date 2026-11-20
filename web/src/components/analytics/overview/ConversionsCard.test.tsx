@@ -110,7 +110,7 @@ test('lists conversions with rate and revenue, and breaks one down by channel', 
   expect(table.textContent).toContain('4.0%')
   expect(table.textContent).toContain('$600.00')
 
-  fireEvent.click(view.getByRole('button', { name: /Purchase/ }))
+  fireEvent.click(view.getByRole('button', { name: /^Purchase/ }))
   const list = await view.findByRole('list', { name: 'Purchase by Channel' })
   expect(list.textContent).toContain('Email')
   expect(list.textContent).toContain('20%')

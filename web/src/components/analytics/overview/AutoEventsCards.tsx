@@ -10,8 +10,10 @@
  */
 
 import { aggregateApiTraffic } from '@/api/client'
-import { getPropertyBreakdownOptions } from '@/api/client/@tanstack/react-query.gen'
-import { client } from '@/api/client/client.gen'
+import {
+  getEventPropertiesOptions,
+  getPropertyBreakdownOptions,
+} from '@/api/client/@tanstack/react-query.gen'
 import type {
   ProjectResponse,
   TrafficAggregationResponse,
@@ -38,7 +40,6 @@ import {
   notFoundReferrersRequest,
   notFoundWindow,
   propertyValueLabel,
-  type EventPropertiesResponse,
 } from '@/lib/auto-events'
 import { useQuery } from '@tanstack/react-query'
 import { formatDistanceToNow } from 'date-fns'
@@ -53,43 +54,6 @@ interface AutoEventsCardProps {
   startDate: Date | undefined
   endDate: Date | undefined
   environment: number | undefined
-}
-
-/**
- * `GET /analytics/event-properties` is called through the shared client
- * directly until the generated client is refreshed from a server that has it.
- */
-async function fetchEventProperties(params: {
-  projectId: number
-  eventName: string
-  property: string
-  startDate: Date
-  endDate: Date
-  environment: number | undefined
-}): Promise<EventPropertiesResponse> {
-  const { data, error } = await client.get<
-    { 200: EventPropertiesResponse },
-    unknown,
-    false
-  >({
-    security: [{ scheme: 'bearer', type: 'http' }],
-    url: '/analytics/event-properties',
-    query: {
-      project_id: params.projectId,
-      event_name: params.eventName,
-      property: params.property,
-      start_date: params.startDate.toISOString(),
-      end_date: params.endDate.toISOString(),
-      environment_id: params.environment,
-      limit: 10,
-    },
-  })
-  if (error || !data) {
-    throw new Error(
-      `Could not load ${params.eventName} by ${params.property} for project ${params.projectId}`
-    )
-  }
-  return data
 }
 
 function CardSkeleton() {
@@ -172,24 +136,17 @@ function EventPropertyCard({
   formatValue: (value: string | null) => string
 }) {
   const { data, isLoading, isError } = useQuery({
-    queryKey: [
-      'event-properties',
-      project.id,
-      eventName,
-      property,
-      startDate?.toISOString(),
-      endDate?.toISOString(),
-      environment,
-    ],
-    queryFn: () =>
-      fetchEventProperties({
-        projectId: project.id,
-        eventName,
+    ...getEventPropertiesOptions({
+      query: {
+        project_id: project.id,
+        event_name: eventName,
         property,
-        startDate: startDate as Date,
-        endDate: endDate as Date,
-        environment,
-      }),
+        start_date: startDate?.toISOString() ?? '',
+        end_date: endDate?.toISOString() ?? '',
+        environment_id: environment,
+        limit: 10,
+      },
+    }),
     enabled: !!startDate && !!endDate,
   })
 
@@ -228,7 +185,7 @@ function EventPropertyCard({
               id: item.value ?? '(not set)',
               title: (
                 <span title={item.value ?? undefined}>
-                  {formatValue(item.value)}
+                  {formatValue(item.value ?? null)}
                 </span>
               ),
               facts: [
@@ -334,16 +291,9 @@ function AnsweredNotFound({
       // the report then lists paths without their referrer.
       let referrers: TrafficAggregationResponse | null = null
       if (referrersBody) {
-        const result = await client.post<
-          { 200: TrafficAggregationResponse },
-          unknown,
-          false
-        >({
-          security: [{ scheme: 'bearer', type: 'http' }],
-          url: '/projects/{project_id}/api-analytics/query',
+        const result = await aggregateApiTraffic({
           path: { project_id: project.id },
           body: referrersBody,
-          headers: { 'Content-Type': 'application/json' },
         })
         referrers = result.error ? null : (result.data ?? null)
       }

@@ -22,6 +22,36 @@ const SESSION_ID_KEY = "temps_session_id";
 const SESSION_LAST_SEEN_KEY = "temps_session_last_seen";
 
 /**
+ * Cookieless mode (ADR 109 D3). Once on, identity is never read from or
+ * written to the device: the server derives a daily visitor id from the
+ * request instead. It is one-way for the page's lifetime, so a second
+ * analytics instance configured without it cannot start storing ids again.
+ */
+let cookieless = false;
+
+/**
+ * Stop storing identity on the device and delete what an earlier visit
+ * stored, so switching a site to cookieless also forgets returning visitors'
+ * ids. Called by `createAnalytics({ cookieless: true })`.
+ */
+export function enableCookielessIdentity(): void {
+  cookieless = true;
+  try {
+    if (typeof localStorage === "undefined") return;
+    localStorage.removeItem(VISITOR_ID_KEY);
+    localStorage.removeItem(SESSION_ID_KEY);
+    localStorage.removeItem(SESSION_LAST_SEEN_KEY);
+  } catch {
+    // Storage unusable: there is nothing stored to delete either.
+  }
+}
+
+/** Whether identity storage is off for this page (see `enableCookielessIdentity`). */
+export function isCookielessIdentity(): boolean {
+  return cookieless;
+}
+
+/**
  * Mirrors the proxy's default session inactivity window
  * (`session_max_age_minutes` in `crates/temps-proxy/src/traits.rs`) so
  * client-generated session grouping stays consistent with the
@@ -44,6 +74,7 @@ function randomId(prefix: string): string {
  * new visitor on every event, so the server's own identity is used instead.
  */
 export function getOrCreateVisitorId(): string | undefined {
+  if (cookieless) return undefined;
   try {
     if (typeof localStorage === "undefined") return undefined;
     let visitorId = localStorage.getItem(VISITOR_ID_KEY);
@@ -63,6 +94,7 @@ export function getOrCreateVisitorId(): string | undefined {
  * outbound request so `lastSeen` tracks real activity.
  */
 export function getOrCreateSessionId(): string | undefined {
+  if (cookieless) return undefined;
   try {
     if (typeof localStorage === "undefined") return undefined;
     const now = Date.now();

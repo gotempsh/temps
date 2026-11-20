@@ -2,9 +2,9 @@
 
 ## Status
 
-Proposed — 2026-11-19. D1 and D2 are implemented; what they settled is
-recorded under "Settled while implementing D1" and "... D2". D3 to D9 are
-not started.
+Proposed — 2026-11-19. D1 to D3 are implemented; what they settled is
+recorded under "Settled while implementing D1", "... D2" and "... D3". D4
+to D9 are not started.
 
 Related: ADR 012 (ClickHouse analytics backend), ADR 076 (analytics ingest
 keys), ADR 110 (product analytics gaps against PostHog; D2 here is the goal
@@ -363,6 +363,53 @@ they come last.
   one. CLI `temps analytics conversions list | create | update | delete |
   breakdown`. Writes are audit-logged (`ANALYTICS_GOAL_CREATED`,
   `_UPDATED`, `_DELETED`).
+
+## Settled while implementing D3
+
+- **Where the mode lives.** A column on `projects`,
+  `analytics_identity_mode` (`persistent` default, or `cookieless`), not on
+  `project_analytics_settings`. The proxy decides whether to set cookies on
+  every request and must not do I/O for it; the project row is already in
+  its route table, and the route-change trigger now also fires on this
+  column, so a switch takes effect on the next route reload. The keyed
+  ingest path, which has no route-table entry, reads the mode through a
+  60-second cache that the settings endpoint clears in its own process.
+  API: `GET`/`PUT /projects/{project_id}/analytics/identity`, audited as
+  `ANALYTICS_IDENTITY_MODE_UPDATED`.
+- **The id.** `cl_` + the first 128 bits of `SHA-256(salt, project id,
+  client address, user agent)`, each part length-prefixed. The salt is 32
+  random bytes per UTC day in `analytics_identity_salts`, encrypted with
+  `EncryptionService`. The first event of a day on each node inserts it
+  (`ON CONFLICT DO NOTHING`, so nodes agree) and deletes older days; an
+  hourly sweep deletes them too when no cookieless traffic arrives.
+- **Sessions.** With nothing on the device, a visitor's current session is
+  held in memory: a cache of at most 50,000 visitors (about 10 MB), each
+  entry expiring after 30 minutes without activity, the same window as
+  `_temps_sid`. A miss looks up the visitor's last event inside the window
+  once, so a restart or another node continues the session. Past the cap the
+  least recently seen visitors are evicted and their next event looks the
+  session up again. On ClickHouse-only event storage that lookup finds
+  nothing, and a restart starts new sessions.
+- **The proxy.** For a cookieless project it resolves no visitor or session,
+  sets neither cookie, and expires both when a browser still sends them.
+  Request logs of such a project therefore carry no visitor.
+- **Ingest.** For a cookieless project the server ignores every visitor or
+  session id a browser sends, cookie or payload, and derives both itself,
+  so an old tracker cannot bring stored ids back. Keyed events from a
+  backend are counted by the address that sent them; the docs say to send
+  cookieless events from the browser.
+- **The tracker.** `cookieless: true` (`data-cookieless="true"` on the
+  script tag, `<TempsAnalyticsProvider cookieless>`) writes nothing to
+  `localStorage`, deletes the ids an earlier visit stored, and never starts
+  session replay. It is one-way for the page's lifetime.
+- **Where it shows.** A Visitor identity card under Analytics → Settings,
+  with what each mode costs and the tracker snippet; a one-line note on the
+  visitors, journey and replay views of a cookieless project. CLI `temps
+  analytics identity show | set --mode`.
+- **Left for later.** The geolocation table still stores the client
+  address, under the existing IP retention policy; a cookieless project
+  could store only the derived location. D4's user-id join across days is
+  not built yet.
 
 ## Not doing
 

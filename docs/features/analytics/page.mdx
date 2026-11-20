@@ -14,9 +14,11 @@ export const sections = [
   { title: 'Outbound Links, Downloads & 404s', id: 'automatic-events' },
   { title: 'Session Replay', id: 'session-replay' },
   { title: 'Performance Monitoring', id: 'performance-monitoring' },
+  { title: 'Conversions', id: 'conversions' },
   { title: 'Funnel Analysis', id: 'funnel-analysis' },
   { title: 'Sending Analytics from React', id: 'react-sdk' },
   { title: 'Enriching Visitors', id: 'enrich-visitors' },
+  { title: 'Cookieless Tracking', id: 'cookieless' },
   { title: 'Privacy & Compliance', id: 'privacy' },
 ]
 
@@ -1355,6 +1357,56 @@ visitors.forEach(v => {
 
 ---
 
+## Cookieless Tracking {{ anchor: true, id: 'cookieless' }}
+
+By default Temps recognises a returning visitor by an id kept on their device: the `_temps_visitor_id` cookie (365 days) when Temps serves the page, or `localStorage` when Temps is only the analytics backend. In the EU that usually needs consent before tracking starts.
+
+A project can instead be **cookieless**. Nothing is stored on the device. Temps counts a visitor by a hash of a daily salt, the project, the client address and the browser's user agent. The salt is 32 random bytes per UTC day, kept encrypted in the database so every node derives the same id, and deleted once the day is over, after which yesterday's ids cannot be recomputed from anything Temps keeps.
+
+Switch it under **Analytics → Settings → Visitor identity**, or from the CLI:
+
+```bash
+temps analytics identity show -p my-site
+temps analytics identity set -p my-site --mode cookieless
+```
+
+In cookieless mode the proxy stops setting `_temps_visitor_id` and `_temps_sid`, and expires them when a browser still sends them. Tell the tracker too, so it does not write to `localStorage` either:
+
+<CodeGroup title="Cookieless tracker">
+```tsx {{ title: 'React' }}
+<TempsAnalyticsProvider cookieless>
+  {children}
+</TempsAnalyticsProvider>
+```
+
+```html {{ title: 'Script tag' }}
+<script defer
+  src="https://cdn.jsdelivr.net/npm/@temps-sdk/analytics-browser/dist/temps.min.js"
+  data-cookieless="true"></script>
+```
+
+```ts {{ title: 'Vue, Svelte, plain JS' }}
+createAnalytics({ cookieless: true })
+```
+</CodeGroup>
+
+The tracker option also deletes the ids an earlier visit stored. The server ignores any id a browser sends for a cookieless project, so a tracker you forgot to update cannot bring stored ids back into the reports.
+
+### What changes
+
+- A returning visitor counts as a new visitor the next day.
+- Unique visitors over a period of several days are the sum of each day's unique visitors.
+- Visitor profiles and journeys cover a single day.
+- Session replay is off: a replay needs an id stored on the device.
+- Sessions still end after 30 minutes without activity, decided on the server.
+- Visitors on the same network with the same browser version are counted once per day.
+- Request logs carry no visitor, since the proxy no longer recognises one.
+- Events your backend sends with an ingest key are counted by the address that sent them, so send cookieless events from the browser.
+
+Switching applies to new visits. History recorded in either mode stays as it is.
+
+---
+
 ## Privacy & Compliance {{ anchor: true, id: 'privacy' }}
 
 Temps analytics is designed with privacy in mind and complies with GDPR, CCPA, and other regulations.
@@ -1365,8 +1417,8 @@ Temps analytics is designed with privacy in mind and complies with GDPR, CCPA, a
   <Property name="Self-Hosted">
     All data stays on your infrastructure—no data sent to third parties
   </Property>
-  <Property name="No Cookies">
-    IP-based tracking (no tracking cookies required)
+  <Property name="Cookieless Mode">
+    Per project: nothing stored on the visitor's device, visitors counted by a daily-rotating hash (see [Cookieless Tracking](#cookieless))
   </Property>
   <Property name="Anonymization">
     IP address hashing and anonymization options

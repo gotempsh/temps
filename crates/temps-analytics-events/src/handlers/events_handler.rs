@@ -65,6 +65,9 @@ pub struct AppState {
     /// Lock-free per-project limiter for the Host-resolved ingest path, which
     /// is the per-event hot path for every deployed site.
     pub host_ingest_rate_limiter: Arc<super::HostIngestRateLimiter>,
+    /// ADR 109 D3: visitor and session ids of cookieless projects, shared
+    /// with the identity settings endpoint so a mode change applies at once.
+    pub cookieless_identity: Arc<temps_analytics::cookieless::CookielessIdentity>,
 }
 
 /// Per-project ceiling applied to the Host-resolved (keyless) ingest branch
@@ -745,6 +748,23 @@ fn primary_accept_language(header: &str) -> Option<String> {
     Some(tag.to_ascii_lowercase())
 }
 
+/// 503 for an event whose cookieless identity could not be derived (the
+/// salt or session lookup failed). The event is not stored under a made-up
+/// id; the tracker retries it like any other failed send.
+fn identity_unavailable_response(
+    project_id: i32,
+    error: &temps_analytics::cookieless::CookielessIdentityError,
+) -> axum::response::Response {
+    ErrorBuilder::new(StatusCode::SERVICE_UNAVAILABLE)
+        .title("Visitor identity unavailable")
+        .detail(format!(
+            "Could not derive the cookieless visitor of an event for project {}: {}",
+            project_id, error
+        ))
+        .build()
+        .into_response()
+}
+
 /// Record analytics event
 #[utoipa::path(
     tag = "Metrics",
@@ -794,7 +814,7 @@ pub async fn record_event_metrics(
     // keyed event look like it happened on the analytics backend, and
     // `get_channel` would classify the customer's real internal navigation as
     // "Referral" instead of a self-referral.
-    let (project_id, environment_id, deployment_id, site_hostname, branch) = if let Some(key) =
+    let (project_id, environment_id, deployment_id, site_hostname, branch, identity_mode) = if let Some(key) =
         extract_analytics_key(&headers, raw_query.as_deref())
     {
         let origin = headers
@@ -813,6 +833,19 @@ pub async fn record_event_metrics(
                     "Resolved analytics ingest key {} to project={}, env={:?}, deploy={:?}",
                     scope.key_id, scope.project_id, scope.environment_id, scope.deployment_id
                 );
+                // No route-table entry carries this project's row, so its
+                // identity mode comes from a short-lived cache.
+                let identity_mode = match state
+                    .cookieless_identity
+                    .identity_mode(scope.project_id)
+                    .await
+                {
+                    Ok(mode) => mode,
+                    Err(e) => {
+                        error!("{}", e);
+                        return identity_unavailable_response(scope.project_id, &e);
+                    }
+                };
                 // No site hostname from this branch — see above. The service
                 // falls back to what the SDK put in the payload.
                 (
@@ -821,6 +854,7 @@ pub async fn record_event_metrics(
                     scope.deployment_id,
                     None,
                     IngestBranch::keyed(&headers),
+                    identity_mode,
                 )
             }
             Err(problem) => return problem.into_response(),
@@ -888,6 +922,7 @@ pub async fn record_event_metrics(
                     deployment_id,
                     (!host.is_empty()).then(|| host.clone()),
                     IngestBranch::HostResolved,
+                    project.analytics_identity_mode,
                 )
             }
             None => {
@@ -998,16 +1033,39 @@ pub async fn record_event_metrics(
         (None, None)
     };
 
-    let session_id = resolve_client_identity(
-        metadata.session_id_cookie,
-        payload.session_id.clone(),
-        branch,
-    );
-    let visitor_id = resolve_client_identity(
-        metadata.visitor_id_cookie,
-        payload.visitor_id.clone(),
-        branch,
-    );
+    // ADR 109 D3: a cookieless project's visitor and session come from the
+    // request alone. Any id the browser sends, cookie or payload, is ignored,
+    // so a tracker left in persistent mode cannot bring stored ids back.
+    let (session_id, visitor_id) = if identity_mode.is_cookieless() {
+        match state
+            .cookieless_identity
+            .visit(
+                project_id,
+                &metadata.ip_address,
+                user_agent.as_deref().unwrap_or_default(),
+            )
+            .await
+        {
+            Ok(visit) => (Some(visit.session_id), Some(visit.visitor_id)),
+            Err(e) => {
+                error!("{}", e);
+                return identity_unavailable_response(project_id, &e);
+            }
+        }
+    } else {
+        (
+            resolve_client_identity(
+                metadata.session_id_cookie,
+                payload.session_id.clone(),
+                branch,
+            ),
+            resolve_client_identity(
+                metadata.visitor_id_cookie,
+                payload.visitor_id.clone(),
+                branch,
+            ),
+        )
+    };
 
     // The SDK sends `domain` as a sibling of `event_data`, not nested inside
     // it, but `resolve_site_hostname`'s data-derived fallback (ADR-040 §3)
@@ -1507,6 +1565,20 @@ pub struct EventsApiDoc;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_cookieless_identity(
+        db: Arc<sea_orm::DatabaseConnection>,
+    ) -> Arc<temps_analytics::cookieless::CookielessIdentity> {
+        let encryption = Arc::new(
+            temps_core::EncryptionService::new(
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            )
+            .expect("valid test key"),
+        );
+        Arc::new(temps_analytics::cookieless::CookielessIdentity::new(
+            db, encryption,
+        ))
+    }
     use axum::body::Body;
     use axum::http::Request;
     use axum::middleware;
@@ -1616,6 +1688,7 @@ mod tests {
             ingest_key_service: Arc::new(AnalyticsIngestKeyService::new(db.clone())),
             ingest_rate_limiter: Arc::new(AnalyticsIngestRateLimiter::new()),
             host_ingest_rate_limiter: Arc::new(crate::handlers::HostIngestRateLimiter::new()),
+            cookieless_identity: test_cookieless_identity(db.clone()),
         });
 
         let auth_middleware = middleware::from_fn(
@@ -2118,6 +2191,7 @@ mod tests {
             ingest_key_service: Arc::new(AnalyticsIngestKeyService::new(db.clone())),
             ingest_rate_limiter: Arc::new(AnalyticsIngestRateLimiter::new()),
             host_ingest_rate_limiter: Arc::new(crate::handlers::HostIngestRateLimiter::new()),
+            cookieless_identity: test_cookieless_identity(db.clone()),
         });
 
         // No auth middleware — should return 401
@@ -3539,6 +3613,86 @@ mod tests {
         let events = stored_events(db.as_ref()).await;
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].session_id.as_deref(), Some("cookie-session-0002"));
+
+        test_db.cleanup().await;
+    }
+
+    /// ADR 109 D3: for a cookieless project the server derives the visitor
+    /// and session itself. Ids sent by the browser, cookie or payload, never
+    /// decide them, and the same browser stays in one session.
+    #[tokio::test]
+    async fn cookieless_ingest_ignores_sent_ids_and_derives_its_own() {
+        use sea_orm::ConnectionTrait;
+        let mut test_db: TestDatabase = test_db_or_skip!();
+        let db = test_db.connection_arc();
+        let project = insert_test_project(db.as_ref()).await;
+        db.execute_unprepared(&format!(
+            "UPDATE projects SET analytics_identity_mode = 'cookieless' WHERE id = {}",
+            project.id
+        ))
+        .await
+        .expect("switch the project to cookieless");
+        let (_app, state, _crypto) = setup_test_app(db.clone()).await;
+        let key = mint_key(&state, project.id, None).await;
+
+        let send = |user_agent: &'static str| {
+            let mut payload = event_payload();
+            payload["sessionId"] = serde_json::json!("sdk-session-0003");
+            payload["visitorId"] = serde_json::json!("sdk-visitor-0003");
+            let mut request = beacon(&key, "application/json", SITE_ORIGIN, payload.to_string());
+            let headers = request.headers_mut();
+            headers.insert(
+                TEST_SESSION_COOKIE_HEADER,
+                axum::http::HeaderValue::from_static("cookie-session-0003"),
+            );
+            headers.insert(
+                axum::http::header::USER_AGENT,
+                axum::http::HeaderValue::from_static(user_agent),
+            );
+            request
+        };
+        const BROWSER_A: &str = "Mozilla/5.0 (X11; Linux x86_64) Firefox/131.0";
+        const BROWSER_B: &str = "Mozilla/5.0 (Macintosh) Safari/605.1.15";
+
+        for user_agent in [BROWSER_A, BROWSER_A, BROWSER_B] {
+            let response = setup_public_app(state.clone())
+                .oneshot(send(user_agent))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        }
+
+        let events = stored_events(db.as_ref()).await;
+        assert_eq!(events.len(), 3);
+        for event in &events {
+            let session = event.session_id.as_deref().unwrap_or_default();
+            assert_ne!(session, "sdk-session-0003", "the payload id must be ignored");
+            assert_ne!(session, "cookie-session-0003", "the cookie must be ignored");
+        }
+        let mut by_time = events.clone();
+        by_time.sort_by_key(|event| event.timestamp);
+        assert_eq!(
+            by_time[0].session_id, by_time[1].session_id,
+            "the same browser stays in one session"
+        );
+        assert_ne!(by_time[0].session_id, by_time[2].session_id);
+        assert_eq!(by_time[0].visitor_id, by_time[1].visitor_id);
+        assert_ne!(by_time[0].visitor_id, by_time[2].visitor_id);
+
+        let visitors = temps_entities::visitor::Entity::find()
+            .all(db.as_ref())
+            .await
+            .expect("visitors");
+        assert_eq!(visitors.len(), 2);
+        for visitor in visitors {
+            assert!(
+                visitor
+                    .visitor_id
+                    .starts_with(temps_analytics::cookieless::COOKIELESS_VISITOR_PREFIX),
+                "a cookieless visitor id is derived, not taken from the browser: {}",
+                visitor.visitor_id
+            );
+        }
 
         test_db.cleanup().await;
     }

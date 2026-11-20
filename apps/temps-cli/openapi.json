@@ -3967,6 +3967,402 @@
         ],
         "type": "string"
       },
+      "AnalyticsGoal": {
+        "description": "A conversion goal.",
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "event_filter": {
+            "items": {
+              "$ref": "#/components/schemas/SmartFilter"
+            },
+            "type": "array"
+          },
+          "event_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/AnalyticsGoalKind"
+          },
+          "name": {
+            "type": "string"
+          },
+          "page_path": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "revenue_currency": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "revenue_property": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "project_id",
+          "name",
+          "kind",
+          "event_filter",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
+      },
+      "AnalyticsGoalBreakdownDimension": {
+        "description": "What a goal breakdown groups converting visitors by.",
+        "enum": [
+          "channel",
+          "referrer",
+          "utm_source",
+          "utm_medium",
+          "utm_campaign",
+          "page",
+          "country",
+          "device_type",
+          "browser",
+          "operating_system"
+        ],
+        "type": "string"
+      },
+      "AnalyticsGoalBreakdownResponse": {
+        "description": "Response of `GET /projects/{project_id}/analytics/goals/{goal_id}/breakdown`.",
+        "properties": {
+          "dimension": {
+            "$ref": "#/components/schemas/AnalyticsGoalBreakdownDimension"
+          },
+          "goal_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "items": {
+            "description": "Ordered by unique conversions, then total conversions.",
+            "items": {
+              "$ref": "#/components/schemas/AnalyticsGoalBreakdownRow"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "goal_id",
+          "dimension",
+          "items"
+        ],
+        "type": "object"
+      },
+      "AnalyticsGoalBreakdownRow": {
+        "description": "One value of a goal breakdown.",
+        "properties": {
+          "conversion_rate": {
+            "description": "`unique_conversions` as a percentage of `visitors`.",
+            "format": "double",
+            "type": "number"
+          },
+          "revenue": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/AnalyticsGoalRevenue",
+                "description": "Revenue total and average, when the goal names a revenue property."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "total_conversions": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "unique_conversions": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "value": {
+            "description": "`null` when the visitor or event has no value for the dimension.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "visitors": {
+            "description": "Distinct non-crawler visitors with that value in the period.",
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "visitors",
+          "unique_conversions",
+          "total_conversions",
+          "conversion_rate"
+        ],
+        "type": "object"
+      },
+      "AnalyticsGoalInput": {
+        "description": "Body of `POST` and `PUT /projects/{project_id}/analytics/goals`.",
+        "properties": {
+          "event_filter": {
+            "description": "Conditions every matching event must meet, in the vocabulary funnel\nsteps use, e.g. `[{\"type\":\"custom_data\",\"value\":{\"path\":\"plan\",\"value\":\"pro\"}}]`.",
+            "items": {
+              "$ref": "#/components/schemas/SmartFilter"
+            },
+            "type": "array"
+          },
+          "event_name": {
+            "description": "Required for `event` goals, refused for `page` goals.",
+            "example": "signup",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "kind": {
+            "$ref": "#/components/schemas/AnalyticsGoalKind"
+          },
+          "name": {
+            "description": "Shown in the Conversions report, e.g. \"Signup\". Unique per project,\nignoring case.",
+            "example": "Signup",
+            "type": "string"
+          },
+          "page_path": {
+            "description": "Required for `page` goals, refused for `event` goals. Starts with `/`;\n`*` matches any run of characters, e.g. `/thank-you` or `/docs/*`.",
+            "example": "/thank-you",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "revenue_currency": {
+            "description": "ISO 4217 currency code of `revenue_property`, e.g. `EUR`.",
+            "example": "EUR",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "revenue_property": {
+            "description": "Event property holding the value of one conversion, e.g. `amount`.\nEvent goals only; requires `revenue_currency`.",
+            "example": "amount",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "name",
+          "kind"
+        ],
+        "type": "object"
+      },
+      "AnalyticsGoalKind": {
+        "description": "What a goal matches.",
+        "enum": [
+          "event",
+          "page"
+        ],
+        "type": "string"
+      },
+      "AnalyticsGoalListResponse": {
+        "description": "A page of goals, newest first.",
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/AnalyticsGoal"
+            },
+            "type": "array"
+          },
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "items",
+          "total",
+          "page",
+          "page_size"
+        ],
+        "type": "object"
+      },
+      "AnalyticsGoalRevenue": {
+        "description": "Revenue a goal's conversions carried.",
+        "properties": {
+          "average": {
+            "description": "`total` divided by the conversions that carried a number.",
+            "format": "double",
+            "type": "number"
+          },
+          "currency": {
+            "type": "string"
+          },
+          "total": {
+            "description": "Sum of the revenue property over conversions that carried a number.",
+            "format": "double",
+            "type": "number"
+          }
+        },
+        "required": [
+          "currency",
+          "total",
+          "average"
+        ],
+        "type": "object"
+      },
+      "AnalyticsGoalStats": {
+        "description": "Conversion figures of one goal in a period.",
+        "properties": {
+          "conversion_rate": {
+            "description": "`unique_conversions` as a percentage of the period's visitors.",
+            "format": "double",
+            "type": "number"
+          },
+          "goal_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/AnalyticsGoalKind"
+          },
+          "name": {
+            "type": "string"
+          },
+          "revenue": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/AnalyticsGoalRevenue",
+                "description": "Present when the goal names a revenue property."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "total_conversions": {
+            "description": "Matching events, a visitor converting twice counting twice.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "unique_conversions": {
+            "description": "Distinct visitors who converted.",
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "goal_id",
+          "name",
+          "kind",
+          "unique_conversions",
+          "total_conversions",
+          "conversion_rate"
+        ],
+        "type": "object"
+      },
+      "AnalyticsGoalStatsResponse": {
+        "description": "Response of `GET /projects/{project_id}/analytics/goals/stats`.",
+        "properties": {
+          "goals": {
+            "description": "Every goal of the project, in creation order, including the ones\nwithout conversions in the period.",
+            "items": {
+              "$ref": "#/components/schemas/AnalyticsGoalStats"
+            },
+            "type": "array"
+          },
+          "visitors": {
+            "description": "Distinct non-crawler visitors with a page view in the period: the\ndenominator of every conversion rate, as on the overview.",
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "visitors",
+          "goals"
+        ],
+        "type": "object"
+      },
+      "AnalyticsIdentityMode": {
+        "description": "Per-project visitor identity mode.",
+        "enum": [
+          "persistent",
+          "cookieless"
+        ],
+        "type": "string"
+      },
+      "AnalyticsIdentitySettings": {
+        "description": "How a project tells its visitors apart, and what that costs.",
+        "properties": {
+          "limitations": {
+            "description": "Reports that behave differently in this mode, for the console to say\nso next to them.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "mode": {
+            "$ref": "#/components/schemas/AnalyticsIdentityMode",
+            "description": "`persistent` (the default): ids stored in a cookie or `localStorage`,\nvisitors recognised across days. `cookieless`: nothing stored on the\ndevice; a visitor is a new visitor every day."
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "sdk_option": {
+            "description": "What the browser SDK must be told for this mode, so it writes nothing\neither: `cookieless: true`, or `data-cookieless=\"true\"` on the script\ntag. `None` in `persistent` mode.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_id",
+          "mode",
+          "limitations",
+          "updated_at"
+        ],
+        "type": "object"
+      },
       "AnalyticsIngestEndpoint": {
         "description": "The public address an app Temps does not deploy should send analytics to.\n\nServed separately from the platform settings because `GET /settings`\nneeds `settings:read`, which a project member does not hold, while the\ninstall snippet this value goes into is shown to every role that can read\nthe project's analytics. Only the one address the snippet embeds is\nexposed; no other setting travels with it.",
         "properties": {
@@ -31174,6 +31570,120 @@
           "event_data",
           "request_path",
           "request_query"
+        ],
+        "type": "object"
+      },
+      "EventPropertiesQuery": {
+        "description": "Query parameters for the breakdown of one event by one of its properties",
+        "properties": {
+          "end_date": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "environment_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "event_name": {
+            "description": "The event to break down, e.g. `outbound_click`",
+            "type": "string"
+          },
+          "limit": {
+            "description": "Maximum number of values to return (default: 20, max: 100)",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "property": {
+            "description": "Top-level key of the event's custom properties to group by, e.g. `url`.\nLetters, digits, `_`, `-` and `.`; at most 64 characters.",
+            "type": "string"
+          },
+          "start_date": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "event_name",
+          "property",
+          "project_id",
+          "start_date",
+          "end_date"
+        ],
+        "type": "object"
+      },
+      "EventPropertiesResponse": {
+        "description": "One event broken down by one of its custom properties, most frequent\nvalue first. Used for the outbound-link and file-download reports\n(ADR 109 D1), and for any `trackEvent()` property.",
+        "properties": {
+          "event_name": {
+            "description": "The event that was broken down",
+            "type": "string"
+          },
+          "items": {
+            "description": "The most frequent values, at most `limit` of them",
+            "items": {
+              "$ref": "#/components/schemas/EventPropertyValue"
+            },
+            "type": "array"
+          },
+          "property": {
+            "description": "The property the values belong to",
+            "type": "string"
+          },
+          "total_count": {
+            "description": "Occurrences of the event in the period, whatever the property's value",
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "event_name",
+          "property",
+          "total_count",
+          "items"
+        ],
+        "type": "object"
+      },
+      "EventPropertyValue": {
+        "description": "One value of an event property and how often it occurred",
+        "properties": {
+          "count": {
+            "description": "Occurrences of the event with this value",
+            "format": "int64",
+            "type": "integer"
+          },
+          "percentage": {
+            "description": "Share of `total_count`, 0 to 100",
+            "format": "double",
+            "type": "number"
+          },
+          "unique_visitors": {
+            "description": "Distinct visitors who sent the event with this value",
+            "format": "int64",
+            "type": "integer"
+          },
+          "value": {
+            "description": "The value as text; null when the event did not carry the property",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "count",
+          "unique_visitors",
+          "percentage"
         ],
         "type": "object"
       },
@@ -77313,7 +77823,8 @@
           "browser",
           "operating_system",
           "device_type",
-          "cache_status"
+          "cache_status",
+          "referrer"
         ],
         "type": "string"
       },
@@ -78241,6 +78752,18 @@
             ]
           }
         },
+        "type": "object"
+      },
+      "UpdateAnalyticsIdentitySettings": {
+        "description": "Body of `PUT /projects/{project_id}/analytics/identity`.",
+        "properties": {
+          "mode": {
+            "$ref": "#/components/schemas/AnalyticsIdentityMode"
+          }
+        },
+        "required": [
+          "mode"
+        ],
         "type": "object"
       },
       "UpdateAnalyticsIngestKeyRequest": {
@@ -99764,6 +100287,115 @@
           }
         ],
         "summary": "Get paginated list of raw occurrences of a specific event, including custom JSON properties",
+        "tags": [
+          "Analytics"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/analytics/event-properties": {
+      "get": {
+        "description": "Ranks the values of one top-level key of an event's custom properties,\ne.g. the `url` of `outbound_click` or the `extension` of `file_download`\n(ADR 109 D1). Crawler traffic is excluded. A value is null when the event\nwas sent without that property.",
+        "operationId": "get_event_properties",
+        "parameters": [
+          {
+            "description": "Event to break down, e.g. outbound_click",
+            "in": "query",
+            "name": "event_name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Top-level property key to group by, e.g. url. Letters, digits, '_', '-' and '.'; at most 64 characters",
+            "in": "query",
+            "name": "property",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Project ID",
+            "in": "query",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Environment ID (optional)",
+            "in": "query",
+            "name": "environment_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Start date (ISO 8601)",
+            "in": "query",
+            "name": "start_date",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "End date (ISO 8601)",
+            "in": "query",
+            "name": "end_date",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Maximum number of values (default: 20, max: 100)",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EventPropertiesResponse"
+                }
+              }
+            },
+            "description": "Property values ranked by occurrences"
+          },
+          "400": {
+            "description": "Invalid property name or parameters"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Break one event down by one of its custom properties",
         "tags": [
           "Analytics"
         ],
@@ -145280,6 +145912,642 @@
         ]
       }
     },
+    "/projects/{project_id}/analytics/goals": {
+      "get": {
+        "operationId": "list_analytics_goals",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "1-based page, default 1.",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Default 20, at most 100.",
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AnalyticsGoalListResponse"
+                }
+              }
+            },
+            "description": "Goals"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "List a project's conversion goals, newest first",
+        "tags": [
+          "Conversions"
+        ]
+      },
+      "post": {
+        "operationId": "create_analytics_goal",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AnalyticsGoalInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AnalyticsGoal"
+                }
+              }
+            },
+            "description": "Goal created"
+          },
+          "400": {
+            "description": "Invalid goal"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "409": {
+            "description": "Name taken or goal limit reached"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Define a conversion goal",
+        "tags": [
+          "Conversions"
+        ]
+      }
+    },
+    "/projects/{project_id}/analytics/goals/stats": {
+      "get": {
+        "operationId": "get_analytics_goal_stats",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Inclusive start (ISO 8601).",
+            "example": "2026-11-01T00:00:00Z",
+            "in": "query",
+            "name": "start_date",
+            "required": true,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Exclusive end (ISO 8601).",
+            "example": "2026-11-08T00:00:00Z",
+            "in": "query",
+            "name": "end_date",
+            "required": true,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "environment_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AnalyticsGoalStatsResponse"
+                }
+              }
+            },
+            "description": "Conversion figures"
+          },
+          "400": {
+            "description": "Invalid period"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Conversions, conversion rate and revenue of every goal in a period",
+        "tags": [
+          "Conversions"
+        ]
+      }
+    },
+    "/projects/{project_id}/analytics/goals/{goal_id}": {
+      "delete": {
+        "operationId": "delete_analytics_goal",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Goal ID",
+            "in": "path",
+            "name": "goal_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Goal deleted"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Goal not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Delete a conversion goal (stored events are not touched)",
+        "tags": [
+          "Conversions"
+        ]
+      },
+      "get": {
+        "operationId": "get_analytics_goal",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Goal ID",
+            "in": "path",
+            "name": "goal_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AnalyticsGoal"
+                }
+              }
+            },
+            "description": "Goal"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Goal not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Get one conversion goal",
+        "tags": [
+          "Conversions"
+        ]
+      },
+      "put": {
+        "operationId": "update_analytics_goal",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Goal ID",
+            "in": "path",
+            "name": "goal_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AnalyticsGoalInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AnalyticsGoal"
+                }
+              }
+            },
+            "description": "Goal updated"
+          },
+          "400": {
+            "description": "Invalid goal"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Goal not found"
+          },
+          "409": {
+            "description": "Name taken"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Replace a conversion goal's definition",
+        "tags": [
+          "Conversions"
+        ]
+      }
+    },
+    "/projects/{project_id}/analytics/goals/{goal_id}/breakdown": {
+      "get": {
+        "operationId": "get_analytics_goal_breakdown",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Goal ID",
+            "in": "path",
+            "name": "goal_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "dimension",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/AnalyticsGoalBreakdownDimension"
+            }
+          },
+          {
+            "description": "Inclusive start (ISO 8601).",
+            "example": "2026-11-01T00:00:00Z",
+            "in": "query",
+            "name": "start_date",
+            "required": true,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Exclusive end (ISO 8601).",
+            "example": "2026-11-08T00:00:00Z",
+            "in": "query",
+            "name": "end_date",
+            "required": true,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "environment_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Rows to return, default 10, at most 100.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AnalyticsGoalBreakdownResponse"
+                }
+              }
+            },
+            "description": "Breakdown"
+          },
+          "400": {
+            "description": "Invalid period or limit"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Goal not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "One goal's conversions by source, page, country or technology",
+        "tags": [
+          "Conversions"
+        ]
+      }
+    },
+    "/projects/{project_id}/analytics/identity": {
+      "get": {
+        "operationId": "get_analytics_identity_settings",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AnalyticsIdentitySettings"
+                }
+              }
+            },
+            "description": "Identity settings"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Project not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "How the project identifies visitors: stored ids or cookieless",
+        "tags": [
+          "Analytics"
+        ]
+      },
+      "put": {
+        "description": "`cookieless` stores nothing on the visitor's device: the proxy stops\nsetting analytics cookies and visitors are counted by a hash that changes\nevery day. Visitors already counted keep their history.",
+        "operationId": "update_analytics_identity_settings",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateAnalyticsIdentitySettings"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AnalyticsIdentitySettings"
+                }
+              }
+            },
+            "description": "Identity settings updated"
+          },
+          "400": {
+            "description": "Unknown mode"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Project not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Switch between stored visitor ids and cookieless tracking",
+        "tags": [
+          "Analytics"
+        ]
+      }
+    },
     "/projects/{project_id}/analytics/ingest-endpoint": {
       "get": {
         "description": "This is the `basePath` of the install snippet. It is its own endpoint\nbecause `GET /settings` needs `settings:read`, which a project member does\nnot hold; this one needs only `AnalyticsRead` on the project, exactly like\nlisting the keys the same snippet embeds, and exposes nothing but the one\naddress. `external_url: null` means none is stored.",
@@ -184578,6 +185846,10 @@
       "name": "Funnels"
     },
     {
+      "description": "Conversion goals: which events or pages count as a conversion, and how often visitors reach them",
+      "name": "Conversions"
+    },
+    {
       "description": "Analytics and session replay management",
       "name": "Analytics"
     },
@@ -184800,6 +186072,10 @@
     {
       "description": "AI interpretation of recent visitor activity",
       "name": "Visitor Activity"
+    },
+    {
+      "description": "Web analytics",
+      "name": "Analytics"
     },
     {
       "description": "Cron jobs management API",

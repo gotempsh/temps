@@ -26,6 +26,9 @@ pub mod ai_usage_logs;
 pub mod ai_user_preferences;
 pub mod alarms;
 pub mod analytics_goals;
+// Cookieless tracking (ADR 109 D3).
+pub mod analytics_identity_mode;
+pub mod analytics_identity_salts;
 pub mod analytics_ingest_keys;
 pub mod analytics_traffic_filters;
 pub mod audience;

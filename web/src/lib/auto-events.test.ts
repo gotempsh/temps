@@ -100,7 +100,7 @@ describe('not-found requests', () => {
   test('never sends more than the 20 values an in filter accepts', () => {
     const paths = Array.from({ length: 30 }, (_, i) => `/p${i}`)
     const request = notFoundReferrersRequest(window, undefined, paths)
-    const inFilter = request?.filters.find((filter) => filter.operator === 'in')
+    const inFilter = request?.filters?.find((filter) => filter.operator === 'in')
     expect(inFilter?.values).toHaveLength(20)
   })
 })

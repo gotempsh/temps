@@ -21,6 +21,7 @@ import { performanceInsights } from './performance.js'
 import { enrichVisitorAction } from './enrich.js'
 import { registerAnalyticsKeysCommands } from './keys.js'
 import { registerAnalyticsConversionsCommands } from './conversions.js'
+import { registerAnalyticsIdentityCommands } from './identity.js'
 import { fileDownloads, notFound, outboundLinks } from './auto-events.js'
 
 function collect(value: string, previous: string[]): string[] {
@@ -35,6 +36,7 @@ export function registerAnalyticsCommands(program: Command): void {
 
   registerAnalyticsKeysCommands(analytics)
   registerAnalyticsConversionsCommands(analytics)
+  registerAnalyticsIdentityCommands(analytics)
 
   analytics
     .command('overview')
@@ -444,6 +446,10 @@ Examples:
   $ temps analytics conversions create -p my-site --name Signup --event signup
   $ temps analytics conversions create -p my-site --name Purchase --event purchase --revenue-property amount --currency EUR
   $ temps analytics conversions breakdown -p my-site --goal-id 3 --by channel
+
+  Visitor identity (stored ids or cookieless):
+  $ temps analytics identity show -p my-site
+  $ temps analytics identity set -p my-site --mode cookieless
 
   Ingest keys (for apps Temps does not deploy):
   $ temps analytics keys list   --project-id 7

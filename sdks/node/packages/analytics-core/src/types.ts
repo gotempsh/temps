@@ -115,6 +115,15 @@ export interface AnalyticsClientOptions {
    * not work on this endpoint.
    */
   ingestKey?: string;
+  /**
+   * Store nothing on the visitor's device (ADR 109 D3). No visitor or session
+   * id is written to `localStorage`, ids an earlier visit stored are deleted,
+   * and session recording does not start. Turn it on together with the
+   * project's "Cookieless" identity mode in the Temps Console, which makes
+   * the server count visitors by a hash that changes every day: a returning
+   * visitor counts as new the next day. Defaults to false.
+   */
+  cookieless?: boolean;
 }
 
 export interface AnalyticsOptions extends AnalyticsClientOptions, AutoTrackOptions {

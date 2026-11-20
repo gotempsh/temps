@@ -16,6 +16,10 @@ import {
   OutboundLinksCard,
 } from '@/components/analytics/overview/AutoEventsCards'
 import { ConversionsCard } from '@/components/analytics/overview/ConversionsCard'
+import {
+  CookielessFactLine,
+  VisitorIdentityCard,
+} from '@/components/analytics/VisitorIdentityCard'
 
 import { DateTimeRange } from '@/components/ui/date-time-range'
 
@@ -1040,6 +1044,8 @@ function SessionReplaysTab({ project }: SessionReplaysTabProps) {
         onRefresh={advance}
       />
 
+      <CookielessFactLine project={project} view="replays" />
+
       {/* Session Replays Component */}
       <SessionReplays
         project={project}
@@ -1087,6 +1093,8 @@ function JourneyTab({ project }: JourneyTabProps) {
         refreshQueryKeys={[queryKeyPrefix(getPageFlowQueryKey)]}
         onRefresh={advance}
       />
+
+      <CookielessFactLine project={project} view="journey" />
 
       <PageFlow
         project={project}
@@ -1150,7 +1158,12 @@ export function ProjectAnalytics({ project }: ProjectAnalyticsProps) {
       <Route path="setup" element={<AnalyticsSetup project={project} />} />
       <Route
         path="settings"
-        element={<AnalyticsTrafficSettings project={project} />}
+        element={
+          <div className="space-y-6">
+            <AnalyticsTrafficSettings project={project} />
+            <VisitorIdentityCard project={project} />
+          </div>
+        }
       />
       <Route
         path="live"

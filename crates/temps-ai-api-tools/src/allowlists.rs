@@ -286,6 +286,8 @@ pub const AI_READ_ALLOWLIST: &[&str] = &[
     "get_unique_events",
     // Conversion goals (ADR 109 D2): definitions the user wrote and
     // aggregate counts per goal or per dimension value.
+    // Visitor identity mode (ADR 109 D3): persistent or cookieless.
+    "get_analytics_identity_settings",
     "list_analytics_goals",
     "get_analytics_goal",
     "get_analytics_goal_stats",
@@ -1323,6 +1325,9 @@ pub const AI_WRITE_ALLOWLIST: &[&str] = &[
     "create_funnel",
     "update_funnel",
     "delete_funnel",
+    // Switching visitor identity changes how new visits are counted; history
+    // already recorded stays as it is (ADR 109 D3).
+    "update_analytics_identity_settings",
     // Deleting a conversion goal deletes no events; defining it again
     // brings its history back.
     "create_analytics_goal",

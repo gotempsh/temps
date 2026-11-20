@@ -35,6 +35,8 @@ function readDataset(): AnalyticsOptions {
   // there is no Host-based route-table entry to attribute the events with.
   if (ds.ingestKey) opts.ingestKey = ds.ingestKey;
   if (ds.domain) opts.domain = ds.domain;
+  // `data-cookieless="true"`: store nothing on the device (ADR 109 D3).
+  if (ds.cookieless) opts.cookieless = ds.cookieless === "true";
   if (ds.disabled) opts.disabled = ds.disabled === "true";
   if (ds.ignoreLocalhost) opts.ignoreLocalhost = ds.ignoreLocalhost === "true";
   if (ds.autoTrackPageviews) opts.autoTrackPageviews = ds.autoTrackPageviews === "true";

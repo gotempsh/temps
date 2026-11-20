@@ -18,6 +18,7 @@ import {
   notFoundEventData,
   setupLinkTracking,
 } from "./AutoTracking";
+import { enableCookielessIdentity } from "./identity";
 
 interface InternalCleanup {
   (): void;
@@ -48,9 +49,17 @@ export function createAnalytics(options: AnalyticsOptions = {}): AnalyticsApi {
     autoTrackFileDownloads = true,
     fileDownloadExtensions,
     autoTrackNotFound = true,
+    cookieless = false,
   } = options;
 
   const cleanups: InternalCleanup[] = [];
+
+  // Before anything can send an event, so the first page view already goes
+  // out without a stored id (ADR 109 D3).
+  if (cookieless) enableCookielessIdentity();
+  // Session replay needs a visitor that persists across page loads, which is
+  // exactly what cookieless mode gives up.
+  const recordingAllowed = !cookieless;
 
   const enabled = computeEnabled(disabled, ignoreLocalhost);
 
@@ -159,8 +168,14 @@ export function createAnalytics(options: AnalyticsOptions = {}): AnalyticsApi {
     );
   }
 
+  if (cookieless && enableSessionRecording) {
+    // eslint-disable-next-line no-console
+    console.warn(
+      "[temps] Session recording is off in cookieless mode: a replay needs a visitor id stored on the device."
+    );
+  }
   const recorder =
-    enabled && enableSessionRecording
+    enabled && enableSessionRecording && recordingAllowed
       ? new SessionRecorder({
           basePath,
           ingestKey,
@@ -184,7 +199,7 @@ export function createAnalytics(options: AnalyticsOptions = {}): AnalyticsApi {
     trackNotFound,
     identify,
     enableSessionRecording(): void {
-      if (!enabled) return;
+      if (!enabled || !recordingAllowed) return;
       if (runtimeRecorder) {
         runtimeRecorder.start();
         return;

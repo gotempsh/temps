@@ -848,6 +848,43 @@ pub async fn init_session_replay(
         IngestBranch::HostResolved
     };
 
+    // ADR 109 D3: a replay needs an id stored on the device, which a
+    // cookieless project never has. Checked before the visitor check, so an
+    // outdated tracker is told why rather than to send a visitor id.
+    let cookieless = match &keyed_scope {
+        Some(scope) => state
+            .cookieless_identity
+            .identity_mode(scope.project_id)
+            .await
+            .map_err(|e| {
+                ErrorBuilder::new(StatusCode::SERVICE_UNAVAILABLE)
+                    .title("Visitor identity unavailable")
+                    .detail(e.to_string())
+                    .build()
+            })?
+            .is_cookieless(),
+        None => state
+            .route_table
+            .get_route(&metadata.host)
+            .and_then(|route| {
+                route
+                    .project
+                    .as_ref()
+                    .map(|project| project.analytics_identity_mode.is_cookieless())
+            })
+            .unwrap_or(false),
+    };
+    if cookieless {
+        return Err(ErrorBuilder::new(StatusCode::FORBIDDEN)
+            .title("Session replay is off for cookieless projects")
+            .detail(format!(
+                "Session {} was not recorded: the project on host {} tracks visitors \
+                 without cookies, and a replay needs an id stored on the device.",
+                request.session_id, metadata.host
+            ))
+            .build());
+    }
+
     // Only reject the request if the client sent neither a cookie nor a
     // fallback id, which means it's an SDK version too old to generate one
     // (or, on the Host-resolved branch, that no cookie is present at all —
@@ -1289,6 +1326,15 @@ mod tests {
             project_access_checker: None,
             ingest_key_service: Arc::new(AnalyticsIngestKeyService::new(db.clone())),
             ingest_rate_limiter: Arc::new(AnalyticsIngestRateLimiter::new()),
+            cookieless_identity: Arc::new(temps_analytics::cookieless::CookielessIdentity::new(
+                db.clone(),
+                Arc::new(
+                    temps_core::EncryptionService::new(
+                        "0000000000000000000000000000000000000000000000000000000000000000",
+                    )
+                    .expect("valid test key"),
+                ),
+            )),
         })
     }
 
@@ -1450,6 +1496,52 @@ mod tests {
         // pointer at a nonexistent `environments.id = 0`.
         assert_eq!(sessions[0].environment_id, None);
         assert_eq!(sessions[0].deployment_id, None);
+
+        test_db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn a_cookieless_project_records_no_replay() {
+        use sea_orm::ConnectionTrait;
+        let mut test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let project = insert_db_project(db.as_ref()).await;
+        insert_db_visitor(db.as_ref(), project.id, "client-generated-visitor").await;
+        db.execute_unprepared(&format!(
+            "UPDATE projects SET analytics_identity_mode = 'cookieless' WHERE id = {}",
+            project.id
+        ))
+        .await
+        .expect("switch the project to cookieless");
+        let state = build_state(db.clone());
+        let key = state
+            .ingest_key_service
+            .create(project.id, None, None, None, None, None)
+            .await
+            .expect("minting an ingest key must succeed");
+
+        let response = setup_public_app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_temps/session-replay/init")
+                    .header("host", "app.not-deployed-by-temps.test")
+                    .header("content-type", "application/json")
+                    .header("x-temps-analytics-key", &key.public_key)
+                    .body(Body::from(init_payload("session-c").to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(stored_sessions(db.as_ref()).await.is_empty());
 
         test_db.cleanup().await;
     }

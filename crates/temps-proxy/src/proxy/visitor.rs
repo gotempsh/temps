@@ -9,6 +9,29 @@ pub const VISITOR_ID_COOKIE: &str = "_temps_visitor_id";
 
 pub const SESSION_ID_COOKIE: &str = "_temps_sid";
 
+/// Whether the request's project counts visitors without cookies (ADR 109
+/// D3). Read from the route table's project row: no I/O per request.
+pub(super) fn is_cookieless(ctx: &ProxyContext) -> bool {
+    ctx.project
+        .as_ref()
+        .is_some_and(|project| project.analytics_identity_mode.is_cookieless())
+}
+
+/// The tracking cookies a cookieless project's response expires: whichever
+/// of the two the browser still sends from before the switch.
+pub(super) fn tracking_cookies_to_expire(
+    sends_visitor_cookie: bool,
+    sends_session_cookie: bool,
+) -> Vec<&'static str> {
+    [
+        (sends_visitor_cookie, VISITOR_ID_COOKIE),
+        (sends_session_cookie, SESSION_ID_COOKIE),
+    ]
+    .into_iter()
+    .filter_map(|(sent, name)| sent.then_some(name))
+    .collect()
+}
+
 // Helper functions for project-scoped cookie names
 pub(super) fn get_visitor_cookie_name(_project_id: Option<i32>) -> String {
     VISITOR_ID_COOKIE.to_string()
@@ -25,6 +48,13 @@ impl LoadBalancer {
     pub(super) async fn ensure_visitor_session(&self, ctx: &mut ProxyContext) {
         // Only resolve once per request
         if ctx.visitor_id.is_some() {
+            return;
+        }
+
+        // A cookieless project is never given a visitor or a session here:
+        // nothing on the request may identify the browser across requests,
+        // and its analytics ingest derives a daily id instead.
+        if is_cookieless(ctx) {
             return;
         }
 
@@ -214,6 +244,21 @@ impl LoadBalancer {
         let is_https = self.is_https_request(session);
         let project_id = ctx.project.as_ref().map(|p| p.id);
 
+        // ── Cookieless project: set nothing, expire what is left ───────────
+        if is_cookieless(ctx) {
+            let sends = |name: &str| {
+                find_request_cookie(session.req_header(), name, |_| Some(())).is_some()
+            };
+            for name in
+                tracking_cookies_to_expire(sends(VISITOR_ID_COOKIE), sends(SESSION_ID_COOKIE))
+            {
+                let expired =
+                    self.build_cookie_string(name, "", cookie::time::Duration::ZERO, is_https);
+                response.append_header("Set-Cookie", expired)?;
+            }
+            return Ok(());
+        }
+
         // ── Visitor cookie ──────────────────────────────────────────────────
         if let Some(visitor_id) = &ctx.visitor_id {
             let cookie_name = get_visitor_cookie_name(project_id);
@@ -343,6 +388,71 @@ mod visitor_tests {
 
         assert!(ctx.visitor_id.is_none());
         assert!(ctx.session_id.is_none());
+        Ok(())
+    }
+
+    fn cookieless_ctx(lb: &super::LoadBalancer) -> ProxyContext {
+        let mut ctx = browser_ctx(lb);
+        // Every other column at the default a new project gets.
+        let project: temps_entities::projects::Model = serde_json::from_value(serde_json::json!({
+            "id": 7, "name": "site", "slug": "site", "repo_name": "site",
+            "repo_owner": "example", "directory": ".", "main_branch": "main",
+            "preset": "dockerfile", "created_at": chrono::Utc::now(),
+            "updated_at": chrono::Utc::now(), "pull_only_root_directory": false,
+            "is_deleted": false, "is_public_repo": false, "attack_mode": false, "shield_mode": "log",
+            "ai_write_actions_enabled": false, "error_source_context_enabled": false,
+            "vulnerability_scanning_enabled": false, "enable_preview_environments": false,
+            "preview_envs_on_demand": false, "preview_envs_idle_timeout_seconds": 300,
+            "preview_envs_wake_timeout_seconds": 30, "source_type": "docker_image",
+            "project_type": temps_entities::types::ProjectType::Server,
+            "hosting": temps_entities::types::Hosting::Hosted,
+            "cross_project_trace_sharing": true, "cloud_telemetry_fidelity": "metered",
+            "cloud_telemetry_attribute_allowlist": [], "cloud_telemetry_write_mode": "local",
+            "cloud_analytics_write_mode": "local", "analytics_identity_mode": "cookieless"
+        }))
+        .expect("test project fixture deserializes");
+        ctx.project = Some(std::sync::Arc::new(project));
+        ctx
+    }
+
+    #[tokio::test]
+    async fn a_cookieless_project_gives_no_visitor_or_session() -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        let lb = load_balancer(dir.path())?;
+        let mut ctx = cookieless_ctx(&lb);
+        // Even a browser still carrying an old cookie is not recognised.
+        ctx.request_visitor_cookie = Some("old-sealed-visitor".to_string());
+
+        lb.ensure_visitor_session(&mut ctx).await;
+
+        assert!(super::is_cookieless(&ctx));
+        assert!(ctx.visitor_id.is_none());
+        assert!(ctx.session_id.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn only_the_cookies_a_browser_still_sends_are_expired() {
+        assert!(super::tracking_cookies_to_expire(false, false).is_empty());
+        assert_eq!(
+            super::tracking_cookies_to_expire(true, false),
+            vec![VISITOR_ID_COOKIE]
+        );
+        assert_eq!(
+            super::tracking_cookies_to_expire(true, true),
+            vec![VISITOR_ID_COOKIE, SESSION_ID_COOKIE]
+        );
+    }
+
+    #[test]
+    fn an_expired_tracking_cookie_has_no_value_and_max_age_zero() -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        let lb = load_balancer(dir.path())?;
+        let expired =
+            lb.build_cookie_string(VISITOR_ID_COOKIE, "", cookie::time::Duration::ZERO, true);
+        assert!(expired.starts_with(&format!("{VISITOR_ID_COOKIE}=;")), "{expired}");
+        assert!(expired.contains("Max-Age=0"), "{expired}");
+        assert!(expired.contains("Path=/"), "{expired}");
         Ok(())
     }
 

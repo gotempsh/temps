@@ -11,10 +11,13 @@
 pub mod analytics;
 pub mod api_traffic;
 pub mod channel;
+/// Cookieless visitor ids (ADR 109 D3).
+pub mod cookieless;
 pub mod datacenter;
 pub mod global;
 pub mod global_handler;
 pub mod handler;
+pub mod identity_settings;
 pub mod ingest_keys;
 pub mod plugin;
 pub mod retention;

@@ -12903,6 +12903,7 @@ name = "temps-analytics"
 version = "0.1.0-beta.63"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "async-trait",
  "axum",
  "bollard",

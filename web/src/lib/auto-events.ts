@@ -16,7 +16,6 @@ import type {
   TrafficAggregationRequest,
   TrafficAggregationResponse,
   TrafficFilter,
-  TrafficMetric,
 } from '@/api/client/types.gen'
 
 /** Event names the tracker emits; they match `@temps-sdk/analytics-core`. */
@@ -35,42 +34,6 @@ export const MAX_NOT_FOUND_WINDOW_DAYS = 30
 export const NOT_FOUND_PATH_LIMIT = 10
 
 const DAY_MS = 24 * 60 * 60 * 1000
-
-/** One value of an event property, as `GET /analytics/event-properties` returns it. */
-export interface EventPropertyValue {
-  value: string | null
-  count: number
-  unique_visitors: number
-  percentage: number
-}
-
-/** Response of `GET /analytics/event-properties`. */
-export interface EventPropertiesResponse {
-  event_name: string
-  property: string
-  total_count: number
-  items: EventPropertyValue[]
-}
-
-/**
- * The aggregation request with the `referrer` dimension the server accepts
- * from this release on. Kept local until the generated client is refreshed
- * from a server that has it.
- */
-export type NotFoundReferrerRequest = Omit<
-  TrafficAggregationRequest,
-  'dimensions' | 'filters' | 'order_by'
-> & {
-  dimensions: Array<'path' | 'referrer'>
-  filters: Array<
-    | TrafficFilter
-    | { dimension: 'referrer'; operator: 'not_eq'; values: string[] }
-  >
-  order_by: Array<{
-    field: { kind: 'metric'; field: TrafficMetric }
-    direction: 'desc'
-  }>
-}
 
 /** One row of the not-found report. */
 export interface NotFoundPathRow {
@@ -134,7 +97,7 @@ export function notFoundReferrersRequest(
   window: NotFoundWindow,
   environmentId: number | undefined,
   paths: string[]
-): NotFoundReferrerRequest | null {
+): TrafficAggregationRequest | null {
   if (paths.length === 0) return null
   return {
     start_time: window.start.toISOString(),

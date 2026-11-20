@@ -7,8 +7,6 @@
  *
  * - `outbound` and `downloads` rank the `url` property of the `outbound_click`
  *   and `file_download` events through `GET /analytics/event-properties`.
- *   That endpoint is called through the shared client with local types until
- *   `openapi.json` is refreshed from a server that has it.
  * - `not-found` ranks the 404s Temps answered to real visitors (API traffic
  *   aggregation over the request log), plus the paths pages reported with
  *   `trackNotFound()` / `data-temps-404` (`not_found` events).
@@ -20,11 +18,11 @@ import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
 import { requireProjectSlug } from '../../config/resolve-project.js'
 import {
   aggregateApiTraffic,
+  getEventProperties,
   getProjectBySlug,
   getPropertyBreakdown,
 } from '../../api/sdk.gen.js'
 import type {
-  ProblemDetails,
   TrafficAggregationRequest,
   TrafficAggregationResponse,
 } from '../../api/types.gen.js'
@@ -44,19 +42,6 @@ interface AutoEventOptions {
   period?: string
   limit?: string
   json?: boolean
-}
-
-/** Mirrors `EventPropertiesResponse` in `crates/temps-analytics`. */
-export interface EventPropertiesResponse {
-  event_name: string
-  property: string
-  total_count: number
-  items: Array<{
-    value: string | null
-    count: number
-    unique_visitors: number
-    percentage: number
-  }>
 }
 
 /** Parse `--limit`, defaulting to 20 and refusing anything outside 1..100. */
@@ -157,8 +142,8 @@ async function eventPropertyTop(
   const project = await resolveProject(options.project)
 
   const data = await withSpinner(`Fetching ${title.toLowerCase()}...`, async () => {
-    const { data, error } = await client.get<EventPropertiesResponse, ProblemDetails>({
-      url: '/analytics/event-properties',
+    const { data, error } = await getEventProperties({
+      client,
       query: {
         project_id: project.id,
         event_name: eventName,

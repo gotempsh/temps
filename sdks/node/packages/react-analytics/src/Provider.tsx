@@ -14,6 +14,8 @@ import { DEFAULT_BASE_PATH } from "./constants";
 import {
   NOT_FOUND_EVENT,
   NotFoundMarkerWatcher,
+  enableCookielessIdentity,
+  isCookielessIdentity,
   notFoundEventData,
   setupLinkTracking,
 } from "@temps-sdk/analytics-core";
@@ -40,8 +42,14 @@ export function TempsAnalyticsProvider({
   autoTrackFileDownloads = true,
   fileDownloadExtensions,
   autoTrackNotFound = true,
+  cookieless = false,
   children,
 }: TempsAnalyticsProviderProps): ReactElement {
+  // Cookieless mode (ADR 109 D3) is switched on during render, not in an
+  // effect: children's effects run before this component's, and one of them
+  // may send the first event. Idempotent, and a no-op during SSR.
+  if (cookieless && !isCookielessIdentity()) enableCookielessIdentity();
+
   const enabled = useMemo(() => {
     if (disabled) return false;
     if (typeof window === "undefined") return false;
@@ -300,13 +308,14 @@ export function TempsAnalyticsProvider({
         {children}
         {enabled && (
           // Forward the whole config; the provider-level values go last so the
-          // config cannot override them.
+          // config cannot override them. A replay needs an id stored on the
+          // device, which cookieless mode never writes.
           <SessionRecorder
             {...sessionRecordingConfig}
             basePath={basePath}
             ingestKey={ingestKey}
             domain={domain}
-            enabled={isRecordingEnabled}
+            enabled={isRecordingEnabled && !cookieless}
           />
         )}
       </SessionRecordingProvider>
