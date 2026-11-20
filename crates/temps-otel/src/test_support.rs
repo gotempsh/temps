@@ -6,6 +6,12 @@
 //! Provides an in-memory storage backend for unit and integration tests,
 //! plus helpers to construct protobuf trace trees and OtelService instances.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test support: an in-memory store whose lock is never poisoned"
+)]
+
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -866,6 +872,12 @@ impl OtelStorage for MockOtelStorage {
                 if span.duration_ms < min_dur {
                     continue;
                 }
+            }
+            // The time window, as the real backends apply it to span starts.
+            if query.start_time.is_some_and(|start| span.start_time < start)
+                || query.end_time.is_some_and(|end| span.start_time > end)
+            {
+                continue;
             }
             trace_map
                 .entry(span.trace_id.clone())

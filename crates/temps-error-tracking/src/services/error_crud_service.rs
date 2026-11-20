@@ -273,6 +273,14 @@ impl ErrorCRUDService {
         if let Some(assignee) = refine.assignee {
             query = query.filter(assignee.condition());
         }
+        if let Some(issue_type) = refine.issue_type.as_deref() {
+            if !["error", "performance"].contains(&issue_type) {
+                return Err(ErrorTrackingError::Validation(format!(
+                    "issue type '{issue_type}' must be error or performance"
+                )));
+            }
+            query = query.filter(error_groups::Column::IssueType.eq(issue_type));
+        }
         if let Some(search) = refine.search.as_deref().filter(|s| !s.trim().is_empty()) {
             use sea_orm::sea_query::extension::postgres::PgExpr;
             use sea_orm::sea_query::Expr;
@@ -375,6 +383,7 @@ impl ErrorCRUDService {
             .map(|group| ErrorGroupDomain {
                 ignore: super::types::GroupIgnoreState::from_group(&group),
                 resolution: super::types::GroupResolutionState::from_group(&group),
+                issue_type: group.issue_type.clone(),
                 assignee: None,
                 id: group.id,
                 title: group.title,
@@ -708,6 +717,7 @@ impl ErrorCRUDService {
         Ok(ErrorGroupDomain {
             ignore: super::types::GroupIgnoreState::from_group(&group),
             resolution,
+            issue_type: group.issue_type.clone(),
             assignee,
             id: group.id,
             title: group.title,

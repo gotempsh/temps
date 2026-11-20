@@ -35,7 +35,7 @@ mod next_release_tests;
 #[cfg(test)]
 mod saved_search_tests;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 pub use activity::{ActivityDetails, ActivityEntry, ActivityKind, ActivityPage, MAX_COMMENT_CHARS};
 pub use assignee::{

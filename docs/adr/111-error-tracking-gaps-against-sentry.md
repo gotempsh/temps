@@ -6,7 +6,8 @@ Proposed — 2026-11-19. Being implemented in the order of the Decision
 section. D1.1 (bulk actions), D1.2 (merge and split), D1.3 (ignore
 until), D1.4 (inbound filters), D1.5 (resolve in the next release),
 D1.6 (assignment), D1.7 (comments and activity) and D1.8 (saved searches)
-have shipped, so D1 is complete; the questions they settled
+have shipped, so D1 is complete. Of D2, D2.1 (performance issues) has
+shipped. The questions they settled
 are recorded under "Settled while implementing".
 
 Related: ADR 016 (ClickHouse traces backend), ADR 027 (cross-project trace
@@ -394,3 +395,37 @@ deploys, which is web services. It comes last and may never be worth building.
 - The console's error list gains a text search box and an "Ignored" status
   option, so every filter a saved search can hold is visible and editable
   on the page that applies it.
+
+### D2.1 Performance issues
+
+- **One table.** Performance issues are rows of `error_groups` with
+  `issue_type = 'performance'` (every existing row is `error`). This answers
+  the open question the conservative way for the inbox: one list, one
+  workflow, one set of alert rules, and Fix with agent with no new surface.
+  The list filters by `issue_type`; the issue page shows the evidence (the
+  pattern, the spans involved, their time, a link to the trace) above the
+  usual tabs.
+- **Filing goes through ingest.** A finding becomes an ordinary event with
+  a grouping key (detector, service, root operation, normalized pattern) in
+  place of the computed fingerprint, and a dedup key (the trace plus the
+  grouping key) stored like a Sentry event id. A trace read twice therefore
+  counts once, and the count of an issue is the number of traces it was
+  found in. Inbound filters do not apply: they are for SDK noise.
+- **Detectors**, with fixed thresholds: N+1 (the same normalized statement 5
+  or more times under one parent), slow query (a database span of 1 s or
+  more), consecutive HTTP (3 or more non-overlapping client calls of 50 ms
+  or more under one parent), large payload (a body of 1 MB or more by the
+  OpenTelemetry size attributes). Per-project thresholds are not offered
+  yet; a column can add them without changing what is stored.
+- **Budget.** A background loop every 5 minutes, never at ingest. Each tick
+  takes the 20 projects checked longest ago, reads each one's 20 slowest
+  root traces in the window since its last check (at most 200 traces a
+  tick, 2,000 spans a trace) and never reaches back more than 15 minutes, so
+  a busy project is sampled rather than queued. Traces younger than a
+  minute wait for the next tick. Every console instance runs the loop;
+  instances that read the same trace are deduplicated by the dedup key.
+- **Status.** `performance_scan_state` records per project where the scan
+  stopped and what it found;
+  `GET /projects/{project_id}/performance-issues/status` reports it with a
+  `configured` flag, the reason when nothing has been checked, and the
+  detector list, so the console can explain an empty list.

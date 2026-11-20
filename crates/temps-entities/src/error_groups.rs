@@ -73,6 +73,10 @@ pub struct Model {
     /// The newest release of the project when the group was resolved.
     pub resolved_in_release_after_id: Option<i32>,
 
+    /// `error` for a group filed from an exception, `performance` for one a
+    /// trace detector filed (ADR 111, D2).
+    pub issue_type: String,
+
     // Relations
     pub project_id: i32,
     pub environment_id: Option<i32>,

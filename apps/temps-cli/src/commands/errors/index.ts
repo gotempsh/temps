@@ -30,6 +30,7 @@ import { existsSync, statSync } from 'node:fs'
 import { resolve, basename, join } from 'node:path'
 import { registerActivityCommands } from './activity.js'
 import { registerInboundFilterCommands } from './filters.js'
+import { checkIssueType, registerPerformanceCommands } from './performance.js'
 import { applySavedSearch, loadSavedSearch, registerSavedSearchCommands } from './saved-searches.js'
 
 interface ListOptions {
@@ -45,6 +46,7 @@ interface ListOptions {
   assignee?: string
   search?: string
   savedSearch?: string
+  type?: string
   json?: boolean
 }
 
@@ -449,6 +451,7 @@ export function registerErrorsCommands(program: Command): void {
     .option('--assignee <who>', 'Only groups assigned to: me (you or your teams), none, user:<id> or team:<id>')
     .option('--search <text>', 'Only groups whose title, type or message contains this text')
     .option('--saved-search <id>', 'Apply a saved search; flags given here override its filters')
+    .option('--type <type>', 'Only errors, or only performance issues found in traces: error or performance')
     .option('--json', 'Output in JSON format')
     .action(listErrorGroupsAction)
 
@@ -535,6 +538,7 @@ export function registerErrorsCommands(program: Command): void {
   registerInboundFilterCommands(errors)
   registerActivityCommands(errors)
   registerSavedSearchCommands(errors)
+  registerPerformanceCommands(errors)
 
   errors
     .command('events')
@@ -695,7 +699,9 @@ async function listErrorGroupsAction(flags: ListOptions): Promise<void> {
 
   const environmentId = options.environmentId ? parseInt(options.environmentId, 10) : undefined
   let assignee: string | undefined
+  let issueType: string | undefined
   try {
+    issueType = options.type ? checkIssueType(options.type) : undefined
     assignee = options.assignee ? checkAssigneeFilter(options.assignee) : undefined
   } catch (e) {
     warning(e instanceof Error ? e.message : String(e))
@@ -717,6 +723,7 @@ async function listErrorGroupsAction(flags: ListOptions): Promise<void> {
         ...(options.sortOrder && { sort_order: options.sortOrder }),
         ...(assignee && { assignee }),
         ...(options.search && { search: options.search }),
+        ...(issueType && { issue_type: issueType }),
       },
     })
     if (error) {

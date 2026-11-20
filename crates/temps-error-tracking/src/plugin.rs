@@ -412,6 +412,23 @@ impl TempsPlugin for ErrorTrackingPlugin {
                     "AlarmService not available - error tracking alarms will not be persisted"
                 );
             }
+            // Performance issues (ADR 111, D2) read stored traces. Without
+            // the OTel plugin there are no traces, so the scanner does not
+            // start and the status endpoint says why.
+            match context.get_service::<dyn temps_otel::OtelStorage>() {
+                Some(storage) => {
+                    let scanner = crate::services::performance::PerformanceScanner::new(
+                        context.require_service::<sea_orm::DatabaseConnection>(),
+                        storage,
+                        context.require_service::<ErrorTrackingService>(),
+                    );
+                    tokio::spawn(scanner.run());
+                    tracing::debug!("Performance issue scanner started");
+                }
+                None => tracing::warn!(
+                    "OTel storage not available - performance issues will not be detected"
+                ),
+            }
             Ok(())
         })
     }
@@ -537,6 +554,9 @@ impl TempsPlugin for ErrorTrackingPlugin {
             .merge(<crate::handlers::activity_handler::ActivityApiDoc as OpenApiTrait>::openapi());
         schema.merge(
             <crate::handlers::saved_search_handler::SavedSearchApiDoc as OpenApiTrait>::openapi(),
+        );
+        schema.merge(
+            <crate::handlers::performance_handler::PerformanceApiDoc as OpenApiTrait>::openapi(),
         );
         schema.merge(
             <crate::handlers::client_outcome_handler::ClientOutcomeApiDoc as OpenApiTrait>::openapi(

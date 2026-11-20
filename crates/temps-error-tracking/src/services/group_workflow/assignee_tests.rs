@@ -275,6 +275,7 @@ async fn assigned_to_me_includes_my_teams_and_a_team_assignment_mails_its_member
                     &GroupListRefinement {
                         assignee: Some(filter),
                         search: None,
+                        issue_type: None,
                     },
                 )
                 .await

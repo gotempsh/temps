@@ -30688,6 +30688,10 @@
               }
             ]
           },
+          "issue_type": {
+            "description": "`error`, or `performance` for an issue a trace detector filed: an\nN+1 query, a slow database query, consecutive HTTP calls or an\noversized payload.",
+            "type": "string"
+          },
           "last_seen": {
             "type": "string"
           },
@@ -30749,6 +30753,7 @@
           "last_seen",
           "total_count",
           "status",
+          "issue_type",
           "project_id",
           "created_at",
           "updated_at"
@@ -43977,6 +43982,13 @@
               "null"
             ]
           },
+          "issue_type": {
+            "description": "`error` or `performance`; omitted for both.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "page": {
             "format": "int64",
             "minimum": 0,
@@ -53470,6 +53482,108 @@
           "changes",
           "fingerprint",
           "computed_at"
+        ],
+        "type": "object"
+      },
+      "PerformanceDetectorResponse": {
+        "description": "One detector and what it looks for.",
+        "properties": {
+          "description": {
+            "type": "string"
+          },
+          "key": {
+            "description": "`n_plus_one_query`, `slow_db_query`, `sequential_http` or\n`oversized_payload`.",
+            "type": "string"
+          },
+          "title": {
+            "description": "The issue type it files, e.g. `N+1 Query`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "key",
+          "title",
+          "description"
+        ],
+        "type": "object"
+      },
+      "PerformanceIssueStatusResponse": {
+        "description": "Whether traces of the project are checked for performance issues, and\nwhat the last check did.",
+        "properties": {
+          "check_interval_minutes": {
+            "description": "Minutes between checks.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "configured": {
+            "description": "True once a check has read at least one trace of the project.",
+            "type": "boolean"
+          },
+          "detectors": {
+            "items": {
+              "$ref": "#/components/schemas/PerformanceDetectorResponse"
+            },
+            "type": "array"
+          },
+          "issues_found": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "last_error": {
+            "description": "The last check's failure, if it failed.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_run_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reason": {
+            "description": "Why nothing is detected yet, when `configured` is false.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "scanned_until": {
+            "description": "Traces started before this have been considered.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "setup_path": {
+            "description": "The console page, relative to the project, that sets up what is\nmissing.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "traces_per_check": {
+            "description": "Traces checked per project per check, the slowest first.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "traces_scanned": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "configured",
+          "traces_scanned",
+          "issues_found",
+          "traces_per_check",
+          "check_interval_minutes",
+          "detectors"
         ],
         "type": "object"
       },
@@ -160604,6 +160718,18 @@
                 "null"
               ]
             }
+          },
+          {
+            "description": "`error` or `performance`; omitted for both.",
+            "in": "query",
+            "name": "issue_type",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
           }
         ],
         "responses": {
@@ -167512,6 +167638,53 @@
         "summary": "Fetch the un-truncated form of one event by `(kind, id)`. Side panel\n\"Show full\" action calls this — the list response carries truncated\npreviews + a `*_truncated` flag to let the UI decide whether to fetch.",
         "tags": [
           "Observability"
+        ]
+      }
+    },
+    "/projects/{project_id}/performance-issues/status": {
+      "get": {
+        "operationId": "get_performance_issue_status",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PerformanceIssueStatusResponse"
+                }
+              }
+            },
+            "description": "Detection status"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Missing error_tracking:read or project access"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Whether performance issues are detected for a project",
+        "tags": [
+          "error-tracking"
         ]
       }
     },
@@ -187282,6 +187455,10 @@
     },
     {
       "description": "Saved searches over error groups",
+      "name": "error-tracking"
+    },
+    {
+      "description": "Performance issues",
       "name": "error-tracking"
     },
     {

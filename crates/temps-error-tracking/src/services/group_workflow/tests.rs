@@ -24,7 +24,7 @@ macro_rules! test_db {
     };
 }
 
-pub(super) async fn create_project(db: &DatabaseConnection) -> i32 {
+pub(crate) async fn create_project(db: &DatabaseConnection) -> i32 {
     let now = Utc::now();
     projects::ActiveModel {
         name: Set("Workflow Project".to_string()),

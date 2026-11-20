@@ -8,6 +8,7 @@ pub mod audit;
 pub mod group_workflow_handler;
 pub mod handler;
 pub mod inbound_filter_handler;
+pub mod performance_handler;
 pub mod sentry_compat_handlers;
 pub mod source_map_handlers;
 pub mod types;

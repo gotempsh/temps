@@ -14432,6 +14432,12 @@ export type ErrorGroupResponse = {
     first_seen: string;
     id: number;
     ignore?: GroupIgnoreState | null;
+    /**
+     * `error`, or `performance` for an issue a trace detector filed: an
+     * N+1 query, a slow database query, consecutive HTTP calls or an
+     * oversized payload.
+     */
+    issue_type: string;
     last_seen: string;
     /**
      * Set when this group was merged into another one. Its events and count
@@ -20435,6 +20441,10 @@ export type ListErrorGroupsQuery = {
     assignee?: string | null;
     end_date?: string | null;
     environment_id?: number | null;
+    /**
+     * `error` or `performance`; omitted for both.
+     */
+    issue_type?: string | null;
     page?: number;
     page_size?: number;
     /**
@@ -24764,6 +24774,62 @@ export type PendingChanges = {
     service_id: number;
     service_name: string;
     support: WorkloadSupport;
+};
+
+/**
+ * One detector and what it looks for.
+ */
+export type PerformanceDetectorResponse = {
+    description: string;
+    /**
+     * `n_plus_one_query`, `slow_db_query`, `sequential_http` or
+     * `oversized_payload`.
+     */
+    key: string;
+    /**
+     * The issue type it files, e.g. `N+1 Query`.
+     */
+    title: string;
+};
+
+/**
+ * Whether traces of the project are checked for performance issues, and
+ * what the last check did.
+ */
+export type PerformanceIssueStatusResponse = {
+    /**
+     * Minutes between checks.
+     */
+    check_interval_minutes: number;
+    /**
+     * True once a check has read at least one trace of the project.
+     */
+    configured: boolean;
+    detectors: Array<PerformanceDetectorResponse>;
+    issues_found: number;
+    /**
+     * The last check's failure, if it failed.
+     */
+    last_error?: string | null;
+    last_run_at?: string | null;
+    /**
+     * Why nothing is detected yet, when `configured` is false.
+     */
+    reason?: string | null;
+    /**
+     * Traces started before this have been considered.
+     */
+    scanned_until?: string | null;
+    /**
+     * The console page, relative to the project, that sets up what is
+     * missing.
+     */
+    setup_path?: string | null;
+    /**
+     * Traces checked per project per check, the slowest first.
+     */
+    traces_per_check: number;
+    traces_scanned: number;
 };
 
 export type PerformanceMetricsQuery = SpeedSegmentFilters & {
@@ -84447,6 +84513,10 @@ export type ListErrorGroupsData = {
          * Case-insensitive text in the title, error type or message.
          */
         search?: string | null;
+        /**
+         * `error` or `performance`; omitted for both.
+         */
+        issue_type?: string | null;
     };
     url: '/projects/{project_id}/error-groups';
 };
@@ -88808,6 +88878,42 @@ export type ObservabilityFullEventResponses = {
 };
 
 export type ObservabilityFullEventResponse = ObservabilityFullEventResponses[keyof ObservabilityFullEventResponses];
+
+export type GetPerformanceIssueStatusData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/performance-issues/status';
+};
+
+export type GetPerformanceIssueStatusErrors = {
+    /**
+     * Not authenticated
+     */
+    401: unknown;
+    /**
+     * Missing error_tracking:read or project access
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetPerformanceIssueStatusResponses = {
+    /**
+     * Detection status
+     */
+    200: PerformanceIssueStatusResponse;
+};
+
+export type GetPerformanceIssueStatusResponse = GetPerformanceIssueStatusResponses[keyof GetPerformanceIssueStatusResponses];
 
 export type DeleteReleaseSourceFilesData = {
     body?: never;

@@ -362,6 +362,14 @@ impl ErrorTrackingService {
         }
     }
 
+    /// What the performance scanner last did for a project (ADR 111, D2).
+    pub async fn performance_scan_state(
+        &self,
+        project_id: i32,
+    ) -> Result<Option<super::performance::ScanState>, ErrorTrackingError> {
+        super::performance::scan_state(self.db.as_ref(), project_id).await
+    }
+
     pub async fn process_error_event_with_receipt(
         &self,
         error_data: CreateErrorEventData,
@@ -369,8 +377,13 @@ impl ErrorTrackingService {
         let mut error_data = error_data.without_nul();
         // Artifact availability and symbolication admission must never change
         // the identity of the same SDK-submitted stack.
-        let submitted_fingerprint = (error_data.source.as_deref() == Some("sentry"))
-            .then(|| self.ingestion.generate_fingerprint(&error_data));
+        let submitted_fingerprint = match error_data.grouping_key.as_deref() {
+            Some(key) => Some(super::error_ingestion_service::keyed_hex(&format!(
+                "group:{key}"
+            ))),
+            None => (error_data.source.as_deref() == Some("sentry"))
+                .then(|| self.ingestion.generate_fingerprint(&error_data)),
+        };
         // Symbolicate stack traces if source maps are available
         if let Some(sm_service) = self.source_map_service.get() {
             if let Err(e) = sm_service.symbolicate_error_event(&mut error_data).await {

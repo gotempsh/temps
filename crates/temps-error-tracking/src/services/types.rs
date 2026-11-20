@@ -292,6 +292,20 @@ pub struct CreateErrorEventData {
     // Source of the error event (e.g., "sentry", "custom", "bugsnag")
     pub source: Option<String>,
 
+    /// `performance` for an issue a trace detector found (ADR 111, D2);
+    /// `None` is an ordinary error.
+    #[serde(default)]
+    pub issue_type: Option<String>,
+    /// Identity of this occurrence for retry deduplication when the event
+    /// has no Sentry event id: the detector, trace and pattern. The same key
+    /// is stored once.
+    #[serde(default)]
+    pub dedup_key: Option<String>,
+    /// Grouping key used instead of the computed fingerprint: occurrences
+    /// with the same key land in the same group.
+    #[serde(default)]
+    pub grouping_key: Option<String>,
+
     // Raw Sentry event (full event payload from Sentry SDK)
     pub raw_sentry_event: Option<serde_json::Value>,
 
@@ -408,6 +422,8 @@ pub struct ErrorGroupDomain {
     /// (ADR 111, D1.3). `None` for any other group.
     pub ignore: Option<GroupIgnoreState>,
     pub resolution: Option<GroupResolutionState>,
+    /// `error`, or `performance` for a group a trace detector filed.
+    pub issue_type: String,
     /// The user or team the group is assigned to (ADR 111, D1.6).
     pub assignee: Option<super::group_workflow::GroupAssignee>,
     pub project_id: i32,
@@ -649,6 +665,8 @@ pub struct GroupListRefinement {
     pub assignee: Option<super::group_workflow::AssigneeFilter>,
     /// Case-insensitive substring of the title, error type or message.
     pub search: Option<String>,
+    /// `error` or `performance` (ADR 111, D2); `None` for both.
+    pub issue_type: Option<String>,
 }
 
 /// A group resolved in the next release (ADR 111, D1.5).

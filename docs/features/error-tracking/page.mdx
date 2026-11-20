@@ -973,6 +973,45 @@ Filters are evaluated in memory with no database call and no lock per event; dro
 
 ---
 
+## Performance Issues {{ anchor: true, id: 'performance-issues' }}
+
+Temps checks the traces your project sends (OpenTelemetry, or a Sentry SDK with tracing) for four patterns and files each one as an issue next to your errors, with the same workflow: resolve, ignore, assign, comment, alert rules and Fix with agent.
+
+| Issue | Found when |
+|---|---|
+| **N+1 Query** | the same database query runs 5 or more times under one parent span, as when a loop loads one row per item |
+| **Slow DB Query** | one database span takes 1 second or more |
+| **Consecutive HTTP Calls** | 3 or more HTTP calls of 50 ms or more run one after another, none overlapping, under one parent span |
+| **Large HTTP Payload** | a request or response body is 1 MB or more (`http.request.body.size`, `http.response.body.size` and their older names) |
+
+Queries are compared with their literals replaced (`WHERE id = 7` and `WHERE id = 9` are the same query), so one loop is one issue however many items it ran over. The same pattern in the same operation of the same service is one issue across traces; its count is the number of traces it was found in.
+
+Checks run in the background every 5 minutes, never while traces are received. Each check reads, per project, the 20 slowest root traces stored since the last check, at most 200 traces across projects, and never looks back more than 15 minutes. A busy project is therefore sampled, slowest traces first, not checked exhaustively. A trace read twice counts once.
+
+Choose **Performance** in the issue type menu of the error list to see only these issues; the page says when traces were last checked and what to set up when none have been received.
+
+<CodeGroup title="Performance Issues">
+```bash {{ title: 'CLI' }}
+# What is checked, and when traces were last checked
+temps errors performance --project-id 42
+
+# Only performance issues
+temps errors list --project-id 42 --type performance
+```
+
+```typescript {{ title: 'API' }}
+const issues = await fetch(
+  'https://your-temps-instance.com/api/projects/42/error-groups?issue_type=performance',
+  { headers: { 'Authorization': `Bearer ${API_KEY}` } }
+).then(r => r.json());
+
+const status = await fetch(
+  'https://your-temps-instance.com/api/projects/42/performance-issues/status',
+  { headers: { 'Authorization': `Bearer ${API_KEY}` } }
+).then(r => r.json());
+```
+</CodeGroup>
+
 ## Additional Resources
 
 <div className="not-prose">

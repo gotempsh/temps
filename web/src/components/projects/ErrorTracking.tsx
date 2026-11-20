@@ -6,6 +6,7 @@ import { PageHeader } from '@/components/layout/PageContainer'
 import { ProjectResponse } from '@/api/client'
 import {
   getEnvironmentsOptions,
+  getPerformanceIssueStatusOptions,
   getErrorDashboardStatsOptions,
   getErrorDashboardStatsQueryKey,
   getErrorTimeSeriesQueryKey,
@@ -153,6 +154,15 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
   const [assigneeFilter, setAssigneeFilter] = useState<string>('any')
   const [groupSort, setGroupSort] = useState('last_seen:desc')
   const [searchText, setSearchText] = useState('')
+  // Errors, performance issues found in traces (ADR 111, D2), or both.
+  const [issueType, setIssueType] = useState<'all' | 'error' | 'performance'>(
+    'all'
+  )
+  const performanceStatus = useQuery({
+    ...getPerformanceIssueStatusOptions({ path: { project_id: project.id } }),
+    enabled: issueType === 'performance',
+    staleTime: 60_000,
+  })
   const search = useDebounce(searchText.trim(), 300)
   const [page, setPage] = useState(1)
   const pageSize = 25
@@ -219,7 +229,7 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
   // Bulk triage selection, by group id. Cleared whenever the visible page
   // changes, so a resolve can never land on a group the user cannot see.
   const [selectedGroupIds, setSelectedGroupIds] = useState<number[]>([])
-  const pageScope = `${statusFilter}\u0000${assigneeFilter}\u0000${search}\u0000${groupSort}\u0000${environmentFilter}\u0000${dateFilter.quickFilter}\u0000${dateFilter.dateRange?.from?.getTime() ?? ''}\u0000${dateFilter.dateRange?.to?.getTime() ?? ''}`
+  const pageScope = `${issueType}\u0000${statusFilter}\u0000${assigneeFilter}\u0000${search}\u0000${groupSort}\u0000${environmentFilter}\u0000${dateFilter.quickFilter}\u0000${dateFilter.dateRange?.from?.getTime() ?? ''}\u0000${dateFilter.dateRange?.to?.getTime() ?? ''}`
   const [previousPageScope, setPreviousPageScope] = useState(pageScope)
   if (pageScope !== previousPageScope) {
     setPreviousPageScope(pageScope)
@@ -246,6 +256,7 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
         status: statusFilter === 'all' ? null : statusFilter,
         assignee: assigneeFilter === 'any' ? null : assigneeFilter,
         search: search || null,
+        issue_type: issueType === 'all' ? null : issueType,
         start_date: timeRange.startTime,
         end_date: timeRange.endTime,
         environment_id: environmentFilter,
@@ -538,6 +549,15 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
             >
               {text.type}
             </Badge>
+            {group.issue_type === 'performance' && (
+              <Badge
+                variant="secondary"
+                className="text-[10px] px-1.5 py-0"
+                title="Found in traces by a performance detector"
+              >
+                Performance
+              </Badge>
+            )}
             {envName && (
               <Badge
                 variant="outline"
@@ -764,6 +784,24 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
                 maxLength={256}
               />
               <Select
+                value={issueType}
+                onValueChange={(v) =>
+                  setIssueType(v as 'all' | 'error' | 'performance')
+                }
+              >
+                <SelectTrigger
+                  className="w-[150px]"
+                  aria-label="Show errors, performance issues, or both"
+                >
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">All issues</SelectItem>
+                  <SelectItem value="error">Errors</SelectItem>
+                  <SelectItem value="performance">Performance</SelectItem>
+                </SelectContent>
+              </Select>
+              <Select
                 value={statusFilter}
                 onValueChange={(v) => setStatusFilter(v as GroupStatusView)}
               >
@@ -819,6 +857,40 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
             </div>
           }
         />
+      )}
+
+      {issueType === 'performance' && performanceStatus.data && (
+        <Alert>
+          <Info className="h-4 w-4" />
+          <AlertDescription className="text-sm">
+            {performanceStatus.data.configured ? (
+              <>
+                The slowest {performanceStatus.data.traces_per_check} traces of
+                this project are checked every{' '}
+                {performanceStatus.data.check_interval_minutes} minutes for N+1
+                queries, slow queries, consecutive HTTP calls and large
+                payloads; {performanceStatus.data.traces_scanned} traces checked
+                so far.
+                {performanceStatus.data.last_error &&
+                  ` The last check failed: ${performanceStatus.data.last_error}`}
+              </>
+            ) : (
+              <>
+                Performance issues are found in this project&rsquo;s traces, for
+                example a query run once per item in a loop.{' '}
+                {performanceStatus.data.reason}.{' '}
+                {performanceStatus.data.setup_path && (
+                  <Link
+                    className="underline"
+                    to={`/projects/${project.slug}/${performanceStatus.data.setup_path}`}
+                  >
+                    Set up tracing
+                  </Link>
+                )}
+              </>
+            )}
+          </AlertDescription>
+        </Alert>
       )}
 
       {!hasErrors && !isCheckingErrors && (

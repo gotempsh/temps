@@ -51,7 +51,7 @@ pub use plugin::OtelPlugin;
 pub use services::OtelService;
 pub use storage::OtelStorage;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 
 /// Application state shared across OTel HTTP handlers.

@@ -65,6 +65,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         .merge(super::assignee_handler::routes())
         .merge(super::activity_handler::routes())
         .merge(super::saved_search_handler::routes())
+        .merge(super::performance_handler::routes())
         .merge(super::inbound_filter_handler::routes())
         .merge(super::release_handler::routes())
         .merge(super::client_outcome_handler::routes())
@@ -120,6 +121,8 @@ pub struct ListErrorGroupsQuery {
     pub assignee: Option<String>,
     /// Case-insensitive text in the title, error type or message.
     pub search: Option<String>,
+    /// `error` or `performance`; omitted for both.
+    pub issue_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize, ToSchema, IntoParams)]
@@ -231,6 +234,10 @@ pub struct ErrorGroupResponse {
     /// While the group is resolved in the next release: the release it was
     /// resolved after.
     pub resolution: Option<crate::services::types::GroupResolutionState>,
+    /// `error`, or `performance` for an issue a trace detector filed: an
+    /// N+1 query, a slow database query, consecutive HTTP calls or an
+    /// oversized payload.
+    pub issue_type: String,
     pub project_id: i32,
     pub environment_id: Option<i32>,
     pub deployment_id: Option<i32>,
@@ -324,6 +331,7 @@ impl From<ErrorGroupDomain> for ErrorGroupResponse {
             merged_into_group_id: group.merged_into_group_id,
             ignore: group.ignore,
             resolution: group.resolution,
+            issue_type: group.issue_type,
             project_id: group.project_id,
             environment_id: group.environment_id,
             deployment_id: group.deployment_id,
@@ -661,6 +669,7 @@ pub async fn list_error_groups(
             .map(|a| crate::services::group_workflow::AssigneeFilter::parse(a, auth.user_id()))
             .transpose()?,
         search: query.search,
+        issue_type: query.issue_type.filter(|t| !t.trim().is_empty()),
     };
 
     let (groups, total_count) = state

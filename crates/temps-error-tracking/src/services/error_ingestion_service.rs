@@ -77,7 +77,18 @@ fn default_placeholder(value: &str) -> bool {
     matches!(value, "{{ default }}" | "{{default}}")
 }
 
+/// SHA-256 of `value`, hex encoded.
+pub(crate) fn keyed_hex(value: &str) -> String {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(value.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
 fn sdk_event_id(data: &CreateErrorEventData) -> Option<String> {
+    if let Some(key) = data.dedup_key.as_deref() {
+        return Some(keyed_hex(&format!("dedup:{key}"))[..32].to_string());
+    }
     if data.source.as_deref() != Some("sentry") {
         return None;
     }
@@ -839,6 +850,10 @@ impl ErrorIngestionService {
             error_type: Set(exception_type.clone()),
             message_template: Set(Some(exception_value.clone())),
             embedding: Set(embedding),
+            issue_type: Set(error_data
+                .issue_type
+                .clone()
+                .unwrap_or_else(|| "error".to_string())),
             first_seen: Set(event_time),
             last_seen: Set(event_time),
             total_count: Set(0),

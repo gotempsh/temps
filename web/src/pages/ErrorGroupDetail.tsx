@@ -24,6 +24,8 @@ import { IgnoreMenu } from '@/components/error-tracking/IgnoreMenu'
 import { ResolveMenu } from '@/components/error-tracking/ResolveMenu'
 import { AssigneeMenu } from '@/components/error-tracking/AssigneeMenu'
 import { GroupActivity } from '@/components/error-tracking/GroupActivity'
+import { PerformanceIssueCard } from '@/components/error-tracking/PerformanceIssueCard'
+import { performanceEvidence } from '@/components/error-tracking/performance-evidence'
 import {
   IGNORE_PRESETS,
   describeIgnoreState,
@@ -257,6 +259,10 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
   const groupPath = { group_id: errorGroup.id, project_id: project.id }
   const latestEvent = errorEvents?.data?.[0] as ErrorEventResponse | undefined
   const sentryEvent = latestEvent ? extractSentryEvent(latestEvent.data) : null
+  const evidence =
+    errorGroup?.issue_type === 'performance' && latestEvent
+      ? performanceEvidence(latestEvent.data)
+      : null
 
   return (
     <div>
@@ -477,6 +483,16 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
           errorGroupId={parseInt(errorGroupId!)}
         />
       </div>
+
+      {evidence && errorGroup && (
+        <div className="mb-6">
+          <PerformanceIssueCard
+            projectSlug={project.slug}
+            title={errorGroup.error_type}
+            evidence={evidence}
+          />
+        </div>
+      )}
 
       {/* Tabs for different views */}
       <Tabs value={selectedTab} onValueChange={setSelectedTab}>
