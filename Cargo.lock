@@ -15044,6 +15044,7 @@ dependencies = [
  "temps-sandbox-providers",
  "temps-service-protocol",
  "temps-shield",
+ "temps-uptime-probe",
  "temps-vulnerability-scanner",
  "temps-wireguard",
  "temps-workload",
@@ -16133,6 +16134,7 @@ dependencies = [
  "async-trait",
  "axum",
  "chrono",
+ "futures",
  "hex",
  "hmac 0.13.0",
  "http 1.5.0",
@@ -16153,6 +16155,7 @@ dependencies = [
  "temps-entities",
  "temps-routes",
  "temps-test-utils",
+ "temps-uptime-probe",
  "thiserror 2.0.21",
  "tokio",
  "tokio-rustls",
@@ -16224,6 +16227,26 @@ dependencies = [
  "tokio",
  "tracing",
  "utoipa",
+ "x509-parser",
+]
+
+[[package]]
+name = "temps-uptime-probe"
+version = "0.1.0-beta.63"
+dependencies = [
+ "async-trait",
+ "hickory-resolver",
+ "reqwest 0.12.28",
+ "rustls",
+ "serde",
+ "serde_json",
+ "temps-core",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-rustls",
+ "url",
+ "utoipa",
+ "webpki-roots 1.0.12",
  "x509-parser",
 ]
 

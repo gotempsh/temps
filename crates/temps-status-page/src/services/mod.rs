@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+pub mod checks;
 mod db_retry;
 pub mod health_check_service;
 pub mod incident_service;

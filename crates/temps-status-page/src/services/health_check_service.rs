@@ -23,6 +23,7 @@ use temps_entities::{
 use tokio::time::{sleep, timeout};
 use tracing::{debug, error, info, warn};
 
+use super::checks::{MonitorCheckKind, TargetChecks};
 use super::types::{normalize_check_interval_seconds, validate_check_path, StatusPageError};
 
 /// Grace period before the scheduler runs its first health check cycle.
@@ -549,6 +550,18 @@ fn report_check_error(
     outcome
 }
 
+/// Target checks for tests: a fixed key and the network prober.
+#[cfg(test)]
+pub(crate) fn test_target_checks() -> Arc<TargetChecks> {
+    Arc::new(TargetChecks::new(
+        Arc::new(temps_core::EncryptionService::new_from_password(
+            "health-check-tests",
+        )),
+        Arc::new(super::checks::NetworkProber),
+        Arc::new(super::checks::NoNodeLocations),
+    ))
+}
+
 pub struct HealthCheckService {
     db: Arc<DatabaseConnection>,
     http_client: reqwest::Client,
@@ -557,6 +570,8 @@ pub struct HealthCheckService {
     /// ADR 068 D4: which address to probe, if any. Empty without the
     /// ingress plugin, where every monitor probes as before.
     environment_addresses: Option<Arc<EnvironmentAddressSlot>>,
+    /// Probes of monitors for targets outside Temps (ADR 108 D3, D4).
+    target_checks: Arc<TargetChecks>,
 }
 
 /// What a monitor records when its environment has no address anyone can
@@ -595,6 +610,7 @@ impl HealthCheckService {
         db: Arc<DatabaseConnection>,
         config_service: Arc<ConfigService>,
         job_queue: Arc<dyn JobQueue>,
+        target_checks: Arc<TargetChecks>,
     ) -> Result<Self, StatusPageError> {
         let http_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
@@ -613,6 +629,7 @@ impl HealthCheckService {
             config_service,
             job_queue,
             environment_addresses: None,
+            target_checks,
         })
     }
 
@@ -807,6 +824,7 @@ impl HealthCheckService {
             let config_service = self.config_service.clone();
             let job_queue = self.job_queue.clone();
             let addresses = self.addresses();
+            let target_checks = self.target_checks.clone();
             let permit = match semaphore.clone().acquire_owned().await {
                 Ok(permit) => permit,
                 Err(error) => {
@@ -821,8 +839,15 @@ impl HealthCheckService {
             let monitor_id = monitor.id;
             let task = tokio::spawn(async move {
                 let _permit = permit; // Hold permit until task completes
-                match Self::check_monitor_with(db, config_service, monitor, job_queue, addresses)
-                    .await
+                match Self::check_any(
+                    db,
+                    config_service,
+                    monitor,
+                    job_queue,
+                    addresses,
+                    target_checks,
+                )
+                .await
                 {
                     Ok(()) => {
                         if MONITOR_CHECK_ERRORS.record_success(&monitor_id).is_some() {
@@ -885,6 +910,89 @@ impl HealthCheckService {
         }
 
         Ok(monitor_count)
+    }
+
+    /// Check `monitor`, whichever kind it is.
+    async fn check_any(
+        db: Arc<DatabaseConnection>,
+        config_service: Arc<ConfigService>,
+        monitor: status_monitors::Model,
+        job_queue: Arc<dyn JobQueue>,
+        addresses: Option<Arc<dyn EnvironmentAddresses>>,
+        target_checks: Arc<TargetChecks>,
+    ) -> Result<(), StatusPageError> {
+        if MonitorCheckKind::from_stored(&monitor.check_kind) == MonitorCheckKind::Environment {
+            return Self::check_monitor_with(db, config_service, monitor, job_queue, addresses)
+                .await;
+        }
+        Self::check_target_monitor(&db, &monitor, &job_queue, &target_checks).await
+    }
+
+    /// Probe a monitor for a target outside Temps and record the outcome,
+    /// unless the monitor changed, was paused or deleted meanwhile.
+    async fn check_target_monitor(
+        db: &Arc<DatabaseConnection>,
+        monitor: &status_monitors::Model,
+        job_queue: &Arc<dyn JobQueue>,
+        target_checks: &TargetChecks,
+    ) -> Result<(), StatusPageError> {
+        let super::checks::CheckResult { outcome, locations } = target_checks.run(monitor).await?;
+        let status = outcome.status.stored().to_string();
+        let check = status_checks::ActiveModel {
+            monitor_id: Set(monitor.id),
+            status: Set(status.clone()),
+            response_time_ms: Set(outcome.response_time_ms),
+            checked_at: Set(Utc::now()),
+            error_message: Set(outcome.message.clone()),
+            ..Default::default()
+        };
+        let txn = db.begin().await?;
+        let current = status_monitors::Entity::find_by_id(monitor.id)
+            .lock_exclusive()
+            .one(&txn)
+            .await?;
+        if current.is_none_or(|row| !row.is_active || row.updated_at != monitor.updated_at) {
+            debug!(
+                monitor_id = monitor.id,
+                "Discarded a target check: the monitor changed while it ran"
+            );
+            return Ok(());
+        }
+        check.insert(&txn).await?;
+        if let Some(locations) = locations {
+            let json = serde_json::to_value(&locations).map_err(|error| {
+                StatusPageError::InvalidRequest(format!(
+                    "location results of monitor {} could not be encoded: {error}",
+                    monitor.id
+                ))
+            })?;
+            // Not through the active model: that would move `updated_at`,
+            // which tells the scheduler the monitor was edited.
+            status_monitors::Entity::update_many()
+                .col_expr(status_monitors::Column::LocationResults, Expr::value(json))
+                .filter(status_monitors::Column::Id.eq(monitor.id))
+                .exec(&txn)
+                .await?;
+        }
+        txn.commit().await?;
+        report_check_outcome(
+            &MONITOR_DOWN,
+            monitor.id,
+            &status,
+            outcome.message.as_deref(),
+        );
+        let job = Job::StatusCheckCompleted(StatusCheckCompletedJob {
+            monitor_id: monitor.id,
+            status,
+            error_message: outcome.message,
+        });
+        if let Err(e) = job_queue.send(job).await {
+            error!(
+                "Failed to emit StatusCheckCompleted job for monitor {}: {:?}",
+                monitor.id, e
+            );
+        }
+        Ok(())
     }
 
     /// Check a single monitor, without knowing environment addresses.
@@ -1886,12 +1994,13 @@ impl HealthCheckService {
                                 // claim the slot before probing so the sweep
                                 // does not immediately re-probe this monitor.
                                 Self::schedule_next_check(service.db.as_ref(), &monitor).await;
-                                if let Err(e) = Self::check_monitor_with(
+                                if let Err(e) = Self::check_any(
                                     service.db.clone(),
                                     service.config_service.clone(),
                                     monitor,
                                     service.job_queue.clone(),
                                     service.addresses(),
+                                    service.target_checks.clone(),
                                 )
                                 .await
                                 {
@@ -2718,6 +2827,12 @@ mod tests {
             is_active: true,
             is_managed: false,
             next_check_at: None,
+            check_kind: "environment".to_string(),
+            target: None,
+            check_spec: None,
+            request_encrypted: None,
+            probe_from_nodes: false,
+            location_results: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -3528,8 +3643,9 @@ mod tests {
 
         let config_service = test_config_service(&db, &test_db.database_url);
         let job_queue: Arc<dyn temps_core::JobQueue> = Arc::new(NeverJobQueue);
-        let health_check_service = HealthCheckService::new(db.clone(), config_service, job_queue)
-            .expect("test HTTP client should build");
+        let health_check_service =
+            HealthCheckService::new(db.clone(), config_service, job_queue, test_target_checks())
+                .expect("test HTTP client should build");
 
         // If the paused check were skipped or stale, this would try to hit
         // `paused-skip-test-production.test.local`, which doesn't resolve —
@@ -4025,8 +4141,9 @@ mod tests {
 
         let config_service = test_config_service(&db, &test_db.database_url);
         let job_queue: Arc<dyn temps_core::JobQueue> = Arc::new(NeverJobQueue);
-        let service = HealthCheckService::new(db.clone(), config_service, job_queue)
-            .expect("test HTTP client should build");
+        let service =
+            HealthCheckService::new(db.clone(), config_service, job_queue, test_target_checks())
+                .expect("test HTTP client should build");
 
         service
             .run_all_checks()

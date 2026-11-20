@@ -1527,6 +1527,7 @@ where
 pub(crate) fn map_error(error: StatusPageError) -> Problem {
     match error {
         StatusPageError::NotFound => not_found().detail("Resource not found").build(),
+        StatusPageError::TargetMonitor(error) => Problem::from(error),
         error @ (StatusPageError::StatusPageNotFound { .. }
         | StatusPageError::IncidentUpdateNotFound { .. }
         | StatusPageError::IncidentNotFound { .. }
