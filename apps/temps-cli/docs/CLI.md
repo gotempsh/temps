@@ -3323,6 +3323,8 @@ Manage uptime monitors for status pages
 
 - `list` (`ls`) - List all monitors for a project
 - `create` (`add`) - Create a new monitor for a project
+- `add-target` - Monitor a URL, port, TLS certificate or DNS record outside Temps
+- `update-target` - Change a monitor of a target outside Temps; omitted flags keep their value
 - `show` - Show monitor details and current status
 - `remove` (`rm`) - Delete a monitor
 - `status` - Get current status — all monitors for a project, or a single monitor by ID
@@ -3354,6 +3356,59 @@ Create a new monitor for a project
 | `--check-path <path>` | HTTP health-check path (must start with "/", e.g. /api/healthz). Defaults to "/" for HTTP monitors. | - | No |
 | `--environment-id <id>` | Environment ID (default: 0 for production) | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
+
+### `monitors add-target`
+
+Monitor a URL, port, TLS certificate or DNS record outside Temps
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--kind <kind>` | http, tcp, tls or dns | - | Yes |
+| `--target <target>` | URL (http), host:port (tcp, tls) or host name (dns) | - | Yes |
+| `-n, --name <name>` | Monitor name | - | Yes |
+| `-i, --interval <seconds>` | Check interval in seconds (default 60, at least 30) | - | No |
+| `--keyword-absent` | Fail when --keyword is present instead of missing | - | No |
+| `--method <method>` | HTTP method (default GET) | - | No |
+| `--expect-status <codes>` | Codes or classes counted as up, e.g. 200,204 or 2xx (default 2xx or 3xx) | - | No |
+| `--keyword <text>` | Text the response body must contain (first 256 KiB; never stored) | - | No |
+| `--degraded-after-ms <ms>` | Slower than this is degraded (http, tcp) | - | No |
+| `--warn-days <days>` | Degraded when the certificate expires within this many days (tls, default 14) | - | No |
+| `--record <type>` | DNS record type: A, AAAA, CNAME, MX, TXT, NS (default A) | - | No |
+| `--expect <values>` | Comma-separated DNS values; any match is up (default: any answer) | - | No |
+| `--header-file <path>` | File of "Name: value" request headers; stored encrypted, never shown | - | No |
+| `--body-file <path>` | File with the request body; stored encrypted | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `monitors update-target`
+
+Change a monitor of a target outside Temps; omitted flags keep their value
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--monitor-id <id>` | Monitor ID | - | Yes |
+| `--kind <kind>` | Change the check kind (pass the check flags for it) | - | No |
+| `--target <target>` | New target | - | No |
+| `-n, --name <name>` | New name | - | No |
+| `-i, --interval <seconds>` | Check interval in seconds | - | No |
+| `--keyword-absent` | Fail when --keyword is present instead of missing | - | No |
+| `--pause` | Stop checking | - | No |
+| `--resume` | Start checking again | - | No |
+| `--method <method>` | HTTP method (default GET) | - | No |
+| `--expect-status <codes>` | Codes or classes counted as up, e.g. 200,204 or 2xx (default 2xx or 3xx) | - | No |
+| `--keyword <text>` | Text the response body must contain (first 256 KiB; never stored) | - | No |
+| `--degraded-after-ms <ms>` | Slower than this is degraded (http, tcp) | - | No |
+| `--warn-days <days>` | Degraded when the certificate expires within this many days (tls, default 14) | - | No |
+| `--record <type>` | DNS record type: A, AAAA, CNAME, MX, TXT, NS (default A) | - | No |
+| `--expect <values>` | Comma-separated DNS values; any match is up (default: any answer) | - | No |
+| `--header-file <path>` | File of "Name: value" request headers; stored encrypted, never shown | - | No |
+| `--body-file <path>` | File with the request body; stored encrypted | - | No |
+| `--json` | Output in JSON format | - | No |
 
 ### `monitors show`
 

@@ -5,7 +5,10 @@
 Proposed — 2026-11-19. D1 implemented — 2026-11-19 (see *Settled while
 implementing D1*). D2 implemented — 2026-11-20: the email subscription first, then the feed,
 webhooks, maintenance windows and page password (see *Settled while
-implementing D2*). D3 to D8 not started.
+implementing D2*). D3 and D4 implemented together — 2026-11-20: HTTP
+assertions, TCP, TLS certificate and DNS checks against any public target;
+ICMP, domain registration expiry and browser checks deferred (see *Settled
+while implementing D3 and D4*). D5 to D8 not started.
 
 Related: ADR 021 (multi-node log aggregation, humanized alert notifications),
 ADR 025 (unified alarm log), ADR 026 (metric alert label filters), ADR 045 to
@@ -341,6 +344,58 @@ the probe already applies (`PublicProbeTarget`), so a monitor cannot be
 pointed at internal addresses. D3 and D4 are one change to the monitor model
 and should ship together: most of D3's non-HTTP kinds have few targets until
 D4 exists.
+
+### Settled while implementing D3 and D4
+
+One change, as planned: a monitor watches either an environment or an
+explicit target.
+
+- **A new discriminator, not `monitor_type`.** `status_monitors.check_kind`
+  (`environment`, `http`, `tcp`, `tls`, `dns`) with a typed spec in
+  `check_spec`, and a database constraint that an environment monitor has no
+  target and a target monitor has a target, a spec and no environment.
+  `monitor_type` is a free-form legacy string that existing rows and clients
+  read; target monitors set it to their kind and nothing branches on it.
+- **Assertions apply to target monitors only.** Environment monitors keep
+  their built-in rule (`GET`, 2xx or 3xx); giving them the same assertions is
+  a follow-up, since their URL and path are managed by deployments.
+- **Shipped kinds:** HTTP (method, expected codes or classes such as `2xx`,
+  keyword present or absent in the first 256 KiB, degraded-after threshold,
+  headers and body), TCP connect, TLS certificate (publicly trusted chain for
+  the host; degraded inside the warning period, default 14 days, down when
+  expired or untrusted) and DNS (A, AAAA, CNAME, MX, TXT, NS; any listed
+  value matching is up). Redirects are not followed, so the configured
+  status is judged on the first answer.
+- **Deferred:** ICMP needs raw sockets (`CAP_NET_RAW`), which the binary
+  does not hold by default; domain registration expiry needs RDAP lookups
+  against registries, a new outbound dependency; browser transactions are
+  not built (*Not doing*: no resident headless browser).
+- **Secrets in requests.** Headers and body are encrypted at rest with
+  `EncryptionService` in one column; only header names are stored and shown
+  in plaintext. An update keeps them unless it replaces them, and they are
+  dropped when the kind changes away from HTTP. Hop-by-hop and
+  framing headers (`Host`, `Content-Length` and the like) are refused, and so
+  are credentials in the URL.
+- **Public targets, twice.** On save an IP literal, or a name that resolves,
+  must be public; a name that does not resolve yet is accepted, so a monitor
+  can be created before its DNS. Every probe resolves again and pins the
+  connection to the checked address (`PublicProbeTarget`). DNS checks use
+  the system resolver and never echo a private A or AAAA answer.
+- **Footprint.** 50 target monitors per project, the existing 30-second
+  interval floor and 0.5 to 30-second timeouts, and the scheduler's existing
+  sweep and concurrency limit of 10: no new task or resident process.
+- **Incidents without an environment.** A target monitor's outage opens an
+  incident and notifies like any monitor; deployment alarms are skipped,
+  since there is no deployment. Target monitors can be selected on a status
+  page.
+- **Audit and API.** Writes are audited with the target host only, never the
+  path, query or headers. Creation and changes have their own endpoints
+  (`POST /projects/{id}/monitors/targets`,
+  `PATCH /projects/{id}/monitors/{monitor_id}/target`); listing, history and
+  deletion reuse the monitor endpoints. The schema names are
+  `MonitorCheckKind`, `DnsCheckRecordType` and `CheckRequestHeader` because
+  the plugin OpenAPI merge keeps one schema per name and `CheckKind`,
+  `DnsRecordType` and `RequestHeader` already existed.
 
 ### D5. Probes from more than one place
 

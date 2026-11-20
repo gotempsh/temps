@@ -487,7 +487,7 @@ fn shown_address(ip: IpAddr) -> String {
 }
 
 async fn probe_dns(check: &DnsCheck, name: &str, timeout: Duration) -> ProbeOutcome {
-    use super::spec::DnsRecordType;
+    use super::spec::DnsCheckRecordType;
     use hickory_resolver::config::ResolveHosts;
     use hickory_resolver::proto::rr::{RData, RecordType};
 
@@ -512,12 +512,12 @@ async fn probe_dns(check: &DnsCheck, name: &str, timeout: Duration) -> ProbeOutc
         }
     };
     let record_type = match check.record_type {
-        DnsRecordType::A => RecordType::A,
-        DnsRecordType::Aaaa => RecordType::AAAA,
-        DnsRecordType::Cname => RecordType::CNAME,
-        DnsRecordType::Mx => RecordType::MX,
-        DnsRecordType::Txt => RecordType::TXT,
-        DnsRecordType::Ns => RecordType::NS,
+        DnsCheckRecordType::A => RecordType::A,
+        DnsCheckRecordType::Aaaa => RecordType::AAAA,
+        DnsCheckRecordType::Cname => RecordType::CNAME,
+        DnsCheckRecordType::Mx => RecordType::MX,
+        DnsCheckRecordType::Txt => RecordType::TXT,
+        DnsCheckRecordType::Ns => RecordType::NS,
     };
     let started = Instant::now();
     let lookup = tokio::time::timeout(timeout, resolver.lookup(name, record_type)).await;
@@ -553,7 +553,10 @@ async fn probe_dns(check: &DnsCheck, name: &str, timeout: Duration) -> ProbeOutc
         .collect();
     let outcome = judge_dns(check, name, &answers, elapsed);
     if outcome.status == ProbeStatus::Operational
-        || !matches!(check.record_type, DnsRecordType::A | DnsRecordType::Aaaa)
+        || !matches!(
+            check.record_type,
+            DnsCheckRecordType::A | DnsCheckRecordType::Aaaa
+        )
     {
         return outcome;
     }
@@ -573,7 +576,7 @@ async fn probe_dns(check: &DnsCheck, name: &str, timeout: Duration) -> ProbeOutc
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::checks::spec::{DnsRecordType, KeywordAssertion};
+    use crate::services::checks::spec::{DnsCheckRecordType, KeywordAssertion};
 
     const FAST: Duration = Duration::from_millis(120);
 
@@ -694,7 +697,7 @@ mod tests {
     #[test]
     fn dns_answers_are_matched() {
         let check = DnsCheck {
-            record_type: DnsRecordType::A,
+            record_type: DnsCheckRecordType::A,
             expected: vec!["192.0.2.10".into()],
             timeout_ms: None,
         };

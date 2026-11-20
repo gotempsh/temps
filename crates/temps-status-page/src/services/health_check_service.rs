@@ -23,7 +23,7 @@ use temps_entities::{
 use tokio::time::{sleep, timeout};
 use tracing::{debug, error, info, warn};
 
-use super::checks::{CheckKind, TargetChecks};
+use super::checks::{MonitorCheckKind, TargetChecks};
 use super::types::{normalize_check_interval_seconds, validate_check_path, StatusPageError};
 
 /// Grace period before the scheduler runs its first health check cycle.
@@ -920,7 +920,7 @@ impl HealthCheckService {
         addresses: Option<Arc<dyn EnvironmentAddresses>>,
         target_checks: Arc<TargetChecks>,
     ) -> Result<(), StatusPageError> {
-        if CheckKind::from_stored(&monitor.check_kind) == CheckKind::Environment {
+        if MonitorCheckKind::from_stored(&monitor.check_kind) == MonitorCheckKind::Environment {
             return Self::check_monitor_with(db, config_service, monitor, job_queue, addresses)
                 .await;
         }

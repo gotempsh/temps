@@ -20,7 +20,7 @@ pub use probe::{NetworkProber, ProbeOutcome, ProbeStatus, TargetProber};
 pub use runner::TargetChecks;
 pub use service::{TargetMonitorService, MAX_TARGET_MONITORS_PER_PROJECT};
 pub use spec::{
-    CheckKind, CheckRequest, CheckSpec, DnsCheck, DnsRecordType, HttpCheck, HttpMethod,
-    KeywordAssertion, RequestHeader, TcpCheck, TlsCheck,
+    CheckRequest, CheckRequestHeader, CheckSpec, DnsCheck, DnsCheckRecordType, HttpCheck,
+    HttpMethod, KeywordAssertion, MonitorCheckKind, TcpCheck, TlsCheck,
 };
 pub use types::{CreateTargetMonitorRequest, MonitorCheckView, UpdateTargetMonitorRequest};

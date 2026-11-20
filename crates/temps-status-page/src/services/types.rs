@@ -292,7 +292,7 @@ pub struct MonitorResponse {
     pub monitor_url: String, // The URL being monitored (constructed from environment)
     /// `environment` for a monitor of a Temps environment, otherwise the
     /// check run against `check.target` (ADR 108 D3, D4).
-    pub check_kind: crate::services::checks::CheckKind,
+    pub check_kind: crate::services::checks::MonitorCheckKind,
     /// How a monitor outside Temps is checked; `null` for an environment
     /// monitor.
     pub check: Option<crate::services::checks::MonitorCheckView>,
@@ -555,9 +555,9 @@ impl From<temps_entities::status_monitors::Model> for MonitorResponse {
             check_path: model.check_path,
             // Environment monitors get theirs from the service layer.
             monitor_url: model.target.clone().unwrap_or_default(),
-            check_kind: crate::services::checks::CheckKind::from_stored(&model.check_kind),
+            check_kind: crate::services::checks::MonitorCheckKind::from_stored(&model.check_kind),
             check: crate::services::checks::MonitorCheckView::from_row(
-                crate::services::checks::CheckKind::from_stored(&model.check_kind),
+                crate::services::checks::MonitorCheckKind::from_stored(&model.check_kind),
                 model.target.as_deref(),
                 model.check_spec.as_ref(),
             ),

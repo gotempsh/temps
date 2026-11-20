@@ -23,6 +23,7 @@ function monitor(
     name: 'Monitor',
     monitor_type: 'http',
     monitor_url: '',
+    check_kind: 'environment',
     check_interval_seconds: 60,
     is_active: true,
     created_at: '',

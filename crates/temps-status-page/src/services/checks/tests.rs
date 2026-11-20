@@ -22,10 +22,10 @@ use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
 use tower::ServiceExt;
 
 use super::probe::{ProbeOutcome, ProbeStatus, TargetProber};
-use super::spec::{CheckRequest, CheckSpec, HttpCheck, RequestHeader, Target, TcpCheck};
+use super::spec::{CheckRequest, CheckRequestHeader, CheckSpec, HttpCheck, Target, TcpCheck};
 use super::{
-    CheckKind, CreateTargetMonitorRequest, TargetChecks, TargetMonitorError, TargetMonitorService,
-    UpdateTargetMonitorRequest, MAX_TARGET_MONITORS_PER_PROJECT,
+    CreateTargetMonitorRequest, MonitorCheckKind, TargetChecks, TargetMonitorError,
+    TargetMonitorService, UpdateTargetMonitorRequest, MAX_TARGET_MONITORS_PER_PROJECT,
 };
 use crate::routes::target_monitors::{
     create_target_monitor, create_target_monitor_router, update_target_monitor,
@@ -182,7 +182,7 @@ fn http_request(target: &str) -> CreateTargetMonitorRequest {
             ..Default::default()
         }),
         request: Some(CheckRequest {
-            headers: vec![RequestHeader {
+            headers: vec![CheckRequestHeader {
                 name: "Authorization".to_string(),
                 value: SECRET.to_string(),
             }],
@@ -255,7 +255,7 @@ async fn http_monitor_stores_its_request_encrypted_and_never_returns_it() {
     assert!(!stored_spec.contains(SECRET), "{stored_spec}");
 
     let response = MonitorResponse::from(model.clone());
-    assert_eq!(response.check_kind, CheckKind::Http);
+    assert_eq!(response.check_kind, MonitorCheckKind::Http);
     assert_eq!(
         response.monitor_url,
         "https://api.example.test/health?token=abc"

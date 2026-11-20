@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use super::spec::{CheckKind, CheckRequest, CheckSpec, StoredCheck};
+use super::spec::{CheckRequest, CheckSpec, MonitorCheckKind, StoredCheck};
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CreateTargetMonitorRequest {
@@ -52,11 +52,11 @@ impl MonitorCheckView {
     /// The view of a monitor row, `None` for an environment monitor or an
     /// unreadable spec.
     pub fn from_row(
-        kind: CheckKind,
+        kind: MonitorCheckKind,
         target: Option<&str>,
         spec: Option<&serde_json::Value>,
     ) -> Option<Self> {
-        if kind == CheckKind::Environment {
+        if kind == MonitorCheckKind::Environment {
             return None;
         }
         let stored: StoredCheck = serde_json::from_value(spec?.clone()).ok()?;

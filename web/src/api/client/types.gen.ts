@@ -4946,6 +4946,36 @@ export type ChatWorkspaceResponse = {
  */
 export type CheckKind = 'http' | 'local';
 
+/**
+ * The secret part of an HTTP check: headers and body, encrypted at rest.
+ */
+export type CheckRequest = {
+    body?: string | null;
+    headers?: Array<CheckRequestHeader>;
+};
+
+/**
+ * One HTTP request header. The value is stored encrypted and never
+ * returned.
+ */
+export type CheckRequestHeader = {
+    name: string;
+    value: string;
+};
+
+/**
+ * A target monitor's check, one shape per kind.
+ */
+export type CheckSpec = (HttpCheck & {
+    kind: 'http';
+}) | (TcpCheck & {
+    kind: 'tcp';
+}) | (TlsCheck & {
+    kind: 'tls';
+}) | (DnsCheck & {
+    kind: 'dns';
+});
+
 export type CheckStatus = 'healthy' | 'warning' | 'error' | 'unknown';
 
 /**
@@ -9585,6 +9615,25 @@ export type CreateStatusPageWebhookRequest = {
     url: string;
 };
 
+export type CreateTargetMonitorRequest = {
+    check: CheckSpec;
+    /**
+     * How often to check, in seconds (default 60, at least 30).
+     */
+    check_interval_seconds?: number | null;
+    /**
+     * Shown in the console and, unless renamed there, on status pages.
+     */
+    name: string;
+    request?: CheckRequest | null;
+    /**
+     * What to check: a URL (`http`), `host:port` (`tcp`, `tls`; `tls`
+     * defaults to 443) or a host name (`dns`). It must have a public
+     * address.
+     */
+    target: string;
+};
+
 export type CreateTeamMemberRequest = {
     role: TeamRole;
     user_id: number;
@@ -11725,6 +11774,18 @@ export type DnsChangesResponse = {
      */
     removed_ids: Array<number>;
 };
+
+export type DnsCheck = {
+    /**
+     * Up when any answer equals one of these (case-insensitive, trailing
+     * dot ignored). Empty: up when the name has any record of the type.
+     */
+    expected?: Array<string>;
+    record_type: DnsCheckRecordType;
+    timeout_ms?: number | null;
+};
+
+export type DnsCheckRecordType = 'A' | 'AAAA' | 'CNAME' | 'MX' | 'TXT' | 'NS';
 
 export type DnsCompletionResponse = {
     domain: string;
@@ -18173,6 +18234,24 @@ export type HttpChallengeDebugResponse = {
     validation_url?: string | null;
 };
 
+export type HttpCheck = {
+    /**
+     * Slower than this many milliseconds is degraded, not up.
+     */
+    degraded_after_ms?: number | null;
+    /**
+     * Status codes that count as up: exact codes ("204") or classes
+     * ("2xx"). Empty: any 2xx or 3xx.
+     */
+    expected_status?: Array<string>;
+    keyword?: KeywordAssertion | null;
+    method?: HttpMethod;
+    /**
+     * Time limit of one request, 500 to 30,000 ms (default 10,000).
+     */
+    timeout_ms?: number | null;
+};
+
 export type HttpCheckList = {
     items: Array<HttpCheckView>;
     page: number;
@@ -18222,6 +18301,8 @@ export type HttpChecksCapabilities = {
     alerts_setup_path: string;
     detection_rule_count: number;
 };
+
+export type HttpMethod = 'GET' | 'HEAD' | 'POST' | 'PUT' | 'PATCH' | 'DELETE' | 'OPTIONS';
 
 /**
  * What a tunnel address answers at Cloudflare's edge, as the user chose
@@ -19823,6 +19904,22 @@ export type KeysResponse = {
      * List of matching keys
      */
     keys: Array<string>;
+};
+
+/**
+ * Text that must, or must not, appear in the response body.
+ */
+export type KeywordAssertion = {
+    /**
+     * `true`: the check fails unless the text is there. `false`: it fails
+     * when the text is there (e.g. "maintenance mode").
+     */
+    present?: boolean;
+    /**
+     * Case-sensitive, at most 200 characters. Only the first 256 KiB of
+     * the body is searched, and the body is never stored.
+     */
+    text: string;
 };
 
 export type KillJobBody = {
@@ -21770,6 +21867,26 @@ export type ModelUsage = {
     total_tokens: number;
 };
 
+/**
+ * What a monitor checks. `Environment` is the probe of a Temps
+ * environment; the others check an explicit target.
+ */
+export type MonitorCheckKind = 'environment' | 'http' | 'tcp' | 'tls' | 'dns';
+
+/**
+ * How a monitor outside Temps is checked. Header values are not included.
+ */
+export type MonitorCheckView = {
+    check: CheckSpec;
+    has_body: boolean;
+    /**
+     * Names of the request headers sent; their values are stored
+     * encrypted.
+     */
+    header_names: Array<string>;
+    target: string;
+};
+
 export type MonitorConfig = {
     checkin_margin?: number;
     failure_issue_threshold?: number;
@@ -21780,7 +21897,13 @@ export type MonitorConfig = {
 };
 
 export type MonitorResponse = {
+    check?: MonitorCheckView | null;
     check_interval_seconds: number;
+    /**
+     * `environment` for a monitor of a Temps environment, otherwise the
+     * check run against `check.target` (ADR 108 D3, D4).
+     */
+    check_kind: MonitorCheckKind;
     check_path?: string | null;
     created_at: string;
     environment_id?: number | null;
@@ -35372,6 +35495,14 @@ export type TargetRecommendation = {
     yearly_savings_usd?: number | null;
 };
 
+export type TcpCheck = {
+    /**
+     * Slower than this many milliseconds to connect is degraded.
+     */
+    degraded_after_ms?: number | null;
+    timeout_ms?: number | null;
+};
+
 export type TeamListResponse = {
     page: number;
     page_size: number;
@@ -36234,6 +36365,15 @@ export type TimeseriesQueryParams = {
      * Filter by user ID
      */
     user_id?: number | null;
+};
+
+export type TlsCheck = {
+    timeout_ms?: number | null;
+    /**
+     * A certificate expiring within this many days is degraded
+     * (default 14, at most 90). An expired or untrusted one is down.
+     */
+    warn_days?: number | null;
 };
 
 export type TlsMode = 'None' | 'Starttls' | 'Tls';
@@ -38661,6 +38801,18 @@ export type UpdateSubscriptionSettingsRequest = {
      * From address at a verified email domain; an empty string clears it.
      */
     sender?: string | null;
+};
+
+export type UpdateTargetMonitorRequest = {
+    check?: CheckSpec | null;
+    check_interval_seconds?: number | null;
+    /**
+     * `false` pauses the monitor.
+     */
+    is_active?: boolean | null;
+    name?: string | null;
+    request?: CheckRequest | null;
+    target?: string | null;
 };
 
 export type UpdateTeamRequest = {
@@ -88586,6 +88738,106 @@ export type CreateMonitorResponses = {
 };
 
 export type CreateMonitorResponse = CreateMonitorResponses[keyof CreateMonitorResponses];
+
+export type CreateTargetMonitorData = {
+    body: CreateTargetMonitorRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/monitors/targets';
+};
+
+export type CreateTargetMonitorErrors = {
+    /**
+     * Invalid target or check, or a non-public address
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Project not found
+     */
+    404: unknown;
+    /**
+     * The project has too many target monitors
+     */
+    409: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type CreateTargetMonitorResponses = {
+    /**
+     * Monitor created
+     */
+    201: MonitorResponse;
+};
+
+export type CreateTargetMonitorResponse = CreateTargetMonitorResponses[keyof CreateTargetMonitorResponses];
+
+export type UpdateTargetMonitorData = {
+    body: UpdateTargetMonitorRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Monitor ID
+         */
+        monitor_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/monitors/{monitor_id}/target';
+};
+
+export type UpdateTargetMonitorErrors = {
+    /**
+     * Invalid target or check, or a non-public address
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Monitor not found in the project
+     */
+    404: unknown;
+    /**
+     * The monitor checks a Temps environment
+     */
+    409: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UpdateTargetMonitorResponses = {
+    /**
+     * Monitor updated
+     */
+    200: MonitorResponse;
+};
+
+export type UpdateTargetMonitorResponse = UpdateTargetMonitorResponses[keyof UpdateTargetMonitorResponses];
 
 export type ObservabilityListEventsData = {
     body?: never;

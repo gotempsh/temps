@@ -31,7 +31,7 @@ pub const MAX_TLS_WARN_DAYS: u32 = 90;
 /// environment; the others check an explicit target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum CheckKind {
+pub enum MonitorCheckKind {
     Environment,
     Http,
     Tcp,
@@ -39,7 +39,7 @@ pub enum CheckKind {
     Dns,
 }
 
-impl CheckKind {
+impl MonitorCheckKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Environment => "environment",
@@ -145,7 +145,7 @@ pub struct TlsCheck {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "UPPERCASE")]
-pub enum DnsRecordType {
+pub enum DnsCheckRecordType {
     A,
     Aaaa,
     Cname,
@@ -154,7 +154,7 @@ pub enum DnsRecordType {
     Ns,
 }
 
-impl DnsRecordType {
+impl DnsCheckRecordType {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::A => "A",
@@ -169,7 +169,7 @@ impl DnsRecordType {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct DnsCheck {
-    pub record_type: DnsRecordType,
+    pub record_type: DnsCheckRecordType,
     /// Up when any answer equals one of these (case-insensitive, trailing
     /// dot ignored). Empty: up when the name has any record of the type.
     #[serde(default)]
@@ -189,12 +189,12 @@ pub enum CheckSpec {
 }
 
 impl CheckSpec {
-    pub fn kind(&self) -> CheckKind {
+    pub fn kind(&self) -> MonitorCheckKind {
         match self {
-            Self::Http(_) => CheckKind::Http,
-            Self::Tcp(_) => CheckKind::Tcp,
-            Self::Tls(_) => CheckKind::Tls,
-            Self::Dns(_) => CheckKind::Dns,
+            Self::Http(_) => MonitorCheckKind::Http,
+            Self::Tcp(_) => MonitorCheckKind::Tcp,
+            Self::Tls(_) => MonitorCheckKind::Tls,
+            Self::Dns(_) => MonitorCheckKind::Dns,
         }
     }
 
@@ -227,7 +227,7 @@ pub struct StoredCheck {
 /// One HTTP request header. The value is stored encrypted and never
 /// returned.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct RequestHeader {
+pub struct CheckRequestHeader {
     pub name: String,
     pub value: String,
 }
@@ -236,7 +236,7 @@ pub struct RequestHeader {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
 pub struct CheckRequest {
     #[serde(default)]
-    pub headers: Vec<RequestHeader>,
+    pub headers: Vec<CheckRequestHeader>,
     #[serde(default)]
     pub body: Option<String>,
 }
@@ -343,7 +343,7 @@ fn parse_host_port(raw: &str, default_port: Option<u16>) -> Result<Target, Check
 }
 
 /// Parse and validate `raw` as the target of a `kind` check.
-pub fn parse_target(kind: CheckKind, raw: &str) -> Result<Target, CheckConfigError> {
+pub fn parse_target(kind: MonitorCheckKind, raw: &str) -> Result<Target, CheckConfigError> {
     let raw = raw.trim();
     if raw.is_empty() {
         return Err(invalid("target", "the target is empty"));
@@ -358,11 +358,11 @@ pub fn parse_target(kind: CheckKind, raw: &str) -> Result<Target, CheckConfigErr
         return Err(invalid("target", "the target contains control characters"));
     }
     match kind {
-        CheckKind::Environment => Err(invalid(
+        MonitorCheckKind::Environment => Err(invalid(
             "target",
             "an environment monitor checks its environment, not a target",
         )),
-        CheckKind::Http => {
+        MonitorCheckKind::Http => {
             let url = reqwest::Url::parse(raw)
                 .map_err(|e| invalid("target", format!("'{raw}' is not a URL: {e}")))?;
             if !matches!(url.scheme(), "http" | "https") {
@@ -385,9 +385,9 @@ pub fn parse_target(kind: CheckKind, raw: &str) -> Result<Target, CheckConfigErr
             }
             Ok(Target::Url(url))
         }
-        CheckKind::Tcp => parse_host_port(raw, None),
-        CheckKind::Tls => parse_host_port(raw, Some(443)),
-        CheckKind::Dns => {
+        MonitorCheckKind::Tcp => parse_host_port(raw, None),
+        MonitorCheckKind::Tls => parse_host_port(raw, Some(443)),
+        MonitorCheckKind::Dns => {
             if raw.contains("://") || raw.contains('/') || raw.contains(':') {
                 return Err(invalid(
                     "target",
@@ -543,13 +543,13 @@ pub fn validate_spec(
                     ));
                 }
                 match dns.record_type {
-                    DnsRecordType::A if value.parse::<std::net::Ipv4Addr>().is_err() => {
+                    DnsCheckRecordType::A if value.parse::<std::net::Ipv4Addr>().is_err() => {
                         return Err(invalid(
                             "expected",
                             format!("'{value}' is not an IPv4 address"),
                         ));
                     }
-                    DnsRecordType::Aaaa if value.parse::<std::net::Ipv6Addr>().is_err() => {
+                    DnsCheckRecordType::Aaaa if value.parse::<std::net::Ipv6Addr>().is_err() => {
                         return Err(invalid(
                             "expected",
                             format!("'{value}' is not an IPv6 address"),
@@ -652,47 +652,51 @@ mod tests {
     #[test]
     fn targets_are_parsed_per_kind() {
         assert_eq!(
-            parse_target(CheckKind::Http, " https://api.example.com/health ")
+            parse_target(MonitorCheckKind::Http, " https://api.example.com/health ")
                 .expect("http")
                 .stored(),
             "https://api.example.com/health"
         );
         assert_eq!(
-            parse_target(CheckKind::Tcp, "DB.Example.com:5432")
+            parse_target(MonitorCheckKind::Tcp, "DB.Example.com:5432")
                 .expect("tcp")
                 .stored(),
             "db.example.com:5432"
         );
         assert_eq!(
-            parse_target(CheckKind::Tls, "example.com")
+            parse_target(MonitorCheckKind::Tls, "example.com")
                 .expect("tls")
                 .stored(),
             "example.com:443"
         );
         assert_eq!(
-            parse_target(CheckKind::Tcp, "[2001:db8::1]:22")
+            parse_target(MonitorCheckKind::Tcp, "[2001:db8::1]:22")
                 .expect("v6")
                 .stored(),
             "[2001:db8::1]:22"
         );
         assert_eq!(
-            parse_target(CheckKind::Dns, "example.com.")
+            parse_target(MonitorCheckKind::Dns, "example.com.")
                 .expect("dns")
                 .stored(),
             "example.com"
         );
         for (kind, raw, reason) in [
-            (CheckKind::Http, "ftp://example.com", "http://"),
-            (CheckKind::Http, "https://u:p@example.com", "credentials"),
-            (CheckKind::Http, "https://example.com/#x", "fragment"),
-            (CheckKind::Tcp, "example.com", "add a port"),
-            (CheckKind::Tcp, "example.com:0", "not a port"),
-            (CheckKind::Tcp, "2001:db8::1:22", "brackets"),
-            (CheckKind::Tcp, "bad_host!:22", "not a valid host"),
-            (CheckKind::Dns, "https://example.com", "host name"),
-            (CheckKind::Dns, "192.0.2.1", "not an address"),
-            (CheckKind::Environment, "x", "environment"),
-            (CheckKind::Http, "", "empty"),
+            (MonitorCheckKind::Http, "ftp://example.com", "http://"),
+            (
+                MonitorCheckKind::Http,
+                "https://u:p@example.com",
+                "credentials",
+            ),
+            (MonitorCheckKind::Http, "https://example.com/#x", "fragment"),
+            (MonitorCheckKind::Tcp, "example.com", "add a port"),
+            (MonitorCheckKind::Tcp, "example.com:0", "not a port"),
+            (MonitorCheckKind::Tcp, "2001:db8::1:22", "brackets"),
+            (MonitorCheckKind::Tcp, "bad_host!:22", "not a valid host"),
+            (MonitorCheckKind::Dns, "https://example.com", "host name"),
+            (MonitorCheckKind::Dns, "192.0.2.1", "not an address"),
+            (MonitorCheckKind::Environment, "x", "environment"),
+            (MonitorCheckKind::Http, "", "empty"),
         ] {
             let err = parse_target(kind, raw).expect_err(raw);
             assert!(err.to_string().contains(reason), "{raw}: {err}");
@@ -756,7 +760,7 @@ mod tests {
         )
         .contains("HEAD"));
         let header = |name: &str| CheckRequest {
-            headers: vec![RequestHeader {
+            headers: vec![CheckRequestHeader {
                 name: name.into(),
                 value: "x".into(),
             }],
@@ -785,7 +789,7 @@ mod tests {
     fn dns_expectations_match_the_record_type() {
         let ok = validate_spec(
             CheckSpec::Dns(DnsCheck {
-                record_type: DnsRecordType::Cname,
+                record_type: DnsCheckRecordType::Cname,
                 expected: vec!["Edge.Example.NET.".into()],
                 timeout_ms: None,
             }),
@@ -795,14 +799,14 @@ mod tests {
         assert_eq!(
             ok,
             CheckSpec::Dns(DnsCheck {
-                record_type: DnsRecordType::Cname,
+                record_type: DnsCheckRecordType::Cname,
                 expected: vec!["edge.example.net".into()],
                 timeout_ms: None
             })
         );
         let err = validate_spec(
             CheckSpec::Dns(DnsCheck {
-                record_type: DnsRecordType::A,
+                record_type: DnsCheckRecordType::A,
                 expected: vec!["example.com".into()],
                 timeout_ms: None,
             }),
@@ -833,7 +837,10 @@ mod tests {
             serde_json::from_value::<CheckSpec>(json).expect("back"),
             spec
         );
-        assert_eq!(CheckKind::from_stored("dns"), CheckKind::Dns);
-        assert_eq!(CheckKind::from_stored("web"), CheckKind::Environment);
+        assert_eq!(MonitorCheckKind::from_stored("dns"), MonitorCheckKind::Dns);
+        assert_eq!(
+            MonitorCheckKind::from_stored("web"),
+            MonitorCheckKind::Environment
+        );
     }
 }

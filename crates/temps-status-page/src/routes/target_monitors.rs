@@ -25,9 +25,10 @@ use utoipa::OpenApi;
 
 use super::audit::{TargetMonitorAction, TargetMonitorAudit};
 use crate::services::checks::{
-    CheckKind, CheckRequest, CheckSpec, CreateTargetMonitorRequest, DnsCheck, DnsRecordType,
-    HttpCheck, HttpMethod, KeywordAssertion, MonitorCheckView, RequestHeader, TargetMonitorError,
-    TargetMonitorService, TcpCheck, TlsCheck, UpdateTargetMonitorRequest,
+    CheckRequest, CheckRequestHeader, CheckSpec, CreateTargetMonitorRequest, DnsCheck,
+    DnsCheckRecordType, HttpCheck, HttpMethod, KeywordAssertion, MonitorCheckKind,
+    MonitorCheckView, TargetMonitorError, TargetMonitorService, TcpCheck, TlsCheck,
+    UpdateTargetMonitorRequest,
 };
 use crate::services::MonitorResponse;
 
@@ -82,7 +83,7 @@ impl From<TargetMonitorError> for Problem {
 fn target_host(monitor: &MonitorResponse) -> Option<String> {
     let target = &monitor.check.as_ref()?.target;
     match monitor.check_kind {
-        CheckKind::Http => reqwest::Url::parse(target)
+        MonitorCheckKind::Http => reqwest::Url::parse(target)
             .ok()
             .and_then(|url| url.host_str().map(str::to_string)),
         _ => Some(target.clone()),
@@ -245,17 +246,17 @@ pub fn create_target_monitor_router(state: Arc<TargetMonitorRoutesState>) -> Rou
         CreateTargetMonitorRequest,
         UpdateTargetMonitorRequest,
         MonitorCheckView,
-        CheckKind,
+        MonitorCheckKind,
         CheckSpec,
         CheckRequest,
-        RequestHeader,
+        CheckRequestHeader,
         HttpCheck,
         HttpMethod,
         KeywordAssertion,
         TcpCheck,
         TlsCheck,
         DnsCheck,
-        DnsRecordType,
+        DnsCheckRecordType,
     ))
 )]
 pub struct TargetMonitorApiDoc;

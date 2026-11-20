@@ -19,7 +19,7 @@ use tracing::info;
 use super::error::{CheckConfigError, TargetMonitorError};
 use super::runner::TargetChecks;
 use super::spec::{
-    parse_target, validate_spec, CheckKind, CheckRequest, CheckSpec, StoredCheck, Target,
+    parse_target, validate_spec, CheckRequest, CheckSpec, MonitorCheckKind, StoredCheck, Target,
 };
 use super::types::{CreateTargetMonitorRequest, UpdateTargetMonitorRequest};
 use crate::services::types::{normalize_check_interval_seconds, DEFAULT_CHECK_INTERVAL_SECS};
@@ -172,7 +172,7 @@ impl TargetMonitorService {
             .ok_or(TargetMonitorError::ProjectNotFound { project_id })?;
         let existing = status_monitors::Entity::find()
             .filter(status_monitors::Column::ProjectId.eq(project_id))
-            .filter(status_monitors::Column::CheckKind.ne(CheckKind::Environment.as_str()))
+            .filter(status_monitors::Column::CheckKind.ne(MonitorCheckKind::Environment.as_str()))
             .count(&txn)
             .await?;
         if existing >= MAX_TARGET_MONITORS_PER_PROJECT {
@@ -224,7 +224,7 @@ impl TargetMonitorService {
             .one(self.db.as_ref())
             .await?
             .ok_or(TargetMonitorError::NotFound { monitor_id })?;
-        if CheckKind::from_stored(&model.check_kind) == CheckKind::Environment {
+        if MonitorCheckKind::from_stored(&model.check_kind) == MonitorCheckKind::Environment {
             return Err(TargetMonitorError::NotTargetMonitor { monitor_id });
         }
         let current = self.checks.decode(&model)?;
@@ -237,7 +237,7 @@ impl TargetMonitorService {
         };
         let check_request = match (request.request, kind) {
             (Some(new), _) => new,
-            (None, CheckKind::Http) => current.request.clone(),
+            (None, MonitorCheckKind::Http) => current.request.clone(),
             (None, _) => CheckRequest::default(),
         };
         let spec = validate_spec(spec, &check_request).map_err(config(project_id))?;

@@ -10,7 +10,7 @@ use temps_entities::status_monitors;
 
 use super::error::TargetMonitorError;
 use super::probe::{ProbeOutcome, TargetProber};
-use super::spec::{parse_target, CheckKind, CheckRequest, StoredCheck, Target};
+use super::spec::{parse_target, CheckRequest, MonitorCheckKind, StoredCheck, Target};
 
 /// A target monitor's check, decoded from its row.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,8 +43,8 @@ impl TargetChecks {
             monitor_id: monitor.id,
             reason,
         };
-        let kind = CheckKind::from_stored(&monitor.check_kind);
-        if kind == CheckKind::Environment {
+        let kind = MonitorCheckKind::from_stored(&monitor.check_kind);
+        if kind == MonitorCheckKind::Environment {
             return Err(TargetMonitorError::NotTargetMonitor {
                 monitor_id: monitor.id,
             });

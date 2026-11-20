@@ -10614,6 +10614,129 @@
         ],
         "type": "string"
       },
+      "CheckRequest": {
+        "description": "The secret part of an HTTP check: headers and body, encrypted at rest.",
+        "properties": {
+          "body": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "headers": {
+            "items": {
+              "$ref": "#/components/schemas/CheckRequestHeader"
+            },
+            "type": "array"
+          }
+        },
+        "type": "object"
+      },
+      "CheckRequestHeader": {
+        "description": "One HTTP request header. The value is stored encrypted and never\nreturned.",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "value": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "value"
+        ],
+        "type": "object"
+      },
+      "CheckSpec": {
+        "description": "A target monitor's check, one shape per kind.",
+        "oneOf": [
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/HttpCheck"
+              },
+              {
+                "properties": {
+                  "kind": {
+                    "enum": [
+                      "http"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind"
+                ],
+                "type": "object"
+              }
+            ]
+          },
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/TcpCheck"
+              },
+              {
+                "properties": {
+                  "kind": {
+                    "enum": [
+                      "tcp"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind"
+                ],
+                "type": "object"
+              }
+            ]
+          },
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/TlsCheck"
+              },
+              {
+                "properties": {
+                  "kind": {
+                    "enum": [
+                      "tls"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind"
+                ],
+                "type": "object"
+              }
+            ]
+          },
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/DnsCheck"
+              },
+              {
+                "properties": {
+                  "kind": {
+                    "enum": [
+                      "dns"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind"
+                ],
+                "type": "object"
+              }
+            ]
+          }
+        ]
+      },
       "CheckStatus": {
         "enum": [
           "healthy",
@@ -19711,6 +19834,46 @@
         ],
         "type": "object"
       },
+      "CreateTargetMonitorRequest": {
+        "properties": {
+          "check": {
+            "$ref": "#/components/schemas/CheckSpec"
+          },
+          "check_interval_seconds": {
+            "description": "How often to check, in seconds (default 60, at least 30).",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "name": {
+            "description": "Shown in the console and, unless renamed there, on status pages.",
+            "type": "string"
+          },
+          "request": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/CheckRequest",
+                "description": "Headers and body of an HTTP check. Stored encrypted; header values\nare never returned."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "target": {
+            "description": "What to check: a URL (`http`), `host:port` (`tcp`, `tls`; `tls`\ndefaults to 443) or a host name (`dns`). It must have a public\naddress.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "target",
+          "check"
+        ],
+        "type": "object"
+      },
       "CreateTeamMemberRequest": {
         "properties": {
           "role": {
@@ -24330,6 +24493,43 @@
           "removed_ids"
         ],
         "type": "object"
+      },
+      "DnsCheck": {
+        "properties": {
+          "expected": {
+            "description": "Up when any answer equals one of these (case-insensitive, trailing\ndot ignored). Empty: up when the name has any record of the type.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "record_type": {
+            "$ref": "#/components/schemas/DnsCheckRecordType"
+          },
+          "timeout_ms": {
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "record_type"
+        ],
+        "type": "object"
+      },
+      "DnsCheckRecordType": {
+        "enum": [
+          "A",
+          "AAAA",
+          "CNAME",
+          "MX",
+          "TXT",
+          "NS"
+        ],
+        "type": "string"
       },
       "DnsCompletionResponse": {
         "properties": {
@@ -38953,6 +39153,49 @@
         ],
         "type": "object"
       },
+      "HttpCheck": {
+        "properties": {
+          "degraded_after_ms": {
+            "description": "Slower than this many milliseconds is degraded, not up.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "expected_status": {
+            "description": "Status codes that count as up: exact codes (\"204\") or classes\n(\"2xx\"). Empty: any 2xx or 3xx.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "keyword": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/KeywordAssertion"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "method": {
+            "$ref": "#/components/schemas/HttpMethod"
+          },
+          "timeout_ms": {
+            "description": "Time limit of one request, 500 to 30,000 ms (default 10,000).",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "HttpCheckList": {
         "properties": {
           "items": {
@@ -39147,6 +39390,18 @@
           "alerts_setup_path"
         ],
         "type": "object"
+      },
+      "HttpMethod": {
+        "enum": [
+          "GET",
+          "HEAD",
+          "POST",
+          "PUT",
+          "PATCH",
+          "DELETE",
+          "OPTIONS"
+        ],
+        "type": "string"
       },
       "HttpPolicy": {
         "description": "What a tunnel address answers at Cloudflare's edge, as the user chose\nit (ADR 070 D1). Stored on the address (`project_custom_domains.\nhttp_policy`); `None` there means never chosen, and nothing is changed\nfor such an address until a run records a choice.",
@@ -42614,6 +42869,23 @@
         },
         "required": [
           "keys"
+        ],
+        "type": "object"
+      },
+      "KeywordAssertion": {
+        "description": "Text that must, or must not, appear in the response body.",
+        "properties": {
+          "present": {
+            "description": "`true`: the check fails unless the text is there. `false`: it fails\nwhen the text is there (e.g. \"maintenance mode\").",
+            "type": "boolean"
+          },
+          "text": {
+            "description": "Case-sensitive, at most 200 characters. Only the first 256 KiB of\nthe body is searched, and the body is never stored.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "text"
         ],
         "type": "object"
       },
@@ -47094,6 +47366,45 @@
         ],
         "type": "object"
       },
+      "MonitorCheckKind": {
+        "description": "What a monitor checks. `Environment` is the probe of a Temps\nenvironment; the others check an explicit target.",
+        "enum": [
+          "environment",
+          "http",
+          "tcp",
+          "tls",
+          "dns"
+        ],
+        "type": "string"
+      },
+      "MonitorCheckView": {
+        "description": "How a monitor outside Temps is checked. Header values are not included.",
+        "properties": {
+          "check": {
+            "$ref": "#/components/schemas/CheckSpec"
+          },
+          "has_body": {
+            "type": "boolean"
+          },
+          "header_names": {
+            "description": "Names of the request headers sent; their values are stored\nencrypted.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "target": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "target",
+          "check",
+          "header_names",
+          "has_body"
+        ],
+        "type": "object"
+      },
       "MonitorConfig": {
         "additionalProperties": false,
         "properties": {
@@ -47131,9 +47442,24 @@
       },
       "MonitorResponse": {
         "properties": {
+          "check": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/MonitorCheckView",
+                "description": "How a monitor outside Temps is checked; `null` for an environment\nmonitor."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "check_interval_seconds": {
             "format": "int32",
             "type": "integer"
+          },
+          "check_kind": {
+            "$ref": "#/components/schemas/MonitorCheckKind",
+            "description": "`environment` for a monitor of a Temps environment, otherwise the\ncheck run against `check.target` (ADR 108 D3, D4)."
           },
           "check_path": {
             "type": [
@@ -47196,6 +47522,7 @@
           "name",
           "monitor_type",
           "monitor_url",
+          "check_kind",
           "check_interval_seconds",
           "is_active",
           "created_at",
@@ -75610,6 +75937,28 @@
         ],
         "type": "object"
       },
+      "TcpCheck": {
+        "properties": {
+          "degraded_after_ms": {
+            "description": "Slower than this many milliseconds to connect is degraded.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "timeout_ms": {
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "TeamListResponse": {
         "properties": {
           "page": {
@@ -77254,6 +77603,28 @@
           "user_id": {
             "description": "Filter by user ID",
             "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "TlsCheck": {
+        "properties": {
+          "timeout_ms": {
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "warn_days": {
+            "description": "A certificate expiring within this many days is degraded\n(default 14, at most 90). An expired or untrusted one is down.",
+            "format": "int32",
+            "minimum": 0,
             "type": [
               "integer",
               "null"
@@ -82517,6 +82888,59 @@
           },
           "sender": {
             "description": "From address at a verified email domain; an empty string clears it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "UpdateTargetMonitorRequest": {
+        "properties": {
+          "check": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/CheckSpec",
+                "description": "Replaces the check, and may change its kind; the target must fit."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "check_interval_seconds": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "is_active": {
+            "description": "`false` pauses the monitor.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "request": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/CheckRequest",
+                "description": "Replaces every header and the body. Omit to keep them."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "target": {
             "type": [
               "string",
               "null"
@@ -167048,6 +167472,150 @@
           }
         ],
         "summary": "Create a new monitor",
+        "tags": [
+          "Status Page"
+        ]
+      }
+    },
+    "/projects/{project_id}/monitors/targets": {
+      "post": {
+        "description": "Checks a URL (`http`), a port (`tcp`), a TLS certificate (`tls`) or a\nDNS record (`dns`) that is not a Temps environment. The target must have\na public address. The first check runs within about 15 seconds.",
+        "operationId": "create_target_monitor",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateTargetMonitorRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MonitorResponse"
+                }
+              }
+            },
+            "description": "Monitor created"
+          },
+          "400": {
+            "description": "Invalid target or check, or a non-public address"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Project not found"
+          },
+          "409": {
+            "description": "The project has too many target monitors"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Monitor a target outside Temps",
+        "tags": [
+          "Status Page"
+        ]
+      }
+    },
+    "/projects/{project_id}/monitors/{monitor_id}/target": {
+      "patch": {
+        "description": "Fields left out keep their value. `request` replaces every header and the\nbody. Changing the check may change its kind; the target must fit it.",
+        "operationId": "update_target_monitor",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Monitor ID",
+            "in": "path",
+            "name": "monitor_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateTargetMonitorRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MonitorResponse"
+                }
+              }
+            },
+            "description": "Monitor updated"
+          },
+          "400": {
+            "description": "Invalid target or check, or a non-public address"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Monitor not found in the project"
+          },
+          "409": {
+            "description": "The monitor checks a Temps environment"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Change a monitor of a target outside Temps",
         "tags": [
           "Status Page"
         ]
