@@ -5,6 +5,7 @@ import { useState } from 'react'
 import { Code2, ScrollText } from 'lucide-react'
 import { Link } from 'react-router'
 import { Button } from '@/components/ui/button'
+import { Collapsible, CollapsibleContent } from '@/components/ui/collapsible'
 import { EmptyState } from '@/components/ui/empty-state'
 import {
   CopySetupPromptButton,
@@ -41,6 +42,7 @@ export function LogsEmptyState({
               size="sm"
               variant="outline"
               aria-expanded={showHttp}
+              aria-controls="logs-any-framework-setup"
               onClick={() => setShowHttp((v) => !v)}
             >
               <Code2 className="size-4" />
@@ -50,11 +52,17 @@ export function LogsEmptyState({
           </div>
         }
       />
-      {showHttp && (
-        <div className="rounded-lg border bg-card p-4">
+      {/* Stays mounted while closed, so reopening keeps the chosen tab and
+          the expanded raw HTTP details. */}
+      <Collapsible open={showHttp} onOpenChange={setShowHttp}>
+        <CollapsibleContent
+          forceMount
+          id="logs-any-framework-setup"
+          className="rounded-lg border bg-card p-4 data-[state=closed]:hidden"
+        >
           <PlainHttpSetup project={project} signal="logs" />
-        </div>
-      )}
+        </CollapsibleContent>
+      </Collapsible>
     </div>
   )
 }
