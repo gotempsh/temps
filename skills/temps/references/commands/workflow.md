@@ -28,6 +28,8 @@ List workflows/agents available on this project
 
 Trigger a workflow and stream its output
 
+**Usage:** `workflow run [slug] [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |

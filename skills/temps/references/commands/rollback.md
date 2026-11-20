@@ -8,6 +8,8 @@ Apply [the CLI runtime and safety contract](../cli-runtime.md) before executing 
 
 Rollback to a previous deployment
 
+**Usage:** `rollback [project] [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |

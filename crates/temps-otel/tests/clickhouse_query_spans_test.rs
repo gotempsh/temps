@@ -595,6 +595,7 @@ fn stats_query(project_ids: Vec<i32>, minutes: i64) -> SpanStatsQuery {
         sort_order: SortOrder::default(),
         limit: None,
         offset: None,
+        apdex_threshold_ms: None,
     }
 }
 
@@ -728,6 +729,33 @@ async fn span_stats_aggregates_and_scopes_to_the_requested_projects_and_window()
     let steady = rows.iter().find(|r| r.span_name == "steady").unwrap();
     assert!(erratic.tail_ratio > steady.tail_ratio);
     assert!(erratic.coefficient_of_variation > steady.coefficient_of_variation);
+    assert_eq!(erratic.apdex, None, "no threshold asked for, no score");
+}
+
+#[tokio::test]
+async fn span_stats_scores_apdex_from_exact_counts() {
+    let Some((storage, _probe, _c)) = seeded_stats().await else {
+        return;
+    };
+    let rows = storage
+        .query_span_stats(SpanStatsQuery {
+            apdex_threshold_ms: Some(100.0),
+            ..stats_query(vec![PROJECT], 60)
+        })
+        .await
+        .expect("query_span_stats");
+    // steady: 100ms satisfies, 101..119ms tolerate. erratic: 40..57ms
+    // satisfy, the two 2s calls frustrate.
+    let steady = rows.iter().find(|r| r.span_name == "steady").unwrap();
+    assert_eq!(steady.satisfied_count, Some(1));
+    assert_eq!(steady.tolerating_count, Some(19));
+    assert_eq!(steady.frustrated_count, Some(0));
+    assert_eq!(steady.apdex, Some(0.525));
+    let erratic = rows.iter().find(|r| r.span_name == "erratic").unwrap();
+    assert_eq!(erratic.satisfied_count, Some(18));
+    assert_eq!(erratic.frustrated_count, Some(2));
+    assert_eq!(erratic.apdex, Some(0.9));
+    assert_eq!(erratic.apdex_threshold_ms, Some(100.0));
 }
 
 #[tokio::test]
@@ -1037,4 +1065,93 @@ async fn span_stats_agrees_between_clickhouse_and_timescaledb() {
             .expect("timescaledb count_span_stats");
         assert_eq!(ch_total, ts_total, "total differs for sort_by {sort_by:?}");
     }
+}
+
+/// `http.target` carries the query string, so a page path matches it with or
+/// without one, and nothing that merely starts with the same characters.
+#[tokio::test]
+async fn query_spans_matches_a_request_path_with_or_without_its_query() {
+    let Some((storage, _probe, _c)) = setup().await else {
+        return;
+    };
+    let targets = [
+        ("p001", "/products/42"),
+        ("p002", "/products/42?ref=home"),
+        ("p003", "/products/42#reviews"),
+        ("p004", "/products/420"),
+        ("p005", "/products/42/reviews"),
+    ];
+    let spans = targets
+        .iter()
+        .enumerate()
+        .map(|(index, (span_id, target))| {
+            span(
+                PROJECT,
+                &format!("eeee{index:04}"),
+                span_id,
+                None,
+                "GET /products/:id",
+                "storefront",
+                SpanStatusCode::Ok,
+                5,
+                20.0,
+                None,
+                &[("http.target", target)],
+            )
+        })
+        .collect();
+    storage.store_spans(spans).await.expect("store spans");
+
+    let mut found = ids(&storage
+        .query_spans(TraceQuery {
+            project_id: PROJECT,
+            start_time: Some(Utc::now() - Duration::hours(1)),
+            attribute_path: Some(temps_otel::types::AttributePath {
+                key: "http.target".to_string(),
+                path: "/products/42".to_string(),
+            }),
+            limit: Some(100),
+            ..Default::default()
+        })
+        .await
+        .expect("path query"));
+    found.sort();
+    assert_eq!(found, vec!["p001", "p002", "p003"]);
+}
+
+/// A bounded trace read returns the first spans by start time and no more.
+#[tokio::test]
+async fn get_trace_spans_reads_only_the_first_spans_of_a_trace() {
+    let Some((storage, _probe, _c)) = setup().await else {
+        return;
+    };
+    let spans = (0..5)
+        .map(|index| {
+            span(
+                PROJECT,
+                "ffff5555",
+                &format!("s{index}"),
+                None,
+                "SELECT row",
+                "storefront",
+                SpanStatusCode::Ok,
+                10 - index,
+                1.0,
+                None,
+                &[],
+            )
+        })
+        .collect();
+    storage.store_spans(spans).await.expect("store spans");
+
+    let first = storage
+        .get_trace_spans(PROJECT, "ffff5555", 3)
+        .await
+        .expect("bounded read");
+    assert_eq!(ids(&first), vec!["s0", "s1", "s2"]);
+    let all = storage
+        .get_trace(PROJECT, "ffff5555")
+        .await
+        .expect("whole trace");
+    assert_eq!(all.len(), 5);
 }

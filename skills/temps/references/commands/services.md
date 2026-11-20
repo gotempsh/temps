@@ -166,6 +166,8 @@ List available service types
 
 Show parameters schema for a service type (useful for automation)
 
+**Usage:** `services types info <type> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -259,6 +261,8 @@ Unlink a service from a project
 ### `services connect`
 
 Get connection info for a service by name or slug
+
+**Usage:** `services connect <name> [options]`
 
 **Options:**
 

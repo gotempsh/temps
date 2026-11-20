@@ -55,6 +55,8 @@ List a bounded page of runs
 
 Get run metadata; payloads require explicit reveal permission
 
+**Usage:** `workflows get <run-id> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -69,6 +71,8 @@ Get run metadata; payloads require explicit reveal permission
 
 Explain run state without decrypting payloads
 
+**Usage:** `workflows diagnose <run-id> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -80,6 +84,8 @@ Explain run state without decrypting payloads
 ### `workflows start`
 
 Start a run with an explicit deduplication key
+
+**Usage:** `workflows start <workflow> [options]`
 
 **Options:**
 
@@ -95,6 +101,8 @@ Start a run with an explicit deduplication key
 
 cancel a run
 
+**Usage:** `workflows cancel <run-id> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -108,6 +116,8 @@ cancel a run
 
 resume a run
 
+**Usage:** `workflows resume <run-id> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -120,6 +130,8 @@ resume a run
 ### `workflows retry`
 
 retry a run
+
+**Usage:** `workflows retry <run-id> [options]`
 
 **Options:**
 
@@ -135,6 +147,8 @@ retry a run
 
 delete a run
 
+**Usage:** `workflows delete <run-id> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -147,6 +161,8 @@ delete a run
 ### `workflows send-event`
 
 Send an event to matching waits
+
+**Usage:** `workflows send-event <name> [options]`
 
 **Options:**
 
@@ -162,6 +178,8 @@ Send an event to matching waits
 
 Poll until terminal or the bounded deadline
 
+**Usage:** `workflows watch <run-id> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -174,6 +192,8 @@ Poll until terminal or the bounded deadline
 ### `workflows init`
 
 Create a Node workflow worker in a new directory
+
+**Usage:** `workflows init <directory> [options]`
 
 **Options:**
 

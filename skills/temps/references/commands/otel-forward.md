@@ -57,6 +57,8 @@ Create a new OTel forwarding destination
 
 Show OTel forwarding destination details
 
+**Usage:** `otel-forward show <id> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -66,6 +68,8 @@ Show OTel forwarding destination details
 ### `otel-forward update`
 
 Update an OTel forwarding destination
+
+**Usage:** `otel-forward update <id> [options]`
 
 **Options:**
 
@@ -91,6 +95,8 @@ Update an OTel forwarding destination
 
 Remove an OTel forwarding destination
 
+**Usage:** `otel-forward remove <id> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -101,6 +107,8 @@ Remove an OTel forwarding destination
 ### `otel-forward test`
 
 Send a test delivery to an OTel forwarding destination
+
+**Usage:** `otel-forward test <id> [options]`
 
 **Options:**
 
@@ -158,6 +166,8 @@ Create a new instance-wide default forwarding destination
 
 Show instance default destination details
 
+**Usage:** `otel-forward instance-default show <id> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -167,6 +177,8 @@ Show instance default destination details
 #### `otel-forward instance-default update`
 
 Update an instance default forwarding destination
+
+**Usage:** `otel-forward instance-default update <id> [options]`
 
 **Options:**
 
@@ -192,6 +204,8 @@ Update an instance default forwarding destination
 
 Remove an instance default forwarding destination
 
+**Usage:** `otel-forward instance-default remove <id> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -202,6 +216,8 @@ Remove an instance default forwarding destination
 #### `otel-forward instance-default test`
 
 Send a test delivery to an instance default forwarding destination
+
+**Usage:** `otel-forward instance-default test <id> [options]`
 
 **Options:**
 

@@ -47,6 +47,7 @@ import {
   Table,
   TableBody,
   TableCell,
+  TableHead,
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
@@ -55,6 +56,7 @@ import {
   type SortDirection,
 } from '@/components/ui/sortable-table-head'
 import { SegmentedControl } from '@/components/ui/segmented-control'
+import { PageBackendSheet } from '@/components/project/PageBackendSheet'
 import { SpeedWorldMap } from '@/components/project/SpeedWorldMap'
 import { cn } from '@/lib/utils'
 import { useQuery } from '@tanstack/react-query'
@@ -65,6 +67,7 @@ import {
   Code2,
   Info,
   Monitor,
+  Server,
   Smartphone,
   X,
   Zap,
@@ -343,6 +346,7 @@ function BreakdownMetricCell({
 
 interface SpeedBreakdownCardProps {
   projectId: number
+  projectSlug: string
   environmentId: number | null
   startDate: string
   endDate: string
@@ -354,6 +358,7 @@ interface SpeedBreakdownCardProps {
 
 function SpeedBreakdownCard({
   projectId,
+  projectSlug,
   environmentId,
   startDate,
   endDate,
@@ -365,6 +370,7 @@ function SpeedBreakdownCard({
   const [dimension, setDimension] = useState<BreakdownDimension>('path')
   const [sortKey, setSortKey] = useState<BreakdownSortKey>('events')
   const [sortDirection, setSortDirection] = useState<SortDirection>('desc')
+  const [backendPath, setBackendPath] = useState<string | null>(null)
 
   const { data, isLoading, isError } = useWindowQuery({
     ...getGroupedPageMetricsOptions({
@@ -497,6 +503,9 @@ function SpeedBreakdownCard({
                       align="right"
                     />
                   ))}
+                  {dimension === 'path' && (
+                    <TableHead className="text-right">Backend</TableHead>
+                  )}
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -527,6 +536,21 @@ function SpeedBreakdownCard({
                       {BREAKDOWN_METRICS.map((m) => (
                         <BreakdownMetricCell key={m} value={g[m]} metric={m} />
                       ))}
+                      {dimension === 'path' && (
+                        <TableCell className="text-right">
+                          {g.group_key.startsWith('/') && (
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              aria-label={`Backend requests for ${g.group_key}`}
+                              onClick={() => setBackendPath(g.group_key)}
+                            >
+                              <Server className="h-3.5 w-3.5" />
+                              <span className="max-sm:sr-only">Backend</span>
+                            </Button>
+                          )}
+                        </TableCell>
+                      )}
                     </TableRow>
                   )
                 })}
@@ -541,6 +565,12 @@ function SpeedBreakdownCard({
           </div>
         )}
       </CardContent>
+      <PageBackendSheet
+        projectId={projectId}
+        projectSlug={projectSlug}
+        path={backendPath}
+        onClose={() => setBackendPath(null)}
+      />
     </Card>
   )
 }
@@ -1021,6 +1051,7 @@ export function ProjectSpeedInsights({ project }: ProjectSpeedInsightsProps) {
           {/* Per-page / per-dimension breakdown */}
           <SpeedBreakdownCard
             projectId={project.id}
+            projectSlug={project.slug}
             environmentId={effectiveEnvironment}
             startDate={startDate}
             endDate={endDate}

@@ -1725,7 +1725,12 @@ impl TempsPlugin for OtelPlugin {
 
             // Create app state for handlers. The `project_access_checker` is
             // injected in `configure_routes` (after all services register).
+            let operation_trends = Arc::new(crate::services::OperationTrendService::new(
+                db.clone(),
+                storage.clone(),
+            ));
             let app_state = OtelAppState {
+                operation_trends: operation_trends.clone(),
                 otel_service: otel_service.clone(),
                 metrics_store: Some(metrics_store.clone()),
                 metrics_write_tx: Some(metrics_write_tx),
@@ -2289,6 +2294,10 @@ impl TempsPlugin for OtelPlugin {
                 });
             }
 
+            // Per-operation hourly rollups behind trends and regressions after
+            // a deployment (ADR 111, D2): a bounded job every 10 minutes.
+            tokio::spawn(operation_trends.run());
+
             // Spawn the metric alert evaluator run loop (evaluator already created above).
             {
                 let evaluator = metric_alert_evaluator;
@@ -2368,7 +2377,11 @@ impl TempsPlugin for OtelPlugin {
     }
 
     fn openapi_schema(&self) -> Option<OpenApi> {
-        Some(<OtelApiDoc as OpenApiTrait>::openapi())
+        let mut doc = <OtelApiDoc as OpenApiTrait>::openapi();
+        doc.merge(
+            <crate::handlers::operation_trends_handler::OperationTrendsApiDoc as OpenApiTrait>::openapi(),
+        );
+        Some(doc)
     }
 }
 

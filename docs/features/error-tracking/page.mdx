@@ -117,17 +117,17 @@ These checks use synthetic applications, real HTTP endpoints, native storage que
 | DSN and transport | Adapted: project-scoped public DSNs, gzip, byte-length envelope framing, mixed items and authenticated tunnels | Public DSNs are write-only. OTLP and management endpoints still require server authentication. |
 | Errors, messages and stacks | Adapted: native error events, groups and stack details | Symbolication depends on available native source artifacts; native crash decoding is separate. |
 | Breadcrumbs, users, tags and contexts | Adapted: error detail payload and native metadata | User/request/browser/runtime fields populate native details; exact user/tag filtering is available on native event queries. Other typed contexts stay in JSON metadata and the original source event. Not every field has a separate index. |
-| Fingerprints and grouping | Adapted: native fingerprints and grouping; concurrent insertion and counts reconciled | Explicit SDK fingerprints and `{{ default }}` are supported. Default grouping uses Temps stack/message normalization, not Sentry server algorithm versions. Grouping configuration APIs are not provided. |
-| Issue APIs and triage | Existing native error list, detail and resolution APIs/UI | Sentry issue APIs are not implemented. |
+| Fingerprints and grouping | Adapted: native fingerprints and grouping; concurrent insertion and counts reconciled; native extension: reversible group merge and fingerprint split | Explicit SDK fingerprints and `{{ default }}` are supported. Default grouping uses Temps stack/message normalization, not Sentry server algorithm versions. Grouping configuration APIs are not provided. A merge or split redirects future events and never rewrites stored ones. |
+| Issue APIs and triage | Existing native error list, detail and resolution APIs/UI; native extension: bulk resolve/reopen/ignore by ID or filter (`POST /projects/{project_id}/error-groups/bulk`, `temps errors bulk`); [resolve in the next release](#resolve-next-release); [assignment to a user or team](#assign) with an assigned-to-me filter; ignore until a time, count or user count; server-side [inbound filters](#inbound-filters) that drop matching events before storage | Sentry issue APIs are not implemented. Bulk requests are capped at 1,000 groups and 50 status-change notifications each. |
 | Alert APIs and alerts | Existing Temps alert rules and alarms; cron health feeds native alarms | Sentry alert APIs are not implemented. Delivery requires a configured provider; external delivery was not verified in the synthetic run. |
 | Debug ID source maps and artifact bundles | Adapted: CLI artifact bundles imported into native source maps; exact Debug ID lookup without a release, including maps uploaded after an error | Full-access project build credential required; public DSNs cannot access artifacts. SYSB v2, stored/deflated ZIP entries, 50 MiB compressed/expanded bundle, 256 files, 128 maps. Symbolication loads at most 32 maps/50 MiB per event; staged chunks expire after one hour (64 MiB/project, 256 MiB globally). Indexed/Hermes/native debug artifacts are outside this contract. |
-| Releases | Native extension: correlate retained errors, logs, spans, metric points, feedback and check-ins by SDK release version | Errors → Releases shows exact counts and native example links in a bounded 1–31 day window. Deployment/finalization, commits and release health are separate workflows. |
-| Tracing | Adapted: transaction events and version-2 batched span items become native spans | Other span versions and Sentry performance product parity are outstanding. |
+| Releases | Native extension: correlate retained errors, logs, spans, metric points, feedback and check-ins by SDK release version | Errors → Releases shows exact counts and native example links in a bounded 1–31 day window. Deployment/finalization and commits are separate workflows; [release health](#release-health) is shown above the table. |
+| Tracing | Adapted: transaction events and version-2 batched span items become native spans; native extension: [performance issues](#performance-issues) (N+1, slow query, consecutive HTTP, large payload), [Apdex](#apdex), [trends and regressions after a deployment](#operation-trends), a [breakdown inside an operation](#operation-breakdown) and [pages joined to their backend requests](#page-backend) | Other span versions are outstanding. Pages are joined to backend requests by path and time, not by trace id. |
 | Structured logs | Adapted: version-1/2 batched `log` items become native telemetry logs; native extension: typed attribute queries and UI | String, boolean, int64 and finite numeric comparisons preserve declared types. Historical rows without type metadata remain available through Any type. Version-2 opt-in IP/UA inference uses trusted request metadata. |
 | Metrics | Adapted: version-1/2 batched `trace_metric` and legacy SDK StatsD counters, gauges and distributions become native metric points | Modern counters are delta monotonic sums; legacy counters are delta up/down sums. Sets, `metric_buckets`, future versions and cumulative Sentry wire formats are unsupported. The current Sentry metrics protocol defines increments rather than cumulative counters. |
 | Replay | Adapted: paired web replay metadata and rrweb recording segments become native visitors and replays | No Temps analytics SDK required. Mobile/video replay is unsupported; technical timeline events are labeled as SDK breadcrumbs, performance measurements, recorder configuration or segment metadata. |
 | Cron monitoring | Native extension: SDK check-ins, interval/crontab schedules, missed-run and timeout detection, native management and run history | Temps observes the existing scheduler; it does not execute jobs. See [Cron monitoring](/docs/monitoring#cron-monitoring). |
-| Release health | Outstanding | Session/aggregate-session payloads, crash-free rates and adoption need separate product work. |
+| Release health | Native extension: `session` and `sessions` items become hourly counters; [crash-free sessions and users, adoption and the deploying release](#release-health) per release, published as metrics for alert rules | Counters only, never individual sessions. Distinct users are an estimate. Sessions on tunneled envelopes without a DSN, older than 5 days or with a release over 250 characters are not counted. |
 | Profiles | Outstanding | Profiling payloads, storage, aggregation and flamegraphs need separate product work. |
 | Feedback | Native extension: modern `feedback` and legacy `user_report` text submissions feed a project inbox with error/replay links, native queries, resolve/reopen/ignore and deletion | Verified Node 8/10/11 and browser 11 modern feedback, plus browser 7 legacy reports. Feedback attachments/screenshots and other SDK families are outside this contract. |
 | Attachments | Outstanding | Binary framing is supported; attachment storage and attachment APIs are not. |
@@ -442,7 +442,45 @@ with sentry_sdk.configure_scope() as scope:
 
 ### Merge & Split Groups
 
-Groups cannot be merged or split after the fact. To change how future events group, send a [custom fingerprint](#custom-fingerprinting) from your SDK: events with the same fingerprint land in one group, and events with different fingerprints are kept apart.
+Two groups that are one bug can be merged, and a group holding two bugs can be split. Both work on the fingerprint aliases ingest already follows, so they change where future events land without rewriting a single stored event.
+
+**Merging** picks one surviving group. The other groups' fingerprints route to it, their counts are added to its own, and they stop appearing in lists. Each merged group keeps its own events and its own count, which is what makes the merge exactly reversible: unmerging moves its fingerprints back and subtracts the count it contributed. Events ingested while it was merged stay in the surviving group, together with the count that covers them. A merge never changes a group's status, so it cannot reopen an issue or fire a regression alert.
+
+**Splitting** moves named fingerprints into a new group, which receives their events from then on. Events already stored stay with the original group, where their stack traces are; the new group starts at zero. List a group's fingerprints first to see what there is to split, and keep at least one behind.
+
+<CodeGroup title="Merge and Split">
+```bash {{ title: 'CLI' }}
+# Merge groups 124 and 131 into group 123
+temps errors merge --project-id 42 --group-id 123 --source-group-ids 124,131
+
+# Undo that for group 124 only
+temps errors unmerge --project-id 42 --group-id 124
+
+# See what a group is made of, then split one fingerprint out
+temps errors fingerprints --project-id 42 --group-id 123
+temps errors split --project-id 42 --group-id 123 \
+  --fingerprints 9f2c... --title "Checkout timeout"
+```
+
+```typescript {{ title: 'API' }}
+// Merge 124 and 131 into 123
+await fetch('https://your-temps-instance.com/api/projects/42/error-groups/123/merge', {
+  method: 'POST',
+  headers: { 'Authorization': `Bearer ${API_KEY}`, 'Content-Type': 'application/json' },
+  body: JSON.stringify({ source_group_ids: [124, 131] })
+});
+
+// Take 124 back out
+await fetch('https://your-temps-instance.com/api/projects/42/error-groups/124/unmerge', {
+  method: 'POST',
+  headers: { 'Authorization': `Bearer ${API_KEY}` }
+});
+```
+</CodeGroup>
+
+A merge takes at most 50 groups per request and a split at most 200 fingerprints. A group that was merged away cannot be merged again, and a group that has absorbed others cannot itself be merged away until those are taken back out, which keeps every alias one step from its original group and unmerging unambiguous. A fingerprint that arrived through a merge belongs to that merge: unmerging moves it back, and a split cannot take it. In the console, select groups on **Errors** and choose Merge; the surviving group's page shows what was merged into it, offers Split, and a merged-away group's page links to its survivor with an Unmerge button.
+
+To change how *future* events group without touching existing groups, send a [custom fingerprint](#custom-fingerprinting) from your SDK: events with the same fingerprint land in one group, and events with different fingerprints are kept apart.
 
 ---
 
@@ -614,7 +652,9 @@ Manage error lifecycle from discovery to resolution.
     Marked as fixed (manually or automatically)
   </Property>
   <Property name="Ignored">
-    Known errors that should be suppressed
+    Known errors that should be suppressed. A plain ignore lasts until the
+    next event, which reopens the group; [ignore conditions](#ignore-until)
+    keep it ignored longer
   </Property>
   <Property name="Regressed">
     Error recurred after being resolved
@@ -648,7 +688,153 @@ await fetch('https://your-temps-instance.com/api/projects/42/error-groups/123', 
 ```
 </CodeGroup>
 
-The CLI and API change one group at a time; to resolve several, run the command once per group ID.
+### Resolve in the Next Release {{ anchor: true, id: 'resolve-next-release' }}
+
+When the fix is merged but not deployed yet, a plain resolve reopens the group on the next event from the release still running. Resolve it **in the next release** instead: the group records the project's newest release at that moment and stays resolved for events from that release, from an older one, and for events with no release. The first event from a newer release reopens it as a regression.
+
+Releases are ordered by the Temps deployment that first carried them. A git deployment's release is its commit SHA (the `SENTRY_RELEASE` Temps injects), so a release that has been deployed but has not sent an event yet still counts as the current one. A release the SDK sets itself, with no matching deployment, is ordered by when Temps first saw it. A project with no release cannot use this option; the request fails and asks for a plain resolve.
+
+<CodeGroup title="Resolve in the Next Release">
+```bash {{ title: 'CLI' }}
+temps errors update --project-id 42 --group-id 123 --status resolved --in-next-release
+
+# Every unresolved match, after a fix is merged
+temps errors bulk --project-id 42 --action resolve --search "cart total" --in-next-release
+```
+
+```typescript {{ title: 'API' }}
+await fetch('https://your-temps-instance.com/api/projects/42/error-groups/123', {
+  method: 'PUT',
+  headers: { 'Authorization': `Bearer ${API_KEY}`, 'Content-Type': 'application/json' },
+  body: JSON.stringify({ status: 'resolved', in_next_release: true })
+});
+```
+</CodeGroup>
+
+The group's `resolution` field shows the release it was resolved after, and the console offers **Resolve in next release** next to **Resolve**. The check runs in the statement that already counts the event, against a per-project release list that ingest adds to once per release. Any other status change, or resolving it again, replaces the condition.
+
+### Assign Groups {{ anchor: true, id: 'assign' }}
+
+A group is assigned to a **user** or a **team**, separately from its status: an assigned group can be resolved or ignored and keeps its assignee. Only users who can open the project can be assigned. A new assignee gets an email when an email provider is configured (a team's members are mailed, up to 50), and `status_change` alert rules that list `assigned` fire, as they did when assignment was a status. Assigning the current assignee again changes nothing and tells nobody.
+
+The error list filters by assignee: **Assigned to me** shows the groups assigned to you or to a team you are in, and **Unassigned** shows the rest. In the API the filter is `assignee=me`, `none`, `user:<id>` or `team:<id>` on `GET /projects/{project_id}/error-groups`.
+
+<CodeGroup title="Assign Groups">
+```bash {{ title: 'CLI' }}
+# Assign to yourself, to a user, to a team, or to nobody
+temps errors assign --project-id 42 --group-id 123 --me
+temps errors assign --project-id 42 --group-id 123 --user-id 7
+temps errors assign --project-id 42 --group-id 123 --team-id 3
+temps errors assign --project-id 42 --group-id 123 --none
+
+# What is on my plate
+temps errors list --project-id 42 --status unresolved --assignee me
+```
+
+```typescript {{ title: 'API' }}
+await fetch('https://your-temps-instance.com/api/projects/42/error-groups/123/assignee', {
+  method: 'PUT',
+  headers: { 'Authorization': `Bearer ${API_KEY}`, 'Content-Type': 'application/json' },
+  body: JSON.stringify({ team_id: 3 })   // or { user_id: 7 }, or {} to unassign
+});
+```
+</CodeGroup>
+
+Earlier versions stored the assignee as free text and used an `assigned` status. Upgrading matches each stored assignee to the user with that email and moves `assigned` groups to `unresolved`, with their assignee. A value that matches no user stays in the read-only `assigned_to` field. The `assigned_to` field of the update request still works, by email, and the status `assigned` is accepted and stored as `unresolved`.
+
+### Comments and Activity {{ anchor: true, id: 'activity' }}
+
+The **Activity** tab of a group shows its history, newest first: who changed its status (and whether it was a bulk action), who assigned it, merges and splits, and each event that reopened a resolved or ignored group, with that event's release. Teammates leave comments there too: what you found, a link to the fix, who is on it. A comment is plain text, up to 10,000 characters, and everyone who can open the project can read it. Its author can edit it; its author or an administrator can delete it. Comment writes are audit-logged, without their text.
+
+<CodeGroup title="Comments and Activity">
+```bash {{ title: 'CLI' }}
+# Comment, edit your comment, delete a comment
+temps errors comment --project-id 42 --group-id 123 --body "Started after the cache change; rolling back"
+temps errors comment --project-id 42 --group-id 123 --edit 9 --body "Rolled back in 2.4.2"
+temps errors comment --project-id 42 --group-id 123 --delete 9
+
+# The history of the group
+temps errors activity --project-id 42 --group-id 123
+```
+
+```typescript {{ title: 'API' }}
+await fetch('https://your-temps-instance.com/api/projects/42/error-groups/123/comments', {
+  method: 'POST',
+  headers: { 'Authorization': `Bearer ${API_KEY}`, 'Content-Type': 'application/json' },
+  body: JSON.stringify({ body: 'Started after the cache change' })
+});
+
+// Newest first; page_size up to 100
+const activity = await fetch(
+  'https://your-temps-instance.com/api/projects/42/error-groups/123/activity?page=1&page_size=20',
+  { headers: { 'Authorization': `Bearer ${API_KEY}` } }
+).then(r => r.json());
+```
+</CodeGroup>
+
+Activity is recorded from this version on; changes made before the upgrade are not in the log. An event that reopens a group is logged once, when it reopens it; ordinary events are never logged here.
+
+### Saved Searches {{ anchor: true, id: 'saved-searches' }}
+
+Set the list's filters (status, assignee, environment, text and sort) and choose **Saved searches → Save the current filters** to keep them under a name. A saved search is yours unless you share it with everyone who can open the project. **Assigned to me** in a shared search means each person's own groups. The time range is not saved, so a search always looks at the range you have open. You can hold 50 saved searches per project. Only the owner can rename or change one; the owner or an administrator can delete a shared one.
+
+<CodeGroup title="Saved Searches">
+```bash {{ title: 'CLI' }}
+# Save a search, list them, and run one (flags you add override it)
+temps errors searches save --project-id 42 --name "Open and mine" --status unresolved --assignee me
+temps errors searches save --project-id 42 --name "Checkout timeouts" --search timeout --shared
+temps errors searches list --project-id 42
+temps errors list --project-id 42 --saved-search 5
+temps errors searches delete --project-id 42 --id 5
+```
+
+```typescript {{ title: 'API' }}
+await fetch('https://your-temps-instance.com/api/projects/42/error-saved-searches', {
+  method: 'POST',
+  headers: { 'Authorization': `Bearer ${API_KEY}`, 'Content-Type': 'application/json' },
+  body: JSON.stringify({
+    name: 'Open and mine',
+    shared: false,
+    filters: { status: 'unresolved', assignee: 'me', sort_by: 'last_seen', sort_order: 'desc' }
+  })
+});
+```
+</CodeGroup>
+
+### Triage Many Groups at Once
+
+One request resolves, reopens or ignores up to 1,000 groups. Select them by ID, or by the same filters the list uses — status, environment, event window and a text search over the title, error type and message. A request carries either IDs or filters, never both.
+
+<CodeGroup title="Bulk Triage">
+```bash {{ title: 'CLI' }}
+# Resolve three groups
+temps errors bulk --project-id 42 --action resolve --group-ids 123,124,131
+
+# Ignore every unresolved group whose message mentions a known-noisy library
+temps errors bulk --project-id 42 --action ignore --status unresolved --search "ResizeObserver"
+
+# Reopen everything that was resolved during the last bad deploy window
+temps errors bulk --project-id 42 --action unresolve \
+  --start-date 2026-11-18T09:00:00Z --end-date 2026-11-18T10:00:00Z
+```
+
+```typescript {{ title: 'API' }}
+// Resolve groups 123, 124 and 131 in project 42
+const response = await fetch('https://your-temps-instance.com/api/projects/42/error-groups/bulk', {
+  method: 'POST',
+  headers: {
+    'Authorization': `Bearer ${API_KEY}`,
+    'Content-Type': 'application/json'
+  },
+  body: JSON.stringify({ action: 'resolve', group_ids: [123, 124, 131] })
+});
+const { updated, updated_ids, skipped, remaining } = await response.json();
+```
+</CodeGroup>
+
+The response says what changed: `updated_ids` are the groups whose status moved, `skipped` counts selected groups that were already in that state (for an ignore with conditions or a resolve in the next release, groups that already hold exactly those conditions), and `remaining` counts matching groups left because this one hit the 1,000-group cap (always `0` when IDs were given). Send the same request again to change them; it moves on to the groups the first one did not reach. An ID that belongs to another project fails the whole request with a 404 and writes nothing. In the console, select groups with the checkboxes on **Errors** and use the bar above the list.
+
+A bulk request is audit-logged once, with the selection it was given and the groups it changed. `status_change` alert rules are evaluated for the groups that changed, and at most 50 notifications are delivered per request so a single triage click cannot fan out into thousands; the groups beyond that cap are not recorded as fired and stay eligible next time.
 
 ### Auto-Resolution
 
@@ -711,9 +897,259 @@ temps errors update --project-id 42 --group-id 123 --status ignored
 ```
 </CodeGroup>
 
-Ignoring by message pattern is done in the SDK with `ignoreErrors`, as shown above; the server has no pattern rules.
+### Ignore Until {{ anchor: true, id: 'ignore-until' }}
+
+A plain ignore lasts until the next event: that event reopens the group, exactly as a resolved group reopens. To keep a group quiet for longer, ignore it with conditions. It then stays ignored, still counting every event, until **any one** of them is met:
+
+| Condition | API field | CLI flag | Comes back when |
+|---|---|---|---|
+| For a while | `until` (time, at most 366 days ahead) | `--ignore-for 7d` or `--ignore-until <ISO 8601>` | the first event after that time |
+| N more times | `event_count` (1–1,000,000) | `--ignore-count 100` | the Nth event after the ignore |
+| N new users | `user_count` (1–10,000) | `--ignore-users 10` | the Nth distinct user affected after the ignore |
+| Forever | `forever: true` | `--ignore-forever` | never on its own; reopen it by hand |
+
+<CodeGroup title="Ignore Until">
+```bash {{ title: 'CLI' }}
+# Quiet for a week, or until it happens 100 more times
+temps errors update --project-id 42 --group-id 123 --status ignored \
+  --ignore-for 7d --ignore-count 100
+
+# Ignore every match until it reaches 10 new users
+temps errors bulk --project-id 42 --action ignore --search "ResizeObserver" --ignore-users 10
+```
+
+```typescript {{ title: 'API' }}
+await fetch('https://your-temps-instance.com/api/projects/42/error-groups/123', {
+  method: 'PUT',
+  headers: { 'Authorization': `Bearer ${API_KEY}`, 'Content-Type': 'application/json' },
+  body: JSON.stringify({ status: 'ignored', ignore: { event_count: 100, until: '2026-12-01T00:00:00Z' } })
+});
+```
+</CodeGroup>
+
+The conditions are checked in the statement that already counts the event in its group, so they cost nothing per event. Users are counted under the first of the event's user ID, email, username, IP address and visitor, exactly and only while a user condition is active; the count and the users behind it are forgotten when the group comes back or its status changes. While a group stays ignored it fires no alerts. When a condition is met the group reopens as `unresolved`, which is a regression like any other: regression alert rules fire once. Any status change clears the conditions, and ignoring an ignored group again replaces them. The group's `ignore` field shows the conditions and progress; the console shows them on the group page and offers the presets from the Ignore menu.
+
+### Inbound Filters {{ anchor: true, id: 'inbound-filters' }}
+
+Ignoring a group still stores every event. To stop storing noise at all, add an inbound filter: a per-project rule that drops a matching error event when it arrives, before it is grouped, counted or alerted on. Filters apply to every SDK and release at once, with no redeploy, which is what `ignoreErrors` in the SDK cannot do for clients already in the field.
+
+| Kind | Drops an error event when | Pattern |
+|---|---|---|
+| Browser extensions | a stack frame's file is a `chrome-extension://`, `moz-extension://`, `safari-extension://`, `safari-web-extension://`, `ms-browser-extension://` or `edge-extension://` URL | none |
+| Web crawlers | the request's user agent names a known crawler, link previewer or uptime bot (Googlebot, Bingbot, facebookexternalhit, GPTBot, Pingdom, ...) | none |
+| Localhost | the page URL's host is `localhost`, `*.localhost`, `0.0.0.0` or a loopback IP, or the user's IP is a loopback address | none |
+| Error message | an exception's `Type: message` (or the type or message alone, when only one is set) matches | glob, such as `*ResizeObserver loop*` |
+| Release | the event's release matches | glob, such as `0.9.*` |
+
+Globs match the whole text, case-insensitively: `*` matches any run of characters and `?` exactly one; anything else is literal. Patterns are at most 200 characters and are matched against the first 1,024 characters of the text. A project holds at most 50 filters, and each built-in kind once.
+
+Open **Errors → Inbound filters** in a project to add, switch off and delete filters. Each filter shows how many events it dropped and when it last dropped one, so a filter that eats real errors is visible.
+
+<CodeGroup title="Inbound Filters">
+```bash {{ title: 'CLI' }}
+# Drop errors raised inside browser extensions
+temps errors filters add --project-id 42 --kind browser-extensions
+
+# Drop a known-noisy message from every client
+temps errors filters add --project-id 42 --kind error-message --pattern "*ResizeObserver loop*"
+
+# See what each filter dropped; switch one off
+temps errors filters list --project-id 42
+temps errors filters update --project-id 42 --filter-id 7 --disable
+```
+
+```typescript {{ title: 'API' }}
+await fetch('https://your-temps-instance.com/api/projects/42/error-inbound-filters', {
+  method: 'POST',
+  headers: { 'Authorization': `Bearer ${API_KEY}`, 'Content-Type': 'application/json' },
+  body: JSON.stringify({ kind: 'release', pattern: '0.9.*' })
+});
+```
+</CodeGroup>
+
+A dropped event is acknowledged to the SDK as accepted, so the SDK neither retries it nor reports it as lost, and it is not stored anywhere: it cannot be recovered by deleting the filter. Filters apply to error events only; transactions, logs, replays and feedback are not filtered. A change made in the console or API takes effect for the next event on the server that handled it, and on other servers sharing the database within about 15 seconds. Reading and writing filters needs the error-tracking read and write permissions; every change is audit-logged.
+
+Filters are evaluated in memory with no database call and no lock per event; drop counts are kept in memory and written to the database every 15 seconds, so a crash can lose up to 15 seconds of counts but never an event that should have been kept.
 
 ---
+
+## Performance Issues {{ anchor: true, id: 'performance-issues' }}
+
+Temps checks the traces your project sends (OpenTelemetry, or a Sentry SDK with tracing) for four patterns and files each one as an issue next to your errors, with the same workflow: resolve, ignore, assign, comment, alert rules and Fix with agent.
+
+| Issue | Found when |
+|---|---|
+| **N+1 Query** | the same database query runs 5 or more times under one parent span, as when a loop loads one row per item |
+| **Slow DB Query** | one database span takes 1 second or more |
+| **Consecutive HTTP Calls** | 3 or more HTTP calls of 50 ms or more run one after another, none overlapping, under one parent span |
+| **Large HTTP Payload** | a request or response body is 1 MB or more (`http.request.body.size`, `http.response.body.size` and their older names) |
+
+Queries are compared with their literals replaced (`WHERE id = 7` and `WHERE id = 9` are the same query), so one loop is one issue however many items it ran over. The same pattern in the same operation of the same service is one issue across traces; its count is the number of traces it was found in.
+
+Checks run in the background every 5 minutes, never while traces are received. Each check reads, per project, the 20 slowest root traces stored since the last check, at most 200 traces across projects, and never looks back more than 15 minutes. A busy project is therefore sampled, slowest traces first, not checked exhaustively. A trace read twice counts once.
+
+Choose **Performance** in the issue type menu of the error list to see only these issues; the page says when traces were last checked and what to set up when none have been received.
+
+<CodeGroup title="Performance Issues">
+```bash {{ title: 'CLI' }}
+# What is checked, and when traces were last checked
+temps errors performance --project-id 42
+
+# Only performance issues
+temps errors list --project-id 42 --type performance
+```
+
+```typescript {{ title: 'API' }}
+const issues = await fetch(
+  'https://your-temps-instance.com/api/projects/42/error-groups?issue_type=performance',
+  { headers: { 'Authorization': `Bearer ${API_KEY}` } }
+).then(r => r.json());
+
+const status = await fetch(
+  'https://your-temps-instance.com/api/projects/42/performance-issues/status',
+  { headers: { 'Authorization': `Bearer ${API_KEY}` } }
+).then(r => r.json());
+```
+</CodeGroup>
+
+## Operation Performance {{ anchor: true, id: 'operation-performance' }}
+
+**Traces → Operations** ranks every operation (span name per service) by time spent, latency percentiles, error rate and inconsistency. The sections below describe what it adds on top of the latency table.
+
+### Apdex {{ anchor: true, id: 'apdex' }}
+
+Each operation gets an Apdex score from 0 to 1 for a threshold `T` you pick: calls at or under `T` are *satisfied*, calls over `T` and up to `4T` are *tolerating* and count half, slower calls are *frustrated* and count nothing.
+
+```
+Apdex = (satisfied + tolerating / 2) / calls
+```
+
+The default threshold is 500 ms; the **Satisfied under** menu changes it, and the choice stays in the page address so a shared link keeps it. Scores under 0.70 are marked as a warning and under 0.50 as a problem (the conventional bands: 0.94 excellent, 0.85 good, 0.70 fair, 0.50 poor). Hover a score to see the three counts behind it. The counts are exact, computed in the same query as the percentiles.
+
+<CodeGroup title="Apdex">
+```bash {{ title: 'CLI' }}
+# Score operations against a 200 ms target
+temps traces span-stats --project-id 42 --apdex-ms 200
+```
+
+```typescript {{ title: 'API' }}
+const { data } = await fetch(
+  'https://your-temps-instance.com/api/otel/span-stats?project_id=42&apdex_threshold_ms=200',
+  { headers: { 'Authorization': `Bearer ${API_KEY}` } }
+).then(r => r.json());
+// data[0].apdex, data[0].satisfied_count, data[0].tolerating_count, data[0].frustrated_count
+```
+</CodeGroup>
+
+`apdex_threshold_ms` must be greater than 0 and at most 600000 (ten minutes); the API defaults it to 500.
+
+### Trends and Regressions After a Deployment {{ anchor: true, id: 'operation-trends' }}
+
+Every complete hour, Temps keeps one point per operation: calls, errors and the p50, p95 and p99 latency of that hour. The trend button at the end of each row of **Traces → Operations** draws the last 14 days of p95 and p50, with the deployments that went live in that time as markers.
+
+The **Did a deployment slow anything down?** card above the table picks a deployment (the latest one by default) and compares each operation's p95 in the day after it went live with the week before it:
+
+- The week before gives a band: the median of the hourly p95s and their spread, the same robust model the anomaly alert rules use.
+- An operation is **slower** when its median hourly p95 after the deployment is more than three spreads above the band and at least 20% higher; **faster** in the opposite case. A small wobble on a very steady operation is not reported.
+- The hour the deployment went live in belongs to neither side. An operation needs 8 hours of history before and 2 complete hours after to be judged; the card counts the ones still waiting.
+
+Span names are chosen by your code, so the history keeps at most 200 operations per project and hour, those with the most total time. How many did not fit in the last hour is shown under the trend; they still appear in the operations table, which reads spans directly. History is kept for 30 days and is rolled up every 10 minutes, one complete hour at a time, starting with the last 24 hours.
+
+<CodeGroup title="Trends and Regressions">
+```bash {{ title: 'CLI' }}
+# One operation, day by day, with deployments
+temps traces trend --project-id 42 --service checkout-api --operation "GET /cart"
+
+# What changed after deployment 812
+temps traces regressions --project-id 42 --deployment-id 812
+```
+
+```typescript {{ title: 'API' }}
+const trend = await fetch(
+  'https://your-temps-instance.com/api/otel/operations/trend?project_id=42&service_name=checkout-api&span_name=GET%20%2Fcart',
+  { headers: { 'Authorization': `Bearer ${API_KEY}` } }
+).then(r => r.json());
+
+const changes = await fetch(
+  'https://your-temps-instance.com/api/otel/operations/regressions?project_id=42&deployment_id=812',
+  { headers: { 'Authorization': `Bearer ${API_KEY}` } }
+).then(r => r.json());
+```
+</CodeGroup>
+
+### Where the Time Goes {{ anchor: true, id: 'operation-breakdown' }}
+
+The trend sheet of an operation also shows where the time of its calls goes. Temps reads up to 20 traces from the last 24 hours that contain the operation and charges every span under each call only the time its own children do not cover (its exclusive time). Those times are summed per downstream call (a query, an HTTP call to another service, a cache read) and shown as a share of the operation's time, next to the operation's own time. A query run ten times per call appears once, with **10.0×** calls each.
+
+- **Recent calls** samples the latest calls; **Slow calls (p95+)** samples only calls at or over the window's p95, which shows what the slow ones spend their time on.
+- **Split calls by an attribute** groups the calls by the value of one attribute of the operation's own spans (for example `http.route`, `tenant.id` or `gen_ai.request.model`) with their count, average, maximum and share of the time.
+- Calls that run in parallel each keep their own time, so shares can add up to more than 100%.
+
+### Pages and the Backend Requests That Served Them {{ anchor: true, id: 'page-backend' }}
+
+In **Speed Insights**, break down by **Path** and choose **Backend** on a page to compare its web vitals with the server requests your backend traced for that path in the last 24 hours: their count, failures, p50/p75/p95, how much of the page's time to first byte (p75) the backend accounts for, and the slowest requests linked to their traces.
+
+A page load carries no trace id (the browser sends no `traceparent` on a navigation), so requests are matched by project, path and time, not one to one. A server span matches when its `url.path` (or the older `http.target`, query string ignored) is the page's path, which OpenTelemetry and Sentry HTTP instrumentations set. A static page has no backend request; the sheet says so and links to traces.
+
+<CodeGroup title="Breakdown and Page Backend">
+```bash {{ title: 'CLI' }}
+# Where the time of slow calls goes, and which tenant is slow
+temps traces breakdown --project-id 42 --service checkout-api --operation "GET /cart" --sample slow --attribute tenant.id
+
+# A page's web vitals next to the backend requests for its path
+temps traces page --project-id 42 --path /checkout
+```
+
+```typescript {{ title: 'API' }}
+const breakdown = await fetch(
+  'https://your-temps-instance.com/api/otel/operations/breakdown?project_id=42&service_name=checkout-api&span_name=GET%20%2Fcart&sample=slow',
+  { headers: { 'Authorization': `Bearer ${API_KEY}` } }
+).then(r => r.json());
+
+const page = await fetch(
+  'https://your-temps-instance.com/api/otel/pages/backend?project_id=42&path=%2Fcheckout',
+  { headers: { 'Authorization': `Bearer ${API_KEY}` } }
+).then(r => r.json());
+```
+</CodeGroup>
+
+## Release Health {{ anchor: true, id: 'release-health' }}
+
+**Errors → Releases** opens with **Release health**: for each release with sessions in the last 1, 7 or 14 days, the crash-free sessions and users, its adoption (its share of the sessions started in the last 24 hours), its sessions and estimated users, and the Temps deployment that shipped it, linked to the deployment (and its rollback). The trend button draws the crash-free rate of the release per hour.
+
+Sentry SDKs send a session when the app starts and again when it ends or fails; browser and mobile SDKs do so by default, server SDKs when session tracking is on. Temps counts them the way Sentry's own ingestion does:
+
+- A session **starts** with its first update. It is **errored** when an update reports errors or ends errored, abnormal or crashed (counted once per session), **crashed** when it ends crashed, **abnormal** when it ends abnormally. Server SDKs that send pre-aggregated `sessions` items are counted from their totals.
+- **Crash-free sessions** is `1 − crashed / sessions`; **crash-free users** is `1 − crashed users / users`.
+- Only counters are stored, one row per project, SDK environment, release and the hour sessions started; no session is kept. Distinct users are an estimate (about 6.5% standard error), never more than the sessions counted.
+- Sessions are counted once the envelope is acknowledged, so a retried envelope is not counted twice. Counting never slows ingest: when the in-memory queue (10,000 updates, written every 10 seconds) is full, sessions are dropped and the response header `x-temps-sentry-sessions-dropped` says how many. Counters are kept for 90 days.
+- A release seen only in sessions is registered like the release of an error, so it is ordered for [resolve in the next release](#resolve-next-release) and tied to the deployment whose commit SHA it is.
+
+### Alert on a Crash-Free Drop
+
+Every five minutes Temps publishes, for each release with a session in the last hour, the gauges `release.crash_free_sessions`, `release.crash_free_users` (over the last 24 hours, once there are 20 sessions or users) and `release.sessions`, labelled `release` and `environment`. Any metric alert rule can use them. **Alert on a crash-free drop** opens a new metric alert prefilled with the lowest crash-free rate over 15 minutes below 99% for 10 minutes, one alert per release; change the threshold, severity and notifications before saving.
+
+<CodeGroup title="Release Health">
+```bash {{ title: 'CLI' }}
+# Crash-free rates, adoption and deployment of each release
+temps errors releases --project-id 42 --environment production
+
+# One release, hour by hour
+temps errors release my-app@1.4.0 --project-id 42 --days 2
+```
+
+```typescript {{ title: 'API' }}
+const health = await fetch(
+  'https://your-temps-instance.com/api/projects/42/release-health?environment=production&days=7',
+  { headers: { 'Authorization': `Bearer ${API_KEY}` } }
+).then(r => r.json());
+
+const series = await fetch(
+  'https://your-temps-instance.com/api/projects/42/release-health/series?release=my-app%401.4.0',
+  { headers: { 'Authorization': `Bearer ${API_KEY}` } }
+).then(r => r.json());
+```
+</CodeGroup>
 
 ## Additional Resources
 
