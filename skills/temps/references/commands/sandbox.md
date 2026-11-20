@@ -134,6 +134,8 @@ List nodes with their sandbox placement state (the default)
 
 Show a node's placement state and every live sandbox on it, from all users (name, id, or 'control-plane'). Admin only
 
+**Usage:** `sandbox nodes show <node> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -146,6 +148,8 @@ Show a node's placement state and every live sandbox on it, from all users (name
 
 Allow exactly these nodes to run new sandboxes, replacing the list (names, ids, or 'control-plane'). Admin only
 
+**Usage:** `sandbox nodes set <nodes...> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -156,6 +160,8 @@ Allow exactly these nodes to run new sandboxes, replacing the list (names, ids, 
 
 Add nodes to the list allowed to run new sandboxes. Admin only
 
+**Usage:** `sandbox nodes allow <nodes...> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -165,6 +171,8 @@ Add nodes to the list allowed to run new sandboxes. Admin only
 #### `sandbox nodes deny`
 
 Stop nodes from taking new sandboxes (existing ones keep running). Admin only
+
+**Usage:** `sandbox nodes deny <nodes...> [options]`
 
 **Options:**
 
@@ -196,6 +204,8 @@ Stop every node from taking new sandboxes (existing ones keep running). Admin on
 
 Destroy every sandbox on a worker node, from all users, so the node can be removed. Works on a node that is offline for good. Admin only
 
+**Usage:** `sandbox nodes evict <node> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -207,6 +217,8 @@ Destroy every sandbox on a worker node, from all users, so the node can be remov
 
 Show details for a sandbox
 
+**Usage:** `sandbox show <id> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -216,6 +228,8 @@ Show details for a sandbox
 ### `sandbox rm` (alias: `stop`, `destroy`)
 
 Remove a sandbox permanently (aliases: stop, destroy)
+
+**Usage:** `sandbox rm <id> [options]`
 
 **Options:**
 
@@ -227,17 +241,25 @@ Remove a sandbox permanently (aliases: stop, destroy)
 
 Pause a running sandbox (non-destructive — resume later with `sandbox resume`)
 
+**Usage:** `sandbox pause <id>`
+
 ### `sandbox resume`
 
 Resume a paused sandbox
+
+**Usage:** `sandbox resume <id>`
 
 ### `sandbox restart`
 
 Restart a running sandbox (preserves filesystem)
 
+**Usage:** `sandbox restart <id>`
+
 ### `sandbox clone`
 
 Clone a git repo or extract a tarball into a running sandbox
+
+**Usage:** `sandbox clone <id> [options]`
 
 **Options:**
 
@@ -255,6 +277,8 @@ Clone a git repo or extract a tarball into a running sandbox
 
 Open an interactive terminal in a sandbox. Detach with Ctrl-P Ctrl-Q to leave the program running; `exit` ends it. Reattach with the same --tab
 
+**Usage:** `sandbox shell <id> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -266,6 +290,8 @@ Open an interactive terminal in a sandbox. Detach with Ctrl-P Ctrl-Q to leave th
 
 Extend a sandbox's idle timeout
 
+**Usage:** `sandbox extend <id> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -275,6 +301,8 @@ Extend a sandbox's idle timeout
 ### `sandbox exec`
 
 Run a command inside a sandbox. Use `--` to pass flags: `exec ID -- ls -la`
+
+**Usage:** `sandbox exec <id> [args...] [options]`
 
 **Options:**
 
@@ -288,9 +316,13 @@ Run a command inside a sandbox. Use `--` to pass flags: `exec ID -- ls -la`
 
 Stream logs from a detached job (SSE)
 
+**Usage:** `sandbox logs <id> <jobId>`
+
 ### `sandbox domain`
 
 Resolve the preview URL for a port inside a sandbox
+
+**Usage:** `sandbox domain <id> [options]`
 
 **Options:**
 
@@ -301,6 +333,8 @@ Resolve the preview URL for a port inside a sandbox
 ### `sandbox password`
 
 Generate, rotate, or clear the preview-URL password for a sandbox
+
+**Usage:** `sandbox password <id> [options]`
 
 **Options:**
 
@@ -314,6 +348,8 @@ Generate, rotate, or clear the preview-URL password for a sandbox
 
 Show or set who may open the preview URLs: Temps login (default), the preview password, or anyone, optionally from listed networks only
 
+**Usage:** `sandbox preview-access <id> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -326,6 +362,8 @@ Show or set who may open the preview URLs: Temps login (default), the preview pa
 ### `sandbox egress`
 
 Show or set where the sandbox may connect to: the internet, nothing, or only listed hosts and CIDRs. Private, loopback and metadata addresses are always refused
+
+**Usage:** `sandbox egress <id> [options]`
 
 **Options:**
 
@@ -351,6 +389,8 @@ Filesystem operations inside a sandbox
 
 Read a file from the sandbox
 
+**Usage:** `sandbox fs read <id> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -361,6 +401,8 @@ Read a file from the sandbox
 #### `sandbox fs write`
 
 Write a file to the sandbox
+
+**Usage:** `sandbox fs write <id> [options]`
 
 **Options:**
 
@@ -375,6 +417,8 @@ Write a file to the sandbox
 
 Stat a path inside the sandbox
 
+**Usage:** `sandbox fs stat <id> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -385,6 +429,8 @@ Stat a path inside the sandbox
 #### `sandbox fs mkdir`
 
 Create a directory inside the sandbox (mkdir -p)
+
+**Usage:** `sandbox fs mkdir <id> [options]`
 
 **Options:**
 
@@ -421,6 +467,8 @@ List your snapshots
 
 Show details for a snapshot
 
+**Usage:** `sandbox snapshots show <snapId> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -430,6 +478,8 @@ Show details for a snapshot
 #### `sandbox snapshots delete` (alias: `rm`)
 
 Delete a snapshot permanently
+
+**Usage:** `sandbox snapshots delete <snapId> [options]`
 
 **Options:**
 
@@ -450,6 +500,8 @@ Show snapshot storage usage and quota
 ### `sandbox snapshot`
 
 Take a snapshot of a sandbox
+
+**Usage:** `sandbox snapshot <id> [options]`
 
 **Options:**
 

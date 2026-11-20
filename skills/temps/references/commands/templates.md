@@ -29,6 +29,8 @@ List available templates
 
 Create a template: every service (an app, what `projects` manages), the databases it needs, its shared variables and path routes
 
+**Usage:** `templates create <slug> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -53,6 +55,8 @@ Create a template: every service (an app, what `projects` manages), the database
 ### `templates validate`
 
 Validate a Temps-native template YAML file or directory offline
+
+**Usage:** `templates validate <path> [options]`
 
 **Options:**
 

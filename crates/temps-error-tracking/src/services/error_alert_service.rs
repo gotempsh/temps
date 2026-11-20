@@ -18,6 +18,11 @@ use super::types::ErrorTrackingError;
 /// cost an API caller controls.
 pub const MAX_ERROR_ALERT_RULES_PER_PROJECT: u64 = 100;
 
+/// Status-change notifications one bulk triage request may send. A bulk
+/// resolve can select up to 1,000 groups; delivering one notification per
+/// group per rule would turn a single click into an unbounded fan-out.
+pub const BULK_STATUS_CHANGE_NOTIFICATION_LIMIT: usize = 50;
+
 /// Trigger types that can fire an error alert
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -355,6 +360,163 @@ impl ErrorAlertService {
         }
 
         notifications
+    }
+
+    /// Evaluate `status_change` rules for many groups changed by one bulk
+    /// triage request (ADR 111, D1).
+    ///
+    /// Same rules, filters and cooldown as [`Self::evaluate_status_change`],
+    /// but the work is bounded by the number of rules rather than by the
+    /// number of groups: one cooldown query and one fire insert per rule, not
+    /// per group. Notifications are capped at
+    /// [`BULK_STATUS_CHANGE_NOTIFICATION_LIMIT`], because one triage click
+    /// must not fan out into a thousand deliveries; a fire is recorded only
+    /// for a group that is actually notified, so the rest stay eligible for
+    /// the next request.
+    pub async fn evaluate_status_change_many(
+        &self,
+        project_id: i32,
+        groups: &[error_groups::Model],
+        new_status: &str,
+    ) -> Vec<AlertNotification> {
+        if groups.is_empty() {
+            return Vec::new();
+        }
+        let rules = match self.get_enabled_rules(project_id).await {
+            Ok(rules) => rules,
+            Err(e) => {
+                error!("Failed to load alert rules for project {project_id}: {e}");
+                return Vec::new();
+            }
+        };
+        let mut notifications = Vec::new();
+        let mut budget = BULK_STATUS_CHANGE_NOTIFICATION_LIMIT;
+        let mut suppressed = 0_usize;
+        for rule in &rules {
+            if AlertTriggerType::from_str(&rule.trigger_type)
+                != Some(AlertTriggerType::StatusChange)
+            {
+                continue;
+            }
+            let fires_on_this_status =
+                match serde_json::from_value::<StatusChangeConfig>(rule.trigger_config.clone()) {
+                    Ok(config) => config.statuses.iter().any(|s| s == new_status),
+                    // No config means "any status change", as for one group.
+                    Err(_) => true,
+                };
+            if !fires_on_this_status {
+                continue;
+            }
+            let candidates: Vec<&error_groups::Model> = groups
+                .iter()
+                .filter(|group| self.matches_filters(rule, group))
+                .collect();
+            if candidates.is_empty() {
+                continue;
+            }
+            let cooling_down = self
+                .groups_in_cooldown(rule, &candidates.iter().map(|g| g.id).collect::<Vec<_>>())
+                .await;
+            let eligible: Vec<&error_groups::Model> = candidates
+                .into_iter()
+                .filter(|group| !cooling_down.contains(&group.id))
+                .collect();
+            let (notify, over_budget) = eligible.split_at(eligible.len().min(budget));
+            suppressed += over_budget.len();
+            if notify.is_empty() {
+                continue;
+            }
+            budget -= notify.len();
+            self.record_fires(rule.id, &notify.iter().map(|g| g.id).collect::<Vec<_>>())
+                .await;
+            for group in notify {
+                info!(
+                    "Alert rule '{}' (type: status_change) fired for error group {} in project {}",
+                    rule.name, group.id, group.project_id
+                );
+                notifications.push(AlertNotification {
+                    rule_name: rule.name.clone(),
+                    trigger_type: AlertTriggerType::StatusChange.as_str().to_string(),
+                    group_title: group.title.clone(),
+                    group_id: group.id,
+                    project_id: group.project_id,
+                    environment_id: group.environment_id,
+                    priority: rule.notification_priority.clone(),
+                    message: format!("Error group status changed to '{new_status}'."),
+                    project_name: None,
+                    project_slug: None,
+                    environment_name: None,
+                    error_type: group.error_type.clone(),
+                    total_count: group.total_count,
+                    first_seen: group.first_seen.to_rfc3339(),
+                    last_seen: group.last_seen.to_rfc3339(),
+                });
+            }
+        }
+        if suppressed > 0 {
+            warn!(
+                project_id,
+                suppressed,
+                "Bulk status change produced more alert notifications than the per-request limit of {}; the rest were not sent and not recorded as fired",
+                BULK_STATUS_CHANGE_NOTIFICATION_LIMIT
+            );
+        }
+        notifications
+    }
+
+    /// Which of `group_ids` have fired `rule` inside its cooldown window.
+    /// One query for the whole set.
+    async fn groups_in_cooldown(
+        &self,
+        rule: &error_alert_rules::Model,
+        group_ids: &[i32],
+    ) -> std::collections::HashSet<i32> {
+        let threshold = Utc::now() - Duration::minutes(i64::from(rule.cooldown_minutes));
+        match error_alert_fires::Entity::find()
+            .filter(error_alert_fires::Column::RuleId.eq(rule.id))
+            .filter(error_alert_fires::Column::ErrorGroupId.is_in(group_ids.to_vec()))
+            .filter(error_alert_fires::Column::FiredAt.gte(threshold))
+            .all(self.db.as_ref())
+            .await
+        {
+            Ok(fires) => fires.into_iter().map(|fire| fire.error_group_id).collect(),
+            Err(e) => {
+                error!(
+                    "Failed to read alert fires for rule {}: {}; treating every group as cooling down",
+                    rule.id, e
+                );
+                group_ids.iter().copied().collect()
+            }
+        }
+    }
+
+    /// Record one fire per group in a single insert.
+    async fn record_fires(&self, rule_id: i32, group_ids: &[i32]) {
+        if group_ids.is_empty() {
+            return;
+        }
+        let now = Utc::now();
+        let fires = group_ids
+            .iter()
+            .map(|group_id| error_alert_fires::ActiveModel {
+                rule_id: Set(rule_id),
+                error_group_id: Set(*group_id),
+                fired_at: Set(now),
+                notification_sent: Set(true),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        if let Err(e) = error_alert_fires::Entity::insert_many(fires)
+            .exec(self.db.as_ref())
+            .await
+        {
+            error!(
+                "Failed to record {} alert fires for rule {}: {}",
+                group_ids.len(),
+                rule_id,
+                e
+            );
+        }
     }
 
     // === CRUD operations for alert rules ===

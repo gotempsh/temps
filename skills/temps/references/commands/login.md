@@ -8,6 +8,8 @@ Apply [the CLI runtime and safety contract](../cli-runtime.md) before executing 
 
 Authenticate with a Temps server. Opens the browser for interactive logins; use --api-key for headless / CI.
 
+**Usage:** `login [url] [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |

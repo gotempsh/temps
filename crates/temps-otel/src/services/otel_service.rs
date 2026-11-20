@@ -3299,6 +3299,7 @@ mod tests {
             sort_order: SortOrder::default(),
             limit: None,
             offset: None,
+            apdex_threshold_ms: None,
         }
     }
 

@@ -32,9 +32,13 @@ Configure CLI settings (AWS-style wizard)
 
 Get a configuration value
 
+**Usage:** `configure get <key>`
+
 ### `configure set`
 
 Set a configuration value
+
+**Usage:** `configure set <key> <value>`
 
 ### `configure list`
 

@@ -35,6 +35,29 @@ describe('generateDocs', () => {
     }
   })
 
+  test('shows the positional arguments a command requires', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'temps-cli-docs-'))
+    tempDirs.push(directory)
+    const output = join(directory, 'COMMANDS.md')
+
+    await generateDocs({ format: 'markdown', output })
+
+    const markdown = await readFile(output, 'utf8')
+    const section = markdown.slice(markdown.indexOf('### `errors release`\n'))
+    // The heading stays the bare name; the argument is in the usage line.
+    expect(section.split('\n### ')[0]).toContain(
+      '**Usage:** `errors release <release> [options]`',
+    )
+    const { createProgram } = await import('../cli.js')
+    const { commandArguments } = await import('./docs.js')
+    const program = createProgram()
+    const errors = program.commands.find((command) => command.name() === 'errors')
+    const release = errors?.commands.find((command) => command.name() === 'release')
+    expect(release && commandArguments(release)).toBe('<release>')
+    const releases = errors?.commands.find((command) => command.name() === 'releases')
+    expect(releases && commandArguments(releases)).toBe('')
+  })
+
   test('hides unimplemented commands from help but keeps them runnable', async () => {
     const { createProgram } = await import('../cli.js')
     const program = createProgram()

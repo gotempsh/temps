@@ -5,6 +5,12 @@ import type { Command } from 'commander'
 import { requireAuth, config, credentials } from '../../config/store.js'
 import { setupClient, client, getErrorMessage, normalizeApiUrl } from '../../lib/api-client.js'
 import {
+  bulkUpdateErrorGroups,
+  setErrorGroupAssignee,
+  listErrorGroupFingerprints,
+  mergeErrorGroups,
+  splitErrorGroup,
+  unmergeErrorGroup,
   listErrorGroups,
   getErrorGroup,
   updateErrorGroup,
@@ -13,6 +19,7 @@ import {
   getErrorStats,
   getErrorTimeSeries,
   getErrorDashboardStats,
+  getCurrentUser,
 } from '../../api/sdk.gen.js'
 import type { ErrorGroupResponse, ErrorEventResponse, ErrorTimeSeriesDataResponse } from '../../api/types.gen.js'
 import { withSpinner, startSpinner, succeedSpinner, failSpinner } from '../../ui/spinner.js'
@@ -21,6 +28,11 @@ import { newline, header, icons, json, colors, success, info, warning, keyValue,
 import { readFile, readdir } from 'node:fs/promises'
 import { existsSync, statSync } from 'node:fs'
 import { resolve, basename, join } from 'node:path'
+import { registerActivityCommands } from './activity.js'
+import { registerInboundFilterCommands } from './filters.js'
+import { checkIssueType, registerPerformanceCommands } from './performance.js'
+import { registerReleaseHealthCommands } from './release-health.js'
+import { applySavedSearch, loadSavedSearch, registerSavedSearchCommands } from './saved-searches.js'
 
 interface ListOptions {
   projectId: string
@@ -32,7 +44,56 @@ interface ListOptions {
   endDate?: string
   sortBy?: string
   sortOrder?: string
+  assignee?: string
+  search?: string
+  savedSearch?: string
+  type?: string
   json?: boolean
+}
+
+interface AssignOptions {
+  projectId: string
+  groupId: string
+  userId?: string
+  teamId?: string
+  me?: boolean
+  none?: boolean
+  json?: boolean
+}
+
+/** Body of `PUT .../assignee` from the `errors assign` flags. */
+export function buildAssigneeBody(
+  options: Pick<AssignOptions, 'userId' | 'teamId' | 'me' | 'none'>,
+  currentUserId: number | undefined
+): { user_id?: number; team_id?: number } {
+  const chosen = [options.userId, options.teamId, options.me, options.none].filter(
+    (v) => v !== undefined && v !== false
+  )
+  if (chosen.length !== 1) {
+    throw new Error('Choose exactly one of --user-id, --team-id, --me or --none')
+  }
+  if (options.none) return {}
+  if (options.me) {
+    if (currentUserId === undefined) {
+      throw new Error('--me needs a signed-in user; use --user-id instead')
+    }
+    return { user_id: currentUserId }
+  }
+  const raw = (options.userId ?? options.teamId) as string
+  const id = Number(raw)
+  if (!Number.isInteger(id) || id <= 0) {
+    throw new Error(`Expected a positive numeric id, got "${raw}"`)
+  }
+  return options.userId !== undefined ? { user_id: id } : { team_id: id }
+}
+
+/** Check the `--assignee` list filter before sending it. */
+export function checkAssigneeFilter(value: string): string {
+  const trimmed = value.trim()
+  if (!/^(me|none|user:[0-9]+|team:[0-9]+)$/.test(trimmed)) {
+    throw new Error(`--assignee takes me, none, user:<id> or team:<id>; got "${value}"`)
+  }
+  return trimmed
 }
 
 interface ShowOptions {
@@ -41,11 +102,61 @@ interface ShowOptions {
   json?: boolean
 }
 
-interface UpdateOptions {
+/** `--ignore-*` flags shared by `errors update` and `errors bulk`. */
+export interface IgnoreFlags {
+  /** With resolve: stay resolved until an event from a newer release. */
+  inNextRelease?: boolean
+  ignoreFor?: string
+  ignoreUntil?: string
+  ignoreCount?: string
+  ignoreUsers?: string
+  ignoreForever?: boolean
+}
+
+interface UpdateOptions extends IgnoreFlags {
   projectId: string
   groupId: string
   status: string
   assignedTo?: string
+}
+
+interface BulkOptions extends IgnoreFlags {
+  projectId: string
+  action: string
+  groupIds?: string
+  status?: string
+  environmentId?: string
+  startDate?: string
+  endDate?: string
+  search?: string
+  json?: boolean
+}
+
+interface MergeOptions {
+  projectId: string
+  groupId: string
+  sourceGroupIds: string
+  json?: boolean
+}
+
+interface UnmergeOptions {
+  projectId: string
+  groupId: string
+  json?: boolean
+}
+
+interface SplitOptions {
+  projectId: string
+  groupId: string
+  fingerprints: string
+  title?: string
+  json?: boolean
+}
+
+interface FingerprintsOptions {
+  projectId: string
+  groupId: string
+  json?: boolean
 }
 
 interface EventsListOptions {
@@ -84,6 +195,137 @@ interface DashboardOptions {
 }
 
 const ERROR_STATUSES = ['unresolved', 'resolved', 'ignored']
+
+/** Transitions `temps errors bulk` accepts, as the API names them. */
+export const BULK_ERROR_ACTIONS = ['resolve', 'unresolve', 'ignore'] as const
+
+/** Groups one bulk request may name explicitly; mirrors the server's cap. */
+export const BULK_ERROR_GROUP_LIMIT = 1000
+
+/** Groups one merge request may absorb; mirrors the server's cap. */
+export const MAX_MERGE_SOURCES = 50
+
+/**
+ * Parse `--group-ids 12,15,18` into positive integers, rejecting anything
+ * that is not a group id so a typo cannot silently widen or narrow the
+ * selection.
+ */
+export function parseGroupIds(raw: string): number[] {
+  const ids = raw
+    .split(',')
+    .map((part) => part.trim())
+    .filter((part) => part.length > 0)
+    .map((part) => {
+      if (!/^[0-9]+$/.test(part)) {
+        throw new Error(`Invalid group ID: ${part}`)
+      }
+      const id = Number.parseInt(part, 10)
+      if (id <= 0) {
+        throw new Error(`Invalid group ID: ${part}`)
+      }
+      return id
+    })
+  const unique = [...new Set(ids)]
+  if (unique.length === 0) {
+    throw new Error('--group-ids needs at least one group ID')
+  }
+  if (unique.length > BULK_ERROR_GROUP_LIMIT) {
+    throw new Error(
+      `--group-ids names ${unique.length} groups; at most ${BULK_ERROR_GROUP_LIMIT} per request`
+    )
+  }
+  return unique
+}
+
+/** When an ignored group comes back, as the API takes it. */
+export interface IgnoreConditionsBody {
+  until?: string
+  event_count?: number
+  user_count?: number
+  forever?: boolean
+}
+
+const DURATION_UNITS: Record<string, number> = {
+  m: 60_000,
+  h: 3_600_000,
+  d: 86_400_000,
+  w: 604_800_000,
+}
+
+function positiveInteger(raw: string, flag: string): number {
+  if (!/^[0-9]+$/.test(raw.trim()) || Number.parseInt(raw, 10) <= 0) {
+    throw new Error(`${flag} must be a positive whole number, got "${raw}"`)
+  }
+  return Number.parseInt(raw, 10)
+}
+
+/**
+ * Turn the `--ignore-*` flags into ignore conditions, or `undefined` when
+ * none is given (a plain ignore: the next event reopens the group).
+ * `--ignore-for 7d` is resolved against `now` into an absolute time.
+ */
+export function buildIgnoreConditions(
+  flags: IgnoreFlags,
+  now: Date = new Date()
+): IgnoreConditionsBody | undefined {
+  const body: IgnoreConditionsBody = {}
+  if (flags.ignoreFor && flags.ignoreUntil) {
+    throw new Error('Use either --ignore-for or --ignore-until, not both')
+  }
+  if (flags.ignoreFor) {
+    const match = /^([0-9]+)\s*([mhdw])$/.exec(flags.ignoreFor.trim())
+    if (!match) {
+      throw new Error(
+        `--ignore-for takes a number and a unit (m, h, d, w), such as 30m or 7d; got "${flags.ignoreFor}"`
+      )
+    }
+    const [, digits = '', unit = ''] = match
+    const amount = positiveInteger(digits, '--ignore-for')
+    const unitMs = DURATION_UNITS[unit] ?? 0
+    body.until = new Date(now.getTime() + amount * unitMs).toISOString()
+  }
+  if (flags.ignoreUntil) {
+    const until = new Date(flags.ignoreUntil)
+    if (Number.isNaN(until.getTime())) {
+      throw new Error(`--ignore-until is not a date: "${flags.ignoreUntil}"`)
+    }
+    body.until = until.toISOString()
+  }
+  if (flags.ignoreCount) {
+    body.event_count = positiveInteger(flags.ignoreCount, '--ignore-count')
+  }
+  if (flags.ignoreUsers) {
+    body.user_count = positiveInteger(flags.ignoreUsers, '--ignore-users')
+  }
+  if (flags.ignoreForever) {
+    if (Object.keys(body).length > 0) {
+      throw new Error('--ignore-forever cannot be combined with the other --ignore-* flags')
+    }
+    body.forever = true
+  }
+  return Object.keys(body).length > 0 ? body : undefined
+}
+
+/** Register the `--ignore-*` flags on a command. */
+function withIgnoreFlags(command: Command): Command {
+  return command
+    .option('--ignore-for <duration>', 'With ignore: come back after this long (30m, 12h, 7d, 2w)')
+    .option('--ignore-until <date>', 'With ignore: come back at this time (ISO 8601)')
+    .option('--ignore-count <n>', 'With ignore: come back after this many more occurrences')
+    .option('--ignore-users <n>', 'With ignore: come back once this many new users are affected')
+    .option('--ignore-forever', 'With ignore: never come back on its own')
+    .option(
+      '--in-next-release',
+      'With resolve: stay resolved until an event arrives from a release newer than the current one'
+    )
+}
+
+/** Refuse `--in-next-release` with anything but a resolve. */
+export function checkInNextRelease(inNextRelease: boolean | undefined, resolving: boolean): void {
+  if (inNextRelease && !resolving) {
+    throw new Error('--in-next-release goes with resolving (--status resolved or --action resolve)')
+  }
+}
 
 // Source map interfaces
 interface SourceMapUploadOptions {
@@ -207,8 +449,24 @@ export function registerErrorsCommands(program: Command): void {
     .option('--end-date <date>', 'Filter by end date (ISO 8601)')
     .option('--sort-by <field>', 'Sort by field (e.g., total_count, last_seen, first_seen)')
     .option('--sort-order <order>', 'Sort order: asc or desc')
+    .option('--assignee <who>', 'Only groups assigned to: me (you or your teams), none, user:<id> or team:<id>')
+    .option('--search <text>', 'Only groups whose title, type or message contains this text')
+    .option('--saved-search <id>', 'Apply a saved search; flags given here override its filters')
+    .option('--type <type>', 'Only errors, or only performance issues found in traces: error or performance')
     .option('--json', 'Output in JSON format')
     .action(listErrorGroupsAction)
+
+  errors
+    .command('assign')
+    .description('Assign an error group to a user or team, or unassign it')
+    .requiredOption('--project-id <id>', 'Project ID')
+    .requiredOption('--group-id <id>', 'Error group ID')
+    .option('--user-id <id>', 'Assign to this user')
+    .option('--team-id <id>', 'Assign to this team')
+    .option('--me', 'Assign to yourself')
+    .option('--none', 'Unassign the group')
+    .option('--json', 'Output in JSON format')
+    .action(assignErrorGroupAction)
 
   errors
     .command('show')
@@ -218,14 +476,71 @@ export function registerErrorsCommands(program: Command): void {
     .option('--json', 'Output in JSON format')
     .action(showErrorGroup)
 
+  withIgnoreFlags(
+    errors
+      .command('update')
+      .description('Update error group status')
+      .requiredOption('--project-id <id>', 'Project ID')
+      .requiredOption('--group-id <id>', 'Error group ID')
+      .requiredOption('--status <status>', 'New status (unresolved, resolved, ignored)')
+      .option('--assigned-to <email>', 'Assign to the user with this email ("" unassigns); see also errors assign')
+  ).action(updateErrorGroupAction)
+
+  const bulk = errors
+    .command('bulk')
+    .description('Resolve, reopen or ignore many error groups in one request')
+    .requiredOption('--project-id <id>', 'Project ID')
+    .requiredOption('--action <action>', `Transition to apply (${BULK_ERROR_ACTIONS.join(', ')})`)
+    .option('--group-ids <ids>', `Comma-separated group IDs (at most ${BULK_ERROR_GROUP_LIMIT})`)
+    .option('--status <status>', 'Select every group in this status instead of listing IDs')
+    .option('--environment-id <id>', 'Select every group of this environment')
+    .option('--start-date <date>', 'With --end-date: only groups with events in the window (ISO 8601)')
+    .option('--end-date <date>', 'With --start-date: only groups with events in the window (ISO 8601)')
+    .option('--search <text>', 'Select groups whose title, type or message contains this text')
+    .option('--json', 'Output in JSON format')
+
+  withIgnoreFlags(bulk).action(bulkUpdateErrorGroupsAction)
+
   errors
-    .command('update')
-    .description('Update error group status')
+    .command('merge')
+    .description('Merge other error groups into one surviving group')
+    .requiredOption('--project-id <id>', 'Project ID')
+    .requiredOption('--group-id <id>', 'Surviving error group ID')
+    .requiredOption('--source-group-ids <ids>', `Comma-separated group IDs to merge in (at most ${MAX_MERGE_SOURCES})`)
+    .option('--json', 'Output in JSON format')
+    .action(mergeErrorGroupsAction)
+
+  errors
+    .command('unmerge')
+    .description('Take an error group back out of the merge it is part of')
+    .requiredOption('--project-id <id>', 'Project ID')
+    .requiredOption('--group-id <id>', 'Merged-away error group ID')
+    .option('--json', 'Output in JSON format')
+    .action(unmergeErrorGroupAction)
+
+  errors
+    .command('split')
+    .description('Split fingerprints out of an error group into a new one')
     .requiredOption('--project-id <id>', 'Project ID')
     .requiredOption('--group-id <id>', 'Error group ID')
-    .requiredOption('--status <status>', 'New status (unresolved, resolved, ignored)')
-    .option('--assigned-to <user>', 'Assign to user')
-    .action(updateErrorGroupAction)
+    .requiredOption('--fingerprints <hashes>', 'Comma-separated fingerprint hashes to move out')
+    .option('--title <title>', 'Title for the new group')
+    .option('--json', 'Output in JSON format')
+    .action(splitErrorGroupAction)
+
+  errors
+    .command('fingerprints')
+    .description('List the fingerprints routing to an error group')
+    .requiredOption('--project-id <id>', 'Project ID')
+    .requiredOption('--group-id <id>', 'Error group ID')
+    .option('--json', 'Output in JSON format')
+    .action(listErrorGroupFingerprintsAction)
+
+  registerInboundFilterCommands(errors)
+  registerActivityCommands(errors)
+  registerSavedSearchCommands(errors)
+  registerPerformanceCommands(errors)
+  registerReleaseHealthCommands(errors)
 
   errors
     .command('events')
@@ -360,14 +675,23 @@ export function registerErrorsCommands(program: Command): void {
     .action(deleteSourceFilesAction)
 }
 
-async function listErrorGroupsAction(options: ListOptions): Promise<void> {
+async function listErrorGroupsAction(flags: ListOptions): Promise<void> {
   await requireAuth()
   await setupClient()
 
-  const projectId = parseInt(options.projectId, 10)
+  const projectId = parseInt(flags.projectId, 10)
   if (isNaN(projectId)) {
     warning('Invalid project ID')
     return
+  }
+  let options = flags
+  if (flags.savedSearch) {
+    try {
+      options = applySavedSearch(flags, await loadSavedSearch(projectId, flags.savedSearch))
+    } catch (e) {
+      warning(e instanceof Error ? e.message : String(e))
+      return
+    }
   }
 
   if (options.status && !ERROR_STATUSES.includes(options.status)) {
@@ -376,6 +700,15 @@ async function listErrorGroupsAction(options: ListOptions): Promise<void> {
   }
 
   const environmentId = options.environmentId ? parseInt(options.environmentId, 10) : undefined
+  let assignee: string | undefined
+  let issueType: string | undefined
+  try {
+    issueType = options.type ? checkIssueType(options.type) : undefined
+    assignee = options.assignee ? checkAssigneeFilter(options.assignee) : undefined
+  } catch (e) {
+    warning(e instanceof Error ? e.message : String(e))
+    return
+  }
 
   const result = await withSpinner('Fetching error groups...', async () => {
     const { data, error } = await listErrorGroups({
@@ -390,6 +723,9 @@ async function listErrorGroupsAction(options: ListOptions): Promise<void> {
         ...(options.endDate && { end_date: options.endDate }),
         ...(options.sortBy && { sort_by: options.sortBy }),
         ...(options.sortOrder && { sort_order: options.sortOrder }),
+        ...(assignee && { assignee }),
+        ...(options.search && { search: options.search }),
+        ...(issueType && { issue_type: issueType }),
       },
     })
     if (error) {
@@ -421,6 +757,7 @@ async function listErrorGroupsAction(options: ListOptions): Promise<void> {
     { header: 'Type', key: 'error_type' },
     { header: 'Count', accessor: (g) => g.total_count.toString(), color: (v) => parseInt(v, 10) > 100 ? colors.error(v) : v },
     { header: 'Status', key: 'status', color: (v) => statusBadge(v === 'resolved' ? 'success' : v === 'ignored' ? 'inactive' : 'error') },
+    { header: 'Assignee', accessor: (g) => g.assignee?.name ?? g.assigned_to ?? '-' },
     { header: 'Last Seen', accessor: (g) => formatRelativeTime(g.last_seen) },
   ]
 
@@ -430,6 +767,57 @@ async function listErrorGroupsAction(options: ListOptions): Promise<void> {
     info(`Page ${pagination.page} of ${pagination.total_pages} (${pagination.total_count} total)`)
   }
   newline()
+}
+
+async function assignErrorGroupAction(options: AssignOptions): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const projectId = parseInt(options.projectId, 10)
+  const groupId = parseInt(options.groupId, 10)
+  if (isNaN(projectId) || isNaN(groupId)) {
+    warning('Invalid project or group ID')
+    return
+  }
+  let body: { user_id?: number; team_id?: number }
+  try {
+    const me = options.me ? await currentUserId() : undefined
+    body = buildAssigneeBody(options, me)
+  } catch (e) {
+    warning(e instanceof Error ? e.message : String(e))
+    return
+  }
+
+  const result = await withSpinner('Assigning error group...', async () => {
+    const { data, error } = await setErrorGroupAssignee({
+      client,
+      path: { project_id: projectId, group_id: groupId },
+      body,
+    })
+    if (error || !data) {
+      throw new Error(getErrorMessage(error))
+    }
+    return data
+  })
+
+  if (options.json) {
+    json(result)
+    return
+  }
+  if (!result.assignee) {
+    success(`Error group #${groupId} is unassigned`)
+  } else {
+    success(`Error group #${groupId} assigned to ${result.assignee.name} (${result.assignee.type} ${result.assignee.id})`)
+  }
+  if (!result.changed) {
+    info('Nothing changed: it already had that assignee')
+  }
+}
+
+/** The signed-in user's id, for `--me`. */
+async function currentUserId(): Promise<number | undefined> {
+  const { data } = await getCurrentUser({ client })
+  return typeof data?.id === 'number' ? data.id : undefined
 }
 
 async function showErrorGroup(options: ShowOptions): Promise<void> {
@@ -470,7 +858,9 @@ async function showErrorGroup(options: ShowOptions): Promise<void> {
   if (group.message_template) {
     keyValue('Message', group.message_template)
   }
-  if (group.assigned_to) {
+  if (group.assignee) {
+    keyValue('Assigned To', `${group.assignee.name} (${group.assignee.type} ${group.assignee.id})`)
+  } else if (group.assigned_to) {
     keyValue('Assigned To', group.assigned_to)
   }
   if (group.environment_id !== null && group.environment_id !== undefined) {
@@ -502,6 +892,23 @@ async function updateErrorGroupAction(options: UpdateOptions): Promise<void> {
     warning(`Invalid status: ${options.status}. Available: ${ERROR_STATUSES.join(', ')}`)
     return
   }
+  let ignore: IgnoreConditionsBody | undefined
+  try {
+    ignore = buildIgnoreConditions(options)
+  } catch (e) {
+    warning(e instanceof Error ? e.message : String(e))
+    return
+  }
+  if (ignore && options.status !== 'ignored') {
+    warning('The --ignore-* flags go with --status ignored')
+    return
+  }
+  try {
+    checkInNextRelease(options.inNextRelease, options.status === 'resolved')
+  } catch (e) {
+    warning(e instanceof Error ? e.message : String(e))
+    return
+  }
 
   await withSpinner('Updating error group...', async () => {
     const { error } = await updateErrorGroup({
@@ -510,6 +917,8 @@ async function updateErrorGroupAction(options: UpdateOptions): Promise<void> {
       body: {
         status: options.status,
         assigned_to: options.assignedTo ?? undefined,
+        ignore,
+        in_next_release: options.inNextRelease ?? false,
       },
     })
     if (error) {
@@ -521,6 +930,264 @@ async function updateErrorGroupAction(options: UpdateOptions): Promise<void> {
   info(`Status: ${options.status}`)
   if (options.assignedTo) {
     info(`Assigned to: ${options.assignedTo}`)
+  }
+}
+
+async function bulkUpdateErrorGroupsAction(options: BulkOptions): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const projectId = parseInt(options.projectId, 10)
+  if (isNaN(projectId)) {
+    warning('Invalid project ID')
+    return
+  }
+  if (!BULK_ERROR_ACTIONS.includes(options.action as (typeof BULK_ERROR_ACTIONS)[number])) {
+    warning(`Invalid action: ${options.action}. Available: ${BULK_ERROR_ACTIONS.join(', ')}`)
+    return
+  }
+  const hasFilter =
+    options.status !== undefined ||
+    options.environmentId !== undefined ||
+    options.startDate !== undefined ||
+    options.endDate !== undefined ||
+    options.search !== undefined
+  if (options.groupIds && hasFilter) {
+    warning('Use either --group-ids or the filter options, not both')
+    return
+  }
+  if (!options.groupIds && !hasFilter) {
+    warning('Select groups with --group-ids, or with --status/--search/--environment-id/--start-date/--end-date')
+    return
+  }
+  if (options.status && !ERROR_STATUSES.includes(options.status)) {
+    warning(`Invalid status: ${options.status}. Available: ${ERROR_STATUSES.join(', ')}`)
+    return
+  }
+
+  let ignore: IgnoreConditionsBody | undefined
+  try {
+    ignore = buildIgnoreConditions(options)
+  } catch (e) {
+    warning(e instanceof Error ? e.message : String(e))
+    return
+  }
+  if (ignore && options.action !== 'ignore') {
+    warning('The --ignore-* flags go with --action ignore')
+    return
+  }
+  try {
+    checkInNextRelease(options.inNextRelease, options.action === 'resolve')
+  } catch (e) {
+    warning(e instanceof Error ? e.message : String(e))
+    return
+  }
+
+  let groupIds: number[] | undefined
+  if (options.groupIds) {
+    try {
+      groupIds = parseGroupIds(options.groupIds)
+    } catch (e) {
+      warning(e instanceof Error ? e.message : String(e))
+      return
+    }
+  }
+
+  const result = await withSpinner('Updating error groups...', async () => {
+    const { data, error } = await bulkUpdateErrorGroups({
+      client,
+      path: { project_id: projectId },
+      body: groupIds
+        ? {
+            action: options.action as (typeof BULK_ERROR_ACTIONS)[number],
+            group_ids: groupIds,
+            ignore,
+            in_next_release: options.inNextRelease ?? false,
+          }
+        : {
+            action: options.action as (typeof BULK_ERROR_ACTIONS)[number],
+            ignore,
+            in_next_release: options.inNextRelease ?? false,
+            filter: {
+              status: options.status,
+              environment_id: options.environmentId
+                ? parseInt(options.environmentId, 10)
+                : undefined,
+              start_date: options.startDate,
+              end_date: options.endDate,
+              search: options.search,
+            },
+          },
+    })
+    if (error || !data) {
+      throw new Error(getErrorMessage(error))
+    }
+    return data
+  })
+
+  if (options.json) {
+    json(result)
+    return
+  }
+
+  success(`${result.updated} error group${result.updated === 1 ? '' : 's'} ${options.action}d`)
+  if (result.skipped > 0) {
+    info(`Already in that state: ${result.skipped}`)
+  }
+  if (result.remaining > 0) {
+    info(`Matching groups left for another request: ${result.remaining}`)
+  }
+}
+
+async function mergeErrorGroupsAction(options: MergeOptions): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const projectId = parseInt(options.projectId, 10)
+  const groupId = parseInt(options.groupId, 10)
+  if (isNaN(projectId) || isNaN(groupId)) {
+    warning('Invalid project or group ID')
+    return
+  }
+  let sourceGroupIds: number[]
+  try {
+    sourceGroupIds = parseGroupIds(options.sourceGroupIds)
+  } catch (e) {
+    warning(e instanceof Error ? e.message : String(e))
+    return
+  }
+  if (sourceGroupIds.includes(groupId)) {
+    warning(`Group ${groupId} survives the merge; do not list it in --source-group-ids`)
+    return
+  }
+
+  const result = await withSpinner('Merging error groups...', async () => {
+    const { data, error } = await mergeErrorGroups({
+      client,
+      path: { project_id: projectId, group_id: groupId },
+      body: { source_group_ids: sourceGroupIds },
+    })
+    if (error || !data) {
+      throw new Error(getErrorMessage(error))
+    }
+    return data
+  })
+
+  if (options.json) {
+    json(result)
+    return
+  }
+  success(`${result.merged_group_ids.length} error group${result.merged_group_ids.length === 1 ? '' : 's'} merged into #${result.target_group_id}`)
+  info(`Fingerprints now routing to #${result.target_group_id}: ${result.moved_fingerprints}`)
+  info(`Events accounted for by #${result.target_group_id}: ${result.total_count}`)
+}
+
+async function unmergeErrorGroupAction(options: UnmergeOptions): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const projectId = parseInt(options.projectId, 10)
+  const groupId = parseInt(options.groupId, 10)
+  if (isNaN(projectId) || isNaN(groupId)) {
+    warning('Invalid project or group ID')
+    return
+  }
+
+  const result = await withSpinner('Unmerging error group...', async () => {
+    const { data, error } = await unmergeErrorGroup({
+      client,
+      path: { project_id: projectId, group_id: groupId },
+    })
+    if (error || !data) {
+      throw new Error(getErrorMessage(error))
+    }
+    return data
+  })
+
+  if (options.json) {
+    json(result)
+    return
+  }
+  success(`Error group #${result.group_id} taken out of #${result.target_group_id}`)
+  info(`Fingerprints moved back: ${result.moved_fingerprints}`)
+}
+
+async function splitErrorGroupAction(options: SplitOptions): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const projectId = parseInt(options.projectId, 10)
+  const groupId = parseInt(options.groupId, 10)
+  if (isNaN(projectId) || isNaN(groupId)) {
+    warning('Invalid project or group ID')
+    return
+  }
+  const fingerprints = options.fingerprints
+    .split(',')
+    .map((part) => part.trim())
+    .filter((part) => part.length > 0)
+  if (fingerprints.length === 0) {
+    warning('--fingerprints needs at least one fingerprint hash')
+    return
+  }
+
+  const result = await withSpinner('Splitting error group...', async () => {
+    const { data, error } = await splitErrorGroup({
+      client,
+      path: { project_id: projectId, group_id: groupId },
+      body: { fingerprints, title: options.title },
+    })
+    if (error || !data) {
+      throw new Error(getErrorMessage(error))
+    }
+    return data
+  })
+
+  if (options.json) {
+    json(result)
+    return
+  }
+  success(`${result.moved_fingerprints} fingerprint${result.moved_fingerprints === 1 ? '' : 's'} split into #${result.new_group_id}`)
+  info('Stored events stay in the original group; future events land in the new one')
+}
+
+async function listErrorGroupFingerprintsAction(options: FingerprintsOptions): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const projectId = parseInt(options.projectId, 10)
+  const groupId = parseInt(options.groupId, 10)
+  if (isNaN(projectId) || isNaN(groupId)) {
+    warning('Invalid project or group ID')
+    return
+  }
+
+  const result = await withSpinner('Loading fingerprints...', async () => {
+    const { data, error } = await listErrorGroupFingerprints({
+      client,
+      path: { project_id: projectId, group_id: groupId },
+    })
+    if (error || !data) {
+      throw new Error(getErrorMessage(error))
+    }
+    return data
+  })
+
+  if (options.json) {
+    json(result)
+    return
+  }
+  header(`Fingerprints of error group #${result.group_id}`)
+  printTable(result.fingerprints, [
+    { header: 'Fingerprint', accessor: (row) => row.fingerprint_hash },
+    {
+      header: 'Merged from',
+      accessor: (row) =>
+        row.merged_from_group_id ? `#${row.merged_from_group_id}` : '-',
+    },
+  ])
+  if (result.merged_group_ids.length > 0) {
+    info(`Groups merged into this one: ${result.merged_group_ids.map((id) => `#${id}`).join(', ')}`)
   }
 }
 
