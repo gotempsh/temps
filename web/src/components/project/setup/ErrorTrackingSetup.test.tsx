@@ -36,7 +36,7 @@ test('the plain HTTP option shows the DSN its examples read from $SENTRY_DSN', (
       </MemoryRouter>
     </QueryClientProvider>
   )
-  fireEvent.click(view.getByText('Plain HTTP / any framework'))
+  fireEvent.click(view.getByText('Any language or framework'))
   fireEvent.click(view.getByRole('button', { name: 'Continue' }))
 
   expect(view.getByTestId('plain-http-errors')).toBeTruthy()

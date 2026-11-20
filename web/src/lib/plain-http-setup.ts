@@ -11,8 +11,19 @@
  * `$TEMPS_API_KEY`).
  */
 import type { IngestEndpoint, IngestSignalSetup } from '@/api/client'
+import type { CodeLanguage } from '@/components/ui/code-block'
 
 export type IngestSignalName = IngestSignalSetup['signal']
+
+/** One tab of a library example: what to install and how to start it. */
+export type LibraryExample = {
+  id: string
+  label: string
+  /** File name shown in the code block's title bar. */
+  file: string
+  language: CodeLanguage
+  code: string
+}
 
 export function endpointUrl(setup: IngestSignalSetup, name: string): string {
   const found = setup.endpoints.find((e: IngestEndpoint) => e.name === name)
@@ -118,6 +129,143 @@ addEventListener('pagehide', () => {
   navigator.sendBeacon(\`\${TEMPS_URL}?${param}=\${encodeURIComponent(TEMPS_KEY)}\`,
     new Blob([body], { type: 'text/plain' }));
 });`
+}
+
+/**
+ * Official Sentry SDKs, each reading the DSN from the environment. Temps is
+ * Sentry wire-compatible, so the SDK needs nothing but the DSN.
+ */
+export function sentrySdkExamples(setup: IngestSignalSetup): LibraryExample[] {
+  const dsn = setup.auth.env_var
+  return [
+    {
+      id: 'node',
+      label: 'Node.js',
+      file: 'instrument.js',
+      language: 'javascript',
+      code: `// npm install @sentry/node
+const Sentry = require('@sentry/node');
+
+Sentry.init({ dsn: process.env.${dsn} });`,
+    },
+    {
+      id: 'browser',
+      label: 'Browser',
+      file: 'main.js',
+      language: 'javascript',
+      code: `// npm install @sentry/browser
+import * as Sentry from '@sentry/browser';
+
+// The DSN is public: it can only send events to this project.
+Sentry.init({ dsn: '<value of ${dsn}>' });`,
+    },
+    {
+      id: 'python',
+      label: 'Python',
+      file: 'app.py',
+      language: 'python',
+      code: `# pip install sentry-sdk
+import os
+import sentry_sdk
+
+sentry_sdk.init(dsn=os.environ["${dsn}"])`,
+    },
+    {
+      id: 'go',
+      label: 'Go',
+      file: 'main.go',
+      language: 'go',
+      code: `// go get github.com/getsentry/sentry-go
+if err := sentry.Init(sentry.ClientOptions{Dsn: os.Getenv("${dsn}")}); err != nil {
+\tlog.Fatalf("sentry.Init: %s", err)
+}
+defer sentry.Flush(2 * time.Second)`,
+    },
+    {
+      id: 'ruby',
+      label: 'Ruby',
+      file: 'config/initializers/sentry.rb',
+      language: 'ruby',
+      code: `# bundle add sentry-ruby
+Sentry.init do |config|
+  config.dsn = ENV["${dsn}"]
+end`,
+    },
+  ]
+}
+
+/** The `/api/_temps` base the Temps browser SDK takes as `basePath`. */
+function analyticsBasePath(setup: IngestSignalSetup): string {
+  return endpointUrl(setup, 'init').replace(/\/session-replay\/init$/, '')
+}
+
+/**
+ * Session replay with a library: the Temps React SDK, or rrweb directly for
+ * any other stack. Both mask inputs; recording starts only after consent.
+ */
+export function sessionReplayExamples(
+  setup: IngestSignalSetup
+): LibraryExample[] {
+  const key = `<value of ${setup.auth.env_var}>`
+  const header = setup.auth.headers[0]?.name ?? 'X-Temps-Analytics-Key'
+  return [
+    {
+      id: 'react',
+      label: 'React',
+      file: 'layout.tsx',
+      language: 'tsx',
+      code: `// npm install @temps-sdk/react-analytics
+import { TempsAnalyticsProvider } from '@temps-sdk/react-analytics';
+
+<TempsAnalyticsProvider
+  basePath="${analyticsBasePath(setup)}"
+  ingestKey="${key}"
+  enableSessionRecording
+  sessionRecordingConfig={{ maskAllInputs: true }}
+>
+  {children}
+</TempsAnalyticsProvider>`,
+    },
+    {
+      id: 'rrweb',
+      label: 'Any framework (rrweb)',
+      file: 'replay.js',
+      language: 'javascript',
+      code: `// npm install rrweb
+import { record } from 'rrweb';
+
+// The analytics key is public by design: it can only write to this project.
+const headers = { 'Content-Type': 'application/json', '${header}': '${key}' };
+const sessionId = (sessionStorage.temps_rid ||= 's_' + crypto.randomUUID().replaceAll('-', ''));
+const visitorId = (localStorage.temps_vid ||= 'v_' + crypto.randomUUID().replaceAll('-', ''));
+
+// Events are base64(zlib(JSON)); the browser's 'deflate' stream is zlib.
+async function pack(events) {
+  const stream = new Blob([JSON.stringify(events)]).stream().pipeThrough(new CompressionStream('deflate'));
+  const bytes = new Uint8Array(await new Response(stream).arrayBuffer());
+  return btoa(Array.from(bytes, (b) => String.fromCharCode(b)).join(''));
+}
+
+// Call after the visitor consents, where the law requires it.
+export async function startReplay() {
+  await fetch(${JSON.stringify(endpointUrl(setup, 'init'))}, {
+    method: 'POST', headers,
+    body: JSON.stringify({ sessionId, visitorId, url: location.href, userAgent: navigator.userAgent,
+      language: navigator.language, viewportWidth: innerWidth, viewportHeight: innerHeight }),
+  });
+  let buffer = [];
+  record({ emit: (event) => buffer.push(event), maskAllInputs: true });
+  setInterval(async () => {
+    if (!buffer.length) return;
+    const batch = buffer; buffer = [];
+    await fetch(${JSON.stringify(endpointUrl(setup, 'events'))}, {
+      method: 'POST', headers, keepalive: true,
+      body: JSON.stringify({ sessionId, batchId: crypto.randomUUID(), events: await pack(batch) }),
+    });
+  }, 5000);
+}`,
+    },
+  ]
 }
 
 /**

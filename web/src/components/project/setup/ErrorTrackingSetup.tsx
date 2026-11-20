@@ -721,10 +721,10 @@ ${platform.buildSnippet(platform.dsnExpression)}
                 </div>
                 <div className="min-w-0 flex-1">
                   <p className="font-medium leading-none">
-                    Plain HTTP / any framework
+                    Any language or framework
                   </p>
                   <p className="mt-1 text-xs text-muted-foreground">
-                    Any Sentry SDK, or POST envelopes yourself
+                    Any Sentry SDK, or raw envelopes
                   </p>
                 </div>
                 {plainHttp && (
@@ -821,11 +821,11 @@ ${platform.buildSnippet(platform.dsnExpression)}
               </div>
               <div className="min-w-0">
                 <p className="font-medium leading-none">
-                  {plainHttp ? 'Plain HTTP / any framework' : platform.name}
+                  {plainHttp ? 'Any language or framework' : platform.name}
                 </p>
                 <p className="mt-1 text-xs text-muted-foreground">
                   {plainHttp
-                    ? 'Any Sentry SDK, or POST envelopes yourself'
+                    ? 'Any Sentry SDK, or raw envelopes'
                     : platform.description}
                 </p>
               </div>
@@ -849,20 +849,13 @@ ${platform.buildSnippet(platform.dsnExpression)}
           )}
 
           {plainHttp ? (
-            <div className="space-y-4">
-              {/* The examples read $SENTRY_DSN; show the DSN this page
-                  already loaded so they run without another trip. */}
-              {hasDsn && (
-                <CodeBlock
-                  defaultWrap
-                  language="bash"
-                  title=".env"
-                  code={`SENTRY_DSN=${dsn}`}
-                  showCopy
-                />
-              )}
-              <PlainHttpSetup project={project} signal="errors" />
-            </div>
+            // The examples read $SENTRY_DSN; step 1 shows the DSN this page
+            // already loaded so they run without another trip.
+            <PlainHttpSetup
+              project={project}
+              signal="errors"
+              credentialValue={hasDsn ? dsn : undefined}
+            />
           ) : (
             <>
               <div className="rounded-lg border border-primary/30 bg-primary/5 p-4">

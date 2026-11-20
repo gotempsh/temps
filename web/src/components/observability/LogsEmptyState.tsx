@@ -44,7 +44,7 @@ export function LogsEmptyState({
               onClick={() => setShowHttp((v) => !v)}
             >
               <Code2 className="size-4" />
-              Plain HTTP / any framework
+              Any language or framework
             </Button>
             <CopySetupPromptButton project={project} signal="logs" />
           </div>

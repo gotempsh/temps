@@ -1964,11 +1964,13 @@ function IngestKeySetup({ project }: ProjectAnalyticsProps) {
           </ScrollableTabsList>
           <TabsContent value="react" className="space-y-3 pt-3">
             <CodeBlock
+              title="terminal"
               language="bash"
               code="npm install @temps-sdk/react-analytics"
               showCopy
             />
             <CodeBlock
+              title="layout.tsx"
               language="tsx"
               code={`import { TempsAnalyticsProvider } from '@temps-sdk/react-analytics';
 
@@ -1983,7 +1985,8 @@ function IngestKeySetup({ project }: ProjectAnalyticsProps) {
           </TabsContent>
           <TabsContent value="script" className="space-y-3 pt-3">
             <CodeBlock
-              language="text"
+              title="index.html"
+              language="html"
               code={`<script
   defer
   data-base-path="${baseUrl}"
@@ -2286,10 +2289,10 @@ export default function App() {
     },
     {
       id: PLAIN_HTTP_OPTION,
-      name: 'Plain HTTP / any framework',
+      name: 'Any language or framework',
       category: 'Other',
       icon: () => <Code2 className="h-5 w-5" />,
-      description: 'curl, fetch or sendBeacon from any stack',
+      description: 'The SDK, a script tag, or plain fetch',
       setupCode: '',
     },
   ]
@@ -2533,8 +2536,17 @@ After implementation:
           {isPlainHttp ? (
             <>
               <IngestKeySetup project={project} />
-              <PlainHttpSetup project={project} signal="analytics" />
-              <PlainHttpSetup project={project} signal="session_replay" />
+              {/* The key card above already shows the key. */}
+              <PlainHttpSetup
+                project={project}
+                signal="analytics"
+                showCredentialStep={false}
+              />
+              <PlainHttpSetup
+                project={project}
+                signal="session_replay"
+                showCredentialStep={false}
+              />
             </>
           ) : isExternal ? (
             <>

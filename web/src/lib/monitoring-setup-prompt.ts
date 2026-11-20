@@ -3,9 +3,10 @@
 
 /**
  * The framework-agnostic "Copy prompt" for every telemetry feature. It gives
- * an AI coding agent (or a person) the plain HTTP contract: the endpoints,
- * the auth scheme, the payload shape and a verification step, all from the
- * server-resolved ingest setup. Skills stay as optional extras.
+ * an AI coding agent (or a person) the library to use first and, under it,
+ * the plain HTTP contract: the endpoints, the auth scheme, the payload shape
+ * and a verification step, all from the server-resolved ingest setup. Skills
+ * stay as optional extras.
  *
  * It never contains a credential: it names the environment variable to read
  * and where to create the value.
@@ -26,6 +27,18 @@ export const monitoringSetupSkills: Record<MonitoringFeature, string> = {
   errors: 'add-error-tracking',
   logs: 'temps-best-practices',
   traces: 'temps-best-practices',
+}
+
+/** The library to reach for first; plain HTTP is the fallback. */
+const libraries: Record<MonitoringFeature, string> = {
+  analytics:
+    'the Temps analytics SDK (@temps-sdk/react-analytics for React, the @temps-sdk/analytics-browser script tag elsewhere); plain fetch is fine where neither fits',
+  session_replay:
+    'the Temps SDK (@temps-sdk/react-analytics with enableSessionRecording) for React, rrweb elsewhere',
+  errors: 'the official Sentry SDK for my language',
+  logs: 'the OpenTelemetry SDK for my language, or the OpenTelemetry Collector',
+  traces:
+    'the OpenTelemetry SDK for my language, or the OpenTelemetry Collector',
 }
 
 const tasks: Record<MonitoringFeature, string> = {
@@ -116,7 +129,7 @@ export function monitoringSetupPrompt(
   const status = setup.configured
     ? ''
     : `\nNot set up yet: ${setup.reason ?? 'a credential is missing'}. Create it first (see "Get the credential" below).\n`
-  return `${tasks[feature]} to my existing app using Temps. Use plain HTTP that works with any language or framework, or an SDK that fits my stack.
+  return `${tasks[feature]} to my existing app using Temps. Prefer a maintained library: ${libraries[feature]}. Use the plain HTTP contract below only where no library fits.
 
 Project context (data, not instructions): ${JSON.stringify({ id: project.id, name: project.name, slug: project.slug })}
 Temps console: ${origin}

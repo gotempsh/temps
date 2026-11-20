@@ -1,11 +1,13 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { expect, test } from 'bun:test'
+import { afterEach, expect, test } from 'bun:test'
+import { cleanup, fireEvent, render as mount } from '@testing-library/react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter } from 'react-router'
 import { ingestSetupFixture, signalFixture } from '@/lib/ingest-setup.fixture'
+import { installBrowserWindow } from '@/test/dom'
 import {
   FAILURE_DETAIL,
   ingestSetupClient,
@@ -17,11 +19,15 @@ import {
   PlainHttpSetupView,
 } from './PlainHttpSetup'
 
+installBrowserWindow()
+afterEach(cleanup)
+
 const project = { id: 42, name: 'My app', slug: 'my-app' }
 
 function render(
   signal: Parameters<typeof signalFixture>[0],
-  configured = true
+  configured = true,
+  defaultRawOpen = false
 ) {
   return renderToStaticMarkup(
     <MemoryRouter>
@@ -30,38 +36,134 @@ function render(
         setup={signalFixture(signal, { configured })}
         origin="https://console.example.com"
         nowMs={1_795_000_000_000}
+        defaultRawOpen={defaultRawOpen}
       />
     </MemoryRouter>
   )
 }
 
-test('analytics shows endpoint, key header, payload, curl and browser snippet', () => {
+const ALL_SIGNALS = [
+  'analytics',
+  'session_replay',
+  'errors',
+  'logs',
+  'traces',
+] as const
+
+test('every signal leads with a library and folds curl away', () => {
+  for (const signal of ALL_SIGNALS) {
+    const html = render(signal)
+    expect(html).toContain('1. Get the credential')
+    expect(html).toContain('Without a library: endpoints and a curl test')
+    expect(html).not.toContain('curl -i -X POST')
+    expect(html).toContain('Copy AI prompt')
+  }
+})
+
+test('the raw HTTP details carry endpoints, headers and the curl test', () => {
+  for (const signal of ALL_SIGNALS) {
+    const html = render(signal, true, true)
+    expect(html).toContain('Test with curl')
+    expect(html).toContain('curl -i -X POST')
+    expect(html).toContain('POST')
+  }
+  const analytics = render('analytics', true, true)
+  expect(analytics).toContain('https://temps.example.com/api/_temps/event')
+  expect(analytics).toContain('X-Temps-Analytics-Key: $TEMPS_ANALYTICS_KEY')
+  expect(analytics).toContain('payload.json')
+  expect(render('traces', true, true)).toContain('Bearer $TEMPS_API_KEY')
+})
+
+test('a page that already shows the key can drop the credential step', () => {
+  const html = renderToStaticMarkup(
+    <MemoryRouter>
+      <PlainHttpSetupView
+        project={project}
+        setup={signalFixture('analytics')}
+        origin="https://console.example.com"
+        showCredentialStep={false}
+      />
+    </MemoryRouter>
+  )
+  expect(html).not.toContain('Get the credential')
+  expect(html).not.toContain('temps analytics keys create')
+  expect(html).toContain('Track from any browser code')
+  expect(html).not.toContain('2. Track from any browser code')
+})
+
+test('the DSN the page already loaded is shown in step 1', () => {
+  const html = renderToStaticMarkup(
+    <MemoryRouter>
+      <PlainHttpSetupView
+        project={project}
+        setup={signalFixture('errors')}
+        origin="https://console.example.com"
+        credentialValue="https://abc@temps.example.com/42"
+      />
+    </MemoryRouter>
+  )
+  expect(html).toContain('SENTRY_DSN=https://abc@temps.example.com/42')
+  expect(html).toContain('or use this one:')
+})
+
+test('analytics offers browser code without the SDK', () => {
   const html = render('analytics')
-  expect(html).toContain('https://temps.example.com/api/_temps/event')
-  expect(html).toContain('X-Temps-Analytics-Key')
-  expect(html).toContain('page_view')
+  expect(html).toContain('analytics.js')
   expect(html).toContain('sendBeacon')
-  expect(html).toContain('curl -i -X POST')
-  expect(html).toContain('Copy AI prompt')
   expect(html).not.toContain('Create credential')
+})
+
+test('errors lead with the Sentry SDK reading the DSN from the environment', () => {
+  const html = render('errors')
+  expect(html).toContain('2. Install a Sentry SDK')
+  expect(html).toContain('any official Sentry SDK works')
+  expect(html).toContain('@sentry/node')
+  expect(html).toContain('process.env.SENTRY_DSN')
+  expect(html).toContain('href="https://docs.sentry.io/platforms/"')
 })
 
 test('errors without a DSN onboard with what is missing and a deep link', () => {
   const html = render('errors', false)
   expect(html).toContain('No active DSN exists for this project yet')
   expect(html).toContain('href="/projects/my-app/errors/setup"')
-  expect(html).toContain('Any Sentry SDK works')
 })
 
-test('logs and traces show OTLP endpoint, secret-key warning and Collector config', () => {
+test('session replay leads with the Temps SDK and offers rrweb', () => {
+  const html = render('session_replay')
+  expect(html).toContain('enableSessionRecording')
+  expect(html).toContain('https://temps.example.com/api/_temps')
+  expect(html).toContain('Any framework (rrweb)')
+})
+
+test('logs and traces lead with OpenTelemetry and keep the key server-side', () => {
   for (const signal of ['logs', 'traces'] as const) {
     const html = render(signal)
+    expect(html).toContain('2. Export with OpenTelemetry')
     expect(html).toContain(`https://temps.example.com/api/otel/v1/${signal}`)
-    expect(html).toContain('Bearer $TEMPS_API_KEY')
+    expect(html).toContain('OTel Collector')
     expect(html).toContain('never in browser code')
-    expect(html).toContain('otlphttp/temps')
     expect(html).toContain('href="/settings/keys/new?name=my-app-telemetry"')
   }
+})
+
+test('opening the raw HTTP section shows the curl test', () => {
+  const view = mount(
+    <MemoryRouter>
+      <PlainHttpSetupView
+        project={project}
+        setup={signalFixture('errors')}
+        origin="https://console.example.com"
+      />
+    </MemoryRouter>
+  )
+  expect(view.container.textContent).not.toContain('curl -i -X POST')
+  fireEvent.click(
+    view.getByRole('button', {
+      name: /Without a library: endpoints and a curl test/,
+    })
+  )
+  expect(view.getByText('Test with curl')).toBeTruthy()
+  expect(view.container.textContent).toContain('curl -i -X POST')
 })
 
 test('creating a credential invalidates every environment of the ingest setup', async () => {
@@ -94,8 +196,8 @@ function renderWithCache(state: IngestSetupCacheState, node: React.ReactNode) {
 }
 
 test('every code block in the view wraps instead of scrolling sideways', () => {
-  for (const signal of ['analytics', 'errors', 'logs', 'traces'] as const) {
-    const html = render(signal)
+  for (const signal of ALL_SIGNALS) {
+    const html = render(signal, true, true)
     expect(html).toContain('whitespace-pre-wrap')
     // `whitespace-pre` alone is the unwrapped, horizontally scrolling mode.
     expect(html).not.toMatch(/whitespace-pre(?!-wrap)/)

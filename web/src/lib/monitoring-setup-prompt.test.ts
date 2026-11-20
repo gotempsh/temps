@@ -169,3 +169,24 @@ test('an unconfigured signal says what is missing first', () => {
   )
   expect(prompt).toContain('Not set up yet: No active DSN exists')
 })
+
+test('each prompt names the library to prefer over plain HTTP', () => {
+  const expected = {
+    analytics: '@temps-sdk/react-analytics',
+    session_replay: 'rrweb',
+    errors: 'official Sentry SDK',
+    logs: 'OpenTelemetry SDK',
+    traces: 'OpenTelemetry SDK',
+  } as const
+  for (const feature of features) {
+    const prompt = monitoringSetupPrompt(
+      feature,
+      project,
+      'http://localhost:3000',
+      signalFixture(feature)
+    )
+    expect(prompt).toContain('Prefer a maintained library')
+    expect(prompt).toContain(expected[feature])
+    expect(prompt).toContain('only where no library fits')
+  }
+})

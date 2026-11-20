@@ -13,7 +13,9 @@ import {
   otlpLogsRequest,
   otlpTracesRequest,
   sentryEnvelope,
+  sentrySdkExamples,
   sessionReplayCurl,
+  sessionReplayExamples,
 } from './plain-http-setup'
 
 type Field = { field: number; wire: number; value: bigint | Uint8Array }
@@ -228,4 +230,58 @@ test('the external .env block never puts a path-based URL in OTEL_EXPORTER_OTLP_
     'OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=https://temps.example.com/api/otel/v1/42/7/0/traces'
   )
   expect(block).not.toContain('<YOUR_API_KEY>')
+})
+
+describe('library examples', () => {
+  test('every Sentry SDK example reads the DSN variable and embeds no DSN', () => {
+    const examples = sentrySdkExamples(signalFixture('errors'))
+    expect(examples.map((e) => e.id)).toEqual([
+      'node',
+      'browser',
+      'python',
+      'go',
+      'ruby',
+    ])
+    for (const example of examples) {
+      expect(example.code).toContain('SENTRY_DSN')
+      expect(example.code).not.toMatch(/https?:\/\/[^\s'"]*@/)
+      expect(example.file.length).toBeGreaterThan(0)
+    }
+  })
+
+  test('session replay examples point at this project and mask inputs', () => {
+    const [react, rrweb] = sessionReplayExamples(
+      signalFixture('session_replay')
+    )
+    expect(react.code).toContain(
+      'basePath="https://temps.example.com/api/_temps"'
+    )
+    expect(react.code).toContain('enableSessionRecording')
+    expect(react.code).toContain('maskAllInputs: true')
+    expect(rrweb.code).toContain(
+      '"https://temps.example.com/api/_temps/session-replay/init"'
+    )
+    expect(rrweb.code).toContain(
+      '"https://temps.example.com/api/_temps/session-replay/events"'
+    )
+    expect(rrweb.code).toContain("'X-Temps-Analytics-Key'")
+    expect(rrweb.code).toContain('maskAllInputs: true')
+    expect(rrweb.code).toContain('<value of TEMPS_ANALYTICS_KEY>')
+  })
+
+  test('the rrweb example packs events as base64 zlib, which the server inflates', async () => {
+    const { inflateSync } = await import('node:zlib')
+    const code = sessionReplayExamples(signalFixture('session_replay'))[1].code
+    const body = code.match(
+      /async function pack\(events\) \{([\s\S]*?)\n\}/
+    )?.[1]
+    expect(body).toBeTruthy()
+    const pack = new Function('events', `return (async () => {${body}})()`) as (
+      events: unknown[]
+    ) => Promise<string>
+    const events = [{ type: 4, data: { href: 'https://apps.example.com/' } }]
+    const packed = await pack(events)
+    const inflated = inflateSync(Buffer.from(packed, 'base64')).toString()
+    expect(JSON.parse(inflated)).toEqual(events)
+  })
 })

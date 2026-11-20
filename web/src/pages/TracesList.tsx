@@ -531,7 +531,7 @@ function OtelSetupSection({
                 </div>
                 <div className="flex-1 min-w-0">
                   <p className="font-medium leading-none truncate">
-                    Plain HTTP / any framework
+                    Any language or framework
                   </p>
                   <p className="mt-1 text-xs text-muted-foreground truncate">
                     Any OpenTelemetry SDK or the Collector
