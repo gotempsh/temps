@@ -12,6 +12,8 @@ interface CommandInfo {
   aliases: string[]
   options: OptionInfo[]
   subcommands: CommandInfo[]
+  /** Positional arguments as Commander shows them: `<release>`, `[path...]`. */
+  arguments: string
   usage?: string
 }
 
@@ -70,8 +72,19 @@ function extractCommandInfo(cmd: Command, parentName = ''): CommandInfo {
     aliases,
     options,
     subcommands,
+    arguments: commandArguments(cmd),
     usage: cmd.usage(),
   }
+}
+
+/** A command's positional arguments, `<required>` and `[optional]`. */
+export function commandArguments(cmd: Command): string {
+  return cmd.registeredArguments
+    .map((arg) => {
+      const name = `${arg.name()}${arg.variadic ? '...' : ''}`
+      return arg.required ? `<${name}>` : `[${name}]`
+    })
+    .join(' ')
 }
 
 function escapeForMdx(text: string): string {
@@ -91,6 +104,13 @@ function generateMarkdown(commands: CommandInfo[], level = 2, format: 'markdown'
 
     if (cmd.description) {
       md += `${cmd.description}\n\n`
+    }
+
+    // Headings stay the bare command name (they name the routed reference
+    // files and anchors), so positional arguments are shown here.
+    if (cmd.arguments) {
+      const options = cmd.options.length > 0 ? ' [options]' : ''
+      md += `**Usage:** \`${cmd.name} ${cmd.arguments}${options}\`\n\n`
     }
 
     if (cmd.options.length > 0) {

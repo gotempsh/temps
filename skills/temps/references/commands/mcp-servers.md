@@ -46,6 +46,8 @@ Create a new MCP server definition
 
 Update an existing MCP server definition
 
+**Usage:** `mcp-servers update <slug> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -59,6 +61,8 @@ Update an existing MCP server definition
 ### `mcp-servers delete` (alias: `rm`)
 
 Delete an MCP server definition
+
+**Usage:** `mcp-servers delete <slug> [options]`
 
 **Options:**
 

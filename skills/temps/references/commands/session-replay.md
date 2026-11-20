@@ -34,6 +34,8 @@ List session replays for a project
 
 List session replays for a specific visitor
 
+**Usage:** `session-replay visitor <visitor-id> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -46,6 +48,8 @@ List session replays for a specific visitor
 
 Show session metadata (use numeric session ID from list)
 
+**Usage:** `session-replay show <visitor-id> <session-id> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -55,6 +59,8 @@ Show session metadata (use numeric session ID from list)
 ### `session-replay events`
 
 Download or page through all rrweb events for a session
+
+**Usage:** `session-replay events <visitor-id> <session-id> [options]`
 
 **Options:**
 
@@ -68,6 +74,8 @@ Download or page through all rrweb events for a session
 ### `session-replay delete` (alias: `rm`)
 
 Delete a session replay
+
+**Usage:** `session-replay delete <visitor-id> <session-id> [options]`
 
 **Options:**
 

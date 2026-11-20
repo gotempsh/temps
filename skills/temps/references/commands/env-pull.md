@@ -8,6 +8,8 @@ Apply [the CLI runtime and safety contract](../cli-runtime.md) before executing 
 
 Pull environment variables to a .env file
 
+**Usage:** `env:pull [file] [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |

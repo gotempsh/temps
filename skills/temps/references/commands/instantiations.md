@@ -32,6 +32,8 @@ List your recent template creations and imports, newest first
 
 Show every step of a template creation or import
 
+**Usage:** `instantiations show <id> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -43,6 +45,8 @@ Show every step of a template creation or import
 ### `instantiations retry`
 
 Continue from the step that failed; finished steps are not repeated
+
+**Usage:** `instantiations retry <id> [options]`
 
 **Options:**
 

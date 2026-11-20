@@ -8,6 +8,8 @@ Apply [the CLI runtime and safety contract](../cli-runtime.md) before executing 
 
 Deploy the current project (runs setup wizard if not linked)
 
+**Usage:** `up [project] [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
