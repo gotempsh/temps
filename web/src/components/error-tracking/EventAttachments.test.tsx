@@ -161,10 +161,14 @@ describe('AttachmentUsageSummary', () => {
 })
 
 describe('QuotaForm', () => {
-  const renderForm = (quota_bytes: number) =>
+  const renderForm = (quota_bytes: number, refreshing = false) =>
     renderToStaticMarkup(
       <QueryClientProvider client={new QueryClient()}>
-        <QuotaForm projectId={3} usage={usage({ quota_bytes })} />
+        <QuotaForm
+          projectId={3}
+          usage={usage({ quota_bytes })}
+          refreshing={refreshing}
+        />
       </QueryClientProvider>
     )
 
@@ -172,6 +176,12 @@ describe('QuotaForm', () => {
     const html = renderForm(268_435_456)
     expect(html).toMatch(/<button[^>]*disabled=""[^>]*>Save quota<\/button>/)
     expect(html).not.toContain('not a whole number of MiB')
+  })
+
+  test('waits for the saved quota to be read again before another save', () => {
+    // Not a whole MiB, so Save would otherwise be enabled.
+    const html = renderForm(1, true)
+    expect(html).toMatch(/<button[^>]*disabled=""[^>]*>Save quota<\/button>/)
   })
 
   test('a quota that is not whole MiB says so and can be saved as shown', () => {

@@ -308,16 +308,26 @@ mod storage {
             return;
         };
         event(&f, SDK_EVENT, chrono::Duration::minutes(5)).await;
-        let previous = f.service.set_quota(f.project_id, 4).await.expect("quota");
-        assert_eq!(previous, DEFAULT_QUOTA_BYTES);
+        let change = f.service.set_quota(f.project_id, 4).await.expect("quota");
+        assert_eq!(change.previous_quota_bytes, DEFAULT_QUOTA_BYTES);
+        // The answer is the committed state, the same a later read gives.
+        assert_eq!(change.usage.quota_bytes, 4);
         let usage = f.service.usage(f.project_id).await.expect("usage");
-        assert_eq!(usage.quota_bytes, 4);
+        assert_eq!(change.usage, usage);
         assert_eq!(
-            f.service.set_quota(f.project_id, 5).await.expect("quota"),
+            f.service
+                .set_quota(f.project_id, 5)
+                .await
+                .expect("quota")
+                .previous_quota_bytes,
             4
         );
         assert_eq!(
-            f.service.set_quota(f.project_id, 4).await.expect("quota"),
+            f.service
+                .set_quota(f.project_id, 4)
+                .await
+                .expect("quota")
+                .previous_quota_bytes,
             5
         );
 

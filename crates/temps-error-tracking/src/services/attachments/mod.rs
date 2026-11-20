@@ -190,6 +190,13 @@ const EXPIRED_PAGE_SELECT: &str = "SELECT a.id, a.project_id, a.event_time, \
                  WHERE e.id = a.owner_id AND e.timestamp = a.event_time) AS expired \
      FROM (SELECT id, project_id, owner_id, event_time FROM error_attachments";
 
+/// A saved attachment quota: the one it replaced and the usage it left.
+#[derive(Debug, Clone)]
+pub struct QuotaChange {
+    pub previous_quota_bytes: i64,
+    pub usage: AttachmentUsage,
+}
+
 /// One row of a sweep page: where the page ends, and whether to remove it.
 #[derive(Debug, Clone, FromQueryResult)]
 struct SweepCandidate {
@@ -1206,9 +1213,23 @@ impl AttachmentService {
             ),
             None => (0, 0, DEFAULT_QUOTA_BYTES),
         };
+        Ok(self
+            .usage_view(project_id, used_bytes, files, quota_bytes)
+            .await)
+    }
+
+    /// The usage of `project_id` from its stored totals, with the storage
+    /// probe and the drop counters. Nothing in it can fail.
+    async fn usage_view(
+        &self,
+        project_id: i32,
+        used_bytes: i64,
+        files: i64,
+        quota_bytes: i64,
+    ) -> AttachmentUsage {
         let (configured, reason) = self.availability(project_id).await;
         let counts = self.counts();
-        Ok(AttachmentUsage {
+        AttachmentUsage {
             configured,
             setup_path: (!configured).then(|| SETUP_PATH.to_string()),
             reason,
@@ -1220,7 +1241,7 @@ impl AttachmentService {
             max_attachments_per_event: MAX_ATTACHMENTS_PER_EVENT as i64,
             dropped_over_quota: counts.over_quota,
             dropped_queue_full: counts.dropped_queue_full,
-        })
+        }
     }
 
     /// Probe blob storage: a read of a key that never exists answers
@@ -1258,7 +1279,7 @@ impl AttachmentService {
         &self,
         project_id: i32,
         quota_bytes: i64,
-    ) -> Result<i64, ErrorTrackingError> {
+    ) -> Result<QuotaChange, ErrorTrackingError> {
         if !(0..=MAX_QUOTA_BYTES).contains(&quota_bytes) {
             return Err(ErrorTrackingError::Validation(format!(
                 "quota_bytes must be between 0 and {MAX_QUOTA_BYTES}, got {quota_bytes}"
@@ -1283,15 +1304,27 @@ impl AttachmentService {
             .await?
             .ok_or(ErrorTrackingError::ProjectNotFound)?
             .try_get("", "quota_bytes")?;
-        tx.execute(Statement::from_sql_and_values(
-            DatabaseBackend::Postgres,
-            "UPDATE error_attachment_usage SET quota_bytes = $2, updated_at = NOW() \
-             WHERE project_id = $1",
-            [project_id.into(), quota_bytes.into()],
-        ))
-        .await?;
+        // The totals are read in the same statement, so the answer is the
+        // committed state and nothing that can fail runs after the commit.
+        let saved = tx
+            .query_one(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "UPDATE error_attachment_usage SET quota_bytes = $2, updated_at = NOW() \
+                 WHERE project_id = $1 RETURNING bytes, files, quota_bytes",
+                [project_id.into(), quota_bytes.into()],
+            ))
+            .await?
+            .ok_or(ErrorTrackingError::ProjectNotFound)?;
+        let used_bytes: i64 = saved.try_get("", "bytes")?;
+        let files: i64 = saved.try_get("", "files")?;
+        let quota_bytes: i64 = saved.try_get("", "quota_bytes")?;
         tx.commit().await?;
-        Ok(previous)
+        Ok(QuotaChange {
+            previous_quota_bytes: previous,
+            usage: self
+                .usage_view(project_id, used_bytes, files, quota_bytes)
+                .await,
+        })
     }
 }
 

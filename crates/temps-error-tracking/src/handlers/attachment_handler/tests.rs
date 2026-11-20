@@ -242,3 +242,47 @@ fn file_names_are_quoted_safely_and_kept_exactly_in_the_encoded_form() {
     );
     assert!(HeaderValue::from_str(&content_disposition(false, "a\u{7f}b;c\\d%e")).is_ok());
 }
+
+#[tokio::test]
+async fn a_saved_quota_answers_with_the_committed_usage_and_reads_nothing_after_it() {
+    // Only the transaction's statements have answers: a read after the
+    // commit would find none and fail the request after the quota was saved.
+    let db = Arc::new(
+        sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_exec_results([sea_orm::MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 0,
+            }])
+            .append_query_results([
+                vec![std::collections::BTreeMap::from([(
+                    "quota_bytes",
+                    sea_orm::Value::from(268_435_456i64),
+                )])],
+                vec![std::collections::BTreeMap::from([
+                    ("bytes", sea_orm::Value::from(3i64)),
+                    ("files", sea_orm::Value::from(1i64)),
+                    ("quota_bytes", sea_orm::Value::from(1024i64)),
+                ])],
+            ])
+            .into_connection(),
+    );
+    let audit = Arc::new(RecordingAuditLogger::default());
+    let state = app_state(&db, audit.clone());
+    let Json(usage) = set_error_attachment_quota(
+        State(state),
+        RequireAuth(test_user(3, Role::User)),
+        Path(1),
+        Extension(metadata()),
+        Json(SetAttachmentQuotaRequest { quota_bytes: 1024 }),
+    )
+    .await
+    .expect("quota saved");
+    assert_eq!(
+        (usage.quota_bytes, usage.used_bytes, usage.files),
+        (1024, 3, 1)
+    );
+    let entries = audit.entries.lock().expect("audit lock");
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert_eq!(entries[0].1["previous_quota_bytes"], 268_435_456);
+    assert_eq!(entries[0].1["quota_bytes"], 1024);
+}

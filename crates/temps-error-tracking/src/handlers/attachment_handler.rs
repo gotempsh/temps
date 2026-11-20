@@ -357,7 +357,9 @@ pub async fn set_error_attachment_quota(
     permission_guard!(auth, ErrorTrackingWrite);
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
-    let previous_quota_bytes = state
+    // The service answers with the committed state, so once the quota is
+    // saved this handler has nothing left that can fail.
+    let change = state
         .error_tracking_service
         .attachments
         .set_quota(project_id, request.quota_bytes)
@@ -369,7 +371,7 @@ pub async fn set_error_attachment_quota(
             user_agent: metadata.user_agent,
         },
         project_id,
-        previous_quota_bytes,
+        previous_quota_bytes: change.previous_quota_bytes,
         quota_bytes: request.quota_bytes,
     };
     if let Err(error) = state.audit_service.create_audit_log(&audit).await {
@@ -378,13 +380,7 @@ pub async fn set_error_attachment_quota(
             "Failed to create attachment quota audit log: {error}"
         );
     }
-    // Read after the audit, so a failed read cannot hide a recorded write.
-    let usage = state
-        .error_tracking_service
-        .attachments
-        .usage(project_id)
-        .await?;
-    Ok(Json(usage))
+    Ok(Json(change.usage))
 }
 
 #[cfg(test)]

@@ -95,9 +95,15 @@ export function AttachmentUsageSummary({ usage }: { usage: AttachmentUsage }) {
 export function QuotaForm({
   projectId,
   usage,
+  refreshing = false,
 }: {
   projectId: number
   usage: AttachmentUsage
+  /**
+   * The saved quota is being read again (after a failed save, which may
+   * have been committed): no new save until the server's value is in.
+   */
+  refreshing?: boolean
 }) {
   const queryClient = useQueryClient()
   const form = useForm<QuotaFormData>({
@@ -162,7 +168,10 @@ export function QuotaForm({
           {...form.register('quota_mib', { valueAsNumber: true })}
         />
       </div>
-      <Button type="submit" disabled={save.isPending || (exact && !isDirty)}>
+      <Button
+        type="submit"
+        disabled={save.isPending || refreshing || (exact && !isDirty)}
+      >
         {save.isPending ? 'Saving…' : 'Save quota'}
       </Button>
       {!exact && (
@@ -238,7 +247,13 @@ export function AttachmentsSettingsBody({
     <>
       {failure}
       {usage && <AttachmentUsageSummary usage={usage} />}
-      {usage && <QuotaForm projectId={projectId} usage={usage} />}
+      {usage && (
+        <QuotaForm
+          projectId={projectId}
+          usage={usage}
+          refreshing={isRetrying}
+        />
+      )}
     </>
   )
 }
