@@ -60,6 +60,15 @@ test('every signal leads with a library and folds curl away', () => {
   }
 })
 
+test('setup code blocks have no title bar, like the docs', () => {
+  for (const signal of ALL_SIGNALS) {
+    const html = render(signal, true, true)
+    // Untitled blocks float their controls; titled ones render a header bar.
+    expect(html).toContain('group-hover/code:opacity-100')
+    expect(html).not.toContain('h-9 items-center justify-between')
+  }
+})
+
 test('the raw HTTP details carry endpoints, headers and the curl test', () => {
   for (const signal of ALL_SIGNALS) {
     const html = render(signal, true, true)
@@ -70,7 +79,7 @@ test('the raw HTTP details carry endpoints, headers and the curl test', () => {
   const analytics = render('analytics', true, true)
   expect(analytics).toContain('https://temps.example.com/api/_temps/event')
   expect(analytics).toContain('X-Temps-Analytics-Key: $TEMPS_ANALYTICS_KEY')
-  expect(analytics).toContain('payload.json')
+  expect(analytics).toContain('&quot;custom&quot;:')
   expect(render('traces', true, true)).toContain('Bearer $TEMPS_API_KEY')
 })
 
@@ -108,7 +117,7 @@ test('the DSN the page already loaded is shown in step 1', () => {
 
 test('analytics offers browser code without the SDK', () => {
   const html = render('analytics')
-  expect(html).toContain('analytics.js')
+  expect(html).toContain('TEMPS_URL')
   expect(html).toContain('sendBeacon')
   expect(html).not.toContain('Create credential')
 })

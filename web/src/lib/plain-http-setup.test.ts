@@ -245,7 +245,6 @@ describe('library examples', () => {
     for (const example of examples) {
       expect(example.code).toContain('SENTRY_DSN')
       expect(example.code).not.toMatch(/https?:\/\/[^\s'"]*@/)
-      expect(example.file.length).toBeGreaterThan(0)
     }
   })
 

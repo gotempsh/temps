@@ -148,7 +148,6 @@ function LibraryTabs({
         <TabsContent key={example.id} value={example.id} className="pt-3">
           <CodeBlock
             defaultWrap
-            title={example.file}
             language={example.language}
             code={example.code}
           />
@@ -211,14 +210,12 @@ function LibraryStep({
               {
                 id: 'sdk',
                 label: 'OpenTelemetry SDK',
-                file: '.env',
                 language: 'bash',
                 code: otlpEnvVars(setup, serviceName),
               },
               {
                 id: 'collector',
                 label: 'OTel Collector',
-                file: 'otel-collector.yaml',
                 language: 'yaml',
                 code: otelCollectorConfig(setup),
               },
@@ -251,7 +248,6 @@ function LibraryStep({
           </p>
           <CodeBlock
             defaultWrap
-            title="analytics.js"
             language="javascript"
             code={analyticsBrowserSnippet(setup)}
           />
@@ -301,17 +297,20 @@ function RawHttpDetails({
       {setup.signal === 'analytics' && (
         <CodeBlock
           defaultWrap
-          title="payload.json"
           language="json"
           code={JSON.stringify(analyticsPayloads(), null, 2)}
         />
       )}
-      <CodeBlock
-        defaultWrap
-        title="Test with curl"
-        language="bash"
-        code={verificationCurl(setup, serviceName, nowMs)}
-      />
+      <div className="space-y-2">
+        <p className="text-xs font-medium text-muted-foreground">
+          Test with curl
+        </p>
+        <CodeBlock
+          defaultWrap
+          language="bash"
+          code={verificationCurl(setup, serviceName, nowMs)}
+        />
+      </div>
     </div>
   )
 }
@@ -389,14 +388,12 @@ export function PlainHttpSetupView({
           {credentialValue ? (
             <CodeBlock
               defaultWrap
-              title=".env"
               language="bash"
               code={`${setup.auth.env_var}=${credentialValue}`}
             />
           ) : (
             <CodeBlock
               defaultWrap
-              title="terminal"
               language="bash"
               code={setup.auth.cli_command}
             />

@@ -19,8 +19,6 @@ export type IngestSignalName = IngestSignalSetup['signal']
 export type LibraryExample = {
   id: string
   label: string
-  /** File name shown in the code block's title bar. */
-  file: string
   language: CodeLanguage
   code: string
 }
@@ -141,7 +139,6 @@ export function sentrySdkExamples(setup: IngestSignalSetup): LibraryExample[] {
     {
       id: 'node',
       label: 'Node.js',
-      file: 'instrument.js',
       language: 'javascript',
       code: `// npm install @sentry/node
 const Sentry = require('@sentry/node');
@@ -151,7 +148,6 @@ Sentry.init({ dsn: process.env.${dsn} });`,
     {
       id: 'browser',
       label: 'Browser',
-      file: 'main.js',
       language: 'javascript',
       code: `// npm install @sentry/browser
 import * as Sentry from '@sentry/browser';
@@ -162,7 +158,6 @@ Sentry.init({ dsn: '<value of ${dsn}>' });`,
     {
       id: 'python',
       label: 'Python',
-      file: 'app.py',
       language: 'python',
       code: `# pip install sentry-sdk
 import os
@@ -173,7 +168,6 @@ sentry_sdk.init(dsn=os.environ["${dsn}"])`,
     {
       id: 'go',
       label: 'Go',
-      file: 'main.go',
       language: 'go',
       code: `// go get github.com/getsentry/sentry-go
 if err := sentry.Init(sentry.ClientOptions{Dsn: os.Getenv("${dsn}")}); err != nil {
@@ -184,7 +178,6 @@ defer sentry.Flush(2 * time.Second)`,
     {
       id: 'ruby',
       label: 'Ruby',
-      file: 'config/initializers/sentry.rb',
       language: 'ruby',
       code: `# bundle add sentry-ruby
 Sentry.init do |config|
@@ -212,7 +205,6 @@ export function sessionReplayExamples(
     {
       id: 'react',
       label: 'React',
-      file: 'layout.tsx',
       language: 'tsx',
       code: `// npm install @temps-sdk/react-analytics
 import { TempsAnalyticsProvider } from '@temps-sdk/react-analytics';
@@ -229,7 +221,6 @@ import { TempsAnalyticsProvider } from '@temps-sdk/react-analytics';
     {
       id: 'rrweb',
       label: 'Any framework (rrweb)',
-      file: 'replay.js',
       language: 'javascript',
       code: `// npm install rrweb
 import { record } from 'rrweb';

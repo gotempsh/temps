@@ -1964,7 +1964,6 @@ function IngestKeySetup({ project }: ProjectAnalyticsProps) {
           </ScrollableTabsList>
           <TabsContent value="react" className="space-y-3 pt-3">
             <CodeBlock
-              title="terminal"
               language="bash"
               code="npm install @temps-sdk/react-analytics"
               showCopy
