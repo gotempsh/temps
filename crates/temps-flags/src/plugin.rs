@@ -20,7 +20,10 @@ use tracing::debug;
 use utoipa::openapi::OpenApi;
 use utoipa::OpenApi as OpenApiTrait;
 
-use crate::handlers::{configure_routes, FlagsApiDoc, FlagsAppState};
+use crate::handlers::{
+    configure_public_routes, configure_routes, rate_limit::SlotRateLimiter, FlagsApiDoc,
+    FlagsAppState, PublicFlagsState,
+};
 use crate::services::FlagService;
 
 pub struct FlagsPlugin;
@@ -69,6 +72,23 @@ impl TempsPlugin for FlagsPlugin {
         });
 
         Some(PluginRoutes::new(configure_routes().with_state(app_state)))
+    }
+
+    /// `/api/_temps/flags` and the same-origin OFREP endpoints: called by
+    /// browsers on customers' sites, tenant resolved from `Host`.
+    fn configure_public_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
+        let state = Arc::new(PublicFlagsState {
+            flag_service: context.require_service::<FlagService>(),
+            route_table: context.require_service::<temps_routes::CachedPeerTable>(),
+            // Only feeds the implicit `country` attribute; flags evaluate
+            // without it.
+            geoip: context.get_service::<temps_geo::GeoIpService>(),
+            project_limiter: SlotRateLimiter::new(),
+            address_limiter: SlotRateLimiter::new(),
+        });
+        Some(PluginRoutes::new(
+            configure_public_routes().with_state(state),
+        ))
     }
 
     fn openapi_schema(&self) -> Option<OpenApi> {

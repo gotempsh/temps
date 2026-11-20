@@ -11,6 +11,8 @@ export * from "./usePageLeave";
 export * from "./useSpeedAnalytics";
 export * from "./useEngagementTracking";
 export * from "./useScrollVisibility";
+export * from "./useFlag";
+export type { FlagContext, FlagEvaluation, FlagExposure } from "@temps-sdk/analytics-core";
 export { EngagementTracker, type EngagementTrackerOptions, type EngagementData } from "./EngagementTracker";
 export {
   SessionRecorder,

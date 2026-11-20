@@ -122,7 +122,7 @@ The request path: reverse proxy, edge cache, route table and bot protection.
 | [`temps-edge`](../../crates/temps-edge) | Database-free edge CDN node that caches static assets locally and proxies dynamic requests to a Temps control plane | **1**: cli |  |
 | [`temps-edge-rules`](../../crates/temps-edge-rules) | Edge rule model, validation and evaluation engine (ADR-089). Pure: no I/O. | **1**: proxy |  |
 | [`temps-proxy`](../../crates/temps-proxy) | Pingora reverse proxy: request routing, TLS and on-demand certificates, request logs, IP access control, rate limits and Shield | **2**: cli, observability |  |
-| [`temps-routes`](../../crates/temps-routes) | Proxy route table kept in sync via Postgres LISTEN/NOTIFY, plus ingress endpoints, the gate, Shield and public-ingress sync | **8**: analytics-events, analytics-performance, analytics-session-replay, cli, error-tracking, ingress, network-policy, proxy |  |
+| [`temps-routes`](../../crates/temps-routes) | Proxy route table kept in sync via Postgres LISTEN/NOTIFY, plus ingress endpoints, the gate, Shield and public-ingress sync | **9**: analytics-events, analytics-performance, analytics-session-replay, cli, error-tracking, flags, ingress, network-policy, proxy |  |
 | [`temps-shield`](../../crates/temps-shield) | Shield: proof-of-work challenges, clearance cookies and reputation lists (ADR 066) | **5**: environments, node-agent, projects, proxy, routes |  |
 
 ## domain
@@ -147,7 +147,7 @@ Control-plane features: a service layer plus HTTP handlers for one product area.
 | [`temps-environments`](../../crates/temps-environments) | Project environments: environment CRUD, environment variables and secrets, ingress and login settings, and Shield mode | **2**: cli, projects |  |
 | [`temps-external-plugins`](../../crates/temps-external-plugins) | External plugin host: discovers, installs, spawns and supervises standalone plugin binaries and proxies HTTP and events to them | **1**: cli |  |
 | [`temps-flags`](../../crates/temps-flags) | Feature flags: per-project flags with per-environment values, evaluation and bucketing, changed without a redeploy | **1**: cli |  |
-| [`temps-geo`](../../crates/temps-geo) | IP geolocation: MaxMind GeoIP lookups, database refresh, IP address info and the geolocation settings | **6**: analytics-events, analytics-performance, audit, cli, error-tracking, proxy |  |
+| [`temps-geo`](../../crates/temps-geo) | IP geolocation: MaxMind GeoIP lookups, database refresh, IP address info and the geolocation settings | **7**: analytics-events, analytics-performance, audit, cli, error-tracking, flags, proxy |  |
 | [`temps-git`](../../crates/temps-git) | Git provider integrations (GitHub, GitLab, Bitbucket, Gitea): connections, repository access, webhooks and PR comments | **9**: ai-agents, ai-chat, cli, deployments, import, project-groups, projects, sandbox, service-access |  |
 | [`temps-infra`](../../crates/temps-infra) | Platform info and DNS lookup endpoints: server public and private IPs, Docker platform features and A-record resolution | **1**: cli |  |
 | [`temps-ingress`](../../crates/temps-ingress) | Ingress connectors (Cloudflare Tunnel, Tailscale): control-plane providers and node-facing handlers for non-public cluster entry | **1**: cli |  |

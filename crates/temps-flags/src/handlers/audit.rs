@@ -46,6 +46,8 @@ pub struct FeatureFlagCreatedAudit {
     pub value_type: String,
     pub default_value: serde_json::Value,
     pub client_visible: bool,
+    pub variants: serde_json::Value,
+    pub exposure_sample_rate: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -58,6 +60,33 @@ pub struct FeatureFlagUpdatedAudit {
     pub new_default_value: serde_json::Value,
     pub old_client_visible: bool,
     pub new_client_visible: bool,
+    pub old_variants: serde_json::Value,
+    pub new_variants: serde_json::Value,
+    pub old_exposure_sample_rate: f64,
+    pub new_exposure_sample_rate: f64,
+}
+
+/// Targeting rules replaced in one environment. Records both lists in full:
+/// a rule change alters who sees what in production with no deployment.
+#[derive(Debug, Clone, Serialize)]
+pub struct FeatureFlagRulesSetAudit {
+    pub context: AuditContext,
+    pub project_id: i32,
+    pub flag_id: i32,
+    pub key: String,
+    pub environment_id: i32,
+    pub old_rules: Option<serde_json::Value>,
+    pub new_rules: serde_json::Value,
+}
+
+/// The bucketing salt was regenerated: every rollout and split of the flag
+/// was reassigned. The salt itself is never recorded.
+#[derive(Debug, Clone, Serialize)]
+pub struct FeatureFlagReshuffledAudit {
+    pub context: AuditContext,
+    pub project_id: i32,
+    pub flag_id: i32,
+    pub key: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -92,6 +121,8 @@ pub struct FeatureFlagRestoredAudit {
 }
 
 impl_audit_operation!(FeatureFlagCreatedAudit, "FEATURE_FLAG_CREATED");
+impl_audit_operation!(FeatureFlagRulesSetAudit, "FEATURE_FLAG_RULES_SET");
+impl_audit_operation!(FeatureFlagReshuffledAudit, "FEATURE_FLAG_RESHUFFLED");
 impl_audit_operation!(FeatureFlagRestoredAudit, "FEATURE_FLAG_RESTORED");
 impl_audit_operation!(FeatureFlagUpdatedAudit, "FEATURE_FLAG_UPDATED");
 impl_audit_operation!(FeatureFlagArchivedAudit, "FEATURE_FLAG_ARCHIVED");

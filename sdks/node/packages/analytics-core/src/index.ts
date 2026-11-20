@@ -8,3 +8,13 @@ export { EngagementTracker, type EngagementTrackerOptions, type EngagementData }
 export { SpeedTracker, type SpeedTrackerOptions } from "./SpeedTracker";
 export { SessionRecorder, type SessionRecorderOptions } from "./SessionRecorder";
 export { createAnalytics } from "./Analytics";
+export {
+  FeatureFlags,
+  exposureEventData,
+  type FeatureFlagsOptions,
+  type FlagContext,
+  type FlagEvaluation,
+  type FlagExposure,
+  type FlagReason,
+  type FlagsStatus,
+} from "./FeatureFlags";

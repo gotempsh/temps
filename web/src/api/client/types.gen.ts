@@ -3227,6 +3227,12 @@ export type AttributeSliceResponse = {
 };
 
 /**
+ * A targeting attribute: what the caller (or the server, implicitly) knows
+ * about the subject.
+ */
+export type AttributeValue = boolean | number | string;
+
+/**
  * Who an address is for.
  */
 export type Audience = 'public' | 'private' | 'signed_in' | 'tailnet_users' | 'unsupported';
@@ -6815,6 +6821,16 @@ export type ComposeValidationReportResponse = {
 };
 
 /**
+ * Comparison applied by one rule condition.
+ */
+export type ConditionOperator = 'eq' | 'neq' | 'in' | 'not_in' | 'contains' | 'not_contains' | 'matches' | 'gt' | 'gte' | 'lt' | 'lte' | 'exists' | 'not_exists';
+
+/**
+ * The right-hand side of a condition: one value, or a list for `in`/`not_in`.
+ */
+export type ConditionValue = Array<AttributeValue> | AttributeValue;
+
+/**
  * Connect the chat's sandbox to the services of a project.
  */
 export type ConnectProjectRequest = {
@@ -8582,6 +8598,11 @@ export type CreateFlagRequest = {
     default_value: unknown;
     description?: string | null;
     /**
+     * Share of subjects (`0..=1`) whose browser records a `flag_exposure`
+     * event when it reads the flag. Defaults to 0: exposure is opt-in.
+     */
+    exposure_sample_rate?: number;
+    /**
      * Stable key used in application code. Immutable after create.
      */
     key: string;
@@ -8590,6 +8611,10 @@ export type CreateFlagRequest = {
      * call site.
      */
     value_type: FlagValueType;
+    /**
+     * Named values targeting rules may serve. Each must match `value_type`.
+     */
+    variants?: Array<FlagVariant>;
 };
 
 export type CreateFunnelRequest = {
@@ -14668,6 +14693,30 @@ export type EstimateBulkActivationRequest = {
 };
 
 /**
+ * Why an evaluation produced the value it did.
+ *
+ * Part of the wire contract, and the only thing that makes "why is this user
+ * seeing the old checkout?" answerable.
+ */
+export type EvalReason = {
+    kind: 'FLAG_NOT_FOUND';
+} | {
+    kind: 'DISABLED';
+} | {
+    index: number;
+    kind: 'RULE_MATCH';
+} | {
+    index: number;
+    kind: 'PERCENTAGE_ROLLOUT';
+} | {
+    kind: 'ENVIRONMENT_VALUE';
+} | {
+    kind: 'DEFAULT';
+} | {
+    kind: 'ERROR';
+};
+
+/**
  * A rule supplied to the dry run instead of the saved ones.
  */
 export type EvaluateEdgeRuleInput = {
@@ -14721,6 +14770,33 @@ export type EvaluateEdgeRulesResponse = {
      */
     summary: string;
     trace: Array<EvaluateEdgeRuleTraceEntry>;
+};
+
+/**
+ * Evaluate one flag as an app in an environment would.
+ */
+export type EvaluateFlagRequest = {
+    attributes?: {
+        [key: string]: AttributeValue;
+    };
+    environment_id: number;
+    /**
+     * Bucketing subject. Required for rules with a rollout or a split to
+     * apply.
+     */
+    key?: string | null;
+};
+
+/**
+ * The outcome of evaluating one flag. Always carries a usable value.
+ */
+export type Evaluation = {
+    reason: EvalReason;
+    value: unknown;
+    /**
+     * The variant served, when a rule served one. `None` for plain values.
+     */
+    variant?: string | null;
 };
 
 /**
@@ -15935,6 +16011,19 @@ export type FiringSeriesEntry = {
 export type FlagEnvironmentResponse = {
     enabled: boolean;
     environment_id: number;
+    /**
+     * Ordered targeting rules; first match wins.
+     */
+    rules: Array<FlagRule>;
+    /**
+     * `false` when the stored rules could not be decoded. The flag then
+     * serves its default with reason `ERROR` until they are replaced.
+     */
+    rules_valid: boolean;
+    /**
+     * Send back as `expected_updated_at` when replacing the rules.
+     */
+    updated_at: string;
     value?: unknown;
 };
 
@@ -15964,6 +16053,10 @@ export type FlagResponse = {
      * everywhere.
      */
     environments: Array<FlagEnvironmentResponse>;
+    /**
+     * Share of subjects whose browser records exposure events. 0 = off.
+     */
+    exposure_sample_rate: number;
     id: number;
     key: string;
     /**
@@ -15971,13 +16064,44 @@ export type FlagResponse = {
      * which is a real answer rather than missing data.
      */
     last_evaluated_at?: string | null;
+    /**
+     * Send back as `expected_updated_at` to make an update conditional.
+     */
     updated_at: string;
     value_type: string;
+    /**
+     * Named values targeting rules may serve.
+     */
+    variants: Array<FlagVariant>;
+};
+
+/**
+ * `when <conditions> [within rollout_percentage] serve <serve>`.
+ */
+export type FlagRule = {
+    /**
+     * All must hold. Empty means every subject.
+     */
+    conditions?: Array<RuleCondition>;
+    /**
+     * Free text shown in the console, e.g. "Beta customers".
+     */
+    description?: string | null;
+    /**
+     * Share of matching subjects the rule applies to, `0..=100`. `None` means
+     * all of them. Ramping it up never removes anyone already included.
+     */
+    rollout_percentage?: number | null;
+    serve: RuleServe;
 };
 
 /**
  * A single flag, already resolved down to one environment. This is what the
- * evaluator sees and what the SDK caches in memory.
+ * evaluator sees and what the server-side SDK caches in memory.
+ *
+ * Carries the rules and the salt, so it is **server-side only**: it is served
+ * to deployment tokens (`/flags/snapshot`) and never to a browser, which only
+ * ever receives evaluated results (ADR 034 R5.1).
  */
 export type FlagSnapshot = {
     /**
@@ -15994,7 +16118,19 @@ export type FlagSnapshot = {
      */
     environment_value?: unknown;
     key: string;
+    /**
+     * Ordered targeting rules for this environment. First match wins.
+     */
+    rules?: Array<FlagRule>;
+    /**
+     * Bucketing salt. Needed by an SDK that evaluates rollouts locally.
+     */
+    salt?: string;
     value_type: FlagValueType;
+    /**
+     * Named values rules may serve.
+     */
+    variants?: Array<FlagVariant>;
 };
 
 export type FlagSnapshotResponse = {
@@ -16010,6 +16146,23 @@ export type FlagSnapshotResponse = {
  * The declared type of a flag's value. Fixed at create time.
  */
 export type FlagValueType = 'bool' | 'string' | 'number' | 'json';
+
+/**
+ * A named value a flag can serve, so a rollout or an experiment keys off a
+ * stable name (`control`, `test`) rather than a serialized value (ADR 034
+ * R1.4, ADR 110 D3).
+ */
+export type FlagVariant = {
+    description?: string | null;
+    /**
+     * `[a-z0-9][a-z0-9._-]*`, unique within the flag.
+     */
+    key: string;
+    /**
+     * Must match the flag's `value_type`.
+     */
+    value: unknown;
+};
 
 /**
  * Data moving from one part to another. `from` is the part that starts it.
@@ -23617,6 +23770,51 @@ export type OccupiedRangeReport = {
     source: string;
 };
 
+export type OfrepBulkResponse = {
+    flags: Array<OfrepEvaluationSuccess>;
+};
+
+export type OfrepEvaluationFailure = {
+    /**
+     * `FLAG_NOT_FOUND`, `INVALID_CONTEXT`, `PARSE_ERROR` or `GENERAL`.
+     */
+    errorCode: string;
+    errorDetails: string;
+    key: string;
+};
+
+/**
+ * OFREP evaluation request: `{ "context": { "targetingKey": "...", ... } }`.
+ *
+ * `context` is an OpenFeature evaluation context, arbitrary JSON by
+ * definition. Scalar entries become targeting attributes; nested objects and
+ * arrays are ignored.
+ */
+export type OfrepEvaluationRequest = {
+    context?: {
+        [key: string]: unknown;
+    } | null;
+};
+
+export type OfrepEvaluationSuccess = {
+    key: string;
+    metadata: OfrepMetadata;
+    /**
+     * `STATIC`, `TARGETING_MATCH`, `SPLIT`, `DISABLED`, `DEFAULT` or `ERROR`.
+     */
+    reason: string;
+    value: unknown;
+    variant?: string | null;
+};
+
+/**
+ * OFREP metadata. Always empty today; present because the protocol defines
+ * it.
+ */
+export type OfrepMetadata = {
+    [key: string]: unknown;
+};
+
 export type OidcProviderResponse = {
     client_id: string;
     /**
@@ -28237,6 +28435,49 @@ export type PublicEnvExampleResponse = {
 };
 
 /**
+ * One evaluated flag, as a browser sees it.
+ */
+export type PublicFlagEvaluation = {
+    key: string;
+    reason: EvalReason;
+    /**
+     * Whether the app should record a `flag_exposure` analytics event when
+     * it reads this flag. Decided here, per subject, from the flag's
+     * exposure sample rate, so sampling is stable for a visitor and costs
+     * the browser nothing.
+     */
+    record_exposure: boolean;
+    value: unknown;
+    variant?: string | null;
+};
+
+/**
+ * Body of `POST /api/_temps/flags`. Every field is optional; an empty body
+ * evaluates every client-visible flag for the visitor the request carries.
+ */
+export type PublicFlagsRequest = {
+    /**
+     * Targeting attributes. Override the implicit ones of the same name.
+     */
+    attributes?: {
+        [key: string]: AttributeValue;
+    };
+    /**
+     * Bucketing subject, e.g. a signed-in user id. Defaults to the Temps
+     * visitor cookie when the request carries one.
+     */
+    key?: string | null;
+    /**
+     * Evaluate only these flags. Omit for all client-visible flags.
+     */
+    keys?: Array<string> | null;
+};
+
+export type PublicFlagsResponse = {
+    flags: Array<PublicFlagEvaluation>;
+};
+
+/**
  * Public hostname generation mode for Temps-managed preview routes.
  *
  * The mode is stored per managed domain (`dns_managed_domains.generated_hostname_mode`)
@@ -30730,6 +30971,32 @@ export type RouteUser = {
 export type RouteUserWithRoles = {
     roles: Array<RouteRole>;
     user: RouteUser;
+};
+
+/**
+ * `attribute <operator> value`.
+ */
+export type RuleCondition = {
+    /**
+     * Context attribute name, e.g. `plan`, `country`, `email`.
+     */
+    attribute: string;
+    operator: ConditionOperator;
+    value?: ConditionValue | null;
+};
+
+/**
+ * What a matching rule serves.
+ */
+export type RuleServe = {
+    kind: 'value';
+    value: unknown;
+} | {
+    kind: 'variant';
+    variant: string;
+} | {
+    kind: 'split';
+    split: Array<VariantWeight>;
 };
 
 export type RunBackupRequest = {
@@ -33734,6 +34001,22 @@ export type SetFlagEnvironmentRequest = {
      * flag default), anything else sets it. Must match `value_type`.
      */
     value?: unknown;
+};
+
+/**
+ * Replace the ordered targeting rules of a flag in one environment.
+ */
+export type SetFlagRulesRequest = {
+    /**
+     * The environment row's `updated_at` as last read, or absent when the
+     * flag had no row for this environment. A 409 means someone else changed
+     * the rules in between: reload and apply the change again.
+     */
+    expected_updated_at?: string | null;
+    /**
+     * First match wins. An empty list removes all targeting.
+     */
+    rules: Array<FlagRule>;
 };
 
 export type SetGroupRepositoryRequest = {
@@ -38573,6 +38856,17 @@ export type UpdateFlagRequest = {
      * Tri-state: absent leaves it, `null` clears it, a string sets it.
      */
     description?: string | null;
+    /**
+     * The flag's `updated_at` as last read. When sent, the update is refused
+     * with 409 if the flag changed since.
+     */
+    expected_updated_at?: string | null;
+    exposure_sample_rate?: number | null;
+    /**
+     * Replaces the variant list. A variant still served by a rule cannot be
+     * removed.
+     */
+    variants?: Array<FlagVariant> | null;
 };
 
 export type UpdateGitSettingsRequest = {
@@ -39896,6 +40190,21 @@ export type VariableHistoryList = {
     page: number;
     page_size: number;
     total: number;
+};
+
+/**
+ * One arm of a weighted split.
+ */
+export type VariantWeight = {
+    /**
+     * A variant key declared on the flag.
+     */
+    variant: string;
+    /**
+     * Share of the rule's subjects, in whole percent. A split's weights sum
+     * to 100.
+     */
+    weight: number;
 };
 
 export type VaultLinkList = {
@@ -41856,6 +42165,11 @@ export type CiExecutorStatusWritable = {
 };
 
 /**
+ * The right-hand side of a condition: one value, or a list for `in`/`not_in`.
+ */
+export type ConditionValueWritable = Array<AttributeValue> | AttributeValue;
+
+/**
  * OTLP ingest behaviour: per-project rate limits and storage quota, the
  * background analysis jobs, and optional S3 archival of OTel logs.
  *
@@ -42325,6 +42639,112 @@ export type RecordEventMetricsResponses = {
 };
 
 export type RecordEventMetricsResponse = RecordEventMetricsResponses[keyof RecordEventMetricsResponses];
+
+export type EvaluatePublicFlagsData = {
+    body: PublicFlagsRequest;
+    path?: never;
+    query?: never;
+    url: '/_temps/flags';
+};
+
+export type EvaluatePublicFlagsErrors = {
+    /**
+     * Malformed or oversized context
+     */
+    400: unknown;
+    /**
+     * No environment serves this host
+     */
+    404: unknown;
+    /**
+     * Rate limit exceeded
+     */
+    429: unknown;
+    /**
+     * Flags could not be loaded
+     */
+    503: unknown;
+};
+
+export type EvaluatePublicFlagsResponses = {
+    /**
+     * Evaluated client-visible flags
+     */
+    200: PublicFlagsResponse;
+};
+
+export type EvaluatePublicFlagsResponse = EvaluatePublicFlagsResponses[keyof EvaluatePublicFlagsResponses];
+
+export type OfrepPublicBulkData = {
+    body: OfrepEvaluationRequest;
+    path?: never;
+    query?: never;
+    url: '/_temps/ofrep/v1/evaluate/flags';
+};
+
+export type OfrepPublicBulkErrors = {
+    /**
+     * Invalid context
+     */
+    400: OfrepEvaluationFailure;
+    /**
+     * No environment serves this host
+     */
+    404: unknown;
+    /**
+     * Rate limit exceeded
+     */
+    429: unknown;
+};
+
+export type OfrepPublicBulkError = OfrepPublicBulkErrors[keyof OfrepPublicBulkErrors];
+
+export type OfrepPublicBulkResponses = {
+    /**
+     * Evaluated client-visible flags
+     */
+    200: OfrepBulkResponse;
+};
+
+export type OfrepPublicBulkResponse = OfrepPublicBulkResponses[keyof OfrepPublicBulkResponses];
+
+export type OfrepPublicSingleData = {
+    body: OfrepEvaluationRequest;
+    path: {
+        /**
+         * Flag key
+         */
+        key: string;
+    };
+    query?: never;
+    url: '/_temps/ofrep/v1/evaluate/flags/{key}';
+};
+
+export type OfrepPublicSingleErrors = {
+    /**
+     * Invalid context
+     */
+    400: OfrepEvaluationFailure;
+    /**
+     * Flag not found or not client-visible
+     */
+    404: OfrepEvaluationFailure;
+    /**
+     * Rate limit exceeded
+     */
+    429: unknown;
+};
+
+export type OfrepPublicSingleError = OfrepPublicSingleErrors[keyof OfrepPublicSingleErrors];
+
+export type OfrepPublicSingleResponses = {
+    /**
+     * Evaluated flag
+     */
+    200: OfrepEvaluationSuccess;
+};
+
+export type OfrepPublicSingleResponse = OfrepPublicSingleResponses[keyof OfrepPublicSingleResponses];
 
 export type IngestTunneledEnvelopeData = {
     /**
@@ -69511,6 +69931,81 @@ export type TestNotificationRouteResponses = {
 
 export type TestNotificationRouteResponse = TestNotificationRouteResponses[keyof TestNotificationRouteResponses];
 
+export type OfrepServerBulkData = {
+    body: OfrepEvaluationRequest;
+    path?: never;
+    query?: never;
+    url: '/ofrep/v1/evaluate/flags';
+};
+
+export type OfrepServerBulkErrors = {
+    /**
+     * Invalid context or token not environment-scoped
+     */
+    400: OfrepEvaluationFailure;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+};
+
+export type OfrepServerBulkError = OfrepServerBulkErrors[keyof OfrepServerBulkErrors];
+
+export type OfrepServerBulkResponses = {
+    /**
+     * Evaluated flags
+     */
+    200: OfrepBulkResponse;
+};
+
+export type OfrepServerBulkResponse = OfrepServerBulkResponses[keyof OfrepServerBulkResponses];
+
+export type OfrepServerSingleData = {
+    body: OfrepEvaluationRequest;
+    path: {
+        /**
+         * Flag key
+         */
+        key: string;
+    };
+    query?: never;
+    url: '/ofrep/v1/evaluate/flags/{key}';
+};
+
+export type OfrepServerSingleErrors = {
+    /**
+     * Invalid context or token not environment-scoped
+     */
+    400: OfrepEvaluationFailure;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Flag not found
+     */
+    404: OfrepEvaluationFailure;
+};
+
+export type OfrepServerSingleError = OfrepServerSingleErrors[keyof OfrepServerSingleErrors];
+
+export type OfrepServerSingleResponses = {
+    /**
+     * Evaluated flag
+     */
+    200: OfrepEvaluationSuccess;
+};
+
+export type OfrepServerSingleResponse = OfrepServerSingleResponses[keyof OfrepServerSingleResponses];
+
 export type ListOperationsData = {
     body?: never;
     path?: never;
@@ -87690,6 +88185,10 @@ export type UpdateFlagErrors = {
      */
     404: unknown;
     /**
+     * Flag changed since it was read
+     */
+    409: unknown;
+    /**
      * Internal server error
      */
     500: unknown;
@@ -87755,6 +88254,154 @@ export type SetFlagEnvironmentResponses = {
 };
 
 export type SetFlagEnvironmentResponse = SetFlagEnvironmentResponses[keyof SetFlagEnvironmentResponses];
+
+export type SetFlagRulesData = {
+    body: SetFlagRulesRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Flag key
+         */
+        key: string;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/flags/{key}/environments/{environment_id}/rules';
+};
+
+export type SetFlagRulesErrors = {
+    /**
+     * Validation error
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Flag or environment not found
+     */
+    404: unknown;
+    /**
+     * Rules changed since they were read
+     */
+    409: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type SetFlagRulesResponses = {
+    /**
+     * Rules replaced
+     */
+    200: FlagEnvironmentResponse;
+};
+
+export type SetFlagRulesResponse = SetFlagRulesResponses[keyof SetFlagRulesResponses];
+
+export type EvaluateFlagData = {
+    body: EvaluateFlagRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Flag key
+         */
+        key: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/flags/{key}/evaluate';
+};
+
+export type EvaluateFlagErrors = {
+    /**
+     * Environment not in project, or the context exceeds the evaluation limits
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Flag or environment not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type EvaluateFlagResponses = {
+    /**
+     * Evaluation
+     */
+    200: Evaluation;
+};
+
+export type EvaluateFlagResponse = EvaluateFlagResponses[keyof EvaluateFlagResponses];
+
+export type ReshuffleFlagData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Flag key
+         */
+        key: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/flags/{key}/reshuffle';
+};
+
+export type ReshuffleFlagErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Flag not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ReshuffleFlagResponses = {
+    /**
+     * Salt regenerated
+     */
+    200: FlagResponse;
+};
+
+export type ReshuffleFlagResponse = ReshuffleFlagResponses[keyof ReshuffleFlagResponses];
 
 export type RestoreFlagData = {
     body?: never;
