@@ -8,12 +8,18 @@ import {
   describeTargeting,
   formatAnswer,
   parseSurveyId,
+  projectLookup,
   readQuestions,
   readTargeting,
   windowFromDays,
 } from './index.js'
 
 describe('surveys command helpers', () => {
+  test('--project takes a numeric id or a slug', () => {
+    expect(projectLookup('42')).toEqual({ id: 42 })
+    expect(projectLookup('shop-2')).toEqual({ slug: 'shop-2' })
+  })
+
   test('survey ids are positive whole numbers', () => {
     expect(parseSurveyId('12')).toBe(12)
     expect(() => parseSurveyId('0')).toThrow(/positive whole number/)

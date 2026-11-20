@@ -69,16 +69,32 @@ export function isScale(kind: QuestionKind): boolean {
 }
 
 /**
- * A fresh question id, numbered after the highest `qN` in the draft. A lower
- * number is never reused: answers are stored under the id, so a new question
- * that took a removed question's id would inherit its answers.
+ * A fresh question id, random rather than numbered. Answers are stored under
+ * the id, and a survey does not remember the ids of questions removed in an
+ * earlier edit, so any id derived from the questions still present could be
+ * one a removed question used, and the new question would inherit its
+ * answers. 10 base-36 characters make a repeat practically impossible.
  */
-export function nextQuestionId(questions: QuestionDraft[]): string {
-  const highest = questions.reduce((max, q) => {
-    const match = /^q(\d+)$/.exec(q.id)
-    return match ? Math.max(max, Number(match[1])) : max
-  }, questions.length)
-  return `q${highest + 1}`
+export function nextQuestionId(
+  questions: QuestionDraft[],
+  random: () => number = secureRandom
+): string {
+  const taken = new Set(questions.map((q) => q.id))
+  for (;;) {
+    let suffix = ''
+    while (suffix.length < 10) {
+      suffix += Math.floor(random() * 36).toString(36)
+    }
+    const id = `q_${suffix}`
+    if (!taken.has(id)) return id
+  }
+}
+
+/** A uniform number in [0, 1) from the platform CSPRNG. */
+function secureRandom(): number {
+  const word = new Uint32Array(1)
+  crypto.getRandomValues(word)
+  return word[0] / 2 ** 32
 }
 
 export function blankQuestion(

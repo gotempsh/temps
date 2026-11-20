@@ -10,8 +10,12 @@ import type {
 import {
   deleteSurveyMutation,
   getSurveyOptions,
+  getSurveyQueryKey,
   getSurveyResultsOptions,
+  getSurveyResultsQueryKey,
   listSurveyResponsesOptions,
+  listSurveyResponsesQueryKey,
+  listSurveysQueryKey,
   updateSurveyMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import { TimeAgo } from '@/components/utils/TimeAgo'
@@ -38,7 +42,7 @@ import {
   TableRow,
 } from '@/components/ui/table'
 import { useGoBack } from '@/hooks/useGoBack'
-import { useMutation, useQuery } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ArrowLeft, Loader2, Pencil, Trash2 } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router'
@@ -92,13 +96,28 @@ export function SurveyDetail({ project }: SurveyDetailProps) {
     enabled: surveyId > 0,
   })
 
+  // After a write, everything derived from the definition is stale: the
+  // list, this survey, its results in every window, and its responses (the
+  // server shapes answers by the current questions).
+  const queryClient = useQueryClient()
+  const invalidateSurvey = () => {
+    for (const queryKey of [
+      listSurveysQueryKey({ path: { project_id: project.id } }),
+      getSurveyQueryKey({ path }),
+      getSurveyResultsQueryKey({ path }),
+      listSurveyResponsesQueryKey({ path }),
+    ]) {
+      void queryClient.invalidateQueries({ queryKey })
+    }
+  }
+
   const changeStatus = useMutation({
     ...updateSurveyMutation(),
     onSuccess: (saved) => {
       toast.success(
         `${saved.name} is now ${STATUS_LABELS[saved.status].toLowerCase()}`
       )
-      void surveyQuery.refetch()
+      invalidateSurvey()
     },
     onError: (error) =>
       toast.error(surveyErrorMessage(error, 'Could not change the status')),
@@ -109,6 +128,9 @@ export function SurveyDetail({ project }: SurveyDetailProps) {
       toast.success(
         'Survey deleted. Its answers stay in your analytics events.'
       )
+      void queryClient.invalidateQueries({
+        queryKey: listSurveysQueryKey({ path: { project_id: project.id } }),
+      })
       navigate(listPath)
     },
     onError: (error) =>
@@ -287,58 +309,63 @@ export function SurveyDetail({ project }: SurveyDetailProps) {
           </p>
         ) : (
           <div className="space-y-4">
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>When</TableHead>
-                  <TableHead>Answers</TableHead>
-                  <TableHead className="hidden md:table-cell">Page</TableHead>
-                  <TableHead className="text-right">Visitor</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {responsesQuery.data.responses.map((response) => (
-                  <TableRow key={response.event_id}>
-                    <TableCell className="whitespace-nowrap text-sm">
-                      <TimeAgo date={response.timestamp} />
-                    </TableCell>
-                    <TableCell className="text-sm">
-                      <dl className="space-y-0.5">
-                        {survey.questions
-                          .filter((q) => response.answers[q.id] !== undefined)
-                          .map((q) => (
-                            <div key={q.id} className="flex gap-2">
-                              <dt className="shrink-0 text-muted-foreground">
-                                {q.prompt}
-                              </dt>
-                              <dd className="break-words">
-                                {formatAnswer(response.answers[q.id])}
-                              </dd>
-                            </div>
-                          ))}
-                      </dl>
-                    </TableCell>
-                    <TableCell className="hidden md:table-cell font-mono text-xs">
-                      {response.pathname}
-                    </TableCell>
-                    <TableCell className="text-right">
-                      {response.visitor_id ? (
-                        <Link
-                          className="text-sm underline-offset-4 hover:underline"
-                          to={`/projects/${project.slug}/analytics/visitors/${response.visitor_id}`}
-                        >
-                          Profile
-                        </Link>
-                      ) : (
-                        <span className="text-sm text-muted-foreground">
-                          Anonymous
-                        </span>
-                      )}
-                    </TableCell>
+            {/* Columns show by the table's own width (DESIGN.md). */}
+            <div className="@container">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>When</TableHead>
+                    <TableHead>Answers</TableHead>
+                    <TableHead className="hidden @2xl:table-cell">
+                      Page
+                    </TableHead>
+                    <TableHead className="text-right">Visitor</TableHead>
                   </TableRow>
-                ))}
-              </TableBody>
-            </Table>
+                </TableHeader>
+                <TableBody>
+                  {responsesQuery.data.responses.map((response) => (
+                    <TableRow key={response.event_id}>
+                      <TableCell className="whitespace-nowrap text-sm">
+                        <TimeAgo date={response.timestamp} />
+                      </TableCell>
+                      <TableCell className="text-sm">
+                        <dl className="space-y-0.5">
+                          {survey.questions
+                            .filter((q) => response.answers[q.id] !== undefined)
+                            .map((q) => (
+                              <div key={q.id} className="flex gap-2">
+                                <dt className="shrink-0 text-muted-foreground">
+                                  {q.prompt}
+                                </dt>
+                                <dd className="break-words">
+                                  {formatAnswer(response.answers[q.id])}
+                                </dd>
+                              </div>
+                            ))}
+                        </dl>
+                      </TableCell>
+                      <TableCell className="hidden @2xl:table-cell font-mono text-xs">
+                        {response.pathname}
+                      </TableCell>
+                      <TableCell className="text-right">
+                        {response.visitor_id ? (
+                          <Link
+                            className="text-sm underline-offset-4 hover:underline"
+                            to={`/projects/${project.slug}/analytics/visitors/${response.visitor_id}`}
+                          >
+                            Profile
+                          </Link>
+                        ) : (
+                          <span className="text-sm text-muted-foreground">
+                            Anonymous
+                          </span>
+                        )}
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </div>
             <ResponsivePagination
               page={page}
               pageSize={responsesQuery.data.page_size}
@@ -355,10 +382,7 @@ export function SurveyDetail({ project }: SurveyDetailProps) {
         survey={survey}
         open={editOpen}
         onOpenChange={setEditOpen}
-        onSaved={() => {
-          void surveyQuery.refetch()
-          void resultsQuery.refetch()
-        }}
+        onSaved={invalidateSurvey}
       />
       <ConfirmDeleteDialog
         open={deleteOpen}
@@ -387,7 +411,7 @@ function Stat({ label, value }: { label: string; value: string }) {
 function NotShownYet({ survey }: { survey: SurveyResponse }) {
   const message =
     survey.status === 'active'
-      ? 'Nobody has seen this survey in this window. Check that the app renders <TempsSurveys /> (React) or enables surveys: {} in the analytics SDK, and that the path, event and flag above match.'
+      ? 'Nobody has seen this survey in this window. Check that the app renders <TempsSurveys /> (React) or sets surveys: { enabled: true } in the analytics SDK, and that the path, event and flag above match.'
       : `This survey is ${STATUS_LABELS[survey.status].toLowerCase()}, so visitors do not see it. Launch it to start collecting answers.`
   return (
     <p className="rounded-md border border-dashed p-4 text-sm text-muted-foreground">

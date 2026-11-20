@@ -20,13 +20,14 @@ import {
 describe('survey form', () => {
   test('a new draft is a valid one-question NPS survey once named', () => {
     const draft = { ...emptyDraft(), name: 'How are we doing?' }
+    const id = draft.questions[0].id
     expect(hasErrors(validateDraft(draft, true))).toBe(false)
     expect(draftToBody(draft)).toEqual({
       name: 'How are we doing?',
       description: null,
       questions: [
         {
-          id: 'q1',
+          id,
           kind: 'nps',
           prompt: 'How likely are you to recommend us to a friend?',
           optional: false,
@@ -42,13 +43,24 @@ describe('survey form', () => {
     })
   })
 
-  test('question ids never collide and never reuse a lower number', () => {
+  test('question ids are fresh and valid, never derived from the remaining questions', () => {
     const first = blankQuestion([])
-    expect(first.id).toBe('q1')
-    const second = { ...blankQuestion([first]), id: 'q3' }
-    // q2 may have been removed; its answers are stored under "q2".
-    expect(nextQuestionId([first, second])).toBe('q4')
-    expect(nextQuestionId([{ ...first, id: 'rating' }])).toBe('q2')
+    expect(first.id).toMatch(/^q_[a-z0-9]{10}$/)
+    // Removing a question and adding one must not hand out an id a removed
+    // question used: a random id does not depend on what is left.
+    const ids = new Set(
+      Array.from({ length: 200 }, () => nextQuestionId([first]))
+    )
+    expect(ids.size).toBe(200)
+    expect(ids.has(first.id)).toBe(false)
+  })
+
+  test('a generated id that is already taken is drawn again', () => {
+    const draws = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.5]
+    let index = 0
+    const random = () => draws[Math.min(index++, draws.length - 1)]
+    const taken = { ...blankQuestion([]), id: 'q_0000000000' }
+    expect(nextQuestionId([taken], random)).toBe('q_ii' + 'i'.repeat(8))
   })
 
   test('reports each problem next to its field', () => {
@@ -63,6 +75,7 @@ describe('survey form', () => {
       questions: [
         {
           ...blankQuestion([], 'single_choice'),
+          id: 'q1',
           prompt: 'Plan?',
           choices: ['A', 'A'],
         },
