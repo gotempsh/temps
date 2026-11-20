@@ -1,9 +1,11 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { expect, test } from 'bun:test'
+import { afterEach, expect, test } from 'bun:test'
+import { cleanup, fireEvent, render } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { renderToStaticMarkup } from 'react-dom/server'
+import { installBrowserWindow } from '@/test/dom'
 import { MemoryRouter, Route, Routes } from 'react-router'
 import { BreadcrumbProvider } from '@/contexts/BreadcrumbContext'
 import {
@@ -13,11 +15,15 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import { WorkflowDetail } from './WorkflowDetail'
 import {
+  openTabQueryKeys,
   workflowDetailCrumbs,
   workflowDetailTab,
   workflowGrantsOptions,
   workflowKeysOptions,
 } from './detail-tabs'
+
+installBrowserWindow()
+afterEach(cleanup)
 
 const path = { project_id: 1, environment_id: 2 }
 
@@ -196,4 +202,53 @@ test('on a tab the workflow crumb links back to the workflow', () => {
     'Settings',
   ])
   expect(onSettings[3].href).toBe('/workflows/1/2?workflow=email%2Fsequence')
+})
+
+test('an unsaved access edit survives switching to another tab and back', () => {
+  const cache = withRuns('orders', [])
+  cache.setQueryData<object>(workflowGrantsOptions(path, 1).queryKey, {
+    grants: [],
+    total: 0,
+    total_pages: 0,
+    page: 1,
+    page_size: 20,
+  })
+  const view = render(
+    <MemoryRouter
+      initialEntries={['/workflows/1/2?workflow=orders&tab=access']}
+    >
+      <QueryClientProvider client={cache}>
+        <BreadcrumbProvider>
+          <Routes>
+            <Route
+              path="/workflows/:projectId/:environmentId"
+              element={<WorkflowDetail />}
+            />
+          </Routes>
+        </BreadcrumbProvider>
+      </QueryClientProvider>
+    </MemoryRouter>
+  )
+  const resource = () =>
+    view.container.querySelector<HTMLInputElement>('#workflow-resource')
+  fireEvent.input(resource()!, { target: { value: 'orders-draft' } })
+  fireEvent.mouseDown(view.getByRole('tab', { name: /Runs/ }))
+  expect(view.getByRole('tab', { name: /Runs/ }).dataset.state).toBe('active')
+  // Hidden, not removed: the draft is still in the form.
+  expect(resource()?.value).toBe('orders-draft')
+  fireEvent.mouseDown(view.getByRole('tab', { name: /Access/ }))
+  expect(resource()?.value).toBe('orders-draft')
+  // A tab never opened loads nothing.
+  expect(view.container.textContent).not.toContain('Journal storage')
+})
+
+test('refresh reloads the list on the open tab, never the settings form', () => {
+  expect(openTabQueryKeys('access', path, 2)).toEqual([
+    workflowGrantsOptions(path, 2).queryKey,
+  ])
+  expect(openTabQueryKeys('keys', path, 3)).toEqual([
+    workflowKeysOptions(path.project_id, 3).queryKey,
+  ])
+  expect(openTabQueryKeys('settings', path, 1)).toEqual([])
+  expect(openTabQueryKeys('runs', path, 1)).toEqual([])
 })

@@ -130,9 +130,11 @@ export function WorkflowEnvironment({
     onError: (error) =>
       toast.error(problemDetail(error, 'Could not create the credential.')),
   })
+  // Issuing replaces any existing credential, so nothing is issued until the
+  // overview says whether one exists: rotating always asks first.
   const issueCredential = () => {
-    if (issue.isPending) return
-    if (overview?.credential.configured) setRotating(true)
+    if (issue.isPending || !overview) return
+    if (overview.credential.configured) setRotating(true)
     else issue.mutate()
   }
   const base = `/workflows/${projectId}/${environmentId}`
@@ -178,11 +180,14 @@ export function WorkflowEnvironment({
                 <DropdownMenuSeparator />
                 <DropdownMenuItem
                   onSelect={issueCredential}
+                  disabled={!overview}
                   aria-disabled={issue.isPending}
                 >
-                  {overview?.credential.configured
-                    ? 'Rotate credential'
-                    : 'Create credential'}
+                  {!overview
+                    ? 'Checking credential…'
+                    : overview.credential.configured
+                      ? 'Rotate credential'
+                      : 'Create credential'}
                 </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>

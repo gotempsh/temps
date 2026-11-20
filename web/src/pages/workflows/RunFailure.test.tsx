@@ -5,7 +5,7 @@ import { describe, expect, test } from 'bun:test'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { renderToStaticMarkup } from 'react-dom/server'
 import type { WorkflowRunResponse } from '@/api/client'
-import type { WorkflowStepResponse } from '@/api/client'
+import type { WorkflowStepResponse, WorkflowStepStatus } from '@/api/client'
 import { RunFailure } from './RunFailure'
 import {
   PAYLOAD_PREVIEW_CHARS,
@@ -15,6 +15,9 @@ import {
   payloadPreview,
   payloadQueryKey,
   payloadText,
+  runPayloadsKey,
+  failedStepPages,
+  findFailedStep,
 } from './run-failure'
 
 function seeded() {
@@ -88,11 +91,11 @@ describe('a failed run says what failed', () => {
   })
   test('the error and the input show without a click, under their names', () => {
     const client = seeded()
-    client.setQueryData(payloadQueryKey('synthetic-run', 'error'), {
+    client.setQueryData(payloadQueryKey(run, 'error'), {
       target: 'error',
       value: 'Invalid input: email is required',
     })
-    client.setQueryData(payloadQueryKey('synthetic-run', 'input'), {
+    client.setQueryData(payloadQueryKey(run, 'input'), {
       target: 'input',
       value: { userId: 'u_1' },
     })
@@ -109,7 +112,7 @@ describe('a failed run says what failed', () => {
   })
   test('a failed step shows its own error, not the run error', () => {
     const client = seeded()
-    client.setQueryData(payloadQueryKey('synthetic-run', 'step_error', 1), {
+    client.setQueryData(payloadQueryKey(run, 'step_error', 1), {
       target: 'step_error',
       sequence: 1,
       value: 'SMTP refused the message',
@@ -133,7 +136,7 @@ describe('a failed run says what failed', () => {
     const long = Array.from({ length: 30 }, (_, i) => `line ${i + 1}`).join(
       '\n'
     )
-    client.setQueryData(payloadQueryKey('synthetic-run', 'error'), {
+    client.setQueryData(payloadQueryKey(run, 'error'), {
       target: 'error',
       value: long,
     })
@@ -145,7 +148,7 @@ describe('a failed run says what failed', () => {
   test('without payload access the panel says which permission is missing', () => {
     const client = seeded()
     const query = client.getQueryCache().build<unknown, object>(client, {
-      queryKey: payloadQueryKey('synthetic-run', 'error'),
+      queryKey: payloadQueryKey(run, 'error'),
     })
     query.setState({
       status: 'error',
@@ -180,5 +183,57 @@ describe('a failed run says what failed', () => {
     )
     expect(payloadText('\n  Error: boom\n')).toBe('Error: boom')
     expect(payloadText(null)).toBe('Nothing was stored.')
+  })
+})
+
+describe('a retried run never shows the previous failure', () => {
+  test('a new attempt or finish time reads its payloads again', () => {
+    const first = {
+      ...run,
+      attempt: 1,
+      finished_at: '2026-01-01T00:00:00Z',
+    } as WorkflowRunResponse
+    const client = seeded()
+    client.setQueryData(payloadQueryKey(first, 'error'), {
+      target: 'error',
+      value: 'first failure',
+    })
+    expect(panel(client, first)).toContain('first failure')
+    for (const again of [
+      { ...first, attempt: 2 },
+      { ...first, finished_at: '2026-01-02T00:00:00Z' },
+    ]) {
+      expect(payloadQueryKey(again, 'error')).not.toEqual(
+        payloadQueryKey(first, 'error')
+      )
+      expect(panel(client, again)).not.toContain('first failure')
+    }
+    // Every payload of the run shares one prefix, so a retry clears them all.
+    client.removeQueries({ queryKey: runPayloadsKey(first.id) })
+    expect(client.getQueryData(payloadQueryKey(first, 'error'))).toBeUndefined()
+  })
+})
+
+describe('the failed step is found at the end of the journal', () => {
+  test('the last two pages of 100 are read, whatever page is on screen', () => {
+    expect(failedStepPages(0)).toEqual([])
+    expect(failedStepPages(1)).toEqual([1])
+    expect(failedStepPages(100)).toEqual([1])
+    expect(failedStepPages(101)).toEqual([1, 2])
+    expect(failedStepPages(250)).toEqual([2, 3])
+  })
+  test('the most recently recorded failed step wins', () => {
+    const step = (sequence: number, status: WorkflowStepStatus) => ({
+      sequence,
+      status,
+    })
+    expect(
+      findFailedStep([
+        [step(98, 'failed'), step(99, 'completed')],
+        [step(100, 'completed'), step(101, 'failed'), step(102, 'completed')],
+      ])?.sequence
+    ).toBe(101)
+    expect(findFailedStep([[step(0, 'completed')]])).toBeUndefined()
+    expect(findFailedStep([])).toBeUndefined()
   })
 })

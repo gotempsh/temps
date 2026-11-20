@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useEffect } from 'react'
+import { useEffect, useState } from 'react'
 import { type UseQueryResult, useQuery } from '@tanstack/react-query'
 import {
   DataTable,
@@ -40,6 +40,7 @@ import { WorkflowGrantsPanel } from './WorkflowGrants'
 import { WorkflowKeysPanel } from './ProjectWorkflowKeys'
 import { WorkflowSettingsPanel } from './WorkflowSettings'
 import {
+  openTabQueryKeys,
   workflowDetailCrumbs,
   workflowDetailTab,
   type WorkflowDetailTab,
@@ -68,6 +69,13 @@ export function WorkflowDetail() {
     query: { workflow, page: tab === 'runs' ? page : 1, page_size: 20 },
   })
   const runs = useQuery(runsOptions)
+  // A tab's panel mounts the first time it is opened and then stays mounted
+  // while hidden, so unsaved Settings or Access edits survive switching tabs
+  // and nothing loads for a tab never opened.
+  const [opened, setOpened] = useState<ReadonlySet<WorkflowDetailTab>>(
+    () => new Set([tab])
+  )
+  if (!opened.has(tab)) setOpened(new Set([...opened, tab]))
   const overviewOptions = getWorkflowsOverviewOptions({ path })
   const overview = useQuery(overviewOptions)
   const summary = overview.data?.workflows.find((row) => row.name === workflow)
@@ -111,7 +119,11 @@ export function WorkflowDetail() {
       verdict={summary && <DefinitionVerdict summary={summary} />}
       actions={
         <RefreshButton
-          queryKeys={[runsOptions.queryKey, overviewOptions.queryKey]}
+          queryKeys={[
+            runsOptions.queryKey,
+            overviewOptions.queryKey,
+            ...openTabQueryKeys(tab, path, page),
+          ]}
         />
       }
       facts={summary ? workflowFacts(summary) : []}
@@ -142,33 +154,42 @@ export function WorkflowDetail() {
               onPageChange={(value) => go('runs', value)}
             />
           </TabsContent>
-          <TabsContent value="settings" className="mt-4">
-            <WorkflowSettingsPanel
-              path={path}
-              embedded
-              description={`Applies to every workflow in ${environmentName}.`}
-            />
+          <TabsContent value="settings" forceMount className={keptPanel}>
+            {opened.has('settings') && (
+              <WorkflowSettingsPanel
+                path={path}
+                embedded
+                description={`Applies to every workflow in ${environmentName}.`}
+              />
+            )}
           </TabsContent>
-          <TabsContent value="access" className="mt-4">
-            <WorkflowGrantsPanel
-              path={path}
-              page={page}
-              onPageChange={(value) => go('access', value)}
-              description={`Other environments allowed to start workflows or send events in ${environmentName}.`}
-            />
+          <TabsContent value="access" forceMount className={keptPanel}>
+            {opened.has('access') && (
+              <WorkflowGrantsPanel
+                path={path}
+                page={tab === 'access' ? page : 1}
+                onPageChange={(value) => go('access', value)}
+                description={`Other environments allowed to start workflows or send events in ${environmentName}.`}
+              />
+            )}
           </TabsContent>
-          <TabsContent value="keys" className="mt-4">
-            <WorkflowKeysPanel
-              projectId={path.project_id}
-              page={page}
-              onPageChange={(value) => go('keys', value)}
-            />
+          <TabsContent value="keys" forceMount className={keptPanel}>
+            {opened.has('keys') && (
+              <WorkflowKeysPanel
+                projectId={path.project_id}
+                page={tab === 'keys' ? page : 1}
+                onPageChange={(value) => go('keys', value)}
+              />
+            )}
           </TabsContent>
         </Tabs>
       }
     />
   )
 }
+
+/** A kept-mounted tab panel: hidden, not removed, while another tab is open. */
+const keptPanel = 'mt-4 data-[state=inactive]:hidden'
 
 function DefinitionVerdict({ summary }: { summary: WorkflowSummaryResponse }) {
   return summary.defined ? (

@@ -47,7 +47,7 @@ export function ObservabilitySetupGuide({
       </Link>
     </Button>
   )
-  const guide = guides[kind](setupLink)
+  const guide = guides[kind](setupLink, service?.id)
   return (
     <SetupGuide
       title={guide.title}
@@ -61,7 +61,7 @@ type Guide = { title: string; description: string; steps: SetupGuideStep[] }
 
 const guides: Record<
   ObservabilityKind,
-  (setupLink: (label: string) => ReactNode) => Guide
+  (setupLink: (label: string) => ReactNode, projectId?: number) => Guide
 > = {
   analytics: (setupLink) => ({
     title: 'No analytics yet',
@@ -109,7 +109,7 @@ const guides: Record<
       },
     ],
   }),
-  traces: (setupLink) => ({
+  traces: (setupLink, projectId) => ({
     title: 'No traces yet',
     description: 'No trace arrived in the selected time range.',
     steps: [
@@ -124,7 +124,7 @@ const guides: Record<
           'Apps deployed on Temps get these variables automatically. Anywhere else, set them with an API key:',
         content: (
           <>
-            <CodeBlock code={traceEnvironment} language="bash" />
+            <CodeBlock code={traceEnvironment(projectId)} language="bash" />
             {setupLink('Open trace setup')}
           </>
         ),
@@ -149,7 +149,7 @@ const guides: Record<
             <Button asChild variant="outline">
               <Link to="/projects/new">New project</Link>
             </Button>
-            {setupLink('Open logs')}
+            {setupLink('Open deployments')}
           </div>
         ),
       },

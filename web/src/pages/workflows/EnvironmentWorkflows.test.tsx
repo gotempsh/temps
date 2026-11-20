@@ -190,6 +190,41 @@ test('settings, grants and keys are one menu away', async () => {
   }
 })
 
+test('until the credential status loads, the menu cannot create or rotate one', async () => {
+  // Nothing cached: the overview is still loading.
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false, staleTime: Infinity } },
+  })
+  client.setQueryDefaults(
+    getWorkflowsOverviewOptions({ path: { project_id: 1, environment_id: 2 } })
+      .queryKey,
+    { queryFn: () => new Promise(() => {}) }
+  )
+  try {
+    const view = render(
+      <MemoryRouter>
+        <QueryClientProvider client={client}>
+          <WorkflowEnvironment projectId={1} environmentId={2} />
+        </QueryClientProvider>
+      </MemoryRouter>
+    )
+    fireEvent.keyDown(
+      view.getByRole('button', { name: 'Workflow settings and access' }),
+      { key: 'Enter' }
+    )
+    const item = await view.findByRole('menuitem', {
+      name: 'Checking credential…',
+    })
+    expect(item.hasAttribute('data-disabled')).toBe(true)
+    expect(
+      view.queryByRole('menuitem', { name: 'Create credential' })
+    ).toBeNull()
+  } finally {
+    cleanup()
+    client.clear()
+  }
+})
+
 test('starting a run offers only the workflows the deployment declares', async () => {
   const client = clientWith(definitions)
   try {

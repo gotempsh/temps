@@ -55,7 +55,8 @@ createServer(toNodeListener(handler)).listen(Number(process.env.PORT || 3000))`,
         code: `// src/app/.well-known/temps/workflows/[action]/route.ts
 import { createWorkflowHandler, defineWorkflow, type FetchHandler } from '@temps-sdk/workflows'
 
-export const onboarding = defineWorkflow('onboarding', async (ctx) => {
+// Not exported: a Next.js route file may only export its handlers.
+const onboarding = defineWorkflow('onboarding', async (ctx) => {
   await ctx.step('send-welcome', () => sendWelcomeEmail(ctx.input.email))
   await ctx.sleep('wait-a-day', '1d')
   await ctx.step('send-tips', () => sendTipsEmail(ctx.input.email))

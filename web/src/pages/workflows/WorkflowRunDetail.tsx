@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { useEffect } from 'react'
-import { useQuery } from '@tanstack/react-query'
+import { useQueries, useQuery } from '@tanstack/react-query'
 import { DataTable, Detail, PageState, Status } from '@temps-sdk/ds'
 import { Workflow } from 'lucide-react'
 import { Link, useParams, useSearchParams } from 'react-router'
@@ -23,6 +23,11 @@ import { usePageTitle } from '@/hooks/usePageTitle'
 import { problemDetail } from '@/lib/api-problem'
 import { workflowTone } from './status'
 import { RunFailure } from './RunFailure'
+import {
+  FAILED_STEP_PAGE_SIZE,
+  failedStepPages,
+  findFailedStep,
+} from './run-failure'
 
 export function WorkflowRunDetail() {
   const params = useParams()
@@ -40,6 +45,22 @@ export function WorkflowRunDetail() {
   })
   const run = useQuery(runOptions)
   const steps = useQuery(stepOptions)
+  // The failed step is read from the journal's end, not the page on screen,
+  // so the failure reads the same while the journal is browsed.
+  const failedStepOptions = (
+    run.data?.status === 'failed' && run.data.error_kind === 'step_failed'
+      ? failedStepPages(run.data.step_count)
+      : []
+  ).map((stepPage) =>
+    listWorkflowStepsOptions({
+      path,
+      query: { page: stepPage, page_size: FAILED_STEP_PAGE_SIZE },
+    })
+  )
+  const failedStepLookup = useQueries({ queries: failedStepOptions })
+  const failedStep = findFailedStep(
+    failedStepLookup.map((lookup) => lookup.data?.steps ?? [])
+  )
   const project = useQuery(getProjectOptions({ path: { id: path.project_id } }))
   const environment = useQuery(
     getEnvironmentOptions({
@@ -168,10 +189,12 @@ export function WorkflowRunDetail() {
             <RunFailure
               path={path}
               run={run.data}
-              failedStep={[...(steps.data?.steps ?? [])]
-                .reverse()
-                .find((step) => step.status === 'failed')}
-              invalidate={[runOptions.queryKey, stepOptions.queryKey]}
+              failedStep={failedStep}
+              invalidate={[
+                runOptions.queryKey,
+                stepOptions.queryKey,
+                ...failedStepOptions.map((options) => options.queryKey),
+              ]}
             />
           )}
           {steps.isError ? (

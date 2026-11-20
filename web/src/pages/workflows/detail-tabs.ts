@@ -89,3 +89,24 @@ export function workflowKeysOptions(project_id: number, page: number) {
     query: { page, page_size: 20 },
   })
 }
+
+/**
+ * What Refresh reloads besides the runs and the overview: the list on the
+ * open tab. Settings is left out, so a refresh never resets a form being
+ * edited.
+ */
+export function openTabQueryKeys(
+  tab: WorkflowDetailTab,
+  path: { project_id: number; environment_id: number },
+  page: number
+): readonly unknown[][] {
+  switch (tab) {
+    case 'access':
+      return [workflowGrantsOptions(path, page).queryKey]
+    case 'keys':
+      return [workflowKeysOptions(path.project_id, page).queryKey]
+    case 'runs':
+    case 'settings':
+      return []
+  }
+}

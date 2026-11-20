@@ -28,6 +28,7 @@ import {
   payloadQueryKey,
   payloadText,
   problemStatus,
+  runPayloadsKey,
 } from './run-failure'
 
 export function RunFailure({
@@ -47,6 +48,8 @@ export function RunFailure({
       (await retryWorkflowRun({ path, body: {}, throwOnError: true })).data,
     onSuccess: async () => {
       toast.success('Run queued again')
+      // The retried attempt replaces the stored error; never show the old one.
+      cache.removeQueries({ queryKey: runPayloadsKey(run.id) })
       await Promise.all(
         invalidate.map((queryKey) => cache.invalidateQueries({ queryKey }))
       )
@@ -63,12 +66,15 @@ export function RunFailure({
         {(stepError || run.has_error) && (
           <Payload
             path={path}
+            run={run}
             label="Error"
             target={stepError ? 'step_error' : 'error'}
             sequence={stepError?.sequence}
           />
         )}
-        {run.has_input && <Payload path={path} label="Input" target="input" />}
+        {run.has_input && (
+          <Payload path={path} run={run} label="Input" target="input" />
+        )}
         <div>
           <Button
             variant="outline"
@@ -90,17 +96,19 @@ export function RunFailure({
 /** One encrypted payload, read when the panel opens and shown in place. */
 function Payload({
   path,
+  run,
   label,
   target,
   sequence,
 }: {
   path: { project_id: number; environment_id: number; run_id: string }
+  run: WorkflowRunResponse
   label: string
   target: WorkflowRevealTarget
   sequence?: number
 }) {
   const payload = useQuery({
-    queryKey: payloadQueryKey(path.run_id, target, sequence),
+    queryKey: payloadQueryKey(run, target, sequence),
     queryFn: async () =>
       (
         await revealWorkflowPayload({

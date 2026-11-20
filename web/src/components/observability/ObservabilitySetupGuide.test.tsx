@@ -8,7 +8,11 @@ import { MemoryRouter } from 'react-router'
 import { getProjectOptions } from '@/api/client/@tanstack/react-query.gen'
 import { QueryContent } from './GlobalPage'
 import { ObservabilitySetupGuide } from './ObservabilitySetupGuide'
-import { serviceSetupHref, type ObservabilityKind } from './observability-setup'
+import {
+  serviceSetupHref,
+  traceEnvironment,
+  type ObservabilityKind,
+} from './observability-setup'
 
 function render(node: React.ReactNode, client = new QueryClient()) {
   return renderToStaticMarkup(
@@ -77,12 +81,32 @@ describe('empty observability pages teach the setup', () => {
     expect(html).toContain('Open error tracking setup for Storefront')
   })
 
+  test('manual trace export names the project, as API-key ingest requires', () => {
+    // An API key identifies a user, so OTLP ingest also needs the project.
+    expect(traceEnvironment()).toContain(
+      'OTEL_EXPORTER_OTLP_HEADERS=Authorization=Bearer <api-key>,X-Temps-Project-Id=<project-id>'
+    )
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: Infinity } },
+    })
+    client.setQueryData<object>(
+      getProjectOptions({ path: { id: 7 } }).queryKey,
+      { id: 7, name: 'Storefront', slug: 'storefront' }
+    )
+    const html = render(
+      <ObservabilitySetupGuide kind="traces" projectId={7} />,
+      client
+    )
+    expect(html).toContain('X-Temps-Project-Id=7')
+  })
+
   test('each kind links to the service page that sets it up', () => {
     expect(serviceSetupHref('analytics', 'shop')).toBe(
       '/projects/shop/analytics/setup'
     )
     expect(serviceSetupHref('traces', 'shop')).toBe('/projects/shop/traces')
-    expect(serviceSetupHref('logs', 'shop')).toBe('/projects/shop/logs')
+    // The project's own logs route is request logs, not container output.
+    expect(serviceSetupHref('logs', 'shop')).toBe('/projects/shop/deployments')
     expect(serviceSetupHref('errors')).toBe('/projects')
   })
 })

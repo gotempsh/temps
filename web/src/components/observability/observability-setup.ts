@@ -12,12 +12,17 @@ import type { SetupSnippet } from '@/components/onboarding/SetupGuide'
  */
 export type ObservabilityKind = 'analytics' | 'errors' | 'traces' | 'logs'
 
-/** Where a service sets the feature up, relative to `/projects/{slug}`. */
+/**
+ * Where a service sets the feature up, relative to `/projects/{slug}`. Logs
+ * need no setup beyond running the service, so they open its deployments:
+ * the project's `logs` route is request logs, and container output is only
+ * on the global Logs page.
+ */
 export const serviceSetupPath: Record<ObservabilityKind, string> = {
   analytics: 'analytics/setup',
   errors: 'errors/setup',
   traces: 'traces',
-  logs: 'logs',
+  logs: 'deployments',
 }
 
 export function serviceSetupHref(
@@ -133,10 +138,15 @@ opentelemetry-instrument python main.py`,
   },
 ]
 
-/** The OTLP settings an app outside Temps sets by hand. */
-export const traceEnvironment = `OTEL_EXPORTER_OTLP_ENDPOINT=https://<your-temps-domain>/api/otel
+/**
+ * The OTLP settings an app outside Temps sets by hand. An API key identifies
+ * a user, not a project, so ingest also needs the project's ID.
+ */
+export function traceEnvironment(projectId?: number): string {
+  return `OTEL_EXPORTER_OTLP_ENDPOINT=https://<your-temps-domain>/api/otel
 OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
-OTEL_EXPORTER_OTLP_HEADERS=Authorization=Bearer <api-key>`
+OTEL_EXPORTER_OTLP_HEADERS=Authorization=Bearer <api-key>,X-Temps-Project-Id=${projectId ?? '<project-id>'}`
+}
 
 export const logSnippet = `console.log('order placed', { orderId: 42 })
 console.error('payment failed', error)`

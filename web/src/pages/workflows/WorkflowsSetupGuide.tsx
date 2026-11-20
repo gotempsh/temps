@@ -49,7 +49,7 @@ export function WorkflowsSetupGuide({
         {
           title: 'Define a workflow and serve it',
           caption:
-            'Each step runs once and is recorded; sleeps and waits hold nothing in memory.',
+            'Finished steps are recorded and replayed, but a step can run again before it finishes, so make it safe to repeat. Sleeps and waits hold nothing in memory.',
           content: (
             <>
               <SnippetTabs

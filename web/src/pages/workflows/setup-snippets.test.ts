@@ -44,3 +44,11 @@ describe('setup snippets', () => {
     expect(startSnippet).toContain('idempotencyKey')
   })
 })
+
+test('the Next.js route exports only its handlers, so next build accepts it', () => {
+  const { code } = defineSnippet('nextjs')
+  const exported = [...code.matchAll(/^export (?:const|function) (\w+)/gm)].map(
+    (match) => match[1]
+  )
+  expect(exported).toEqual(['GET', 'POST'])
+})
