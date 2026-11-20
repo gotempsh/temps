@@ -6,11 +6,13 @@ pub mod health_check_service;
 pub mod incident_service;
 pub mod maintenance;
 pub mod monitor_service;
+pub mod outbound;
 pub mod page_access;
 pub mod public_pages;
 pub mod status_page_service;
 pub mod subscribers;
 pub mod types;
+pub mod webhooks;
 
 pub use health_check_service::HealthCheckService;
 pub use incident_service::IncidentService;

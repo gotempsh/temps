@@ -55,5 +55,6 @@ pub mod public_subscriptions;
 pub mod status_page;
 pub mod status_pages;
 pub mod subscribers;
+pub mod webhooks;
 
 pub use status_page::*;

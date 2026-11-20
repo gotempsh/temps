@@ -15,9 +15,6 @@ use temps_core::environment_address::{
     https_url, AddressKind, EnvironmentAddress, EnvironmentAddressSlot, EnvironmentAddresses,
 };
 use temps_core::log_transitions::{FailureLog, KeyedFailureLatch};
-use temps_core::url_validation::{
-    resolve_and_validate_domain, validate_outbound_ip, UrlValidationError,
-};
 use temps_core::{Job, JobQueue, JobReceiver, QueueError, StatusCheckCompletedJob};
 use temps_entities::{
     cloudflare_access_providers, deployment_containers, deployments, environment_domains,
@@ -212,70 +209,12 @@ fn local_proxy_client_with_roots(
         .map_err(|source| StatusPageError::HttpClientBuild { source })
 }
 
-/// Where a non-local (public URL) probe may connect, decided at probe time.
-enum PublicProbeTarget {
-    /// Every resolved address passed the outbound policy; the client is pinned
-    /// to exactly those addresses.
-    Pinned(reqwest::Client),
-    /// The host is (or resolves to) an address outside the outbound policy:
-    /// loopback, RFC 1918, link-local/metadata, etc., and not trusted.
-    NonPublic(String),
-    /// The host did not resolve.
-    Unresolved(String),
-}
+use super::outbound::{pinned_public_client, PublicProbeTarget};
 
-/// Re-resolve and validate the probe host at probe time, and build a client
-/// pinned to the validated addresses.
-///
-/// The probed hostname is validated nowhere else: a domain whose DNS later
-/// points at `127.0.0.1`, an RFC 1918 address or `169.254.169.254` would
-/// otherwise turn every periodic probe into a request to that internal
-/// address. Resolving once, validating every address with the shared outbound
-/// policy (which honours the operator's trusted private networks), and
-/// pinning the client to those addresses means a rebinding answer cannot slip
-/// in between the check and the connect. Inherited proxy settings are
-/// disabled for the same reason (a proxy would do its own resolution), and
-/// redirects stay unfollowed.
+/// A client for a probe of `url`, pinned to its validated public addresses
+/// (see [`pinned_public_client`]).
 async fn public_probe_target(url: &str) -> Result<PublicProbeTarget, StatusPageError> {
-    let parsed = reqwest::Url::parse(url).map_err(|error| {
-        StatusPageError::InvalidRequest(format!("Health URL '{url}' is invalid: {error}"))
-    })?;
-    let port = parsed.port_or_known_default().ok_or_else(|| {
-        StatusPageError::InvalidRequest(format!("Health URL '{url}' has no usable port"))
-    })?;
-    let mut builder = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .user_agent("Temps-Status-Monitor/1.0")
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none());
-    match parsed.host() {
-        Some(url::Host::Ipv4(ip)) => {
-            if let Err(e) = validate_outbound_ip(IpAddr::V4(ip)) {
-                return Ok(PublicProbeTarget::NonPublic(e.to_string()));
-            }
-        }
-        Some(url::Host::Ipv6(ip)) => {
-            if let Err(e) = validate_outbound_ip(IpAddr::V6(ip)) {
-                return Ok(PublicProbeTarget::NonPublic(e.to_string()));
-            }
-        }
-        Some(url::Host::Domain(domain)) => match resolve_and_validate_domain(domain, port).await {
-            Ok(addresses) => builder = builder.resolve_to_addrs(domain, &addresses),
-            Err(UrlValidationError::DnsResolutionFailed(reason)) => {
-                return Ok(PublicProbeTarget::Unresolved(reason));
-            }
-            Err(e) => return Ok(PublicProbeTarget::NonPublic(e.to_string())),
-        },
-        None => {
-            return Err(StatusPageError::InvalidRequest(format!(
-                "Health URL '{url}' has no host"
-            )));
-        }
-    }
-    builder
-        .build()
-        .map(PublicProbeTarget::Pinned)
-        .map_err(|source| StatusPageError::HttpClientBuild { source })
+    pinned_public_client(url, Duration::from_secs(30), "Temps-Status-Monitor/1.0").await
 }
 
 fn should_route_probe_locally(is_managed: bool, uses_external_url: bool) -> bool {

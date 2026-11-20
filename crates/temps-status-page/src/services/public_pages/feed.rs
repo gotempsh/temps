@@ -37,7 +37,7 @@ fn rfc3339(at: &UtcDateTime) -> String {
 }
 
 /// A stable opaque id derived from `parts`.
-fn opaque_id(parts: &[&str]) -> String {
+pub(crate) fn opaque_id(parts: &[&str]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"status-page-feed");
     for part in parts {

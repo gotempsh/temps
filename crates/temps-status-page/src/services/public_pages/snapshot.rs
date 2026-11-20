@@ -116,6 +116,8 @@ pub struct PublishedSnapshot {
     pub feed_custom_host: Bytes,
     /// Set when the page needs a password.
     pub(crate) gate: Option<PageGate>,
+    /// The newest [`FEED_ENTRIES`] public events, for the feed and webhooks.
+    pub(crate) events: Vec<PageEvent>,
     /// The password form a protected page shows instead, for its slug URL
     /// and for a custom hostname. Empty for an open page.
     pub locked_html: Bytes,
@@ -547,6 +549,7 @@ impl StatusSnapshotCache {
             } = assemble_page(page, &page_selections, &data, now);
             let base_path = format!("/api/status/{}", page.slug);
             let feed = Bytes::from(render_atom_feed(&page.slug, &response, &events, &base_path));
+            let events_for_snapshot = events.clone();
             let feed_custom_host =
                 Bytes::from(render_atom_feed(&page.slug, &response, &events, ""));
             let subscriptions_since = subscriptions_since(page);
@@ -610,6 +613,7 @@ impl StatusSnapshotCache {
                         feed,
                         feed_custom_host,
                         gate,
+                        events: events_for_snapshot,
                         locked_html,
                         locked_html_custom_host,
                     }),

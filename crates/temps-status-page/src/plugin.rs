@@ -26,10 +26,12 @@ use crate::routes::status_page::{create_router, StatusPageApiDoc, StatusPageAppS
 use crate::routes::subscribers::{
     create_subscriber_router, SubscriberApiDoc, SubscriberRoutesState,
 };
+use crate::routes::webhooks::{create_webhook_router, WebhookApiDoc, WebhookRoutesState};
 use crate::services::maintenance::StatusPageMaintenanceService;
 use crate::services::page_access::PageAccessService;
 use crate::services::public_pages::{DomainServiceCertificates, StatusPageDomainService};
 use crate::services::subscribers::{StatusPageSubscriberService, TempsEmailMailer};
+use crate::services::webhooks::{PinnedWebhookTransport, StatusPageWebhookService};
 use crate::services::{
     HealthCheckService, MonitorService, PublicStatusPageService, StatusPageService,
     StatusSnapshotCache,
@@ -319,6 +321,17 @@ impl TempsPlugin for StatusPagePlugin {
                     .as_ref(),
             )));
 
+            // Webhooks (ADR 108 D2): owner-registered endpoints, delivered by
+            // a bounded background dispatcher.
+            let webhook_service = Arc::new(StatusPageWebhookService::new(
+                db.clone(),
+                snapshot_cache.clone(),
+                context.require_service::<temps_core::EncryptionService>(),
+                Arc::new(PinnedWebhookTransport),
+            ));
+            context.register_service(webhook_service.clone());
+            tokio::spawn(webhook_service.run_dispatcher());
+
             // Maintenance windows (ADR 108 D2).
             context.register_service(Arc::new(StatusPageMaintenanceService::new(
                 db.clone(),
@@ -446,11 +459,18 @@ impl TempsPlugin for StatusPagePlugin {
             audit: app_state.audit_service.clone(),
             project_access_checker: app_state.project_access_checker.clone(),
         });
+        let webhook_state = Arc::new(WebhookRoutesState {
+            webhooks: context.require_service::<StatusPageWebhookService>(),
+            pages: app_state.public_status_page_service.clone(),
+            audit: app_state.audit_service.clone(),
+            project_access_checker: app_state.project_access_checker.clone(),
+        });
         let routes = create_router()
             .with_state(app_state)
             .merge(create_subscriber_router(subscriber_state))
             .merge(create_maintenance_router(maintenance_state))
-            .merge(create_page_password_router(password_state));
+            .merge(create_page_password_router(password_state))
+            .merge(create_webhook_router(webhook_state));
         Some(PluginRoutes::new(routes))
     }
 
@@ -475,6 +495,7 @@ impl TempsPlugin for StatusPagePlugin {
         doc.merge(<SubscriberApiDoc as OpenApiTrait>::openapi());
         doc.merge(<MaintenanceApiDoc as OpenApiTrait>::openapi());
         doc.merge(<PagePasswordApiDoc as OpenApiTrait>::openapi());
+        doc.merge(<WebhookApiDoc as OpenApiTrait>::openapi());
         Some(doc)
     }
 }

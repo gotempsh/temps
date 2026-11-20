@@ -235,6 +235,67 @@ impl AuditOperation for StatusPageSubscriberAudit {
     }
 }
 
+/// Actions on a status page's webhooks (ADR 108 D2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StatusPageWebhookAction {
+    Created,
+    Updated,
+    Deleted,
+}
+
+/// Audit payload of a webhook change. The URL is recorded (it is where the
+/// page's events go); the signing secret never is.
+#[derive(Debug, Clone, Serialize)]
+pub struct StatusPageWebhookAudit {
+    pub actor_user_id: Option<i32>,
+    pub ip_address: Option<String>,
+    pub user_agent: String,
+    pub action: StatusPageWebhookAction,
+    pub project_ids: Vec<i32>,
+    pub status_page_id: i32,
+    pub webhook_id: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+}
+
+impl AuditOperation for StatusPageWebhookAudit {
+    fn operation_type(&self) -> String {
+        match self.action {
+            StatusPageWebhookAction::Created => "STATUS_PAGE_WEBHOOK_CREATED",
+            StatusPageWebhookAction::Updated => "STATUS_PAGE_WEBHOOK_UPDATED",
+            StatusPageWebhookAction::Deleted => "STATUS_PAGE_WEBHOOK_DELETED",
+        }
+        .to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        self.actor_user_id
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.user_agent
+    }
+
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        serde_json::to_string(self).map_err(|source| {
+            temps_core::AuditError::serialize(
+                format!(
+                    "status page {} webhook {}",
+                    self.status_page_id, self.webhook_id
+                ),
+                source,
+            )
+        })
+    }
+}
+
 /// A status page's password was set, changed or removed (ADR 108 D2). The
 /// password itself is never recorded.
 #[derive(Debug, Clone, Serialize)]
