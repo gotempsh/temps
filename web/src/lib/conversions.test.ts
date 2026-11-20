@@ -183,4 +183,26 @@ describe('labels', () => {
       { type: 'custom_data', value: { path: 'plan', value: 'pro' } },
     ])
   })
+
+  test('turning an event goal into a page goal drops its event filters', () => {
+    const existing = goal({
+      kind: 'event',
+      event_name: 'purchase',
+      page_path: null,
+      event_filter: [
+        { type: 'custom_data', value: { path: 'plan', value: 'pro' } },
+        { type: 'channel', value: 'Email' },
+      ],
+    })
+    const input = formValuesToInput(
+      { ...goalToFormValues(existing), kind: 'page', pagePath: '/thank-you' },
+      existing
+    )
+    expect(input).toMatchObject({
+      kind: 'page',
+      page_path: '/thank-you',
+      event_name: null,
+      event_filter: [],
+    })
+  })
 })

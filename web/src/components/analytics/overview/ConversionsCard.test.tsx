@@ -117,3 +117,30 @@ test('lists conversions with rate and revenue, and breaks one down by channel', 
   expect(breakdownQueries[0]?.get('dimension')).toBe('channel')
   api.restore()
 })
+
+test('when the definitions fail to load the card says so instead of offering dead actions', async () => {
+  const api = mockApi({
+    'GET /projects/7/analytics/goals': () =>
+      jsonResponse({ title: 'Internal Server Error', status: 500 }, 500),
+    'GET /projects/7/analytics/goals/stats': () =>
+      jsonResponse({
+        visitors: 300,
+        goals: [
+          {
+            goal_id: 3,
+            name: 'Purchase',
+            kind: 'event',
+            unique_conversions: 12,
+            total_conversions: 15,
+            conversion_rate: 4,
+            revenue: null,
+          },
+        ],
+      }),
+  })
+  const view = renderWithClient(<ConversionsCard {...range} />)
+
+  expect(await view.findByText(/Conversions could not be loaded/)).toBeTruthy()
+  expect(view.queryByRole('table', { name: 'Conversions' })).toBeNull()
+  api.restore()
+})

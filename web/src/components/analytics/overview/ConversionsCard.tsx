@@ -107,9 +107,11 @@ function useInvalidateConversions() {
   const queryClient = useQueryClient()
   return () =>
     Promise.all(
-      ['listAnalyticsGoals', 'getAnalyticsGoalStats', 'getAnalyticsGoalBreakdown'].map(
-        (id) => queryClient.invalidateQueries({ queryKey: [{ _id: id }] })
-      )
+      [
+        'listAnalyticsGoals',
+        'getAnalyticsGoalStats',
+        'getAnalyticsGoalBreakdown',
+      ].map((id) => queryClient.invalidateQueries({ queryKey: [{ _id: id }] }))
     )
 }
 
@@ -191,19 +193,23 @@ export function ConversionsCard({
       <CardContent className="space-y-4">
         <ConversionsBody
           isLoading={stats.isLoading || goals.isLoading}
-          isError={stats.isError}
+          // Without the definitions, Edit and Delete would have nothing to act on.
+          isError={stats.isError || goals.isError}
           rows={rows}
           hasRevenue={hasRevenue}
           selectedId={selectedId}
           onSelect={(id) => setSelectedId(id === selectedId ? null : id)}
           onCreate={openCreate}
           onEdit={(id) => {
-            const goal = definitions.get(id)
+            const goal = definitionOrExplain(definitions, id)
             if (!goal) return
             setEditing(goal)
             setDialogOpen(true)
           }}
-          onDelete={(id) => setDeleting(definitions.get(id) ?? null)}
+          onDelete={(id) => {
+            const goal = definitionOrExplain(definitions, id)
+            if (goal) setDeleting(goal)
+          }}
           describe={(id) => {
             const goal = definitions.get(id)
             return goal ? describeGoal(goal) : ''
@@ -247,6 +253,24 @@ export function ConversionsCard({
   )
 }
 
+/**
+ * The definition of a reported goal, or `undefined` after telling the user
+ * why: a goal deleted elsewhere since the list loaded has stats but no
+ * definition.
+ */
+function definitionOrExplain(
+  definitions: Map<number, AnalyticsGoal>,
+  id: number
+): AnalyticsGoal | undefined {
+  const goal = definitions.get(id)
+  if (!goal) {
+    toast.error(
+      `Conversion ${id} is no longer defined. Refresh the page to see the current conversions.`
+    )
+  }
+  return goal
+}
+
 interface ConversionsBodyProps {
   isLoading: boolean
   isError: boolean
@@ -284,8 +308,8 @@ function ConversionsBody(props: ConversionsBodyProps) {
           No conversions defined yet. A conversion is an event or a page that
           counts as success, for example the <code>signup</code> event or a
           visit to <code>/thank-you</code>. Temps then shows how many visitors
-          reach it, the conversion rate, revenue, and where those visitors
-          came from. It applies to events already recorded.
+          reach it, the conversion rate, revenue, and where those visitors came
+          from. It applies to events already recorded.
         </p>
         <div className="flex flex-wrap gap-x-4 gap-y-1">
           <Button
@@ -327,7 +351,9 @@ function ConversionsBody(props: ConversionsBodyProps) {
         {props.rows.map((row) => (
           <TableRow
             key={row.goal_id}
-            data-state={row.goal_id === props.selectedId ? 'selected' : undefined}
+            data-state={
+              row.goal_id === props.selectedId ? 'selected' : undefined
+            }
           >
             <TableCell className="min-w-0">
               <button
@@ -554,8 +580,8 @@ function ConversionDialog({
             {goal ? `Edit ${goal.name}` : 'Add a conversion'}
           </DialogTitle>
           <DialogDescription>
-            Count the visitors who did something that matters. Applies to
-            events already recorded too.
+            Count the visitors who did something that matters. Applies to events
+            already recorded too.
           </DialogDescription>
         </DialogHeader>
         <Form {...form}>
@@ -691,8 +717,8 @@ function ConversionDialog({
                       <Input placeholder="/thank-you" {...field} />
                     </FormControl>
                     <FormDescription>
-                      <code>*</code> matches anything, e.g.{' '}
-                      <code>/blog/*</code>.
+                      <code>*</code> matches anything, e.g. <code>/blog/*</code>
+                      .
                     </FormDescription>
                     <FormMessage />
                   </FormItem>

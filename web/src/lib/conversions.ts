@@ -120,13 +120,15 @@ export function goalToFormValues(goal: AnalyticsGoal): ConversionFormValues {
 
 /**
  * Request body for the form. `previous` is the goal being edited: filters the
- * form does not show are kept as they were.
+ * form does not show are kept as they were, unless the goal changes kind.
+ * They described what the old kind matched, and the new form would hide them.
  */
 export function formValuesToInput(
   values: ConversionFormValues,
   previous?: AnalyticsGoal
 ): AnalyticsGoalInput {
-  const kept = previous?.event_filter ?? []
+  const kept =
+    previous && previous.kind === values.kind ? previous.event_filter : []
   const isEvent = values.kind === 'event'
   // Only the event form edits a property; a page goal keeps every filter it had.
   const firstCustom = isEvent ? kept.findIndex(isCustomData) : -1
