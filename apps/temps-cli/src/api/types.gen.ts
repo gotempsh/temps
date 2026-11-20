@@ -3178,6 +3178,13 @@ export type AttachmentChunkUpload = {
     chunk: Blob | File;
 };
 
+/**
+ * The attachments of an event or feedback, in the order the SDK sent them.
+ */
+export type AttachmentList = {
+    data: Array<AttachmentView>;
+};
+
 export type AttachmentUploadStarted = {
     /**
      * The most bytes one chunk may carry.
@@ -3187,6 +3194,64 @@ export type AttachmentUploadStarted = {
      * Opaque id to send every chunk and the completion to.
      */
     upload_id: string;
+};
+
+/**
+ * Whether attachments can be stored, and how much of the quota is used.
+ */
+export type AttachmentUsage = {
+    /**
+     * Whether blob storage is set up and answering.
+     */
+    configured: boolean;
+    /**
+     * Since the server started: attachments dropped because the project
+     * was over its quota, across every project.
+     */
+    dropped_over_quota: number;
+    /**
+     * Since the server started: attachments dropped because the upload
+     * queue was full, across every project.
+     */
+    dropped_queue_full: number;
+    files: number;
+    max_attachment_bytes: number;
+    max_attachments_per_event: number;
+    max_event_attachment_bytes: number;
+    quota_bytes: number;
+    /**
+     * Why attachments are not stored, when they are not.
+     */
+    reason?: string | null;
+    /**
+     * Console path where blob storage is enabled.
+     */
+    setup_path?: string | null;
+    used_bytes: number;
+};
+
+/**
+ * A stored attachment.
+ */
+export type AttachmentView = {
+    attachment_type: string;
+    /**
+     * As the SDK sent it. The download is served as an image only for
+     * PNG, JPEG, GIF and WebP, and as a file to save otherwise.
+     */
+    content_type: string;
+    created_at: string;
+    filename: string;
+    id: number;
+    /**
+     * The error event id or feedback id.
+     */
+    owner_id: number;
+    /**
+     * `error` or `feedback`.
+     */
+    owner_kind: string;
+    size_bytes: number;
 };
 
 export type AttrOp = 'eq' | 'neq' | 'exists' | 'prefix' | 'gt' | 'lt';
@@ -33204,6 +33269,14 @@ export type SetAlternateSourcesRequest = {
      * project to its configured source again.
      */
     allow_alternate_sources: boolean;
+};
+
+export type SetAttachmentQuotaRequest = {
+    /**
+     * Bytes of attachments the project may store, 0 to 100 GiB. Lowering it
+     * deletes nothing: new attachments are dropped until use falls under it.
+     */
+    quota_bytes: number;
 };
 
 /**
@@ -85040,6 +85113,178 @@ export type UpdateAlertRuleResponses = {
 
 export type UpdateAlertRuleResponse = UpdateAlertRuleResponses[keyof UpdateAlertRuleResponses];
 
+export type SetErrorAttachmentQuotaData = {
+    body: SetAttachmentQuotaRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/error-attachments/quota';
+};
+
+export type SetErrorAttachmentQuotaErrors = {
+    /**
+     * Quota out of range
+     */
+    400: unknown;
+    /**
+     * Not authenticated
+     */
+    401: unknown;
+    /**
+     * Error tracking write permission required
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type SetErrorAttachmentQuotaResponses = {
+    /**
+     * Quota set
+     */
+    200: AttachmentUsage;
+};
+
+export type SetErrorAttachmentQuotaResponse = SetErrorAttachmentQuotaResponses[keyof SetErrorAttachmentQuotaResponses];
+
+export type GetErrorAttachmentUsageData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/error-attachments/usage';
+};
+
+export type GetErrorAttachmentUsageErrors = {
+    /**
+     * Not authenticated
+     */
+    401: unknown;
+    /**
+     * No access to the project
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetErrorAttachmentUsageResponses = {
+    /**
+     * Storage state, use and limits
+     */
+    200: AttachmentUsage;
+};
+
+export type GetErrorAttachmentUsageResponse = GetErrorAttachmentUsageResponses[keyof GetErrorAttachmentUsageResponses];
+
+export type DeleteErrorAttachmentData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Attachment ID
+         */
+        attachment_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/error-attachments/{attachment_id}';
+};
+
+export type DeleteErrorAttachmentErrors = {
+    /**
+     * Not authenticated
+     */
+    401: unknown;
+    /**
+     * Error tracking write permission required
+     */
+    403: unknown;
+    /**
+     * No such attachment in the project
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+    /**
+     * Blob storage is not set up or the file could not be deleted from it
+     */
+    503: unknown;
+};
+
+export type DeleteErrorAttachmentResponses = {
+    /**
+     * Attachment deleted; its bytes are back in the quota
+     */
+    204: void;
+};
+
+export type DeleteErrorAttachmentResponse = DeleteErrorAttachmentResponses[keyof DeleteErrorAttachmentResponses];
+
+export type GetErrorAttachmentContentData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Attachment ID
+         */
+        attachment_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/error-attachments/{attachment_id}/content';
+};
+
+export type GetErrorAttachmentContentErrors = {
+    /**
+     * Not authenticated
+     */
+    401: unknown;
+    /**
+     * No access to the project
+     */
+    403: unknown;
+    /**
+     * No such attachment in the project
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+    /**
+     * Blob storage is not set up or not answering
+     */
+    503: unknown;
+};
+
+export type GetErrorAttachmentContentResponses = {
+    /**
+     * The file. PNG, JPEG, GIF and WebP are served inline; everything else as application/octet-stream to save
+     */
+    200: Blob | File;
+};
+
+export type GetErrorAttachmentContentResponse = GetErrorAttachmentContentResponses[keyof GetErrorAttachmentContentResponses];
+
 export type GetErrorDashboardStatsData = {
     body?: never;
     path: {
@@ -85623,6 +85868,54 @@ export type GetErrorEventResponses = {
 };
 
 export type GetErrorEventResponse = GetErrorEventResponses[keyof GetErrorEventResponses];
+
+export type ListErrorEventAttachmentsData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Error group ID
+         */
+        group_id: number;
+        /**
+         * Error event ID
+         */
+        event_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/error-groups/{group_id}/events/{event_id}/attachments';
+};
+
+export type ListErrorEventAttachmentsErrors = {
+    /**
+     * Not authenticated
+     */
+    401: unknown;
+    /**
+     * No access to the project
+     */
+    403: unknown;
+    /**
+     * No such event in the group
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListErrorEventAttachmentsResponses = {
+    /**
+     * Attachments of the event
+     */
+    200: AttachmentList;
+};
+
+export type ListErrorEventAttachmentsResponse = ListErrorEventAttachmentsResponses[keyof ListErrorEventAttachmentsResponses];
 
 export type ListErrorGroupFingerprintsData = {
     body?: never;
@@ -86933,7 +87226,7 @@ export type DeleteProjectFeedbackErrors = {
 
 export type DeleteProjectFeedbackResponses = {
     /**
-     * Feedback permanently deleted
+     * Feedback and its attachments permanently deleted
      */
     204: void;
 };
@@ -86992,6 +87285,50 @@ export type UpdateProjectFeedbackResponses = {
 };
 
 export type UpdateProjectFeedbackResponse = UpdateProjectFeedbackResponses[keyof UpdateProjectFeedbackResponses];
+
+export type ListFeedbackAttachmentsData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Feedback ID
+         */
+        feedback_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/feedback/{feedback_id}/attachments';
+};
+
+export type ListFeedbackAttachmentsErrors = {
+    /**
+     * Not authenticated
+     */
+    401: unknown;
+    /**
+     * No access to the project
+     */
+    403: unknown;
+    /**
+     * No such feedback in the project
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListFeedbackAttachmentsResponses = {
+    /**
+     * Attachments of the feedback
+     */
+    200: AttachmentList;
+};
+
+export type ListFeedbackAttachmentsResponse = ListFeedbackAttachmentsResponses[keyof ListFeedbackAttachmentsResponses];
 
 export type ListFlagsData = {
     body?: never;
