@@ -10,10 +10,9 @@
 import type { Command } from 'commander'
 import { requireAuth } from '../../config/store.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
-import { requireProjectSlug } from '../../config/resolve-project.js'
+import { resolveAnalyticsProject } from './project.js'
 import {
   getAnalyticsIdentitySettings,
-  getProjectBySlug,
   updateAnalyticsIdentitySettings,
 } from '../../api/sdk.gen.js'
 import type { AnalyticsIdentityMode, AnalyticsIdentitySettings } from '../../api/types.gen.js'
@@ -49,16 +48,6 @@ interface IdentityOptions {
   json?: boolean
 }
 
-async function resolveProjectId(flagValue?: string): Promise<number> {
-  const resolved = await requireProjectSlug(flagValue)
-  if (resolved.source !== 'flag') {
-    info(`Using project ${colors.bold(resolved.slug)} (from ${resolved.source})`)
-  }
-  const { data, error } = await getProjectBySlug({ client, path: { slug: resolved.slug } })
-  if (error || !data) throw new Error(`Project "${resolved.slug}" not found`)
-  return data.id
-}
-
 function print(settings: AnalyticsIdentitySettings): void {
   header('Visitor identity')
   for (const line of describeIdentity(settings)) info(line)
@@ -68,7 +57,7 @@ function print(settings: AnalyticsIdentitySettings): void {
 async function showIdentity(options: IdentityOptions): Promise<void> {
   await requireAuth()
   await setupClient()
-  const projectId = await resolveProjectId(options.project)
+  const projectId = (await resolveAnalyticsProject(options.project)).id
   const settings = await withSpinner('Fetching identity settings...', async () => {
     const { data, error } = await getAnalyticsIdentitySettings({
       client,
@@ -90,7 +79,7 @@ async function setIdentity(
   const mode = parseIdentityMode(options.mode)
   await requireAuth()
   await setupClient()
-  const projectId = await resolveProjectId(options.project)
+  const projectId = (await resolveAnalyticsProject(options.project)).id
   if (mode === 'cookieless' && !options.yes && !options.json) {
     warning('In cookieless mode a returning visitor counts as new the next day, and session replay is off.')
     const confirmed = await promptConfirm({ message: 'Switch to cookieless tracking?', default: false })

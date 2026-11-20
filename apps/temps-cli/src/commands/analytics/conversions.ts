@@ -12,13 +12,12 @@
 import type { Command } from 'commander'
 import { requireAuth } from '../../config/store.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
-import { requireProjectSlug } from '../../config/resolve-project.js'
+import { resolveAnalyticsProject } from './project.js'
 import {
   createAnalyticsGoal,
   deleteAnalyticsGoal,
   getAnalyticsGoalBreakdown,
   getAnalyticsGoalStats,
-  getProjectBySlug,
   listAnalyticsGoals,
   updateAnalyticsGoal,
 } from '../../api/sdk.gen.js'
@@ -147,20 +146,10 @@ export function formatRevenue(revenue: AnalyticsGoalRevenue | null | undefined):
   return `${revenue.total.toFixed(2)} ${revenue.currency}`
 }
 
-async function resolveProjectId(flagValue?: string): Promise<number> {
-  const resolved = await requireProjectSlug(flagValue)
-  if (resolved.source !== 'flag') {
-    info(`Using project ${colors.bold(resolved.slug)} (from ${resolved.source})`)
-  }
-  const { data, error } = await getProjectBySlug({ client, path: { slug: resolved.slug } })
-  if (error || !data) throw new Error(`Project "${resolved.slug}" not found`)
-  return data.id
-}
-
 async function listConversions(options: ProjectOptions & { period: string }): Promise<void> {
   await requireAuth()
   await setupClient()
-  const projectId = await resolveProjectId(options.project)
+  const projectId = (await resolveAnalyticsProject(options.project)).id
   const { startDate, endDate, label } = parsePeriod(options.period)
 
   const [goals, stats] = await withSpinner('Fetching conversions...', async () => {
@@ -219,7 +208,7 @@ async function saveConversion(
   const goalId = mode === 'update' ? parseGoalId(options.goalId) : undefined
   await requireAuth()
   await setupClient()
-  const projectId = await resolveProjectId(options.project)
+  const projectId = (await resolveAnalyticsProject(options.project)).id
 
   const goal = await withSpinner('Saving conversion...', async () => {
     const result =
@@ -248,7 +237,7 @@ async function deleteConversion(
   const goalId = parseGoalId(options.goalId)
   await requireAuth()
   await setupClient()
-  const projectId = await resolveProjectId(options.project)
+  const projectId = (await resolveAnalyticsProject(options.project)).id
   if (!options.force && !options.yes) {
     warning('The conversion stops appearing in reports. Recorded events are kept.')
     const confirmed = await promptConfirm({
@@ -281,7 +270,7 @@ async function breakdownConversion(
   }
   await requireAuth()
   await setupClient()
-  const projectId = await resolveProjectId(options.project)
+  const projectId = (await resolveAnalyticsProject(options.project)).id
   const { startDate, endDate, label } = parsePeriod(options.period)
 
   const data = await withSpinner('Fetching breakdown...', async () => {

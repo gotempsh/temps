@@ -15,11 +15,10 @@
 import chalk from 'chalk'
 import { requireAuth } from '../../config/store.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
-import { requireProjectSlug } from '../../config/resolve-project.js'
+import { resolveAnalyticsProject } from './project.js'
 import {
   aggregateApiTraffic,
   getEventProperties,
-  getProjectBySlug,
   getPropertyBreakdown,
 } from '../../api/sdk.gen.js'
 import type {
@@ -88,16 +87,6 @@ export function notFoundRequest(
   }
 }
 
-async function resolveProject(project: string | undefined): Promise<{ slug: string; id: number }> {
-  const resolved = await requireProjectSlug(project)
-  if (resolved.source !== 'flag') {
-    info(`Using project ${colors.bold(resolved.slug)} (from ${resolved.source})`)
-  }
-  const { data, error } = await getProjectBySlug({ client, path: { slug: resolved.slug } })
-  if (error || !data) throw new Error(`Project "${resolved.slug}" not found`)
-  return { slug: resolved.slug, id: data.id }
-}
-
 function printTable(
   title: string,
   subtitle: string,
@@ -139,7 +128,7 @@ async function eventPropertyTop(
   await setupClient()
   const period = options.period ?? '7d'
   const { startDate, endDate, label } = parsePeriod(period)
-  const project = await resolveProject(options.project)
+  const project = await resolveAnalyticsProject(options.project)
 
   const data = await withSpinner(`Fetching ${title.toLowerCase()}...`, async () => {
     const { data, error } = await getEventProperties({
@@ -204,7 +193,7 @@ export async function notFound(options: AutoEventOptions): Promise<void> {
   const period = options.period ?? '7d'
   const parsed = parsePeriod(period)
   const { startDate, narrowed } = clampNotFoundStart(parsed.startDate, parsed.endDate)
-  const project = await resolveProject(options.project)
+  const project = await resolveAnalyticsProject(options.project)
 
   const [answered, reported] = await withSpinner('Fetching not-found pages...', async () => {
     const answered = await aggregateApiTraffic({
