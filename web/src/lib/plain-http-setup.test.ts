@@ -135,10 +135,38 @@ describe('curl examples', () => {
   })
 
   test('session replay inits with camelCase fields and names the batch fields', () => {
-    const curl = sessionReplayCurl(signalFixture('session_replay'))
-    expect(curl).toContain('"sessionId":"s_4f5a6b7c"')
+    const curl = sessionReplayCurl(
+      signalFixture('session_replay'),
+      's_0123abcd',
+      'v_4567ef01'
+    )
+    expect(curl).toContain('"sessionId":"s_0123abcd"')
+    expect(curl).toContain('"visitorId":"v_4567ef01"')
     expect(curl).toContain('POST {"sessionId","events","batchId"}')
     expect(curl).not.toContain('session_id')
+  })
+
+  test('each session replay example gets fresh IDs', () => {
+    // Session IDs are global: a second project reusing one is rejected.
+    const setup = signalFixture('session_replay')
+    const ids = (curl: string) => curl.match(/"(s|v)_[0-9a-f]{16}"/g)
+    const first = ids(sessionReplayCurl(setup))
+    const second = ids(sessionReplayCurl(setup))
+    expect(first).toHaveLength(2)
+    expect(second).toHaveLength(2)
+    expect(first).not.toEqual(second)
+  })
+
+  test('keyed examples say how to pass an allowed origin', () => {
+    // A key with allowed origins rejects a request without a matching Origin.
+    for (const curl of [
+      analyticsCurl(signalFixture('analytics')),
+      sessionReplayCurl(signalFixture('session_replay')),
+    ]) {
+      expect(curl).toContain(
+        "# If the key lists allowed origins, add a matching one: -H 'Origin: https://apps.example.com'"
+      )
+    }
   })
 
   test('OTLP posts protobuf with the bearer and project headers', () => {

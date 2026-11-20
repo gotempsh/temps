@@ -77,11 +77,11 @@ Page view (send on every page load and client-side route change):
 ${JSON.stringify(p.page_view)}
 Custom event:
 ${JSON.stringify(p.custom)}
-A 204 response means the event was recorded.`
+A 204 response means the event was recorded. If the key lists allowed origins, requests from outside a browser (server-side code, curl) must send an Origin header matching one of them, or they get 403.`
       break
     }
     case 'session_replay':
-      shapes = `Flow: POST init once per session with JSON {"sessionId","visitorId","url","userAgent","language","viewportWidth","viewportHeight"}, then POST batches to events as {"sessionId","events","batchId"} where events = base64(zlib-deflate(JSON array of rrweb events)) and batchId is stable across retries. Record with the rrweb library.
+      shapes = `Flow: POST init once per session with JSON {"sessionId","visitorId","url","userAgent","language","viewportWidth","viewportHeight"}, then POST batches to events as {"sessionId","events","batchId"} where events = base64(zlib-deflate(JSON array of rrweb events)) and batchId is stable across retries. Record with the rrweb library. If the key lists allowed origins, requests from outside a browser (server-side code, curl) must send an Origin header matching one of them, or they get 403.
 Privacy (required): start recording only after the visitor consents where the law requires it, and let them turn it off; set maskAllInputs: true; add the rr-block class to elements that show personal or payment data, and the rr-mask class to sensitive text; do not record login, checkout or account pages.`
       break
     case 'errors':

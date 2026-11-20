@@ -77,12 +77,32 @@ export function ExternalOtelEnvBlock({
   const traces = findSignal(query.data, 'traces')
 
   if (traces) {
+    // A failed background refresh keeps the variables that already loaded.
     return (
-      <CodeBlock
-        code={externalOtelEnvBlock(traces, serviceName)}
-        language="bash"
-        title=".env"
-      />
+      <div className="space-y-3">
+        {query.isError && (
+          <Alert>
+            <AlertTitle>Could not refresh the OTLP endpoint</AlertTitle>
+            <AlertDescription className="flex flex-wrap items-center gap-2">
+              <span>Showing the last loaded values.</span>
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={query.isFetching}
+                onClick={() => void query.refetch()}
+              >
+                Retry
+              </Button>
+            </AlertDescription>
+          </Alert>
+        )}
+        <CodeBlock
+          defaultWrap
+          code={externalOtelEnvBlock(traces, serviceName)}
+          language="bash"
+          title=".env"
+        />
+      </div>
     )
   }
   if (query.isError) {

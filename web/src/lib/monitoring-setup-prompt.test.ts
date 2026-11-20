@@ -146,6 +146,20 @@ test('an environment-scoped OTLP prompt never suggests the generic endpoint', ()
   )
 })
 
+test('analytics and replay prompts explain allowed origins outside a browser', () => {
+  for (const feature of ['analytics', 'session_replay'] as const) {
+    const prompt = monitoringSetupPrompt(
+      feature,
+      project,
+      'https://console.example.com',
+      signalFixture(feature)
+    )
+    expect(prompt).toContain(
+      'must send an Origin header matching one of them, or they get 403'
+    )
+  }
+})
+
 test('an unconfigured signal says what is missing first', () => {
   const prompt = monitoringSetupPrompt(
     'errors',

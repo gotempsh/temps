@@ -61,4 +61,14 @@ test('a cached setup stays usable after a failed refresh', () => {
   })
   expect(html).toContain('OTEL_EXPORTER_OTLP_TRACES_ENDPOINT')
   expect(html).not.toContain('Could not load the OTLP endpoint')
+  // ...and says the refresh failed, with a way to try again.
+  expect(html).toContain('Could not refresh the OTLP endpoint')
+  expect(html).toContain('Retry')
+})
+
+test('the .env block wraps instead of scrolling sideways', () => {
+  const html = renderEnvBlock({ kind: 'loaded', data: ingestSetupFixture() })
+  expect(html).toContain('whitespace-pre-wrap')
+  expect(html).not.toMatch(/whitespace-pre(?!-wrap)/)
+  expect(html).not.toContain('Could not refresh the OTLP endpoint')
 })

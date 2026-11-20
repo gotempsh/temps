@@ -54,9 +54,17 @@ function headerFlags(setup: IngestSignalSetup): string[] {
   )
 }
 
+/**
+ * A key with allowed origins rejects a request without a matching `Origin`
+ * (browsers send it; curl and servers do not), so the examples say so.
+ */
+const ORIGIN_NOTE =
+  "# If the key lists allowed origins, add a matching one: -H 'Origin: https://apps.example.com'"
+
 export function analyticsCurl(setup: IngestSignalSetup): string {
   const url = endpointUrl(setup, 'event')
   return [
+    ORIGIN_NOTE,
     `curl -i -X POST ${shellQuote(url)} \\`,
     ...headerFlags(setup).map((h) => `${h} \\`),
     `  -H 'Content-Type: application/json' \\`,
@@ -112,13 +120,27 @@ addEventListener('pagehide', () => {
 });`
 }
 
-export function sessionReplayCurl(setup: IngestSignalSetup): string {
+/**
+ * Session replay init. Session IDs are global (a second project reusing one
+ * gets a cross-project rejection), so each example gets fresh IDs.
+ */
+export function sessionReplayCurl(
+  setup: IngestSignalSetup,
+  sessionId = `s_${hex(8)}`,
+  visitorId = `v_${hex(8)}`
+): string {
   const url = endpointUrl(setup, 'init')
+  const body = JSON.stringify({
+    sessionId,
+    visitorId,
+    url: 'https://apps.example.com/',
+  })
   return [
+    ORIGIN_NOTE,
     `curl -i -X POST ${shellQuote(url)} \\`,
     ...headerFlags(setup).map((h) => `${h} \\`),
     `  -H 'Content-Type: application/json' \\`,
-    `  -d '{"sessionId":"s_4f5a6b7c","visitorId":"v_0b1c2d3e","url":"https://apps.example.com/"}'`,
+    `  -d ${shellQuote(body)}`,
     `# Then POST {"sessionId","events","batchId"} to ${endpointUrl(setup, 'events')},`,
     '# where events is base64(zlib(JSON array of rrweb events)).',
   ].join('\n')
