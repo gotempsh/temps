@@ -51,7 +51,12 @@ test('tab icons sit before the label and drop on a phone', () => {
 test('on a narrow strip, the current tab is scrolled into view', () => {
   // A 300px strip whose tabs are 100px apart: Check-ins, the sixth, starts
   // past the edge.
-  const original = HTMLElement.prototype.getBoundingClientRect
+  // Restored by descriptor: assigning the inherited method back would leave
+  // an own copy on `HTMLElement` that hides later tests' fakes.
+  const original = Object.getOwnPropertyDescriptor(
+    HTMLElement.prototype,
+    'getBoundingClientRect'
+  )
   HTMLElement.prototype.getBoundingClientRect = function (this: HTMLElement) {
     if (this.tagName === 'NAV')
       return { left: 0, right: 300, width: 300 } as DOMRect
@@ -68,7 +73,13 @@ test('on a narrow strip, the current tab is scrolled into view', () => {
     // Centred: 500 - 0 - (300 - 80) / 2.
     expect(nav.scrollLeft).toBe(390)
   } finally {
-    HTMLElement.prototype.getBoundingClientRect = original
+    if (original)
+      Object.defineProperty(
+        HTMLElement.prototype,
+        'getBoundingClientRect',
+        original
+      )
+    else Reflect.deleteProperty(HTMLElement.prototype, 'getBoundingClientRect')
   }
 })
 

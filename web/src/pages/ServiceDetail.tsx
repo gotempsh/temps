@@ -165,6 +165,7 @@ import { isVerifiedNotFound } from '@/lib/read-failure'
 import { toast } from 'sonner'
 import { toastRedeployAfterLinkChange } from '@/lib/service-link-redeploy'
 import { LogIngestBudgetWarning } from '@/components/observability/LogIngestBudgetNotice'
+import { scrollToElementId } from '@/lib/scroll-to-element'
 
 /**
  * Pick the role label to render for a cluster member.
@@ -456,9 +457,7 @@ export function ServiceDetail() {
   const serviceLoaded = !!service
   useEffect(() => {
     if (!serviceLoaded || location.hash !== `#${SERVICE_BACKUPS_ANCHOR}`) return
-    document
-      .getElementById(SERVICE_BACKUPS_ANCHOR)
-      ?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    scrollToElementId(SERVICE_BACKUPS_ANCHOR, { behavior: 'smooth' })
   }, [serviceLoaded, location.hash])
 
   // Notify when cluster creation or a readiness-gated start settles
