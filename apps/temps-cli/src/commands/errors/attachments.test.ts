@@ -71,6 +71,19 @@ describe('saveDownload', () => {
     }
   })
 
+  test('creates a missing output directory without force, as it does with force', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'temps-attachment-'))
+    try {
+      const path = join(dir, 'new-dir', 'nested', 'app.log')
+      expect(await saveDownload(path, new TextEncoder().encode('first'), false)).toBe(true)
+      expect(await Bun.file(path).text()).toBe('first')
+      expect(await saveDownload(path, new TextEncoder().encode('second'), false)).toBe(false)
+      expect(await Bun.file(path).text()).toBe('first')
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
   test('of two concurrent downloads to one name without force, exactly one writes', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'temps-attachment-'))
     try {

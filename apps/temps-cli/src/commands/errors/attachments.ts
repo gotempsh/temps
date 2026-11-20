@@ -5,8 +5,8 @@
 // kept in the project's blob storage (ADR 111, D4).
 
 import type { Command } from 'commander'
-import { writeFile } from 'node:fs/promises'
-import { basename } from 'node:path'
+import { mkdir, writeFile } from 'node:fs/promises'
+import { basename, dirname } from 'node:path'
 import { requireAuth } from '../../config/store.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
 import {
@@ -71,6 +71,8 @@ export async function saveDownload(path: string, bytes: Uint8Array, force: boole
     return true
   }
   try {
+    // Like Bun.write in the --force branch, create a missing parent directory.
+    await mkdir(dirname(path), { recursive: true })
     // Bun.write has no create-only mode; the `wx` flag is O_CREAT | O_EXCL.
     await writeFile(path, bytes, { flag: 'wx' })
     return true
