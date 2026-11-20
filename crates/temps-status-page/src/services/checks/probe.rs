@@ -112,19 +112,44 @@ impl TargetProber for NetworkProber {
         request: &CheckRequest,
     ) -> ProbeOutcome {
         let timeout = spec.timeout();
-        match (spec, target) {
-            (CheckSpec::Http(check), Target::Url(url)) => {
-                probe_http(check, url, request, timeout).await
+        let probe = async {
+            match (spec, target) {
+                (CheckSpec::Http(check), Target::Url(url)) => {
+                    probe_http(check, url, request, timeout).await
+                }
+                (CheckSpec::Tcp(check), Target::HostPort { host, port }) => {
+                    probe_tcp(check, host, *port, timeout).await
+                }
+                (CheckSpec::Tls(check), Target::HostPort { host, port }) => {
+                    probe_tls(check, host, *port, timeout).await
+                }
+                (CheckSpec::Dns(check), Target::Name(name)) => {
+                    probe_dns(check, name, timeout).await
+                }
+                _ => ProbeOutcome::down(None, "the stored target does not fit the check kind"),
             }
-            (CheckSpec::Tcp(check), Target::HostPort { host, port }) => {
-                probe_tcp(check, host, *port, timeout).await
-            }
-            (CheckSpec::Tls(check), Target::HostPort { host, port }) => {
-                probe_tls(check, host, *port, timeout).await
-            }
-            (CheckSpec::Dns(check), Target::Name(name)) => probe_dns(check, name, timeout).await,
-            _ => ProbeOutcome::down(None, "the stored target does not fit the check kind"),
-        }
+        };
+        within(timeout, probe).await
+    }
+}
+
+/// `probe`, bounded by the check's `timeout` from start to finish. Each probe
+/// times its own connection or request, but resolving the target's address
+/// comes first and has no deadline of its own, so a slow resolver would hold
+/// up every monitor waiting in the same sweep.
+async fn within(
+    timeout: Duration,
+    probe: impl std::future::Future<Output = ProbeOutcome>,
+) -> ProbeOutcome {
+    match tokio::time::timeout(timeout, probe).await {
+        Ok(outcome) => outcome,
+        Err(_) => ProbeOutcome::down(
+            Some(timeout),
+            format!(
+                "no answer within {}, name resolution included",
+                seconds(timeout)
+            ),
+        ),
     }
 }
 
@@ -486,10 +511,26 @@ fn shown_address(ip: IpAddr) -> String {
     }
 }
 
+/// A DNS answer normalised exactly as expectations are on save
+/// ([`normalize_dns_value`]), TXT included, so a match never depends on case.
+fn dns_answer(data: &hickory_resolver::proto::rr::RData) -> Option<String> {
+    use hickory_resolver::proto::rr::RData;
+    let value = match data {
+        RData::A(a) => a.0.to_string(),
+        RData::AAAA(aaaa) => aaaa.0.to_string(),
+        RData::CNAME(cname) => cname.0.to_string(),
+        RData::NS(ns) => ns.0.to_string(),
+        RData::MX(mx) => mx.exchange.to_string(),
+        RData::TXT(txt) => txt.to_string(),
+        _ => return None,
+    };
+    Some(normalize_dns_value(&value))
+}
+
 async fn probe_dns(check: &DnsCheck, name: &str, timeout: Duration) -> ProbeOutcome {
     use super::spec::DnsCheckRecordType;
     use hickory_resolver::config::ResolveHosts;
-    use hickory_resolver::proto::rr::{RData, RecordType};
+    use hickory_resolver::proto::rr::RecordType;
 
     let mut builder = match hickory_resolver::Resolver::builder_tokio() {
         Ok(builder) => builder,
@@ -541,15 +582,7 @@ async fn probe_dns(check: &DnsCheck, name: &str, timeout: Duration) -> ProbeOutc
         .answers()
         .iter()
         .filter(|record| record.record_type() == record_type)
-        .filter_map(|record| match &record.data {
-            RData::A(a) => Some(normalize_dns_value(&a.0.to_string())),
-            RData::AAAA(aaaa) => Some(normalize_dns_value(&aaaa.0.to_string())),
-            RData::CNAME(cname) => Some(normalize_dns_value(&cname.0.to_string())),
-            RData::NS(ns) => Some(normalize_dns_value(&ns.0.to_string())),
-            RData::MX(mx) => Some(normalize_dns_value(&mx.exchange.to_string())),
-            RData::TXT(txt) => Some(txt.to_string()),
-            _ => None,
-        })
+        .filter_map(|record| dns_answer(&record.data))
         .collect();
     let outcome = judge_dns(check, name, &answers, elapsed);
     if outcome.status == ProbeStatus::Operational
@@ -691,6 +724,44 @@ mod tests {
         assert_eq!(
             judge_certificate(&check, now - 1, now, FAST).status,
             ProbeStatus::Down
+        );
+    }
+
+    #[test]
+    fn txt_answers_match_expectations_whatever_their_case() {
+        use hickory_resolver::proto::rr::rdata::TXT;
+        use hickory_resolver::proto::rr::RData;
+        let check = DnsCheck {
+            record_type: DnsCheckRecordType::Txt,
+            // As saved: expectations are normalised on save.
+            expected: vec![normalize_dns_value("site-verification=AbC123")],
+            timeout_ms: None,
+        };
+        let answer = dns_answer(&RData::TXT(TXT::new(vec![
+            "site-verification=AbC123".to_string()
+        ])))
+        .expect("a TXT answer");
+        assert_eq!(
+            judge_dns(&check, "example.com", &[answer], FAST).status,
+            ProbeStatus::Operational
+        );
+    }
+
+    #[tokio::test]
+    async fn a_probe_is_bounded_by_its_timeout_name_resolution_included() {
+        let outcome = within(
+            Duration::from_millis(20),
+            std::future::pending::<ProbeOutcome>(),
+        )
+        .await;
+        assert_eq!(outcome.status, ProbeStatus::Down);
+        assert_eq!(outcome.response_time_ms, Some(20));
+        assert!(
+            outcome
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("name resolution included")),
+            "{outcome:?}"
         );
     }
 
