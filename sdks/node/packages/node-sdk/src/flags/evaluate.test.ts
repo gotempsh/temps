@@ -311,5 +311,9 @@ describe('targeting rules', () => {
     expect(gte('0x10')).toBe(false);
     expect(gte('0b1111')).toBe(false);
     expect(gte('Infinity')).toBe(false);
+    // Linear on a long numeral that fails to match.
+    const started = Date.now();
+    expect(gte('9'.repeat(100_000) + 'x')).toBe(false);
+    expect(Date.now() - started).toBeLessThan(500);
   });
 });

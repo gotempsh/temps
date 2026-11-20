@@ -118,7 +118,7 @@ class Malformed extends Error {}
  * accepts. `Number()` alone also reads `0x10`, `0b1` and `0o7`, which the
  * server treats as plain strings, so the two evaluators would disagree.
  */
-const DECIMAL = /^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/;
+const DECIMAL = /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/;
 
 function asNumber(value: AttributeValue): number | null {
   if (typeof value === 'number') return Number.isFinite(value) ? value : null;

@@ -203,12 +203,16 @@ function FlagDetailBody({
       return
     }
     setExposureError(null)
+    // The server stores the trimmed text; keep the draft equal to what is
+    // saved so the next refetch advances the draft's baseline revision.
+    const trimmedDescription = description.trim()
+    setDescription(trimmedDescription)
 
     update.mutate({
       path: { project_id: projectId, key: flag.key },
       body: {
         default_value: parsed.value,
-        description: description.trim() || null,
+        description: trimmedDescription || null,
         // Sent only when edited: the field shows a rounded percentage, and
         // saving that back would change a rate nobody touched.
         ...(exposurePercent === exposureText(flag.exposure_sample_rate)

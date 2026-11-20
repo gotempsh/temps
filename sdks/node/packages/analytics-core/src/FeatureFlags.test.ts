@@ -176,6 +176,9 @@ describe("FeatureFlags", () => {
     expect(flags.get("checkout.v2", false)).toBe(true);
 
     flags.setDisabled(true);
+    // Disabled means bootstrap or fallback only, not what was fetched.
+    expect(flags.get("checkout.v2", false)).toBe(false);
+    expect(flags.peek("checkout.v2", false)).toBe(false);
     flags.setContext({ key: "user-1" });
     flags.get("checkout.v2", false);
     expect(fetch).toHaveBeenCalledTimes(1);

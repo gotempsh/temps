@@ -26076,19 +26076,6 @@ export type ProjectCloudTelemetryResponse = {
     write_mode: CloudTelemetryWriteMode;
 };
 
-export type ProjectDsnResponse = {
-    created_at: string;
-    deployment_id?: number | null;
-    dsn: string;
-    environment_id?: number | null;
-    event_count: number;
-    id: number;
-    is_active: boolean;
-    name: string;
-    project_id: number;
-    public_key: string;
-};
-
 /**
  * Project-level configuration
  */
@@ -26109,6 +26096,19 @@ export type ProjectConfiguration = {
      * Proposed slug (URL-safe identifier)
      */
     slug: string;
+};
+
+export type ProjectDsnResponse = {
+    created_at: string;
+    deployment_id?: number | null;
+    dsn: string;
+    environment_id?: number | null;
+    event_count: number;
+    id: number;
+    is_active: boolean;
+    name: string;
+    project_id: number;
+    public_key: string;
 };
 
 /**

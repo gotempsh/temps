@@ -211,7 +211,9 @@ async function resolveProject(projectOption?: string): Promise<{ slug: string; i
     info(`Using project ${colors.bold(resolved.slug)} (from ${resolved.source})`)
   }
 
-  const lookup = projectLookup(resolved.slug)
+  // Only an explicit --project may be a numeric id; a slug stored in the
+  // directory config, the environment or the context default is a slug.
+  const lookup = resolved.source === 'flag' ? projectLookup(resolved.slug) : { slug: resolved.slug }
   const { data, error } =
     'id' in lookup
       ? await getProject({ client, path: { id: lookup.id } })

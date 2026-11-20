@@ -414,6 +414,13 @@ function FlagRow({
               {flag.description}
             </span>
           )}
+          {/* The Source column is hidden below sm; this warning is needed to
+              act, so it moves under the name there. */}
+          {effective.source === 'invalid-rules' && (
+            <span className="text-xs text-destructive sm:hidden">
+              Rules unreadable: the default value is served
+            </span>
+          )}
         </div>
       </TableCell>
 

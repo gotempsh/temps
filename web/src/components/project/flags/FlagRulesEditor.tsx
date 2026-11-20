@@ -114,7 +114,7 @@ export function FlagRulesEditor({
       const status = (failure as { status?: number } | null)?.status
       if (status === 409) {
         setError(
-          'Someone else changed these rules after you opened them. Reload to see their version, then apply your change again.'
+          'Someone else changed these rules after you opened them. Discard your edits to see their version, then apply your change again.'
         )
         return
       }
@@ -286,8 +286,18 @@ export function FlagRulesEditor({
           Cancel
         </Button>
         {error?.startsWith('Someone else') && (
-          <Button type="button" size="sm" variant="outline" onClick={onChanged}>
-            Reload
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            onClick={() => {
+              // Dropping the drafts is what lets the editor adopt the server
+              // revision: a dirty draft keeps its old one on purpose.
+              cancel()
+              onChanged()
+            }}
+          >
+            Discard and reload
           </Button>
         )}
       </div>
