@@ -20,7 +20,8 @@ use async_trait::async_trait;
 use sea_orm::DatabaseConnection;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::sync::Arc;
-use tracing::error;
+use temps_core::retry::RetryConfig;
+use tracing::{error, warn};
 
 /// Provider type stored in `notification_providers.provider_type`.
 pub const TELEGRAM_PROVIDER_TYPE: &str = "telegram";
@@ -359,10 +360,18 @@ impl TelegramProvider {
             })
     }
 
-    /// Post one `sendMessage` call and turn Telegram's answer into a result.
+    /// Deliver the notification, retrying what a later attempt can fix.
+    ///
+    /// Retried: connection failures, 5xx answers and rate limits whose
+    /// `retry_after` fits under `retry.max_delay`. Not retried: rejected
+    /// settings (bad token, unknown chat), which fail the same way again, and
+    /// timeouts, because Telegram may already have posted the message and a
+    /// retry would post it twice. Providers are delivered one after another,
+    /// so the bound also caps how long this can hold up the next one.
     pub(crate) async fn send_message(
         &self,
         notification: &Notification,
+        retry: &RetryConfig,
     ) -> std::result::Result<(), TelegramError> {
         self.validate()?;
         let client = self.http_client()?;
@@ -377,46 +386,129 @@ impl TelegramProvider {
             payload["message_thread_id"] = serde_json::Value::from(thread_id);
         }
 
+        let max_attempts = retry.max_attempts.max(1);
+        let mut attempt: u32 = 0;
+        loop {
+            let (error, next) = match self.post_message(&client, &payload).await {
+                Ok(()) => return Ok(()),
+                Err(failure) => failure,
+            };
+            let delay = match next {
+                RetryAdvice::Never => None,
+                RetryAdvice::Backoff => Some(retry.compute_delay(attempt)),
+                RetryAdvice::After(wait) => (wait <= retry.max_delay).then_some(wait),
+            };
+            let Some(delay) = delay.filter(|_| attempt + 1 < max_attempts) else {
+                return Err(error);
+            };
+            warn!(
+                chat_id = %self.chat(),
+                attempt = attempt + 1,
+                max_attempts,
+                retry_in_ms = delay.as_millis() as u64,
+                "Telegram delivery failed, retrying: {}",
+                error
+            );
+            tokio::time::sleep(delay).await;
+            attempt += 1;
+        }
+    }
+
+    /// Post one `sendMessage` call and turn Telegram's answer into a result,
+    /// with whether trying again could succeed.
+    async fn post_message(
+        &self,
+        client: &reqwest::Client,
+        payload: &serde_json::Value,
+    ) -> std::result::Result<(), (TelegramError, RetryAdvice)> {
         let chat_id = self.chat().to_string();
         let response = client
             .post(self.method_url("sendMessage"))
-            .json(&payload)
+            .json(payload)
             .send()
             .await
-            // The URL carries the bot token: never let it into the error.
-            .map_err(|e| TelegramError::Request {
-                chat_id: chat_id.clone(),
-                reason: e.without_url().to_string(),
+            .map_err(|e| {
+                // Only a request that never reached Telegram is safe to repeat.
+                let advice = if e.is_connect() {
+                    RetryAdvice::Backoff
+                } else {
+                    RetryAdvice::Never
+                };
+                // The URL carries the bot token: never let it into the error.
+                let error = TelegramError::Request {
+                    chat_id: chat_id.clone(),
+                    reason: e.without_url().to_string(),
+                };
+                (error, advice)
             })?;
 
         let status = response.status().as_u16();
-        let body = response.text().await.map_err(|e| TelegramError::Request {
-            chat_id: chat_id.clone(),
-            reason: format!("failed to read the response body: {}", e.without_url()),
+        let server_error = (500..600).contains(&status);
+        let body = response.text().await.map_err(|e| {
+            let error = TelegramError::Request {
+                chat_id: chat_id.clone(),
+                reason: format!("failed to read the response body: {}", e.without_url()),
+            };
+            (error, RetryAdvice::Never)
         })?;
 
-        let parsed: TelegramApiResponse =
-            serde_json::from_str(&body).map_err(|e| TelegramError::InvalidResponse {
+        let parsed: TelegramApiResponse = serde_json::from_str(&body).map_err(|e| {
+            let error = TelegramError::InvalidResponse {
                 chat_id: chat_id.clone(),
                 status,
                 reason: format!("{e}; body starts with '{}'", truncate_chars(&body, 200)),
-            })?;
+            };
+            // A proxy in front of Telegram answers an outage with HTML.
+            let advice = if server_error {
+                RetryAdvice::Backoff
+            } else {
+                RetryAdvice::Never
+            };
+            (error, advice)
+        })?;
 
         if parsed.ok && (200..300).contains(&status) {
             return Ok(());
         }
 
+        let retry_after = parsed.parameters.as_ref().and_then(|p| p.retry_after);
+        let advice = match retry_after {
+            Some(seconds) if status == 429 => {
+                RetryAdvice::After(std::time::Duration::from_secs(seconds))
+            }
+            _ if server_error => RetryAdvice::Backoff,
+            _ => RetryAdvice::Never,
+        };
         let description = parsed
             .description
             .unwrap_or_else(|| "no description was returned".to_string());
         let guidance = rejection_guidance(status, &description, parsed.parameters.as_ref());
-        Err(TelegramError::Rejected {
+        let error = TelegramError::Rejected {
             chat_id,
             status,
             description,
             guidance,
-        })
+        };
+        Err((error, advice))
     }
+}
+
+/// Whether a failed `sendMessage` is worth another attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryAdvice {
+    /// It would fail the same way, or could post the message twice.
+    Never,
+    /// Transient: wait the configured backoff.
+    Backoff,
+    /// Telegram asked to wait this long first.
+    After(std::time::Duration),
+}
+
+/// Retries for automatic alerts: three attempts at most, 1 s then 2 s apart.
+fn delivery_retry() -> RetryConfig {
+    RetryConfig::new(3)
+        .with_base_delay(std::time::Duration::from_secs(1))
+        .with_max_delay(std::time::Duration::from_secs(10))
 }
 
 #[async_trait]
@@ -427,11 +519,13 @@ impl NotificationProvider for TelegramProvider {
     }
 
     async fn send(&self, notification: &Notification) -> Result<()> {
-        Ok(self.send_message(notification).await?)
+        Ok(self.send_message(notification, &delivery_retry()).await?)
     }
 
     async fn send_test(&self, notification: &Notification) -> Result<String> {
-        self.send_message(notification).await?;
+        // One attempt: the operator is waiting and should see the real error.
+        self.send_message(notification, &RetryConfig::new(1))
+            .await?;
         Ok(format!(
             "Test message delivered to Telegram chat {}",
             self.chat()
@@ -836,13 +930,15 @@ mod tests {
             .mount(&server)
             .await;
         let error = mock_provider(&server, "123")
-            .send_message(&Notification::new("t", "m"))
+            .send_message(&Notification::new("t", "m"), &fast_retry())
             .await
             .unwrap_err();
         assert!(
             matches!(error, TelegramError::InvalidResponse { status: 502, .. }),
             "{error}"
         );
+        // A gateway outage is transient: every attempt was used.
+        assert_eq!(server.received_requests().await.unwrap().len(), 3);
     }
 
     #[tokio::test]
@@ -853,7 +949,7 @@ mod tests {
             ..provider("123")
         };
         let message = p
-            .send(&Notification::new("t", "m"))
+            .send_message(&Notification::new("t", "m"), &fast_retry())
             .await
             .unwrap_err()
             .to_string();
@@ -862,6 +958,139 @@ mod tests {
             "{message}"
         );
         assert!(!message.contains("AAExampleSecretToken"), "{message}");
+    }
+
+    /// Three attempts with no waiting, so retry tests run instantly.
+    fn fast_retry() -> RetryConfig {
+        RetryConfig::new(3)
+            .with_base_delay(std::time::Duration::ZERO)
+            .with_max_delay(std::time::Duration::from_secs(1))
+    }
+
+    fn rejection(status: u16, description: &str) -> ResponseTemplate {
+        ResponseTemplate::new(status).set_body_json(serde_json::json!({
+            "ok": false,
+            "error_code": status,
+            "description": description,
+        }))
+    }
+
+    fn delivered() -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true}))
+    }
+
+    #[tokio::test]
+    async fn a_server_error_is_retried_until_delivered() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(rejection(500, "Internal Server Error"))
+            .up_to_n_times(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(delivered())
+            .mount(&server)
+            .await;
+
+        mock_provider(&server, "123")
+            .send_message(&Notification::new("t", "m"), &fast_retry())
+            .await
+            .expect("the third attempt is delivered");
+        assert_eq!(server.received_requests().await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_rate_limit_is_retried_after_the_wait_telegram_asks_for() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(429).set_body_json(serde_json::json!({
+                "ok": false,
+                "error_code": 429,
+                "description": "Too Many Requests: retry after 0",
+                "parameters": {"retry_after": 0},
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(delivered())
+            .mount(&server)
+            .await;
+
+        mock_provider(&server, "123")
+            .send_message(&Notification::new("t", "m"), &fast_retry())
+            .await
+            .expect("delivered after the requested wait");
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_rate_limit_longer_than_the_cap_fails_at_once_with_the_wait() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(429).set_body_json(serde_json::json!({
+                "ok": false,
+                "error_code": 429,
+                "description": "Too Many Requests: retry after 60",
+                "parameters": {"retry_after": 60},
+            })))
+            .mount(&server)
+            .await;
+
+        let message = mock_provider(&server, "123")
+            .send_message(&Notification::new("t", "m"), &fast_retry())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("retry after 60 seconds"), "{message}");
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn rejected_settings_are_not_retried() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(rejection(400, "Bad Request: chat not found"))
+            .mount(&server)
+            .await;
+
+        mock_provider(&server, "123")
+            .send_message(&Notification::new("t", "m"), &fast_retry())
+            .await
+            .unwrap_err();
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_test_message_is_sent_once_so_the_error_shows_at_once() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(rejection(500, "Internal Server Error"))
+            .mount(&server)
+            .await;
+
+        mock_provider(&server, "123")
+            .send_test(&Notification::new("t", "m"))
+            .await
+            .unwrap_err();
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn automatic_delivery_retries_are_bounded() {
+        let retry = delivery_retry();
+        assert_eq!(retry.max_attempts, 3);
+        let waits: Vec<_> = (0..retry.max_attempts - 1)
+            .map(|attempt| retry.compute_delay(attempt))
+            .collect();
+        assert_eq!(
+            waits,
+            [
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_secs(2)
+            ]
+        );
+        assert!(retry.max_delay <= std::time::Duration::from_secs(10));
     }
 
     #[tokio::test]
