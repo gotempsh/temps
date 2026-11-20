@@ -20082,6 +20082,27 @@
         ],
         "type": "object"
       },
+      "CreateTelegramProviderRequest": {
+        "properties": {
+          "config": {
+            "$ref": "#/components/schemas/TelegramConfig"
+          },
+          "enabled": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "config"
+        ],
+        "type": "object"
+      },
       "CreateThreadArtifactRequest": {
         "properties": {
           "kind": {
@@ -77584,6 +77605,44 @@
         ],
         "type": "string"
       },
+      "TelegramConfig": {
+        "description": "Configuration for a Telegram notification provider (Telegram Bot API\n`sendMessage`). Request-side config. Not `Serialize`: `bot_token` is a\n`SecretString`; use [`TelegramConfig::into_stored_value`].",
+        "properties": {
+          "bot_token": {
+            "$ref": "#/components/schemas/SecretString",
+            "description": "Bot token from @BotFather. Encrypted at rest and masked in normal API\nresponses. Send `***` on update to keep the stored token."
+          },
+          "chat_id": {
+            "description": "Chat to post to: a numeric user, group or channel ID (`-100…` for supergroups and channels) or a public `@channelusername`. A JSON integer is accepted too.",
+            "examples": [
+              "-1001234567890"
+            ],
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "format": "int64",
+                "type": "integer"
+              }
+            ]
+          },
+          "message_thread_id": {
+            "description": "Optional forum topic (`message_thread_id`) for forum-style groups.",
+            "example": 42,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "bot_token",
+          "chat_id"
+        ],
+        "type": "object"
+      },
       "TelemetryEventCategory": {
         "description": "Area an event belongs to, for operator-facing disclosure (see\n[`TelemetryEventKind::category`]). Serialized as snake_case.",
         "enum": [
@@ -84346,6 +84405,29 @@
             ]
           }
         },
+        "type": "object"
+      },
+      "UpdateTelegramProviderRequest": {
+        "properties": {
+          "config": {
+            "$ref": "#/components/schemas/TelegramConfig"
+          },
+          "enabled": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "config"
+        ],
         "type": "object"
       },
       "UpdateTelemetrySettingsRequest": {
@@ -135028,6 +135110,119 @@
           }
         ],
         "summary": "Update a Slack notification provider",
+        "tags": [
+          "Notification Providers"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/notification-providers/telegram": {
+      "post": {
+        "operationId": "create_telegram_provider",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateTelegramProviderRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotificationProviderResponse"
+                }
+              }
+            },
+            "description": "Successfully created Telegram provider"
+          },
+          "400": {
+            "description": "Invalid bot token, chat ID or topic ID"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Create a new Telegram notification provider",
+        "tags": [
+          "Notification Providers"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/notification-providers/telegram/{id}": {
+      "put": {
+        "operationId": "update_telegram_provider",
+        "parameters": [
+          {
+            "description": "Provider ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateTelegramProviderRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotificationProviderResponse"
+                }
+              }
+            },
+            "description": "Successfully updated Telegram provider"
+          },
+          "400": {
+            "description": "Invalid bot token, chat ID or topic ID"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Provider not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Update a Telegram notification provider",
         "tags": [
           "Notification Providers"
         ],

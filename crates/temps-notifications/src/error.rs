@@ -10,9 +10,10 @@
 
 use crate::routing::NotificationRouteError;
 use crate::services::{
-    CloudNotificationError, EmailDeliveryError, NotificationProviderConfigMergeError,
-    WebhookDeliveryError,
+    CloudNotificationError, EmailDeliveryError, NotificationProviderConfigError,
+    NotificationProviderConfigMergeError, WebhookDeliveryError,
 };
+use crate::telegram::TelegramError;
 use thiserror::Error;
 
 pub type Result<T, E = NotificationError> = std::result::Result<T, E>;
@@ -21,6 +22,16 @@ pub type Result<T, E = NotificationError> = std::result::Result<T, E>;
 pub enum NotificationError {
     #[error("Notification provider with ID {provider_id} not found")]
     ProviderNotFound { provider_id: i32 },
+
+    /// A type-specific endpoint (e.g. `PUT /notification-providers/telegram/{id}`)
+    /// was given the ID of a provider of another type. Refused before any write:
+    /// storing a Telegram config on a Slack row would break its delivery.
+    #[error("Notification provider {provider_id} is a '{actual}' provider, not '{expected}'")]
+    ProviderTypeMismatch {
+        provider_id: i32,
+        expected: &'static str,
+        actual: String,
+    },
 
     #[error("Notification provider {provider_id} has unsupported type '{provider_type}'")]
     UnsupportedProviderType {
@@ -112,6 +123,11 @@ pub enum NotificationError {
     #[error(transparent)]
     ConfigMerge(#[from] NotificationProviderConfigMergeError),
 
+    /// A config that would be stored but could never deliver (e.g. a
+    /// malformed Telegram bot token). Maps to 400 at the API.
+    #[error(transparent)]
+    InvalidProviderConfig(#[from] NotificationProviderConfigError),
+
     #[error("Failed to serialize {what} for notification batch '{batch_key}': {source}")]
     MetadataSerialization {
         what: &'static str,
@@ -159,6 +175,11 @@ pub enum NotificationError {
 
     #[error(transparent)]
     Cloud(#[from] CloudNotificationError),
+
+    /// Telegram Bot API delivery failures. Never contain the bot token: it is
+    /// part of the request URL, which is stripped from every transport error.
+    #[error(transparent)]
+    Telegram(#[from] TelegramError),
 
     #[error("Email provider not initialized")]
     EmailProviderNotInitialized,
