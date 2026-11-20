@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { z } from 'zod'
+
 /** The editable workspace file limits: setting key, label and allowed range. */
 export const WORKSPACE_FILE_LIMIT_FIELDS = [
   ['max_files_per_upload', 'Files per upload', 1, 100],
@@ -53,7 +55,7 @@ function rangeError(
   if (integer && !Number.isInteger(value)) {
     return `${label} must be a whole number`
   }
-  if (value < min || value > max) {
+  if (!z.number().min(min).max(max).safeParse(value).success) {
     return `${label} must be between ${min} and ${max}`
   }
   return null
@@ -65,13 +67,17 @@ function rangeError(
  * field's name and allowed range, instead of silently rewriting the value.
  */
 export function validateSandboxLimits(
-  draft: SandboxLimitsDraft
+  draft: SandboxLimitsDraft,
+  bounds: { maxCpu: number; maxMemory: number } = {
+    maxCpu: CPU_LIMIT_RANGE.max,
+    maxMemory: MEMORY_LIMIT_RANGE.max,
+  }
 ): SandboxLimitsResult {
   const cpuError = rangeError(
     'CPU cores',
     draft.cpuLimit,
     CPU_LIMIT_RANGE.min,
-    CPU_LIMIT_RANGE.max,
+    bounds.maxCpu,
     false
   )
   if (cpuError) return { ok: false, message: cpuError }
@@ -79,7 +85,7 @@ export function validateSandboxLimits(
     'Memory (MB)',
     draft.memoryLimitMb,
     MEMORY_LIMIT_RANGE.min,
-    MEMORY_LIMIT_RANGE.max,
+    bounds.maxMemory,
     true
   )
   if (memoryError) return { ok: false, message: memoryError }

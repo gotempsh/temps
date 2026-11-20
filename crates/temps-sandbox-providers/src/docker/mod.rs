@@ -262,6 +262,7 @@ impl DockerSandboxConfig {
 pub const DEFAULT_PIDS_LIMIT: i64 = 512;
 
 pub struct DockerSandboxProvider {
+    capacity: tokio::sync::OnceCell<crate::SandboxHostCapacity>,
     docker: Arc<Docker>,
     config: DockerSandboxConfig,
     service_access: Option<service_access::AccessMounts>,
@@ -361,10 +362,40 @@ impl Drop for ReapClaim<'_> {
 }
 
 impl DockerSandboxProvider {
+    async fn capacity(&self) -> Result<crate::SandboxHostCapacity, AgentError> {
+        self.capacity
+            .get_or_try_init(|| async {
+                let unavailable = |reason: String| AgentError::SandboxProviderUnavailable {
+                    provider: "docker".into(),
+                    reason: format!("reading sandbox host capacity: {reason}"),
+                };
+                let info =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), self.docker.info())
+                        .await
+                        .map_err(|err| unavailable(err.to_string()))?
+                        .map_err(|err| unavailable(err.to_string()))?;
+                let cpu = info
+                    .ncpu
+                    .filter(|n| *n > 0)
+                    .ok_or_else(|| unavailable("missing NCPU".into()))?;
+                let bytes = info
+                    .mem_total
+                    .filter(|n| *n >= 1024 * 1024)
+                    .ok_or_else(|| unavailable("missing MemTotal".into()))?;
+                Ok(crate::SandboxHostCapacity {
+                    cpu_cores: cpu as f64,
+                    memory_mb: bytes as u64 / (1024 * 1024),
+                })
+            })
+            .await
+            .copied()
+    }
+
     pub fn new(docker: Arc<Docker>, config: DockerSandboxConfig) -> Self {
         Self {
             docker,
             config,
+            capacity: Default::default(),
             service_access: None,
             network_lock: tokio::sync::Mutex::new(()),
             creates_in_flight: std::sync::Mutex::new(SandboxLifecycle::default()),

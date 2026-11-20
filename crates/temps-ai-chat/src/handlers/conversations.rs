@@ -694,8 +694,9 @@ pub async fn get_global_ai_workspace(
                     error = %error,
                     "Could not read global workspace resource usage"
                 );
-                diagnostic =
-                    Some("Workspace resource usage is temporarily unavailable.".to_string());
+                diagnostic.get_or_insert_with(|| {
+                    "Workspace resource usage is temporarily unavailable.".to_string()
+                });
                 temps_sandbox::services::ApplicationWorkspaceUsage::default()
             }
         }
@@ -713,6 +714,16 @@ pub async fn get_global_ai_workspace(
         .await
         .is_ok_and(|metadata| metadata.is_dir());
 
+    let capacity = sandboxes
+        .application_workspace_capacity(
+            &workspace_id,
+            &defaults,
+            summary.as_ref().and_then(|s| s.backend.as_deref()),
+        )
+        .await;
+    let (cpu_limit, memory_limit_mb) =
+        workspace_status_limits(&workspace_id, &defaults, capacity, &mut diagnostic);
+
     Ok(Json(ApplicationWorkspaceResponse {
         state: state_name.to_string(),
         desired_state: defaults.desired_state,
@@ -726,8 +737,8 @@ pub async fn get_global_ai_workspace(
         runtime_update_available: false,
         runtime_update_image: None,
         runtime_update_error: None,
-        cpu_limit: defaults.cpu_limit,
-        memory_limit_mb: defaults.memory_limit_mb as i64,
+        cpu_limit,
+        memory_limit_mb: memory_limit_mb as i64,
         pids_limit: defaults.pids_limit,
         disk_limit_mb: defaults.disk_limit_mb as i64,
         disk_limit_enforced: summary

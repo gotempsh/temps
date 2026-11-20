@@ -100,6 +100,7 @@ import {
   toggleRow,
   togglePage,
 } from './alarmBulkSelection'
+import { scrollElementIntoView } from '@/lib/scroll-to-element'
 
 const SILENCE_OPTIONS = [
   { label: '1 hour', hours: 1 },
@@ -572,7 +573,7 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
   useEffect(() => {
     if (deepLinkAlarmId == null || items.length === 0) return
     const el = document.querySelector(`[data-alarm-id="${deepLinkAlarmId}"]`)
-    if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    if (el) scrollElementIntoView(el, { behavior: 'smooth', block: 'center' })
   }, [deepLinkAlarmId, items])
 
   const resetFilters = () => {
