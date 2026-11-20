@@ -275,7 +275,7 @@ function Checkout() {
   // `false` until flags arrive, then the served value.
   const useV2 = useFlag('checkout.v2', false)
   const arm = useFlagVariant('pricing.page') // 'control' | 'test' | null
-  return useV2 ? <CheckoutV2 /> : <Checkout />
+  return useV2 ? <CheckoutV2 /> : <CheckoutV1 />
 }
 ```
 
@@ -405,4 +405,4 @@ Not yet available:
 - Exposure events from server-side SDKs (only browsers record them today)
 - Flag-change correlation with analytics and error tracking
 - Per-environment usage (today "last evaluated" is per flag, across all environments)
-- Instant propagation across separate console and proxy processes: a change is live at once on a single-binary install, and within 5 seconds in a split topology
+- Instant propagation across separate console and proxy processes: a change is live at once on a single-binary install, and in a split topology within 5 seconds plus the time one cache refresh takes
