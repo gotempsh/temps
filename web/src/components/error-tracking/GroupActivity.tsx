@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { useState } from 'react'
+import { zodResolver } from '@hookform/resolvers/zod'
+import { useForm, useWatch } from 'react-hook-form'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { MessageSquare, Pencil, Trash2 } from 'lucide-react'
 import {
@@ -17,6 +19,7 @@ import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
 import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { Skeleton } from '@/components/ui/skeleton'
+import { ResponsivePagination } from '@/components/ui/responsive-pagination'
 import { Textarea } from '@/components/ui/textarea'
 import { TimeAgo } from '@/components/utils/TimeAgo'
 import { queryKeyPrefix } from '@/lib/refresh'
@@ -25,9 +28,13 @@ import {
   commentPreview,
   describeActivity,
 } from './activity-label'
+import {
+  commentFormSchema,
+  MAX_COMMENT_CHARS,
+  type CommentFormData,
+} from './forms'
 
 const PAGE_SIZE = 20
-const MAX_COMMENT_CHARS = 10_000
 
 interface GroupActivityProps {
   projectId: number
@@ -50,7 +57,10 @@ export function GroupActivity({
 }: GroupActivityProps) {
   const queryClient = useQueryClient()
   const [page, setPage] = useState(1)
-  const [draft, setDraft] = useState('')
+  const composer = useForm<CommentFormData>({
+    resolver: zodResolver(commentFormSchema),
+    defaultValues: { body: '' },
+  })
   const path = { project_id: projectId, group_id: groupId }
 
   const activity = useQuery({
@@ -68,7 +78,7 @@ export function GroupActivity({
     ...createErrorGroupCommentMutation(),
     meta: { errorTitle: 'Failed to add the comment' },
     onSuccess: () => {
-      setDraft('')
+      composer.reset({ body: '' })
       setPage(1)
       refresh()
     },
@@ -77,33 +87,46 @@ export function GroupActivity({
   const entries = activity.data?.data ?? []
   const total = activity.data?.total_count ?? 0
   const pages = Math.max(1, Math.ceil(total / PAGE_SIZE))
-  const trimmed = draft.trim()
+  const draftIsBlank =
+    useWatch({ control: composer.control, name: 'body' }).trim().length === 0
+  const draftError = composer.formState.errors.body?.message
 
   return (
     <div className="space-y-4">
       <Card>
-        <CardContent className="space-y-2 p-4">
-          <Textarea
-            value={draft}
-            onChange={(e) => setDraft(e.target.value)}
-            placeholder="Add a comment: what you found, a link to the fix, who is on it"
-            aria-label="Comment on this error group"
-            maxLength={MAX_COMMENT_CHARS}
-            rows={3}
-          />
-          <div className="flex items-center justify-between gap-2">
-            <span className="text-xs text-muted-foreground">
-              Everyone who can open this project sees comments.
-            </span>
-            <Button
-              size="sm"
-              disabled={trimmed.length === 0 || create.isPending}
-              onClick={() => create.mutate({ path, body: { body: trimmed } })}
-            >
-              <MessageSquare className="mr-2 h-4 w-4" />
-              Comment
-            </Button>
-          </div>
+        <CardContent className="p-4">
+          <form
+            className="space-y-2"
+            noValidate
+            onSubmit={composer.handleSubmit(({ body }) =>
+              create.mutate({ path, body: { body } })
+            )}
+          >
+            <Textarea
+              placeholder="Add a comment: what you found, a link to the fix, who is on it"
+              aria-label="Comment on this error group"
+              aria-invalid={draftError ? true : undefined}
+              maxLength={MAX_COMMENT_CHARS}
+              rows={3}
+              {...composer.register('body')}
+            />
+            {draftError && (
+              <p className="text-xs text-destructive">{draftError}</p>
+            )}
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-xs text-muted-foreground">
+                Everyone who can open this project sees comments.
+              </span>
+              <Button
+                type="submit"
+                size="sm"
+                disabled={draftIsBlank || create.isPending}
+              >
+                <MessageSquare className="mr-2 h-4 w-4" />
+                Comment
+              </Button>
+            </div>
+          </form>
         </CardContent>
       </Card>
 
@@ -151,27 +174,14 @@ export function GroupActivity({
       </ol>
 
       {pages > 1 && (
-        <div className="flex items-center justify-end gap-2 text-sm">
-          <Button
-            variant="outline"
-            size="sm"
-            disabled={page <= 1}
-            onClick={() => setPage((p) => Math.max(1, p - 1))}
-          >
-            Newer
-          </Button>
-          <span className="text-muted-foreground">
-            Page {page} of {pages}
-          </span>
-          <Button
-            variant="outline"
-            size="sm"
-            disabled={page >= pages}
-            onClick={() => setPage((p) => p + 1)}
-          >
-            Older
-          </Button>
-        </div>
+        <ResponsivePagination
+          page={page}
+          pageSize={PAGE_SIZE}
+          total={total}
+          totalPages={pages}
+          onPageChange={setPage}
+          ariaLabel="Activity pages"
+        />
       )}
     </div>
   )
@@ -193,7 +203,13 @@ function ActivityRow({
   onChanged: () => void
 }) {
   const [editing, setEditing] = useState(false)
-  const [text, setText] = useState(entry.body ?? '')
+  const editor = useForm<CommentFormData>({
+    resolver: zodResolver(commentFormSchema),
+    defaultValues: { body: entry.body ?? '' },
+  })
+  const editIsBlank =
+    useWatch({ control: editor.control, name: 'body' }).trim().length === 0
+  const editError = editor.formState.errors.body?.message
   const [confirmingDelete, setConfirmingDelete] = useState(false)
   const path = {
     project_id: projectId,
@@ -251,7 +267,7 @@ function ActivityRow({
                   className="h-7 w-7"
                   aria-label="Edit comment"
                   onClick={() => {
-                    setText(entry.body ?? '')
+                    editor.reset({ body: entry.body ?? '' })
                     setEditing(true)
                   }}
                 >
@@ -273,16 +289,26 @@ function ActivityRow({
             </div>
           </div>
           {editing ? (
-            <div className="space-y-2">
+            <form
+              className="space-y-2"
+              noValidate
+              onSubmit={editor.handleSubmit(({ body }) =>
+                update.mutate({ path, body: { body } })
+              )}
+            >
               <Textarea
-                value={text}
-                onChange={(e) => setText(e.target.value)}
                 aria-label="Edit the comment"
+                aria-invalid={editError ? true : undefined}
                 maxLength={MAX_COMMENT_CHARS}
                 rows={3}
+                {...editor.register('body')}
               />
+              {editError && (
+                <p className="text-xs text-destructive">{editError}</p>
+              )}
               <div className="flex justify-end gap-2">
                 <Button
+                  type="button"
                   variant="outline"
                   size="sm"
                   onClick={() => setEditing(false)}
@@ -290,16 +316,14 @@ function ActivityRow({
                   Cancel
                 </Button>
                 <Button
+                  type="submit"
                   size="sm"
-                  disabled={text.trim().length === 0 || update.isPending}
-                  onClick={() =>
-                    update.mutate({ path, body: { body: text.trim() } })
-                  }
+                  disabled={editIsBlank || update.isPending}
                 >
                   Save
                 </Button>
               </div>
-            </div>
+            </form>
           ) : (
             <p className="whitespace-pre-wrap break-words text-sm">
               {entry.body}

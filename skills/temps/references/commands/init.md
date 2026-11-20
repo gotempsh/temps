@@ -8,6 +8,8 @@ Apply [the CLI runtime and safety contract](../cli-runtime.md) before executing 
 
 Initialize a Temps project in the current directory
 
+**Usage:** `init [project-slug] [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |

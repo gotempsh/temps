@@ -376,6 +376,8 @@ Show the health of each release: crash-free sessions and users, adoption and dep
 
 Show one release's sessions and crash-free rate per hour
 
+**Usage:** `errors release <release> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |

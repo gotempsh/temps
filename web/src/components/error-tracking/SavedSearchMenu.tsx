@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { useRef, useState } from 'react'
+import { zodResolver } from '@hookform/resolvers/zod'
+import { Controller, useForm, useWatch } from 'react-hook-form'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Bookmark, BookmarkCheck, Trash2, Users } from 'lucide-react'
 import {
@@ -39,6 +41,11 @@ import {
   viewMatches,
   type GroupListView,
 } from './saved-search-view'
+import {
+  MAX_SAVED_SEARCH_NAME_CHARS,
+  savedSearchFormSchema,
+  type SavedSearchFormData,
+} from './forms'
 
 interface SavedSearchMenuProps {
   projectId: number
@@ -60,8 +67,13 @@ export function SavedSearchMenu({
 }: SavedSearchMenuProps) {
   const queryClient = useQueryClient()
   const [saving, setSaving] = useState(false)
-  const [name, setName] = useState('')
-  const [shared, setShared] = useState(false)
+  const form = useForm<SavedSearchFormData>({
+    resolver: zodResolver(savedSearchFormSchema),
+    defaultValues: { name: '', shared: false },
+  })
+  const nameIsBlank =
+    useWatch({ control: form.control, name: 'name' }).trim().length === 0
+  const nameError = form.formState.errors.name?.message
   const [deleting, setDeleting] = useState<ErrorSavedSearchResponse | null>(
     null
   )
@@ -85,8 +97,7 @@ export function SavedSearchMenu({
     meta: { errorTitle: 'Failed to save the search' },
     onSuccess: () => {
       setSaving(false)
-      setName('')
-      setShared(false)
+      form.reset({ name: '', shared: false })
       refresh()
     },
   })
@@ -232,34 +243,49 @@ export function SavedSearchMenu({
           </DialogHeader>
           <form
             className="space-y-4"
-            onSubmit={(e) => {
-              e.preventDefault()
+            noValidate
+            onSubmit={form.handleSubmit(({ name, shared }) =>
               create.mutate({
                 path,
-                body: {
-                  name: name.trim(),
-                  shared,
-                  filters: filtersFromView(view),
-                },
+                body: { name, shared, filters: filtersFromView(view) },
               })
-            }}
+            )}
           >
             <div className="space-y-2">
               <Label htmlFor="saved-search-name">Name</Label>
               <Input
                 id="saved-search-name"
-                value={name}
-                onChange={(e) => setName(e.target.value)}
                 placeholder="Open and mine"
-                maxLength={100}
+                maxLength={MAX_SAVED_SEARCH_NAME_CHARS}
                 autoFocus
+                aria-invalid={nameError ? true : undefined}
+                aria-describedby={
+                  nameError ? 'saved-search-name-error' : undefined
+                }
+                {...form.register('name')}
               />
+              {nameError && (
+                <p
+                  id="saved-search-name-error"
+                  className="text-xs text-destructive"
+                >
+                  {nameError}
+                </p>
+              )}
             </div>
             <div className="flex items-center gap-2">
-              <Checkbox
-                id="saved-search-shared"
-                checked={shared}
-                onCheckedChange={(checked) => setShared(checked === true)}
+              <Controller
+                control={form.control}
+                name="shared"
+                render={({ field }) => (
+                  <Checkbox
+                    id="saved-search-shared"
+                    checked={field.value}
+                    onCheckedChange={(checked) =>
+                      field.onChange(checked === true)
+                    }
+                  />
+                )}
               />
               <Label htmlFor="saved-search-shared" className="font-normal">
                 Share with everyone who can open this project
@@ -273,10 +299,7 @@ export function SavedSearchMenu({
               >
                 Cancel
               </Button>
-              <Button
-                type="submit"
-                disabled={name.trim().length === 0 || create.isPending}
-              >
+              <Button type="submit" disabled={nameIsBlank || create.isPending}>
                 Save
               </Button>
             </DialogFooter>

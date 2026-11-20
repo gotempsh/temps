@@ -40,6 +40,8 @@ Disable the Temps MCP server on this instance (admin)
 
 Configure an AI client to connect to this Temps instance over MCP. Clients: claude-code, claude-desktop, codex, cursor, vscode, windsurf, zed
 
+**Usage:** `mcp add [client] [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -53,6 +55,8 @@ Configure an AI client to connect to this Temps instance over MCP. Clients: clau
 ### `mcp remove`
 
 Remove the Temps MCP server from an AI client
+
+**Usage:** `mcp remove [client]`
 
 ### `mcp status`
 

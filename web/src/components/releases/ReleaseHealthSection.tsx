@@ -37,6 +37,14 @@ import {
   SheetTitle,
 } from '@/components/ui/sheet'
 import { Skeleton } from '@/components/ui/skeleton'
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from '@/components/ui/table'
 import { readFailureServerDetail } from '@/lib/read-failure'
 import {
   crashFreeAlertHref,
@@ -234,22 +242,26 @@ export function ReleaseHealthContent({
     )
   }
   return (
-    <div className="overflow-x-auto">
-      <table className="w-full text-sm">
-        <thead className="text-left text-xs text-muted-foreground">
-          <tr>
-            <th className="py-2 pr-3 font-medium">Release</th>
-            <th className="py-2 pr-3 font-medium">Crash-free sessions</th>
-            <th className="py-2 pr-3 font-medium">Crash-free users</th>
-            <th className="py-2 pr-3 font-medium">Adoption (24h)</th>
-            <th className="py-2 pr-3 font-medium">Sessions</th>
-            <th className="py-2 pr-3 font-medium">Users</th>
-            <th className="py-2 font-medium">
+    <div className="@container">
+      <Table className="text-sm">
+        <TableHeader>
+          <TableRow>
+            <TableHead>Release</TableHead>
+            <TableHead>Crash-free sessions</TableHead>
+            <TableHead className="hidden @xl:table-cell">
+              Crash-free users
+            </TableHead>
+            <TableHead className="hidden @2xl:table-cell">
+              Adoption (24h)
+            </TableHead>
+            <TableHead className="hidden @3xl:table-cell">Sessions</TableHead>
+            <TableHead className="hidden @3xl:table-cell">Users</TableHead>
+            <TableHead className="w-10">
               <span className="sr-only">Trend</span>
-            </th>
-          </tr>
-        </thead>
-        <tbody className="divide-y">
+            </TableHead>
+          </TableRow>
+        </TableHeader>
+        <TableBody>
           {data.items.map((row) => (
             <ReleaseHealthRow
               key={row.release}
@@ -258,8 +270,8 @@ export function ReleaseHealthContent({
               onOpen={onOpen}
             />
           ))}
-        </tbody>
-      </table>
+        </TableBody>
+      </Table>
       {data.total > data.items.length && (
         <p className="pt-2 text-xs text-muted-foreground">
           The {data.items.length} most recently active of {data.total} releases.
@@ -280,9 +292,12 @@ function ReleaseHealthRow({
 }) {
   const deployment = row.deployment
   return (
-    <tr className="align-top">
-      <td className="py-2 pr-3">
-        <span className="block break-all font-mono text-xs" title={row.release}>
+    <TableRow className="align-top">
+      <TableCell className="whitespace-normal">
+        <span
+          className="block font-mono text-xs [overflow-wrap:anywhere]"
+          title={row.release}
+        >
           {releaseLabel(row.release)}
         </span>
         {deployment ? (
@@ -304,29 +319,44 @@ function ReleaseHealthRow({
             Not deployed by Temps
           </span>
         )}
-      </td>
-      <td className="py-2 pr-3">
+        {/* What the hidden columns say, on narrow containers. */}
+        <span className="block text-xs text-muted-foreground @3xl:hidden">
+          <span className="@xl:hidden">
+            {formatRate(row.crash_free_users)} crash-free users ·{' '}
+          </span>
+          <span className="@2xl:hidden">
+            {formatRate(row.adoption)} adoption ·{' '}
+          </span>
+          {row.sessions.toLocaleString()} sessions · ~
+          {row.users.toLocaleString()} users
+        </span>
+      </TableCell>
+      <TableCell>
         <Rate rate={row.crash_free_sessions} />
         {row.crashed_sessions > 0 && (
           <span className="block text-xs text-muted-foreground">
             {row.crashed_sessions.toLocaleString()} crashed
           </span>
         )}
-      </td>
-      <td className="py-2 pr-3">
+      </TableCell>
+      <TableCell className="hidden @xl:table-cell">
         <Rate rate={row.crash_free_users} />
-      </td>
-      <td className="py-2 pr-3 tabular-nums">{formatRate(row.adoption)}</td>
-      <td className="py-2 pr-3 tabular-nums">
+      </TableCell>
+      <TableCell className="hidden tabular-nums @2xl:table-cell">
+        {formatRate(row.adoption)}
+      </TableCell>
+      <TableCell className="hidden tabular-nums @3xl:table-cell">
         {row.sessions.toLocaleString()}
         {row.errored_sessions > 0 && (
           <span className="block text-xs text-muted-foreground">
             {row.errored_sessions.toLocaleString()} with errors
           </span>
         )}
-      </td>
-      <td className="py-2 pr-3 tabular-nums">~{row.users.toLocaleString()}</td>
-      <td className="py-2 text-right">
+      </TableCell>
+      <TableCell className="hidden tabular-nums @3xl:table-cell">
+        ~{row.users.toLocaleString()}
+      </TableCell>
+      <TableCell className="text-right">
         <Button
           variant="ghost"
           size="icon"
@@ -335,8 +365,8 @@ function ReleaseHealthRow({
         >
           <LineChart className="size-4" aria-hidden />
         </Button>
-      </td>
-    </tr>
+      </TableCell>
+    </TableRow>
   )
 }
 

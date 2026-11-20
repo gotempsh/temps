@@ -68,6 +68,8 @@ Create a new environment
 
 Delete an environment
 
+**Usage:** `environments delete <environment> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -110,6 +112,8 @@ List environment variables
 
 Get a specific environment variable
 
+**Usage:** `environments vars get <key> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -119,6 +123,8 @@ Get a specific environment variable
 #### `environments vars set`
 
 Set an environment variable
+
+**Usage:** `environments vars set <key> [value] [options]`
 
 **Options:**
 
@@ -134,6 +140,8 @@ Set an environment variable
 
 Delete an environment variable
 
+**Usage:** `environments vars delete <key> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -144,6 +152,8 @@ Delete an environment variable
 #### `environments vars import`
 
 Import environment variables from a .env file
+
+**Usage:** `environments vars import [file] [options]`
 
 **Options:**
 
@@ -167,6 +177,8 @@ Export environment variables to .env format
 
 View or set CPU/memory resources for an environment
 
+**Usage:** `environments resources <environment> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -182,6 +194,8 @@ View or set CPU/memory resources for an environment
 
 View or set upstream request/idle timeouts for an environment
 
+**Usage:** `environments timeouts <environment> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -196,6 +210,8 @@ View or set upstream request/idle timeouts for an environment
 ### `environments force-https`
 
 View or set the HTTP to HTTPS redirect override for an environment
+
+**Usage:** `environments force-https <environment> [options]`
 
 **Options:**
 
@@ -234,6 +250,8 @@ Where the scheduler would run an environment's replicas, and why
 
 Show the nodes each replica would run on now, the eligible nodes ranked, and the ones excluded with the reason
 
+**Usage:** `environments placement explain <environment> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -244,6 +262,8 @@ Show the nodes each replica would run on now, the eligible nodes ranked, and the
 #### `environments placement recommend`
 
 Recommend target nodes from where the environment actually ran (recommended, never applied)
+
+**Usage:** `environments placement recommend <environment> [options]`
 
 **Options:**
 
@@ -266,6 +286,8 @@ How an environment's replicas are isolated: a container (process) or a Firecrack
 
 Show the isolation and whether it takes effect
 
+**Usage:** `environments isolation show <environment> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -276,6 +298,8 @@ Show the isolation and whether it takes effect
 #### `environments isolation set`
 
 Set the isolation: process or micro_vm (a microVM replica only runs on a node that provides one)
+
+**Usage:** `environments isolation set <environment> <isolation> [options]`
 
 **Options:**
 
@@ -301,6 +325,8 @@ Persistent volumes mounted into an environment's replicas; a replica that mounts
 
 List the environment's volumes, newest first
 
+**Usage:** `environments volumes list <environment> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -313,6 +339,8 @@ List the environment's volumes, newest first
 #### `environments volumes create`
 
 Create a volume (attach it to mount it)
+
+**Usage:** `environments volumes create <environment> [options]`
 
 **Options:**
 
@@ -328,6 +356,8 @@ Create a volume (attach it to mount it)
 
 Show whether the next deploy mounts the attached volumes, and what to fix if not
 
+**Usage:** `environments volumes status <environment> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -338,6 +368,8 @@ Show whether the next deploy mounts the attached volumes, and what to fix if not
 #### `environments volumes attach`
 
 Mount a volume (id or name) into every replica at --mount-path
+
+**Usage:** `environments volumes attach <environment> <volume> [options]`
 
 **Options:**
 
@@ -352,6 +384,8 @@ Mount a volume (id or name) into every replica at --mount-path
 
 Stop mounting a volume (id or name); its data is kept
 
+**Usage:** `environments volumes detach <environment> <volume> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -362,6 +396,8 @@ Stop mounting a volume (id or name); its data is kept
 #### `environments volumes rm` (alias: `delete`)
 
 Delete a volume (id or name), and its data unless it was created with --retain
+
+**Usage:** `environments volumes rm <environment> <volume> [options]`
 
 **Options:**
 
@@ -385,6 +421,8 @@ Whether visitors must sign in to Temps to open an environment
 
 Show the login requirement and whether the proxy enforces it now
 
+**Usage:** `environments ingress show <environment> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -395,6 +433,8 @@ Show the login requirement and whether the proxy enforces it now
 #### `environments ingress set`
 
 Require visitors to sign in to Temps, or stop requiring it
+
+**Usage:** `environments ingress set <environment> [options]`
 
 **Options:**
 

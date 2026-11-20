@@ -8,6 +8,8 @@ Apply [the CLI runtime and safety contract](../cli-runtime.md) before executing 
 
 Detect and deploy a local source directory or ZIP without Git
 
+**Usage:** `drop <path> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |

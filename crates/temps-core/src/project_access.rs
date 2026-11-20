@@ -93,6 +93,36 @@ pub trait ProjectAccessChecker: Send + Sync {
         Ok(access)
     }
 
+    /// Batch form of [`Self::user_can_access_project`] for callers checking
+    /// many users against one project (the members of a team being
+    /// notified about it).
+    ///
+    /// The returned map contains exactly one entry per unique requested
+    /// user id, sorted by user id. Any error fails the whole batch, so a
+    /// caller never treats a partial answer as access. The compatibility
+    /// default resolves each unique id sequentially; database-backed
+    /// implementations should override this to read every user at once.
+    async fn users_can_access_project(
+        &self,
+        user_ids: &[i32],
+        project_id: i32,
+    ) -> Result<std::collections::BTreeMap<i32, bool>, Box<dyn std::error::Error + Send + Sync>>
+    {
+        let mut unique_user_ids = user_ids.to_vec();
+        unique_user_ids.sort_unstable();
+        unique_user_ids.dedup();
+
+        let mut access = std::collections::BTreeMap::new();
+        for user_id in unique_user_ids {
+            access.insert(
+                user_id,
+                self.user_can_access_project(user_id, project_id).await?,
+            );
+        }
+
+        Ok(access)
+    }
+
     /// Returns the set of permission strings (matching
     /// `temps_auth::permissions::Permission::to_string()`, e.g.
     /// `"deployments:create"`) `user_id` holds *within* `project_id`, for
@@ -267,4 +297,71 @@ pub trait MembershipPermissionResolver: Send + Sync {
         &self,
         team_member_id: i32,
     ) -> Result<Option<Vec<String>>, Box<dyn std::error::Error + Send + Sync>>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Users 1 and 3 may access project 7; user 9 makes the check fail.
+    struct Members {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ProjectAccessChecker for Members {
+        async fn user_can_access_project(
+            &self,
+            user_id: i32,
+            project_id: i32,
+        ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if user_id == 9 {
+                return Err(format!("membership of user {user_id} unavailable").into());
+            }
+            Ok(project_id == 7 && matches!(user_id, 1 | 3))
+        }
+    }
+
+    #[tokio::test]
+    async fn users_can_access_project_answers_each_unique_user_once() {
+        let checker = Members {
+            calls: AtomicUsize::new(0),
+        };
+        let access = checker
+            .users_can_access_project(&[3, 2, 1, 3, 2], 7)
+            .await
+            .expect("every check succeeds");
+        assert_eq!(
+            access.into_iter().collect::<Vec<_>>(),
+            vec![(1, true), (2, false), (3, true)]
+        );
+        assert_eq!(checker.calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn users_can_access_project_fails_the_whole_batch_on_one_error() {
+        let checker = Members {
+            calls: AtomicUsize::new(0),
+        };
+        let error = checker
+            .users_can_access_project(&[1, 9, 3], 7)
+            .await
+            .expect_err("user 9 cannot be checked");
+        assert!(error.to_string().contains("user 9"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn users_can_access_project_with_no_users_checks_nothing() {
+        let checker = Members {
+            calls: AtomicUsize::new(0),
+        };
+        let access = checker
+            .users_can_access_project(&[], 7)
+            .await
+            .expect("nothing to check");
+        assert!(access.is_empty());
+        assert_eq!(checker.calls.load(Ordering::SeqCst), 0);
+    }
 }
