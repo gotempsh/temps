@@ -102,6 +102,13 @@ impl MigrationTrait for Migration {
             .transpose()?
             .unwrap_or(false);
         if present {
+            // Block new attachment rows until this rollback commits (each
+            // Postgres migration runs in its own transaction), so the check
+            // below and the drops see the same rows: a file inserted after
+            // the check would otherwise be dropped with its object left
+            // behind. ACCESS EXCLUSIVE is what DROP takes anyway.
+            db.execute_unprepared("LOCK TABLE error_attachments IN ACCESS EXCLUSIVE MODE")
+                .await?;
             let listed = db
                 .query_one(sea_orm::Statement::from_string(
                     sea_orm::DatabaseBackend::Postgres,
@@ -175,7 +182,7 @@ mod tests {
             "a hash must be 32 bytes"
         );
 
-        let refused = Migration.down(&manager).await;
+        let refused = down_in_transaction(&db).await;
         assert!(
             matches!(&refused, Err(DbErr::Migration(message)) if message.contains("still lists files")),
             "{refused:?}"
@@ -183,7 +190,74 @@ mod tests {
         db.execute_unprepared("DELETE FROM error_attachments")
             .await
             .expect("delete rows");
-        Migration.down(&manager).await.expect("down");
-        Migration.down(&manager).await.expect("down again");
+        down_in_transaction(&db).await.expect("down");
+        down_in_transaction(&db).await.expect("down again");
+    }
+
+    /// The rollback as the migrator runs it on Postgres: in a transaction.
+    async fn down_in_transaction(db: &sea_orm::DatabaseConnection) -> Result<(), DbErr> {
+        use sea_orm::TransactionTrait;
+        let txn = db.begin().await?;
+        Migration.down(&SchemaManager::new(&txn)).await?;
+        txn.commit().await
+    }
+
+    #[tokio::test]
+    async fn the_rollback_waits_for_a_file_being_inserted_and_then_refuses() {
+        use sea_orm::TransactionTrait;
+        if !temps_test_utils::external_database_configured()
+            && !temps_test_utils::docker_available().await
+        {
+            eprintln!("Skipping error attachments migration: database unavailable");
+            return;
+        }
+        let test = temps_test_utils::TestDatabase::new()
+            .await
+            .expect("test database");
+        let db = test.connection_arc();
+        Migration.up(&SchemaManager::new(db.as_ref())).await.expect("up");
+
+        // An upload reserving its row, not yet committed when the rollback
+        // starts: the rollback's check cannot see it.
+        let upload = db.begin().await.expect("upload transaction");
+        upload
+            .execute_unprepared(
+                "INSERT INTO error_attachments (project_id, owner_kind, owner_id, ordinal, \
+                     filename, content_type, attachment_type, size_bytes, content_sha256) \
+                 VALUES (7, 'error', 11, 0, 'a.txt', 'text/plain', 'event.attachment', \
+                     3, sha256('abc'::bytea))",
+            )
+            .await
+            .expect("reserve a file");
+
+        let rollback_db = db.clone();
+        let rollback =
+            tokio::spawn(async move { down_in_transaction(rollback_db.as_ref()).await });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !rollback.is_finished(),
+            "the rollback waits for the insert under way"
+        );
+        upload.commit().await.expect("commit the file");
+
+        let refused = tokio::time::timeout(std::time::Duration::from_secs(10), rollback)
+            .await
+            .expect("the rollback finishes once the insert commits")
+            .expect("rollback task");
+        assert!(
+            matches!(&refused, Err(DbErr::Migration(message)) if message.contains("still lists files")),
+            "the committed file is seen, not dropped: {refused:?}"
+        );
+        let kept = db
+            .query_one(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT COUNT(*) AS n FROM error_attachments".to_owned(),
+            ))
+            .await
+            .expect("count")
+            .map(|row| row.try_get::<i64>("", "n"))
+            .transpose()
+            .expect("n");
+        assert_eq!(kept, Some(1));
     }
 }
