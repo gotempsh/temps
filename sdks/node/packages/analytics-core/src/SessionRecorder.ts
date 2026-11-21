@@ -727,7 +727,18 @@ export class SessionRecorder {
     void this.startRecording();
   }
 
+  /**
+   * Stop recording at the app's request (an opt-out, an unmount, a destroy).
+   * This also cancels the new replay a pending `reset()` would start, so a
+   * visitor who withdraws consent while the reset waits for the server is
+   * not recorded again once it succeeds.
+   */
   public stop(): void {
+    this.resumeAfterResetPending = false;
+    this.halt();
+  }
+
+  private halt(): void {
     this.enabled = false;
     this.stopRecording();
   }
@@ -755,7 +766,7 @@ export class SessionRecorder {
    */
   public endForReset(): void {
     if (this.enabled) this.resumeAfterResetPending = true;
-    this.stop();
+    this.halt();
   }
 
   /**

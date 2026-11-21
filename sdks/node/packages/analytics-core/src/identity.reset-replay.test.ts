@@ -64,6 +64,24 @@ describe("reset() and session replay (ADR 109 D4)", () => {
     expect(resume).not.toHaveBeenCalled();
   });
 
+  it("keeps recording off when the app disabled it while the reset was pending", async () => {
+    const start = vi.spyOn(SessionRecorder.prototype, "start");
+    let confirm: () => void = () => undefined;
+    resetResponse = () =>
+      new Promise<Response>((resolve) => {
+        confirm = () => resolve(new Response(null, { status: 204 }));
+      });
+    const recording = createAnalytics({ ...quiet, enableSessionRecording: true });
+    instances.push(recording);
+    const startsBefore = start.mock.calls.length;
+
+    const pending = recording.reset();
+    recording.disableSessionRecording();
+    confirm();
+    await pending;
+    expect(start.mock.calls.length).toBe(startsBefore);
+  });
+
   it("follows a reset from another instance, and stops listening once destroyed", async () => {
     const end = vi.spyOn(SessionRecorder.prototype, "endForReset");
     const recording = createAnalytics({ ...quiet, enableSessionRecording: true });
@@ -95,6 +113,18 @@ describe("SessionRecorder across a reset", () => {
     recorder.resumeAfterReset();
     recorder.resumeAfterReset();
     expect(start).toHaveBeenCalledTimes(1);
+  });
+
+  it("an explicit stop or destroy cancels the replay a pending reset would start", () => {
+    for (const end of ["stop", "destroy"] as const) {
+      const recorder = new SessionRecorder({ enabled: false });
+      const start = vi.spyOn(recorder, "start").mockImplementation(() => undefined);
+      (recorder as unknown as { enabled: boolean }).enabled = true;
+      recorder.endForReset();
+      recorder[end]();
+      recorder.resumeAfterReset();
+      expect(start).not.toHaveBeenCalled();
+    }
   });
 
   it("never sends an undelivered batch of the ended replay under the next one", async () => {
