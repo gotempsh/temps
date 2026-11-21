@@ -8705,7 +8705,7 @@ View project analytics
 
 - `keys` - Manage analytics ingest keys (pa_...) for apps Temps does not deploy
 - `conversions` (`goals`) - Conversion goals: events or pages that count as success
-- `identity` - Whether visitors are recognised by a stored id or tracked cookieless
+- `identity` - Whether visitors are recognised by a stored id or tracked cookieless, and who may identify them
 - `overview` (`o`) - Show analytics dashboard overview
 - `top` - Show breakdown by dimension: pages, referrers, browsers, os, devices, countries, regions, cities, channels, events, languages, utm_source, utm_medium, utm_campaign
 - `outbound` - Show the outbound links visitors clicked (outbound_click events)
@@ -8724,6 +8724,7 @@ View project analytics
 - `api-query` - Run a typed multi-dimensional API traffic aggregation
 - `api-summary` - Show an AI-generated summary of API traffic from /api-analytics/summary (requires AI Assistance to be configured and enabled on the project)
 - `enrich` - Attach identity or attributes to a visitor (merges into custom_data; a null value removes a key)
+- `identify` - Label a visitor with your app's user id, as your backend would (browser identify cannot replace it)
 
 ### `analytics keys`
 
@@ -8897,16 +8898,16 @@ Where the visitors who converted came from
 
 ### `analytics identity`
 
-Whether visitors are recognised by a stored id or tracked cookieless
+Whether visitors are recognised by a stored id or tracked cookieless, and who may identify them
 
 **Subcommands:**
 
-- `show` - Show the identity mode and what it changes
-- `set` - Switch between persistent and cookieless tracking
+- `show` - Show the identity mode, whether browser identify is accepted, and what they change
+- `set` - Switch between persistent and cookieless tracking, or accept/refuse browser identify
 
 #### `analytics identity show`
 
-Show the identity mode and what it changes
+Show the identity mode, whether browser identify is accepted, and what they change
 
 **Options:**
 
@@ -8917,14 +8918,15 @@ Show the identity mode and what it changes
 
 #### `analytics identity set`
 
-Switch between persistent and cookieless tracking
+Switch between persistent and cookieless tracking, or accept/refuse browser identify
 
 **Options:**
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `-p, --project <project>` | Project slug or ID | - | No |
-| `--mode <mode>` | One of persistent, cookieless | - | Yes |
+| `--mode <mode>` | One of persistent, cookieless | - | No |
+| `--browser-identify <accept|refuse>` | Whether identify() from the browser is applied; refuse leaves identify to the app's backend | - | No |
 | `-y, --yes` | Skip confirmation | - | No |
 | `--json` | Output in JSON format | - | No |
 
@@ -9214,6 +9216,23 @@ Attach identity or attributes to a visitor (merges into custom_data; a null valu
 | `-f, --file <path>` | Read the JSON object to merge from a file | - | No |
 | `--set <key=value>` | Set one key to a string value (repeatable; use --data for numbers, booleans, or nested values) | `` | No |
 | `--unset <key>` | Remove one top-level key (repeatable; sends null) | `` | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics identify`
+
+Label a visitor with your app's user id, as your backend would (browser identify cannot replace it)
+
+**Usage:** `analytics identify <visitor-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--user-id <id>` | Your app's id for this person (at most 256 characters) | - | Yes |
+| `-d, --data <json>` | Traits as a JSON object, e.g. '{"plan":"pro"}' | - | No |
+| `--set <key=value>` | Set one trait to a string value (repeatable) | `` | No |
+| `--unset <key>` | Remove one trait (repeatable; sends null) | `` | No |
 | `--json` | Output in JSON format | - | No |
 
 ## `funnels` (alias: `funnel`)

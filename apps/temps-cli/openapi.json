@@ -4404,6 +4404,10 @@
       "AnalyticsIdentitySettings": {
         "description": "How a project tells its visitors apart, and what that costs.",
         "properties": {
+          "accept_browser_identify": {
+            "description": "Whether `identify()` from the browser is applied (ADR 109 D4). When\n`false`, only the app's backend can identify a visitor. Defaults to\n`true`. Ignored in `cookieless` mode, where identify stores nothing.",
+            "type": "boolean"
+          },
           "limitations": {
             "description": "Reports that behave differently in this mode, for the console to say\nso next to them.",
             "items": {
@@ -4434,6 +4438,7 @@
         "required": [
           "project_id",
           "mode",
+          "accept_browser_identify",
           "limitations",
           "updated_at"
         ],
@@ -9404,6 +9409,33 @@
           "browser",
           "count",
           "percentage"
+        ],
+        "type": "object"
+      },
+      "BrowserIdentifyPayload": {
+        "description": "Body of `POST /_temps/identify` (ADR 109 D4).",
+        "properties": {
+          "traits": {
+            "description": "Traits merged into the visitor's `custom_data`; `null` removes a key.\nAt most 32 keys and 8 KB.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "user_id": {
+            "description": "The app's own id for the signed-in person. At most 256 characters.",
+            "type": "string"
+          },
+          "visitor_id": {
+            "description": "The tracker's stored visitor id. Read only where events read it (a\nkeyed request); a proxied site's visitor comes from its cookie.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "user_id"
         ],
         "type": "object"
       },
@@ -40890,6 +40922,59 @@
           "allow_all"
         ],
         "type": "string"
+      },
+      "IdentifyOutcome": {
+        "description": "What an identify call did.",
+        "enum": [
+          "updated",
+          "unchanged",
+          "visitor_not_found",
+          "cookieless_project",
+          "browser_identify_refused",
+          "server_identity_kept"
+        ],
+        "type": "string"
+      },
+      "IdentifyVisitorRequest": {
+        "description": "Body of both identify endpoints.",
+        "properties": {
+          "traits": {
+            "description": "Traits merged into the visitor's `custom_data` at the top level; a\nkey set to `null` is removed. At most 32 keys and 8 KB.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "user_id": {
+            "description": "The app's own id for the person (database id, UUID, email). At most\n256 characters, no control characters.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "user_id"
+        ],
+        "type": "object"
+      },
+      "IdentifyVisitorResponse": {
+        "description": "The answer of both identify endpoints.",
+        "properties": {
+          "applied": {
+            "description": "Whether the visitor carries the requested identity now\n(`updated` or `unchanged`).",
+            "type": "boolean"
+          },
+          "message": {
+            "type": "string"
+          },
+          "outcome": {
+            "$ref": "#/components/schemas/IdentifyOutcome"
+          }
+        },
+        "required": [
+          "applied",
+          "outcome",
+          "message"
+        ],
+        "type": "object"
       },
       "IgnoreConditionsRequest": {
         "description": "When an ignored error group comes back. With no field set the next event\nreopens it; with fields set it stays ignored until any one is met.",
@@ -82607,15 +82692,25 @@
         "type": "object"
       },
       "UpdateAnalyticsIdentitySettings": {
-        "description": "Body of `PUT /projects/{project_id}/analytics/identity`.",
+        "description": "Body of `PUT /projects/{project_id}/analytics/identity`. Each field is\noptional; an omitted field keeps its value, and at least one is required.",
         "properties": {
+          "accept_browser_identify": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "mode": {
-            "$ref": "#/components/schemas/AnalyticsIdentityMode"
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/AnalyticsIdentityMode"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
-        "required": [
-          "mode"
-        ],
         "type": "object"
       },
       "UpdateAnalyticsIngestKeyRequest": {
@@ -87514,6 +87609,21 @@
             "format": "int32",
             "type": "integer"
           },
+          "identified_at": {
+            "example": "2024-01-01T00:00:00Z",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "identity_source": {
+            "description": "Who set `user_id`: `browser` (the SDK) or `server` (a deployment\ntoken). `None` while the visitor is anonymous.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "ip_address": {
             "type": [
               "string",
@@ -87571,7 +87681,17 @@
               "null"
             ]
           },
+          "trait_sources": {
+            "description": "Who last set each key of `custom_data`: `{\"plan\": \"server\"}`. Keys\nwritten before identify existed are absent."
+          },
           "user_agent": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "user_id": {
+            "description": "The app's own user id, once `identify()` labelled this visitor.",
             "type": [
               "string",
               "null"
@@ -87786,6 +87906,13 @@
             "format": "int32",
             "type": "integer"
           },
+          "identity_source": {
+            "description": "Who set `user_id`: `browser` (the SDK) or `server` (a deployment\ntoken). `None` while the visitor is anonymous.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "ip_address": {
             "type": [
               "string",
@@ -87844,6 +87971,13 @@
             ]
           },
           "user_agent": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "user_id": {
+            "description": "The app's own user id, once `identify()` labelled this visitor.",
             "type": [
               "string",
               "null"
@@ -88024,6 +88158,13 @@
           },
           "filter_region": {
             "description": "Geolocation region (matches `ip_geolocations.region`)",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "filter_user_id": {
+            "description": "The app's user id set by `identify()` (matches `visitor.user_id`):\nevery device and browser the same user was identified on.",
             "type": [
               "string",
               "null"
@@ -92135,6 +92276,75 @@
         ]
       }
     },
+    "/_temps/identify": {
+      "post": {
+        "operationId": "record_browser_identify",
+        "parameters": [
+          {
+            "description": "Analytics ingest key, as for `POST /_temps/event`.",
+            "in": "header",
+            "name": "x-temps-analytics-key",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Query-string fallback for the ingest key, as for `POST /_temps/event`.",
+            "in": "query",
+            "name": "temps_key",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BrowserIdentifyPayload"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IdentifyVisitorResponse"
+                }
+              }
+            },
+            "description": "What identify did. Only the visitor this request already resolves to (its cookie, or the tracker's id on a keyed request) can be identified; the page never names a visitor. `applied: false` with an `outcome` says why nothing was stored: cookieless project, browser identify refused by the project, the backend already identified the visitor as someone else, or no visitor yet."
+          },
+          "400": {
+            "description": "Empty or over-long user id, or traits that are not a JSON object within 32 keys and 8 KB"
+          },
+          "401": {
+            "description": "Unknown ingest key"
+          },
+          "404": {
+            "description": "Host not tracked"
+          },
+          "429": {
+            "description": "Ingest rate limit, or too many visitor-changing identify calls for this project in the last minute"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "summary": "Identify the visitor of this browser (ADR 109 D4)",
+        "tags": [
+          "Metrics"
+        ]
+      }
+    },
     "/_temps/ofrep/v1/evaluate/flags": {
       "post": {
         "operationId": "ofrep_public_bulk",
@@ -92247,6 +92457,20 @@
         "summary": "OFREP single-flag evaluation, same origin.",
         "tags": [
           "Feature Flags"
+        ]
+      }
+    },
+    "/_temps/reset": {
+      "post": {
+        "operationId": "reset_browser_identity",
+        "responses": {
+          "204": {
+            "description": "The visitor and session cookies are expired, so the next page view starts a new visitor. No visitor row is changed: the previous visitor keeps its identity. The tracker clears its own stored ids itself."
+          }
+        },
+        "summary": "Forget this browser's visitor (ADR 109 D4)",
+        "tags": [
+          "Metrics"
         ]
       }
     },
@@ -106431,6 +106655,15 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "User id set by identify(): the same user on every device",
+            "in": "query",
+            "name": "filter_user_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -106583,6 +106816,15 @@
             "description": "First-touch referrer hostname (use 'Direct' for null)",
             "in": "query",
             "name": "filter_referrer",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "User id set by identify(): the same user on every device",
+            "in": "query",
+            "name": "filter_user_id",
             "required": false,
             "schema": {
               "type": "string"
@@ -106877,6 +107119,70 @@
           }
         ],
         "summary": "Attach attributes (for example the signed-in user's id, name and email) to a\nvisitor.",
+        "tags": [
+          "Analytics"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/analytics/visitors/{visitor_id}/identify": {
+      "put": {
+        "description": "The form a deployed app uses: the project comes from its injected\ndeployment token, so the app needs no project id. Behaves exactly like\n`PUT /projects/{project_id}/analytics/visitors/{visitor_id}/identify`,\nwhich callers without a project-scoped token use instead.",
+        "operationId": "identify_visitor_for_token",
+        "parameters": [
+          {
+            "description": "The sealed `enc_...` value of the `_temps_visitor_id` cookie, or the browser tracker's stored visitor id sealed the same way. Deployment tokens may only pass a sealed value.",
+            "in": "path",
+            "name": "visitor_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/IdentifyVisitorRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IdentifyVisitorResponse"
+                }
+              }
+            },
+            "description": "What identify did. `applied: false` with an `outcome` says why nothing was stored (unknown visitor, cookieless project)."
+          },
+          "400": {
+            "description": "Not a project-scoped token, an empty or over-long user id, or traits that are not a JSON object within 32 keys and 8 KB"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Missing `visitors:enrich`, or a raw visitor id"
+          },
+          "429": {
+            "description": "The deployment token made too many visitor-changing writes in the last minute"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Identify a visitor of the token's own project (ADR 109 D4)",
         "tags": [
           "Analytics"
         ],
@@ -151524,7 +151830,7 @@
         ]
       },
       "put": {
-        "description": "`cookieless` stores nothing on the visitor's device: the proxy stops\nsetting analytics cookies and visitors are counted by a hash that changes\nevery day. Visitors already counted keep their history.",
+        "description": "`mode`: `cookieless` stores nothing on the visitor's device: the proxy\nstops setting analytics cookies and visitors are counted by a hash that\nchanges every day. Visitors already counted keep their history.\n\n`accept_browser_identify`: `false` ignores `identify()` from the browser,\nso only the app's backend (a deployment token) can attach a user id.\nOmitted fields keep their value.",
         "operationId": "update_analytics_identity_settings",
         "parameters": [
           {
@@ -151560,7 +151866,7 @@
             "description": "Identity settings updated"
           },
           "400": {
-            "description": "Unknown mode"
+            "description": "Unknown mode, or nothing to change"
           },
           "401": {
             "description": "Unauthorized"
@@ -151580,7 +151886,7 @@
             "bearer_auth": []
           }
         ],
-        "summary": "Switch between stored visitor ids and cookieless tracking",
+        "summary": "Change how the project identifies visitors",
         "tags": [
           "Analytics"
         ]
@@ -152242,6 +152548,82 @@
         "summary": "Remove a traffic filter. Matching traffic counts again from now on; events\nit already excluded stay excluded.",
         "tags": [
           "Analytics Settings"
+        ]
+      }
+    },
+    "/projects/{project_id}/analytics/visitors/{visitor_id}/identify": {
+      "put": {
+        "description": "Sets the visitor's `user_id` and merges `traits` into its `custom_data`,\nboth marked as vouched for by the backend: a later `identify()` from the\nbrowser cannot replace them. Deployed apps call it with the injected\ndeployment token (`visitors:enrich`) and the sealed `_temps_visitor_id`\ncookie of the request, which the Node SDK's `analytics.identify(request,\n...)` reads for them. In a cookieless project nothing is stored.",
+        "operationId": "identify_visitor",
+        "parameters": [
+          {
+            "description": "Project the visitor belongs to",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The sealed `enc_...` value of the `_temps_visitor_id` cookie. User and API-key callers may also pass the raw visitor id; deployment tokens may not.",
+            "in": "path",
+            "name": "visitor_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/IdentifyVisitorRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IdentifyVisitorResponse"
+                }
+              }
+            },
+            "description": "What identify did. `applied: false` with an `outcome` says why nothing was stored (unknown visitor, cookieless project)."
+          },
+          "400": {
+            "description": "Empty or over-long user id, or traits that are not a JSON object within 32 keys and 8 KB"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Missing analytics write (`visitors:enrich` for deployment tokens), another project, or a deployment token with a raw visitor id"
+          },
+          "404": {
+            "description": "Project not found"
+          },
+          "429": {
+            "description": "The deployment token made too many visitor-changing writes in the last minute"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Identify a visitor from the app's backend (ADR 109 D4).",
+        "tags": [
+          "Analytics"
         ]
       }
     },

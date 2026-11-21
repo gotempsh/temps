@@ -1893,6 +1893,12 @@ export type AnalyticsIdentityMode = 'persistent' | 'cookieless';
  */
 export type AnalyticsIdentitySettings = {
     /**
+     * Whether `identify()` from the browser is applied (ADR 109 D4). When
+     * `false`, only the app's backend can identify a visitor. Defaults to
+     * `true`. Ignored in `cookieless` mode, where identify stores nothing.
+     */
+    accept_browser_identify: boolean;
+    /**
      * Reports that behave differently in this mode, for the console to say
      * so next to them.
      */
@@ -4324,6 +4330,28 @@ export type BrowserCount = {
     browser: string;
     count: number;
     percentage: number;
+};
+
+/**
+ * Body of `POST /_temps/identify` (ADR 109 D4).
+ */
+export type BrowserIdentifyPayload = {
+    /**
+     * Traits merged into the visitor's `custom_data`; `null` removes a key.
+     * At most 32 keys and 8 KB.
+     */
+    traits?: {
+        [key: string]: unknown;
+    } | null;
+    /**
+     * The app's own id for the signed-in person. At most 256 characters.
+     */
+    user_id: string;
+    /**
+     * The tracker's stored visitor id. Read only where events read it (a
+     * keyed request); a proxied site's visitor comes from its cookie.
+     */
+    visitor_id?: string | null;
 };
 
 export type BrowsersQuery = {
@@ -19024,6 +19052,42 @@ export type HttpChecksCapabilities = {
  * for such an address until a run records a choice.
  */
 export type HttpPolicy = 'https_only' | 'allow_http' | 'allow_all';
+
+/**
+ * What an identify call did.
+ */
+export type IdentifyOutcome = 'updated' | 'unchanged' | 'visitor_not_found' | 'cookieless_project' | 'browser_identify_refused' | 'server_identity_kept';
+
+/**
+ * Body of both identify endpoints.
+ */
+export type IdentifyVisitorRequest = {
+    /**
+     * Traits merged into the visitor's `custom_data` at the top level; a
+     * key set to `null` is removed. At most 32 keys and 8 KB.
+     */
+    traits?: {
+        [key: string]: unknown;
+    } | null;
+    /**
+     * The app's own id for the person (database id, UUID, email). At most
+     * 256 characters, no control characters.
+     */
+    user_id: string;
+};
+
+/**
+ * The answer of both identify endpoints.
+ */
+export type IdentifyVisitorResponse = {
+    /**
+     * Whether the visitor carries the requested identity now
+     * (`updated` or `unchanged`).
+     */
+    applied: boolean;
+    message: string;
+    outcome: IdentifyOutcome;
+};
 
 /**
  * When an ignored error group comes back. With no field set the next event
@@ -38714,10 +38778,12 @@ export type UpdateAlertRuleRequest = {
 };
 
 /**
- * Body of `PUT /projects/{project_id}/analytics/identity`.
+ * Body of `PUT /projects/{project_id}/analytics/identity`. Each field is
+ * optional; an omitted field keeps its value, and at least one is required.
  */
 export type UpdateAnalyticsIdentitySettings = {
-    mode: AnalyticsIdentityMode;
+    accept_browser_identify?: boolean | null;
+    mode?: AnalyticsIdentityMode | null;
 };
 
 /**
@@ -40934,6 +41000,12 @@ export type VisitorDetails = {
     first_referrer_hostname?: string | null;
     first_seen: string;
     id: number;
+    identified_at?: string | null;
+    /**
+     * Who set `user_id`: `browser` (the SDK) or `server` (a deployment
+     * token). `None` while the visitor is anonymous.
+     */
+    identity_source?: string | null;
     ip_address?: string | null;
     ip_address_id?: number | null;
     is_crawler: boolean;
@@ -40944,7 +41016,16 @@ export type VisitorDetails = {
     project_id: number;
     region?: string | null;
     timezone?: string | null;
+    /**
+     * Who last set each key of `custom_data`: `{"plan": "server"}`. Keys
+     * written before identify existed are absent.
+     */
+    trait_sources?: unknown;
     user_agent?: string | null;
+    /**
+     * The app's own user id, once `identify()` labelled this visitor.
+     */
+    user_id?: string | null;
     visitor_id: string;
 };
 
@@ -41029,6 +41110,11 @@ export type VisitorInfo = {
     first_referrer_hostname?: string | null;
     first_seen: string;
     id: number;
+    /**
+     * Who set `user_id`: `browser` (the SDK) or `server` (a deployment
+     * token). `None` while the visitor is anonymous.
+     */
+    identity_source?: string | null;
     ip_address?: string | null;
     ip_address_id?: number | null;
     is_crawler: boolean;
@@ -41040,6 +41126,10 @@ export type VisitorInfo = {
     region?: string | null;
     timezone?: string | null;
     user_agent?: string | null;
+    /**
+     * The app's own user id, once `identify()` labelled this visitor.
+     */
+    user_id?: string | null;
     visitor_id: string;
 };
 
@@ -41115,6 +41205,11 @@ export type VisitorSegmentFilters = {
      * Geolocation region (matches `ip_geolocations.region`)
      */
     filter_region?: string | null;
+    /**
+     * The app's user id set by `identify()` (matches `visitor.user_id`):
+     * every device and browser the same user was identified on.
+     */
+    filter_user_id?: string | null;
 };
 
 export type VisitorSessionsQuery = {
@@ -43326,6 +43421,56 @@ export type EvaluatePublicFlagsResponses = {
 
 export type EvaluatePublicFlagsResponse = EvaluatePublicFlagsResponses[keyof EvaluatePublicFlagsResponses];
 
+export type RecordBrowserIdentifyData = {
+    body: BrowserIdentifyPayload;
+    headers?: {
+        /**
+         * Analytics ingest key, as for `POST /_temps/event`.
+         */
+        'x-temps-analytics-key'?: string | null;
+    };
+    path?: never;
+    query?: {
+        /**
+         * Query-string fallback for the ingest key, as for `POST /_temps/event`.
+         */
+        temps_key?: string;
+    };
+    url: '/_temps/identify';
+};
+
+export type RecordBrowserIdentifyErrors = {
+    /**
+     * Empty or over-long user id, or traits that are not a JSON object within 32 keys and 8 KB
+     */
+    400: unknown;
+    /**
+     * Unknown ingest key
+     */
+    401: unknown;
+    /**
+     * Host not tracked
+     */
+    404: unknown;
+    /**
+     * Ingest rate limit, or too many visitor-changing identify calls for this project in the last minute
+     */
+    429: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type RecordBrowserIdentifyResponses = {
+    /**
+     * What identify did. Only the visitor this request already resolves to (its cookie, or the tracker's id on a keyed request) can be identified; the page never names a visitor. `applied: false` with an `outcome` says why nothing was stored: cookieless project, browser identify refused by the project, the backend already identified the visitor as someone else, or no visitor yet.
+     */
+    200: IdentifyVisitorResponse;
+};
+
+export type RecordBrowserIdentifyResponse = RecordBrowserIdentifyResponses[keyof RecordBrowserIdentifyResponses];
+
 export type OfrepPublicBulkData = {
     body: OfrepEvaluationRequest;
     path?: never;
@@ -43396,6 +43541,22 @@ export type OfrepPublicSingleResponses = {
 };
 
 export type OfrepPublicSingleResponse = OfrepPublicSingleResponses[keyof OfrepPublicSingleResponses];
+
+export type ResetBrowserIdentityData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/_temps/reset';
+};
+
+export type ResetBrowserIdentityResponses = {
+    /**
+     * The visitor and session cookies are expired, so the next page view starts a new visitor. No visitor row is changed: the previous visitor keeps its identity. The tracker clears its own stored ids itself.
+     */
+    204: void;
+};
+
+export type ResetBrowserIdentityResponse = ResetBrowserIdentityResponses[keyof ResetBrowserIdentityResponses];
 
 export type IngestTunneledEnvelopeData = {
     /**
@@ -50850,6 +51011,10 @@ export type GetVisitorFacetsData = {
          * First-touch referrer hostname (use 'Direct' for null)
          */
         filter_referrer?: string;
+        /**
+         * User id set by identify(): the same user on every device
+         */
+        filter_user_id?: string;
     };
     url: '/analytics/visitor-facets';
 };
@@ -50930,6 +51095,10 @@ export type GetVisitorsData = {
          * First-touch referrer hostname (use 'Direct' for null)
          */
         filter_referrer?: string;
+        /**
+         * User id set by identify(): the same user on every device
+         */
+        filter_user_id?: string;
     };
     url: '/analytics/visitors';
 };
@@ -51128,6 +51297,50 @@ export type EnrichVisitorResponses = {
 };
 
 export type EnrichVisitorResponse2 = EnrichVisitorResponses[keyof EnrichVisitorResponses];
+
+export type IdentifyVisitorForTokenData = {
+    body: IdentifyVisitorRequest;
+    path: {
+        /**
+         * The sealed `enc_...` value of the `_temps_visitor_id` cookie, or the browser tracker's stored visitor id sealed the same way. Deployment tokens may only pass a sealed value.
+         */
+        visitor_id: string;
+    };
+    query?: never;
+    url: '/analytics/visitors/{visitor_id}/identify';
+};
+
+export type IdentifyVisitorForTokenErrors = {
+    /**
+     * Not a project-scoped token, an empty or over-long user id, or traits that are not a JSON object within 32 keys and 8 KB
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Missing `visitors:enrich`, or a raw visitor id
+     */
+    403: unknown;
+    /**
+     * The deployment token made too many visitor-changing writes in the last minute
+     */
+    429: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type IdentifyVisitorForTokenResponses = {
+    /**
+     * What identify did. `applied: false` with an `outcome` says why nothing was stored (unknown visitor, cookieless project).
+     */
+    200: IdentifyVisitorResponse;
+};
+
+export type IdentifyVisitorForTokenResponse = IdentifyVisitorForTokenResponses[keyof IdentifyVisitorForTokenResponses];
 
 export type GetVisitorInfoData = {
     body?: never;
@@ -78749,7 +78962,7 @@ export type UpdateAnalyticsIdentitySettingsData = {
 
 export type UpdateAnalyticsIdentitySettingsErrors = {
     /**
-     * Unknown mode
+     * Unknown mode, or nothing to change
      */
     400: unknown;
     /**
@@ -79259,6 +79472,58 @@ export type DeleteTrafficFilterResponses = {
 };
 
 export type DeleteTrafficFilterResponse = DeleteTrafficFilterResponses[keyof DeleteTrafficFilterResponses];
+
+export type IdentifyVisitorData = {
+    body: IdentifyVisitorRequest;
+    path: {
+        /**
+         * Project the visitor belongs to
+         */
+        project_id: number;
+        /**
+         * The sealed `enc_...` value of the `_temps_visitor_id` cookie. User and API-key callers may also pass the raw visitor id; deployment tokens may not.
+         */
+        visitor_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/analytics/visitors/{visitor_id}/identify';
+};
+
+export type IdentifyVisitorErrors = {
+    /**
+     * Empty or over-long user id, or traits that are not a JSON object within 32 keys and 8 KB
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Missing analytics write (`visitors:enrich` for deployment tokens), another project, or a deployment token with a raw visitor id
+     */
+    403: unknown;
+    /**
+     * Project not found
+     */
+    404: unknown;
+    /**
+     * The deployment token made too many visitor-changing writes in the last minute
+     */
+    429: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type IdentifyVisitorResponses = {
+    /**
+     * What identify did. `applied: false` with an `outcome` says why nothing was stored (unknown visitor, cookieless project).
+     */
+    200: IdentifyVisitorResponse;
+};
+
+export type IdentifyVisitorResponse2 = IdentifyVisitorResponses[keyof IdentifyVisitorResponses];
 
 export type GetApiCallersData = {
     body?: never;
