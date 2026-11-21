@@ -224,6 +224,16 @@ Security is enforced at the container level:
 - PID limit of 512 processes
 - Containers bind to localhost — external access goes through the Temps proxy with automatic TLS
 
+### Runtime user {{ anchor: true, id: 'runtime-user' }}
+
+Images built by the Python, Go, Rust and Java presets, `autopack`, and every `nixpacks-*` preset run as a fixed non-root user, `autopack` (uid and gid `10001`), with `HOME=/home/autopack`:
+
+- The user owns `/app` and the files copied into it, and nothing else in the image. Write runtime files under `/app`, `$HOME` or `/tmp`.
+- The app listens on the `PORT` Temps sets, which is above 1024, so it needs no privileges to bind.
+- Dependency caches (pip, Go build, Cargo, Maven and Gradle) are only used while the image builds, so the running app never needs them.
+
+A repository Dockerfile runs as whatever `USER` it sets, and as root if it sets none. The deployment log and the console then warn that the image runs as root. See [Run as a non-root user](/docs/docker-containers#non-root-user) for the lines to add.
+
 ---
 
 ## What is not supported {{ anchor: true, id: 'not-supported' }}

@@ -30,6 +30,8 @@ mod react_app;
 pub mod registry_prefix;
 mod rsbuild;
 mod rust_preset;
+#[cfg(test)]
+mod runtime_user_test_support;
 mod vite;
 mod workflow_worker;
 mod workspace_manifests;
