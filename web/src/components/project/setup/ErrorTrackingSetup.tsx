@@ -6,6 +6,7 @@ import {
   getOrCreateDsnMutation,
   hasErrorGroupsOptions,
   listDsnsOptions,
+  getProjectIngestSetupQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
 import {
   SetupWizardShell,
@@ -16,11 +17,13 @@ import { CodeBlock } from '@/components/ui/code-block'
 import { CopyButton } from '@/components/ui/copy-button'
 import { cn } from '@/lib/utils'
 import { Callout } from '@temps-sdk/ds'
-import { useMutation, useQuery } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { PlainHttpSetup } from '@/components/project/setup/PlainHttpSetup'
 import {
   ArrowLeft,
   ArrowRight,
   Check,
+  Code2,
   FileCode,
   Info,
   Loader2,
@@ -560,6 +563,9 @@ export function ErrorTrackingSetup({ project }: ErrorTrackingSetupProps) {
   )
   const [selectedPlatform, setSelectedPlatform] =
     useState<PlatformId>(recommendedPlatform)
+  // The framework-agnostic option: any Sentry SDK, or raw envelopes.
+  const [plainHttp, setPlainHttp] = useState(false)
+  const queryClient = useQueryClient()
 
   const { data: existingDsns, refetch: refetchDsns } = useQuery({
     ...listDsnsOptions({ path: { project_id: project.id } }),
@@ -593,11 +599,17 @@ export function ErrorTrackingSetup({ project }: ErrorTrackingSetupProps) {
         {
           onSuccess: () => {
             refetchDsns()
+            // The plain HTTP setup reports whether a DSN exists.
+            void queryClient.invalidateQueries({
+              queryKey: getProjectIngestSetupQueryKey({
+                path: { project_id: project.id },
+              }),
+            })
           },
         }
       )
     }
-  }, [wizardStep, hasDsn, createDsn, project.id, refetchDsns])
+  }, [wizardStep, hasDsn, createDsn, project.id, refetchDsns, queryClient])
 
   const { data: hasErrorsData } = useQuery({
     ...hasErrorGroupsOptions({ path: { project_id: project.id } }),
@@ -689,6 +701,39 @@ ${platform.buildSnippet(platform.dsnExpression)}
             </div>
           )}
 
+          <div className="space-y-3">
+            <div className="border-l-4 border-l-muted-foreground/40 py-0.5 pl-3">
+              <h3 className="text-sm font-semibold">Any framework</h3>
+            </div>
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
+              <button
+                type="button"
+                onClick={() => setPlainHttp(true)}
+                className={cn(
+                  'relative flex items-center gap-3 rounded-lg border bg-card p-4 text-left transition-all hover:border-primary/60 hover:bg-accent/40',
+                  plainHttp &&
+                    'border-primary bg-primary/5 ring-2 ring-primary/20'
+                )}
+                aria-pressed={plainHttp}
+              >
+                <div className="rounded-md bg-muted p-2 text-foreground">
+                  <Code2 className="size-5" />
+                </div>
+                <div className="min-w-0 flex-1">
+                  <p className="font-medium leading-none">
+                    Any language or framework
+                  </p>
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    Any Sentry SDK, or raw envelopes
+                  </p>
+                </div>
+                {plainHttp && (
+                  <Check className="size-4 shrink-0 text-primary" />
+                )}
+              </button>
+            </div>
+          </div>
+
           {CATEGORY_ORDER.map((cat) => {
             const items = PLATFORMS.filter((p) => p.category === cat)
             if (items.length === 0) return null
@@ -717,13 +762,17 @@ ${platform.buildSnippet(platform.dsnExpression)}
                       <button
                         key={p.id}
                         type="button"
-                        onClick={() => setSelectedPlatform(p.id)}
+                        onClick={() => {
+                          setSelectedPlatform(p.id)
+                          setPlainHttp(false)
+                        }}
                         className={cn(
                           'relative flex items-center gap-3 rounded-lg border bg-card p-4 text-left transition-all hover:border-primary/60 hover:bg-accent/40',
                           isSelected &&
+                            !plainHttp &&
                             'border-primary bg-primary/5 ring-2 ring-primary/20'
                         )}
-                        aria-pressed={isSelected}
+                        aria-pressed={isSelected && !plainHttp}
                       >
                         <div className="rounded-md bg-muted p-2 text-foreground">
                           {p.icon}
@@ -743,7 +792,7 @@ ${platform.buildSnippet(platform.dsnExpression)}
                             {p.description}
                           </p>
                         </div>
-                        {isSelected && (
+                        {isSelected && !plainHttp && (
                           <Check className="size-4 shrink-0 text-primary" />
                         )}
                       </button>
@@ -767,20 +816,29 @@ ${platform.buildSnippet(platform.dsnExpression)}
         <div className="space-y-6">
           <div className="flex items-center justify-between gap-3 rounded-lg border bg-card p-4">
             <div className="flex items-center gap-3 min-w-0">
-              <div className="rounded-md bg-muted p-2">{platform.icon}</div>
+              <div className="rounded-md bg-muted p-2">
+                {plainHttp ? <Code2 className="size-5" /> : platform.icon}
+              </div>
               <div className="min-w-0">
-                <p className="font-medium leading-none">{platform.name}</p>
+                <p className="font-medium leading-none">
+                  {plainHttp ? 'Any language or framework' : platform.name}
+                </p>
                 <p className="mt-1 text-xs text-muted-foreground">
-                  {platform.description}
+                  {plainHttp
+                    ? 'Any Sentry SDK, or raw envelopes'
+                    : platform.description}
                 </p>
               </div>
             </div>
-            <CopyButton
-              value={aiPrompt}
-              className="shrink-0 rounded-md border border-border px-3 py-1.5 text-xs font-medium"
-            >
-              Copy AI prompt
-            </CopyButton>
+            {/* The plain HTTP view carries its own prompt. */}
+            {!plainHttp && (
+              <CopyButton
+                value={aiPrompt}
+                className="shrink-0 rounded-md border border-border px-3 py-1.5 text-xs font-medium"
+              >
+                Copy AI prompt
+              </CopyButton>
+            )}
           </div>
 
           {createDsn.isPending && !hasDsn && (
@@ -790,183 +848,201 @@ ${platform.buildSnippet(platform.dsnExpression)}
             </div>
           )}
 
-          <div className="rounded-lg border border-primary/30 bg-primary/5 p-4">
-            <div className="flex items-start gap-3">
-              <Terminal className="mt-0.5 size-4 shrink-0 text-primary" />
-              <div className="min-w-0 space-y-2">
-                {platform.sentrySkill ? (
-                  <>
-                    <div>
-                      <p className="text-sm font-medium">
-                        Using an AI coding CLI? Run the official Sentry skill.
-                      </p>
-                      <p className="mt-1 text-xs text-muted-foreground">
-                        Temps is Sentry wire-compatible, so the{' '}
-                        <code className="rounded bg-muted px-1 py-0.5 text-[11px]">
-                          {platform.sentrySkill}
-                        </code>{' '}
-                        skill from{' '}
-                        <code className="rounded bg-muted px-1 py-0.5 text-[11px]">
-                          getsentry/sentry-for-ai
-                        </code>{' '}
-                        works against your Temps DSN — just set{' '}
-                        <code className="rounded bg-muted px-1 py-0.5 text-[11px]">
-                          {platform.envVarName}
-                        </code>{' '}
-                        to the Temps DSN instead of a Sentry one.
-                      </p>
-                    </div>
-                    <div className="space-y-1.5">
-                      <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
-                        Invoke it in your CLI
-                      </p>
-                      <CodeBlock
-                        language="bash"
-                        code={`/${platform.sentrySkill}`}
-                        showCopy
-                      />
-                    </div>
-                  </>
-                ) : (
-                  <>
-                    <div>
-                      <p className="text-sm font-medium">
-                        Using an AI coding CLI? Run the Temps skill.
-                      </p>
-                      <p className="mt-1 text-xs text-muted-foreground">
-                        Works with Claude Code, OpenCode, Codex, and any CLI
-                        that supports skills. The{' '}
-                        <code className="rounded bg-muted px-1 py-0.5 text-[11px]">
-                          add-error-tracking
-                        </code>{' '}
-                        skill detects your platform and wires the
-                        Sentry-compatible SDK using your Temps DSN env var.
-                      </p>
-                    </div>
-                    <div className="space-y-1.5">
-                      <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
-                        1. Install the skill (one-time)
-                      </p>
-                      <CodeBlock
-                        language="bash"
-                        code={`npx skills add https://github.com/gotempsh/temps --skill add-error-tracking`}
-                        showCopy
-                      />
-                    </div>
-                    <div className="space-y-1.5">
-                      <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
-                        2. Invoke it in your CLI
-                      </p>
-                      <CodeBlock
-                        language="bash"
-                        code={`/add-error-tracking`}
-                        showCopy
-                      />
-                    </div>
-                  </>
-                )}
-              </div>
-            </div>
-          </div>
-
-          <div className="space-y-3">
-            <div className="flex items-center gap-2">
-              <Terminal className="size-4 text-muted-foreground" />
-              <h3 className="text-sm font-medium">1. Install the SDK</h3>
-            </div>
-            <CodeBlock
-              language="bash"
-              code={platform.installCommand}
-              showCopy
+          {plainHttp ? (
+            // The examples read $SENTRY_DSN; step 1 shows the DSN this page
+            // already loaded so they run without another trip.
+            <PlainHttpSetup
+              project={project}
+              signal="errors"
+              credentialValue={hasDsn ? dsn : undefined}
             />
-          </div>
-
-          <div className="flex items-start gap-3 rounded-lg border bg-muted/40 p-3 text-sm">
-            <Info className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
-            <div className="min-w-0 space-y-1">
-              <p className="font-medium">
-                Temps injects{' '}
-                <code className="rounded bg-muted px-1 py-0.5 text-[11px]">
-                  {platform.envVarName}
-                </code>{' '}
-                automatically when your app deploys.
-              </p>
-              <p className="text-xs text-muted-foreground">
-                No manual <code>.env</code> changes needed in production — the
-                snippet below reads it from the environment at runtime.
-              </p>
-              <details className="pt-1 text-xs">
-                <summary className="cursor-pointer text-muted-foreground hover:text-foreground">
-                  Running locally? Set it in your <code>.env</code> for dev.
-                </summary>
-                <div className="mt-2">
-                  <CodeBlock
-                    language="bash"
-                    code={`# .env (local dev only)\n${platform.envVarName}=${hasDsn ? dsn : '<your-temps-dsn>'}`}
-                    showCopy
-                  />
+          ) : (
+            <>
+              <div className="rounded-lg border border-primary/30 bg-primary/5 p-4">
+                <div className="flex items-start gap-3">
+                  <Terminal className="mt-0.5 size-4 shrink-0 text-primary" />
+                  <div className="min-w-0 space-y-2">
+                    {platform.sentrySkill ? (
+                      <>
+                        <div>
+                          <p className="text-sm font-medium">
+                            Using an AI coding CLI? Run the official Sentry
+                            skill.
+                          </p>
+                          <p className="mt-1 text-xs text-muted-foreground">
+                            Temps is Sentry wire-compatible, so the{' '}
+                            <code className="rounded bg-muted px-1 py-0.5 text-[11px]">
+                              {platform.sentrySkill}
+                            </code>{' '}
+                            skill from{' '}
+                            <code className="rounded bg-muted px-1 py-0.5 text-[11px]">
+                              getsentry/sentry-for-ai
+                            </code>{' '}
+                            works against your Temps DSN — just set{' '}
+                            <code className="rounded bg-muted px-1 py-0.5 text-[11px]">
+                              {platform.envVarName}
+                            </code>{' '}
+                            to the Temps DSN instead of a Sentry one.
+                          </p>
+                        </div>
+                        <div className="space-y-1.5">
+                          <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+                            Invoke it in your CLI
+                          </p>
+                          <CodeBlock
+                            language="bash"
+                            code={`/${platform.sentrySkill}`}
+                            showCopy
+                          />
+                        </div>
+                      </>
+                    ) : (
+                      <>
+                        <div>
+                          <p className="text-sm font-medium">
+                            Using an AI coding CLI? Run the Temps skill.
+                          </p>
+                          <p className="mt-1 text-xs text-muted-foreground">
+                            Works with Claude Code, OpenCode, Codex, and any CLI
+                            that supports skills. The{' '}
+                            <code className="rounded bg-muted px-1 py-0.5 text-[11px]">
+                              add-error-tracking
+                            </code>{' '}
+                            skill detects your platform and wires the
+                            Sentry-compatible SDK using your Temps DSN env var.
+                          </p>
+                        </div>
+                        <div className="space-y-1.5">
+                          <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+                            1. Install the skill (one-time)
+                          </p>
+                          <CodeBlock
+                            language="bash"
+                            code={`npx skills add https://github.com/gotempsh/temps --skill add-error-tracking`}
+                            showCopy
+                          />
+                        </div>
+                        <div className="space-y-1.5">
+                          <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+                            2. Invoke it in your CLI
+                          </p>
+                          <CodeBlock
+                            language="bash"
+                            code={`/add-error-tracking`}
+                            showCopy
+                          />
+                        </div>
+                      </>
+                    )}
+                  </div>
                 </div>
-              </details>
-            </div>
-          </div>
-
-          <div className="space-y-3">
-            <div className="flex items-center gap-2">
-              <FileCode className="size-4 text-muted-foreground" />
-              <h3 className="text-sm font-medium">2. Initialize the SDK</h3>
-            </div>
-            <CodeBlock
-              language={platform.language}
-              code={platform.buildSnippet(platform.dsnExpression)}
-              showCopy
-            />
-          </div>
-
-          <Callout tone="info" title="Browser policy and network reports">
-            <div className="space-y-3">
-              <p>
-                Browsers can send CSP violations and network failures directly,
-                including failures that happen before your JavaScript starts.
-                Add report-uri to your existing CSP policy. Use report-only mode
-                while testing. NEL needs HTTPS and browser support.
-              </p>
-              {hasDsn ? (
-                <CodeBlock
-                  language="text"
-                  showCopy
-                  code={buildBrowserReportExample(dsn, project.id)}
-                />
-              ) : (
-                <p>Create a project DSN above to get the report endpoints.</p>
-              )}
-              <div className="flex flex-wrap gap-3">
-                <Button
-                  variant="link"
-                  onClick={() => navigate(`/projects/${project.slug}/errors`)}
-                >
-                  CSP issues
-                </Button>
-                <Button
-                  variant="link"
-                  onClick={() =>
-                    navigate(
-                      `/projects/${project.slug}/telemetry-logs?service=sentry.nel`
-                    )
-                  }
-                >
-                  Network reports in logs
-                </Button>
-                <Button
-                  variant="link"
-                  onClick={() =>
-                    navigate(`/projects/${project.slug}/client-outcomes`)
-                  }
-                >
-                  SDK ingestion health
-                </Button>
               </div>
-            </div>
-          </Callout>
+
+              <div className="space-y-3">
+                <div className="flex items-center gap-2">
+                  <Terminal className="size-4 text-muted-foreground" />
+                  <h3 className="text-sm font-medium">1. Install the SDK</h3>
+                </div>
+                <CodeBlock
+                  language="bash"
+                  code={platform.installCommand}
+                  showCopy
+                />
+              </div>
+
+              <div className="flex items-start gap-3 rounded-lg border bg-muted/40 p-3 text-sm">
+                <Info className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
+                <div className="min-w-0 space-y-1">
+                  <p className="font-medium">
+                    Temps injects{' '}
+                    <code className="rounded bg-muted px-1 py-0.5 text-[11px]">
+                      {platform.envVarName}
+                    </code>{' '}
+                    automatically when your app deploys.
+                  </p>
+                  <p className="text-xs text-muted-foreground">
+                    No manual <code>.env</code> changes needed in production —
+                    the snippet below reads it from the environment at runtime.
+                  </p>
+                  <details className="pt-1 text-xs">
+                    <summary className="cursor-pointer text-muted-foreground hover:text-foreground">
+                      Running locally? Set it in your <code>.env</code> for dev.
+                    </summary>
+                    <div className="mt-2">
+                      <CodeBlock
+                        language="bash"
+                        code={`# .env (local dev only)\n${platform.envVarName}=${hasDsn ? dsn : '<your-temps-dsn>'}`}
+                        showCopy
+                      />
+                    </div>
+                  </details>
+                </div>
+              </div>
+
+              <div className="space-y-3">
+                <div className="flex items-center gap-2">
+                  <FileCode className="size-4 text-muted-foreground" />
+                  <h3 className="text-sm font-medium">2. Initialize the SDK</h3>
+                </div>
+                <CodeBlock
+                  language={platform.language}
+                  code={platform.buildSnippet(platform.dsnExpression)}
+                  showCopy
+                />
+              </div>
+
+              <Callout tone="info" title="Browser policy and network reports">
+                <div className="space-y-3">
+                  <p>
+                    Browsers can send CSP violations and network failures
+                    directly, including failures that happen before your
+                    JavaScript starts. Add report-uri to your existing CSP
+                    policy. Use report-only mode while testing. NEL needs HTTPS
+                    and browser support.
+                  </p>
+                  {hasDsn ? (
+                    <CodeBlock
+                      language="text"
+                      showCopy
+                      code={buildBrowserReportExample(dsn, project.id)}
+                    />
+                  ) : (
+                    <p>
+                      Create a project DSN above to get the report endpoints.
+                    </p>
+                  )}
+                  <div className="flex flex-wrap gap-3">
+                    <Button
+                      variant="link"
+                      onClick={() =>
+                        navigate(`/projects/${project.slug}/errors`)
+                      }
+                    >
+                      CSP issues
+                    </Button>
+                    <Button
+                      variant="link"
+                      onClick={() =>
+                        navigate(
+                          `/projects/${project.slug}/telemetry-logs?service=sentry.nel`
+                        )
+                      }
+                    >
+                      Network reports in logs
+                    </Button>
+                    <Button
+                      variant="link"
+                      onClick={() =>
+                        navigate(`/projects/${project.slug}/client-outcomes`)
+                      }
+                    >
+                      SDK ingestion health
+                    </Button>
+                  </div>
+                </div>
+              </Callout>
+            </>
+          )}
 
           <div className="flex items-center justify-between gap-3 pt-2">
             <Button variant="ghost" onClick={() => setWizardStep('framework')}>

@@ -5,6 +5,8 @@
 import { useEffect, useMemo, useRef } from "react";
 import {
   SessionRecorder as CoreSessionRecorder,
+  isCookielessIdentity,
+  onCookielessIdentity,
   type SessionRecorderOptions,
 } from "@temps-sdk/analytics-core";
 
@@ -79,7 +81,9 @@ export function SessionRecorder(props: SessionRecorderProps): null {
   const optionsKey = useMemo(() => JSON.stringify(props), [props]);
 
   useEffect(() => {
-    if (!props.enabled) return;
+    // A replay needs a visitor id stored on the device, which a cookieless page
+    // never writes (ADR 109 D3).
+    if (!props.enabled || isCookielessIdentity()) return;
 
     const { enabled: _enabled, sampling, ...options } = props;
     const recorder = new CoreSessionRecorder({
@@ -88,9 +92,18 @@ export function SessionRecorder(props: SessionRecorderProps): null {
       enabled: true,
     });
     recorderRef.current = recorder;
+    // Another analytics instance switching the page to cookieless after this
+    // mounted ends the replay and drops what was not uploaded yet.
+    let discarded = false;
+    const unsubscribe = onCookielessIdentity(() => {
+      discarded = true;
+      recorder.discard();
+      recorderRef.current = null;
+    });
 
     return () => {
-      recorder.destroy();
+      unsubscribe();
+      if (!discarded) recorder.destroy();
       recorderRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps

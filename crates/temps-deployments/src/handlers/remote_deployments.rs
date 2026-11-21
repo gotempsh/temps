@@ -3300,6 +3300,7 @@ mod tests {
             cloud_telemetry_attribute_allowlist: Vec::new(),
             cloud_telemetry_write_mode: Default::default(),
             cloud_analytics_write_mode: Default::default(),
+            analytics_identity_mode: Default::default(),
             instantiation_token: None,
             log_ingest_lines_per_sec: None,
             log_ingest_kib_per_sec: None,

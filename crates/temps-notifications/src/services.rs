@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use crate::error::{config_parse_reason, webhook_url_display, NotificationError, Result};
+use crate::telegram::{TelegramError, TelegramProvider, TELEGRAM_PROVIDER_TYPE};
 use crate::types::{Notification, NotificationPriority, NotificationSeverity, NotificationType};
 use crate::{
     NotificationRouteError, NotificationRouteTestResult, NotificationRoutingService,
@@ -116,6 +117,54 @@ pub enum NotificationProviderCreateError {
         #[source]
         source: crate::routing::NotificationRouteError,
     },
+    #[error("Cannot create notification provider '{provider_name}': {source}")]
+    InvalidConfig {
+        provider_name: String,
+        #[source]
+        source: NotificationProviderConfigError,
+    },
+}
+
+/// A provider configuration that would be stored but could never deliver.
+/// Checked on every create and update path (typed and generic endpoints), so
+/// a malformed config is refused with the reason instead of failing silently
+/// at send time.
+#[derive(Debug, thiserror::Error)]
+pub enum NotificationProviderConfigError {
+    #[error("Invalid {provider_type} notification provider configuration: {reason}")]
+    Invalid {
+        provider_type: String,
+        reason: String,
+    },
+}
+
+/// Validate the shape of a provider configuration for the provider types that
+/// define one. Other types are accepted as before.
+pub fn validate_provider_config(
+    provider_type: &str,
+    config: &serde_json::Value,
+) -> std::result::Result<(), NotificationProviderConfigError> {
+    let invalid = |reason: String| NotificationProviderConfigError::Invalid {
+        provider_type: provider_type.to_string(),
+        reason,
+    };
+    match provider_type {
+        TELEGRAM_PROVIDER_TYPE => {
+            let provider: TelegramProvider =
+                serde_json::from_value(config.clone()).map_err(|e| {
+                    invalid(format!(
+                        "expected bot_token, chat_id and optional message_thread_id: {e}"
+                    ))
+                })?;
+            provider.validate().map_err(|e| {
+                invalid(match e {
+                    TelegramError::InvalidConfig { reason } => reason,
+                    other => other.to_string(),
+                })
+            })
+        }
+        _ => Ok(()),
+    }
 }
 
 const MASKED_CONFIG_VALUE: &str = "***";
@@ -744,7 +793,7 @@ fn is_human_visible_metadata_key(
 /// readable twin. Producers that want an entity identified in Slack must send
 /// its `<prefix>_name` or `<prefix>_slug` (e.g. `project_slug`). The IDs still
 /// reach webhook payloads and persisted metadata for correlation.
-fn is_slack_visible_metadata_key(
+pub(crate) fn is_slack_visible_metadata_key(
     key: &str,
     metadata: &std::collections::HashMap<String, String>,
 ) -> bool {
@@ -752,7 +801,7 @@ fn is_slack_visible_metadata_key(
 }
 
 /// Turn a metadata key into a readable label: `project_slug` -> `Project Slug`.
-fn metadata_label(key: &str) -> String {
+pub(crate) fn metadata_label(key: &str) -> String {
     key.split('_')
         .map(|w| {
             let mut c = w.chars();
@@ -767,7 +816,7 @@ fn metadata_label(key: &str) -> String {
 
 /// HTML-encode the five characters that can break element structure or inject
 /// new tags when user-controlled text is interpolated into an HTML template.
-fn html_escape(s: &str) -> String {
+pub(crate) fn html_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
@@ -2799,6 +2848,12 @@ impl NotificationService {
                 config.initialize(self.db.clone()).await?;
                 Box::new(config)
             }
+            TELEGRAM_PROVIDER_TYPE => {
+                let mut config: TelegramProvider =
+                    serde_json::from_str(&decrypted_config).map_err(parse_error)?;
+                config.initialize(self.db.clone()).await?;
+                Box::new(config)
+            }
             other => {
                 return Err(NotificationError::UnsupportedProviderType {
                     provider_id: record.id,
@@ -2830,7 +2885,19 @@ impl NotificationService {
         p_config: T,
         p_enabled: bool,
     ) -> std::result::Result<notification_providers::Model, NotificationProviderCreateError> {
-        let config_json = serde_json::to_string(&p_config).map_err(|source| {
+        let config_value = serde_json::to_value(&p_config).map_err(|source| {
+            NotificationProviderCreateError::Serialization {
+                provider_name: p_name.clone(),
+                source,
+            }
+        })?;
+        validate_provider_config(&p_provider_type, &config_value).map_err(|source| {
+            NotificationProviderCreateError::InvalidConfig {
+                provider_name: p_name.clone(),
+                source,
+            }
+        })?;
+        let config_json = serde_json::to_string(&config_value).map_err(|source| {
             NotificationProviderCreateError::Serialization {
                 provider_name: p_name.clone(),
                 source,
@@ -2906,6 +2973,30 @@ impl NotificationService {
         provider_id: i32,
         update: UpdateProviderRequest,
     ) -> Result<Option<notification_providers::Model>> {
+        self.update_provider_checked(provider_id, None, update)
+            .await
+    }
+
+    /// [`Self::update_provider`] for a type-specific endpoint: refuses, before
+    /// writing anything, a provider whose stored type is not `expected_type`.
+    /// The provider type never changes after creation, so the check made on
+    /// the row loaded here holds for the write that follows.
+    pub async fn update_provider_of_type(
+        &self,
+        provider_id: i32,
+        expected_type: &'static str,
+        update: UpdateProviderRequest,
+    ) -> Result<Option<notification_providers::Model>> {
+        self.update_provider_checked(provider_id, Some(expected_type), update)
+            .await
+    }
+
+    async fn update_provider_checked(
+        &self,
+        provider_id: i32,
+        expected_type: Option<&'static str>,
+        update: UpdateProviderRequest,
+    ) -> Result<Option<notification_providers::Model>> {
         // First check if the provider exists
         let provider = notification_providers::Entity::find_by_id(provider_id)
             .one(self.db.as_ref())
@@ -2916,6 +3007,15 @@ impl NotificationService {
             ))?;
 
         if let Some(provider) = provider {
+            if let Some(expected) = expected_type {
+                if provider.provider_type != expected {
+                    return Err(NotificationError::ProviderTypeMismatch {
+                        provider_id,
+                        expected,
+                        actual: provider.provider_type,
+                    });
+                }
+            }
             let existing_config = provider.config.clone();
             let provider_type = provider.provider_type.clone();
             let renamed_to = update
@@ -2938,6 +3038,9 @@ impl NotificationService {
                     &new_config,
                 )?;
                 Self::merge_masked_values(&decrypted_existing, &mut new_config, "")?;
+                // Validate after the merge, so an unchanged masked secret is
+                // checked as the stored value it stands for.
+                validate_provider_config(&provider_type, &new_config)?;
                 let config_json = serde_json::to_string(&new_config).map_err(|e| {
                     NotificationError::ConfigSerialization {
                         provider_id,
@@ -6560,6 +6663,205 @@ mod tests {
             .cleanup_all_tables()
             .await
             .expect("notification route test data should clean up");
+    }
+
+    #[test]
+    fn telegram_config_is_validated_and_other_types_are_unchanged() {
+        let valid = serde_json::json!({
+            "bot_token": "123456789:AAExampleSecretToken",
+            "chat_id": "-1001234567890",
+            "message_thread_id": 3,
+        });
+        assert!(validate_provider_config("telegram", &valid).is_ok());
+
+        let bad_chat = serde_json::json!({
+            "bot_token": "123456789:AAExampleSecretToken",
+            "chat_id": "my group",
+        });
+        let error = validate_provider_config("telegram", &bad_chat)
+            .expect_err("a chat id with spaces cannot be delivered to");
+        assert!(error.to_string().contains("chat ID 'my group'"), "{error}");
+
+        let missing_token = serde_json::json!({ "chat_id": "123" });
+        let error = validate_provider_config("telegram", &missing_token)
+            .expect_err("bot_token is required");
+        assert!(error.to_string().contains("bot_token"), "{error}");
+
+        // Types without a schema keep accepting arbitrary config.
+        assert!(validate_provider_config("custom", &serde_json::json!({"x": 1})).is_ok());
+    }
+
+    #[tokio::test]
+    async fn telegram_update_refuses_a_provider_of_another_type() {
+        let test_db = test_database_or_skip!();
+        let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password(
+            "notification-telegram-type-guard-test",
+        ));
+        let service = NotificationService::new(test_db.connection_arc(), encryption_service);
+
+        let slack = service
+            .add_provider(
+                "Team Slack".to_string(),
+                "slack".to_string(),
+                serde_json::json!({
+                    "webhook_url": "https://hooks.slack.example/services/T0/B0/x",
+                    "channel": null,
+                }),
+                true,
+            )
+            .await
+            .expect("a Slack provider should be created");
+
+        let error = service
+            .update_provider_of_type(
+                slack.id,
+                TELEGRAM_PROVIDER_TYPE,
+                UpdateProviderRequest {
+                    name: Some("Hijacked".to_string()),
+                    config: Some(serde_json::json!({
+                        "bot_token": "123456789:AAExampleSecretToken",
+                        "chat_id": "-1001234567890",
+                    })),
+                    enabled: None,
+                },
+            )
+            .await
+            .expect_err("a Telegram update must not land on a Slack provider");
+        match &error {
+            NotificationError::ProviderTypeMismatch {
+                provider_id,
+                expected,
+                actual,
+            } => {
+                assert_eq!(*provider_id, slack.id);
+                assert_eq!(*expected, "telegram");
+                assert_eq!(actual, "slack");
+            }
+            other => panic!("expected a type mismatch, got {other}"),
+        }
+
+        // Nothing was written: name, type and Slack config are untouched.
+        let unchanged = service.get_provider(slack.id).await.unwrap().unwrap();
+        assert_eq!(unchanged.name, "Team Slack");
+        assert_eq!(unchanged.provider_type, "slack");
+        let stored = service
+            .decrypt_provider_config_raw(Some(unchanged.id), &unchanged.config)
+            .unwrap();
+        assert_eq!(
+            stored["webhook_url"],
+            "https://hooks.slack.example/services/T0/B0/x"
+        );
+        assert!(stored.get("bot_token").is_none());
+
+        // An unknown ID is still "no such provider" (404), not a type error.
+        let unknown = service
+            .update_provider_of_type(
+                i32::MAX,
+                TELEGRAM_PROVIDER_TYPE,
+                UpdateProviderRequest {
+                    name: Some("Nobody".to_string()),
+                    config: None,
+                    enabled: None,
+                },
+            )
+            .await
+            .expect("a missing provider is not an error");
+        assert!(unknown.is_none());
+    }
+
+    #[tokio::test]
+    async fn telegram_provider_lifecycle_validates_and_preserves_masked_token() {
+        let test_db = test_database_or_skip!();
+        let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password(
+            "notification-telegram-lifecycle-test",
+        ));
+        let service = NotificationService::new(test_db.connection_arc(), encryption_service);
+
+        // A malformed token is refused before anything is stored.
+        let refused = service
+            .add_provider(
+                "Broken Telegram".to_string(),
+                "telegram".to_string(),
+                serde_json::json!({ "bot_token": "not-a-token", "chat_id": "123" }),
+                true,
+            )
+            .await
+            .expect_err("a malformed bot token must be refused");
+        assert!(
+            matches!(
+                refused,
+                NotificationProviderCreateError::InvalidConfig { .. }
+            ),
+            "{refused}"
+        );
+        assert!(!refused.to_string().contains("not-a-token"), "{refused}");
+        assert!(service.list_providers().await.unwrap().is_empty());
+
+        let provider = service
+            .add_provider(
+                "Phone alerts".to_string(),
+                "telegram".to_string(),
+                serde_json::json!({
+                    "bot_token": "123456789:AAExampleSecretToken",
+                    "chat_id": "-1001234567890",
+                    "message_thread_id": null,
+                }),
+                true,
+            )
+            .await
+            .expect("a valid Telegram provider should be created");
+        let masked = service.decrypt_provider_config(&provider.config).unwrap();
+        assert_eq!(masked["bot_token"], "***");
+        assert_eq!(masked["chat_id"], "-1001234567890");
+
+        // Editing the chat while sending back the masked token keeps the
+        // stored token, and the merged result is what gets validated.
+        let updated = service
+            .update_provider(
+                provider.id,
+                UpdateProviderRequest {
+                    name: None,
+                    config: Some(serde_json::json!({
+                        "bot_token": "***",
+                        "chat_id": "@ops_channel",
+                        "message_thread_id": 12,
+                    })),
+                    enabled: None,
+                },
+            )
+            .await
+            .expect("an update with the masked token should succeed")
+            .expect("provider should exist");
+        let stored = service
+            .decrypt_provider_config_raw(Some(updated.id), &updated.config)
+            .unwrap();
+        assert_eq!(stored["bot_token"], "123456789:AAExampleSecretToken");
+        assert_eq!(stored["chat_id"], "@ops_channel");
+        assert_eq!(stored["message_thread_id"], 12);
+
+        let error = service
+            .update_provider(
+                provider.id,
+                UpdateProviderRequest {
+                    name: None,
+                    config: Some(serde_json::json!({
+                        "bot_token": "***",
+                        "chat_id": "not a chat",
+                    })),
+                    enabled: None,
+                },
+            )
+            .await
+            .expect_err("an invalid chat id must be refused on update");
+        assert!(
+            matches!(error, NotificationError::InvalidProviderConfig(_)),
+            "{error}"
+        );
+        let unchanged = service.get_provider(provider.id).await.unwrap().unwrap();
+        let stored = service
+            .decrypt_provider_config_raw(Some(unchanged.id), &unchanged.config)
+            .unwrap();
+        assert_eq!(stored["chat_id"], "@ops_channel");
     }
 
     #[tokio::test]

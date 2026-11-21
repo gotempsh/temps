@@ -92,6 +92,10 @@ pub struct AppState {
     /// this is a separate injection rather than an accessor on the provider.
     pub dsn_service: Arc<DSNService>,
     pub rate_limiter: IngestRateLimiter,
+    /// ADR 109 D3: the project's visitor identity mode, shared with the
+    /// native replay routes and cleared when the setting changes. A
+    /// cookieless project stores no replay from any recording adapter.
+    pub cookieless_identity: Arc<temps_analytics::cookieless::CookielessIdentity>,
 }
 
 /// Share native OTel concurrency admission *before* Axum buffers the body.
@@ -1218,6 +1222,37 @@ async fn process_parsed_envelope(
             *batch.unsupported.entry("sessions").or_insert(0) += session_aggregates.len();
         }
     }
+    // ADR 109 D3: a cookieless project keeps no session replay, from the
+    // native recorder or from Sentry's. Checked before any write, so the
+    // envelope's other items are still stored and the replay is reported as
+    // not stored instead of failing the envelope (which an SDK would resend).
+    if batch.replay.is_some() {
+        match state
+            .cookieless_identity
+            .identity_mode(auth.project_id)
+            .await
+        {
+            Ok(mode) if mode.is_cookieless() => {
+                batch.replay = None;
+                *batch.unsupported.entry("replay_event").or_insert(0) += 1;
+                *batch.unsupported.entry("replay_recording").or_insert(0) += 1;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(
+                    project_id = auth.project_id,
+                    "visitor identity mode of project {} unavailable; replay envelope refused: {error}",
+                    auth.project_id
+                );
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    [(axum::http::header::RETRY_AFTER, "60")],
+                    "Visitor identity unavailable",
+                )
+                    .into_response();
+            }
+        }
+    }
     let unsupported = batch.unsupported.values().sum::<usize>();
     let unsupported_types = batch
         .unsupported
@@ -1949,6 +1984,85 @@ mod tests {
             limit: Some(100),
             offset: None,
         }
+    }
+
+    /// A Sentry replay envelope: a full-snapshot-sized meta event for
+    /// `replay_id`, sent now.
+    fn replay_envelope(replay_id: &str) -> String {
+        let now = chrono::Utc::now();
+        let event = serde_json::json!({
+            "platform": "javascript",
+            "replay_id": replay_id,
+            "segment_id": 0,
+            "replay_start_timestamp": now.timestamp() - 1,
+            "timestamp": now.timestamp(),
+            "urls": ["https://synthetic.example/"],
+        });
+        let recording = format!(
+            "{{\"segment_id\":0}}\n[{{\"type\":4,\"timestamp\":{},\"data\":{{\"width\":800,\"height\":600,\"href\":\"https://synthetic.example/\"}}}}]",
+            now.timestamp_millis()
+        );
+        format!(
+            "{{}}\n{{\"type\":\"replay_event\"}}\n{event}\n{{\"type\":\"replay_recording\",\"length\":{}}}\n{recording}\n",
+            recording.len()
+        )
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_cookieless_project_stores_no_sentry_replay_and_still_accepts_the_envelope() {
+        use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, PaginatorTrait, QueryFilter};
+        let Some(ctx) = conformance_test_context().await else {
+            return;
+        };
+        let server = TestServer::new(configure_routes().with_state(ctx.app_state.clone()));
+        let url = format!("/{}/envelope/?sentry_key={}", ctx.project_id, ctx.dsn_key);
+        let sessions = || async {
+            temps_entities::session_replay_sessions::Entity::find()
+                .filter(
+                    temps_entities::session_replay_sessions::Column::ProjectId.eq(ctx.project_id),
+                )
+                .count(ctx._db.connection())
+                .await
+                .expect("count sessions")
+        };
+
+        // A persistent project stores it: the envelope itself is valid.
+        let stored = server
+            .post(&url)
+            .text(replay_envelope("11111111111111111111111111111111"))
+            .await;
+        stored.assert_status_ok();
+        assert_eq!(
+            stored.header("x-temps-sentry-replay-segments-accepted"),
+            "1"
+        );
+        assert_eq!(sessions().await, 1);
+
+        ctx._db
+            .connection()
+            .execute_unprepared(&format!(
+                "UPDATE projects SET analytics_identity_mode = 'cookieless' WHERE id = {}",
+                ctx.project_id
+            ))
+            .await
+            .expect("switch to cookieless");
+        ctx.app_state
+            .cookieless_identity
+            .forget_identity_mode(ctx.project_id)
+            .await;
+
+        let refused = server
+            .post(&url)
+            .text(replay_envelope("22222222222222222222222222222222"))
+            .await;
+        refused.assert_status_ok();
+        assert_eq!(
+            refused.header("x-temps-sentry-replay-segments-accepted"),
+            "0"
+        );
+        assert_eq!(refused.header("x-temps-sentry-unsupported-items"), "2");
+        assert_eq!(sessions().await, 1, "no session or visitor is stored");
     }
 
     #[tokio::test]
@@ -3962,6 +4076,15 @@ mod tests {
             route_table: route_table.clone(),
             dsn_service: dsn_service.clone(),
             rate_limiter: crate::sentry::rate_limiter::IngestRateLimiter::new(),
+            cookieless_identity: Arc::new(temps_analytics::cookieless::CookielessIdentity::new(
+                db.connection_arc(),
+                Arc::new(
+                    temps_core::EncryptionService::new(
+                        "0000000000000000000000000000000000000000000000000000000000000000",
+                    )
+                    .expect("valid test key"),
+                ),
+            )),
         });
 
         TestContext {

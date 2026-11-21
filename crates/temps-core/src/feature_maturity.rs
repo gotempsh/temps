@@ -100,6 +100,11 @@ pub const FEATURE_MATURITY: &[FeatureMaturity] = &[
         "Funnels do not yet have dedicated end-to-end coverage.",
     ),
     feature(
+        "surveys",
+        Maturity::Beta,
+        "Surveys are new: the question types and display conditions may still change.",
+    ),
+    feature(
         "performance-monitoring",
         Maturity::Beta,
         "Performance monitoring has limited coverage and no dedicated end-to-end scenario.",
@@ -258,6 +263,9 @@ pub fn feature_key_for_api_path(path: &str) -> Option<&'static str> {
     }
     if path.contains("/funnels") {
         return Some("funnels");
+    }
+    if path.contains("/surveys") {
+        return Some("surveys");
     }
     if path.starts_with("/analytics")
         || path.contains("/api-analytics")
@@ -454,6 +462,11 @@ mod tests {
             feature_key_for_api_path("/_temps/session-replay/events"),
             Some("session-replay")
         );
+        assert_eq!(
+            feature_key_for_api_path("/projects/{project_id}/surveys/{survey_id}/results"),
+            Some("surveys")
+        );
+        assert_eq!(feature_key_for_api_path("/_temps/surveys"), Some("surveys"));
         assert_eq!(
             feature_key_for_api_path("/projects/{project_id}/revenue/metrics/mrr"),
             Some("revenue-tracking")
