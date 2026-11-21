@@ -47,6 +47,8 @@ The SDK POSTs to `${basePath}/event`, `${basePath}/speed`, `${basePath}/heartbea
   3. The key is **not a secret** — it's designed to ship in client-side JS, same as a Sentry DSN public key.
   > **Requires an SDK version with `ingestKey` support.** Check the installed package's exported prop types before using this pattern; if `ingestKey` is missing, either upgrade or fall back to a same-origin proxy route that forwards to Temps with the project resolved server-side.
 
+- **No React, or no framework at all** → skip the SDK and call the HTTP API directly: `POST https://<temps-host>/api/_temps/event` with header `X-Temps-Analytics-Key: <pa_ key>` and a JSON body containing `event_name` (`page_view` or a custom name), `request_path`, `request_query`, `event_data`, plus a client-generated `visitor_id`/`session_id` and the site's `domain`. A `204` means it was recorded. `navigator.sendBeacon` cannot set headers, so pass the key as `?temps_key=` and send a `text/plain` body. The Console's **Analytics → Setup → Plain HTTP / any framework** option shows this project's exact URL, a `curl` example and a copyable agent prompt.
+
 The package's built-in default basePath is `/api/_temps`. Set `basePath` only when the app needs a custom same-origin proxy path, or is not hosted on Temps at all (see above).
 
 ## Framework Setup

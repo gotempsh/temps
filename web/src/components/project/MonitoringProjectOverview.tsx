@@ -10,13 +10,18 @@ import {
 import { Link, useLocation } from 'react-router'
 import { PageHeader } from '@/components/layout/PageContainer'
 import { Button } from '@/components/ui/button'
-import { CopyButton } from '@/components/ui/copy-button'
-import { monitoringSetupPrompt } from '@/lib/monitoring-setup-prompt'
+import { CopySetupPromptButton } from '@/components/project/setup/PlainHttpSetup'
 import { Badge } from '@/components/ui/badge'
 import { Skeleton } from '@/components/ui/skeleton'
 import { ProjectEnvironmentSelect } from '@/components/project-frame/ProjectEnvironmentBar'
 import { useProjectEnvironment } from '@/components/project-frame/project-environment-context'
-import { ArrowRight, BarChart3, ShieldAlert, GitFork } from 'lucide-react'
+import {
+  ArrowRight,
+  BarChart3,
+  ShieldAlert,
+  GitFork,
+  ScrollText,
+} from 'lucide-react'
 
 export function MonitoringProjectOverview({
   project,
@@ -64,6 +69,17 @@ export function MonitoringProjectOverview({
       setup: 'traces#traces-setup',
       view: 'traces',
     },
+    {
+      feature: 'logs' as const,
+      title: 'Logs',
+      description: 'Search your app logs. Uses OpenTelemetry.',
+      icon: ScrollText,
+      // No "has logs" probe exists; the logs page shows its own empty state.
+      query: undefined,
+      received: undefined,
+      setup: 'telemetry-logs',
+      view: 'telemetry-logs',
+    },
   ]
   return (
     <section className="space-y-6" aria-label="Monitoring integrations">
@@ -93,29 +109,21 @@ export function MonitoringProjectOverview({
                   <h2 className="font-medium">{title}</h2>
                   <p className="text-sm text-muted-foreground">{description}</p>
                   <p className="mt-1 text-xs text-muted-foreground">
-                    {query.isError
-                      ? 'We could not check for data. Try again.'
-                      : query.isPending
-                        ? 'Checking for data…'
-                        : received
-                          ? 'Data received'
-                          : 'No data yet. Add the setup code to your app.'}
+                    {!query
+                      ? 'Send logs over OTLP/HTTP from any stack.'
+                      : query.isError
+                        ? 'We could not check for data. Try again.'
+                        : query.isPending
+                          ? 'Checking for data…'
+                          : received
+                            ? 'Data received'
+                            : 'No data yet. Add the setup code to your app.'}
                   </p>
                 </div>
               </div>
               <div className="flex flex-wrap items-center gap-2">
-                <CopyButton
-                  value={monitoringSetupPrompt(
-                    feature,
-                    project,
-                    window.location.origin
-                  )}
-                  label={`Copy ${title} setup prompt and skill`}
-                  className="h-9 rounded-md border px-3"
-                >
-                  Copy setup prompt
-                </CopyButton>
-                {query.isError && (
+                <CopySetupPromptButton project={project} signal={feature} />
+                {query?.isError && (
                   <Button
                     variant="outline"
                     size="sm"

@@ -1476,3 +1476,190 @@ async fn child_idempotency_collision_cannot_commit_a_dangling_journal_entry() {
     assert!(f.store.step(parent.id, 0).await.unwrap().is_none());
     assert!(f.store.get_run(id).await.unwrap().is_none());
 }
+
+/// The cross-project listing names every run by its project and environment
+/// slug. Those names come from inner joins in the one scan statement, never
+/// from a lookup per run or per page.
+#[tokio::test]
+async fn the_global_scan_loads_slugs_in_one_joined_statement() {
+    use std::collections::BTreeMap;
+
+    use sea_orm::{DatabaseBackend, MockDatabase};
+
+    let db = MockDatabase::new(DatabaseBackend::Postgres)
+        .append_query_results([Vec::<BTreeMap<&str, sea_orm::Value>>::new()])
+        .into_connection();
+    let conn = Arc::new(db);
+    let store = PgWorkflowStore::new(conn.clone());
+    let filter = RunFilter {
+        status: Some(RunStatus::Running),
+        workflow_name: Some("orders".into()),
+    };
+    let before = Some((Utc::now(), Uuid::new_v4()));
+    assert!(store
+        .scan_runs(&filter, before, 100)
+        .await
+        .unwrap()
+        .is_empty());
+    drop(store);
+
+    let log = Arc::try_unwrap(conn)
+        .expect("the store was dropped")
+        .into_transaction_log();
+    assert_eq!(log.len(), 1, "one statement for the whole batch: {log:?}");
+    let sql = log[0].statements()[0].sql.clone();
+    assert!(sql.contains(r#"INNER JOIN "environments""#), "{sql}");
+    assert!(sql.contains(r#"INNER JOIN "projects""#), "{sql}");
+    assert!(
+        sql.contains(r#""environments"."deleted_at" IS NULL"#),
+        "{sql}"
+    );
+    assert!(sql.contains(r#""projects"."deleted_at" IS NULL"#), "{sql}");
+    assert!(
+        sql.contains(r#""projects"."slug" AS "project_slug""#),
+        "{sql}"
+    );
+    assert!(
+        sql.contains(r#""environments"."slug" AS "environment_slug""#),
+        "{sql}"
+    );
+}
+
+/// The cross-project workflow list is one grouped statement joined to the
+/// live environment and project, and naming never-run environments is one
+/// more, whatever the number of workflows or environments.
+#[tokio::test]
+async fn workflow_summaries_and_names_are_one_joined_statement_each() {
+    use std::collections::BTreeMap;
+
+    use sea_orm::{DatabaseBackend, MockDatabase};
+
+    let empty = || Vec::<BTreeMap<&str, sea_orm::Value>>::new();
+    let conn = Arc::new(
+        MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([empty(), empty()])
+            .into_connection(),
+    );
+    let store = PgWorkflowStore::new(conn.clone());
+    assert!(store
+        .global_workflow_summaries(5_000, None)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(store
+        .environment_names(&[3, 4, 5])
+        .await
+        .unwrap()
+        .is_empty());
+    // No environments to name: no statement at all.
+    assert!(store.environment_names(&[]).await.unwrap().is_empty());
+    drop(store);
+
+    let log = Arc::try_unwrap(conn)
+        .expect("the store was dropped")
+        .into_transaction_log();
+    assert_eq!(log.len(), 2, "{log:?}");
+    let summaries = &log[0].statements()[0];
+    for clause in [
+        "INNER JOIN environments e ON e.id = r.environment_id AND e.deleted_at IS NULL",
+        "INNER JOIN projects p ON p.id = r.project_id AND p.deleted_at IS NULL",
+        "GROUP BY r.project_id, r.environment_id",
+        "LIMIT $1",
+    ] {
+        assert!(
+            summaries.sql.contains(clause),
+            "{clause}: {}",
+            summaries.sql
+        );
+    }
+    // The limit is capped at 1,000 rows.
+    assert_eq!(
+        summaries.values.as_ref().map(|values| values.0.clone()),
+        Some(vec![sea_orm::Value::BigInt(Some(1_000))])
+    );
+    let names = &log[1].statements()[0].sql;
+    assert!(
+        names.contains("INNER JOIN projects p ON p.id = e.project_id AND p.deleted_at IS NULL"),
+        "{names}"
+    );
+    assert!(names.contains("e.id = ANY($1)"), "{names}");
+}
+
+/// A caller limited to some projects is bounded among their projects alone:
+/// the scope is a filter inside the grouped statement, ahead of the limit,
+/// and an empty scope reads nothing. Finding the projects with runs is one
+/// statement over projects, not one per run.
+#[tokio::test]
+async fn scoped_workflow_summaries_filter_projects_before_the_limit() {
+    use std::collections::BTreeMap;
+
+    use sea_orm::{DatabaseBackend, MockDatabase};
+
+    let empty = || Vec::<BTreeMap<&str, sea_orm::Value>>::new();
+    let conn = Arc::new(
+        MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([empty(), empty()])
+            .into_connection(),
+    );
+    let store = PgWorkflowStore::new(conn.clone());
+    assert!(store
+        .global_workflow_summaries(20, Some(&[7, 9]))
+        .await
+        .unwrap()
+        .is_empty());
+    // Nothing readable: no statement at all.
+    assert!(store
+        .global_workflow_summaries(20, Some(&[]))
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(store
+        .workflow_project_ids(41, 500)
+        .await
+        .unwrap()
+        .is_empty());
+    drop(store);
+
+    let log = Arc::try_unwrap(conn)
+        .expect("the store was dropped")
+        .into_transaction_log();
+    assert_eq!(log.len(), 2, "{log:?}");
+    let summaries = &log[0].statements()[0];
+    let filter = summaries
+        .sql
+        .find("WHERE r.project_id = ANY($2)")
+        .unwrap_or_else(|| panic!("no project scope: {}", summaries.sql));
+    let group = summaries.sql.find("GROUP BY").expect("grouped");
+    let limit = summaries.sql.find("LIMIT $1").expect("limited");
+    assert!(filter < group && group < limit, "{}", summaries.sql);
+    assert_eq!(
+        summaries.values.as_ref().map(|values| values.0.clone()),
+        Some(vec![
+            sea_orm::Value::BigInt(Some(20)),
+            sea_orm::Value::Array(
+                sea_orm::sea_query::ArrayType::Int,
+                Some(Box::new(vec![
+                    sea_orm::Value::Int(Some(7)),
+                    sea_orm::Value::Int(Some(9)),
+                ])),
+            ),
+        ])
+    );
+    let projects = &log[1].statements()[0];
+    for clause in [
+        "FROM projects p WHERE p.deleted_at IS NULL AND p.id > $1",
+        "EXISTS (SELECT 1 FROM workflow_runs r",
+        "e.deleted_at IS NULL",
+        "ORDER BY p.id LIMIT $2",
+    ] {
+        assert!(projects.sql.contains(clause), "{clause}: {}", projects.sql);
+    }
+    // A keyset page: after project 41, at most 500 projects.
+    assert_eq!(
+        projects.values.as_ref().map(|values| values.0.clone()),
+        Some(vec![
+            sea_orm::Value::Int(Some(41)),
+            sea_orm::Value::BigInt(Some(500)),
+        ])
+    );
+}

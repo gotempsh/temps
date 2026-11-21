@@ -69,6 +69,94 @@ async fn test_enrich_visitor_by_guid_is_confined_to_project() -> anyhow::Result<
     Ok(())
 }
 
+/// ADR 109 D4: an enrichment that starts while an identify holds the
+/// visitor's row must merge into what that identify committed, not write back
+/// the row it read before, which would drop the identified trait and its
+/// `server` mark.
+#[tokio::test]
+async fn test_enrichment_waits_for_a_concurrent_identify_and_keeps_its_traits() -> anyhow::Result<()>
+{
+    use sea_orm::{ConnectionTrait, DatabaseBackend, EntityTrait, Statement, TransactionTrait};
+    let (service, db, _container) = create_test_analytics_service!(
+        "test_enrichment_waits_for_a_concurrent_identify_and_keeps_its_traits"
+    );
+    let crypto = temps_core::CookieCrypto::new("test_key_32_bytes_long_for_tests").unwrap();
+    let sealed = format!("enc_{}", crypto.encrypt("test_visitor_1").unwrap());
+    let visitor = temps_entities::visitor::Entity::find()
+        .one(db.as_ref())
+        .await?
+        .unwrap();
+
+    // The identify: holds the row lock and sets a backend trait.
+    let identify = db.begin().await?;
+    identify
+        .execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT id FROM visitor WHERE id = $1 FOR UPDATE",
+            [visitor.id.into()],
+        ))
+        .await?;
+    identify
+        .execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "UPDATE visitor SET custom_data = '{\"plan\":\"pro\"}'::jsonb, \
+             trait_sources = '{\"plan\":\"server\"}'::jsonb WHERE id = $1",
+            [visitor.id.into()],
+        ))
+        .await?;
+
+    let enrich = service.enrich_visitor_by_guid(
+        &sealed,
+        Some(visitor.project_id),
+        serde_json::json!({ "company": "Example Co" }),
+    );
+    let commit_once_enrichment_waits = async {
+        let mut waiting = false;
+        for _ in 0..200 {
+            let row = db
+                .query_one(Statement::from_string(
+                    DatabaseBackend::Postgres,
+                    "SELECT COUNT(*) AS waiting FROM pg_stat_activity \
+                     WHERE datname = current_database() AND wait_event_type = 'Lock'"
+                        .to_string(),
+                ))
+                .await?
+                .expect("one row");
+            if row.try_get::<i64>("", "waiting")? > 0 {
+                waiting = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        identify.commit().await?;
+        Ok::<bool, anyhow::Error>(waiting)
+    };
+    let (enriched, waited) = tokio::join!(enrich, commit_once_enrichment_waits);
+    assert!(
+        waited?,
+        "the enrichment must wait for the identify's row lock"
+    );
+    assert!(enriched?.updated);
+
+    let row = temps_entities::visitor::Entity::find_by_id(visitor.id)
+        .one(db.as_ref())
+        .await?
+        .unwrap();
+    assert_eq!(
+        row.custom_data,
+        Some(serde_json::json!({ "plan": "pro", "company": "Example Co" })),
+        "the identified trait survives the enrichment"
+    );
+    assert_eq!(
+        row.trait_sources,
+        Some(serde_json::json!({ "plan": "server", "company": "server" })),
+        "and so does its backend mark"
+    );
+
+    cleanup_test_analytics!(db);
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_scoped_enrichment_cannot_grow_a_row_past_the_cap() -> anyhow::Result<()> {
     let (service, db, _container) =
@@ -240,6 +328,7 @@ async fn test_live_visitors_honour_the_datacenter_opt_out() -> anyhow::Result<()
         project_id: Set(project.id),
         exclude_datacenter_traffic: Set(false),
         exclude_spam_referrers: Set(true),
+        accept_browser_identify: Set(true),
         created_at: Set(now),
         updated_at: Set(now),
     }
@@ -3250,4 +3339,152 @@ async fn test_get_page_path_visitors_flags_see_the_whole_session_within_its_life
 
     cleanup_test_analytics!(db);
     Ok(())
+}
+
+#[tokio::test]
+async fn test_get_event_properties_ranks_values_and_skips_crawlers() -> anyhow::Result<()> {
+    let (service, db, _container) =
+        create_test_analytics_service!("test_get_event_properties_ranks_values");
+
+    use chrono::{TimeZone, Utc};
+    use sea_orm::{ActiveModelTrait, Set};
+    use temps_entities::events;
+
+    let partner = "https://partner.example.org/pricing";
+    let docs = "https://docs.example.net/";
+    // (url property, is_crawler): three clicks to the partner, one to the
+    // docs, one without the property, and a crawler that must not count.
+    let seeded: Vec<(Option<&str>, bool)> = vec![
+        (Some(partner), false),
+        (Some(partner), false),
+        (Some(partner), false),
+        (Some(docs), false),
+        (None, false),
+        (Some(docs), true),
+    ];
+    for (minute, (url, is_crawler)) in seeded.into_iter().enumerate() {
+        let props = match url {
+            Some(url) => serde_json::json!({ "url": url, "host": "elsewhere" }),
+            None => serde_json::json!({ "host": "elsewhere" }),
+        };
+        events::ActiveModel {
+            project_id: Set(1),
+            environment_id: Set(Some(1)),
+            deployment_id: Set(Some(1)),
+            session_id: Set(Some("session_1".to_string())),
+            visitor_id: Set(Some(1)),
+            hostname: Set("example.com".to_string()),
+            pathname: Set("/pricing".to_string()),
+            page_path: Set("/pricing".to_string()),
+            href: Set("https://example.com/pricing".to_string()),
+            timestamp: Set(Utc
+                .with_ymd_and_hms(2024, 1, 1, 12, minute as u32, 0)
+                .unwrap()),
+            event_type: Set("outbound_click".to_string()),
+            event_name: Set(Some("outbound_click".to_string())),
+            props: Set(Some(props)),
+            is_crawler: Set(is_crawler),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+    }
+
+    let start_date = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+    let end_date = Utc.with_ymd_and_hms(2024, 1, 2, 0, 0, 0).unwrap();
+
+    let result = service
+        .get_event_properties(1, "outbound_click", "url", start_date, end_date, None, 20)
+        .await?;
+    assert_eq!(result.event_name, "outbound_click");
+    assert_eq!(result.property, "url");
+    assert_eq!(result.total_count, 5, "the crawler click is excluded");
+    let values: Vec<(Option<&str>, i64)> = result
+        .items
+        .iter()
+        .map(|item| (item.value.as_deref(), item.count))
+        .collect();
+    assert_eq!(values, vec![(Some(partner), 3), (Some(docs), 1), (None, 1)]);
+    assert!((result.items[0].percentage - 60.0).abs() < 1e-9);
+    assert_eq!(result.items[0].unique_visitors, 1);
+
+    // The limit applies after ranking.
+    let top = service
+        .get_event_properties(1, "outbound_click", "url", start_date, end_date, None, 1)
+        .await?;
+    assert_eq!(top.items.len(), 1);
+    assert_eq!(top.total_count, 5);
+
+    // Another environment has nothing.
+    let other_env = service
+        .get_event_properties(
+            1,
+            "outbound_click",
+            "url",
+            start_date,
+            end_date,
+            Some(9999),
+            20,
+        )
+        .await?;
+    assert_eq!(other_env.total_count, 0);
+    assert!(other_env.items.is_empty());
+
+    // A malformed key is refused before any query runs.
+    let invalid = service
+        .get_event_properties(
+            1,
+            "outbound_click",
+            "url'); --",
+            start_date,
+            end_date,
+            None,
+            20,
+        )
+        .await;
+    assert!(matches!(
+        invalid,
+        Err(AnalyticsError::InvalidQuery {
+            field: "property",
+            ..
+        })
+    ));
+
+    cleanup_test_analytics!(db);
+    Ok(())
+}
+
+#[test]
+fn event_property_keys_are_limited_to_sdk_shaped_names() {
+    for key in [
+        "url",
+        "extension",
+        "plan_tier",
+        "checkout.step",
+        "utm-source",
+        "A1",
+    ] {
+        assert!(
+            validate_event_property_key(key).is_ok(),
+            "{key} should be accepted"
+        );
+    }
+    for key in ["", "url ", "a/b", "props->>'x'", "ключ"] {
+        assert!(
+            matches!(
+                validate_event_property_key(key),
+                Err(AnalyticsError::InvalidQuery {
+                    field: "property",
+                    ..
+                })
+            ),
+            "{key:?} should be refused"
+        );
+    }
+    let long = "k".repeat(MAX_EVENT_PROPERTY_KEY_LEN + 1);
+    let err = validate_event_property_key(&long)
+        .err()
+        .map(|e| e.to_string());
+    assert!(err.is_some_and(|message| message.contains("65 characters")));
+    assert!(validate_event_property_key(&"k".repeat(MAX_EVENT_PROPERTY_KEY_LEN)).is_ok());
 }

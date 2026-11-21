@@ -5,8 +5,10 @@ import type React from "react";
 import type {
   JsonValue,
   AnalyticsClientOptions,
+  AutoTrackOptions,
   FeatureFlags,
   FeatureFlagsOptions,
+  IdentifyResult,
 } from "@temps-sdk/analytics-core";
 import type { SessionRecorderConfig } from "./SessionRecorder";
 
@@ -17,22 +19,43 @@ export type {
   AnalyticsClientOptions,
   WebVitalMetric,
   SpeedMetric,
+  IdentifyResult,
 } from "@temps-sdk/analytics-core";
 
 export interface AnalyticsContextValue {
   /** Send a custom event. */
   trackEvent: (eventName: string, data?: Record<string, JsonValue>) => Promise<void>;
-  /** Identify an user if needed. No-op by default. */
-  identify: (userId: string, traits?: Record<string, JsonValue>) => Promise<void> | void;
+  /**
+   * Attach your app's user id (and optional traits) to this visitor, e.g.
+   * right after signup or sign-in. Repeating the same call sends nothing; in
+   * cookieless mode nothing is sent at all.
+   */
+  identify: (userId: string, traits?: Record<string, JsonValue>) => Promise<IdentifyResult>;
+  /** Forget the identity on sign-out; the next event is a new visitor. */
+  reset: () => Promise<void>;
+  /**
+   * The visitor id the tracker stored; `undefined` in cookieless mode or
+   * before the first event. A backend on Temps does not need it: the Node
+   * SDK's `analytics.identify(request, …)` reads the proxy's cookie.
+   */
+  getVisitorId: () => string | undefined;
   /** Manually trigger a pageview. */
   trackPageview: () => void;
+  /**
+   * Report the current page as missing: sends a `not_found` event whose
+   * `path` property is the current path. Call it from your "not found" view,
+   * or mark that view with `data-temps-404` and let the provider do it.
+   */
+  trackNotFound: (data?: Record<string, JsonValue>) => Promise<void>;
   /** Whether analytics are currently enabled. */
   enabled: boolean;
   /** Client-visible feature flags for this visitor. Prefer `useFlag`. */
   flags: FeatureFlags;
+  /** Where the Temps endpoints live, as configured on the provider. */
+  basePath: string;
 }
 
-export interface TempsAnalyticsProviderProps extends AnalyticsClientOptions {
+export interface TempsAnalyticsProviderProps extends AnalyticsClientOptions, AutoTrackOptions {
   /**
    * Feature-flag context (`key`, `attributes`) and server-rendered
    * `bootstrap` values. Read flags with `useFlag`.

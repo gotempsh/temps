@@ -211,6 +211,50 @@ impl AuditOperation for VisitorEnrichedAudit {
     }
 }
 
+/// A visitor identified by the app's backend (ADR 109 D4). Like enrichment,
+/// only key names are recorded: the user id and trait values are personal
+/// data. Identify from the browser is ingest, not an operator action, and is
+/// not audited (an unauthenticated endpoint must not be able to fill the
+/// audit trail).
+#[derive(Debug, Clone, Serialize)]
+pub struct VisitorIdentifiedAudit {
+    pub context: AuditContext,
+    /// `"deployment_token"` or `"user"` (session, API key or CLI token).
+    pub actor_kind: &'static str,
+    pub deployment_token_id: Option<i32>,
+    pub deployment_token_name: Option<String>,
+    pub project_id: i32,
+    pub visitor_row_id: Option<i32>,
+    /// Trait keys the call set, bounded by [`bounded_key_names`].
+    pub trait_keys: Vec<String>,
+    pub trait_key_count: usize,
+    pub removed_keys: Vec<String>,
+    pub removed_key_count: usize,
+}
+
+impl AuditOperation for VisitorIdentifiedAudit {
+    fn operation_type(&self) -> String {
+        "VISITOR_IDENTIFIED".to_string()
+    }
+
+    /// `None` for deployment tokens, which have no `users` row.
+    fn user_id(&self) -> Option<i32> {
+        (self.actor_kind == "user").then_some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,6 +276,31 @@ mod tests {
             removed_keys: Vec::new(),
             removed_key_count: 0,
         }
+    }
+
+    #[test]
+    fn an_identify_audit_names_keys_but_never_the_user_id() {
+        let audit = VisitorIdentifiedAudit {
+            context: AuditContext {
+                user_id: 0,
+                ip_address: None,
+                user_agent: "test".to_string(),
+            },
+            actor_kind: "deployment_token",
+            deployment_token_id: Some(3),
+            deployment_token_name: Some("app".to_string()),
+            project_id: 5,
+            visitor_row_id: Some(11),
+            trait_keys: vec!["plan".to_string()],
+            trait_key_count: 1,
+            removed_keys: Vec::new(),
+            removed_key_count: 0,
+        };
+        assert_eq!(audit.operation_type(), "VISITOR_IDENTIFIED");
+        assert_eq!(audit.user_id(), None);
+        let body = AuditOperation::serialize(&audit).expect("serializes");
+        assert!(body.contains("\"plan\""), "{body}");
+        assert!(!body.contains("user_id\":\"u"), "{body}");
     }
 
     #[test]

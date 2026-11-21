@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { useEffect } from 'react'
-import { useQuery } from '@tanstack/react-query'
+import { useQueries, useQuery } from '@tanstack/react-query'
 import { DataTable, Detail, PageState, Status } from '@temps-sdk/ds'
 import { Workflow } from 'lucide-react'
 import { Link, useParams, useSearchParams } from 'react-router'
@@ -22,6 +22,8 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { problemDetail } from '@/lib/api-problem'
 import { workflowTone } from './status'
+import { RunFailure } from './RunFailure'
+import { failedStepPages, failedStepQuery, findFailedStep } from './run-failure'
 
 export function WorkflowRunDetail() {
   const params = useParams()
@@ -39,6 +41,21 @@ export function WorkflowRunDetail() {
   })
   const run = useQuery(runOptions)
   const steps = useQuery(stepOptions)
+  // The failed step is read from the journal's end, not the page on screen,
+  // so the failure reads the same while the journal is browsed.
+  const failedRun =
+    run.data?.status === 'failed' && run.data.error_kind === 'step_failed'
+      ? run.data
+      : undefined
+  const failedStepOptions = failedRun
+    ? failedStepPages(failedRun.step_count).map((stepPage) =>
+        failedStepQuery(path, failedRun, stepPage)
+      )
+    : []
+  const failedStepLookup = useQueries({ queries: failedStepOptions })
+  const failedStep = findFailedStep(
+    failedStepLookup.map((lookup) => lookup.data?.steps ?? [])
+  )
   const project = useQuery(getProjectOptions({ path: { id: path.project_id } }))
   const environment = useQuery(
     getEnvironmentOptions({
@@ -78,6 +95,7 @@ export function WorkflowRunDetail() {
       queryKeys={[
         runOptions.queryKey,
         stepOptions.queryKey,
+        ...failedStepOptions.map((options) => options.queryKey),
         getProjectOptions({ path: { id: path.project_id } }).queryKey,
         getEnvironmentOptions({
           path: { project_id: path.project_id, env_id: path.environment_id },
@@ -163,8 +181,17 @@ export function WorkflowRunDetail() {
               {run.data.blocked_reason}
             </p>
           )}
-          {run.data?.error_kind && (
-            <p className="text-sm text-destructive">{run.data.error_kind}</p>
+          {run.data?.status === 'failed' && (
+            <RunFailure
+              path={path}
+              run={run.data}
+              failedStep={failedStep}
+              invalidate={[
+                runOptions.queryKey,
+                stepOptions.queryKey,
+                ...failedStepOptions.map((options) => options.queryKey),
+              ]}
+            />
           )}
           {steps.isError ? (
             <p role="alert">
@@ -173,6 +200,8 @@ export function WorkflowRunDetail() {
                 'Could not load the journal. Refresh to retry.'
               )}
             </p>
+          ) : steps.data && steps.data.steps.length === 0 ? (
+            <p className="text-sm text-muted-foreground">No steps ran.</p>
           ) : (
             <DataTable
               aria-label="Workflow journal"

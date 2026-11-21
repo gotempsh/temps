@@ -16,8 +16,8 @@
 //! it holds no pooled connection, and only another configuration of the
 //! same tunnel ever waits on it. Two configurations of one tunnel cannot
 //! overlap without one overwriting the other at the provider, so that wait
-//! is the ordering itself. Nothing else takes it: placement changes,
-//! status reports and token-holder updates never wait for the provider.
+//! is the ordering itself. Hostname DNS retries and final deletion also
+//! take it so a retry cannot publish to a replaced or deleted tunnel.
 
 use std::collections::HashMap;
 use std::sync::Arc;

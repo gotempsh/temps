@@ -37,6 +37,9 @@ tracing = { workspace = true }
 # Time
 chrono = { workspace = true }
 
+# Errors
+thiserror = { workspace = true }
+
 [dev-dependencies]
 temps-test-utils = { path = "../temps-test-utils" }
 tokio = { workspace = true }

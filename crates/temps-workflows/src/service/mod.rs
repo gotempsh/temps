@@ -6,6 +6,8 @@
 //! environment and checks that the environment belongs to the project, and
 //! that a run belongs to the environment, before anything else.
 
+mod definitions;
+pub use definitions::{DefinitionState, WorkflowDefinition, MAX_WORKFLOW_DEFINITIONS};
 mod dev;
 mod diagnosis;
 pub use diagnosis::WorkflowDiagnosis;

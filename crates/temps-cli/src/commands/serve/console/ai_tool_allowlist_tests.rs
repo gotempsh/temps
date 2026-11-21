@@ -213,6 +213,8 @@ fn global_notification_operations_are_available_to_workspace_chats() {
         "update_webhook_provider",
         "create_cloudflare_provider",
         "update_cloudflare_provider",
+        "create_telegram_provider",
+        "update_telegram_provider",
         "delete_notification_provider",
         "create_notification_route",
         "update_notification_route",

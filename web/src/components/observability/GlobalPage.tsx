@@ -181,6 +181,7 @@ export function QueryContent({
   empty,
   title,
   retry,
+  setup,
   children,
 }: {
   loading: boolean
@@ -188,6 +189,12 @@ export function QueryContent({
   empty: boolean
   title: string
   retry: () => void
+  /**
+   * How to start sending this data, shown instead of the generic empty state
+   * when the view is unfiltered. A filtered view keeps the "change the
+   * filters" message: there, data may exist outside the filter.
+   */
+  setup?: ReactNode
   children: ReactNode
 }) {
   if (loading)
@@ -214,6 +221,7 @@ export function QueryContent({
         </AlertDescription>
       </Alert>
     )
+  if (empty && setup) return <>{setup}</>
   if (empty)
     return (
       <div className="rounded-lg border bg-card text-card-foreground">

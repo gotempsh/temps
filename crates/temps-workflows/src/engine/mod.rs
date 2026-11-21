@@ -98,6 +98,18 @@ impl WorkflowEngine {
         self.manifests.cached(environment_id).and_then(Result::ok)
     }
 
+    /// Every manifest read so far, by environment id, without reading any.
+    pub fn cached_manifests(&self) -> Vec<(i32, Arc<Manifest>)> {
+        self.manifests.manifests()
+    }
+
+    /// Cache `manifest` as the environment's, as a successful read would.
+    #[cfg(test)]
+    pub(crate) fn seed_manifest(&self, project_id: i32, environment_id: i32, manifest: Manifest) {
+        self.manifests
+            .put(project_id, environment_id, None, manifest);
+    }
+
     /// Forget the environment's manifest (its settings changed).
     pub fn invalidate_manifest(&self, environment_id: i32) {
         self.manifests.invalidate(environment_id);

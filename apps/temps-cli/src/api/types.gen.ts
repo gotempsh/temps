@@ -1738,6 +1738,200 @@ export type AnalyticsCapability = {
 export type AnalyticsFacet = 'summary' | 'traffic' | 'pages' | 'events' | 'breakdown' | 'speed';
 
 /**
+ * A conversion goal.
+ */
+export type AnalyticsGoal = {
+    created_at: string;
+    event_filter: Array<SmartFilter>;
+    event_name?: string | null;
+    id: number;
+    kind: AnalyticsGoalKind;
+    name: string;
+    page_path?: string | null;
+    project_id: number;
+    revenue_currency?: string | null;
+    revenue_property?: string | null;
+    updated_at: string;
+};
+
+/**
+ * What a goal breakdown groups converting visitors by.
+ */
+export type AnalyticsGoalBreakdownDimension = 'channel' | 'referrer' | 'utm_source' | 'utm_medium' | 'utm_campaign' | 'page' | 'country' | 'device_type' | 'browser' | 'operating_system';
+
+/**
+ * Response of `GET /projects/{project_id}/analytics/goals/{goal_id}/breakdown`.
+ */
+export type AnalyticsGoalBreakdownResponse = {
+    dimension: AnalyticsGoalBreakdownDimension;
+    goal_id: number;
+    /**
+     * Ordered by unique conversions, then total conversions.
+     */
+    items: Array<AnalyticsGoalBreakdownRow>;
+};
+
+/**
+ * One value of a goal breakdown.
+ */
+export type AnalyticsGoalBreakdownRow = {
+    /**
+     * `unique_conversions` as a percentage of `visitors`.
+     */
+    conversion_rate: number;
+    revenue?: AnalyticsGoalRevenue | null;
+    total_conversions: number;
+    unique_conversions: number;
+    /**
+     * `null` when the visitor or event has no value for the dimension.
+     */
+    value?: string | null;
+    /**
+     * Distinct non-crawler visitors with that value in the period.
+     */
+    visitors: number;
+};
+
+/**
+ * Body of `POST` and `PUT /projects/{project_id}/analytics/goals`.
+ */
+export type AnalyticsGoalInput = {
+    /**
+     * Conditions every matching event must meet, in the vocabulary funnel
+     * steps use, e.g. `[{"type":"custom_data","value":{"path":"plan","value":"pro"}}]`.
+     */
+    event_filter?: Array<SmartFilter>;
+    /**
+     * Required for `event` goals, refused for `page` goals.
+     */
+    event_name?: string | null;
+    kind: AnalyticsGoalKind;
+    /**
+     * Shown in the Conversions report, e.g. "Signup". Unique per project,
+     * ignoring case.
+     */
+    name: string;
+    /**
+     * Required for `page` goals, refused for `event` goals. Starts with `/`;
+     * `*` matches any run of characters, e.g. `/thank-you` or `/docs*`.
+     */
+    page_path?: string | null;
+    /**
+     * ISO 4217 currency code of `revenue_property`, e.g. `EUR`.
+     */
+    revenue_currency?: string | null;
+    /**
+     * Event property holding the value of one conversion, e.g. `amount`.
+     * Event goals only; requires `revenue_currency`.
+     */
+    revenue_property?: string | null;
+};
+
+/**
+ * What a goal matches.
+ */
+export type AnalyticsGoalKind = 'event' | 'page';
+
+/**
+ * A page of goals, newest first.
+ */
+export type AnalyticsGoalListResponse = {
+    items: Array<AnalyticsGoal>;
+    page: number;
+    page_size: number;
+    total: number;
+};
+
+/**
+ * Revenue a goal's conversions carried.
+ */
+export type AnalyticsGoalRevenue = {
+    /**
+     * `total` divided by the conversions that carried a number.
+     */
+    average: number;
+    currency: string;
+    /**
+     * Sum of the revenue property over conversions that carried a number.
+     */
+    total: number;
+};
+
+/**
+ * Conversion figures of one goal in a period.
+ */
+export type AnalyticsGoalStats = {
+    /**
+     * `unique_conversions` as a percentage of the period's visitors.
+     */
+    conversion_rate: number;
+    goal_id: number;
+    kind: AnalyticsGoalKind;
+    name: string;
+    revenue?: AnalyticsGoalRevenue | null;
+    /**
+     * Matching events, a visitor converting twice counting twice.
+     */
+    total_conversions: number;
+    /**
+     * Distinct visitors who converted.
+     */
+    unique_conversions: number;
+};
+
+/**
+ * Response of `GET /projects/{project_id}/analytics/goals/stats`.
+ */
+export type AnalyticsGoalStatsResponse = {
+    /**
+     * Every goal of the project, in creation order, including the ones
+     * without conversions in the period.
+     */
+    goals: Array<AnalyticsGoalStats>;
+    /**
+     * Distinct non-crawler visitors with a page view in the period: the
+     * denominator of every conversion rate, as on the overview.
+     */
+    visitors: number;
+};
+
+/**
+ * Per-project visitor identity mode.
+ */
+export type AnalyticsIdentityMode = 'persistent' | 'cookieless';
+
+/**
+ * How a project tells its visitors apart, and what that costs.
+ */
+export type AnalyticsIdentitySettings = {
+    /**
+     * Whether `identify()` from the browser is applied (ADR 109 D4). When
+     * `false`, only the app's backend can identify a visitor. Defaults to
+     * `true`. Ignored in `cookieless` mode, where identify stores nothing.
+     */
+    accept_browser_identify: boolean;
+    /**
+     * Reports that behave differently in this mode, for the console to say
+     * so next to them.
+     */
+    limitations: Array<string>;
+    /**
+     * `persistent` (the default): ids stored in a cookie or `localStorage`,
+     * visitors recognised across days. `cookieless`: nothing stored on the
+     * device; a visitor is a new visitor every day.
+     */
+    mode: AnalyticsIdentityMode;
+    project_id: number;
+    /**
+     * What the browser SDK must be told for this mode, so it writes nothing
+     * either: `cookieless: true`, or `data-cookieless="true"` on the script
+     * tag. `None` in `persistent` mode.
+     */
+    sdk_option?: string | null;
+    updated_at: string;
+};
+
+/**
  * The public address an app Temps does not deploy should send analytics to.
  *
  * Served separately from the platform settings because `GET /settings`
@@ -1972,6 +2166,19 @@ export type AnomalyPreviewResponse = {
      */
     sufficient: boolean;
 };
+
+export type AnswerCount = {
+    count: number;
+    /**
+     * The choice, or the score as text.
+     */
+    value: string;
+};
+
+/**
+ * An answer as the responses list shows it.
+ */
+export type AnswerValue = string | number | Array<string>;
 
 /**
  * A single caller entry in the top-callers breakdown.
@@ -4200,6 +4407,28 @@ export type BrowserCount = {
     browser: string;
     count: number;
     percentage: number;
+};
+
+/**
+ * Body of `POST /_temps/identify` (ADR 109 D4).
+ */
+export type BrowserIdentifyPayload = {
+    /**
+     * Traits merged into the visitor's `custom_data`; `null` removes a key.
+     * At most 32 keys and 8 KB.
+     */
+    traits?: {
+        [key: string]: unknown;
+    } | null;
+    /**
+     * The app's own id for the signed-in person. At most 256 characters.
+     */
+    user_id: string;
+    /**
+     * The tracker's stored visitor id. Read only where events read it (a
+     * keyed request); a proxied site's visitor comes from its cookie.
+     */
+    visitor_id?: string | null;
 };
 
 export type BrowsersQuery = {
@@ -9820,6 +10049,17 @@ export type CreateStatusPageRequest = {
     title: string;
 };
 
+export type CreateSurveyRequest = {
+    description?: string | null;
+    name: string;
+    questions?: Array<SurveyQuestion>;
+    /**
+     * Defaults to `draft`: nothing is shown until the survey is activated.
+     */
+    status?: SurveyStatus;
+    targeting?: SurveyTargeting;
+};
+
 export type CreateTeamMemberRequest = {
     role: TeamRole;
     user_id: number;
@@ -9829,6 +10069,12 @@ export type CreateTeamRequest = {
     description?: string | null;
     name: string;
     slug: string;
+};
+
+export type CreateTelegramProviderRequest = {
+    config: TelegramConfig;
+    enabled?: boolean | null;
+    name: string;
 };
 
 export type CreateThreadArtifactRequest = {
@@ -10693,6 +10939,11 @@ export type DeleteBlobResponse = {
 
 export type DeleteResponse = {
     deleted: number;
+};
+
+export type DeleteSurveyResponse = {
+    deleted: boolean;
+    id: number;
 };
 
 export type DeletedEnvironmentVolumeResponse = {
@@ -15209,6 +15460,75 @@ export type EventMetricsPayload = {
 };
 
 /**
+ * Query parameters for the breakdown of one event by one of its properties
+ */
+export type EventPropertiesQuery = {
+    end_date: string;
+    environment_id?: number | null;
+    /**
+     * The event to break down, e.g. `outbound_click`
+     */
+    event_name: string;
+    /**
+     * Maximum number of values to return (default: 20, max: 100)
+     */
+    limit?: number | null;
+    project_id: number;
+    /**
+     * Top-level key of the event's custom properties to group by, e.g. `url`.
+     * Letters, digits, `_`, `-` and `.`; at most 64 characters.
+     */
+    property: string;
+    start_date: string;
+};
+
+/**
+ * One event broken down by one of its custom properties, most frequent
+ * value first. Used for the outbound-link and file-download reports
+ * (ADR 109 D1), and for any `trackEvent()` property.
+ */
+export type EventPropertiesResponse = {
+    /**
+     * The event that was broken down
+     */
+    event_name: string;
+    /**
+     * The most frequent values, at most `limit` of them
+     */
+    items: Array<EventPropertyValue>;
+    /**
+     * The property the values belong to
+     */
+    property: string;
+    /**
+     * Occurrences of the event in the period, whatever the property's value
+     */
+    total_count: number;
+};
+
+/**
+ * One value of an event property and how often it occurred
+ */
+export type EventPropertyValue = {
+    /**
+     * Occurrences of the event with this value
+     */
+    count: number;
+    /**
+     * Share of `total_count`, 0 to 100
+     */
+    percentage: number;
+    /**
+     * Distinct visitors who sent the event with this value
+     */
+    unique_visitors: number;
+    /**
+     * The value as text; null when the event did not carry the property
+     */
+    value?: string | null;
+};
+
+/**
  * Referrer stats for an event
  */
 export type EventReferrerStats = {
@@ -17728,9 +18048,19 @@ export type GlobalTracesResponse = {
     windows: Array<GlobalTraceWindow>;
 };
 
+/**
+ * A run in the cross-project listing: the run, plus the slugs that name its
+ * project and environment, so the list reads `shop · production` rather than
+ * bare ids.
+ */
+export type GlobalWorkflowRunResponse = WorkflowRunResponse & {
+    environment_slug: string;
+    project_slug: string;
+};
+
 export type GlobalWorkflowRunsResponse = {
     next_cursor?: string | null;
-    runs: Array<WorkflowRunResponse>;
+    runs: Array<GlobalWorkflowRunResponse>;
 };
 
 /**
@@ -18696,6 +19026,10 @@ export type HostnameView = {
     mode: HostnameMode;
     published_at?: string | null;
     /**
+     * Connector on which DNS setup for this failed publication can be retried.
+     */
+    retry_dns_connector_id?: number | null;
+    /**
      * Whether workers serve it. A tunnel only publishes those.
      */
     served_by_workers: boolean;
@@ -18805,6 +19139,42 @@ export type HttpChecksCapabilities = {
  * for such an address until a run records a choice.
  */
 export type HttpPolicy = 'https_only' | 'allow_http' | 'allow_all';
+
+/**
+ * What an identify call did.
+ */
+export type IdentifyOutcome = 'updated' | 'unchanged' | 'visitor_not_found' | 'cookieless_project' | 'browser_identify_refused' | 'server_identity_kept';
+
+/**
+ * Body of both identify endpoints.
+ */
+export type IdentifyVisitorRequest = {
+    /**
+     * Traits merged into the visitor's `custom_data` at the top level; a
+     * key set to `null` is removed. At most 32 keys and 8 KB.
+     */
+    traits?: {
+        [key: string]: unknown;
+    } | null;
+    /**
+     * The app's own id for the person (database id, UUID, email). At most
+     * 256 characters, no control characters.
+     */
+    user_id: string;
+};
+
+/**
+ * The answer of both identify endpoints.
+ */
+export type IdentifyVisitorResponse = {
+    /**
+     * Whether the visitor carries the requested identity now
+     * (`updated` or `unchanged`).
+     */
+    applied: boolean;
+    message: string;
+    outcome: IdentifyOutcome;
+};
 
 /**
  * When an ignored error group comes back. With no field set the next event
@@ -19591,9 +19961,67 @@ export type IncrResponse = {
 };
 
 /**
+ * How to authenticate a signal's requests, without the credential itself.
+ */
+export type IngestAuth = {
+    /**
+     * Whether the credential may ship in browser code. Analytics keys and
+     * DSN keys are public by design; an API key never is.
+     */
+    browser_safe: boolean;
+    /**
+     * `temps` CLI command that creates the credential.
+     */
+    cli_command: string;
+    /**
+     * Console path where the credential is created or shown.
+     */
+    credential_path: string;
+    /**
+     * Environment variable the app should read the credential from.
+     */
+    env_var: string;
+    /**
+     * Headers to send, as templates over `env_var`.
+     */
+    headers: Array<IngestHeader>;
+    kind: IngestAuthKind;
+    /**
+     * Query-string fallback for clients that cannot set headers
+     * (`navigator.sendBeacon`), when the route accepts one.
+     */
+    query_param?: string | null;
+};
+
+/**
+ * The credential a signal's ingest route expects.
+ */
+export type IngestAuthKind = 'analytics_ingest_key' | 'sentry_dsn' | 'api_key';
+
+/**
  * Which budget a dropped line exceeded.
  */
 export type IngestDropReason = 'lines_per_sec' | 'bytes_per_sec';
+
+/**
+ * One ingest route.
+ */
+export type IngestEndpoint = {
+    /**
+     * The `Content-Type` the route accepts.
+     */
+    content_type: string;
+    method: string;
+    /**
+     * Stable identifier of the route within its signal (`event`, `envelope`,
+     * `otlp_traces`, …).
+     */
+    name: string;
+    /**
+     * Absolute URL, built from the public ingress URL.
+     */
+    url: string;
+};
 
 /**
  * One aggregated ingest-failure group: "this signal failed this way N times".
@@ -19634,6 +20062,51 @@ export type IngestErrorsResponse = {
      * Failure groups, most recently seen first.
      */
     errors: Array<IngestErrorSummary>;
+};
+
+/**
+ * A header a request must carry. `value` is a template naming an
+ * environment variable, never a credential.
+ */
+export type IngestHeader = {
+    name: string;
+    value: string;
+};
+
+/**
+ * A kind of telemetry an app can send to Temps.
+ */
+export type IngestSignal = 'analytics' | 'session_replay' | 'errors' | 'logs' | 'traces';
+
+/**
+ * Everything an app needs to send one signal.
+ */
+export type IngestSignalSetup = {
+    auth: IngestAuth;
+    /**
+     * Whether the project has what this signal needs. `false` means a
+     * credential still has to be created. Logs and traces are always `true`:
+     * they authenticate with the caller's own API key, which is not project
+     * state; `auth.credential_path` and `auth.cli_command` say how to get one.
+     */
+    configured: boolean;
+    endpoints: Array<IngestEndpoint>;
+    /**
+     * For OTLP signals without an environment: the value of
+     * `OTEL_EXPORTER_OTLP_ENDPOINT`. SDKs append `/v1/traces` or `/v1/logs`
+     * to it. `None` with an environment, whose per-signal URLs in
+     * `endpoints` go in `OTEL_EXPORTER_OTLP_{TRACES,LOGS}_ENDPOINT`.
+     */
+    otlp_endpoint?: string | null;
+    /**
+     * What is missing when `configured` is `false`.
+     */
+    reason?: string | null;
+    /**
+     * Console path that fixes what is missing, or the signal's setup page.
+     */
+    setup_path: string;
+    signal: IngestSignal;
 };
 
 export type IngressLoginGrantResponse = {
@@ -23649,6 +24122,25 @@ export type NotificationRouteTestResult = {
     severity: string;
 };
 
+export type NpsSummary = {
+    /**
+     * Answers of 0 to 6.
+     */
+    detractors: number;
+    /**
+     * Answers of 7 or 8.
+     */
+    passives: number;
+    /**
+     * Answers of 9 or 10.
+     */
+    promoters: number;
+    /**
+     * `(promoters - detractors) / answers * 100`, from -100 to 100.
+     */
+    score: number;
+};
+
 export type NumericRule = {
     comparison: Comparison;
     critical?: number | null;
@@ -27048,6 +27540,23 @@ export type ProjectInfo = {
 };
 
 /**
+ * The ingest setup of one project (and optionally one environment).
+ */
+export type ProjectIngestSetup = {
+    /**
+     * The environment the URLs attribute telemetry to, when one was asked for.
+     */
+    environment_id?: number | null;
+    project_id: number;
+    project_slug: string;
+    /**
+     * Public ingress URL every endpoint is built from, without a trailing slash.
+     */
+    public_base_url: string;
+    signals: Array<IngestSignalSetup>;
+};
+
+/**
  * A stored policy plus the address the console saw for the caller, so the
  * UI can offer "add my IP" and warn before a lock-out.
  */
@@ -28589,6 +29098,50 @@ export type PublicStatusPageResponse = {
     title: string;
 };
 
+export type PublicSurvey = {
+    display: PublicSurveyDisplay;
+    id: number;
+    name: string;
+    questions: Array<SurveyQuestion>;
+};
+
+/**
+ * The conditions the browser applies before showing a survey.
+ */
+export type PublicSurveyDisplay = {
+    once_per_visitor: boolean;
+    /**
+     * Page path pattern (`*` matches any run of characters); absent for
+     * every page.
+     */
+    path_pattern?: string | null;
+    /**
+     * Show after the app tracks this event; absent to show on page load.
+     */
+    trigger_event?: string | null;
+};
+
+/**
+ * Body of `POST /api/_temps/surveys`. Both fields are optional.
+ */
+export type PublicSurveysRequest = {
+    /**
+     * Attributes for the flag conditions. Override the implicit ones.
+     */
+    attributes?: {
+        [key: string]: AttributeValue;
+    };
+    /**
+     * Stable subject for sampling and flag conditions, e.g. a signed-in
+     * user id. Defaults to the Temps visitor cookie.
+     */
+    key?: string | null;
+};
+
+export type PublicSurveysResponse = {
+    surveys: Array<PublicSurvey>;
+};
+
 export type PublicUptimeDay = {
     /**
      * Mean response time of that day's checks in milliseconds, `null` when
@@ -28756,6 +29309,33 @@ export type QueryDataResponse = {
      * complete one, by a human, a script, or a model reading a tool result.
      */
     truncated: boolean;
+};
+
+export type QuestionKind = 'open_text' | 'rating' | 'nps' | 'single_choice' | 'multiple_choice';
+
+export type QuestionResults = {
+    /**
+     * Responses that answered this question.
+     */
+    answered: number;
+    /**
+     * Mean score of `rating` and `nps` answers.
+     */
+    average?: number | null;
+    /**
+     * Count per choice (declared order) or per score (ascending), zeros
+     * included. Empty for open-text questions: read those in the responses
+     * list.
+     */
+    distribution: Array<AnswerCount>;
+    kind: QuestionKind;
+    nps?: NpsSummary | null;
+    /**
+     * Answers that are not a declared choice or an in-range score.
+     */
+    other: number;
+    prompt: string;
+    question_id: string;
 };
 
 export type QuotaResponse = {
@@ -35968,6 +36548,169 @@ export type SuggestionModeSource = 'chat' | 'default';
  */
 export type SupervisorKind = 'systemd' | 'launchd' | 'container' | 'none';
 
+export type SurveyAnswerListResponse = {
+    page: number;
+    page_size: number;
+    responses: Array<SurveyAnswerSet>;
+    total: number;
+    total_pages: number;
+};
+
+export type SurveyAnswerSet = {
+    /**
+     * Answers by question id. Only declared questions, in the shape their
+     * kind allows.
+     */
+    answers: {
+        [key: string]: AnswerValue;
+    };
+    environment_id?: number | null;
+    /**
+     * Analytics event id of the `survey_sent` event.
+     */
+    event_id: number;
+    /**
+     * Page the survey was answered on.
+     */
+    pathname: string;
+    /**
+     * Session the answer was given in; links to its replay when recorded.
+     */
+    session_id?: string | null;
+    timestamp: string;
+    /**
+     * Visitor who answered; open their profile from the console.
+     */
+    visitor_id?: number | null;
+};
+
+/**
+ * Show the survey only to visitors for whom a feature flag serves a value.
+ */
+export type SurveyFlagCondition = {
+    /**
+     * Flag key in the same project.
+     */
+    key: string;
+    /**
+     * The value the flag must serve. Defaults to `true`.
+     */
+    value?: unknown;
+};
+
+export type SurveyListResponse = {
+    page: number;
+    page_size: number;
+    surveys: Array<SurveyResponse>;
+    total: number;
+    total_pages: number;
+};
+
+/**
+ * One question of a survey.
+ */
+export type SurveyQuestion = {
+    /**
+     * Options for `single_choice` and `multiple_choice`: 2-20, unique.
+     */
+    choices?: Array<string>;
+    /**
+     * Stable id the answer is recorded under: `[a-z0-9_]`, 1-32 characters,
+     * unique within the survey. Keep it when rewording a question so its
+     * answers stay together.
+     */
+    id: string;
+    kind: QuestionKind;
+    /**
+     * Label under the low end of a `rating` or `nps` scale.
+     */
+    lower_label?: string | null;
+    /**
+     * When true the visitor may skip it.
+     */
+    optional?: boolean;
+    prompt: string;
+    /**
+     * Top of a `rating` scale: 3, 5, 7 or 10. Defaults to 5.
+     */
+    scale?: number | null;
+    /**
+     * Label under the high end of a `rating` or `nps` scale.
+     */
+    upper_label?: string | null;
+};
+
+export type SurveyResponse = {
+    created_at: string;
+    description?: string | null;
+    id: number;
+    name: string;
+    project_id: number;
+    questions: Array<SurveyQuestion>;
+    status: SurveyStatus;
+    targeting: SurveyTargeting;
+    /**
+     * Send back as `expected_updated_at` to guard an update.
+     */
+    updated_at: string;
+};
+
+export type SurveyResultsResponse = {
+    /**
+     * `survey_dismissed` events in the window.
+     */
+    dismissed: number;
+    end_date: string;
+    questions: Array<QuestionResults>;
+    /**
+     * `sent / shown`; absent before the survey was shown.
+     */
+    response_rate?: number | null;
+    /**
+     * `survey_sent` events (submitted responses) in the window.
+     */
+    sent: number;
+    /**
+     * `survey_shown` events in the window.
+     */
+    shown: number;
+    start_date: string;
+    survey_id: number;
+};
+
+/**
+ * Where a survey is in its life. Only `active` surveys reach browsers.
+ */
+export type SurveyStatus = 'draft' | 'active' | 'paused' | 'completed';
+
+/**
+ * When a browser shows the survey. Every condition set must hold.
+ */
+export type SurveyTargeting = {
+    flag?: SurveyFlagCondition | null;
+    /**
+     * Never show the survey again to a visitor who saw it. Defaults to true.
+     */
+    once_per_visitor?: boolean;
+    /**
+     * Page path the survey appears on, e.g. `/checkout*`. `*` matches any
+     * run of characters; the pattern must match the whole path. Omit for
+     * every page.
+     */
+    path_pattern?: string | null;
+    /**
+     * Share of visitors, `0..=1`, who may see it. Below 1 the visitor must be
+     * identifiable (the Temps visitor cookie or an explicit key), so the
+     * decision is the same on every page.
+     */
+    sample_rate?: number;
+    /**
+     * Show only after the app tracks an analytics event with this name
+     * (`trackEvent("checkout_completed")`). Omit to show on page load.
+     */
+    trigger_event?: string | null;
+};
+
 /**
  * A commit that touched the failing file.
  */
@@ -36183,6 +36926,27 @@ export type TeamResponse = {
  * alteration blocking a downgrade.
  */
 export type TeamRole = 'owner' | 'admin' | 'deployer' | 'viewer';
+
+/**
+ * Configuration for a Telegram notification provider (Telegram Bot API
+ * `sendMessage`). Request-side config. Not `Serialize`: `bot_token` is a
+ * `SecretString`; use [`TelegramConfig::into_stored_value`].
+ */
+export type TelegramConfig = {
+    /**
+     * Bot token from @BotFather. Encrypted at rest and masked in normal API
+     * responses. Send `***` on update to keep the stored token.
+     */
+    bot_token: SecretString;
+    /**
+     * Chat to post to: a numeric user, group or channel ID (`-100…` for supergroups and channels) or a public `@channelusername`. A JSON integer is accepted too.
+     */
+    chat_id: string | number;
+    /**
+     * Optional forum topic (`message_thread_id`) for forum-style groups.
+     */
+    message_thread_id?: number | null;
+};
 
 /**
  * Area an event belongs to, for operator-facing disclosure (see
@@ -37512,7 +38276,7 @@ export type TrafficAggregationRow = {
     metrics: TrafficMetricValues;
 };
 
-export type TrafficDimension = 'client_ip' | 'method' | 'path' | 'host' | 'status_code' | 'status_class' | 'environment_id' | 'deployment_id' | 'request_source' | 'is_bot' | 'browser' | 'operating_system' | 'device_type' | 'cache_status';
+export type TrafficDimension = 'client_ip' | 'method' | 'path' | 'host' | 'status_code' | 'status_class' | 'environment_id' | 'deployment_id' | 'request_source' | 'is_bot' | 'browser' | 'operating_system' | 'device_type' | 'cache_status' | 'referrer';
 
 export type TrafficDimensionValue = {
     dimension: TrafficDimension;
@@ -37883,6 +38647,15 @@ export type UpdateAlertRuleRequest = {
     notification_priority?: string | null;
     trigger_config?: unknown;
     trigger_type?: string | null;
+};
+
+/**
+ * Body of `PUT /projects/{project_id}/analytics/identity`. Each field is
+ * optional; an omitted field keeps its value, and at least one is required.
+ */
+export type UpdateAnalyticsIdentitySettings = {
+    accept_browser_identify?: boolean | null;
+    mode?: AnalyticsIdentityMode | null;
 };
 
 /**
@@ -39369,8 +40142,34 @@ export type UpdateStatusResponse = {
     update_available: boolean;
 };
 
+export type UpdateSurveyRequest = {
+    /**
+     * `null` clears the description.
+     */
+    description?: string | null;
+    /**
+     * `updated_at` as last read. When sent, the update is refused with 409
+     * if the survey changed since.
+     */
+    expected_updated_at?: string | null;
+    name?: string | null;
+    /**
+     * Replaces every question. Keep a question's `id` to keep its answers
+     * together.
+     */
+    questions?: Array<SurveyQuestion> | null;
+    status?: SurveyStatus | null;
+    targeting?: SurveyTargeting | null;
+};
+
 export type UpdateTeamRequest = {
     description?: string | null;
+    name?: string | null;
+};
+
+export type UpdateTelegramProviderRequest = {
+    config: TelegramConfig;
+    enabled?: boolean | null;
     name?: string | null;
 };
 
@@ -40069,6 +40868,12 @@ export type VisitorDetails = {
     first_referrer_hostname?: string | null;
     first_seen: string;
     id: number;
+    identified_at?: string | null;
+    /**
+     * Who set `user_id`: `browser` (the SDK) or `server` (a deployment
+     * token). `None` while the visitor is anonymous.
+     */
+    identity_source?: string | null;
     ip_address?: string | null;
     ip_address_id?: number | null;
     is_crawler: boolean;
@@ -40079,7 +40884,16 @@ export type VisitorDetails = {
     project_id: number;
     region?: string | null;
     timezone?: string | null;
+    /**
+     * Who last set each key of `custom_data`: `{"plan": "server"}`. Keys
+     * written before identify existed are absent.
+     */
+    trait_sources?: unknown;
     user_agent?: string | null;
+    /**
+     * The app's own user id, once `identify()` labelled this visitor.
+     */
+    user_id?: string | null;
     visitor_id: string;
 };
 
@@ -40164,6 +40978,11 @@ export type VisitorInfo = {
     first_referrer_hostname?: string | null;
     first_seen: string;
     id: number;
+    /**
+     * Who set `user_id`: `browser` (the SDK) or `server` (a deployment
+     * token). `None` while the visitor is anonymous.
+     */
+    identity_source?: string | null;
     ip_address?: string | null;
     ip_address_id?: number | null;
     is_crawler: boolean;
@@ -40175,6 +40994,10 @@ export type VisitorInfo = {
     region?: string | null;
     timezone?: string | null;
     user_agent?: string | null;
+    /**
+     * The app's own user id, once `identify()` labelled this visitor.
+     */
+    user_id?: string | null;
     visitor_id: string;
 };
 
@@ -40250,6 +41073,11 @@ export type VisitorSegmentFilters = {
      * Geolocation region (matches `ip_geolocations.region`)
      */
     filter_region?: string | null;
+    /**
+     * The app's user id set by `identify()` (matches `visitor.user_id`):
+     * every device and browser the same user was identified on.
+     */
+    filter_user_id?: string | null;
 };
 
 export type VisitorSessionsQuery = {
@@ -40850,6 +41678,40 @@ export type WorkflowCredentialStatusResponse = {
      * First characters of the token, to recognise it.
      */
     prefix?: string | null;
+};
+
+/**
+ * One workflow in one environment, with its run counts.
+ */
+export type WorkflowDefinitionResponse = {
+    active_runs: number;
+    completed_runs: number;
+    /**
+     * Runs allowed to execute at once, from the manifest.
+     */
+    concurrency?: number | null;
+    environment_id: number;
+    environment_slug: string;
+    failed_runs: number;
+    last_run_at?: string | null;
+    name: string;
+    project_id: number;
+    project_slug: string;
+    state: WorkflowDefinitionState;
+    version?: string | null;
+};
+
+/**
+ * Whether the environment's current executor declares the workflow.
+ */
+export type WorkflowDefinitionState = 'available' | 'missing' | 'unknown';
+
+export type WorkflowDefinitionsResponse = {
+    page: number;
+    page_size: number;
+    total: number;
+    total_pages: number;
+    workflows: Array<WorkflowDefinitionResponse>;
 };
 
 export type WorkflowDevPollResponse = {
@@ -42427,6 +43289,56 @@ export type EvaluatePublicFlagsResponses = {
 
 export type EvaluatePublicFlagsResponse = EvaluatePublicFlagsResponses[keyof EvaluatePublicFlagsResponses];
 
+export type RecordBrowserIdentifyData = {
+    body: BrowserIdentifyPayload;
+    headers?: {
+        /**
+         * Analytics ingest key, as for `POST /_temps/event`.
+         */
+        'x-temps-analytics-key'?: string | null;
+    };
+    path?: never;
+    query?: {
+        /**
+         * Query-string fallback for the ingest key, as for `POST /_temps/event`.
+         */
+        temps_key?: string;
+    };
+    url: '/_temps/identify';
+};
+
+export type RecordBrowserIdentifyErrors = {
+    /**
+     * Empty or over-long user id, or traits that are not a JSON object within 32 keys and 8 KB
+     */
+    400: unknown;
+    /**
+     * Unknown ingest key
+     */
+    401: unknown;
+    /**
+     * Host not tracked
+     */
+    404: unknown;
+    /**
+     * Ingest rate limit, or too many visitor-changing identify calls for this project in the last minute
+     */
+    429: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type RecordBrowserIdentifyResponses = {
+    /**
+     * What identify did. Only the visitor this request already resolves to (its cookie, or the tracker's id on a keyed request) can be identified; the page never names a visitor. `applied: false` with an `outcome` says why nothing was stored: cookieless project, browser identify refused by the project, the backend already identified the visitor as someone else, or no visitor yet.
+     */
+    200: IdentifyVisitorResponse;
+};
+
+export type RecordBrowserIdentifyResponse = RecordBrowserIdentifyResponses[keyof RecordBrowserIdentifyResponses];
+
 export type OfrepPublicBulkData = {
     body: OfrepEvaluationRequest;
     path?: never;
@@ -42497,6 +43409,22 @@ export type OfrepPublicSingleResponses = {
 };
 
 export type OfrepPublicSingleResponse = OfrepPublicSingleResponses[keyof OfrepPublicSingleResponses];
+
+export type ResetBrowserIdentityData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/_temps/reset';
+};
+
+export type ResetBrowserIdentityResponses = {
+    /**
+     * The visitor and session cookies are expired, so the next page view starts a new visitor. No visitor row is changed: the previous visitor keeps its identity. The tracker clears its own stored ids itself.
+     */
+    204: void;
+};
+
+export type ResetBrowserIdentityResponse = ResetBrowserIdentityResponses[keyof ResetBrowserIdentityResponses];
 
 export type IngestTunneledEnvelopeData = {
     /**
@@ -42576,6 +43504,10 @@ export type AddSessionReplayEventsErrors = {
      * Bad request
      */
     400: ErrorResponse;
+    /**
+     * The project tracks visitors cookieless, so replay data is not stored
+     */
+    403: ErrorResponse;
     /**
      * Session not found
      */
@@ -42724,6 +43656,41 @@ export type UpdateSpeedMetricsResponses = {
 };
 
 export type UpdateSpeedMetricsResponse = UpdateSpeedMetricsResponses[keyof UpdateSpeedMetricsResponses];
+
+export type PublicSurveysData = {
+    body: PublicSurveysRequest;
+    path?: never;
+    query?: never;
+    url: '/_temps/surveys';
+};
+
+export type PublicSurveysErrors = {
+    /**
+     * Malformed or oversized context
+     */
+    400: unknown;
+    /**
+     * No environment serves this host
+     */
+    404: unknown;
+    /**
+     * Rate limit exceeded
+     */
+    429: unknown;
+    /**
+     * Surveys could not be loaded
+     */
+    503: unknown;
+};
+
+export type PublicSurveysResponses = {
+    /**
+     * Surveys this visitor may see
+     */
+    200: PublicSurveysResponse;
+};
+
+export type PublicSurveysResponse2 = PublicSurveysResponses[keyof PublicSurveysResponses];
 
 export type ListAccessServicesGeneralData = {
     body?: never;
@@ -48970,6 +49937,70 @@ export type GetEventEntriesResponses = {
 
 export type GetEventEntriesResponse = GetEventEntriesResponses[keyof GetEventEntriesResponses];
 
+export type GetEventPropertiesData = {
+    body?: never;
+    path?: never;
+    query: {
+        /**
+         * Event to break down, e.g. outbound_click
+         */
+        event_name: string;
+        /**
+         * Top-level property key to group by, e.g. url. Letters, digits, '_', '-' and '.'; at most 64 characters
+         */
+        property: string;
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID (optional)
+         */
+        environment_id?: number;
+        /**
+         * Start date (ISO 8601)
+         */
+        start_date: string;
+        /**
+         * End date (ISO 8601)
+         */
+        end_date: string;
+        /**
+         * Maximum number of values (default: 20, max: 100)
+         */
+        limit?: number;
+    };
+    url: '/analytics/event-properties';
+};
+
+export type GetEventPropertiesErrors = {
+    /**
+     * Invalid property name or parameters
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetEventPropertiesResponses = {
+    /**
+     * Property values ranked by occurrences
+     */
+    200: EventPropertiesResponse;
+};
+
+export type GetEventPropertiesResponse = GetEventPropertiesResponses[keyof GetEventPropertiesResponses];
+
 export type GetEventVisitorsData = {
     body?: never;
     path?: never;
@@ -49848,6 +50879,10 @@ export type GetVisitorFacetsData = {
          * First-touch referrer hostname (use 'Direct' for null)
          */
         filter_referrer?: string;
+        /**
+         * User id set by identify(): the same user on every device
+         */
+        filter_user_id?: string;
     };
     url: '/analytics/visitor-facets';
 };
@@ -49928,6 +50963,10 @@ export type GetVisitorsData = {
          * First-touch referrer hostname (use 'Direct' for null)
          */
         filter_referrer?: string;
+        /**
+         * User id set by identify(): the same user on every device
+         */
+        filter_user_id?: string;
     };
     url: '/analytics/visitors';
 };
@@ -50126,6 +51165,50 @@ export type EnrichVisitorResponses = {
 };
 
 export type EnrichVisitorResponse2 = EnrichVisitorResponses[keyof EnrichVisitorResponses];
+
+export type IdentifyVisitorForTokenData = {
+    body: IdentifyVisitorRequest;
+    path: {
+        /**
+         * The sealed `enc_...` value of the `_temps_visitor_id` cookie, or the browser tracker's stored visitor id sealed the same way. Deployment tokens may only pass a sealed value.
+         */
+        visitor_id: string;
+    };
+    query?: never;
+    url: '/analytics/visitors/{visitor_id}/identify';
+};
+
+export type IdentifyVisitorForTokenErrors = {
+    /**
+     * Not a project-scoped token, an empty or over-long user id, or traits that are not a JSON object within 32 keys and 8 KB
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Missing `visitors:enrich`, or a raw visitor id
+     */
+    403: unknown;
+    /**
+     * The deployment token made too many visitor-changing writes in the last minute
+     */
+    429: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type IdentifyVisitorForTokenResponses = {
+    /**
+     * What identify did. `applied: false` with an `outcome` says why nothing was stored (unknown visitor, cookieless project).
+     */
+    200: IdentifyVisitorResponse;
+};
+
+export type IdentifyVisitorForTokenResponse = IdentifyVisitorForTokenResponses[keyof IdentifyVisitorForTokenResponses];
 
 export type GetVisitorInfoData = {
     body?: never;
@@ -63800,6 +64883,52 @@ export type SetConnectorEnvironmentHostsResponses = {
 
 export type SetConnectorEnvironmentHostsResponse = SetConnectorEnvironmentHostsResponses[keyof SetConnectorEnvironmentHostsResponses];
 
+export type RetryIngressHostnameDnsData = {
+    body?: never;
+    path: {
+        id: number;
+        hostname: string;
+    };
+    query?: never;
+    url: '/ingress/connectors/{id}/hostnames/{hostname}/retry-dns';
+};
+
+export type RetryIngressHostnameDnsErrors = {
+    /**
+     * Invalid hostname
+     */
+    400: unknown;
+    /**
+     * Authentication required
+     */
+    401: unknown;
+    /**
+     * Settings write permission required
+     */
+    403: unknown;
+    /**
+     * Hostname is no longer eligible on this connector
+     */
+    409: unknown;
+    /**
+     * Could not load or save the publication
+     */
+    500: unknown;
+    /**
+     * Could not resolve the managed zone
+     */
+    502: unknown;
+};
+
+export type RetryIngressHostnameDnsResponses = {
+    /**
+     * Publication result, including any DNS conflict
+     */
+    200: HostnameView;
+};
+
+export type RetryIngressHostnameDnsResponse = RetryIngressHostnameDnsResponses[keyof RetryIngressHostnameDnsResponses];
+
 export type GetIngressConnectorLinksData = {
     body?: never;
     path: {
@@ -69189,6 +70318,85 @@ export type UpdateSlackProviderResponses = {
 };
 
 export type UpdateSlackProviderResponse = UpdateSlackProviderResponses[keyof UpdateSlackProviderResponses];
+
+export type CreateTelegramProviderData = {
+    body: CreateTelegramProviderRequest;
+    path?: never;
+    query?: never;
+    url: '/notification-providers/telegram';
+};
+
+export type CreateTelegramProviderErrors = {
+    /**
+     * Invalid bot token, chat ID or topic ID
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type CreateTelegramProviderResponses = {
+    /**
+     * Successfully created Telegram provider
+     */
+    201: NotificationProviderResponse;
+};
+
+export type CreateTelegramProviderResponse = CreateTelegramProviderResponses[keyof CreateTelegramProviderResponses];
+
+export type UpdateTelegramProviderData = {
+    body: UpdateTelegramProviderRequest;
+    path: {
+        /**
+         * Provider ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/notification-providers/telegram/{id}';
+};
+
+export type UpdateTelegramProviderErrors = {
+    /**
+     * Invalid bot token, chat ID or topic ID
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Provider not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UpdateTelegramProviderResponses = {
+    /**
+     * Successfully updated Telegram provider
+     */
+    200: NotificationProviderResponse;
+};
+
+export type UpdateTelegramProviderResponse = UpdateTelegramProviderResponses[keyof UpdateTelegramProviderResponses];
 
 export type CreateWebhookProviderData = {
     body: CreateWebhookProviderRequest;
@@ -77264,6 +78472,432 @@ export type GetFilteredTrafficResponses = {
 
 export type GetFilteredTrafficResponse = GetFilteredTrafficResponses[keyof GetFilteredTrafficResponses];
 
+export type ListAnalyticsGoalsData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: {
+        /**
+         * 1-based page, default 1.
+         */
+        page?: number | null;
+        /**
+         * Default 20, at most 100.
+         */
+        page_size?: number | null;
+    };
+    url: '/projects/{project_id}/analytics/goals';
+};
+
+export type ListAnalyticsGoalsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListAnalyticsGoalsResponses = {
+    /**
+     * Goals
+     */
+    200: AnalyticsGoalListResponse;
+};
+
+export type ListAnalyticsGoalsResponse = ListAnalyticsGoalsResponses[keyof ListAnalyticsGoalsResponses];
+
+export type CreateAnalyticsGoalData = {
+    body: AnalyticsGoalInput;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/analytics/goals';
+};
+
+export type CreateAnalyticsGoalErrors = {
+    /**
+     * Invalid goal
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Name taken or goal limit reached
+     */
+    409: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type CreateAnalyticsGoalResponses = {
+    /**
+     * Goal created
+     */
+    201: AnalyticsGoal;
+};
+
+export type CreateAnalyticsGoalResponse = CreateAnalyticsGoalResponses[keyof CreateAnalyticsGoalResponses];
+
+export type GetAnalyticsGoalStatsData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query: {
+        /**
+         * Inclusive start (ISO 8601).
+         */
+        start_date: string;
+        /**
+         * Exclusive end (ISO 8601).
+         */
+        end_date: string;
+        environment_id?: number | null;
+    };
+    url: '/projects/{project_id}/analytics/goals/stats';
+};
+
+export type GetAnalyticsGoalStatsErrors = {
+    /**
+     * Invalid period
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetAnalyticsGoalStatsResponses = {
+    /**
+     * Conversion figures
+     */
+    200: AnalyticsGoalStatsResponse;
+};
+
+export type GetAnalyticsGoalStatsResponse = GetAnalyticsGoalStatsResponses[keyof GetAnalyticsGoalStatsResponses];
+
+export type DeleteAnalyticsGoalData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Goal ID
+         */
+        goal_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/analytics/goals/{goal_id}';
+};
+
+export type DeleteAnalyticsGoalErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Goal not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type DeleteAnalyticsGoalResponses = {
+    /**
+     * Goal deleted
+     */
+    204: void;
+};
+
+export type DeleteAnalyticsGoalResponse = DeleteAnalyticsGoalResponses[keyof DeleteAnalyticsGoalResponses];
+
+export type GetAnalyticsGoalData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Goal ID
+         */
+        goal_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/analytics/goals/{goal_id}';
+};
+
+export type GetAnalyticsGoalErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Goal not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetAnalyticsGoalResponses = {
+    /**
+     * Goal
+     */
+    200: AnalyticsGoal;
+};
+
+export type GetAnalyticsGoalResponse = GetAnalyticsGoalResponses[keyof GetAnalyticsGoalResponses];
+
+export type UpdateAnalyticsGoalData = {
+    body: AnalyticsGoalInput;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Goal ID
+         */
+        goal_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/analytics/goals/{goal_id}';
+};
+
+export type UpdateAnalyticsGoalErrors = {
+    /**
+     * Invalid goal
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Goal not found
+     */
+    404: unknown;
+    /**
+     * Name taken
+     */
+    409: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UpdateAnalyticsGoalResponses = {
+    /**
+     * Goal updated
+     */
+    200: AnalyticsGoal;
+};
+
+export type UpdateAnalyticsGoalResponse = UpdateAnalyticsGoalResponses[keyof UpdateAnalyticsGoalResponses];
+
+export type GetAnalyticsGoalBreakdownData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Goal ID
+         */
+        goal_id: number;
+    };
+    query: {
+        dimension: AnalyticsGoalBreakdownDimension;
+        /**
+         * Inclusive start (ISO 8601).
+         */
+        start_date: string;
+        /**
+         * Exclusive end (ISO 8601).
+         */
+        end_date: string;
+        environment_id?: number | null;
+        /**
+         * Rows to return, default 10, at most 100.
+         */
+        limit?: number | null;
+    };
+    url: '/projects/{project_id}/analytics/goals/{goal_id}/breakdown';
+};
+
+export type GetAnalyticsGoalBreakdownErrors = {
+    /**
+     * Invalid period or limit
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Goal not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetAnalyticsGoalBreakdownResponses = {
+    /**
+     * Breakdown
+     */
+    200: AnalyticsGoalBreakdownResponse;
+};
+
+export type GetAnalyticsGoalBreakdownResponse = GetAnalyticsGoalBreakdownResponses[keyof GetAnalyticsGoalBreakdownResponses];
+
+export type GetAnalyticsIdentitySettingsData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/analytics/identity';
+};
+
+export type GetAnalyticsIdentitySettingsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Project not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetAnalyticsIdentitySettingsResponses = {
+    /**
+     * Identity settings
+     */
+    200: AnalyticsIdentitySettings;
+};
+
+export type GetAnalyticsIdentitySettingsResponse = GetAnalyticsIdentitySettingsResponses[keyof GetAnalyticsIdentitySettingsResponses];
+
+export type UpdateAnalyticsIdentitySettingsData = {
+    body: UpdateAnalyticsIdentitySettings;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/analytics/identity';
+};
+
+export type UpdateAnalyticsIdentitySettingsErrors = {
+    /**
+     * Unknown mode, or nothing to change
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Project not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UpdateAnalyticsIdentitySettingsResponses = {
+    /**
+     * Identity settings updated
+     */
+    200: AnalyticsIdentitySettings;
+};
+
+export type UpdateAnalyticsIdentitySettingsResponse = UpdateAnalyticsIdentitySettingsResponses[keyof UpdateAnalyticsIdentitySettingsResponses];
+
 export type GetAnalyticsIngestKeyEndpointData = {
     body?: never;
     path: {
@@ -77744,6 +79378,58 @@ export type DeleteTrafficFilterResponses = {
 };
 
 export type DeleteTrafficFilterResponse = DeleteTrafficFilterResponses[keyof DeleteTrafficFilterResponses];
+
+export type IdentifyVisitorData = {
+    body: IdentifyVisitorRequest;
+    path: {
+        /**
+         * Project the visitor belongs to
+         */
+        project_id: number;
+        /**
+         * The sealed `enc_...` value of the `_temps_visitor_id` cookie. User and API-key callers may also pass the raw visitor id; deployment tokens may not.
+         */
+        visitor_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/analytics/visitors/{visitor_id}/identify';
+};
+
+export type IdentifyVisitorErrors = {
+    /**
+     * Empty or over-long user id, or traits that are not a JSON object within 32 keys and 8 KB
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Missing analytics write (`visitors:enrich` for deployment tokens), another project, or a deployment token with a raw visitor id
+     */
+    403: unknown;
+    /**
+     * Project not found
+     */
+    404: unknown;
+    /**
+     * The deployment token made too many visitor-changing writes in the last minute
+     */
+    429: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type IdentifyVisitorResponses = {
+    /**
+     * What identify did. `applied: false` with an `outcome` says why nothing was stored (unknown visitor, cookieless project).
+     */
+    200: IdentifyVisitorResponse;
+};
+
+export type IdentifyVisitorResponse2 = IdentifyVisitorResponses[keyof IdentifyVisitorResponses];
 
 export type GetApiCallersData = {
     body?: never;
@@ -90105,6 +91791,53 @@ export type GetBucketedIncidentsResponses = {
 
 export type GetBucketedIncidentsResponse = GetBucketedIncidentsResponses[keyof GetBucketedIncidentsResponses];
 
+export type GetProjectIngestSetupData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: {
+        /**
+         * Attribute telemetry to this environment of the project.
+         */
+        environment_id?: number;
+    };
+    url: '/projects/{project_id}/ingest-setup';
+};
+
+export type GetProjectIngestSetupErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Project or environment not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetProjectIngestSetupError = GetProjectIngestSetupErrors[keyof GetProjectIngestSetupErrors];
+
+export type GetProjectIngestSetupResponses = {
+    /**
+     * Ingest setup of the project
+     */
+    200: ProjectIngestSetup;
+};
+
+export type GetProjectIngestSetupResponse = GetProjectIngestSetupResponses[keyof GetProjectIngestSetupResponses];
+
 export type GetInheritedEnvVarsData = {
     body?: never;
     path: {
@@ -93265,6 +94998,373 @@ export type GetStatusOverviewResponses = {
 };
 
 export type GetStatusOverviewResponse = GetStatusOverviewResponses[keyof GetStatusOverviewResponses];
+
+export type ListSurveysData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: {
+        /**
+         * Only surveys in this status.
+         */
+        status?: SurveyStatus;
+        /**
+         * Page number, from 1. Default 1.
+         */
+        page?: number;
+        /**
+         * Surveys per page. Default 20, maximum 100.
+         */
+        page_size?: number;
+    };
+    url: '/projects/{project_id}/surveys';
+};
+
+export type ListSurveysErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions (requires surveys:read)
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListSurveysResponses = {
+    /**
+     * Surveys, newest first
+     */
+    200: SurveyListResponse;
+};
+
+export type ListSurveysResponse = ListSurveysResponses[keyof ListSurveysResponses];
+
+export type CreateSurveyData = {
+    body: CreateSurveyRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/surveys';
+};
+
+export type CreateSurveyErrors = {
+    /**
+     * Invalid survey
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions (requires surveys:write)
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type CreateSurveyResponses = {
+    /**
+     * Survey created
+     */
+    201: SurveyResponse;
+};
+
+export type CreateSurveyResponse = CreateSurveyResponses[keyof CreateSurveyResponses];
+
+export type DeleteSurveyData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Survey ID
+         */
+        survey_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/surveys/{survey_id}';
+};
+
+export type DeleteSurveyErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions (requires surveys:write)
+     */
+    403: unknown;
+    /**
+     * Survey not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type DeleteSurveyResponses = {
+    /**
+     * Survey deleted; its answers stay in analytics
+     */
+    200: DeleteSurveyResponse;
+};
+
+export type DeleteSurveyResponse2 = DeleteSurveyResponses[keyof DeleteSurveyResponses];
+
+export type GetSurveyData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Survey ID
+         */
+        survey_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/surveys/{survey_id}';
+};
+
+export type GetSurveyErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions (requires surveys:read)
+     */
+    403: unknown;
+    /**
+     * Survey not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetSurveyResponses = {
+    /**
+     * The survey
+     */
+    200: SurveyResponse;
+};
+
+export type GetSurveyResponse = GetSurveyResponses[keyof GetSurveyResponses];
+
+export type UpdateSurveyData = {
+    body: UpdateSurveyRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Survey ID
+         */
+        survey_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/surveys/{survey_id}';
+};
+
+export type UpdateSurveyErrors = {
+    /**
+     * Invalid survey
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions (requires surveys:write)
+     */
+    403: unknown;
+    /**
+     * Survey not found
+     */
+    404: unknown;
+    /**
+     * The survey changed since expected_updated_at
+     */
+    409: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UpdateSurveyResponses = {
+    /**
+     * Survey updated
+     */
+    200: SurveyResponse;
+};
+
+export type UpdateSurveyResponse = UpdateSurveyResponses[keyof UpdateSurveyResponses];
+
+export type ListSurveyResponsesData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Survey ID
+         */
+        survey_id: number;
+    };
+    query?: {
+        /**
+         * Start of the window, RFC 3339. Default: 30 days before `end_date`.
+         */
+        start_date?: string;
+        /**
+         * End of the window (exclusive), RFC 3339. Default: now.
+         */
+        end_date?: string;
+        /**
+         * Only answers recorded in this environment.
+         */
+        environment_id?: number;
+        /**
+         * Responses list only: page number, from 1.
+         */
+        page?: number;
+        /**
+         * Responses list only: responses per page, default 20, maximum 100.
+         */
+        page_size?: number;
+    };
+    url: '/projects/{project_id}/surveys/{survey_id}/responses';
+};
+
+export type ListSurveyResponsesErrors = {
+    /**
+     * Invalid time window
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions (requires surveys:read)
+     */
+    403: unknown;
+    /**
+     * Survey not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListSurveyResponsesResponses = {
+    /**
+     * Submitted responses, newest first
+     */
+    200: SurveyAnswerListResponse;
+};
+
+export type ListSurveyResponsesResponse = ListSurveyResponsesResponses[keyof ListSurveyResponsesResponses];
+
+export type GetSurveyResultsData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Survey ID
+         */
+        survey_id: number;
+    };
+    query?: {
+        /**
+         * Start of the window, RFC 3339. Default: 30 days before `end_date`.
+         */
+        start_date?: string;
+        /**
+         * End of the window (exclusive), RFC 3339. Default: now.
+         */
+        end_date?: string;
+        /**
+         * Only answers recorded in this environment.
+         */
+        environment_id?: number;
+        /**
+         * Responses list only: page number, from 1.
+         */
+        page?: number;
+        /**
+         * Responses list only: responses per page, default 20, maximum 100.
+         */
+        page_size?: number;
+    };
+    url: '/projects/{project_id}/surveys/{survey_id}/results';
+};
+
+export type GetSurveyResultsErrors = {
+    /**
+     * Invalid time window
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions (requires surveys:read)
+     */
+    403: unknown;
+    /**
+     * Survey not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetSurveyResultsResponses = {
+    /**
+     * Response rate and per-question results
+     */
+    200: SurveyResultsResponse;
+};
+
+export type GetSurveyResultsResponse = GetSurveyResultsResponses[keyof GetSurveyResultsResponses];
 
 export type ListTelemetryReleasesData = {
     body?: never;
@@ -103077,6 +105177,46 @@ export type RecordRunStepResponses = {
 };
 
 export type RecordRunStepResponse = RecordRunStepResponses[keyof RecordRunStepResponses];
+
+export type ListWorkflowDefinitionsData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * 1-based page; default 1.
+         */
+        page?: number | null;
+        /**
+         * Default 20, at most 100.
+         */
+        page_size?: number | null;
+    };
+    url: '/workflows/definitions';
+};
+
+export type ListWorkflowDefinitionsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Access or database failure
+     */
+    500: unknown;
+};
+
+export type ListWorkflowDefinitionsResponses = {
+    /**
+     * Workflows across the projects the caller may read, most recently run first
+     */
+    200: WorkflowDefinitionsResponse;
+};
+
+export type ListWorkflowDefinitionsResponse = ListWorkflowDefinitionsResponses[keyof ListWorkflowDefinitionsResponses];
 
 export type ListAllWorkflowRunsData = {
     body?: never;

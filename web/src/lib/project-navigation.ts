@@ -37,6 +37,7 @@ import {
   FileCode,
   FileText,
   Filter,
+  MessageSquareText,
   Gauge,
   GitBranch,
   GitFork,
@@ -287,6 +288,11 @@ export const PROJECT_NAV_GROUPS: ProjectNavGroup[] = [
           },
           { title: 'Pages', icon: FileText, url: 'analytics/pages' },
           { title: 'Funnels', icon: Filter, url: 'analytics/funnels' },
+          {
+            title: 'Surveys',
+            icon: MessageSquareText,
+            url: 'analytics/surveys',
+          },
           {
             title: 'Activity report',
             icon: CalendarRange,

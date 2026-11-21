@@ -1,0 +1,50 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "temps-surveys"
+version.workspace = true
+edition.workspace = true
+description = "In-app surveys: per-project questions shown by the browser SDK, answered as analytics events, summarised per survey"
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+# Internal crates
+temps-core = { path = "../temps-core" }
+temps-authz = { path = "../temps-authz" }
+temps-entities = { path = "../temps-entities" }
+temps-flags = { path = "../temps-flags" }
+temps-routes = { path = "../temps-routes" }
+temps-geo = { path = "../temps-geo" }
+
+# Web framework
+axum.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Error handling & logging
+thiserror.workspace = true
+tracing.workspace = true
+
+# Date/Time
+chrono.workspace = true
+
+# API Documentation
+utoipa.workspace = true
+
+# Data access
+sea-orm.workspace = true
+
+# Public endpoint: lock-free survey cache, bounded loads
+arc-swap.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
+async-trait.workspace = true
+
+[lints]
+workspace = true

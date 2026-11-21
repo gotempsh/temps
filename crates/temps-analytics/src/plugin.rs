@@ -90,6 +90,28 @@ impl TempsPlugin for AnalyticsPlugin {
             context.register_service(Arc::new(AnalyticsIngestKeyService::new(db.clone())));
             context.register_service(Arc::new(AnalyticsIngestRateLimiter::new()));
 
+            // ADR 109 D3. One instance for the identity settings endpoint and
+            // every ingest path, so they share the daily salt, the session
+            // cache and the identity-mode cache a settings change clears.
+            let cookieless = Arc::new(crate::cookieless::CookielessIdentity::new(
+                db.clone(),
+                context.require_service::<temps_core::EncryptionService>(),
+            ));
+            context.register_service(Arc::new(
+                crate::identity_settings::AnalyticsIdentityService::new(
+                    db.clone(),
+                    cookieless.clone(),
+                ),
+            ));
+            context.register_service(cookieless);
+            // ADR 109 D4: identify, from the browser (ingest) and the backend.
+            context.register_service(Arc::new(
+                crate::visitor_identity::VisitorIdentityService::new(
+                    db.clone(),
+                    cookie_crypto.clone(),
+                ),
+            ));
+
             tracing::debug!("Analytics plugin services registered successfully");
             Ok(())
         })
@@ -112,6 +134,8 @@ impl TempsPlugin for AnalyticsPlugin {
                 300,
                 std::time::Duration::from_secs(60),
             )),
+            visitor_identity: context
+                .require_service::<crate::visitor_identity::VisitorIdentityService>(),
         });
 
         // ADR-040 ingest-key admin CRUD. Its own state so the key service and
@@ -149,7 +173,19 @@ impl TempsPlugin for AnalyticsPlugin {
                     project_access_checker:
                         context.get_service::<dyn temps_core::ProjectAccessChecker>(),
                 },
-            )));
+            )))
+            .merge(
+                crate::identity_settings::routes().with_state(Arc::new(
+                    crate::identity_settings::AnalyticsIdentityState {
+                        service: context
+                            .require_service::<crate::identity_settings::AnalyticsIdentityService>(
+                            ),
+                        audit: context.require_service::<dyn temps_core::AuditLogger>(),
+                        project_access_checker: context
+                            .get_service::<dyn temps_core::ProjectAccessChecker>(),
+                    },
+                )),
+            );
 
         Some(PluginRoutes::new(routes))
     }
@@ -159,6 +195,11 @@ impl TempsPlugin for AnalyticsPlugin {
         context: &'a PluginContext,
     ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
         Box::pin(async move {
+            // Deletes past days' cookieless salts even without cookieless
+            // traffic to trigger the daily refresh (ADR 109 D3).
+            crate::cookieless::spawn_salt_sweep(
+                context.require_service::<crate::cookieless::CookielessIdentity>(),
+            );
             let activity = context.require_service::<crate::activity::service::ActivityService>();
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
@@ -271,6 +312,7 @@ impl TempsPlugin for AnalyticsPlugin {
         doc.merge(AnalyticsIngestKeyApiDoc::openapi());
         doc.merge(crate::global_handler::GlobalAnalyticsApiDoc::openapi());
         doc.merge(crate::activity::handlers::ActivityApiDoc::openapi());
+        doc.merge(crate::identity_settings::AnalyticsIdentityApiDoc::openapi());
         Some(doc)
     }
 }

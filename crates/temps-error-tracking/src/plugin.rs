@@ -573,6 +573,8 @@ impl TempsPlugin for ErrorTrackingPlugin {
             route_table,
             dsn_service: tunnel_dsn_service,
             rate_limiter: crate::sentry::rate_limiter::IngestRateLimiter::new(),
+            cookieless_identity: context
+                .require_service::<temps_analytics::cookieless::CookielessIdentity>(),
         });
         let sentry_routes = crate::sentry::handlers::configure_routes().with_state(sentry_state);
 

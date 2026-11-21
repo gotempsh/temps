@@ -36,6 +36,8 @@ pub struct AppState {
     /// Caps the visitor-changing enrichments (and so the audit rows) a single
     /// deployment token can create per minute.
     pub enrich_budget: Arc<crate::visitor_audit::EnrichWriteBudget>,
+    /// Identify (ADR 109 D4): attach a user id and traits to a visitor.
+    pub visitor_identity: Arc<crate::visitor_identity::VisitorIdentityService>,
 }
 
 #[derive(OpenApi)]
@@ -49,12 +51,15 @@ pub struct AppState {
         get_event_detail,
         get_event_visitors,
         get_event_entries,
+        get_event_properties,
         get_visitors,
         get_visitor_facets,
         get_visitor_details,
         get_visitor_info,
         get_visitor_stats,
         enrich_visitor,
+        identify_visitor,
+        identify_visitor_for_token,
         get_analytics_visitor_sessions,
         get_visitor_journey,
         get_session_details,
@@ -111,6 +116,9 @@ pub struct AppState {
         SessionEventsResponse,
         SessionLogsResponse,
         EnrichVisitorRequest,
+        crate::visitor_identity::IdentifyVisitorRequest,
+        crate::visitor_identity::IdentifyVisitorResponse,
+        crate::visitor_identity::IdentifyOutcome,
         EnrichVisitorResponse,
         HasAnalyticsEventsResponse,
         PageSessionStats,
@@ -192,6 +200,9 @@ pub struct AppState {
         EventEntriesQuery,
         EventEntriesResponse,
         EventEntryInfo,
+        EventPropertiesQuery,
+        EventPropertiesResponse,
+        EventPropertyValue,
     )),
     info(
         title = "Analytics API",
@@ -226,6 +237,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         .route("/analytics/event-detail", get(get_event_detail))
         .route("/analytics/event-visitors", get(get_event_visitors))
         .route("/analytics/event-entries", get(get_event_entries))
+        .route("/analytics/event-properties", get(get_event_properties))
         .route("/analytics/visitors", get(get_visitors))
         .route("/analytics/visitor-facets", get(get_visitor_facets))
         .route("/analytics/visitors/{visitor_id}", get(get_visitor_details))
@@ -242,6 +254,16 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
             // A real payload is a few identity fields. Reject anything larger
             // before it is buffered and parsed.
             put(enrich_visitor).layer(axum::extract::DefaultBodyLimit::max(ENRICH_MAX_BODY_BYTES)),
+        )
+        .route(
+            "/projects/{project_id}/analytics/visitors/{visitor_id}/identify",
+            put(identify_visitor)
+                .layer(axum::extract::DefaultBodyLimit::max(ENRICH_MAX_BODY_BYTES)),
+        )
+        .route(
+            "/analytics/visitors/{visitor_id}/identify",
+            put(identify_visitor_for_token)
+                .layer(axum::extract::DefaultBodyLimit::max(ENRICH_MAX_BODY_BYTES)),
         )
         .route(
             "/analytics/visitors/{visitor_id}/sessions",
@@ -632,6 +654,7 @@ pub async fn get_analytics_events_count(
         ("filter_city" = Option<String>, Query, description = "Geolocation city"),
         ("filter_channel" = Option<String>, Query, description = "First-touch channel"),
         ("filter_referrer" = Option<String>, Query, description = "First-touch referrer hostname (use 'Direct' for null)"),
+        ("filter_user_id" = Option<String>, Query, description = "User id set by identify(): the same user on every device"),
     ),
     responses(
         (status = 200, description = "Successfully retrieved visitors", body = VisitorsResponse),
@@ -694,6 +717,7 @@ pub async fn get_visitors(
         ("filter_city" = Option<String>, Query, description = "Geolocation city"),
         ("filter_channel" = Option<String>, Query, description = "First-touch channel"),
         ("filter_referrer" = Option<String>, Query, description = "First-touch referrer hostname (use 'Direct' for null)"),
+        ("filter_user_id" = Option<String>, Query, description = "User id set by identify(): the same user on every device"),
     ),
     responses(
         (status = 200, description = "Top values per dimension", body = VisitorFacets),
@@ -1267,6 +1291,215 @@ pub async fn enrich_visitor(
     Ok(Json(response))
 }
 
+impl From<crate::visitor_identity::VisitorIdentityError> for Problem {
+    fn from(error: crate::visitor_identity::VisitorIdentityError) -> Self {
+        use crate::visitor_identity::VisitorIdentityError;
+        match error {
+            VisitorIdentityError::Validation { .. } => bad_request()
+                .title("Invalid Identify Call")
+                .detail(error.to_string())
+                .build(),
+            VisitorIdentityError::ProjectNotFound { .. } => not_found()
+                .title("Project Not Found")
+                .detail(error.to_string())
+                .build(),
+            VisitorIdentityError::Database { .. } => internal_server_error()
+                .title("Identify Failed")
+                .detail(error.to_string())
+                .build(),
+        }
+    }
+}
+
+#[utoipa::path(
+    tag = "Analytics",
+    put,
+    path = "/projects/{project_id}/analytics/visitors/{visitor_id}/identify",
+    params(
+        ("project_id" = i32, Path, description = "Project the visitor belongs to"),
+        ("visitor_id" = String, Path, description = "The sealed `enc_...` value of the `_temps_visitor_id` cookie. User and API-key callers may also pass the raw visitor id; deployment tokens may not."),
+    ),
+    request_body = crate::visitor_identity::IdentifyVisitorRequest,
+    responses(
+        (status = 200, description = "What identify did. `applied: false` with an `outcome` says why nothing was stored (unknown visitor, cookieless project).", body = crate::visitor_identity::IdentifyVisitorResponse),
+        (status = 400, description = "Empty or over-long user id, or traits that are not a JSON object within 32 keys and 8 KB"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Missing analytics write (`visitors:enrich` for deployment tokens), another project, or a deployment token with a raw visitor id"),
+        (status = 404, description = "Project not found"),
+        (status = 429, description = "The deployment token made too many visitor-changing writes in the last minute"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+/// Identify a visitor from the app's backend (ADR 109 D4).
+///
+/// Sets the visitor's `user_id` and merges `traits` into its `custom_data`,
+/// both marked as vouched for by the backend: a later `identify()` from the
+/// browser cannot replace them. Deployed apps call it with the injected
+/// deployment token (`visitors:enrich`) and the sealed `_temps_visitor_id`
+/// cookie of the request, which the Node SDK's `analytics.identify(request,
+/// ...)` reads for them. In a cookieless project nothing is stored.
+pub async fn identify_visitor(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<AppState>>,
+    Extension(metadata): Extension<temps_core::RequestMetadata>,
+    axum::extract::Path((project_id, visitor_id)): axum::extract::Path<(i32, String)>,
+    Json(request): Json<crate::visitor_identity::IdentifyVisitorRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, AnalyticsWrite);
+    identify_visitor_in_project(auth, &app_state, metadata, project_id, &visitor_id, request).await
+}
+
+#[utoipa::path(
+    tag = "Analytics",
+    put,
+    path = "/analytics/visitors/{visitor_id}/identify",
+    params(
+        ("visitor_id" = String, Path, description = "The sealed `enc_...` value of the `_temps_visitor_id` cookie, or the browser tracker's stored visitor id sealed the same way. Deployment tokens may only pass a sealed value."),
+    ),
+    request_body = crate::visitor_identity::IdentifyVisitorRequest,
+    responses(
+        (status = 200, description = "What identify did. `applied: false` with an `outcome` says why nothing was stored (unknown visitor, cookieless project).", body = crate::visitor_identity::IdentifyVisitorResponse),
+        (status = 400, description = "Not a project-scoped token, an empty or over-long user id, or traits that are not a JSON object within 32 keys and 8 KB"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Missing `visitors:enrich`, or a raw visitor id"),
+        (status = 429, description = "The deployment token made too many visitor-changing writes in the last minute"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+/// Identify a visitor of the token's own project (ADR 109 D4)
+///
+/// The form a deployed app uses: the project comes from its injected
+/// deployment token, so the app needs no project id. Behaves exactly like
+/// `PUT /projects/{project_id}/analytics/visitors/{visitor_id}/identify`,
+/// which callers without a project-scoped token use instead.
+pub async fn identify_visitor_for_token(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<AppState>>,
+    Extension(metadata): Extension<temps_core::RequestMetadata>,
+    axum::extract::Path(visitor_id): axum::extract::Path<String>,
+    Json(request): Json<crate::visitor_identity::IdentifyVisitorRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, AnalyticsWrite);
+    let Some(project_id) = auth.project_id() else {
+        return Err(bad_request()
+            .title("Project Required")
+            .detail(format!(
+                "Identifying visitor {visitor_id} needs a project: this credential is not scoped to one, so use PUT /projects/{{project_id}}/analytics/visitors/{{visitor_id}}/identify"
+            ))
+            .build());
+    };
+    identify_visitor_in_project(auth, &app_state, metadata, project_id, &visitor_id, request).await
+}
+
+async fn identify_visitor_in_project(
+    auth: temps_authz::context::AuthContext,
+    app_state: &AppState,
+    metadata: temps_core::RequestMetadata,
+    project_id: i32,
+    visitor_id: &str,
+    request: crate::visitor_identity::IdentifyVisitorRequest,
+) -> Result<Json<crate::visitor_identity::IdentifyVisitorResponse>, Problem> {
+    use crate::visitor_identity::{
+        validate_identify_input, IdentifyOutcome, IdentifyVisitorResponse,
+    };
+    use temps_entities::visitor_identity_source::VisitorIdentitySource;
+
+    // Both callers have already checked `AnalyticsWrite`.
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, app_state.project_access_checker);
+
+    let input = validate_identify_input(project_id, &request.user_id, request.traits.as_ref())?;
+
+    // Same rules and write budget as enrichment for a deployment token.
+    let reservation = match auth.deployment_token_info() {
+        Some(token) => {
+            deployment_token_enrich_guard(
+                visitor_id,
+                &serde_json::Value::Object(input.traits.clone()),
+            )?;
+            match app_state.enrich_budget.try_reserve(token.token_id) {
+                Ok(reservation) => Some(reservation),
+                Err(refused) => {
+                    if refused.first_in_window {
+                        tracing::warn!(
+                            deployment_token_id = token.token_id,
+                            project_id,
+                            "Deployment token exceeded its visitor write budget; \
+                             identify calls are refused until the window resets"
+                        );
+                    }
+                    return Err(too_many_requests()
+                        .detail(format!(
+                            "This deployment token made too many visitor-changing writes for \
+                             project {project_id} in the last minute; retry shortly"
+                        ))
+                        .build());
+                }
+            }
+        }
+        None => None,
+    };
+
+    let Some(guid) = app_state.visitor_identity.visitor_guid(visitor_id) else {
+        return Ok(Json(IdentifyVisitorResponse::from(
+            IdentifyOutcome::VisitorNotFound,
+        )));
+    };
+    let result = app_state
+        .visitor_identity
+        .identify(project_id, &guid, VisitorIdentitySource::Server, &input)
+        .await?;
+
+    if result.outcome == IdentifyOutcome::Updated {
+        if let Some(reservation) = reservation {
+            reservation.commit();
+        }
+        let (trait_keys, trait_key_count) =
+            crate::visitor_audit::bounded_key_names(result.set_keys.iter());
+        let (removed_keys, removed_key_count) =
+            crate::visitor_audit::bounded_key_names(result.removed_keys.iter());
+        let token = auth.deployment_token_info();
+        let audit = crate::visitor_audit::VisitorIdentifiedAudit {
+            context: temps_core::AuditContext {
+                user_id: auth.user_id(),
+                ip_address: Some(metadata.ip_address.clone()),
+                user_agent: metadata.user_agent.clone(),
+            },
+            actor_kind: if auth.is_deployment_token() {
+                "deployment_token"
+            } else {
+                "user"
+            },
+            deployment_token_id: token.as_ref().map(|t| t.token_id),
+            deployment_token_name: token.map(|t| t.token_name),
+            project_id,
+            visitor_row_id: result.visitor_row_id,
+            trait_keys,
+            trait_key_count,
+            removed_keys,
+            removed_key_count,
+        };
+        if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
+            error!("Failed to create visitor identify audit log for project {project_id}: {e}");
+        }
+    }
+
+    // A write-only caller (a `visitors:enrich` deployment token) must not
+    // learn whether the stored identity already matched what it sent, the
+    // same rule enrichment follows: a repeat answers like an update. (The
+    // write budget and timing still narrow, not remove, what it can infer.)
+    let outcome = if result.outcome == IdentifyOutcome::Unchanged
+        && !auth.has_permission(&Permission::AnalyticsRead)
+    {
+        IdentifyOutcome::Updated
+    } else {
+        result.outcome
+    };
+    Ok(Json(IdentifyVisitorResponse::from(outcome)))
+}
+
 #[utoipa::path(
     get,
     path = "/analytics/has-events",
@@ -1378,6 +1611,10 @@ pub(super) fn handle_analytics_error(error: AnalyticsError) -> Problem {
                 ))
                 .build()
         }
+        AnalyticsError::InvalidQuery { .. } => bad_request()
+            .title("Invalid Analytics Query")
+            .detail(error.to_string())
+            .build(),
     }
 }
 
@@ -2240,6 +2477,73 @@ pub async fn get_event_entries(
     }
 }
 
+/// Break one event down by one of its custom properties
+///
+/// Ranks the values of one top-level key of an event's custom properties,
+/// e.g. the `url` of `outbound_click` or the `extension` of `file_download`
+/// (ADR 109 D1). Crawler traffic is excluded. A value is null when the event
+/// was sent without that property.
+#[utoipa::path(
+    tag = "Analytics",
+    get,
+    path = "/analytics/event-properties",
+    params(
+        ("event_name" = String, Query, description = "Event to break down, e.g. outbound_click"),
+        ("property" = String, Query, description = "Top-level property key to group by, e.g. url. Letters, digits, '_', '-' and '.'; at most 64 characters"),
+        ("project_id" = i32, Query, description = "Project ID"),
+        ("environment_id" = Option<i32>, Query, description = "Environment ID (optional)"),
+        ("start_date" = String, Query, description = "Start date (ISO 8601)"),
+        ("end_date" = String, Query, description = "End date (ISO 8601)"),
+        ("limit" = Option<u64>, Query, description = "Maximum number of values (default: 20, max: 100)")
+    ),
+    responses(
+        (status = 200, description = "Property values ranked by occurrences", body = EventPropertiesResponse),
+        (status = 400, description = "Invalid property name or parameters"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(
+        ("bearer_auth" = [])
+    )
+)]
+pub async fn get_event_properties(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<AppState>>,
+    Query(query): Query<requests::EventPropertiesQuery>,
+) -> Result<Json<EventPropertiesResponse>, Problem> {
+    permission_guard!(auth, AnalyticsRead);
+    project_scope_guard!(auth, query.project_id);
+    project_access_guard!(auth, query.project_id, app_state.project_access_checker);
+
+    let start_date: UtcDateTime = query.start_date.into();
+    let end_date: UtcDateTime = query.end_date.into();
+
+    app_state
+        .analytics_service
+        .get_event_properties(
+            query.project_id,
+            &query.event_name,
+            &query.property,
+            start_date,
+            end_date,
+            query.environment_id,
+            query.limit.unwrap_or(20),
+        )
+        .await
+        .map(Json)
+        .map_err(|e| {
+            error!(
+                project_id = query.project_id,
+                event_name = %query.event_name,
+                property = %query.property,
+                "Event property breakdown failed: {:?}",
+                e
+            );
+            handle_analytics_error(e)
+        })
+}
+
 #[cfg(test)]
 mod api_traffic_window_tests {
     use super::*;
@@ -2427,6 +2731,12 @@ mod enrich_handler_tests {
                 3,
                 std::time::Duration::from_secs(60),
             )),
+            visitor_identity: Arc::new(crate::visitor_identity::VisitorIdentityService::new(
+                db.clone(),
+                Arc::new(
+                    temps_core::CookieCrypto::new("test_key_32_bytes_long_for_tests").unwrap(),
+                ),
+            )),
         });
         let call = |auth: AuthContext, id: &str, data: serde_json::Value| {
             let state = state.clone();
@@ -2610,5 +2920,161 @@ mod enrich_handler_tests {
         );
 
         cleanup_test_analytics!(db);
+    }
+
+    #[tokio::test]
+    async fn deployment_token_identify_is_confined_vouched_and_audited() {
+        let (service, db, _container) = create_test_analytics_service!(
+            "deployment_token_identify_is_confined_vouched_and_audited"
+        );
+        let crypto = temps_core::CookieCrypto::new("test_key_32_bytes_long_for_tests").unwrap();
+        let sealed = format!("enc_{}", crypto.encrypt("test_visitor_1").unwrap());
+        let visitor = temps_entities::visitor::Entity::find()
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        let project = visitor.project_id;
+        let audit = Arc::new(CapturingAudit::default());
+        let state = Arc::new(AppState {
+            analytics_service: Arc::new(service),
+            project_access_checker: None,
+            api_traffic_service: Arc::new(ApiTrafficService::new(
+                db.clone(),
+                Arc::new(UnavailableAi),
+            )),
+            audit_service: audit.clone(),
+            enrich_budget: Arc::new(crate::visitor_audit::EnrichWriteBudget::new(
+                10,
+                std::time::Duration::from_secs(60),
+            )),
+            visitor_identity: Arc::new(crate::visitor_identity::VisitorIdentityService::new(
+                db.clone(),
+                Arc::new(crypto),
+            )),
+        });
+        let call = |auth: AuthContext, project_id: i32, id: &str, user_id: &str| {
+            let state = state.clone();
+            let id = id.to_string();
+            let user_id = user_id.to_string();
+            async move {
+                identify_visitor(
+                    RequireAuth(auth),
+                    State(state),
+                    Extension(metadata()),
+                    axum::extract::Path((project_id, id)),
+                    Json(crate::visitor_identity::IdentifyVisitorRequest {
+                        user_id,
+                        traits: Some(json!({"plan": "pro"})),
+                    }),
+                )
+                .await
+                .map(|ok| ok.into_response())
+            }
+        };
+        let can_enrich = |p: i32| token(p, vec![DeploymentTokenPermission::VisitorsEnrich]);
+
+        // A raw visitor id is refused for a token.
+        assert_eq!(
+            status_of(call(can_enrich(project), project, "test_visitor_1", "u_1").await),
+            Some(StatusCode::FORBIDDEN)
+        );
+        // Another project's token cannot address this project.
+        assert_eq!(
+            status_of(call(can_enrich(project + 1), project, &sealed, "u_1").await),
+            Some(StatusCode::FORBIDDEN)
+        );
+        // An empty user id is a 400.
+        assert_eq!(
+            status_of(call(can_enrich(project), project, &sealed, "").await),
+            Some(StatusCode::BAD_REQUEST)
+        );
+        // A sealed value that does not decrypt answers like an unknown visitor.
+        let unknown = call(can_enrich(project), project, "enc_garbage", "u_1")
+            .await
+            .expect("answered");
+        assert_eq!(unknown.status(), StatusCode::OK);
+
+        let ok = call(can_enrich(project), project, &sealed, "u_1")
+            .await
+            .expect("identified");
+        assert_eq!(ok.status(), StatusCode::OK);
+        let first_answer = axum::body::to_bytes(ok.into_body(), usize::MAX)
+            .await
+            .expect("first body");
+        let stored = temps_entities::visitor::Entity::find_by_id(visitor.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.user_id.as_deref(), Some("u_1"));
+        assert_eq!(
+            stored.identity_source,
+            Some(temps_entities::visitor_identity_source::VisitorIdentitySource::Server)
+        );
+
+        let entries = audit.0.lock().unwrap().clone();
+        assert_eq!(entries.len(), 1, "only the change is audited");
+        assert_eq!(entries[0].0, "VISITOR_IDENTIFIED");
+        assert_eq!(entries[0].1, None, "a token has no user row");
+        assert!(entries[0].2.contains("\"plan\""));
+        assert!(
+            !entries[0].2.contains("u_1"),
+            "the user id stays out of the audit trail"
+        );
+
+        // Repeating it changes nothing and writes no audit row, and the
+        // write-only token gets the same answer as for the change.
+        let repeat = call(can_enrich(project), project, &sealed, "u_1")
+            .await
+            .expect("unchanged");
+        assert_eq!(audit.0.lock().unwrap().len(), 1);
+        let repeat_answer = axum::body::to_bytes(repeat.into_body(), usize::MAX)
+            .await
+            .expect("repeat body");
+        assert_eq!(
+            first_answer, repeat_answer,
+            "a write-only token cannot tell a repeat from an update"
+        );
+
+        // The token-scoped route takes the project from the token.
+        let by_token = |auth: AuthContext, user_id: &str| {
+            let state = state.clone();
+            let sealed = sealed.clone();
+            let user_id = user_id.to_string();
+            async move {
+                identify_visitor_for_token(
+                    RequireAuth(auth),
+                    State(state),
+                    Extension(metadata()),
+                    axum::extract::Path(sealed),
+                    Json(crate::visitor_identity::IdentifyVisitorRequest {
+                        user_id,
+                        traits: None,
+                    }),
+                )
+                .await
+                .map(|ok| ok.into_response())
+            }
+        };
+        let ok = by_token(can_enrich(project), "u_9")
+            .await
+            .expect("identified");
+        assert_eq!(ok.status(), StatusCode::OK);
+        let stored = temps_entities::visitor::Entity::find_by_id(visitor.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.user_id.as_deref(), Some("u_9"));
+        // A credential without a project is told to use the project route.
+        let session = AuthContext::new_session(
+            crate::ingest_keys::test_fixtures::user_model(1),
+            temps_authz::permissions::Role::Admin,
+        );
+        assert_eq!(
+            status_of(by_token(session, "u_9").await),
+            Some(StatusCode::BAD_REQUEST)
+        );
     }
 }

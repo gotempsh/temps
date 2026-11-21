@@ -968,6 +968,200 @@ async fn global_runs_are_masked_paginated_and_reject_invalid_cursors() {
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
+#[tokio::test]
+async fn global_runs_name_their_project_and_environment_by_slug() {
+    use sea_orm::ConnectionTrait;
+    let Some((h, _, app)) = live("global run slugs").await else {
+        return;
+    };
+    let run = h.start("orders", json!(null)).await;
+    let reader = || Some(AuthContext::new_session(user(h.env.user_id), Role::Reader));
+    let (status, _, body) = send(app.clone(), "GET", "/workflows/runs", None, reader(), None).await;
+    assert_eq!(status, StatusCode::OK);
+    let listed = &body["runs"][0];
+    assert_eq!(listed["id"], run.to_string());
+    assert_eq!(listed["project_slug"], "workflows-test");
+    assert_eq!(listed["environment_slug"], "production");
+    // The run fields are still at the top level, beside the slugs.
+    assert_eq!(listed["project_id"], h.env.project_id);
+    assert_eq!(listed["environment_id"], h.env.environment_id);
+
+    // The slugs come from the same query as the run (an inner join), so a
+    // run of a soft-deleted environment, whose run page is gone, drops out of
+    // the listing instead of appearing with a dead link.
+    h.env
+        .conn
+        .execute_unprepared(&format!(
+            "UPDATE environments SET deleted_at = now() WHERE id = {}",
+            h.env.environment_id
+        ))
+        .await
+        .unwrap();
+    let (status, _, body) = send(app, "GET", "/workflows/runs", None, reader(), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["runs"], json!([]));
+    assert!(body["next_cursor"].is_null());
+}
+
+fn manifest_of(workflows: &[(&str, Option<&str>)]) -> crate::protocol::Manifest {
+    crate::protocol::Manifest {
+        protocol_version: crate::protocol::PROTOCOL_VERSION,
+        sdk: Some("synthetic-sdk".into()),
+        workflows: workflows
+            .iter()
+            .map(|(name, version)| crate::protocol::ManifestWorkflow {
+                name: (*name).into(),
+                version: version.map(Into::into),
+                concurrency: None,
+            })
+            .collect(),
+    }
+}
+
+#[tokio::test]
+async fn workflow_definitions_list_declared_and_run_workflows_by_slug() {
+    use sea_orm::ConnectionTrait;
+    let Some((h, _, app)) = live("workflow definitions").await else {
+        return;
+    };
+    let (project, environment) = (h.env.project_id, h.env.environment_id);
+    let reader = || Some(AuthContext::new_session(user(h.env.user_id), Role::Reader));
+    let list = |app: Router| async move {
+        let (status, _, body) =
+            send(app, "GET", "/workflows/definitions", None, reader(), None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body
+    };
+
+    // The executor declares two workflows; one of them has run.
+    h.engine.seed_manifest(
+        project,
+        environment,
+        manifest_of(&[("orders", Some("v2")), ("refunds", None)]),
+    );
+    h.start("orders", json!(null)).await;
+    let body = list(app.clone()).await;
+    assert_eq!(body["total"], 2, "{body}");
+    let orders = &body["workflows"][0];
+    assert_eq!(orders["name"], "orders");
+    assert_eq!(orders["project_slug"], "workflows-test");
+    assert_eq!(orders["environment_slug"], "production");
+    assert_eq!(orders["project_id"], project);
+    assert_eq!(orders["environment_id"], environment);
+    assert_eq!(orders["state"], "available");
+    assert_eq!(orders["version"], "v2");
+    let runs = orders["active_runs"].as_i64().unwrap()
+        + orders["completed_runs"].as_i64().unwrap()
+        + orders["failed_runs"].as_i64().unwrap();
+    assert_eq!(runs, 1);
+    assert!(orders["last_run_at"].as_str().unwrap().ends_with('Z'));
+    // Declared but never run: listed after the ones with history.
+    let refunds = &body["workflows"][1];
+    assert_eq!(refunds["name"], "refunds");
+    assert_eq!(refunds["state"], "available");
+    assert_eq!(refunds["completed_runs"], 0);
+    assert!(refunds["last_run_at"].is_null());
+
+    // A deployment that dropped `orders`: its history stays, marked missing.
+    h.engine
+        .seed_manifest(project, environment, manifest_of(&[("refunds", None)]));
+    let body = list(app.clone()).await;
+    assert_eq!(body["workflows"][0]["name"], "orders");
+    assert_eq!(body["workflows"][0]["state"], "missing");
+    assert!(body["workflows"][0]["version"].is_null());
+
+    // No manifest read yet: what ran is listed as unknown, nothing else.
+    h.engine.invalidate_manifest(environment);
+    let body = list(app.clone()).await;
+    assert_eq!(body["total"], 1, "{body}");
+    assert_eq!(body["workflows"][0]["state"], "unknown");
+
+    // Pages are bounded.
+    let (status, _, page) = send(
+        app.clone(),
+        "GET",
+        "/workflows/definitions?page=2&page_size=500",
+        None,
+        reader(),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(page["page_size"], 100);
+    assert_eq!(page["workflows"], json!([]));
+
+    let (status, _, _) = send(
+        app.clone(),
+        "GET",
+        "/workflows/definitions",
+        None,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // A soft-deleted environment's workflows are gone with it.
+    h.engine.seed_manifest(
+        project,
+        environment,
+        manifest_of(&[("orders", None), ("refunds", None)]),
+    );
+    h.env
+        .conn
+        .execute_unprepared(&format!(
+            "UPDATE environments SET deleted_at = now() WHERE id = {environment}"
+        ))
+        .await
+        .unwrap();
+    let body = list(app).await;
+    assert_eq!(body["total"], 0, "{body}");
+}
+
+#[tokio::test]
+async fn workflow_definitions_show_only_projects_the_caller_may_read() {
+    let Some(h) = harness(
+        "workflow definitions access",
+        &["orders"],
+        completing(),
+        true,
+    )
+    .await
+    else {
+        return;
+    };
+    h.start("orders", json!(null)).await;
+    let service = Arc::new(WorkflowService::new(
+        h.store.clone(),
+        h.engine.clone(),
+        h.codec.clone(),
+        Arc::new(WorkflowMetrics::new(Arc::new(NoopProjectMetricsSink))),
+    ));
+    for permission in [None, Some(vec![]), Some(vec!["workflows:read".into()])] {
+        let allowed = permission.as_ref().is_some_and(|p| !p.is_empty());
+        let mut state = state_from(
+            service.clone(),
+            h.engine.clone(),
+            Arc::new(RecordingAudit::default()),
+        );
+        Arc::get_mut(&mut state).unwrap().project_access_checker = Some(Arc::new(ListingChecker {
+            fail: false,
+            permission,
+        }));
+        let (status, _, body) = send(
+            router(state),
+            "GET",
+            "/workflows/definitions",
+            None,
+            Some(AuthContext::new_session(user(h.env.user_id), Role::Reader)),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["total"], u64::from(allowed), "{body}");
+    }
+}
+
 struct ListingChecker {
     fail: bool,
     permission: Option<Vec<String>>,

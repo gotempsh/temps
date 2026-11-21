@@ -1529,6 +1529,7 @@ mod tests {
                 temps_entities::cloud_telemetry_write_mode::CloudTelemetryWriteMode::Local,
             cloud_analytics_write_mode:
                 temps_entities::cloud_analytics_write_mode::CloudAnalyticsWriteMode::Local,
+            analytics_identity_mode: Default::default(),
             instantiation_token: None,
             cloud_telemetry_attribute_allowlist: Vec::new(),
             name: "test".into(),

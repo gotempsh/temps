@@ -136,8 +136,11 @@ export function VisitorsList({
     ])
   ) as Partial<Record<FilterKey, string>>
   const activeFilters = FILTERS.filter(({ key }) => !!filters[key])
+  // Not a facet: set from a visitor's "same user on other devices" link.
+  const userIdFilter = state.filter_user_id?.trim() || undefined
   const filterCount =
     activeFilters.length +
+    Number(!!userIdFilter) +
     Number(visitorType !== 'all') +
     Number(!activityOnly) +
     Number(!!environment)
@@ -162,6 +165,7 @@ export function VisitorsList({
     environment_id: environment,
     include_crawlers: visitorType === 'humans' ? false : undefined,
     has_activity_only: activityOnly,
+    filter_user_id: userIdFilter,
     ...filters,
   }
   const facets = useQuery({
@@ -192,6 +196,7 @@ export function VisitorsList({
   const clearFilters = () =>
     patch({
       ...Object.fromEntries(FILTERS.map(({ key }) => [key, undefined])),
+      filter_user_id: undefined,
       environment: undefined,
       visitor_type: undefined,
       activity: undefined,
@@ -228,7 +233,7 @@ export function VisitorsList({
         const Icon = visitor.is_crawler ? Bot : User
         const label = visitor.is_crawler
           ? crawlerLabel(visitor.crawler_name, 'Crawler')
-          : 'Human visitor'
+          : visitor.user_id || 'Human visitor'
         return (
           <RecordLink
             to={`/projects/${project.slug}/analytics/visitors/${visitor.id}`}
@@ -509,7 +514,10 @@ export function VisitorsList({
           </div>
         </div>
       )}
-      {(activeFilters.length > 0 || environment || !activityOnly) && (
+      {(activeFilters.length > 0 ||
+        userIdFilter ||
+        environment ||
+        !activityOnly) && (
         <div
           role="group"
           className="flex flex-wrap items-center gap-2"
@@ -529,6 +537,19 @@ export function VisitorsList({
               <X className="ml-1 size-3" aria-hidden="true" />
             </Button>
           ))}
+          {userIdFilter && (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() =>
+                patch({ filter_user_id: undefined, page: undefined })
+              }
+              aria-label="Remove User id filter"
+            >
+              <span className="max-w-48 truncate">User id: {userIdFilter}</span>
+              <X className="ml-1 size-3" aria-hidden="true" />
+            </Button>
+          )}
           {environment && (
             <Badge variant="secondary">
               Environment:{' '}

@@ -540,6 +540,7 @@ async fn canonical_template_app_url(
         list_project_template_tags,
         create_project_from_template,
         super::operations::list_operations,
+        super::ingest_setup::get_project_ingest_setup,
     ),
     components(
         schemas(
@@ -587,6 +588,13 @@ async fn canonical_template_app_url(
             crate::services::operations::OperationKind,
             crate::services::operations::OperationStatus,
             crate::services::operations::OperationStatusFilter,
+            crate::services::ingest_setup::ProjectIngestSetup,
+            crate::services::ingest_setup::IngestSignalSetup,
+            crate::services::ingest_setup::IngestSignal,
+            crate::services::ingest_setup::IngestEndpoint,
+            crate::services::ingest_setup::IngestAuth,
+            crate::services::ingest_setup::IngestAuthKind,
+            crate::services::ingest_setup::IngestHeader,
         )
     ),
     tags(

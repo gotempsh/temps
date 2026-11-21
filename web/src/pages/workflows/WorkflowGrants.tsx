@@ -6,11 +6,10 @@ import { useForm } from 'react-hook-form'
 import { z } from 'zod'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Ledger, PageState } from '@temps-sdk/ds'
+import { DataTable, PageContainer, PageHeader, PageState } from '@temps-sdk/ds'
 import { ShieldCheck } from 'lucide-react'
 import { Link, useParams, useSearchParams } from 'react-router'
 import { toast } from 'sonner'
-import { listWorkflowGrantsOptions } from '@/api/client/@tanstack/react-query.gen'
 import { createWorkflowGrant, revokeWorkflowGrant } from '@/api/client/sdk.gen'
 import type { WorkflowGrantResponse } from '@/api/client'
 import { Button } from '@/components/ui/button'
@@ -20,6 +19,7 @@ import { Label } from '@/components/ui/label'
 import { RefreshButton } from '@/components/ui/refresh-button'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { problemDetail } from '@/lib/api-problem'
+import { workflowGrantsOptions } from './detail-tabs'
 
 const schema = z
   .object({
@@ -50,18 +50,54 @@ export function WorkflowGrants() {
   }
   const [search, setSearch] = useSearchParams()
   const page = Math.max(1, Number(search.get('page')) || 1)
+  usePageTitle('Workflow access grants')
+  return (
+    <PageContainer>
+      <PageHeader
+        title="Workflow access grants"
+        actions={
+          <div className="flex flex-wrap gap-2">
+            <Button asChild variant="outline">
+              <Link to="/workflows">All workflows</Link>
+            </Button>
+            <RefreshButton
+              queryKeys={[workflowGrantsOptions(path, page).queryKey]}
+            />
+          </div>
+        }
+      />
+      <WorkflowGrantsPanel
+        path={path}
+        page={page}
+        onPageChange={(value) => setSearch({ page: String(value) })}
+      />
+    </PageContainer>
+  )
+}
+
+/**
+ * Who outside this environment may start a workflow or send an event here:
+ * the grant form above the grants it created.
+ */
+export function WorkflowGrantsPanel({
+  path,
+  page,
+  onPageChange,
+  description,
+}: {
+  path: { project_id: number; environment_id: number }
+  page: number
+  onPageChange: (page: number) => void
+  description?: string
+}) {
   const [selected, setSelected] = useState<WorkflowGrantResponse | null>(null)
   const client = useQueryClient()
-  const options = listWorkflowGrantsOptions({
-    path,
-    query: { page, page_size: 20 },
-  })
+  const options = workflowGrantsOptions(path, page)
   const query = useQuery(options)
   const form = useForm<Fields>({
     resolver: zodResolver(schema),
     defaultValues: { source_environment_id: '', action: 'start', resource: '' },
   })
-  usePageTitle('Workflow access grants')
   const invalidate = () =>
     client.invalidateQueries({ queryKey: options.queryKey })
   const create = useMutation({
@@ -98,141 +134,129 @@ export function WorkflowGrants() {
     onError: (error) =>
       toast.error(problemDetail(error, 'Could not revoke the grant.')),
   })
+  const grants = query.data?.grants ?? []
   return (
-    <>
-      <Ledger<WorkflowGrantResponse>
-        title="Workflow access grants"
-        actions={
-          <div className="flex flex-wrap gap-2">
-            <Button asChild variant="outline">
-              <Link to="/workflows">All workflows</Link>
-            </Button>
-            <RefreshButton queryKeys={[options.queryKey]} />
-          </div>
-        }
-        toolbar={
-          <form
-            onSubmit={form.handleSubmit((value) => {
-              if (!create.isPending) create.mutate(value)
-            })}
-            className="grid grid-cols-1 gap-3 rounded-lg border p-4 md:grid-cols-4"
-          >
-            <div className="space-y-1">
-              <Label htmlFor="workflow-source">Source environment ID</Label>
-              <Input
-                id="workflow-source"
-                inputMode="numeric"
-                {...form.register('source_environment_id')}
-              />
-              <p className="text-sm text-destructive">
-                {form.formState.errors.source_environment_id?.message}
-              </p>
-            </div>
-            <fieldset className="space-y-1">
-              <legend className="text-sm font-medium">Allowed operation</legend>
-              <label className="flex items-center gap-2 text-sm">
-                <input
-                  type="radio"
-                  value="start"
-                  {...form.register('action')}
-                />
-                Start workflow
-              </label>
-              <label className="flex items-center gap-2 text-sm">
-                <input
-                  type="radio"
-                  value="event"
-                  {...form.register('action')}
-                />
-                Send event
-              </label>
-            </fieldset>
-            <div className="space-y-1">
-              <Label htmlFor="workflow-resource">
-                Exact workflow or event name
-              </Label>
-              <Input id="workflow-resource" {...form.register('resource')} />
-              <p className="text-sm text-destructive">
-                {form.formState.errors.resource?.message}
-              </p>
-            </div>
-            <div className="flex items-end">
-              <Button type="submit" aria-disabled={create.isPending}>
-                {create.isPending ? 'Granting…' : 'Grant access'}
-              </Button>
-            </div>
-            <p className="text-sm text-muted-foreground md:col-span-4">
-              Destination: project {path.project_id}, environment{' '}
-              {path.environment_id}. Grants allow only the named operation. Run
-              results stay private to this environment.
-            </p>
-          </form>
-        }
-        rows={query.data?.grants ?? []}
-        rowKey={(grant) => grant.id}
-        isLoading={query.isPending}
-        columns={[
-          {
-            key: 'resource',
-            header: 'Resource',
-            render: (grant) => (
-              <span className="[overflow-wrap:anywhere]">{grant.resource}</span>
-            ),
-          },
-          {
-            key: 'source',
-            header: 'Source environment',
-            render: (grant) => grant.source_environment_id,
-          },
-          {
-            key: 'action',
-            header: 'Permission',
-            render: (grant) =>
-              grant.action === 'start' ? 'Start workflow' : 'Send event',
-          },
-          {
-            key: 'revoke',
-            header: '',
-            render: (grant) => (
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => setSelected(grant)}
-              >
-                Revoke
-              </Button>
-            ),
-          },
-        ]}
-        pagination={
-          query.data
-            ? {
-                page,
-                pageSize: 20,
-                total: query.data.total,
-                totalPages: query.data.total_pages,
-                onPageChange: (value) => setSearch({ page: String(value) }),
-              }
-            : undefined
-        }
-        empty={
-          <PageState
-            variant={query.isError ? 'failed' : 'empty'}
-            size="compact"
-            icon={ShieldCheck}
-            title={
-              query.isError
-                ? 'Could not load grants'
-                : 'No external workflow access'
-            }
-            description={
-              query.isError
-                ? problemDetail(query.error, 'Refresh to retry.')
-                : 'Grant a source environment permission to start one workflow or send one event here.'
-            }
+    <div className="space-y-4">
+      {description && (
+        <p className="text-sm text-muted-foreground">{description}</p>
+      )}
+      <form
+        onSubmit={form.handleSubmit((value) => {
+          if (!create.isPending) create.mutate(value)
+        })}
+        className="grid grid-cols-1 gap-3 rounded-lg border p-4 md:grid-cols-4"
+      >
+        <div className="space-y-1">
+          <Label htmlFor="workflow-source">Source environment ID</Label>
+          <Input
+            id="workflow-source"
+            inputMode="numeric"
+            {...form.register('source_environment_id')}
           />
-        }
-      />
+          <p className="text-sm text-destructive">
+            {form.formState.errors.source_environment_id?.message}
+          </p>
+        </div>
+        <fieldset className="space-y-1">
+          <legend className="text-sm font-medium">Allowed operation</legend>
+          <label className="flex items-center gap-2 text-sm">
+            <input type="radio" value="start" {...form.register('action')} />
+            Start workflow
+          </label>
+          <label className="flex items-center gap-2 text-sm">
+            <input type="radio" value="event" {...form.register('action')} />
+            Send event
+          </label>
+        </fieldset>
+        <div className="space-y-1">
+          <Label htmlFor="workflow-resource">
+            Exact workflow or event name
+          </Label>
+          <Input id="workflow-resource" {...form.register('resource')} />
+          <p className="text-sm text-destructive">
+            {form.formState.errors.resource?.message}
+          </p>
+        </div>
+        <div className="flex items-end">
+          <Button type="submit" aria-disabled={create.isPending}>
+            {create.isPending ? 'Granting…' : 'Grant access'}
+          </Button>
+        </div>
+        <p className="text-sm text-muted-foreground md:col-span-4">
+          Grants allow only the named operation. Run results stay private to
+          this environment.
+        </p>
+      </form>
+      {!query.isPending && grants.length === 0 ? (
+        <PageState
+          variant={query.isError ? 'failed' : 'empty'}
+          size="compact"
+          icon={ShieldCheck}
+          title={
+            query.isError
+              ? 'Could not load grants'
+              : 'No external workflow access'
+          }
+          description={
+            query.isError
+              ? problemDetail(query.error, 'Refresh to retry.')
+              : 'Grant a source environment permission to start one workflow or send one event here.'
+          }
+        />
+      ) : (
+        <DataTable<WorkflowGrantResponse>
+          aria-label="Workflow access grants"
+          rows={grants}
+          rowKey={(grant) => grant.id}
+          isLoading={query.isPending}
+          columns={[
+            {
+              key: 'resource',
+              header: 'Resource',
+              render: (grant) => (
+                <span className="[overflow-wrap:anywhere]">
+                  {grant.resource}
+                </span>
+              ),
+            },
+            {
+              key: 'source',
+              header: 'Source environment',
+              render: (grant) => grant.source_environment_id,
+            },
+            {
+              key: 'action',
+              header: 'Permission',
+              render: (grant) =>
+                grant.action === 'start' ? 'Start workflow' : 'Send event',
+            },
+            {
+              key: 'revoke',
+              header: '',
+              render: (grant) => (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setSelected(grant)}
+                >
+                  Revoke
+                </Button>
+              ),
+            },
+          ]}
+          pagination={
+            query.data && query.data.total_pages > 1
+              ? {
+                  page,
+                  pageSize: 20,
+                  total: query.data.total,
+                  totalPages: query.data.total_pages,
+                  onPageChange,
+                }
+              : undefined
+          }
+        />
+      )}
       <ConfirmDeleteDialog
         open={selected !== null}
         onOpenChange={(open) => {
@@ -249,6 +273,6 @@ export function WorkflowGrants() {
           if (selected && !revoke.isPending) revoke.mutate(selected)
         }}
       />
-    </>
+    </div>
   )
 }
