@@ -40,6 +40,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   ArrowLeft,
   Boxes,
+  CalendarClock,
   CheckCircle2,
   Circle,
   ExternalLink,
@@ -47,6 +48,7 @@ import {
   EyeOff,
   Globe,
   Home,
+  Mail,
   MoreVertical,
   Palette,
   RefreshCw,
@@ -66,6 +68,10 @@ import { StatusPageDomains } from './StatusPageDomains'
 import { PublicLinkSection } from './StatusPagePublicLink'
 import { StatusPageAppearanceForm } from './StatusPageAppearanceForm'
 import { StatusPageIncidents } from './StatusPageIncidents'
+import { StatusPageSubscribers } from './StatusPageSubscribers'
+import { StatusPageMaintenance } from './StatusPageMaintenance'
+import { StatusPageFeedCard, StatusPageWebhooks } from './StatusPageWebhooks'
+import { StatusPagePassword } from './StatusPagePassword'
 import { StatusPagePreview } from './StatusPagePreview'
 import {
   formDefaults,
@@ -80,6 +86,8 @@ const DETAIL_TABS = [
   'components',
   'appearance',
   'incidents',
+  'maintenance',
+  'subscribers',
   'domains',
 ] as const
 type DetailTab = (typeof DETAIL_TABS)[number]
@@ -529,6 +537,12 @@ export function StatusPageDetail() {
           <TabsTrigger value="incidents" icon={Siren}>
             Incidents
           </TabsTrigger>
+          <TabsTrigger value="maintenance" icon={CalendarClock}>
+            Maintenance
+          </TabsTrigger>
+          <TabsTrigger value="subscribers" icon={Mail}>
+            Notifications
+          </TabsTrigger>
           <TabsTrigger value="domains" icon={Globe}>
             Domains
           </TabsTrigger>
@@ -541,6 +555,7 @@ export function StatusPageDetail() {
             publishing={publish.isPending}
           />
           <PublicLinkSection page={page} />
+          <StatusPagePassword page={page} />
           <StatusPagePreview page={page} />
         </TabsContent>
         <TabsContent value="components" className="pt-4">
@@ -553,6 +568,14 @@ export function StatusPageDetail() {
           {/* Keyed by page: switching pages must never show (and let you
               act on) the previous page's incidents or page number. */}
           <StatusPageIncidents key={page.id} page={page} />
+        </TabsContent>
+        <TabsContent value="maintenance" className="pt-4">
+          <StatusPageMaintenance key={page.id} page={page} />
+        </TabsContent>
+        <TabsContent value="subscribers" className="space-y-6 pt-4">
+          <StatusPageSubscribers key={page.id} page={page} />
+          <StatusPageWebhooks key={`webhooks-${page.id}`} page={page} />
+          <StatusPageFeedCard page={page} />
         </TabsContent>
         <TabsContent value="domains" className="pt-4">
           <StatusPageDomains page={page} />

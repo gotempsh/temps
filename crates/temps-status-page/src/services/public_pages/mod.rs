@@ -5,6 +5,8 @@
 //! public view (#1412).
 
 pub mod domains;
+pub mod events;
+pub mod feed;
 pub mod render;
 pub mod service;
 pub mod snapshot;
@@ -17,5 +19,5 @@ pub use domains::{
     MAX_DOMAINS_PER_STATUS_PAGE,
 };
 pub use service::{is_well_formed_slug, PublicStatusPageService, StatusPageListFilter, SLUG_LEN};
-pub use snapshot::{PublishedSnapshot, StatusSnapshotCache, REFRESH_INTERVAL};
+pub use snapshot::{PageGate, PublishedSnapshot, StatusSnapshotCache, REFRESH_INTERVAL};
 pub use types::*;

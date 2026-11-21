@@ -104,6 +104,7 @@ LAYERS: dict[str, str] = {
     "temps-preview-gateway": "runtime",
     "temps-pty-agent": "runtime",
     "temps-runtime-health": "runtime",
+    "temps-uptime-probe": "runtime",
     "temps-service-access-runtime": "runtime",
     "temps-vm-agent": "runtime",
     "temps-wireguard": "runtime",

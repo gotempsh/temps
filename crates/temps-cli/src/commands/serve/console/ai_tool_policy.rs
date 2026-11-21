@@ -168,6 +168,43 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        "status page subscriber addresses are personal data; the page owner lists, exports and deletes them in the console",
+        &[
+            "delete_status_page_subscriber",
+            "export_status_page_subscribers",
+            "list_status_page_subscribers",
+        ],
+    ),
+    (
+        "switches mail to the public on or off for a status page and chooses its sender; a human decides",
+        &["update_status_page_subscriptions"],
+    ),
+    (
+        "a maintenance window silences its monitors' outage alerts and is announced to the page's subscribers, feed and webhooks; a human decides",
+        &[
+            "cancel_status_page_maintenance",
+            "create_status_page_maintenance",
+            "update_status_page_maintenance",
+        ],
+    ),
+    (
+        "status page webhooks post page events to an external URL that can carry the receiver's credential, and creating one returns its signing secret; managed in the console or CLI",
+        &[
+            "create_status_page_webhook",
+            "delete_status_page_webhook",
+            "list_status_page_webhooks",
+            "update_status_page_webhook",
+        ],
+    ),
+    (
+        "takes a credential: the status page password",
+        &["set_status_page_password"],
+    ),
+    (
+        "a monitor of a target outside Temps takes request headers and a body that can carry the target's credentials; created and edited in the console or CLI",
+        &["create_target_monitor", "update_target_monitor"],
+    ),
+    (
         "removes monitoring silently, so a human must do it (same rule as delete_alert)",
         &[
             "ExternalServiceMetricsDeleteAlertRule",
@@ -263,6 +300,9 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
             "createProjectSecret",
             "create_api_key",
             "create_deployment_token",
+            // Log ingest keys (ADR 108 D1): creation returns the key in
+            // plaintext once; revoking one cuts off a collector.
+            "create_log_ingest_key",
             "create_oidc_provider",
             "create_oidc_role_mapping",
             // Returns a Shield bypass token in plaintext.
@@ -278,6 +318,7 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
             "delete_user",
             "disable_mfa",
             "get_admin_gate",
+            "list_log_ingest_keys",
             "list_users",
             "login",
             "logout",
@@ -289,6 +330,7 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
             "reset_user_mfa",
             "reset_user_password",
             "restore_user",
+            "revoke_log_ingest_key",
             "revoke_shield_token",
             "rotate_api_key",
             "rotate_deployment_token",
@@ -361,6 +403,17 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
             "reset_browser_identity",
             "revoke_analytics_ingest_key",
             "rotate_analytics_ingest_key",
+            // Status page subscription links and form (ADR 108 D2): used
+            // by visitors and their mail clients.
+            "status_page_confirm",
+            "status_page_confirm_form",
+            "status_page_subscribe",
+            "status_page_unsubscribe",
+            "status_page_unsubscribe_form",
+            // The Atom feed and the password form (ADR 108 D2): used by
+            // feed readers and visitors; unlocking takes the page password.
+            "get_public_status_page_feed",
+            "unlock_public_status_page",
             "track_click",
             "track_open",
             "update_analytics_ingest_key",

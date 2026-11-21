@@ -1012,11 +1012,13 @@ fn pipeline_stat_deltas(
             crate::services::dashboard_service::DashboardLayout,
             crate::services::dashboard_service::DashboardSection,
             crate::services::dashboard_service::DashboardTile,
+            crate::services::dashboard_service::DashboardTileSource,
             metric_alert_handler::CreateMetricAlertRequest,
             metric_alert_handler::UpdateMetricAlertRequest,
             metric_alert_handler::OtelMetricAlertRuleResponse,
             metric_alert_handler::OtelMetricAlertsResponse,
             crate::services::metric_alert_evaluator::SeriesStateEntry,
+            crate::services::metric_alert_service::AlertSeriesSource,
             metric_alert_handler::AnomalyPreviewRequest,
             metric_alert_handler::AnomalyPreviewResponse,
             metric_alert_handler::AnomalyPreviewPointResponse,
@@ -1646,6 +1648,13 @@ impl TempsPlugin for OtelPlugin {
                 // ADR-022: optional general AI foundation, registered by the AI
                 // gateway plugin when present. Absent -> deterministic Tier-1 text.
                 let ai = context.get_service::<dyn temps_ai::AiService>();
+                // ADR 108 D1: the counter behind log alerts, registered by
+                // the log aggregator plugin. Resolved again at
+                // initialization, where every plugin has registered, so the
+                // order of the two plugins cannot decide whether log alerts
+                // work.
+                let log_series =
+                    context.get_service::<dyn temps_core::log_series::LogSeriesSource>();
                 Arc::new(crate::services::MetricAlertEvaluator::new(
                     metric_alert_service.clone(),
                     otel_service.clone(),
@@ -1653,6 +1662,7 @@ impl TempsPlugin for OtelPlugin {
                     alarm_service_dynamic,
                     db.clone(),
                     ai,
+                    log_series,
                 ))
             };
 
@@ -2301,6 +2311,17 @@ impl TempsPlugin for OtelPlugin {
             // Spawn the metric alert evaluator run loop (evaluator already created above).
             {
                 let evaluator = metric_alert_evaluator;
+                // Log alerts (ADR 108 D1) count lines through the log
+                // aggregator's series source. Setting it here — after every
+                // plugin has registered — is what makes the feature
+                // independent of plugin registration order; it is a no-op
+                // when registration already supplied one.
+                match context.get_service::<dyn temps_core::log_series::LogSeriesSource>() {
+                    Some(source) => evaluator.set_log_series(source),
+                    None => debug!(
+                        "No log series source is registered; log alerts will not be evaluated"
+                    ),
+                }
                 tokio::spawn(async move {
                     evaluator.run().await;
                 });

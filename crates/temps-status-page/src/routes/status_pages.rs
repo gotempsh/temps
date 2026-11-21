@@ -27,28 +27,6 @@ use axum::{
 use serde::Deserialize;
 use temps_authz::{permission_guard, project_permission_guard, project_scope_guard, RequireAuth};
 
-/// Authorize `$permission` on every project in `$project_ids` (the projects a
-/// status page draws from), with ADR-028 semantics on each. A page without
-/// components has no project to check against, so only instance
-/// administrators may act on it.
-macro_rules! page_projects_guard {
-    ($auth:expr, $permission:ident, $project_ids:expr, $checker:expr) => {{
-        let __project_ids: &[i32] = &$project_ids;
-        if __project_ids.is_empty() && ($auth.is_deployment_token() || !$auth.is_instance_admin()) {
-            return Err(temps_core::error_builder::forbidden()
-                .title("Insufficient Permissions")
-                .detail(
-                    "This status page has no components left, so it belongs to no project; \
-                     only an instance administrator can manage it",
-                )
-                .build());
-        }
-        for &__project_id in __project_ids {
-            project_permission_guard!($auth, $permission, __project_id, $checker);
-            project_scope_guard!($auth, __project_id);
-        }
-    }};
-}
 use temps_core::problemdetails::Problem;
 use temps_core::RequestMetadata;
 
@@ -1428,7 +1406,12 @@ mod tests {
             audit_service: audit.clone(),
             checker: checker(project_a),
         });
-        let public = create_public_router(Arc::new(PublicStatusState::new(cache)));
+        let access = Arc::new(crate::services::page_access::PageAccessService::new(
+            db.clone(),
+            cache.clone(),
+            &temps_core::EncryptionService::new_from_password("status-page-route-tests"),
+        ));
+        let public = create_public_router(Arc::new(PublicStatusState::new(cache, access)));
         Some(Fx {
             certs,
             _db: test_db,
@@ -1548,6 +1531,7 @@ mod tests {
         // `public_ingress_url`: no address is invented, the page says why.
         assert_eq!(page.public_url, None);
         assert_eq!(page.public_json_url, None);
+        assert_eq!(page.public_feed_url, None);
         assert!(!page.public_url_status.configured);
         assert_eq!(
             page.public_url_status.setup_path.as_deref(),
@@ -1608,6 +1592,12 @@ mod tests {
             "total_checks",
             "failed_checks",
             "degraded_checks",
+            // Scheduled maintenance windows: admin-written public title and
+            // description, times, and the components' display names.
+            "maintenances",
+            "description",
+            "starts_at",
+            "ends_at",
         ]
         .iter()
         .map(|k| k.to_string())
