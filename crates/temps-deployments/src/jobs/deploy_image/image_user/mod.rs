@@ -13,9 +13,12 @@
 //! console read it. Nothing inspects an image on an API request.
 //!
 //! The check is advisory: it never fails or delays a deploy beyond its own
-//! timeout. Anything it cannot determine (an older agent, an unreadable
-//! image, a named user the image's files do not list) is logged as such and
-//! never reported as root.
+//! deadline, which covers the whole step (reaching the node, the check, the
+//! log line and the row update). Anything it cannot determine (an older
+//! agent, an unreadable image, a named user the image's files do not list, a
+//! `USER` too long to be reported) is logged as such and never reported as
+//! root. A multi-architecture build is checked per architecture's image, and
+//! warned about when any of them runs as root.
 
 use std::time::Duration;
 
@@ -35,9 +38,14 @@ use crate::workflow::WorkflowContext;
 pub(crate) const NON_ROOT_USER_DOCS_URL: &str =
     "https://temps.sh/docs/docker-containers#non-root-user";
 
-/// The whole check (inspect plus at most two small file reads) is bounded so
-/// an unresponsive node cannot hold up the deploy it only advises on.
-const IMAGE_USER_CHECK_TIMEOUT: Duration = Duration::from_secs(60);
+/// The whole advisory step, so an unresponsive node or a locked deployment
+/// row cannot hold up the deploy it only advises on.
+const IMAGE_USER_STEP_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The checks themselves (inspect plus at most two small file reads per
+/// image, every image at once), inside the step: what is left of it writes
+/// the outcome.
+const IMAGE_USER_CHECK_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// Longest `USER` recorded on the deployment row. The daemon already drops a
 /// `USER` past `MAX_IMAGE_CONFIG_USER_BYTES` from the image configuration;
@@ -106,11 +114,26 @@ async fn inspect_and_classify(builder: &dyn ImageBuilder, image: &str) -> ImageU
             ),
         };
     };
+    if config.user_omitted {
+        return ImageUserCheck::NotChecked {
+            reason: format!(
+                "image '{image}' sets a USER longer than {} bytes, which is not read",
+                temps_deployer::MAX_IMAGE_CONFIG_USER_BYTES
+            ),
+        };
+    }
+    // Read the files of the image just inspected, by its id, so a tag moved
+    // in the meantime cannot pair this `USER` with another image's passwd.
+    let source = if info.id.starts_with("sha256:") {
+        info.id.as_str()
+    } else {
+        image
+    };
     let declared = config.user;
     let spec = declared.as_deref().unwrap_or("");
     let identity =
         match read_identity_files(image, IdentityFilesNeeded::to_classify(spec), |path| {
-            fetch_image_path(builder, image, path)
+            fetch_image_path(builder, source, image, path)
         })
         .await
         {
@@ -128,18 +151,20 @@ async fn inspect_and_classify(builder: &dyn ImageBuilder, image: &str) -> ImageU
 }
 
 /// One path of `image` as a container-archive tar, through the builder's
-/// path export (served by a worker's agent for an image it built).
+/// path export (served by a worker's agent for an image it built). `source`
+/// is what is exported (the inspected image id); `image` names it in errors.
 ///
 /// A path the image lacks is an export error here, not
 /// [`FetchedPath::Missing`]: the export cannot tell the two apart, so the
 /// check reports it as not checked rather than guessing.
 async fn fetch_image_path(
     builder: &dyn ImageBuilder,
+    source: &str,
     image: &str,
     path: String,
 ) -> Result<FetchedPath, ImageFileError> {
     let stream = builder
-        .export_path_stream(image, &path)
+        .export_path_stream(source, &path)
         .await
         .map_err(|error| ImageFileError::Docker {
             image: image.to_string(),
@@ -155,8 +180,9 @@ async fn fetch_image_path(
 const NON_ROOT_USER_EXAMPLE: &str = "e.g. `RUN useradd -r -u 10001 app` and `USER app` \
      (on Alpine: `RUN adduser -S -u 10001 app`)";
 
-/// The deployment-log warning for an image that runs as root.
-pub(super) fn root_user_warning(origin: &ImageOrigin) -> String {
+/// The deployment-log warning for an image that runs as root. `variant`
+/// names the image when the build produced one per architecture.
+pub(super) fn root_user_warning(origin: &ImageOrigin, variant: Option<&str>) -> String {
     let advice = match origin {
         ImageOrigin::Preset(preset) => format!(
             "The Temps '{preset}' preset that built it does not set a non-root USER. To run \
@@ -170,8 +196,12 @@ pub(super) fn root_user_warning(origin: &ImageOrigin) -> String {
             "Rebuild the image with a non-root USER in its Dockerfile, {NON_ROOT_USER_EXAMPLE}"
         ),
     };
+    let subject = match variant {
+        Some(image) => format!("This deployment's image {image}"),
+        None => "This image".to_string(),
+    };
     format!(
-        "⚠️ This image runs as root (uid 0). {advice}. The deployment continues; see \
+        "⚠️ {subject} runs as root (uid 0). {advice}. The deployment continues; see \
          {NON_ROOT_USER_DOCS_URL}"
     )
 }
@@ -202,6 +232,27 @@ fn image_user_note(check: &ImageUserCheck) -> Option<String> {
     }
 }
 
+/// The deployment's verdict from one check per image: the first image that
+/// runs as root (so a root architecture is never hidden behind a non-root
+/// one), otherwise the primary image's check. `checks` starts with the
+/// primary image.
+fn combine_checks(checks: Vec<(String, ImageUserCheck)>) -> Option<(String, ImageUserCheck)> {
+    let root = checks.iter().position(|(_, check)| {
+        matches!(
+            check,
+            ImageUserCheck::Checked {
+                verdict: ImageUserVerdict::Root,
+                ..
+            }
+        )
+    });
+    let mut checks = checks;
+    match root {
+        Some(index) => Some(checks.swap_remove(index)),
+        None => checks.into_iter().next(),
+    }
+}
+
 /// `USER` as stored on the deployment row: bounded, `None` when absent.
 fn recorded_image_user(declared: Option<&str>) -> Option<String> {
     declared.map(|user| user.chars().take(MAX_RECORDED_IMAGE_USER_CHARS).collect())
@@ -220,14 +271,46 @@ impl DeployImageJob {
     }
 
     /// Check which user the deployment's image runs as, log it, and record it
-    /// on the deployment row. Never fails the deployment.
+    /// on the deployment row. Never fails the deployment, and never holds it
+    /// up past [`IMAGE_USER_STEP_TIMEOUT`].
     pub(super) async fn check_and_record_image_user(
         &self,
         image_output: &BuildImageOutput,
         context: &WorkflowContext,
     ) {
-        let image = image_output.image_tag.as_str();
-        let check = match image_output.builder_node_id {
+        self.check_and_record_image_user_within(image_output, context, IMAGE_USER_STEP_TIMEOUT)
+            .await;
+    }
+
+    pub(super) async fn check_and_record_image_user_within(
+        &self,
+        image_output: &BuildImageOutput,
+        context: &WorkflowContext,
+        deadline: Duration,
+    ) {
+        if tokio::time::timeout(deadline, self.check_log_and_record(image_output, context))
+            .await
+            .is_err()
+        {
+            // Nothing to clean up here: a path export removes its scratch
+            // container through a guard that outlives this future.
+            tracing::warn!(
+                project_id = context.project_id,
+                deployment_id = context.deployment_id,
+                image = image_output.image_tag.as_str(),
+                deadline_secs = deadline.as_secs(),
+                "The image-user check did not finish in time; the deployment continues without it"
+            );
+        }
+    }
+
+    /// Check one image, through the image store that holds it.
+    async fn check_one_image(
+        &self,
+        image_output: &BuildImageOutput,
+        image: &str,
+    ) -> ImageUserCheck {
+        match image_output.builder_node_for_tag(image) {
             Some(node_id) => match self.remote_deployer_for_node_id(node_id).await {
                 Ok(node) => check_image_user(node.as_ref(), image).await,
                 Err(error) => ImageUserCheck::NotChecked {
@@ -241,12 +324,55 @@ impl DeployImageJob {
                         .to_string(),
                 },
             },
+        }
+    }
+
+    async fn check_log_and_record(
+        &self,
+        image_output: &BuildImageOutput,
+        context: &WorkflowContext,
+    ) {
+        // One image per architecture the build produced, the primary first.
+        let mut images = vec![image_output.image_tag.clone()];
+        let mut variants: Vec<&String> = image_output.image_tags_by_platform.values().collect();
+        variants.sort();
+        for tag in variants {
+            if !images.contains(tag) {
+                images.push(tag.clone());
+            }
+        }
+        let checks = match tokio::time::timeout(
+            IMAGE_USER_CHECK_TIMEOUT,
+            futures::future::join_all(
+                images
+                    .iter()
+                    .map(|image| self.check_one_image(image_output, image)),
+            ),
+        )
+        .await
+        {
+            Ok(checks) => images.iter().cloned().zip(checks).collect(),
+            Err(_) => vec![(
+                image_output.image_tag.clone(),
+                ImageUserCheck::NotChecked {
+                    reason: format!(
+                        "checking which user image '{}' runs as took longer than {}s",
+                        image_output.image_tag,
+                        IMAGE_USER_CHECK_TIMEOUT.as_secs()
+                    ),
+                },
+            )],
         };
+        let several = images.len() > 1;
+        let Some((image, check)) = combine_checks(checks) else {
+            return;
+        };
+        let image = image.as_str();
 
         let (level, message) = match image_user_note(&check) {
             None => (
                 LogLevel::Warning,
-                root_user_warning(&self.image_origin(context)),
+                root_user_warning(&self.image_origin(context), several.then_some(image)),
             ),
             Some(note) => (LogLevel::Info, note),
         };

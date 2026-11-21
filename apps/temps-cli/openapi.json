@@ -41221,6 +41221,10 @@
               "string",
               "null"
             ]
+          },
+          "user_omitted": {
+            "description": "The image sets a `USER` longer than `MAX_IMAGE_CONFIG_USER_BYTES`,\nwhich `user` leaves out: the user it runs as is unknown, not root.",
+            "type": "boolean"
           }
         },
         "type": "object"

@@ -19235,6 +19235,11 @@ export type ImageConfig = {
      * `USER`, when the image sets one.
      */
     user?: string | null;
+    /**
+     * The image sets a `USER` longer than `MAX_IMAGE_CONFIG_USER_BYTES`,
+     * which `user` leaves out: the user it runs as is unknown, not root.
+     */
+    user_omitted?: boolean;
 };
 
 /**

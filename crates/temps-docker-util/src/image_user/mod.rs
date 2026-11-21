@@ -215,9 +215,10 @@ fn presence(file: Option<&str>) -> &'static str {
 /// | `uid` not in passwd            | uid / `0`                        | `0`                                      | `/`              |
 /// | `name:group`, `uid:gid`, ...   | as given (group looked up by name or number) | just that gid (no membership groups) | passwd home, else `/` |
 ///
-/// A name is looked up first; a numeric string that is no name is looked up
-/// as a uid, and kept as a bare number when passwd has no such entry. A group
-/// that is not a number must exist in `/etc/group`. `root` resolves to
+/// A numeric user is always a uid and a numeric group always a gid, looked
+/// up by id only (an entry literally *named* `7` never matches `USER 7`), and
+/// kept as a bare number when the file has no such entry. Any other user or
+/// group is a name that must exist in the image's file. `root` resolves to
 /// `0:0` even when the image ships no passwd.
 pub fn resolve_image_user(
     spec: &str,
@@ -247,12 +248,10 @@ pub fn resolve_image_user(
     let group_entries = group.map(parse_group).unwrap_or_default();
 
     let numeric_user = user_part.parse::<u32>().ok();
-    let entry = passwd_entries
-        .iter()
-        .find(|entry| entry.name == user_part)
-        .or_else(|| {
-            numeric_user.and_then(|uid| passwd_entries.iter().find(|entry| entry.uid == uid))
-        });
+    let entry = match numeric_user {
+        Some(uid) => passwd_entries.iter().find(|entry| entry.uid == uid),
+        None => passwd_entries.iter().find(|entry| entry.name == user_part),
+    };
     let uid = match (entry, numeric_user) {
         (Some(entry), _) => entry.uid,
         (None, Some(uid)) => uid,
@@ -268,24 +267,17 @@ pub fn resolve_image_user(
 
     let (gid, groups) = match group_part {
         Some(group_name) => {
-            let numeric_group = group_name.parse::<u32>().ok();
-            let found = group_entries
-                .iter()
-                .find(|entry| entry.name == group_name)
-                .or_else(|| {
-                    numeric_group
-                        .and_then(|gid| group_entries.iter().find(|entry| entry.gid == gid))
-                })
-                .map(|entry| entry.gid);
-            let gid = match (found, numeric_group) {
-                (Some(gid), _) | (None, Some(gid)) => gid,
-                (None, None) => {
-                    return Err(ImageUserError::GroupNotFound {
+            let gid = match group_name.parse::<u32>() {
+                Ok(gid) => gid,
+                Err(_) => group_entries
+                    .iter()
+                    .find(|entry| entry.name == group_name)
+                    .map(|entry| entry.gid)
+                    .ok_or_else(|| ImageUserError::GroupNotFound {
                         spec: spec.to_string(),
                         group: group_name.to_string(),
                         group_file: presence(group),
-                    })
-                }
+                    })?,
             };
             (gid, vec![gid])
         }
@@ -352,21 +344,23 @@ impl ImageUserVerdict {
 /// Uses [`resolve_image_user`], the same lookup a microVM replica runs as,
 /// so the verdict matches what the replica actually gets.
 pub fn classify_image_user(spec: &str, identity: &ImageIdentity) -> ImageUserVerdict {
-    let (user, _) = split_spec(spec);
-    if user.is_empty() && spec.trim().is_empty() {
+    if spec.trim().is_empty() {
         return ImageUserVerdict::Root;
     }
-    // uid 0 is root whatever the group: `0:staff` in an image without a
-    // `staff` group still names the superuser.
-    if user == "0" {
-        return ImageUserVerdict::Root;
-    }
-    match resolve_image_user(spec, identity.passwd.as_deref(), identity.group.as_deref()) {
+    let passwd = identity.passwd.as_deref();
+    match resolve_image_user(spec, passwd, identity.group.as_deref()) {
         Ok(resolved) if resolved.uid == 0 => ImageUserVerdict::Root,
         Ok(resolved) => ImageUserVerdict::NonRoot { uid: resolved.uid },
-        // `root` with a group the image lacks is still the superuser, unless
-        // the image's passwd says otherwise, which it was not asked for.
-        Err(ImageUserError::GroupNotFound { .. }) if user == "root" => ImageUserVerdict::Root,
+        // The uid alone makes the superuser: `0:staff` or `root:staff` in an
+        // image without a `staff` group is still uid 0 (unless the image's
+        // passwd maps `root` elsewhere, which the user-only lookup reads).
+        Err(error @ ImageUserError::GroupNotFound { .. }) => {
+            let (user, _) = split_spec(spec);
+            match resolve_image_user(user, passwd, None) {
+                Ok(resolved) if resolved.uid == 0 => ImageUserVerdict::Root,
+                _ => ImageUserVerdict::Unresolved(error),
+            }
+        }
         Err(error) => ImageUserVerdict::Unresolved(error),
     }
 }
@@ -422,17 +416,32 @@ fn first_archive_file(
             limit: MAX_IDENTITY_FILE_BYTES,
         });
     }
-    let mut contents = Vec::with_capacity(entry.size() as usize);
+    let declared = entry.size();
+    let mut contents = Vec::with_capacity(declared as usize);
     entry
         .read_to_end(&mut contents)
         .map_err(|e| not_readable(format!("reading its contents failed: {e}")))?;
+    // A truncated archive can end inside the payload without the reader
+    // reporting it; a short file would read as a passwd missing the user.
+    if contents.len() as u64 != declared {
+        return Err(not_readable(format!(
+            "the archive holds {} of its {declared} bytes",
+            contents.len()
+        )));
+    }
     Ok(Some(ArchiveFile::Regular(contents)))
 }
 
 /// Where a symlink found at `from` points, as an absolute path inside the
 /// image. `..` stops at the root, as in a chroot, so a link can never name
 /// anything outside the image.
-fn resolve_link_target(from: &str, target: &str) -> String {
+///
+/// `None` for a target that steps back out of a directory it names itself
+/// (`a/link/../passwd`): the runtime resolves `link` before applying `..`,
+/// and the archive exports only take clean paths, so collapsing it here
+/// could read a different file than the container would. Leading `..`
+/// (`../usr/etc/passwd`, the usual layout) is resolved.
+fn resolve_link_target(from: &str, target: &str) -> Option<String> {
     let mut parts: Vec<&str> = if target.starts_with('/') {
         Vec::new()
     } else {
@@ -440,16 +449,21 @@ fn resolve_link_target(from: &str, target: &str) -> String {
         dir.pop();
         dir
     };
+    let mut named_a_directory = false;
     for part in target.split('/') {
         match part {
             "" | "." => {}
+            ".." if named_a_directory => return None,
             ".." => {
                 parts.pop();
             }
-            name => parts.push(name),
+            name => {
+                named_a_directory = true;
+                parts.push(name);
+            }
         }
     }
-    format!("/{}", parts.join("/"))
+    Some(format!("/{}", parts.join("/")))
 }
 
 /// What fetching one path out of an image produced.
@@ -488,14 +502,16 @@ where
             path: path.to_string(),
             reason: e.to_string(),
         })?;
-        tar_bytes.extend_from_slice(chunk.as_ref());
-        if tar_bytes.len() > MAX_IDENTITY_ARCHIVE_BYTES {
+        let chunk = chunk.as_ref();
+        // Checked before copying, so one oversized chunk is never buffered.
+        if chunk.len() > MAX_IDENTITY_ARCHIVE_BYTES - tar_bytes.len() {
             return Err(ImageFileError::TooLarge {
                 image: image.to_string(),
                 path: path.to_string(),
                 limit: MAX_IDENTITY_FILE_BYTES,
             });
         }
+        tar_bytes.extend_from_slice(chunk);
     }
     Ok(tar_bytes)
 }
@@ -530,7 +546,16 @@ where
                 return Ok(Some(String::from_utf8_lossy(&contents).into_owned()))
             }
             Some(ArchiveFile::Symlink(target)) => {
-                current = resolve_link_target(&current, &target);
+                current = resolve_link_target(&current, &target).ok_or_else(|| {
+                    ImageFileError::NotReadable {
+                        image: image.to_string(),
+                        path: current.clone(),
+                        reason: format!(
+                            "it links to '{target}', which steps back out of a directory it \
+                             names; resolving that needs the image's own symlinks"
+                        ),
+                    }
+                })?;
             }
         }
     }
@@ -558,18 +583,16 @@ impl IdentityFilesNeeded {
     };
 
     /// The files [`classify_image_user`] reads for `spec`: `/etc/passwd`
-    /// only for a user given by a name other than `root`, `/etc/group` only
-    /// for a group given by name. A user that is already uid 0 (`root` or
-    /// `0`) is root whatever its group, so it reads nothing.
+    /// only for a user given by name (`root` included: the image's passwd
+    /// decides its uid, as it does for the runtime), `/etc/group` only for a
+    /// group given by name. A numeric uid is never looked up to decide root,
+    /// and uid `0` is root whatever its group, so `0:staff` reads nothing.
     pub fn to_classify(spec: &str) -> Self {
         let (user, group) = split_spec(spec);
-        if user == "root" || user == "0" {
-            return Self::default();
-        }
         let named = |part: &str| !part.is_empty() && part.parse::<u32>().is_err();
         Self {
-            passwd: named(user) && user != "root",
-            group: group.is_some_and(named),
+            passwd: named(user),
+            group: user != "0" && group.is_some_and(named),
         }
     }
 }

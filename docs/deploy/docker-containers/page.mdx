@@ -510,7 +510,7 @@ CMD ["python", "main.py"]
 
 - Listen on a port above 1024: a non-root process cannot bind lower ports.
 - `USER 10001:10001` works too and needs no entry in `/etc/passwd`.
-- A `USER` the image's `/etc/passwd` does not list cannot be checked, so it is not reported as root; Docker refuses to start such an image anyway.
+- A named `USER` the image's `/etc/passwd` does not list cannot be checked, so it is not reported as root; Docker refuses to start such an image anyway. A numeric `USER` needs no entry.
 
 ---
 

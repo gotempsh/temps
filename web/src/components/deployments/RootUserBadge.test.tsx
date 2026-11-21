@@ -31,9 +31,11 @@ test('a root deployment shows a labelled badge that opens the fix and docs', asy
   await waitFor(() =>
     expect(view.getByText('This image runs as root (uid 0)')).toBeTruthy()
   )
-  expect(view.getByText(/RUN useradd -r -u 10001 app/).textContent).toContain(
-    'USER app'
-  )
+  const snippet = view.getByText(/RUN useradd -r -u 10001 app/).textContent
+  expect(snippet).toContain('USER app')
+  // Alpine has no `useradd`: its command sits beside the Debian one.
+  expect(snippet).toContain('# Debian/Ubuntu')
+  expect(snippet).toContain('RUN adduser -S -u 10001 app')
   const docs = view.getByRole('link', { name: 'How to run as a non-root user' })
   expect(docs.getAttribute('href')).toBe(NON_ROOT_USER_DOCS_URL)
   expect(

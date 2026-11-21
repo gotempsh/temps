@@ -18,17 +18,29 @@ use crate::workflow::{LogWriter, WorkflowError};
 struct FakeImageStore {
     /// `None`: an agent that does not report the image configuration.
     config: Option<ImageConfig>,
+    /// Images whose configuration differs from `config`, by tag.
+    per_image: HashMap<&'static str, ImageConfig>,
     files: HashMap<&'static str, Vec<u8>>,
     exported: Mutex<Vec<String>>,
+    /// The image reference each export named.
+    exported_from: Mutex<Vec<String>>,
 }
 
 impl FakeImageStore {
     fn with_user(user: Option<&str>) -> Self {
         Self {
             config: Some(ImageConfig::from_raw(&[], user, &[], &[])),
+            per_image: HashMap::new(),
             files: HashMap::new(),
             exported: Mutex::new(Vec::new()),
+            exported_from: Mutex::new(Vec::new()),
         }
+    }
+
+    fn image_with_user(mut self, image: &'static str, user: Option<&str>) -> Self {
+        self.per_image
+            .insert(image, ImageConfig::from_raw(&[], user, &[], &[]));
+        self
     }
 
     fn file(mut self, path: &'static str, contents: &str) -> Self {
@@ -76,6 +88,10 @@ impl ImageBuilder for FakeImageStore {
         source_path: &str,
     ) -> Result<ImageImportStream, BuilderError> {
         self.exported.lock().unwrap().push(source_path.to_string());
+        self.exported_from
+            .lock()
+            .unwrap()
+            .push(image_name.to_string());
         let Some(archive) = self.files.get(source_path).cloned() else {
             return Err(BuilderError::Other(format!(
                 "no {source_path} in {image_name}"
@@ -116,7 +132,11 @@ impl ImageBuilder for FakeImageStore {
             tags: vec![image_name.to_string()],
             created: None,
             working_dir: None,
-            config: self.config.clone(),
+            config: self
+                .per_image
+                .get(image_name)
+                .cloned()
+                .or_else(|| self.config.clone()),
         })
     }
 
@@ -145,7 +165,10 @@ async fn an_image_without_a_user_is_root_and_reads_no_files() {
 #[tokio::test]
 async fn root_zero_and_uid_zero_with_any_group_are_root() {
     for user in ["root", "0", "0:0", "0:staff", "root:staff"] {
-        let store = FakeImageStore::with_user(Some(user));
+        // `root` is looked up in the image's passwd, like any name.
+        let store = FakeImageStore::with_user(Some(user))
+            .file("/etc/passwd", PASSWD)
+            .file("/etc/group", "root:x:0:\n");
         let check = check_image_user(&store, "my-app:1").await;
         assert_eq!(
             check,
@@ -221,6 +244,33 @@ async fn an_unresolvable_named_user_is_unknown_not_root() {
     );
 }
 
+/// The image's files are read from the image that was inspected, by id,
+/// never by re-resolving a tag that may have moved since.
+#[tokio::test]
+async fn identity_files_are_read_from_the_inspected_image_id() {
+    let store = FakeImageStore::with_user(Some("nodejs")).file("/etc/passwd", PASSWD);
+    check_image_user(&store, "my-app:1").await;
+    assert_eq!(
+        *store.exported_from.lock().unwrap(),
+        vec!["sha256:my-app:1"]
+    );
+}
+
+#[tokio::test]
+async fn a_user_too_long_to_be_reported_is_unknown_not_root() {
+    let long = format!(
+        "app:{}",
+        "g".repeat(temps_deployer::MAX_IMAGE_CONFIG_USER_BYTES)
+    );
+    let store = FakeImageStore::with_user(Some(&long));
+    let check = check_image_user(&store, "my-app:1").await;
+    assert!(
+        matches!(&check, ImageUserCheck::NotChecked { reason } if reason.contains("longer than")),
+        "{check:?}"
+    );
+    assert!(store.exported.lock().unwrap().is_empty());
+}
+
 #[tokio::test]
 async fn an_image_that_cannot_be_inspected_or_described_is_not_checked() {
     let store = FakeImageStore::with_user(None);
@@ -243,7 +293,7 @@ async fn an_image_that_cannot_be_inspected_or_described_is_not_checked() {
 
 #[test]
 fn the_root_warning_names_the_fix_for_each_origin() {
-    let preset = root_user_warning(&ImageOrigin::Preset("python".to_string()));
+    let preset = root_user_warning(&ImageOrigin::Preset("python".to_string()), None);
     assert!(
         preset.starts_with("⚠️ This image runs as root (uid 0)."),
         "{preset}"
@@ -251,7 +301,7 @@ fn the_root_warning_names_the_fix_for_each_origin() {
     assert!(preset.contains("'python' preset"), "{preset}");
     assert!(!preset.contains("your Dockerfile"), "{preset}");
 
-    let dockerfile = root_user_warning(&ImageOrigin::RepositoryDockerfile);
+    let dockerfile = root_user_warning(&ImageOrigin::RepositoryDockerfile, None);
     assert!(
         dockerfile.contains(
             "Add a non-root USER to your Dockerfile, e.g. `RUN useradd -r -u 10001 app` and \
@@ -260,7 +310,7 @@ fn the_root_warning_names_the_fix_for_each_origin() {
         "{dockerfile}"
     );
 
-    let prebuilt = root_user_warning(&ImageOrigin::PrebuiltImage);
+    let prebuilt = root_user_warning(&ImageOrigin::PrebuiltImage, None);
     assert!(prebuilt.contains("Rebuild the image"), "{prebuilt}");
 
     for message in [preset, dockerfile, prebuilt] {
@@ -459,6 +509,70 @@ async fn an_image_that_was_not_checked_leaves_the_row_alone() {
         .any(|line| line.starts_with("Could not check which user the image runs as")));
     drop(job);
     assert!(deployment_updates(db).is_empty());
+}
+
+/// A multi-architecture build is checked per architecture: one image that
+/// runs as root is warned about, by name, even when the primary is not.
+#[tokio::test]
+async fn a_root_image_for_another_architecture_is_warned_about() {
+    let db = mock_db();
+    let store = FakeImageStore::with_user(Some("nodejs"))
+        .file("/etc/passwd", PASSWD)
+        .image_with_user("my-app:1-arm64", None);
+    let job = job(store, Some(db.clone()), false);
+    let log = Arc::new(CapturedLog::default());
+    let context = WorkflowContext::new("run-42".to_string(), 42, 3, 4, log.clone());
+    let mut output = image_output();
+    output.image_tags_by_platform = HashMap::from([
+        ("linux/amd64".to_string(), "my-app:1".to_string()),
+        ("linux/arm64".to_string(), "my-app:1-arm64".to_string()),
+    ]);
+
+    job.check_and_record_image_user(&output, &context).await;
+
+    let lines = log.0.lock().unwrap().clone();
+    let warnings: Vec<_> = lines
+        .iter()
+        .filter(|line| line.contains("runs as root"))
+        .collect();
+    assert_eq!(warnings.len(), 1, "{lines:?}");
+    assert!(warnings[0].contains("my-app:1-arm64"), "{}", warnings[0]);
+    drop(job);
+    let updates = deployment_updates(db);
+    assert_eq!(updates.len(), 1, "{updates:?}");
+    assert!(updates[0].contains("Bool(Some(true))"), "{}", updates[0]);
+}
+
+/// A log writer that never returns, like a stalled log store.
+struct StalledLog;
+
+#[async_trait]
+impl LogWriter for StalledLog {
+    async fn write_log(&self, _message: String) -> Result<(), WorkflowError> {
+        std::future::pending().await
+    }
+
+    fn stage_id(&self) -> i32 {
+        1
+    }
+}
+
+/// One deadline covers the whole step, the log line and the row update
+/// included, so a stalled write cannot keep the replicas from starting.
+#[tokio::test]
+async fn the_whole_advisory_step_is_bounded_by_one_deadline() {
+    let job = job(FakeImageStore::with_user(None), Some(mock_db()), false);
+    let context = WorkflowContext::new("run-42".to_string(), 42, 3, 4, Arc::new(StalledLog));
+    let finished = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        job.check_and_record_image_user_within(
+            &image_output(),
+            &context,
+            std::time::Duration::from_millis(100),
+        ),
+    )
+    .await;
+    assert!(finished.is_ok(), "the step outlived its deadline");
 }
 
 #[test]

@@ -4418,6 +4418,7 @@ mod tests {
             user: Some("app".to_string()),
             env: vec!["SYNTHETIC_SETTING=1".to_string()],
             entrypoint: vec!["/app/server".to_string()],
+            ..Default::default()
         });
         let worker = Arc::new(worker);
         let control_plane = Arc::new(FakeImageStore::default());

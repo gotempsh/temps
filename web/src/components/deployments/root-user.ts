@@ -5,8 +5,16 @@
 export const NON_ROOT_USER_DOCS_URL =
   'https://temps.sh/docs/docker-containers#non-root-user'
 
-/** The two Dockerfile lines the fix asks for. */
-export const NON_ROOT_USER_SNIPPET = 'RUN useradd -r -u 10001 app\nUSER app'
+/**
+ * The Dockerfile lines the fix asks for. `useradd` is the Debian/Ubuntu
+ * command; Alpine images ship `adduser` instead.
+ */
+export const NON_ROOT_USER_SNIPPET = [
+  '# Debian/Ubuntu',
+  'RUN useradd -r -u 10001 app',
+  '# Alpine: RUN adduser -S -u 10001 app',
+  'USER app',
+].join('\n')
 
 /** What the image declares, in words, for the popover's first line. */
 export function describeImageUser(imageUser?: string | null): string {

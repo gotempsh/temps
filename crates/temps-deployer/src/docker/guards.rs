@@ -121,6 +121,10 @@ impl DockerContainerCleanupGuard {
                 &self.container_id,
                 Some(RemoveContainerOptions {
                     force: true,
+                    // The daemon creates an anonymous volume for each
+                    // `VOLUME` of the image at create time; without this
+                    // every extraction would leave them behind.
+                    v: true,
                     ..Default::default()
                 }),
             )
@@ -156,6 +160,7 @@ impl Drop for DockerContainerCleanupGuard {
                     &container_id,
                     Some(RemoveContainerOptions {
                         force: true,
+                        v: true,
                         ..Default::default()
                     }),
                 )
@@ -210,6 +215,85 @@ mod tests {
         assert!(message.contains("unsafe archive"));
         assert!(message.contains("daemon unavailable"));
         assert!(message.contains("container-1"));
+    }
+
+    /// A never-started extraction container with an anonymous volume (what
+    /// an image's `VOLUME` gives it), plus that volume's name.
+    async fn extraction_container_with_a_volume(docker: &Docker) -> (String, String) {
+        let created = docker
+            .create_container(
+                None::<bollard::query_parameters::CreateContainerOptions>,
+                bollard::models::ContainerCreateBody {
+                    image: Some("alpine:latest".to_string()),
+                    cmd: Some(vec!["true".to_string()]),
+                    volumes: Some(vec!["/data".to_string()]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create the extraction container");
+        let inspected = docker
+            .inspect_container(&created.id, None)
+            .await
+            .expect("inspect the extraction container");
+        let volume = inspected
+            .mounts
+            .unwrap_or_default()
+            .into_iter()
+            .find_map(|mount| mount.name)
+            .expect("the container has an anonymous volume");
+        (created.id, volume)
+    }
+
+    /// Whether `volume` is gone, waiting up to ten seconds for a cleanup
+    /// that runs in the background.
+    async fn volume_removed(docker: &Docker, volume: &str) -> bool {
+        for _ in 0..50 {
+            if docker.inspect_volume(volume).await.is_err() {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        false
+    }
+
+    /// Both the normal cleanup and the cancellation cleanup remove the
+    /// anonymous volumes with the container. Only the volume this test
+    /// created is checked, so other activity on the daemon cannot affect it.
+    #[tokio::test]
+    async fn extraction_cleanup_removes_the_containers_anonymous_volumes() {
+        if crate::docker::test_support::create_test_docker_runtime()
+            .await
+            .is_err()
+        {
+            println!("Docker or alpine:latest is unavailable, skipping");
+            return;
+        }
+        let docker = Arc::new(Docker::connect_with_local_defaults().expect("local Docker client"));
+
+        let (container, volume) = extraction_container_with_a_volume(&docker).await;
+        let mut guard =
+            DockerContainerCleanupGuard::new(docker.clone(), container, "alpine:latest", "/data");
+        guard
+            .cleanup()
+            .await
+            .expect("remove the extraction container");
+        assert!(
+            volume_removed(&docker, &volume).await,
+            "cleanup left the anonymous volume {volume} behind"
+        );
+
+        let (container, volume) = extraction_container_with_a_volume(&docker).await;
+        drop(DockerContainerCleanupGuard::new(
+            docker.clone(),
+            container,
+            "alpine:latest",
+            "/data",
+        ));
+        assert!(
+            volume_removed(&docker, &volume).await,
+            "cancellation cleanup left the anonymous volume {volume} behind"
+        );
     }
 
     #[test]

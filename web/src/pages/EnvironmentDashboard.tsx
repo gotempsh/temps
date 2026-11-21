@@ -139,59 +139,69 @@ export function EnvironmentDashboard({
       />
       {/* The project bar already shows the environment's name. */}
       <PageTitle className="sr-only">{environment.name}</PageTitle>
-      <div className="flex items-center gap-3 border-b">
-        <Tabs
-          className="min-w-0 flex-1"
-          value={activeView}
-          onValueChange={(value) =>
-            handleViewChange(resolveEnvironmentView(value))
-          }
-        >
-          <TabsList
-            className="border-b-0"
-            aria-label={`${environment.name} pages`}
+      {/* Narrow: the tabs get the whole first line, the badge and actions
+          the line below, so neither squeezes the tabs. */}
+      <div className="@container border-b">
+        <div className="flex flex-col gap-x-3 @xl:flex-row @xl:items-center">
+          <Tabs
+            className="min-w-0 @xl:flex-1"
+            value={activeView}
+            onValueChange={(value) =>
+              handleViewChange(resolveEnvironmentView(value))
+            }
           >
-            {ENVIRONMENT_VIEWS.map((view) => (
-              <TabsTrigger key={view.value} value={view.value} icon={view.icon}>
-                {view.label}
-              </TabsTrigger>
-            ))}
-          </TabsList>
-        </Tabs>
-        {/* The environment's current deployment, which its containers run. */}
-        <RootUserBadge
-          runsAsRoot={deployment.data?.runs_as_root}
-          imageUser={deployment.data?.image_user}
-        />
-        {activeView === 'containers' ? (
-          // The containers and their deployment; each row's CPU and memory
-          // keep their own 5 s poll.
-          <RefreshButton
-            className="shrink-0"
-            queryKeys={[
-              getEnvironmentQueryKey({
-                path: { project_id: project.id, env_id: environmentId },
-              }),
-              queryKeyPrefix(listContainersQueryKey, {
-                path: { project_id: project.id },
-              }),
-              queryKeyPrefix(getDeploymentQueryKey, {
-                path: { project_id: project.id },
-              }),
-            ]}
-          />
-        ) : null}
-        {onCreateEnvironment && (
-          <Button
-            variant="outline"
-            size="sm"
-            className="shrink-0"
-            onClick={onCreateEnvironment}
-          >
-            <Plus className="size-4" aria-hidden="true" />
-            <span className="max-sm:sr-only">New environment</span>
-          </Button>
-        )}
+            <TabsList
+              className="border-b-0"
+              aria-label={`${environment.name} pages`}
+            >
+              {ENVIRONMENT_VIEWS.map((view) => (
+                <TabsTrigger
+                  key={view.value}
+                  value={view.value}
+                  icon={view.icon}
+                >
+                  {view.label}
+                </TabsTrigger>
+              ))}
+            </TabsList>
+          </Tabs>
+          <div className="flex items-center justify-end gap-2 pb-2 empty:hidden @xl:pb-0">
+            {/* The environment's current deployment, which its containers run. */}
+            <RootUserBadge
+              runsAsRoot={deployment.data?.runs_as_root}
+              imageUser={deployment.data?.image_user}
+            />
+            {activeView === 'containers' ? (
+              // The containers and their deployment; each row's CPU and memory
+              // keep their own 5 s poll.
+              <RefreshButton
+                className="shrink-0"
+                queryKeys={[
+                  getEnvironmentQueryKey({
+                    path: { project_id: project.id, env_id: environmentId },
+                  }),
+                  queryKeyPrefix(listContainersQueryKey, {
+                    path: { project_id: project.id },
+                  }),
+                  queryKeyPrefix(getDeploymentQueryKey, {
+                    path: { project_id: project.id },
+                  }),
+                ]}
+              />
+            ) : null}
+            {onCreateEnvironment && (
+              <Button
+                variant="outline"
+                size="sm"
+                className="shrink-0"
+                onClick={onCreateEnvironment}
+              >
+                <Plus className="size-4" aria-hidden="true" />
+                <span className="max-sm:sr-only">New environment</span>
+              </Button>
+            )}
+          </div>
+        </div>
       </div>
       <EnvironmentViewContent
         project={project}
