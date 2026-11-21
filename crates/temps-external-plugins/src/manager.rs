@@ -1328,6 +1328,15 @@ impl ExternalPluginManager {
     ///
     /// Returns a map of plugin name -> OpenAPI schema.
     pub async fn openapi_schemas(&self) -> Vec<(String, OpenApi)> {
+        self.runtime_openapi_schemas()
+            .await
+            .into_iter()
+            .map(|(name, _, schema)| (name, schema))
+            .collect()
+    }
+
+    /// Read each schema and its verified executable's digest from the same running process.
+    pub(crate) async fn runtime_openapi_schemas(&self) -> Vec<(String, String, OpenApi)> {
         self.plugins
             .read()
             .await
@@ -1336,7 +1345,7 @@ impl ExternalPluginManager {
                 process
                     .openapi_schema
                     .as_ref()
-                    .map(|schema| (name.clone(), schema.clone()))
+                    .map(|schema| (name.clone(), process.sha256.clone(), schema.clone()))
             })
             .collect()
     }

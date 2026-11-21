@@ -33,6 +33,19 @@ pub(crate) struct DynamicPluginRouter {
     pub inner: Arc<RwLock<Router>>,
 }
 
+impl DynamicPluginRouter {
+    pub(crate) fn router(&self) -> Router {
+        let router_ref = self.inner.clone();
+        Router::new().fallback(move |request: Request| {
+            let router_ref = router_ref.clone();
+            async move {
+                let router = router_ref.read().await.clone();
+                router.oneshot(request).await.into_response()
+            }
+        })
+    }
+}
+
 /// External plugins plugin — discovers, manages, and proxies standalone
 /// binary plugins following the TempsPlugin lifecycle.
 pub struct ExternalPluginsPlugin {
@@ -149,19 +162,7 @@ impl TempsPlugin for ExternalPluginsPlugin {
         // Build the listing + admin routes (/x/plugins, /x/plugins/reload)
         let listing_router = handler::configure_routes().with_state((*app_state).clone());
 
-        // Create a dynamic routing layer that reads the swappable proxy router
-        // on every request. When reload_plugins() swaps the inner Router, all
-        // subsequent requests are routed to the new plugins.
-        let router_ref = dynamic.inner.clone();
-        let dynamic_proxy = Router::new().fallback(move |request: Request| {
-            let router_ref = router_ref.clone();
-            async move {
-                let router = router_ref.read().await.clone();
-                router.oneshot(request).await.into_response()
-            }
-        });
-
-        let combined_router = listing_router.merge(dynamic_proxy);
+        let combined_router = listing_router.merge(dynamic.router());
 
         Some(PluginRoutes::new(combined_router))
     }
