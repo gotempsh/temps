@@ -10310,3 +10310,96 @@ async fn test_domains_failure_cause_is_nullable_and_reversible() -> anyhow::Resu
     assert_eq!(kept.try_get::<i32>("", "count")?, 1);
     Ok(())
 }
+
+/// `(data_type, is_nullable, column_default)` of a `deployments` column, or
+/// `None` when it does not exist.
+async fn deployments_column(
+    db: &DatabaseConnection,
+    column: &str,
+) -> anyhow::Result<Option<(String, String, Option<String>)>> {
+    let row = db
+        .query_one(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT data_type, is_nullable, column_default \
+             FROM information_schema.columns \
+             WHERE table_schema = 'public' AND table_name = 'deployments' \
+               AND column_name = $1",
+            [column.into()],
+        ))
+        .await?;
+    Ok(match row {
+        Some(row) => Some((
+            row.try_get("", "data_type")?,
+            row.try_get("", "is_nullable")?,
+            row.try_get("", "column_default")?,
+        )),
+        None => None,
+    })
+}
+
+#[tokio::test]
+async fn test_image_user_columns_on_deployments_up_and_down() -> anyhow::Result<()> {
+    const TEST: &str = "test_image_user_columns_on_deployments_up_and_down";
+    const TARGET: &str = "m20261121_120001_add_image_user_to_deployments";
+    if external_db_configured() {
+        println!("⏭️  Skipping {TEST}: using external database via TEMPS_TEST_DATABASE_URL");
+        return Ok(());
+    }
+
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            eprintln!("⏭️  Skipping {TEST}: Docker unavailable ({error})");
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db_url = format!("postgresql://postgres:postgres@localhost:{port}/postgres");
+    let db = connect_with_retries(&db_url).await?;
+
+    let before = Migrator::migrations()
+        .iter()
+        .position(|migration| migration.name() == TARGET)
+        .unwrap_or_else(|| panic!("migration {TARGET} not found in Migrator"));
+    Migrator::up(&db, Some(before as u32)).await?;
+    assert_eq!(deployments_column(&db, "runs_as_root").await?, None);
+    assert_eq!(deployments_column(&db, "image_user").await?, None);
+
+    Migrator::up(&db, Some(1)).await?;
+    // Existing rows were never checked: not root, no recorded user.
+    assert_eq!(
+        deployments_column(&db, "runs_as_root").await?,
+        Some((
+            "boolean".to_string(),
+            "NO".to_string(),
+            Some("false".to_string())
+        ))
+    );
+    assert_eq!(
+        deployments_column(&db, "image_user").await?,
+        Some(("text".to_string(), "YES".to_string(), None))
+    );
+
+    Migrator::down(&db, Some(steps_back_to(TARGET))).await?;
+    assert_eq!(deployments_column(&db, "runs_as_root").await?, None);
+    assert_eq!(deployments_column(&db, "image_user").await?, None);
+
+    // Re-applying is safe.
+    Migrator::up(&db, None).await?;
+    assert!(deployments_column(&db, "runs_as_root").await?.is_some());
+    Ok(())
+}

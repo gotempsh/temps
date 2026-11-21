@@ -136,6 +136,8 @@ fn make_deployment(id: i32, project_id: i32, environment_id: i32) -> deployments
         promoted_from_deployment_id: None,
         upload_request_id: None,
         docker_socket_mounted: false,
+        runs_as_root: false,
+        image_user: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }

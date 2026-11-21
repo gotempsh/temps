@@ -25,6 +25,8 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 
 [dev-dependencies]
+http-body-util = { workspace = true }
+time = { workspace = true, features = ["parsing"] }
 tempfile = { workspace = true }
 uuid = { workspace = true }
 

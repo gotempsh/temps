@@ -302,6 +302,9 @@ impl DeploymentService {
             promoted_from_deployment_id: Set(None),
             upload_request_id: Set(None),
             docker_socket_mounted: Set(false),
+            // Re-checked by this deployment's own deploy job.
+            runs_as_root: Set(false),
+            image_user: Set(None),
             created_at: Set(now),
             updated_at: Set(now),
         };

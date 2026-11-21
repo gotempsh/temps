@@ -203,6 +203,14 @@ pub struct Model {
     /// (admin-only) does not stop or recreate its already-running
     /// containers.
     pub docker_socket_mounted: bool,
+    /// Whether this deployment's image runs its process as root (uid 0),
+    /// resolved once by the deploy pipeline against the image's own
+    /// `/etc/passwd`. `false` when the image runs as another user, its user
+    /// could not be resolved, or it was never checked.
+    pub runs_as_root: bool,
+    /// The `USER` the deployment's image declares, as written; `None` when
+    /// it declares none (it then runs as root) or was never checked.
+    pub image_user: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
