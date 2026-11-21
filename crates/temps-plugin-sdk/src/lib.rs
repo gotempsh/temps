@@ -78,6 +78,7 @@ pub use manifest::{
     NavEntry, NavSection, PluginCapability, PluginEvent, PluginManifest, PluginManifestBuilder,
     UiManifest, PLUGIN_EVENTS_PATH,
 };
+pub use temps_plugin_protocol::channel::{PublishWatchEvent, WatchEventAck};
 
 /// Re-export commonly used types
 pub mod prelude {
@@ -90,6 +91,7 @@ pub mod prelude {
         NavEntry, NavSection, PluginCapability, PluginEvent, PluginManifest, UiManifest,
     };
     pub use crate::ExternalPlugin;
+    pub use crate::{PublishWatchEvent, WatchEventAck};
 
     // Re-export common dependencies for convenience
     pub use axum;

@@ -541,6 +541,8 @@ mod tests {
         let mut req = HttpRequest::builder().uri("/").body(Body::empty()).unwrap();
         req.extensions_mut().insert(AiToolCall);
         req.extensions_mut().insert(AiToolOrigin {
+            chat_id: None,
+            agent_name: None,
             ip_address: "203.0.113.7".to_string(),
             user_agent: "Mozilla/5.0".to_string(),
         });

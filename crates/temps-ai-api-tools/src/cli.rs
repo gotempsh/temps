@@ -58,6 +58,15 @@ struct Section<'a> {
     operations: Vec<&'a ApiOperation>,
 }
 
+impl Section<'_> {
+    fn command_name<'a>(&self, operation: &'a ApiOperation) -> &'a str {
+        let id = operation.operation_id.as_str();
+        id.strip_prefix(&self.slug)
+            .and_then(|tail| tail.strip_prefix('.'))
+            .unwrap_or(id)
+    }
+}
+
 /// Parse a command line and resolve it to a [`CliAction`]. Never executes.
 ///
 /// `permit` filters which operations are *discoverable* (shown in `--help` /
@@ -113,11 +122,10 @@ pub(crate) fn resolve_with_project_context<'a>(
         }
         // `<section> <operation> …`
         let op_name = &tokens[1];
-        return match sec
-            .operations
-            .iter()
-            .find(|o| o.operation_id.eq_ignore_ascii_case(op_name))
-        {
+        return match sec.operations.iter().find(|o| {
+            o.operation_id.eq_ignore_ascii_case(op_name)
+                || sec.command_name(o).eq_ignore_ascii_case(op_name)
+        }) {
             Some(op) => resolve_operation(op, &tokens[2..], project_selected),
             None => CliAction::Invalid(format!(
                 "Unknown operation '{op_name}' in section '{}'.{}\n\n{}",
@@ -165,7 +173,7 @@ fn suggest_operations(secs: &[Section], token: &str) -> String {
             let id = op.operation_id.to_ascii_lowercase();
             let path = op.path.to_ascii_lowercase();
             if needles.iter().any(|n| id.contains(n) || path.contains(n)) {
-                hits.push(format!("  {} {}", sec.slug, op.operation_id));
+                hits.push(format!("  {} {}", sec.slug, sec.command_name(op)));
                 if hits.len() >= 8 {
                     break;
                 }
@@ -312,7 +320,7 @@ fn render_section_help(sec: &Section) -> String {
     let width = sec
         .operations
         .iter()
-        .map(|o| o.operation_id.len())
+        .map(|o| sec.command_name(o).len())
         .max()
         .unwrap_or(0);
     for op in &sec.operations {
@@ -328,7 +336,7 @@ fn render_section_help(sec: &Section) -> String {
             .unwrap_or_default();
         out.push_str(&format!(
             "  {:<width$}  {summary}\n",
-            op.operation_id,
+            sec.command_name(op),
             width = width
         ));
     }
@@ -927,6 +935,54 @@ mod tests {
     }
 
     use crate::index::ParamSpec;
+
+    #[test]
+    fn dotted_plugin_commands_and_section_help_resolve_the_same_operation() {
+        for (method, access, mode) in [
+            ("get", crate::PluginToolAccess::Read, CliMode::ReadOnly),
+            ("post", crate::PluginToolAccess::Write, CliMode::Write),
+        ] {
+            let spec = serde_json::from_value(serde_json::json!({
+                "openapi":"3.1.0","info":{"title":"Reports","version":"1"},
+                "paths":{"/report":{method:{"operationId":"report","x-temps-ai-tool":{},
+                    "responses":{"200":{"description":"OK"}}}}}
+            }))
+            .unwrap();
+            let plugin = crate::PluginToolsIndex::from_openapi("reports", &spec, true).unwrap();
+            let mut index = analytics_discovery_index();
+            plugin.append_to(&mut index, access);
+            let CliAction::Terminal(help) =
+                resolve(&index, "plugin.reports --help", &|_| true, mode)
+            else {
+                panic!("missing section help")
+            };
+            assert!(
+                help.lines()
+                    .any(|line| line.trim_start().starts_with("report ")),
+                "{help}"
+            );
+            for command in [
+                "plugin.reports report",
+                "plugin.reports.report",
+                "plugin.reports plugin.reports.report",
+            ] {
+                let CliAction::Execute(op, _) = resolve(&index, command, &|_| true, mode) else {
+                    panic!("failed to resolve {command}")
+                };
+                assert_eq!(op.operation_id, "plugin.reports.report");
+                let CliAction::Terminal(help) =
+                    resolve(&index, &format!("{command} --help"), &|_| true, mode)
+                else {
+                    panic!("missing help")
+                };
+                assert!(help.contains("plugin.reports.report"));
+                assert!(matches!(
+                    resolve(&index, command, &|_| false, mode),
+                    CliAction::Invalid(_)
+                ));
+            }
+        }
+    }
 
     #[test]
     fn operation_help_marks_required_plugin_queries_but_preserves_core_compatibility() {

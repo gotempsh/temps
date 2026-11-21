@@ -50,6 +50,7 @@ pub mod suggestion_handlers;
 pub mod suggestions;
 pub mod thread_kind;
 pub mod usage;
+pub mod watches;
 pub mod workspace_chats;
 
 pub use applications::{ApplicationError, ApplicationService, ApplicationWorkspaceService};

@@ -70,6 +70,9 @@ export function startChatIn(application: NewChatInDetail) {
   )
 }
 
+/** Refresh the open transcript after the host appends a notification. */
+export const CHAT_WATCH_DELIVERY_EVENT = 'temps:chat-watch-delivery'
+
 /**
  * Tells the chat list to read itself again: a chat moved between
  * applications, or an application was renamed, so its groups changed.

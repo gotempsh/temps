@@ -36,6 +36,15 @@
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AiToolCall;
 
+/// Host-only marker for a durable plugin watch delivery on a normal chat send.
+#[derive(Debug, Clone)]
+pub struct PluginWatchDelivery(pub String);
+
+/// Installed only by the conversation-bound watch tool. Carries the server-
+/// selected conversation, independent of any arguments supplied by a model.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChatWatchScope(pub String);
+
 /// Refuse a request the AI assistant issued itself, for an operation whose
 /// whole protection is that a *human* performs it.
 ///
@@ -76,6 +85,9 @@ pub fn require_human_caller(
 /// with a visible "via Temps AI assistant" label.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AiToolOrigin {
+    pub chat_id: Option<i64>,
+    /// Display name of the originating chat on a confirmed plugin write.
+    pub agent_name: Option<String>,
     pub ip_address: String,
     pub user_agent: String,
 }
@@ -128,6 +140,8 @@ mod tests {
     #[test]
     fn assistant_user_agent_keeps_the_real_client_and_names_the_assistant() {
         let origin = AiToolOrigin {
+            chat_id: None,
+            agent_name: None,
             ip_address: "203.0.113.7".to_string(),
             user_agent: "Mozilla/5.0".to_string(),
         };

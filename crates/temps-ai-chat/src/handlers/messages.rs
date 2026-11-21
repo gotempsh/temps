@@ -318,6 +318,7 @@ pub async fn send_user_message(
     State(state): State<Arc<AppState>>,
     Extension(metadata): Extension<RequestMetadata>,
     Path(public_id): Path<String>,
+    watch: Option<Extension<temps_core::ai_tool_call::PluginWatchDelivery>>,
     Json(req): Json<SendMessageRequest>,
 ) -> Result<(StatusCode, Json<SendMessageAcceptedResponse>), Problem> {
     let request_started = tokio::time::Instant::now();
@@ -421,8 +422,11 @@ pub async fn send_user_message(
             images,
         }
     };
-    let attachment_metadata =
-        (!attachments.is_empty()).then(|| serde_json::json!({ "attachments": attachments }));
+    let attachment_metadata = watch
+        .map(|Extension(delivery)| serde_json::json!({"plugin_watch_delivery":delivery.0}))
+        .or_else(|| {
+            (!attachments.is_empty()).then(|| serde_json::json!({ "attachments": attachments }))
+        });
     let page_context = req
         .page_context
         .as_deref()

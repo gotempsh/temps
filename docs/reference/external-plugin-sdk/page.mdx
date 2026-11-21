@@ -249,6 +249,35 @@ the SDK boundary.
 
 ---
 
+## Publish events for chat watches {{ anchor: true, id: 'agent-watches' }}
+
+A plugin advertises watchable events in the startup manifest with `PluginManifestBuilder::published_event`. Each declaration names an event, describes its scalar attributes, and lists the fields an agent can match. The first filterable field identifies the resource whose access the plugin checks.
+
+```json
+{
+  "type": "build.finished.v1",
+  "title": "Build finished",
+  "attributes_schema": {
+    "type": "object",
+    "properties": {
+      "project_id": { "type": "integer", "title": "Project ID" },
+      "success": { "type": "boolean", "title": "Successful" },
+      "build_id": { "type": "integer" }
+    },
+    "required": ["project_id", "success", "build_id"]
+  },
+  "filterable": ["project_id", "success"]
+}
+```
+
+On this declaration, `{"project_id":42,"success":false}` watches failed builds in one project. Temps validates identifiers, types and allowed filter fields. The authenticated console proxy calls the plugin's `GET /watch-subjects?source=build.finished.v1&subject=42` at creation and again on delivery. Look up the resource with the verified caller's current permissions and return `{"allowed":true,"label":"Project 42"}` for an allowed scope. Return a denial for a missing or inaccessible scope.
+
+Record an outbox row with the original Unix timestamp in milliseconds and a stable event ID in the same transaction as the underlying change. Call `ctx.temps().publish_watch_event(...)` with the declaration's type in `source`, the resource key in `subject`, and the typed `attributes`. Carry the host-asserted `x-temps-chat-id` from an authenticated originating tool call in `origin_chat_id` so an agent's own writes do not wake it. Remove the outbox row after the host acknowledges it. Matching, deduplication, active installation consent, conversation permissions and the notify/wake choice are enforced by Temps.
+
+On a confirmed Chat write, the host supplies the originating conversation’s display title in `x-temps-agent-name`, or `Temps Chat <id>` for an untitled conversation. Read the header bytes as UTF-8. Use `x-temps-chat-id` as the stable conversation ID across title changes. The proxy strips caller-supplied copies of both headers.
+
+Ask the agent in the conversation to watch a named resource and describe what it should do when that resource changes. The agent discovers the available sources and resolves the resource with its authorized read tools. A new watch wakes the chat by default and follows the original request using the chat’s model and permissions. Ask for notification only to record the event without a model turn. Open **Watches** in the chat header to inspect, pause, resume or remove a watch. Watches use the approving session and plugin revision. When a local file update replaces the plugin identity, approve AI access for the new revision and recreate the watches you need.
+
 ## Public routes {{ anchor: true, id: 'public-routes' }}
 
 Protected routes are the default. Use `public_path` only when a route authenticates itself, such as a signed webhook or a capability URL:

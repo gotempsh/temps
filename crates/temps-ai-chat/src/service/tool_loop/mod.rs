@@ -357,6 +357,14 @@ impl ConversationService {
             repo_tools: self.providers.get("__repo_tools__").cloned(),
             pending: self.write_support.as_ref().map(|ws| ws.pending.clone()),
             audit: self.write_support.as_ref().map(|ws| ws.audit.clone()),
+            watches: (on_assistant
+                && self.watch_tools.ready()
+                && crate::autofix::incident_of_conversation(conv.metadata.as_ref()).is_none())
+            .then(|| crate::watches::ConversationWatches {
+                tools: self.watch_tools.clone(),
+                chat: conv.public_id.clone(),
+                metadata: request_metadata.clone(),
+            }),
             goals: on_assistant.then(|| self.goal_support.clone()).flatten(),
             // Offered exactly where `temps_write` is: a credential has no use
             // outside an operation that can be proposed.

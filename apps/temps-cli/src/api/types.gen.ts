@@ -3507,6 +3507,11 @@ export type AttrPredicate = {
     value?: string | null;
 };
 
+export type Attribute = {
+    title?: string | null;
+    type: ScalarType;
+};
+
 export type AttributeKeysResponse = {
     keys: Array<FacetValue>;
 };
@@ -3531,6 +3536,14 @@ export type AttributeSliceResponse = {
  * about the subject.
  */
 export type AttributeValue = boolean | number | string;
+
+export type AttributesSchema = {
+    properties: {
+        [key: string]: Attribute;
+    };
+    required: Array<string>;
+    type: ObjectType;
+};
 
 /**
  * Who an address is for.
@@ -5410,6 +5423,20 @@ export type ChatSuggestionSettings = {
      * Whether `mode` is the chat's own setting or the user's default.
      */
     source: SuggestionModeSource;
+};
+
+export type ChatWatch = {
+    blocked: boolean;
+    delivered: number;
+    id: string;
+    label?: string | null;
+    last_delivery?: string | null;
+    mode: string;
+    paused: boolean;
+    plugin: string;
+    source: string;
+    subject: string;
+    where: unknown;
 };
 
 /**
@@ -24567,6 +24594,8 @@ export type NumericRule = {
     warning: number;
 };
 
+export type ObjectType = 'object';
+
 /**
  * TimescaleDB compression policy configuration for append-only observability
  * tables. Values are expressed in hours so operators can choose sub-day
@@ -29715,6 +29744,13 @@ export type PublicationView = {
     state: string;
 };
 
+export type PublishedEvent = {
+    attributes_schema: AttributesSchema;
+    filterable: Array<string>;
+    title: string;
+    type: string;
+};
+
 export type PullRequestResponse = {
     base_branch: string;
     connection_id: number;
@@ -32897,6 +32933,8 @@ export type SavedSearchesResponse = {
     time_ranges: Array<string>;
     total: number;
 };
+
+export type ScalarType = 'string' | 'integer' | 'boolean';
 
 export type ScalewayCredentialsRequest = {
     api_key: SecretString;
@@ -42065,6 +42103,40 @@ export type WalWarning = {
 
 export type WalWarningSeverity = 'warning' | 'critical';
 
+export type WatchChange = {
+    action: 'create';
+    digest: string;
+    mode: WatchMode;
+    plugin: string;
+    source: string;
+    subject?: string;
+    where?: unknown;
+} | {
+    action: 'pause';
+    id: string;
+} | {
+    action: 'resume';
+    id: string;
+} | {
+    action: 'remove';
+    id: string;
+};
+
+export type WatchMode = 'notify' | 'wake';
+
+export type WatchPanel = {
+    sources: Array<WatchSource>;
+    watches: Array<ChatWatch>;
+};
+
+export type WatchSource = {
+    declaration: PublishedEvent;
+    digest: string;
+    id: string;
+    label: string;
+    plugin: string;
+};
+
 /**
  * One way in a plan would offer, without its steps and fields.
  */
@@ -46786,6 +46858,52 @@ export type CreateGlobalConversationResponses = {
 };
 
 export type CreateGlobalConversationResponse = CreateGlobalConversationResponses[keyof CreateGlobalConversationResponses];
+
+export type ListChatPluginWatchesData = {
+    body?: never;
+    path: {
+        chat: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{chat}/plugin-watches';
+};
+
+export type ListChatPluginWatchesErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    500: unknown;
+};
+
+export type ListChatPluginWatchesResponses = {
+    200: WatchPanel;
+};
+
+export type ListChatPluginWatchesResponse = ListChatPluginWatchesResponses[keyof ListChatPluginWatchesResponses];
+
+export type ChangeChatPluginWatchData = {
+    body: WatchChange;
+    path: {
+        chat: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{chat}/plugin-watches';
+};
+
+export type ChangeChatPluginWatchErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    409: unknown;
+    500: unknown;
+};
+
+export type ChangeChatPluginWatchResponses = {
+    204: void;
+};
+
+export type ChangeChatPluginWatchResponse = ChangeChatPluginWatchResponses[keyof ChangeChatPluginWatchResponses];
 
 export type GetUserConversationData = {
     body?: never;

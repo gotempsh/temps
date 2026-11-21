@@ -148,6 +148,9 @@ pub struct PluginManifest {
     /// - `domain.created`, `domain.provisioned`
     #[serde(default)]
     pub events: Vec<String>,
+    /// Events this plugin can publish for agent watches.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub published_events: Vec<crate::watch::PublishedEvent>,
 }
 
 fn default_health_path() -> String {
@@ -212,6 +215,7 @@ impl PluginManifest {
                 host_permissions: Vec::new(),
                 hide_header: false,
                 events: Vec::new(),
+                published_events: Vec::new(),
             },
         }
     }
@@ -315,6 +319,11 @@ impl PluginManifestBuilder {
     /// Subscribe to multiple platform events at once.
     pub fn events(mut self, event_types: Vec<String>) -> Self {
         self.manifest.events.extend(event_types);
+        self
+    }
+
+    pub fn published_event(mut self, event: crate::watch::PublishedEvent) -> Self {
+        self.manifest.published_events.push(event);
         self
     }
 

@@ -411,6 +411,7 @@ impl ExternalPluginConfig {
 /// - Providing proxy targets for the axum router
 /// - Graceful shutdown
 pub struct ExternalPluginManager {
+    pub(crate) watch_ready: Arc<tokio::sync::Notify>,
     config: ExternalPluginConfig,
     /// Running plugin processes, keyed by plugin name
     plugins: Arc<RwLock<HashMap<String, ExternalPluginProcess>>>,
@@ -441,6 +442,7 @@ impl ExternalPluginManager {
             host_api: Arc::new(crate::channel::HostApiSlot::new(None)),
             actor_crypto: crate::proxy::ActorCryptoSlot::default(),
             ai_service: Arc::new(RwLock::new(None)),
+            watch_ready: Default::default(),
             audit_service: Arc::new(RwLock::new(None)),
             isolation: tokio::sync::OnceCell::new(),
         }
@@ -1175,6 +1177,8 @@ impl ExternalPluginManager {
             self.host_api.clone(),
             manifest.capabilities.clone(),
             manifest.host_permissions.clone(),
+            manifest.published_events.clone(),
+            self.watch_ready.clone(),
             expected_sha256.to_string(),
             source_identity,
             defer_actor_commit,
@@ -1339,6 +1343,28 @@ impl ExternalPluginManager {
                     .map(|schema| (name.clone(), schema.clone()))
             })
             .collect()
+    }
+
+    pub(crate) async fn declared_watch_sources(&self) -> Vec<crate::watches::WatchSource> {
+        let plugins = self.plugins.read().await;
+        let mut sources = Vec::new();
+        for (name, process) in plugins.iter() {
+            for event in process
+                .manifest
+                .published_events
+                .iter()
+                .filter(|event| event.is_valid())
+            {
+                sources.push(crate::watches::WatchSource {
+                    plugin: name.clone(),
+                    id: event.event_type.clone(),
+                    label: event.title.clone(),
+                    digest: process.sha256.clone(),
+                    declaration: event.clone(),
+                });
+            }
+        }
+        sources
     }
 
     /// Create a PluginProxy for a given plugin name.

@@ -1004,6 +1004,7 @@ pub struct ConversationService {
     /// [`ConversationService::with_goal_support`] is called; the `temps_goal`
     /// tool is then simply not offered.
     goal_support: Option<crate::goals::GoalToolSupport>,
+    watch_tools: crate::watches::WatchTools,
     /// Sealed credential input (`request_secret`). `None` until
     /// [`ConversationService::with_secret_support`] is called; the tool is then
     /// simply not offered.
@@ -1102,6 +1103,7 @@ impl ConversationService {
             providers,
             write_support: None,
             goal_support: None,
+            watch_tools: Default::default(),
             secret_support: None,
             config: None,
             application_workspaces: None,
@@ -1733,6 +1735,11 @@ impl ConversationService {
     }
 
     /// Let assistant chats track goals and be brought back to fix them.
+    pub fn with_watch_tools(mut self, tools: crate::watches::WatchTools) -> Self {
+        self.watch_tools = tools;
+        self
+    }
+
     pub fn with_goal_support(mut self, support: crate::goals::GoalToolSupport) -> Self {
         self.goal_support = Some(support);
         self
@@ -3762,6 +3769,9 @@ impl ConversationService {
             // scope; there is no second project-level feature toggle.
             if conv.context_type == crate::providers::assistant::ASSISTANT_CONTEXT_TYPE {
                 self.maybe_add_goal_tool(&mut tools);
+                if !incident_chat && self.watch_tools.ready() {
+                    tools.push(crate::watches::tool());
+                }
                 if self.blueprint_support.is_some() && conv.project_id.is_none() {
                     tools.extend(crate::workspace_chats::BlueprintToolSupport::tools());
                 }

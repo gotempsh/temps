@@ -106,6 +106,8 @@ impl TempsPlugin for AiChatPlugin {
             );
             context.register_service(pending_actions.clone());
 
+            let watch_tools = Arc::new(crate::watches::WatchTools::default());
+            context.register_service(watch_tools.clone());
             let goals = Arc::new(crate::goals::GoalService::new(db.clone()));
             context.register_service(goals.clone());
 
@@ -263,6 +265,7 @@ impl TempsPlugin for AiChatPlugin {
                     slots: secret_slots.as_ref().clone(),
                     write_api: write_handle_for_secrets,
                 })
+                .with_watch_tools(watch_tools.as_ref().clone())
                 .with_goal_support(crate::goals::GoalToolSupport {
                     goals: goals.clone(),
                     read_api: api_tools_handle_for_goals,

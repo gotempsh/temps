@@ -15,14 +15,14 @@ use std::sync::Arc;
 use chrono::Utc;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, DatabaseConnection, EntityTrait, QueryFilter,
-    QueryOrder, Set, TransactionTrait,
+    QueryOrder, QuerySelect, Set, TransactionTrait,
 };
 
 use temps_ai_api_tools::{ApiCallScope, ProjectSelectorScope, WriteApiToolsHandle};
 use temps_auth::context::AuthContext;
 use temps_auth::permissions::Permission;
 use temps_core::ai_tool_call::AiToolOrigin;
-use temps_entities::ai_pending_actions;
+use temps_entities::{ai_conversations, ai_pending_actions};
 
 use crate::sensitive::{decrypt_value, encrypt_value, redact_text, redact_value};
 
@@ -80,6 +80,21 @@ pub enum PendingActionError {
         operation: &'static str,
         reason: String,
     },
+}
+
+fn chat_sender_name(title: Option<&str>, chat_id: i64) -> String {
+    let name: String = title
+        .unwrap_or_default()
+        .trim()
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(120)
+        .collect();
+    if name.trim().is_empty() {
+        format!("Temps Chat {chat_id}")
+    } else {
+        name.trim().to_owned()
+    }
 }
 
 /// Status of an action paused on a live inline approval in a chat turn.
@@ -576,6 +591,20 @@ impl PendingActionService {
                 }
             })?;
 
+        // Resolve the sender before the claim so a failed lookup leaves the proposal retryable.
+        let agent_name = if action.plugin_revision.is_some() {
+            let title = ai_conversations::Entity::find_by_id(action.conversation_id)
+                .filter(ai_conversations::Column::CreatedBy.eq(user_id))
+                .select_only()
+                .column(ai_conversations::Column::Title)
+                .into_tuple::<Option<String>>()
+                .one(self.db.as_ref())
+                .await?
+                .flatten();
+            Some(chat_sender_name(title.as_deref(), action.conversation_id))
+        } else {
+            None
+        };
         // 5. Atomic claim: flip to "executing" only from the lifecycle this
         // caller owns. Detached endpoints therefore cannot claim inline rows.
         let now = Utc::now();
@@ -617,7 +646,16 @@ impl PendingActionService {
             project_scope: project_id.map_or(ProjectSelectorScope::Unrestricted, |project_id| {
                 ProjectSelectorScope::Allowed(vec![project_id])
             }),
-            origin,
+            origin: Some(temps_core::ai_tool_call::AiToolOrigin {
+                chat_id: Some(action.conversation_id),
+                agent_name,
+                ..origin.unwrap_or_else(|| temps_core::ai_tool_call::AiToolOrigin {
+                    ip_address: String::new(),
+                    user_agent: "Temps Chat".into(),
+                    chat_id: None,
+                    agent_name: None,
+                })
+            }),
             // Bound to the action's owner and conversation, so an action can
             // only spend secrets its own user gave in its own chat.
             secrets: self.secret_slots.as_ref().map(|slots| {
@@ -895,6 +933,22 @@ impl PendingActionService {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn plugin_sender_uses_a_bounded_header_safe_chat_title_or_an_identified_fallback() {
+        assert_eq!(
+            super::chat_sender_name(Some(" Équipe\r\nReview "), 7),
+            "Équipe  Review"
+        );
+        assert_eq!(super::chat_sender_name(None, 7), "Temps Chat 7");
+        assert_eq!(super::chat_sender_name(Some("\0"), 7), "Temps Chat 7");
+        assert_eq!(
+            super::chat_sender_name(Some(&"é".repeat(200)), 7)
+                .chars()
+                .count(),
+            120
+        );
+    }
+
     use super::*;
     use chrono::Utc;
     use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult};

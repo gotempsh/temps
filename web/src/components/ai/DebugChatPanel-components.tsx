@@ -79,6 +79,7 @@ import { GeneratedDeploymentCard } from '@/components/ai/GeneratedDeploymentCard
 import { BlueprintProposalCard } from '@/components/ai/BlueprintProposalCard'
 import {
   CHAT_CONTINUE_EVENT,
+  CHAT_WATCH_DELIVERY_EVENT,
   isProposeBlueprintTool,
   parseBlueprintProposal,
   type BlueprintProposalReceipt,
@@ -2582,7 +2583,12 @@ function useConversationStream(
     }
 
     connect()
+    const onWatchNotification = (event: Event) => {
+      if ((event as CustomEvent<string>).detail === publicId) void resync()
+    }
+    window.addEventListener(CHAT_WATCH_DELIVERY_EVENT, onWatchNotification)
     return () => {
+      window.removeEventListener(CHAT_WATCH_DELIVERY_EVENT, onWatchNotification)
       cancelled = true
       if (reconnectTimer) clearTimeout(reconnectTimer)
       resyncRef.current = null
@@ -4113,7 +4119,10 @@ function DebugChatPanelBody({
   const pendingContinueRef = useRef<string | null>(null)
   const [continueRequests, setContinueRequests] = useState(0)
   const continueWith = useCallback((message: string) => {
-    pendingContinueRef.current = message
+    // Keep every request made from the header while the current turn finishes.
+    pendingContinueRef.current = [pendingContinueRef.current, message]
+      .filter(Boolean)
+      .join('\n\n')
     setContinueRequests((count) => count + 1)
   }, [])
   const continueAfterSecrets = useCallback(

@@ -2340,6 +2340,7 @@ fn service_with_db(ai: Arc<dyn AiService>, db: DatabaseConnection) -> Conversati
         providers: HashMap::new(),
         write_support: None,
         goal_support: None,
+        watch_tools: Default::default(),
         secret_support: None,
         config: None,
         application_workspaces: None,
@@ -2798,6 +2799,7 @@ async fn first_application_turn_persists_and_publishes_harness_session_title() {
         providers: HashMap::new(),
         write_support: None,
         goal_support: None,
+        watch_tools: Default::default(),
         secret_support: None,
         config: None,
         application_workspaces: None,
@@ -3719,6 +3721,7 @@ pub(super) fn db_service_from_arc(db: Arc<DatabaseConnection>) -> ConversationSe
         providers: HashMap::new(),
         write_support: None,
         goal_support: None,
+        watch_tools: Default::default(),
         secret_support: None,
         config: None,
         application_workspaces: None,
@@ -3838,6 +3841,7 @@ fn db_service_with_ai(db: DatabaseConnection, ai: Arc<dyn AiService>) -> Convers
         providers: HashMap::new(),
         write_support: None,
         goal_support: None,
+        watch_tools: Default::default(),
         secret_support: None,
         config: None,
         application_workspaces: None,
@@ -4557,6 +4561,7 @@ async fn two_users_get_separate_conversations_for_the_same_context() {
         providers,
         write_support: None,
         goal_support: None,
+        watch_tools: Default::default(),
         secret_support: None,
         config: None,
         application_workspaces: None,
@@ -6962,10 +6967,16 @@ async fn plugin_write_waits_for_approval_then_executes_and_audits() {
     let observed = calls.clone();
     let router = axum::Router::new().route(
         "/x/reports/create",
-        axum::routing::post(move || {
-            observed.fetch_add(1, Ordering::SeqCst);
-            async { axum::Json(serde_json::json!({"created":true})) }
-        }),
+        axum::routing::post(
+            move |axum::Extension(origin): axum::Extension<
+                temps_core::ai_tool_call::AiToolOrigin,
+            >| {
+                assert_eq!(origin.agent_name.as_deref(), Some("Report editor"));
+                assert_eq!(origin.chat_id, Some(1));
+                observed.fetch_add(1, Ordering::SeqCst);
+                async { axum::Json(serde_json::json!({"created":true})) }
+            },
+        ),
     );
     let spec = serde_json::from_value(serde_json::json!({"openapi":"3.1.0","info":{"title":"reports","version":"1"},"paths":{"/create":{"post":{"operationId":"create","x-temps-ai-tool":{},"responses":{"200":{"description":"ok"}}}}}})).unwrap();
     let registry = Arc::new(PluginToolsRegistry::default());
@@ -7018,7 +7029,13 @@ async fn plugin_write_waits_for_approval_then_executes_and_audits() {
     executed.status = "executed".into();
     executed.result = Some(serde_json::json!({"created":true}));
     let db = MockDatabase::new(DatabaseBackend::Postgres)
-        .append_query_results([vec![row.clone()], vec![row], vec![executed]])
+        .append_query_results([vec![row.clone()], vec![row]])
+        .append_query_results(
+            [[std::collections::BTreeMap::<String, sea_orm::Value>::from(
+                [("title".into(), "Report editor".into())],
+            )]],
+        )
+        .append_query_results([vec![executed]])
         .append_exec_results([sea_orm::MockExecResult {
             last_insert_id: 0,
             rows_affected: 1,
