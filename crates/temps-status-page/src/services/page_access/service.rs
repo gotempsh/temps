@@ -25,8 +25,9 @@ use crate::services::public_pages::{PublishedSnapshot, StatusSnapshotCache};
 pub const MIN_PASSWORD_CHARS: usize = 8;
 /// Bounds what one unlock request can make argon2 hash.
 pub const MAX_PASSWORD_CHARS: usize = 256;
-/// argon2 verifications running at once. Each takes tens of milliseconds
-/// and ~19 MiB; a burst beyond this is told to retry instead of queueing.
+/// argon2 operations running at once, unlock verifications and password
+/// changes together. Each takes tens of milliseconds and ~19 MiB; a burst
+/// beyond this is told to retry instead of queueing.
 pub const MAX_CONCURRENT_VERIFICATIONS: usize = 2;
 
 /// What an unlock attempt led to.
@@ -111,7 +112,15 @@ impl PageAccessService {
         let hash = match request.password {
             Some(password) => {
                 validate(status_page_id, &password)?;
+                // The same permits as unlock: hashing is as heavy as
+                // verifying, so concurrent changes cannot exhaust memory.
+                let permit = self
+                    .verifications
+                    .clone()
+                    .try_acquire_owned()
+                    .map_err(|_| PageAccessError::Busy { status_page_id })?;
                 let hashed = tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
                     Argon2::default()
                         .hash_password(password.as_bytes())
                         .map(|hash| hash.to_string())
@@ -238,6 +247,46 @@ impl PageAccessService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_password_change_waits_for_a_free_hashing_permit() {
+        // No database is reached: the permit is taken before the write.
+        let db = Arc::new(DatabaseConnection::Disconnected);
+        let service = PageAccessService::new(
+            db.clone(),
+            Arc::new(StatusSnapshotCache::new(db)),
+            &EncryptionService::new_from_password("page-access-permits"),
+        );
+        let held: Vec<_> = (0..MAX_CONCURRENT_VERIFICATIONS)
+            .map(|_| {
+                service
+                    .verifications
+                    .clone()
+                    .try_acquire_owned()
+                    .expect("a free permit")
+            })
+            .collect();
+        let busy = service
+            .set_password(
+                7,
+                SetPagePasswordRequest {
+                    password: Some("correct horse battery".to_string()),
+                },
+            )
+            .await
+            .expect_err("every hashing permit is taken");
+        assert!(
+            matches!(busy, PageAccessError::Busy { status_page_id: 7 }),
+            "{busy}"
+        );
+        assert_eq!(service.verifications.available_permits(), 0);
+        drop(held);
+        assert_eq!(
+            service.verifications.available_permits(),
+            MAX_CONCURRENT_VERIFICATIONS,
+            "a refused change holds no permit"
+        );
+    }
 
     #[test]
     fn passwords_are_bounded_and_printable() {

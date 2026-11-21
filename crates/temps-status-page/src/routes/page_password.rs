@@ -16,7 +16,7 @@ use axum::{
     Json, Router,
 };
 use temps_authz::{permission_guard, project_permission_guard, project_scope_guard, RequireAuth};
-use temps_core::error_builder::{bad_request, internal_server_error, not_found};
+use temps_core::error_builder::{bad_request, internal_server_error, not_found, too_many_requests};
 use temps_core::problemdetails::Problem;
 use temps_core::{AuditLogger, RequestMetadata};
 use utoipa::OpenApi;
@@ -43,6 +43,10 @@ impl From<PageAccessError> for Problem {
                 .build(),
             PageAccessError::Validation { .. } => bad_request()
                 .title("Invalid Password")
+                .detail(error.to_string())
+                .build(),
+            PageAccessError::Busy { .. } => too_many_requests()
+                .title("Password Hashing Busy")
                 .detail(error.to_string())
                 .build(),
             PageAccessError::Hash { .. } => internal_server_error()
@@ -99,6 +103,7 @@ pub async fn get_page_password(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Status page not found"),
+        (status = 429, description = "Too many password checks or changes are running; retry in a moment"),
         (status = 500, description = "Internal server error"),
     ),
     tag = "Status Page",

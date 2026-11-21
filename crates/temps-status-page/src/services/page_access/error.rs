@@ -13,6 +13,10 @@ pub enum PageAccessError {
     StatusPageNotFound { status_page_id: i32 },
     #[error("invalid password for status page {status_page_id}: {reason}")]
     Validation { status_page_id: i32, reason: String },
+    #[error(
+        "cannot change the password of status page {status_page_id} now: too many status page passwords are being checked or changed at once; retry in a moment"
+    )]
+    Busy { status_page_id: i32 },
     #[error("could not hash the password of status page {status_page_id}: {reason}")]
     Hash { status_page_id: i32, reason: String },
 }
