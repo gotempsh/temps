@@ -506,22 +506,7 @@ impl BackupService {
         let url = url::Url::parse(&database_url).map_err(|e| BackupError::Internal {
             message: format!("Invalid DATABASE_URL: {}", e),
         })?;
-        let database = url.path().trim_start_matches('/');
-        let mut cmd = vec![
-            "psql".to_string(),
-            "-U".to_string(),
-            url.username().to_string(),
-            "-tAc".to_string(),
-            INSTANCE_IDENTITY_SQL.to_string(),
-        ];
-        if !database.is_empty() {
-            cmd.extend(["-d".to_string(), database.to_string()]);
-        }
-        // The server listens on the DATABASE_URL port inside its container
-        // too: the URL reaches it on its network, not a published port.
-        if let Some(port) = url.port() {
-            cmd.extend(["-p".to_string(), port.to_string()]);
-        }
+        let cmd = identity_probe_command(&url);
         let password_env = format!("PGPASSWORD={}", url.password().unwrap_or(""));
         let in_container = temps_providers::externalsvc::exec_util::run_exec(
             docker,
@@ -880,6 +865,29 @@ impl BackupService {
                 .to_string(),
         })
     }
+}
+
+/// The psql command that reads [`INSTANCE_IDENTITY_SQL`] inside the database
+/// container, as the DATABASE_URL user, database and port. The password goes
+/// in the exec environment, never in the command.
+fn identity_probe_command(url: &url::Url) -> Vec<String> {
+    let database = url.path().trim_start_matches('/');
+    let mut cmd = vec![
+        "psql".to_string(),
+        "-U".to_string(),
+        url.username().to_string(),
+        "-tAc".to_string(),
+        INSTANCE_IDENTITY_SQL.to_string(),
+    ];
+    if !database.is_empty() {
+        cmd.extend(["-d".to_string(), database.to_string()]);
+    }
+    // The server listens on the DATABASE_URL port inside its container too:
+    // the URL reaches it on its network, not a published port.
+    if let Some(port) = url.port() {
+        cmd.extend(["-p".to_string(), port.to_string()]);
+    }
+    cmd
 }
 
 /// The image `container_id` was created from, as configured (not the

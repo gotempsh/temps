@@ -1399,3 +1399,31 @@ async fn base_backup_does_not_start_before_the_walg_command_runs() {
         "{sql:?}"
     );
 }
+
+#[test]
+fn identity_probe_reaches_the_database_url_port_and_database() {
+    let url = url::Url::parse("postgres://temps:s3cret@temps-postgres:6543/temps").unwrap();
+
+    let cmd = identity_probe_command(&url);
+
+    let flag = |name: &str| {
+        cmd.iter()
+            .position(|arg| arg == name)
+            .map(|at| cmd[at + 1].as_str())
+    };
+    assert_eq!(cmd[0], "psql");
+    assert_eq!(flag("-U"), Some("temps"));
+    assert_eq!(flag("-d"), Some("temps"));
+    assert_eq!(flag("-p"), Some("6543"));
+    assert!(!cmd.iter().any(|arg| arg.contains("s3cret")), "{cmd:?}");
+}
+
+#[test]
+fn identity_probe_keeps_the_libpq_defaults_the_url_leaves_out() {
+    let url = url::Url::parse("postgres://postgres@temps-postgres").unwrap();
+
+    let cmd = identity_probe_command(&url);
+
+    assert!(!cmd.contains(&"-p".to_string()), "{cmd:?}");
+    assert!(!cmd.contains(&"-d".to_string()), "{cmd:?}");
+}
