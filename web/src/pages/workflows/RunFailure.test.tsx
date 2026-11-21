@@ -1,8 +1,11 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { describe, expect, test } from 'bun:test'
+import { afterEach, describe, expect, test } from 'bun:test'
+import { cleanup, fireEvent, render } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { installBrowserWindow } from '@/test/dom'
+import { jsonResponse, mockApi } from '@/test/fetch-mock'
 import { renderToStaticMarkup } from 'react-dom/server'
 import type { WorkflowRunResponse } from '@/api/client'
 import type { WorkflowStepResponse, WorkflowStepStatus } from '@/api/client'
@@ -19,6 +22,9 @@ import {
   failedStepPages,
   findFailedStep,
 } from './run-failure'
+
+installBrowserWindow()
+afterEach(cleanup)
 
 function seeded() {
   return new QueryClient({
@@ -158,6 +164,54 @@ describe('a failed run says what failed', () => {
     })
     const html = panel(client, { ...run, has_input: false })
     expect(html).toContain('workflow payload read permission')
+  })
+  test('a payload that failed to load can be read again in place', async () => {
+    const client = seeded()
+    const query = client.getQueryCache().build<unknown, object>(client, {
+      queryKey: payloadQueryKey(run, 'error'),
+    })
+    query.setState({
+      status: 'error',
+      fetchStatus: 'idle',
+      error: { status: 503, detail: 'The vault is unavailable' },
+      data: undefined,
+    })
+    const api = mockApi({
+      'POST /projects/1/environments/2/workflows/runs/synthetic-run/reveal':
+        () =>
+          jsonResponse({ target: 'error', value: 'SMTP refused the message' }),
+    })
+    try {
+      const view = render(
+        <QueryClientProvider client={client}>
+          <RunFailure
+            path={{ project_id: 1, environment_id: 2, run_id: 'synthetic-run' }}
+            run={{ ...run, has_input: false }}
+            invalidate={[]}
+          />
+        </QueryClientProvider>
+      )
+      expect(view.getByText('The vault is unavailable')).toBeTruthy()
+      fireEvent.click(view.getByRole('button', { name: 'Try again' }))
+      expect(await view.findByText('SMTP refused the message')).toBeTruthy()
+      expect(api.calls).toHaveLength(1)
+    } finally {
+      api.restore()
+    }
+  })
+  test('a missing permission offers no retry, which could not fix it', () => {
+    const client = seeded()
+    const query = client.getQueryCache().build<unknown, object>(client, {
+      queryKey: payloadQueryKey(run, 'error'),
+    })
+    query.setState({
+      status: 'error',
+      fetchStatus: 'idle',
+      error: { status: 403, title: 'Forbidden' },
+      data: undefined,
+    })
+    const html = panel(client, { ...run, has_input: false })
+    expect(html).not.toContain('Try again')
   })
   test('a run without stored error or input offers only the retry', () => {
     const html = panel(seeded(), { ...run, has_error: false, has_input: false })

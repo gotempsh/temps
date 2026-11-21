@@ -144,14 +144,34 @@ function PayloadBody({
 }) {
   const [expanded, setExpanded] = useState(false)
   if (payload.isPending) return <Skeleton className="h-9 w-full" />
-  if (payload.isError)
+  if (payload.isError) {
+    // A missing permission does not go away on its own; anything else may.
+    if (problemStatus(payload.error) === 403)
+      return (
+        <p role="alert" className="text-xs text-destructive">
+          Reading payloads needs the workflow payload read permission on this
+          project.
+        </p>
+      )
     return (
-      <p role="alert" className="text-xs text-destructive">
-        {problemStatus(payload.error) === 403
-          ? 'Reading payloads needs the workflow payload read permission on this project.'
-          : problemDetail(payload.error, 'Could not read it.')}
-      </p>
+      <div className="flex flex-wrap items-center gap-2">
+        <p role="alert" className="text-xs text-destructive">
+          {problemDetail(payload.error, 'Could not read it.')}
+        </p>
+        <Button
+          variant="outline"
+          size="sm"
+          className="h-7 px-2 text-xs"
+          aria-disabled={payload.isFetching}
+          onClick={() => {
+            if (!payload.isFetching) void payload.refetch()
+          }}
+        >
+          {payload.isFetching ? 'Reading…' : 'Try again'}
+        </Button>
+      </div>
     )
+  }
   const text = payloadText(payload.data.value)
   const preview = payloadPreview(text)
   return (
