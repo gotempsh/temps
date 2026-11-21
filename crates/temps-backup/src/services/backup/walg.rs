@@ -4,6 +4,7 @@
 //! WAL-G for the control-plane database, locating its container, enabling WAL
 //! archiving and taking base backups.
 
+use super::internal_archive::BaseBackupSteps;
 use super::*;
 
 impl BackupService {
@@ -51,19 +52,48 @@ impl BackupService {
         // Find the container the database host names: by container name
         // (`/temps-postgres` matches "temps-postgres"), by network alias (the
         // Compose service name), or by an address it has on one of its
-        // networks (the bundled Compose files connect by a static IP).
+        // networks (the bundled Compose files connect by a static IP). A
+        // match is only a candidate: it must also be the server Temps is
+        // connected to, since every archiving change goes through that
+        // connection. A candidate that is another server, or that cannot be
+        // checked, is skipped and named in the error if none qualifies.
+        let mut rejected = Vec::new();
         for container in &containers {
             let container_id = container.id.as_deref().unwrap_or("");
-            if container_id.is_empty() {
+            if container_id.is_empty() || !container_serves_host(container, &db_host) {
                 continue;
             }
-            if container_serves_host(container, &db_host) {
-                return self
-                    .resolve_pgdata_for_container(&docker, container_id)
-                    .await;
+            match self
+                .verify_container_is_connected_database(&docker, container_id)
+                .await
+            {
+                Ok(()) => {
+                    return self
+                        .resolve_pgdata_for_container(&docker, container_id)
+                        .await
+                }
+                Err(error) => {
+                    debug!(
+                        container_id = %container_id,
+                        db_host = %db_host,
+                        "Container matching the database host is not the connected database: {}",
+                        error
+                    );
+                    rejected.push(error.to_string());
+                }
             }
         }
 
+        if !rejected.is_empty() {
+            return Err(BackupError::Internal {
+                message: format!(
+                    "No Docker container matching database host '{}' is the database Temps is \
+                     connected to: {}",
+                    db_host,
+                    rejected.join("; ")
+                ),
+            });
+        }
         Err(BackupError::Internal {
             message: format!(
                 "No Docker container found for database host '{}'. \
@@ -129,67 +159,7 @@ impl BackupService {
             message: format!("Failed to connect to Docker: {}", e),
         })?;
 
-        // The backup and the archive_command rollback below both assume the
-        // container is the database Temps is connected to.
-        self.verify_container_is_connected_database(&docker, &container_id)
-            .await?;
-
-        // Verify WAL-G is installed in the container
-        let check_exec = docker
-            .create_exec(
-                &container_id,
-                CreateExecOptions {
-                    cmd: Some(vec!["which", "wal-g"]),
-                    attach_stdout: Some(false),
-                    attach_stderr: Some(false),
-                    ..Default::default()
-                },
-            )
-            .await
-            .map_err(|e| BackupError::Internal {
-                message: format!("Failed to check WAL-G in container: {}", e),
-            })?;
-
-        docker
-            .start_exec(
-                &check_exec.id,
-                Some(StartExecOptions {
-                    detach: true,
-                    ..Default::default()
-                }),
-            )
-            .await
-            .map_err(|e| BackupError::Internal {
-                message: format!("Failed to run WAL-G check: {}", e),
-            })?;
-
-        // Wait for check to complete
-        loop {
-            let inspect =
-                docker
-                    .inspect_exec(&check_exec.id)
-                    .await
-                    .map_err(|e| BackupError::Internal {
-                        message: format!("Failed to inspect WAL-G check exec: {}", e),
-                    })?;
-            if let Some(running) = inspect.running {
-                if !running {
-                    if let Some(exit_code) = inspect.exit_code {
-                        if exit_code != 0 {
-                            return Err(BackupError::Internal {
-                                message: format!(
-                                    "WAL-G is not installed in container {}. \
-                                     Use the gotempsh/timescaledb-walg image.",
-                                    container_id
-                                ),
-                            });
-                        }
-                    }
-                    break;
-                }
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        }
+        ensure_walg_installed(&docker, &container_id).await?;
 
         // Build WAL-G S3 prefix using a STABLE path (no date or backup_id).
         // WAL-G requires all backups and WAL segments to share the same prefix so that:
@@ -271,19 +241,53 @@ impl BackupService {
         // restorable together with the WAL written while it ran, so that WAL
         // must reach the archive. Without archiving the base backup would be
         // unrestorable, so the error ends the WAL-G attempt and the caller
-        // falls back to pg_dump. The settings are read first so a failed push
+        // falls back to pg_dump. The settings are read first so a failure
         // can put back what was there. `archive_then_push` owns that order.
         let archive_before = self.read_archive_settings().await?;
+        let walg_env_path = internal_walg_env_path(&pgdata);
+        // Set once this attempt has replaced walg.env (keeping the old one),
+        // so only then is there a walg.env to put back or a copy to delete.
+        let env_replaced = std::sync::atomic::AtomicBool::new(false);
         let enable = async {
-            self.enable_internal_wal_archiving(&docker, &container_id, &env_vars, &pgdata)
-                .await
-                .map_err(|e| BackupError::Internal {
-                    message: format!(
-                        "Cannot take a WAL-G base backup of the internal database in container \
-                         '{}': continuous WAL archiving could not be enabled: {}",
-                        container_id, e
-                    ),
-                })
+            self.enable_internal_wal_archiving(
+                &docker,
+                &container_id,
+                &env_vars,
+                &pgdata,
+                &env_replaced,
+            )
+            .await
+            .map_err(|e| BackupError::Internal {
+                message: format!(
+                    "Cannot take a WAL-G base backup of the internal database in container \
+                     '{}': continuous WAL archiving could not be enabled: {}",
+                    container_id, e
+                ),
+            })
+        };
+        let restore_env = async {
+            if !env_replaced.load(std::sync::atomic::Ordering::SeqCst) {
+                return Ok(());
+            }
+            run_walg_env_script(
+                &docker,
+                &container_id,
+                walg_env_restore_script(&walg_env_path),
+                "put back the previous",
+            )
+            .await
+        };
+        let discard_previous_env = async {
+            if !env_replaced.load(std::sync::atomic::Ordering::SeqCst) {
+                return Ok(());
+            }
+            run_walg_env_script(
+                &docker,
+                &container_id,
+                format!("rm -f {}", shell_escape(&format!("{walg_env_path}.prev"))),
+                "delete the copy of the previous",
+            )
+            .await
         };
 
         // A push that fails from inside the container (an endpoint or bucket
@@ -356,8 +360,12 @@ impl BackupService {
             &archive_before,
             &internal_walg_archive_command(&pgdata),
             &container_id,
-            enable,
-            push,
+            BaseBackupSteps {
+                enable,
+                push,
+                restore_env,
+                discard_previous_env,
+            },
         )
         .await?;
 
@@ -408,91 +416,48 @@ impl BackupService {
     /// continuous WAL archiving for the internal database via `ALTER SYSTEM`.
     ///
     /// Same approach as external PostgreSQL services: the env file is refreshed on
-    /// every backup so credential rotations are picked up automatically.
+    /// every backup so credential rotations are picked up automatically. The
+    /// file it replaces is kept as `walg.env.prev`, and `env_replaced` is set,
+    /// so a failed backup can put it back.
     async fn enable_internal_wal_archiving(
         &self,
         docker: &bollard::Docker,
         container_id: &str,
         env_vars: &[String],
         pgdata: &str,
+        env_replaced: &std::sync::atomic::AtomicBool,
     ) -> Result<(), BackupError> {
         use bollard::exec::{CreateExecOptions, StartExecOptions};
 
         let walg_env_path = internal_walg_env_path(pgdata);
 
-        // Filter to only S3/WAL-G env vars (no PGDATA, no PG connection vars)
-        let env_file_lines: Vec<&String> = env_vars
-            .iter()
-            .filter(|line| line.starts_with("WALG_") || line.starts_with("AWS_"))
-            .collect();
-
-        // Write the env file via docker exec. `walg_env_path` is derived from
-        // the container's PGDATA and must be escaped like any other value
-        // reaching `sh -c` -- an unescaped path lets shell metacharacters in
-        // it inject arbitrary commands into the exec.
-        let escaped_walg_env_path = shell_escape(&walg_env_path);
-        let write_cmd = format!(
-            "printf '%s\\n' {} > {} && chmod 600 {}",
-            env_file_lines
-                .iter()
-                .filter_map(|line| shell_export_assignment(line)
-                    .map(|assignment| shell_escape(&assignment)))
-                .collect::<Vec<_>>()
-                .join(" "),
-            escaped_walg_env_path,
-            escaped_walg_env_path,
+        // The credentials reach the shell through the exec's environment,
+        // never its command line, which any process in the container can read.
+        let contents = format!(
+            "{}={}",
+            WALG_ENV_CONTENTS_VAR,
+            walg_env_file_contents(env_vars)
         );
-
-        let exec = docker
-            .create_exec(
-                container_id,
-                CreateExecOptions {
-                    cmd: Some(vec!["sh", "-c", &write_cmd]),
-                    attach_stdout: Some(false),
-                    attach_stderr: Some(false),
-                    user: Some("postgres"),
-                    ..Default::default()
-                },
-            )
-            .await
-            .map_err(|e| BackupError::Internal {
-                message: format!("Failed to create env file write exec: {}", e),
-            })?;
-
-        docker
-            .start_exec(
-                &exec.id,
-                Some(StartExecOptions {
-                    detach: true,
-                    ..Default::default()
-                }),
-            )
-            .await
-            .map_err(|e| BackupError::Internal {
-                message: format!("Failed to start env file write exec: {}", e),
-            })?;
-
-        loop {
-            let inspect =
-                docker
-                    .inspect_exec(&exec.id)
-                    .await
-                    .map_err(|e| BackupError::Internal {
-                        message: format!("Failed to inspect env file write exec: {}", e),
-                    })?;
-            if inspect.running == Some(false) {
-                if inspect.exit_code != Some(0) {
-                    return Err(BackupError::Internal {
-                        message: format!(
-                            "Failed to write walg.env (exit code {:?})",
-                            inspect.exit_code
-                        ),
-                    });
-                }
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
+        temps_providers::externalsvc::exec_util::run_exec_as(
+            docker,
+            container_id,
+            vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                walg_env_replace_script(&walg_env_path),
+            ],
+            Some(vec![contents]),
+            std::time::Duration::from_secs(30),
+            Some("postgres"),
+        )
+        .await
+        .map_err(|e| BackupError::Internal {
+            message: format!(
+                "Failed to write {} in container '{}': {}",
+                walg_env_path, container_id, e
+            ),
+        })?;
+        env_replaced.store(true, std::sync::atomic::Ordering::SeqCst);
 
         info!(
             "Written WAL-G credentials to {} in container '{}'",
@@ -591,6 +556,71 @@ impl BackupService {
     }
 }
 
+/// Fail unless `wal-g` is on the PATH of `container_id`.
+async fn ensure_walg_installed(
+    docker: &bollard::Docker,
+    container_id: &str,
+) -> Result<(), BackupError> {
+    use bollard::exec::{CreateExecOptions, StartExecOptions};
+
+    let check_exec = docker
+        .create_exec(
+            container_id,
+            CreateExecOptions {
+                cmd: Some(vec!["which", "wal-g"]),
+                attach_stdout: Some(false),
+                attach_stderr: Some(false),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|e| BackupError::Internal {
+            message: format!("Failed to check WAL-G in container: {}", e),
+        })?;
+
+    docker
+        .start_exec(
+            &check_exec.id,
+            Some(StartExecOptions {
+                detach: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .map_err(|e| BackupError::Internal {
+            message: format!("Failed to run WAL-G check: {}", e),
+        })?;
+
+    // Wait for check to complete
+    loop {
+        let inspect =
+            docker
+                .inspect_exec(&check_exec.id)
+                .await
+                .map_err(|e| BackupError::Internal {
+                    message: format!("Failed to inspect WAL-G check exec: {}", e),
+                })?;
+        if let Some(running) = inspect.running {
+            if !running {
+                if let Some(exit_code) = inspect.exit_code {
+                    if exit_code != 0 {
+                        return Err(BackupError::Internal {
+                            message: format!(
+                                "WAL-G is not installed in container {}. \
+                                 Use the gotempsh/timescaledb-walg image.",
+                                container_id
+                            ),
+                        });
+                    }
+                }
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    Ok(())
+}
+
 /// Where the internal database's WAL-G credentials are written: next to
 /// PGDATA, e.g. `/var/lib/postgresql/walg.env` for
 /// `PGDATA=/var/lib/postgresql/data`.
@@ -600,6 +630,72 @@ fn internal_walg_env_path(pgdata: &str) -> String {
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|| "/var/lib/postgresql".to_string());
     format!("{}/walg.env", volume_root)
+}
+
+/// The exec environment variable that carries walg.env's contents to the
+/// script writing it.
+const WALG_ENV_CONTENTS_VAR: &str = "TEMPS_WALG_ENV";
+
+/// walg.env's contents: an `export` line for each WAL-G and S3 variable (no
+/// PGDATA, no PostgreSQL connection variables).
+fn walg_env_file_contents(env_vars: &[String]) -> String {
+    env_vars
+        .iter()
+        .filter(|line| line.starts_with("WALG_") || line.starts_with("AWS_"))
+        .filter_map(|line| shell_export_assignment(line))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Shell that replaces walg.env at `path` with the contents of
+/// [`WALG_ENV_CONTENTS_VAR`], readable only by its owner, and keeps the file it
+/// replaces as `<path>.prev`. It succeeds only once both are in place, and
+/// otherwise leaves walg.env as it was: the new file is written aside and
+/// renamed over it. `path` is derived from the container's PGDATA and is
+/// escaped like any other value reaching `sh -c`.
+fn walg_env_replace_script(path: &str) -> String {
+    let env = shell_escape(path);
+    let prev = shell_escape(&format!("{path}.prev"));
+    let tmp = shell_escape(&format!("{path}.tmp"));
+    format!(
+        "rm -f {prev} {tmp} && {{ [ ! -e {env} ] || cp -p {env} {prev}; }} && umask 077 && \
+         printf '%s\\n' \"${WALG_ENV_CONTENTS_VAR}\" > {tmp} && chmod 600 {tmp} && \
+         mv -f {tmp} {env}"
+    )
+}
+
+/// Shell that undoes [`walg_env_replace_script`]: the kept file goes back, or,
+/// when there was none, the new walg.env is removed.
+fn walg_env_restore_script(path: &str) -> String {
+    let env = shell_escape(path);
+    let prev = shell_escape(&format!("{path}.prev"));
+    format!("if [ -e {prev} ]; then mv -f {prev} {env}; else rm -f {env}; fi")
+}
+
+/// Run a walg.env maintenance `script` as the postgres user; `action` says
+/// what it does to walg.env, for the error.
+async fn run_walg_env_script(
+    docker: &bollard::Docker,
+    container_id: &str,
+    script: String,
+    action: &str,
+) -> Result<(), BackupError> {
+    temps_providers::externalsvc::exec_util::run_exec_as(
+        docker,
+        container_id,
+        vec!["sh".to_string(), "-c".to_string(), script],
+        None,
+        std::time::Duration::from_secs(30),
+        Some("postgres"),
+    )
+    .await
+    .map(|_| ())
+    .map_err(|e| BackupError::Internal {
+        message: format!(
+            "Failed to {} walg.env in container '{}': {}",
+            action, container_id, e
+        ),
+    })
 }
 
 /// The `archive_command` that ships the internal database's WAL with WAL-G.
@@ -683,5 +779,108 @@ mod tests {
         let db = container("worker", &[], "", "");
         assert!(!container_serves_host(&db, "198.18.255.11"));
         assert!(!container_serves_host(&db, ""));
+    }
+
+    /// Run a walg.env script with `sh`, as the container would, with `contents`
+    /// in the variable the replace script reads.
+    fn run_script(script: &str, contents: &str) -> bool {
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .env(WALG_ENV_CONTENTS_VAR, contents)
+            .status()
+            .expect("sh runs")
+            .success()
+    }
+
+    #[test]
+    fn walg_env_credentials_stay_out_of_the_command_line() {
+        let env_vars = [
+            "WALG_S3_PREFIX=s3://backups/internal_db/walg".to_string(),
+            "AWS_SECRET_ACCESS_KEY=s3cr3t'key".to_string(),
+            "PGDATA=/home/postgres/pgdata/pgroot/data".to_string(),
+        ];
+
+        let contents = walg_env_file_contents(&env_vars);
+        let script = walg_env_replace_script("/home/postgres/pgdata/pgroot/walg.env");
+
+        assert_eq!(
+            contents,
+            "export WALG_S3_PREFIX='s3://backups/internal_db/walg'\n\
+             export AWS_SECRET_ACCESS_KEY='s3cr3t'\\''key'"
+        );
+        assert!(!script.contains("s3cr3t"), "{script}");
+        assert!(!script.contains("WALG_S3_PREFIX"), "{script}");
+    }
+
+    #[test]
+    fn a_replaced_walg_env_can_be_put_back() {
+        let dir = tempfile::tempdir().unwrap();
+        // A space and a quote, which the scripts must escape.
+        let path = dir.path().join("pg data's").join("walg.env");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let path_str = path.to_str().unwrap();
+        let prev = format!("{path_str}.prev");
+        std::fs::write(&path, "export WALG_S3_PREFIX='s3://working'\n").unwrap();
+
+        assert!(run_script(
+            &walg_env_replace_script(path_str),
+            "export WALG_S3_PREFIX='s3://new'"
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "export WALG_S3_PREFIX='s3://new'\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&prev).unwrap(),
+            "export WALG_S3_PREFIX='s3://working'\n"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+
+        assert!(run_script(&walg_env_restore_script(path_str), ""));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "export WALG_S3_PREFIX='s3://working'\n"
+        );
+        assert!(!std::path::Path::new(&prev).exists());
+    }
+
+    #[test]
+    fn putting_back_a_first_walg_env_removes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("walg.env");
+        let path_str = path.to_str().unwrap();
+
+        assert!(run_script(
+            &walg_env_replace_script(path_str),
+            "export WALG_S3_PREFIX='s3://new'"
+        ));
+        assert!(path.exists());
+        assert!(run_script(&walg_env_restore_script(path_str), ""));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_walg_env_that_cannot_be_written_is_left_as_it_was() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("walg.env");
+        let path_str = path.to_str().unwrap();
+        std::fs::write(&path, "export WALG_S3_PREFIX='s3://working'\n").unwrap();
+        // A directory where the new file would be written makes the write fail.
+        std::fs::create_dir_all(dir.path().join("walg.env.tmp").join("busy")).unwrap();
+
+        assert!(!run_script(
+            &walg_env_replace_script(path_str),
+            "export WALG_S3_PREFIX='s3://new'"
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "export WALG_S3_PREFIX='s3://working'\n"
+        );
     }
 }
