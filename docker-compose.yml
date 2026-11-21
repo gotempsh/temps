@@ -60,8 +60,11 @@ services:
       - postgres_socket:/var/run/postgresql
     # NOTE: archive_command is NOT set here on purpose.
     # Command-line parameters take highest priority in PostgreSQL and cannot be
-    # overridden by ALTER SYSTEM. After the first backup, Temps uses ALTER SYSTEM
-    # to set archive_command to source walg.env and run wal-g wal-push.
+    # overridden by ALTER SYSTEM. With archive_mode=on and no archive_command
+    # PostgreSQL keeps every WAL segment, so on startup Temps sets it with
+    # ALTER SYSTEM to a command that discards WAL. Control-plane backups are
+    # logical dumps and need no WAL archive; to archive WAL yourself, set
+    # archive_command with ALTER SYSTEM and Temps leaves it alone.
     command: >
       postgres
       -c wal_level=replica
