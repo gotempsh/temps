@@ -30,6 +30,11 @@ pub struct Deployment {
     pub deployment_config: Option<DeploymentConfigSnapshot>,
     /// Deployment metadata (build info, git event, etc.)
     pub metadata: Option<DeploymentMetadata>,
+    /// Whether the deployment's image runs as root (uid 0), as the deploy
+    /// pipeline recorded it.
+    pub runs_as_root: bool,
+    /// The `USER` the deployment's image declares, as written.
+    pub image_user: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

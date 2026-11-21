@@ -2701,6 +2701,9 @@ async fn process_git_push_event(
             deployment_config: sea_orm::Set(deployment_config_snapshot),
             upload_request_id: sea_orm::Set(None),
             docker_socket_mounted: sea_orm::Set(false),
+            // The deploy job records the image's user once it has checked it.
+            runs_as_root: sea_orm::Set(false),
+            image_user: sea_orm::Set(None),
             created_at: sea_orm::Set(Utc::now()),
             updated_at: sea_orm::Set(Utc::now()),
         };
@@ -3062,6 +3065,8 @@ mod tests {
             promoted_from_deployment_id: None,
             upload_request_id: None,
             docker_socket_mounted: false,
+            runs_as_root: false,
+            image_user: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };

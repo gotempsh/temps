@@ -24204,6 +24204,13 @@
             "format": "int32",
             "type": "integer"
           },
+          "image_user": {
+            "description": "The `USER` the image declares, as written (`nodejs`, `10001:10001`).\n`null` when it declares none (it then runs as root) or the deployment\nwas not checked.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "is_current": {
             "type": "boolean"
           },
@@ -24232,6 +24239,10 @@
                 "type": "null"
               }
             ]
+          },
+          "runs_as_root": {
+            "description": "Whether this deployment's image runs its process as root (uid 0).\nResolved once by the deploy pipeline, before any replica started,\nagainst the image's own `/etc/passwd`. `false` when the image runs as\nanother user, its user could not be resolved, or the deployment\npredates the check. Advisory: a root image still deploys.",
+            "type": "boolean"
           },
           "screenshot_location": {
             "type": [

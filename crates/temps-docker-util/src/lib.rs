@@ -13,6 +13,8 @@
 //!   stopped, was created from them.
 //! - [`upload`]: stream a tar archive into a container, bounded by a stall
 //!   timeout rather than a total deadline.
+//! - [`image_user`]: resolve an image's `USER` against its own `/etc/passwd`
+//!   and `/etc/group`, and tell whether it runs as root.
 //!
 //! This crate sits at the bottom of the dependency graph: bollard and the
 //! little it strictly needs, no `temps-*` crate. It does not log, because a
@@ -28,6 +30,7 @@
 pub mod error;
 pub mod exec;
 pub mod image_removal;
+pub mod image_user;
 pub mod network;
 pub mod pull;
 pub mod upload;

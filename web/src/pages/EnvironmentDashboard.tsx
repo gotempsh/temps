@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { ReachabilityWarningBanner } from '@/components/reachability/ReachabilityWarningBanner'
+import { RootUserBadge } from '@/components/deployments/RootUserBadge'
 import { PageTitle } from '@temps-sdk/ds'
 import {
   getEnvironmentOptions,
@@ -157,6 +158,11 @@ export function EnvironmentDashboard({
             ))}
           </TabsList>
         </Tabs>
+        {/* The environment's current deployment, which its containers run. */}
+        <RootUserBadge
+          runsAsRoot={deployment.data?.runs_as_root}
+          imageUser={deployment.data?.image_user}
+        />
         {activeView === 'containers' ? (
           // The containers and their deployment; each row's CPU and memory
           // keep their own 5 s poll.
