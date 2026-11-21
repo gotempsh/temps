@@ -6,6 +6,7 @@ import type { TrafficAggregationResponse } from '@/api/client/types.gen'
 import {
   MAX_NOT_FOUND_WINDOW_DAYS,
   compactUrl,
+  fetchNotFoundReferrers,
   mergeNotFoundRows,
   notFoundPathsRequest,
   notFoundReferrersRequest,
@@ -145,6 +146,90 @@ describe('mergeNotFoundRows', () => {
     expect(
       mergeNotFoundRows(paths, null).map((row) => row.topReferrer)
     ).toEqual([null, null])
+  })
+})
+
+describe('fetchNotFoundReferrers', () => {
+  /** A referrer page: `rows` on page `page` of `totalPages`. */
+  function referrerPage(
+    rows: Array<{ path: string; referrer: string; requests: number }>,
+    page: number,
+    totalPages: number
+  ): TrafficAggregationResponse {
+    return { ...response(rows, true), page, total_pages: totalPages }
+  }
+
+  test('reads on when one busy path fills the first page', async () => {
+    // Page 1 is all /busy; /quiet's referrer only appears on page 2.
+    const busy = Array.from({ length: 100 }, (_, i) => ({
+      path: '/busy',
+      referrer: `https://site-${i}.example.org/`,
+      requests: 500 - i,
+    }))
+    const pages = [
+      referrerPage(busy, 1, 3),
+      referrerPage(
+        [{ path: '/quiet', referrer: 'https://old.example.net/', requests: 2 }],
+        2,
+        3
+      ),
+      referrerPage([], 3, 3),
+    ]
+    const asked: number[] = []
+    const referrers = await fetchNotFoundReferrers(
+      ['/busy', '/quiet'],
+      async (page) => {
+        asked.push(page)
+        return pages[page - 1] ?? null
+      }
+    )
+    expect(asked).toEqual([1, 2])
+    const merged = mergeNotFoundRows(
+      response(
+        [
+          { path: '/busy', requests: 500 },
+          { path: '/quiet', requests: 2 },
+        ],
+        false
+      ),
+      referrers
+    )
+    expect(merged.map((row) => row.topReferrer)).toEqual([
+      'https://site-0.example.org/',
+      'https://old.example.net/',
+    ])
+  })
+
+  test('stops at the last page and at the page bound', async () => {
+    const asked: number[] = []
+    await fetchNotFoundReferrers(['/a'], async (page) => {
+      asked.push(page)
+      return referrerPage([], page, 1)
+    })
+    expect(asked).toEqual([1])
+
+    const many: number[] = []
+    await fetchNotFoundReferrers(['/never'], async (page) => {
+      many.push(page)
+      return referrerPage(
+        [{ path: '/other', referrer: 'https://x.example.org/', requests: 1 }],
+        page,
+        50
+      )
+    })
+    expect(many).toEqual([1, 2, 3, 4, 5])
+  })
+
+  test('gives null when the server cannot answer, and nothing for no paths', async () => {
+    expect(await fetchNotFoundReferrers(['/a'], async () => null)).toBeNull()
+    let called = false
+    expect(
+      await fetchNotFoundReferrers([], async () => {
+        called = true
+        return null
+      })
+    ).toBeNull()
+    expect(called).toBe(false)
   })
 })
 

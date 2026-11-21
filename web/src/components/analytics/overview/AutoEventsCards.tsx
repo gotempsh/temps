@@ -14,10 +14,7 @@ import {
   getEventPropertiesOptions,
   getPropertyBreakdownOptions,
 } from '@/api/client/@tanstack/react-query.gen'
-import type {
-  ProjectResponse,
-  TrafficAggregationResponse,
-} from '@/api/client/types.gen'
+import type { ProjectResponse } from '@/api/client/types.gen'
 import { RankedList } from '@/components/data-display/RankedList'
 import { Button } from '@/components/ui/button'
 import {
@@ -35,6 +32,7 @@ import {
   NOT_FOUND_EVENT,
   OUTBOUND_CLICK_EVENT,
   compactUrl,
+  fetchNotFoundReferrers,
   mergeNotFoundRows,
   notFoundPathsRequest,
   notFoundReferrersRequest,
@@ -280,23 +278,20 @@ function AnsweredNotFound({
       if (paths.error || !paths.data) {
         throw new Error(`Could not load 404 paths for project ${project.id}`)
       }
-      const referrersBody = notFoundReferrersRequest(
-        range,
-        environment,
-        paths.data.rows.flatMap((row) =>
-          row.dimensions[0]?.value ? [row.dimensions[0].value] : []
-        )
+      const listed = paths.data.rows.flatMap((row) =>
+        row.dimensions[0]?.value ? [row.dimensions[0].value] : []
       )
       // A server older than the `referrer` dimension rejects this request;
       // the report then lists paths without their referrer.
-      let referrers: TrafficAggregationResponse | null = null
-      if (referrersBody) {
+      const referrers = await fetchNotFoundReferrers(listed, async (page) => {
+        const body = notFoundReferrersRequest(range, environment, listed, page)
+        if (!body) return null
         const result = await aggregateApiTraffic({
           path: { project_id: project.id },
-          body: referrersBody,
+          body,
         })
-        referrers = result.error ? null : (result.data ?? null)
-      }
+        return result.error ? null : (result.data ?? null)
+      })
       return mergeNotFoundRows(paths.data, referrers)
     },
     enabled: !!range,

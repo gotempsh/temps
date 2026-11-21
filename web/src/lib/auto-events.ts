@@ -33,6 +33,13 @@ export const MAX_NOT_FOUND_WINDOW_DAYS = 30
 /** Paths ranked in the not-found report. */
 export const NOT_FOUND_PATH_LIMIT = 10
 
+/**
+ * Pages of the referrer breakdown read at most, at 100 rows each. The rows
+ * are ranked across all listed paths, so one busy path can fill a page; the
+ * report reads on until every path has its top referrer, up to this bound.
+ */
+export const NOT_FOUND_REFERRER_PAGE_LIMIT = 5
+
 const DAY_MS = 24 * 60 * 60 * 1000
 
 /** One row of the not-found report. */
@@ -96,7 +103,8 @@ export function notFoundPathsRequest(
 export function notFoundReferrersRequest(
   window: NotFoundWindow,
   environmentId: number | undefined,
-  paths: string[]
+  paths: string[],
+  page = 1
 ): TrafficAggregationRequest | null {
   if (paths.length === 0) return null
   return {
@@ -113,9 +121,40 @@ export function notFoundReferrersRequest(
     order_by: [
       { field: { kind: 'metric', field: 'requests' }, direction: 'desc' },
     ],
-    page: 1,
+    page,
     page_size: 100,
   }
+}
+
+/**
+ * Read the referrer breakdown of `paths` page by page until every path has
+ * a referrer row, the rows run out, or `NOT_FOUND_REFERRER_PAGE_LIMIT` pages
+ * were read. `fetchPage` returns `null` when the server cannot answer (one
+ * older than the `referrer` dimension); a first page of `null` gives `null`,
+ * a later one keeps the rows read so far. Rows are returned in rank order.
+ */
+export async function fetchNotFoundReferrers(
+  paths: string[],
+  fetchPage: (page: number) => Promise<TrafficAggregationResponse | null>
+): Promise<TrafficAggregationResponse | null> {
+  if (paths.length === 0) return null
+  const missing = new Set(paths.slice(0, 20))
+  let first: TrafficAggregationResponse | null = null
+  const rows: TrafficAggregationResponse['rows'] = []
+  for (let page = 1; page <= NOT_FOUND_REFERRER_PAGE_LIMIT; page += 1) {
+    const result = await fetchPage(page)
+    if (!result) break
+    first ??= result
+    rows.push(...result.rows)
+    for (const row of result.rows) {
+      const path = dimensionValue(row, 'path')
+      if (path !== null && dimensionValue(row, 'referrer') !== null) {
+        missing.delete(path)
+      }
+    }
+    if (missing.size === 0 || page >= result.total_pages) break
+  }
+  return first ? { ...first, rows } : null
 }
 
 function dimensionValue(
