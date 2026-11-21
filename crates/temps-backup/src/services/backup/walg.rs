@@ -7,8 +7,9 @@
 use super::*;
 
 impl BackupService {
-    /// Find the Docker container that hosts the internal database by matching the hostname
-    /// from DATABASE_URL against Docker container names and network aliases.
+    /// Find the Docker container that hosts the internal database by matching the host
+    /// from DATABASE_URL against Docker container names, network aliases and network
+    /// addresses.
     ///
     /// Returns `(container_id, pgdata_path)` if found.
     pub(super) async fn find_internal_db_container(&self) -> Result<(String, String), BackupError> {
@@ -47,40 +48,19 @@ impl BackupService {
                 message: format!("Failed to list Docker containers: {}", e),
             })?;
 
-        // Find container matching the database hostname by:
-        // 1. Container name (e.g., /temps-postgres matches "temps-postgres")
-        // 2. Docker Compose service name in network aliases (e.g., "postgres" on compose network)
+        // Find the container the database host names: by container name
+        // (`/temps-postgres` matches "temps-postgres"), by network alias (the
+        // Compose service name), or by an address it has on one of its
+        // networks (the bundled Compose files connect by a static IP).
         for container in &containers {
             let container_id = container.id.as_deref().unwrap_or("");
             if container_id.is_empty() {
                 continue;
             }
-
-            // Check container names (Docker prefixes with '/')
-            if let Some(names) = &container.names {
-                for name in names {
-                    let clean_name = name.trim_start_matches('/');
-                    if clean_name == db_host {
-                        return self
-                            .resolve_pgdata_for_container(&docker, container_id)
-                            .await;
-                    }
-                }
-            }
-
-            // Check network aliases (Docker Compose sets the service name as an alias)
-            if let Some(network_settings) = &container.network_settings {
-                if let Some(networks) = &network_settings.networks {
-                    for net_config in networks.values() {
-                        if let Some(aliases) = &net_config.aliases {
-                            if aliases.iter().any(|a| a == &db_host) {
-                                return self
-                                    .resolve_pgdata_for_container(&docker, container_id)
-                                    .await;
-                            }
-                        }
-                    }
-                }
+            if container_serves_host(container, &db_host) {
+                return self
+                    .resolve_pgdata_for_container(&docker, container_id)
+                    .await;
             }
         }
 
@@ -148,6 +128,11 @@ impl BackupService {
         let docker = Docker::connect_with_local_defaults().map_err(|e| BackupError::Internal {
             message: format!("Failed to connect to Docker: {}", e),
         })?;
+
+        // The backup and the archive_command rollback below both assume the
+        // container is the database Temps is connected to.
+        self.verify_container_is_connected_database(&docker, &container_id)
+            .await?;
 
         // Verify WAL-G is installed in the container
         let check_exec = docker
@@ -536,7 +521,17 @@ impl BackupService {
                 container_id,
                 CreateExecOptions {
                     cmd: Some(vec![
-                        "psql", "-U", pg_user, "-c", &alter_sql, "-c", reload_sql,
+                        // Without ON_ERROR_STOP a failed ALTER SYSTEM still
+                        // exits 0 when the reload after it succeeds.
+                        "psql",
+                        "-v",
+                        "ON_ERROR_STOP=1",
+                        "-U",
+                        pg_user,
+                        "-c",
+                        &alter_sql,
+                        "-c",
+                        reload_sql,
                     ]),
                     attach_stdout: Some(false),
                     attach_stderr: Some(false),
@@ -607,4 +602,83 @@ fn internal_walg_env_path(pgdata: &str) -> String {
 /// The `archive_command` that ships the internal database's WAL with WAL-G.
 pub(super) fn internal_walg_archive_command(pgdata: &str) -> String {
     format!(". {} && wal-g wal-push %p", internal_walg_env_path(pgdata))
+}
+
+/// Whether `container` is the one `db_host` (the DATABASE_URL host) names: by
+/// container name, by a network alias, or by an address it has on one of its
+/// networks.
+fn container_serves_host(container: &bollard::models::ContainerSummary, db_host: &str) -> bool {
+    // `Url::host_str` keeps the brackets around an IPv6 literal.
+    let host = db_host.trim_start_matches('[').trim_end_matches(']');
+    let host_ip = host.parse::<std::net::IpAddr>().ok();
+    let same_address = |address: &Option<String>| match (address.as_deref(), host_ip) {
+        (Some(address), Some(host_ip)) => address.parse::<std::net::IpAddr>().ok() == Some(host_ip),
+        _ => false,
+    };
+
+    // Docker prefixes container names with '/'.
+    let by_name = container
+        .names
+        .iter()
+        .flatten()
+        .any(|name| name.trim_start_matches('/') == host);
+    let by_network = container
+        .network_settings
+        .iter()
+        .filter_map(|settings| settings.networks.as_ref())
+        .flat_map(|networks| networks.values())
+        .any(|endpoint| {
+            endpoint.aliases.iter().flatten().any(|alias| alias == host)
+                || same_address(&endpoint.ip_address)
+                || same_address(&endpoint.global_ipv6_address)
+        });
+    by_name || by_network
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bollard::models::{ContainerSummary, ContainerSummaryNetworkSettings, EndpointSettings};
+    use std::collections::HashMap;
+
+    fn container(name: &str, aliases: &[&str], ipv4: &str, ipv6: &str) -> ContainerSummary {
+        let endpoint = EndpointSettings {
+            aliases: Some(aliases.iter().map(|a| a.to_string()).collect()),
+            ip_address: Some(ipv4.to_string()),
+            global_ipv6_address: Some(ipv6.to_string()),
+            ..Default::default()
+        };
+        ContainerSummary {
+            names: Some(vec![format!("/{name}")]),
+            network_settings: Some(ContainerSummaryNetworkSettings {
+                networks: Some(HashMap::from([("temps-network".to_string(), endpoint)])),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn database_container_is_found_by_its_static_network_address() {
+        // The bundled Compose files connect to the database by IP.
+        let db = container("temps-postgres", &["postgres"], "198.18.255.11", "");
+        assert!(container_serves_host(&db, "198.18.255.11"));
+        assert!(!container_serves_host(&db, "198.18.255.12"));
+    }
+
+    #[test]
+    fn database_container_is_found_by_name_alias_or_ipv6_address() {
+        let db = container("temps-postgres", &["postgres"], "", "fd00::11");
+        assert!(container_serves_host(&db, "temps-postgres"));
+        assert!(container_serves_host(&db, "postgres"));
+        assert!(container_serves_host(&db, "[fd00::11]"));
+        assert!(!container_serves_host(&db, "db.example.internal"));
+    }
+
+    #[test]
+    fn a_container_with_no_address_matches_no_ip_host() {
+        // Docker reports an empty address for a container not yet on a network.
+        let db = container("worker", &[], "", "");
+        assert!(!container_serves_host(&db, "198.18.255.11"));
+        assert!(!container_serves_host(&db, ""));
+    }
 }

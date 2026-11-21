@@ -83,6 +83,35 @@ impl ArchiveSettings {
     }
 }
 
+/// The cluster's identifier, the same for every database and connection on
+/// one PostgreSQL server and different between servers.
+const SYSTEM_IDENTIFIER_SQL: &str =
+    "SELECT system_identifier::text AS system_identifier FROM pg_control_system()";
+
+#[derive(Debug, FromQueryResult)]
+struct SystemIdentifier {
+    system_identifier: String,
+}
+
+/// `Ok` when both reads name the same, non-empty cluster identifier.
+fn same_cluster(
+    container_id: &str,
+    connected: &str,
+    in_container: &str,
+) -> Result<(), BackupError> {
+    let (connected, in_container) = (connected.trim(), in_container.trim());
+    if !connected.is_empty() && connected == in_container {
+        return Ok(());
+    }
+    Err(BackupError::Internal {
+        message: format!(
+            "The control-plane database Temps is connected to (system identifier '{}') is not \
+             the one in container '{}' (system identifier '{}')",
+            connected, container_id, in_container
+        ),
+    })
+}
+
 /// What the startup check did to the control-plane database's archiving.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InternalArchiveReconcile {
@@ -109,9 +138,15 @@ impl BackupService {
         &self,
     ) -> Result<InternalArchiveReconcile, BackupError> {
         self.reconcile_internal_wal_archiving_with(|| async {
-            self.find_internal_db_container()
-                .await
-                .map(|(container_id, _pgdata)| container_id)
+            let (container_id, _pgdata) = self.find_internal_db_container().await?;
+            let docker = bollard::Docker::connect_with_local_defaults().map_err(|e| {
+                BackupError::Internal {
+                    message: format!("Failed to connect to Docker: {}", e),
+                }
+            })?;
+            self.verify_container_is_connected_database(&docker, &container_id)
+                .await?;
+            Ok(container_id)
         })
         .await
     }
@@ -156,6 +191,70 @@ impl BackupService {
         self.set_archive_command(&container_id, NO_ARCHIVE_DESTINATION_COMMAND)
             .await?;
         Ok(InternalArchiveReconcile::Released { container_id })
+    }
+
+    /// Check that `container_id` runs the same PostgreSQL cluster Temps is
+    /// connected to, by comparing the cluster's system identifier read over
+    /// that connection with the one read inside the container.
+    ///
+    /// A container whose name, alias or address matches the DATABASE_URL host
+    /// is not proof by itself: the host may resolve to another server. Every
+    /// change Temps makes to archiving goes through its own connection, so it
+    /// must be the container's database.
+    pub(super) async fn verify_container_is_connected_database(
+        &self,
+        docker: &bollard::Docker,
+        container_id: &str,
+    ) -> Result<(), BackupError> {
+        let connected = SystemIdentifier::find_by_statement(Statement::from_string(
+            DatabaseBackend::Postgres,
+            SYSTEM_IDENTIFIER_SQL.to_string(),
+        ))
+        .one(self.db.as_ref())
+        .await
+        .map_err(|e| BackupError::Internal {
+            message: format!(
+                "Failed to read the system identifier of the control-plane database to match \
+                 it with container '{}': {}",
+                container_id, e
+            ),
+        })?
+        .map(|row| row.system_identifier)
+        .unwrap_or_default();
+
+        let database_url = self.config_service.get_database_url();
+        let url = url::Url::parse(&database_url).map_err(|e| BackupError::Internal {
+            message: format!("Invalid DATABASE_URL: {}", e),
+        })?;
+        let database = url.path().trim_start_matches('/');
+        let mut cmd = vec![
+            "psql".to_string(),
+            "-U".to_string(),
+            url.username().to_string(),
+            "-tAc".to_string(),
+            SYSTEM_IDENTIFIER_SQL.to_string(),
+        ];
+        if !database.is_empty() {
+            cmd.extend(["-d".to_string(), database.to_string()]);
+        }
+        let password_env = format!("PGPASSWORD={}", url.password().unwrap_or(""));
+        let in_container = temps_providers::externalsvc::exec_util::run_exec(
+            docker,
+            container_id,
+            cmd,
+            Some(vec![password_env]),
+            std::time::Duration::from_secs(30),
+        )
+        .await
+        .map_err(|e| BackupError::Internal {
+            message: format!(
+                "Failed to read the system identifier of the database in container '{}': {}",
+                container_id, e
+            ),
+        })?
+        .output;
+
+        same_cluster(container_id, &connected, &in_container)
     }
 
     /// Run a base backup `push` that needs `archiving_command` in place, and
@@ -592,6 +691,29 @@ mod tests {
         assert!(error.contains("temps-postgres"), "{error}");
         assert!(error.contains("/bin/true"), "{error}");
         assert!(error.contains("permission denied"), "{error}");
+    }
+
+    #[test]
+    fn a_container_is_the_connected_database_only_with_the_same_system_identifier() {
+        assert!(same_cluster(
+            "temps-postgres",
+            "7301234567890123456",
+            "7301234567890123456\n"
+        )
+        .is_ok());
+
+        let error = same_cluster(
+            "temps-postgres",
+            "7301234567890123456",
+            "7309999999999999999",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("temps-postgres"), "{error}");
+        assert!(error.contains("7309999999999999999"), "{error}");
+
+        // An empty read (psql printed nothing) never counts as a match.
+        assert!(same_cluster("temps-postgres", "", "").is_err());
     }
 
     #[tokio::test]
