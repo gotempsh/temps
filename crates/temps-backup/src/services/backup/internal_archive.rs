@@ -252,6 +252,121 @@ mod tests {
         assert_eq!(sql[2], "SELECT pg_reload_conf()");
     }
 
+    /// The reported failure, against a real PostgreSQL started the way the
+    /// bundled Compose files start it: completed WAL segments wait in
+    /// `pg_wal/archive_status` as `.ready` and are never archived, until the
+    /// reconcile gives the archiver a command and it clears them.
+    #[cfg(feature = "docker-tests")]
+    #[tokio::test]
+    async fn bundled_database_stops_retaining_wal_after_the_reconcile() {
+        use sea_orm::{ConnectionTrait, Database};
+        use testcontainers::core::{ContainerPort, WaitFor};
+        use testcontainers::runners::AsyncRunner;
+        use testcontainers::{GenericImage, ImageExt};
+
+        let container = match GenericImage::new("pgvector/pgvector", "pg18")
+            .with_exposed_port(ContainerPort::Tcp(5432))
+            .with_wait_for(WaitFor::message_on_stderr(
+                "database system is ready to accept connections",
+            ))
+            .with_env_var("POSTGRES_PASSWORD", "postgres")
+            .with_cmd([
+                "postgres",
+                "-c",
+                "wal_level=replica",
+                "-c",
+                "archive_mode=on",
+                "-c",
+                "archive_timeout=60",
+            ])
+            .start()
+            .await
+        {
+            Ok(container) => container,
+            Err(e) => {
+                println!("Docker not available, skipping: {e}");
+                return;
+            }
+        };
+        let port = container.get_host_port_ipv4(5432).await.unwrap();
+        let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+        // The ready message is also logged by the init-time server, which
+        // then restarts; retry until the final server accepts connections.
+        let mut connected = None;
+        for _ in 0..40 {
+            match Database::connect(&url).await {
+                Ok(db) if db.execute_unprepared("SELECT 1").await.is_ok() => {
+                    connected = Some(db);
+                    break;
+                }
+                _ => tokio::time::sleep(std::time::Duration::from_millis(250)).await,
+            }
+        }
+        let db = Arc::new(connected.expect("PostgreSQL never accepted connections"));
+
+        async fn scalar(db: &DatabaseConnection, sql: &str) -> i64 {
+            #[derive(FromQueryResult)]
+            struct Row {
+                n: i64,
+            }
+            Row::find_by_statement(Statement::from_string(
+                DatabaseBackend::Postgres,
+                sql.to_string(),
+            ))
+            .one(db)
+            .await
+            .unwrap()
+            .unwrap()
+            .n
+        }
+        const READY: &str = "SELECT count(*) AS n FROM pg_ls_dir('pg_wal/archive_status') \
+                             AS f WHERE f LIKE '%.ready'";
+        const ARCHIVED: &str = "SELECT archived_count AS n FROM pg_stat_archiver";
+
+        // Complete a few segments, as normal background activity does.
+        db.execute_unprepared("CREATE TABLE wal_filler (x int)")
+            .await
+            .unwrap();
+        for _ in 0..3 {
+            db.execute_unprepared("INSERT INTO wal_filler SELECT generate_series(1, 1000)")
+                .await
+                .unwrap();
+            db.execute_unprepared("SELECT pg_switch_wal()")
+                .await
+                .unwrap();
+        }
+        let pending = scalar(&db, READY).await;
+        assert!(pending >= 3, "expected retained segments, found {pending}");
+        assert_eq!(scalar(&db, ARCHIVED).await, 0);
+
+        let service = make_scope_test_service(db.clone());
+        let outcome = service
+            .reconcile_internal_wal_archiving_with(|| async { Ok("temps-postgres".to_string()) })
+            .await
+            .unwrap();
+        assert!(matches!(outcome, InternalArchiveReconcile::Released { .. }));
+
+        // The archiver works through the backlog once it has a command.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while scalar(&db, READY).await > 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "segments still waiting for the archiver after 30s"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+        assert!(scalar(&db, ARCHIVED).await >= pending);
+
+        // A second start leaves the database as it is.
+        let outcome = service
+            .reconcile_internal_wal_archiving_with(|| async {
+                panic!("a released database must not trigger container discovery")
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome, InternalArchiveReconcile::Unaffected);
+    }
+
     #[tokio::test]
     async fn database_already_archiving_is_left_alone_without_looking_for_a_container() {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
