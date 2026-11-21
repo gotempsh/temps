@@ -444,28 +444,31 @@ pub async fn patch_preview_gateway_settings(
     // The proxy reads the committed port. Only publish a new destination
     // after Docker has verified the gateway and bound its loopback ingress.
     let save = async {
-        if staged {
+        let replaced_image = if staged {
             let mut spec = PreviewGatewaySpec::from_settings(&requested);
             if previous.enabled && requested.image == previous.image {
                 spec.image.clone_from(&previous_spec.image);
             }
-            preview_gateway::reconcile(&held, docker.clone(), &state.db, spec)
+            preview_gateway::stage_reconcile(&held, docker.clone(), &state.db, spec)
                 .await
                 .map_err(|error| {
                     format!("applying the preview gateway settings failed: {error:#}")
-                })?;
-        }
-        state
+                })?
+        } else {
+            None
+        };
+        let settings = state
             .platform_config_service
             .update_preview_gateway_settings(|gateway| {
                 patch.apply_to(gateway, container_name.as_deref());
             })
             .await
-            .map_err(|error| format!("persisting the preview gateway settings failed: {error}"))
+            .map_err(|error| format!("persisting the preview gateway settings failed: {error}"))?;
+        Ok::<_, String>((settings, replaced_image))
     }
     .await;
-    let settings = match save {
-        Ok(settings) => settings,
+    let (settings, replaced_image) = match save {
+        Ok(saved) => saved,
         Err(mut detail) => {
             if staged || renaming {
                 if let Err(error) = preview_gateway::restore_after_failed_save(
@@ -491,6 +494,10 @@ pub async fn patch_preview_gateway_settings(
     };
     if let Some(mut name) = provider_name {
         *name = preview_gateway::container_name(&settings);
+    }
+
+    if let Some(image_id) = replaced_image {
+        preview_gateway::remove_superseded_gateway_image(&docker, &image_id).await;
     }
 
     // `enabled` is an instance-wide kill switch for preview traffic, so who

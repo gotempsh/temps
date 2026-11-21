@@ -545,13 +545,13 @@ pub fn last_reconcile_failure() -> Option<ReconcileFailure> {
 /// Record `result` of setting the gateway up from `spec`, so its status can
 /// say why it is missing. The error is redacted the way every other gateway
 /// diagnostic is before it leaves the server.
-fn record_outcome(result: &Result<()>, spec: &PreviewGatewaySpec) {
+fn record_outcome<T>(result: &Result<T>, spec: &PreviewGatewaySpec) {
     record_outcome_in(&LAST_FAILURE, result, spec);
 }
 
-fn record_outcome_in(record: &FailureRecord, result: &Result<()>, spec: &PreviewGatewaySpec) {
+fn record_outcome_in<T>(record: &FailureRecord, result: &Result<T>, spec: &PreviewGatewaySpec) {
     match result {
-        Ok(()) => record.clear(),
+        Ok(_) => record.clear(),
         Err(error) => record.failed(
             sanitize_gateway_diagnostic(&format!("{error:#}"), &[&spec.shared_secret]),
             chrono::Utc::now(),
@@ -690,6 +690,20 @@ pub async fn reconcile(
     db: &DatabaseConnection,
     spec: PreviewGatewaySpec,
 ) -> Result<()> {
+    if let Some(image_id) = stage_reconcile(held, docker.clone(), db, spec).await? {
+        remove_superseded_gateway_image(&docker, &image_id).await;
+    }
+    Ok(())
+}
+
+/// Keep the replaced image available until the caller commits the new settings.
+/// A failed save can then restore the gateway using its original image ID.
+pub(crate) async fn stage_reconcile(
+    held: &OperationsLock,
+    docker: Arc<Docker>,
+    db: &DatabaseConnection,
+    spec: PreviewGatewaySpec,
+) -> Result<Option<String>> {
     let result = reconcile_unrecorded(held, docker, db, &spec).await;
     record_outcome(&result, &spec);
     result
@@ -700,7 +714,7 @@ async fn reconcile_unrecorded(
     docker: Arc<Docker>,
     db: &DatabaseConnection,
     spec: &PreviewGatewaySpec,
-) -> Result<()> {
+) -> Result<Option<String>> {
     info!(
         image = %spec.image,
         container = %spec.container_name,
@@ -735,13 +749,14 @@ async fn reconcile_unrecorded(
     let ingress_image = crate::sandbox::docker::image_name_for_runtime("node");
     ensure_image_present(&docker, &ingress_image).await?;
 
-    match inspect(&docker, &spec.container_name).await? {
+    let replaced_image = match inspect(&docker, &spec.container_name).await? {
         Some(existing)
             if container_matches(&existing, spec, &desired_image_id)
                 && existing.running
                 && ingress_matches(&docker, spec, &ingress_image).await? =>
         {
             debug!("preview gateway already running with desired spec");
+            None
         }
         Some(existing) => {
             info!(
@@ -751,16 +766,16 @@ async fn reconcile_unrecorded(
             );
             remove_gateway_pair(&docker, &spec.container_name).await?;
             create_and_start(&docker, spec, &ingress_image, &legacy_owned_networks).await?;
-            // Only once the new gateway runs: a failed switch keeps the old
-            // image around to recreate from.
-            remove_superseded_gateway_image(&docker, &existing, &desired_image_id).await;
+            superseded_gateway_image(&existing.image, &existing.image_id, &desired_image_id)
+                .map(str::to_owned)
         }
         None => {
             info!("preview gateway not present — creating");
             remove_if_present(&docker, &ingress_container_name(&spec.container_name)).await?;
             create_and_start(&docker, spec, &ingress_image, &legacy_owned_networks).await?;
+            None
         }
-    }
+    };
 
     connect_sandbox_networks(&docker, &spec.container_name, &legacy_owned_networks).await?;
 
@@ -768,7 +783,7 @@ async fn reconcile_unrecorded(
         "preview gateway ready on 127.0.0.1:{} → {}:{}",
         spec.host_port, spec.container_name, GATEWAY_CONTAINER_PORT
     );
-    Ok(())
+    Ok(replaced_image)
 }
 
 /// Capture the running image before moving its port. A port change should work
@@ -1243,18 +1258,9 @@ fn replaced_gateway_image_is_disposable(repo_tags: &[String], repo_digests: &[St
 /// any container, running or stopped, still uses it, and that refusal is
 /// expected rather than an error. Failures never fail the reconcile; the
 /// nightly cleanup retries superseded infrastructure images.
-async fn remove_superseded_gateway_image(
-    docker: &Docker,
-    previous: &ExistingContainer,
-    desired_image_id: &str,
-) {
+pub(crate) async fn remove_superseded_gateway_image(docker: &Docker, image_id: &str) {
     use temps_docker_housekeeping::services::{ImageDeleteStatus, ImageRemovalOutcome};
 
-    let Some(image_id) =
-        superseded_gateway_image(&previous.image, &previous.image_id, desired_image_id)
-    else {
-        return;
-    };
     match docker.inspect_image(image_id).await {
         Ok(inspected) => {
             let tags = inspected.repo_tags.unwrap_or_default();
@@ -2095,7 +2101,7 @@ async fn supervise_once(
                     "could not check the preview gateway container {}: {error:#}",
                     spec.container_name
                 );
-                record_outcome(&Err(error), &spec);
+                record_outcome(&Err::<(), _>(error), &spec);
                 return PassOutcome::Failed(reason);
             }
         }
