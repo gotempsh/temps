@@ -150,3 +150,112 @@ async fn python_app_without_an_entry_point_fails_fast_with_a_typed_outcome() {
         .to_string()
         .contains("could not plan this application"));
 }
+
+/// The final stage of a rendered Dockerfile: everything after its last `FROM`.
+fn final_stage(dockerfile: &str) -> &str {
+    let start = dockerfile
+        .match_indices("\nFROM ")
+        .last()
+        .map(|(index, _)| index + 1)
+        .unwrap_or(0);
+    &dockerfile[start..]
+}
+
+/// The user the image runs as: the last `USER` of the final stage.
+fn runtime_user(dockerfile: &str) -> Option<&str> {
+    final_stage(dockerfile)
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("USER "))
+        .next_back()
+        .map(str::trim)
+}
+
+/// Every server-language preset built by autopack, with a sample app it
+/// detects. Static presets are not here: Temps serves their files, it never
+/// runs their image.
+const NON_ROOT_PRESETS: &[(&str, &str)] = &[
+    ("python", "sample-flask-app"),
+    ("go", "sample-go-app"),
+    ("rust", "sample-rust-app"),
+    ("java", "sample-java-app"),
+    ("autopack", "sample-flask-app"),
+    ("nixpacks", "sample-go-app"),
+    ("nixpacks-python", "sample-flask-app"),
+    ("nixpacks-go", "sample-go-app"),
+    ("nixpacks-rust", "sample-rust-app"),
+    ("nixpacks-java", "sample-java-app"),
+];
+
+/// The uid:gid every autopack runtime image runs as.
+const RUNTIME_USER: &str = "10001:10001";
+
+#[tokio::test]
+async fn server_presets_run_as_a_fixed_non_root_user() {
+    for (slug, app) in NON_ROOT_PRESETS {
+        let root = fixture(app);
+        let preset = temps_presets::get_preset_by_slug(slug).unwrap();
+        let rendered = preset.dockerfile(buildkit(&root)).await;
+        assert!(
+            rendered.plan_failure.is_none(),
+            "{slug} on {app}: {:?}",
+            rendered.plan_failure
+        );
+        let stage = final_stage(&rendered.content);
+        assert_eq!(
+            runtime_user(&rendered.content),
+            Some(RUNTIME_USER),
+            "{slug}:\n{stage}"
+        );
+
+        // `USER` comes after every `RUN` of the runtime stage, so nothing the
+        // image does at build time is left for the app to need root for.
+        let lines: Vec<&str> = stage.lines().map(str::trim).collect();
+        let user_at = lines
+            .iter()
+            .rposition(|line| line.starts_with("USER "))
+            .unwrap();
+        assert!(
+            lines[user_at..]
+                .iter()
+                .all(|line| !line.starts_with("RUN ")),
+            "{slug}: a RUN follows USER:\n{stage}"
+        );
+        // Only what the app writes is handed to it: the working directory
+        // and the files copied in, never a recursive chown of the image.
+        assert!(
+            lines[..user_at].contains(&"RUN chown 10001:10001 /app"),
+            "{slug}: /app is not writable by the runtime user:\n{stage}"
+        );
+        assert!(!stage.contains("chown -R"), "{slug}:\n{stage}");
+        assert!(
+            stage.contains("COPY --chown=10001:10001 "),
+            "{slug}: app files are not owned by the runtime user:\n{stage}"
+        );
+        assert!(
+            lines[user_at..].contains(&"ENV HOME=/home/autopack"),
+            "{slug}: HOME is not the runtime user's:\n{stage}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn autopack_user_root_is_an_explicit_opt_out_to_root() {
+    let root = fixture("sample-go-app");
+    let vars = vec!["AUTOPACK_USER=root".to_string()];
+    let rendered = AutopackPreset::new()
+        .dockerfile(buildkit(&root).with_build_vars(&vars))
+        .await;
+    assert!(
+        rendered.plan_failure.is_none(),
+        "{:?}",
+        rendered.plan_failure
+    );
+    // No USER at all: the image runs as root, which the deploy pipeline's
+    // root-user warning reports.
+    assert_eq!(
+        runtime_user(&rendered.content),
+        None,
+        "{}",
+        rendered.content
+    );
+}

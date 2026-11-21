@@ -849,4 +849,34 @@ mod tests {
         let content = dockerfile_for(&NixpacksPreset::auto(), dir.path()).await;
         assert!(content.contains("exit 1"), "{content}");
     }
+
+    #[tokio::test]
+    async fn every_nixpacks_slug_runs_as_the_non_root_autopack_user() {
+        use crate::mod_rs::runtime_user_test_support::{
+            rendered_runtime_user, AUTOPACK_RUNTIME_USER,
+        };
+        for (preset, fixture) in [
+            (NixpacksPreset::auto(), "sample-go-app"),
+            (
+                NixpacksPreset::new(NixpacksProvider::Python),
+                "sample-flask-app",
+            ),
+            (NixpacksPreset::new(NixpacksProvider::Go), "sample-go-app"),
+            (
+                NixpacksPreset::new(NixpacksProvider::Rust),
+                "sample-rust-app",
+            ),
+            (
+                NixpacksPreset::new(NixpacksProvider::Java),
+                "sample-java-app",
+            ),
+        ] {
+            assert_eq!(
+                rendered_runtime_user(&preset, fixture).await.as_deref(),
+                Some(AUTOPACK_RUNTIME_USER),
+                "{}",
+                preset.slug()
+            );
+        }
+    }
 }
