@@ -79,7 +79,8 @@ test("validates success before reporting installation", () => {
 test("install and update are discoverable with advanced ref options", () => {
   const command = new Command("plugin");
   registerPluginInstallCommands(command);
-  expect(command.commands.map((c) => c.name())).toEqual(["install", "update"]);
+  expect(command.commands.map((c) => c.name())).toEqual(["install", "update", "install-local"]);
+  expect(command.commands[2]?.helpInformation()).toContain("--yes");
   expect(command.commands[0]?.helpInformation()).toContain("--ref");
   expect(command.commands[0]?.helpInformation()).toContain("--grant");
   expect(command.commands[1]?.helpInformation()).not.toContain("--grant");

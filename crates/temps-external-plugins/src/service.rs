@@ -277,6 +277,13 @@ impl ExternalPluginsService {
         Ok(())
     }
 
+    pub(crate) async fn active_source(
+        &self,
+        name: &str,
+    ) -> Result<Option<crate::install::ActiveSource>, ExternalPluginsError> {
+        Ok(crate::install::active_source(&self.manager.config().plugins_dir, name).await?)
+    }
+
     pub(crate) async fn repository_source(
         &self,
         name: &str,
@@ -421,9 +428,63 @@ impl ExternalPluginsService {
             &output,
         )
         .await?;
+        let actor_id = self
+            .promote_operator_candidate(
+                &candidate,
+                crate::manager::repository_actor_source(
+                    &selected.source.repository,
+                    selected.source.path.as_deref(),
+                ),
+                progress,
+            )
+            .await?;
+        Ok(RepositoryInstallOutcome {
+            name: candidate.name,
+            version: candidate.version,
+            platform,
+            sha256,
+            source_commit: selected.source.commit,
+            actor_id,
+        })
+    }
+    pub(crate) async fn install_file(
+        &self,
+        receipt: &crate::install::LocalFileReceipt,
+        path: &std::path::Path,
+    ) -> Result<(), ExternalPluginsError> {
+        if !self.manager.config().persistent_installations {
+            return Err(ExternalPluginsError::PersistentStorageRequired);
+        }
+        let _lifecycle = self.lifecycle.lock().await;
+        if self.closing.load(Ordering::Acquire) {
+            return Err(ExternalPluginsError::ShuttingDown);
+        }
+        validate_plugin_name(&receipt.plugin_name)?;
+        let dir = &self.manager.config().plugins_dir;
+        let source = crate::install::active_source(dir, &receipt.plugin_name).await?;
+        if !matches!(source, None | Some(crate::install::ActiveSource::File(_))) {
+            return Err(repository::RepositoryError::SourceConflict {
+                name: receipt.plugin_name.clone(),
+                repository: "local file".into(),
+            }
+            .into());
+        }
+        let candidate = PluginInstaller::prepare_file(dir, receipt, path).await?;
+        self.promote_operator_candidate(&candidate, receipt.actor_source(), None)
+            .await?;
+        Ok(())
+    }
+
+    async fn promote_operator_candidate(
+        &self,
+        candidate: &crate::install::InstallCandidate,
+        source_identity: String,
+        progress: Option<&ProgressHandle>,
+    ) -> Result<String, ExternalPluginsError> {
         if let Some(progress) = progress {
             progress.advance(Stage::StartingPlugin).await;
         }
+        let installer = PluginInstaller::new(self.manager.config().registry.clone())?;
         let pending = match self
             .manager
             .prepare_candidate(
@@ -431,10 +492,7 @@ impl ExternalPluginsService {
                 &candidate.version,
                 &candidate.sha256,
                 &candidate.binary_path,
-                crate::manager::repository_actor_source(
-                    &selected.source.repository,
-                    selected.source.path.as_deref(),
-                ),
+                source_identity,
             )
             .await
         {
@@ -444,15 +502,14 @@ impl ExternalPluginsService {
                     plugin = %candidate.name,
                     version = %candidate.version,
                     reason = %reason,
-                    "Repository plugin candidate failed startup verification"
+                    "Plugin candidate failed startup verification"
                 );
-                let installer = PluginInstaller::new(self.manager.config().registry.clone())?;
-                if let Err(error) = installer.discard(&candidate).await {
-                    tracing::warn!(plugin = %candidate.name, error = %error, "Failed to discard rejected repository candidate");
+                if let Err(error) = installer.discard(candidate).await {
+                    tracing::warn!(plugin = %candidate.name, error = %error, "Failed to discard rejected plugin candidate");
                 }
                 return Err(ExternalPluginsError::CandidateRejected {
-                    name: candidate.name,
-                    version: candidate.version,
+                    name: candidate.name.clone(),
+                    version: candidate.version.clone(),
                     reason,
                 });
             }
@@ -462,6 +519,7 @@ impl ExternalPluginsService {
                 Ok((actor_id, source)) => (actor_id.to_string(), source.to_string()),
                 Err(reason) => {
                     self.manager.discard_candidate(pending).await;
+                    let _ = installer.discard(candidate).await;
                     return Err(ExternalPluginsError::CandidateRejected {
                         name: candidate.name.clone(),
                         version: candidate.version.clone(),
@@ -472,17 +530,17 @@ impl ExternalPluginsService {
         if let Some(progress) = progress {
             progress.advance(Stage::PromotingPlugin).await;
         }
-        let installer = PluginInstaller::new(self.manager.config().registry.clone())?;
-        let activation_rollback = match installer.capture_activation(&candidate).await {
+        let activation_rollback = match installer.capture_activation(candidate).await {
             Ok(rollback) => rollback,
             Err(error) => {
                 self.manager.discard_candidate(pending).await;
+                let _ = installer.discard(candidate).await;
                 return Err(error.into());
             }
         };
-        if let Err(error) = installer.activate(&candidate).await {
+        if let Err(error) = installer.activate(candidate).await {
             self.manager.discard_candidate(pending).await;
-            let _ = installer.discard(&candidate).await;
+            let _ = installer.discard(candidate).await;
             return Err(error.into());
         }
         let grant_service = crate::grants::PluginGrantService::new(self.db.clone());
@@ -511,16 +569,9 @@ impl ExternalPluginsService {
             .publish(temps_ai_api_tools::PluginToolsIndex::default());
         self.manager.promote_candidate(pending).await;
         self.refresh_runtime_surfaces().await;
-        let actor_id = candidate_actor_id;
-        Ok(RepositoryInstallOutcome {
-            name: candidate.name,
-            version: candidate.version,
-            platform,
-            sha256,
-            source_commit: selected.source.commit,
-            actor_id,
-        })
+        Ok(candidate_actor_id)
     }
+
     /// Install the bridge plugins use to call the platform's own HTTP API.
     ///
     /// The console builds its router *after* plugins start (the router
@@ -874,13 +925,14 @@ impl ExternalPluginsService {
 
         // Source identity is bidirectional: signed registry installs must not
         // silently replace an administrator-selected repository release.
-        if crate::install::repository_source(
-            &self.manager.config().plugins_dir,
-            &selected.identity.name,
-        )
-        .await?
-        .is_some()
-        {
+        if !matches!(
+            crate::install::active_source(
+                &self.manager.config().plugins_dir,
+                &selected.identity.name
+            )
+            .await?,
+            None | Some(crate::install::ActiveSource::Registry)
+        ) {
             return Err(repository::RepositoryError::SourceConflict {
                 name: selected.identity.name.clone(),
                 repository: "signed registry".to_string(),

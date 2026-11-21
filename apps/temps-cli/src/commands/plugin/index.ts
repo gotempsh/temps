@@ -14,7 +14,7 @@ import { registerPluginGrantCommands } from "./grants.js";
 export function registerPluginCommands(program: Command) {
   const plugin = program
     .command("plugin")
-    .description("Create, install, update and build TypeScript plugins");
+    .description("Create and build TypeScript plugins, or install and manage external plugins");
   registerPluginInstallCommands(plugin);
   registerPluginGrantCommands(plugin);
   registerPluginDevCommands(plugin);

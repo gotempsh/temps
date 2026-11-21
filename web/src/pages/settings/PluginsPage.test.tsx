@@ -126,6 +126,7 @@ describe('PluginsPage management permissions', () => {
     expect(markup).toContain('Available plugins')
     expect(markup).not.toContain('Build and install')
     expect(markup).not.toContain('GitHub repository')
+    expect(markup).not.toContain('Install from file')
     expect(markup).not.toContain('Share installation counts')
   })
 
@@ -138,6 +139,7 @@ describe('PluginsPage management permissions', () => {
     expect(markup).not.toContain('Reload plugins')
     expect(markup).toContain('Available plugins')
     expect(markup).toContain('Install from GitHub')
+    expect(markup).toContain('Install from file')
     expect(markup).toContain('aria-selected="true"')
     expect(markup).not.toContain('Build and install')
     expect(markup).not.toContain('id="plugin-repo"')

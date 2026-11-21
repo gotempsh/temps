@@ -1218,22 +1218,21 @@ impl ExternalPluginManager {
         expected_sha256: &str,
         binary_path: &Path,
     ) -> Result<PluginManifest, String> {
-        let source_identity = match crate::install::repository_source(
-            &self.config.plugins_dir,
-            expected_name,
-        )
-        .await
-        {
-            Ok(Some(receipt)) => {
-                repository_actor_source(&receipt.repository, receipt.path.as_deref())
-            }
-            Ok(None) => registry_actor_source(&self.config.registry.url),
-            Err(error) => {
-                return Err(format!(
-                    "Cannot resolve verified source identity for {expected_name}: {error}"
-                ))
-            }
-        };
+        let source_identity =
+            match crate::install::active_source(&self.config.plugins_dir, expected_name).await {
+                Ok(Some(crate::install::ActiveSource::File(receipt))) => receipt.actor_source(),
+                Ok(Some(crate::install::ActiveSource::Repository(receipt))) => {
+                    repository_actor_source(&receipt.repository, receipt.path.as_deref())
+                }
+                Ok(None | Some(crate::install::ActiveSource::Registry)) => {
+                    registry_actor_source(&self.config.registry.url)
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "Cannot resolve verified source identity for {expected_name}: {error}"
+                    ));
+                }
+            };
         let process = self
             .spawn_plugin(
                 binary_path,

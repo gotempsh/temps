@@ -16537,6 +16537,10 @@ export type FileObject = {
     purpose?: string;
 };
 
+export type FileUpload = {
+    file: Blob | File;
+};
+
 export type FillSecretRequest = {
     /**
      * The credential. Stored encrypted; never returned and never shown to the
@@ -107930,6 +107934,42 @@ export type AppGetWorkflowRunResponses = {
 };
 
 export type AppGetWorkflowRunResponse = AppGetWorkflowRunResponses[keyof AppGetWorkflowRunResponses];
+
+export type InstallLocalFileData = {
+    body: FileUpload;
+    headers: {
+        /**
+         * Operator approval to execute the file with this SHA-256
+         */
+        'X-Temps-Trust-Sha256': string;
+    };
+    path?: never;
+    query: {
+        name: string;
+        version: string;
+    };
+    url: '/x/plugins/install/file';
+};
+
+export type InstallLocalFileErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    408: unknown;
+    409: unknown;
+    413: unknown;
+    428: unknown;
+    429: unknown;
+    500: unknown;
+    502: unknown;
+    503: unknown;
+};
+
+export type InstallLocalFileResponses = {
+    200: InstallPluginResponse;
+};
+
+export type InstallLocalFileResponse = InstallLocalFileResponses[keyof InstallLocalFileResponses];
 
 export type GetPluginAiToolsData = {
     body?: never;

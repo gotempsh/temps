@@ -16,6 +16,20 @@
 
 ---
 
+## Install a native plugin on a self-hosted Temps server
+
+Sign in as a system administrator and build the plugin for the server's OS and architecture. Use the name and version declared in its Temps plugin manifest.
+
+```bash
+bunx --bun @temps-sdk/cli plugin install-local ./my-plugin --name my-plugin --plugin-version 1.0.0
+```
+
+Review the destination and SHA-256 before confirming. For unattended installs, pass `--yes`. In the console, open **Settings → Plugins → Install from file**, choose the executable, enter its manifest identity and confirm trust. Uploads require persistent plugin storage and accept one executable up to 256 MiB. Use HTTPS or localhost in the browser.
+
+Approval allows native code to run on the server under its configured plugin execution account. Only install code you trust. Temps records the approval, verifies the digest and checks the plugin handshake before switching the active release. Restart discovery verifies the installed receipt and binary again. An upgrade uses the same command with the replacement file. A failed handshake leaves the previous release active. Plugin-owned data persists across upgrades and restarts.
+
+Review declared host permissions in the running plugin's **Permissions** dialog or with `temps plugin grants get my-plugin`. Use `temps plugin grants set` to approve specific permissions. A changed file digest requires fresh grants. For plugins serving MCP at `/mcp`, connect the client to `/api/x/my-plugin/mcp` with its own Temps credentials. The plugin receives the authenticated caller through the usual proxy.
+
 ## Develop and test a plugin locally
 
 Run a compiled plugin with a simulated Temps host on macOS or Linux:

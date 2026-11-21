@@ -35434,6 +35434,18 @@
         ],
         "description": "A file object as returned by the provider."
       },
+      "FileUpload": {
+        "properties": {
+          "file": {
+            "format": "binary",
+            "type": "string"
+          }
+        },
+        "required": [
+          "file"
+        ],
+        "type": "object"
+      },
       "FillSecretRequest": {
         "properties": {
           "value": {
@@ -199496,6 +199508,78 @@
         ],
         "tags": [
           "Workflow App API"
+        ]
+      }
+    },
+    "/x/plugins/install/file": {
+      "post": {
+        "operationId": "install_local_file",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "version",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Operator approval to execute the file with this SHA-256",
+            "in": "header",
+            "name": "X-Temps-Trust-Sha256",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/FileUpload"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InstallPluginResponse"
+                }
+              }
+            }
+          },
+          "400": {},
+          "401": {},
+          "403": {},
+          "408": {},
+          "409": {},
+          "413": {},
+          "428": {},
+          "429": {},
+          "500": {},
+          "502": {},
+          "503": {}
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "External Plugins"
         ]
       }
     },

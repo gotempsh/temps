@@ -43,6 +43,9 @@ export default {
         // consumer yet; exclude until real SSE consumption is built and
         // this can be revisited.
         exclude: [
+          // Each installed plugin owns /x/<name>. Only the host management
+          // routes are part of the console's portable SDK.
+          '/^[A-Z]+ /x/(?!plugins(?:/|$))/',
           // The OpenAI-compatible operation has mixed JSON/SSE media. Use the
           // explicit /responses/json and /responses/stream generated bindings.
           'POST /ai/v1/responses',

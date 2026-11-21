@@ -4,6 +4,7 @@
 //! HTTP handlers for external plugin management endpoints.
 
 mod ai_tools;
+mod local_file;
 use ai_tools::{get_plugin_ai_tools, put_plugin_ai_tools};
 
 use std::sync::Arc;
@@ -764,14 +765,23 @@ pub struct PluginStatusResponse {
 }
 
 #[derive(Debug, Serialize, ToSchema)]
-pub struct PluginSourceResponse {
-    pub kind: String,
-    pub repository_url: String,
-    pub ref_name: String,
-    pub path: Option<String>,
-    pub commit: String,
-    pub version: String,
-    pub builder_image: String,
+#[serde(tag = "kind")]
+pub enum PluginSourceResponse {
+    #[serde(rename = "github")]
+    Repository {
+        repository_url: String,
+        ref_name: String,
+        path: Option<String>,
+        commit: String,
+        version: String,
+        builder_image: String,
+    },
+    #[serde(rename = "local-file")]
+    File {
+        version: String,
+        platform: String,
+        sha256: String,
+    },
 }
 
 fn service_problem(error: &ExternalPluginsError) -> Problem {
@@ -939,7 +949,7 @@ fn public_error_detail(error: &ExternalPluginsError) -> String {
         ExternalPluginsError::Install(InstallError::DigestMismatch {
             plugin, version, ..
         }) => format!(
-            "Downloaded artifact for plugin '{plugin}' v{version} did not match its signed digest"
+            "Executable for plugin '{plugin}' v{version} did not match its expected SHA-256 digest"
         ),
         ExternalPluginsError::Install(InstallError::InvalidNpmTarball {
             plugin, version, ..
@@ -1614,20 +1624,29 @@ async fn get_plugin_status(
     crate::install::validate_plugin_name(&name)
         .map_err(|error| service_problem(&ExternalPluginsError::Install(error)))?;
     let configured = state.service.manager().is_running(&name).await;
-    let source = state
+    let source = match state
         .service
-        .repository_source(&name)
+        .active_source(&name)
         .await
-        .map_err(|error| service_problem(&error))?
-        .map(|receipt| PluginSourceResponse {
-            kind: "github".to_string(),
-            repository_url: receipt.repository,
-            ref_name: receipt.ref_name,
-            path: receipt.path,
-            commit: receipt.commit,
+        .map_err(|err| service_problem(&err))?
+    {
+        Some(crate::install::ActiveSource::Repository(receipt)) => {
+            Some(PluginSourceResponse::Repository {
+                repository_url: receipt.repository,
+                ref_name: receipt.ref_name,
+                path: receipt.path,
+                commit: receipt.commit,
+                version: receipt.version,
+                builder_image: receipt.builder,
+            })
+        }
+        Some(crate::install::ActiveSource::File(receipt)) => Some(PluginSourceResponse::File {
             version: receipt.version,
-            builder_image: receipt.builder,
-        });
+            platform: receipt.platform,
+            sha256: receipt.sha256,
+        }),
+        _ => None,
+    };
     Ok(Json(PluginStatusResponse {
         configured,
         reason: (!configured)
@@ -1650,6 +1669,12 @@ pub fn configure_routes() -> Router<ExternalPluginsAppState> {
         .route(
             "/x/plugins/installation-reporting",
             get(get_installation_reporting).put(put_installation_reporting),
+        )
+        .route(
+            "/x/plugins/install/file",
+            post(local_file::install_local_file).layer(axum::extract::DefaultBodyLimit::max(
+                crate::install::MAX_BINARY_BYTES as usize + 64 * 1024,
+            )),
         )
         .route("/x/plugins/install/repository", post(install_repository))
         .route(
@@ -1679,6 +1704,7 @@ pub fn configure_routes() -> Router<ExternalPluginsAppState> {
         get_installation_reporting,
         put_installation_reporting,
         install_repository,
+        local_file::install_local_file,
         get_repository_install_progress,
         update_repository,
         uninstall_plugin,
@@ -1703,6 +1729,7 @@ pub fn configure_routes() -> Router<ExternalPluginsAppState> {
             crate::catalog::PlatformRelease,
             InstallPluginRequest,
             InstallPluginResponse,
+            local_file::FileUpload,
             UninstallPluginResponse,
             PluginCatalogResponse,
             RepositoryCatalogResponse,
@@ -2545,6 +2572,48 @@ mod tests {
             .join("\n");
         assert!(logs.contains("EXTERNAL_PLUGIN_INSTALL_REQUESTED"));
         assert!(!logs.contains("private-audit-detail"));
+    }
+
+    #[tokio::test]
+    async fn file_install_requires_admin_digest_step_up_and_durable_audit() {
+        let digest = "ab".repeat(32);
+        for (role, approved, step_up, status) in [
+            (Role::User, true, false, StatusCode::FORBIDDEN),
+            (Role::PlatformAdmin, false, false, StatusCode::BAD_REQUEST),
+            (
+                Role::PlatformAdmin,
+                true,
+                true,
+                StatusCode::PRECONDITION_REQUIRED,
+            ),
+            (
+                Role::PlatformAdmin,
+                true,
+                false,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+        ] {
+            let mut state = test_state_with_audit(Arc::new(RejectingAuditLogger));
+            if step_up {
+                state.sensitive_action_authorizer = Arc::new(RequireSensitiveVerification);
+            }
+            let app = configure_routes()
+                .with_state(state)
+                .layer(Extension(metadata().0))
+                .layer(Extension(user_auth(role).0));
+            let mut req = Request::builder()
+                .method("POST")
+                .uri("/x/plugins/install/file?name=fixture&version=1")
+                .header(CONTENT_TYPE, "multipart/form-data; boundary=file");
+            if approved {
+                req = req.header("X-Temps-Trust-Sha256", &digest);
+            }
+            let response = app
+                .oneshot(req.body(Body::empty()).expect("request"))
+                .await
+                .expect("router");
+            assert_eq!(response.status(), status);
+        }
     }
 
     #[tokio::test]

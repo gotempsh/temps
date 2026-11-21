@@ -222,6 +222,36 @@ pub(crate) struct RepositoryReceipt {
     pub sha256: String,
 }
 
+/// An unsigned executable approved by an operator for this host.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LocalFileReceipt {
+    pub source: LocalFileSource,
+    pub plugin_name: String,
+    pub version: String,
+    pub platform: String,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub(crate) enum LocalFileSource {
+    #[serde(rename = "local-file")]
+    File,
+}
+
+pub(crate) enum ActiveSource {
+    Registry,
+    Repository(RepositoryReceipt),
+    File(LocalFileReceipt),
+}
+
+impl LocalFileReceipt {
+    // An unsigned replacement needs fresh grants, even under the same name.
+    pub fn actor_source(&self) -> String {
+        format!("local-file:{}", self.sha256)
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 struct ActiveRecord {
     version: String,
@@ -260,28 +290,65 @@ impl PluginInstaller {
         receipt: RepositoryReceipt,
         built_binary: &Path,
     ) -> Result<InstallCandidate, InstallError> {
-        validate_plugin_name(&receipt.plugin_name)?;
-        validate_version(&receipt.plugin_name, &receipt.version)?;
+        Self::stage_binary(
+            plugins_dir,
+            &receipt.plugin_name,
+            &receipt.version,
+            &receipt.platform,
+            &receipt.sha256,
+            &receipt,
+            built_binary,
+        )
+        .await
+    }
+
+    pub(crate) async fn prepare_file(
+        plugins_dir: &Path,
+        receipt: &LocalFileReceipt,
+        file: &Path,
+    ) -> Result<InstallCandidate, InstallError> {
+        Self::stage_binary(
+            plugins_dir,
+            &receipt.plugin_name,
+            &receipt.version,
+            &receipt.platform,
+            &receipt.sha256,
+            receipt,
+            file,
+        )
+        .await
+    }
+
+    async fn stage_binary(
+        plugins_dir: &Path,
+        name: &str,
+        version: &str,
+        target: &str,
+        digest: &str,
+        receipt: &impl Serialize,
+        built_binary: &Path,
+    ) -> Result<InstallCandidate, InstallError> {
+        validate_plugin_name(name)?;
+        validate_version(name, version)?;
         let platform = platform_target()?;
-        if platform != receipt.platform {
+        if platform != target {
             return Err(InstallError::UnsupportedPlatform {
                 os: std::env::consts::OS.to_string(),
                 arch: std::env::consts::ARCH.to_string(),
                 target_env: platform,
             });
         }
-        let sha256 = normalize_digest(&receipt.plugin_name, &receipt.version, &receipt.sha256)?;
-        let actual =
-            hash_regular_file_capped(&receipt.plugin_name, built_binary, MAX_BINARY_BYTES).await?;
+        let sha256 = normalize_digest(name, version, digest)?;
+        let actual = hash_regular_file_capped(name, built_binary, MAX_BINARY_BYTES).await?;
         if actual != sha256 {
             return Err(InstallError::DigestMismatch {
-                plugin: receipt.plugin_name,
-                version: receipt.version,
+                plugin: name.to_owned(),
+                version: version.to_owned(),
                 expected: sha256,
                 actual,
             });
         }
-        let name = receipt.plugin_name.clone();
+        let name = name.to_owned();
         let cleanup_name = name.clone();
         ensure_directory(&name, plugins_dir).await?;
         let staging_root = plugins_dir.join(".staging");
@@ -290,7 +357,7 @@ impl PluginInstaller {
         let stage = staging_root.join(format!("{name}-{unique}"));
         create_unique_directory(&name, &stage).await?;
         let plugin_root = plugins_dir.join(&name);
-        let directory = format!("{}-{unique}", receipt.version);
+        let directory = unique;
         let version_dir = plugin_root.join(&directory);
         let mut moved_to_version_dir = false;
         let prepared = async {
@@ -307,7 +374,7 @@ impl PluginInstaller {
                 .await
                 .map_err(|error| io_error(&name, &stage.join(BINARY_FILE), error))?;
             }
-            write_json_synced(&name, &stage.join(RECEIPT_FILE), &receipt).await?;
+            write_json_synced(&name, &stage.join(RECEIPT_FILE), receipt).await?;
             sync_directory(&name, &stage).await?;
             ensure_directory(&name, &plugin_root).await?;
             tokio::fs::rename(&stage, &version_dir)
@@ -317,7 +384,7 @@ impl PluginInstaller {
             sync_directory(&name, &plugin_root).await?;
             Ok(InstallCandidate {
                 name,
-                version: receipt.version,
+                version: version.to_owned(),
                 platform,
                 sha256,
                 binary_path: version_dir.join(BINARY_FILE),
@@ -1430,20 +1497,26 @@ async fn verify_active(
     let receipt_bytes = read_regular_file_capped(name, &receipt_path, 2 * 1024 * 1024)
         .await
         .map_err(|error| invalid_receipt(name, &receipt_path, error.to_string()))?;
-    if serde_json::from_slice::<ReceiptSourceMarker>(&receipt_bytes)
+    match serde_json::from_slice::<ReceiptSourceMarker>(&receipt_bytes)
         .ok()
         .and_then(|marker| marker.source)
         .as_deref()
-        == Some("github")
     {
-        return verify_repository_active(
-            name,
-            &active,
-            &version_dir,
-            &receipt_path,
-            &receipt_bytes,
-        )
-        .await;
+        Some("github") => {
+            return verify_repository_active(
+                name,
+                &active,
+                &version_dir,
+                &receipt_path,
+                &receipt_bytes,
+            )
+            .await
+        }
+        Some("local-file") => {
+            let receipt = parse_file_receipt(name, &active, &receipt_path, &receipt_bytes)?;
+            return verify_operator_binary(name, &active, &version_dir, &receipt.sha256).await;
+        }
+        _ => {}
     }
     let accepted_keyset = accepted_keyset
         .ok_or_else(|| invalid_receipt(name, &receipt_path, "signed registry state is missing"))?;
@@ -1562,13 +1635,43 @@ async fn verify_repository_active(
             "repository provenance fields are invalid",
         ));
     }
-    let expected = normalize_digest(name, &receipt.version, &receipt.sha256)?;
+    verify_operator_binary(name, active, version_dir, &receipt.sha256).await
+}
+
+fn parse_file_receipt(
+    name: &str,
+    active: &ActiveRecord,
+    path: &Path,
+    bytes: &[u8],
+) -> Result<LocalFileReceipt, InstallError> {
+    let receipt: LocalFileReceipt = serde_json::from_slice(bytes)
+        .map_err(|error| invalid_receipt(name, path, error.to_string()))?;
+    if receipt.plugin_name != name
+        || receipt.version != active.version
+        || receipt.platform != platform_target()?
+    {
+        return Err(invalid_receipt(
+            name,
+            path,
+            "uploaded file identity does not match active installation",
+        ));
+    }
+    Ok(receipt)
+}
+
+async fn verify_operator_binary(
+    name: &str,
+    active: &ActiveRecord,
+    version_dir: &Path,
+    digest: &str,
+) -> Result<ActiveInstallation, InstallError> {
+    let expected = normalize_digest(name, &active.version, digest)?;
     let binary_path = version_dir.join(BINARY_FILE);
     let actual = hash_regular_file_capped(name, &binary_path, MAX_BINARY_BYTES).await?;
     if actual != expected {
         return Err(InstallError::DigestMismatch {
             plugin: name.to_string(),
-            version: receipt.version,
+            version: active.version.clone(),
             expected,
             actual,
         });
@@ -1587,6 +1690,16 @@ pub(crate) async fn repository_source(
     plugins_dir: &Path,
     name: &str,
 ) -> Result<Option<RepositoryReceipt>, InstallError> {
+    Ok(match active_source(plugins_dir, name).await? {
+        Some(ActiveSource::Repository(receipt)) => Some(receipt),
+        _ => None,
+    })
+}
+
+pub(crate) async fn active_source(
+    plugins_dir: &Path,
+    name: &str,
+) -> Result<Option<ActiveSource>, InstallError> {
     validate_plugin_name(name)?;
     let root = plugins_dir.join(name);
     for directory in [plugins_dir, root.as_path()] {
@@ -1629,13 +1742,18 @@ pub(crate) async fn repository_source(
     let receipt_bytes = read_regular_file_capped(name, &receipt_path, 2 * 1024 * 1024).await?;
     let marker: ReceiptSourceMarker = serde_json::from_slice(&receipt_bytes)
         .map_err(|error| invalid_receipt(name, &receipt_path, error.to_string()))?;
-    if marker.source.as_deref() != Some("github") {
-        return Ok(None);
+    if marker.source.as_deref() == Some("local-file") {
+        let receipt = parse_file_receipt(name, &active, &receipt_path, &receipt_bytes)?;
+        verify_operator_binary(name, &active, &version_dir, &receipt.sha256).await?;
+        return Ok(Some(ActiveSource::File(receipt)));
+    }
+    if marker.source.is_none() {
+        return Ok(Some(ActiveSource::Registry));
     }
     verify_repository_active(name, &active, &version_dir, &receipt_path, &receipt_bytes).await?;
     let receipt: RepositoryReceipt = serde_json::from_slice(&receipt_bytes)
         .map_err(|error| invalid_receipt(name, &receipt_path, error.to_string()))?;
-    Ok(Some(receipt))
+    Ok(Some(ActiveSource::Repository(receipt)))
 }
 
 pub(crate) async fn open_verified_executable(
@@ -2055,7 +2173,8 @@ async fn hash_open_file_capped(
     }
     let mut total = 0u64;
     let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 64 * 1024];
+    // Keep the read buffer off nested async lifecycle futures and worker stacks.
+    let mut buffer = vec![0u8; 64 * 1024];
     loop {
         let read = file
             .read(&mut buffer)
@@ -2123,6 +2242,61 @@ mod tests {
     use super::*;
     use ed25519_dalek::{Signer as _, SigningKey};
     use std::collections::BTreeMap;
+
+    #[tokio::test]
+    async fn file_approval_binds_identity_and_bytes_across_discovery() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let binary = dir.path().join("unselected-file");
+        std::fs::write(&binary, b"native fixture").expect("fixture");
+        let (installer, config) = installer(
+            "http://127.0.0.1/plugin",
+            &SigningKey::from_bytes(&[42; 32]),
+        );
+        let mut receipt = LocalFileReceipt {
+            source: LocalFileSource::File,
+            plugin_name: "file-plugin".into(),
+            version: "v".repeat(64),
+            sha256: "0".repeat(64),
+            platform: platform_target().expect("platform"),
+        };
+        assert!(matches!(
+            PluginInstaller::prepare_file(dir.path(), &receipt, &binary).await,
+            Err(InstallError::DigestMismatch { .. })
+        ));
+        receipt.sha256 = hex::encode(Sha256::digest(b"native fixture"));
+        let candidate = PluginInstaller::prepare_file(dir.path(), &receipt, &binary)
+            .await
+            .expect("stage");
+        assert!(discover_active(dir.path(), &config).await.is_empty());
+        installer.activate(&candidate).await.expect("activate");
+        assert_eq!(
+            discover_active(dir.path(), &config).await[0]
+                .as_ref()
+                .expect("discover")
+                .sha256,
+            receipt.sha256
+        );
+        assert!(
+            matches!(active_source(dir.path(), "file-plugin").await, Ok(Some(ActiveSource::File(active))) if active.actor_source() == receipt.actor_source())
+        );
+        let receipt_path = candidate.binary_path.with_file_name(RECEIPT_FILE);
+        let mut wrong = receipt.clone();
+        wrong.plugin_name = "other-plugin".into();
+        std::fs::write(&receipt_path, serde_json::to_vec(&wrong).expect("receipt"))
+            .expect("replace receipt");
+        assert!(discover_active(dir.path(), &config).await[0].is_err());
+        std::fs::write(
+            &receipt_path,
+            serde_json::to_vec(&receipt).expect("receipt"),
+        )
+        .expect("restore");
+        std::fs::remove_file(&candidate.binary_path).expect("remove staged binary");
+        std::fs::write(&candidate.binary_path, b"modified").expect("replace binary");
+        assert!(matches!(
+            discover_active(dir.path(), &config).await[0],
+            Err(InstallError::DigestMismatch { .. })
+        ));
+    }
 
     #[tokio::test]
     async fn repository_receipt_survives_restart_without_registry_and_detects_tampering() {
