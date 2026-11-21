@@ -1049,7 +1049,11 @@ export function AssistantThread({
               <ChatOperationsIndicator
                 conversationPublicId={conversation.public_id}
               />
-              <ChatPluginWatches key={conversation.public_id} chat={conversation.public_id} readOnly={readOnly} />
+              <ChatPluginWatches
+                key={conversation.public_id}
+                chat={conversation.public_id}
+                readOnly={readOnly}
+              />
               <ChatProjectsLink conversationPublicId={conversation.public_id} />
               <WorkspaceChip conversationPublicId={conversation.public_id} />
               <ChatSandbox
