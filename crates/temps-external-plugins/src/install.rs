@@ -133,6 +133,7 @@ pub(crate) struct ActivationRollback {
 
 #[derive(Debug, Clone)]
 pub struct ActiveInstallation {
+    pub(crate) source_identity: String,
     pub name: String,
     pub version: String,
     pub sha256: String,
@@ -1390,42 +1391,9 @@ pub async fn discover_active(
     registry: &RegistryConfig,
 ) -> Vec<Result<ActiveInstallation, InstallError>> {
     let mut results = Vec::new();
-    let state_path = plugins_dir.join(REGISTRY_STATE_FILE);
-    let accepted_keyset = match read_registry_state(&state_path).await {
-        Ok(Some(state)) => match VerifiedKeyset::verify(
-            state.keyset,
-            &registry.root_trust,
-            chrono::Utc::now(),
-            KeysetUse::HistoricalReceipt,
-        ) {
-            Ok(keyset) if keyset.document.generation == state.highest_keyset_generation => {
-                Some(keyset)
-            }
-            Ok(keyset) => {
-                results.push(Err(invalid_receipt(
-                    "registry",
-                    &state_path,
-                    format!(
-                        "keyset generation {} does not match persisted generation {}",
-                        keyset.document.generation, state.highest_keyset_generation
-                    ),
-                )));
-                return results;
-            }
-            Err(error) => {
-                results.push(Err(invalid_receipt(
-                    "registry",
-                    &state_path,
-                    error.to_string(),
-                )));
-                return results;
-            }
-        },
-        Ok(None) => None,
-        Err(error) => {
-            results.push(Err(error));
-            return results;
-        }
+    let accepted_keyset = match historical_keyset(plugins_dir, registry).await {
+        Ok(keyset) => keyset,
+        Err(error) => return vec![Err(error)],
     };
     let mut entries = match tokio::fs::read_dir(plugins_dir).await {
         Ok(entries) => entries,
@@ -1474,6 +1442,59 @@ pub async fn discover_active(
     results
 }
 
+async fn historical_keyset(
+    plugins_dir: &Path,
+    registry: &RegistryConfig,
+) -> Result<Option<VerifiedKeyset>, InstallError> {
+    let path = plugins_dir.join(REGISTRY_STATE_FILE);
+    let Some(state) = read_registry_state(&path).await? else {
+        return Ok(None);
+    };
+    let keyset = VerifiedKeyset::verify(
+        state.keyset,
+        &registry.root_trust,
+        chrono::Utc::now(),
+        KeysetUse::HistoricalReceipt,
+    )
+    .map_err(|error| invalid_receipt("registry", &path, error.to_string()))?;
+    if keyset.document.generation != state.highest_keyset_generation {
+        return Err(invalid_receipt(
+            "registry",
+            &path,
+            format!(
+                "keyset generation {} does not match persisted generation {}",
+                keyset.document.generation, state.highest_keyset_generation
+            ),
+        ));
+    }
+    Ok(Some(keyset))
+}
+
+/// Verify the currently selected release before replacing a running process.
+pub(crate) async fn verified_active_installation(
+    name: &str,
+    plugins_dir: &Path,
+    registry: &RegistryConfig,
+) -> Result<ActiveInstallation, InstallError> {
+    validate_plugin_name(name)?;
+    let keyset = historical_keyset(plugins_dir, registry).await?;
+    verify_active(name, &plugins_dir.join(name), registry, keyset.as_ref()).await
+}
+
+async fn check_receipt_directory(name: &str, path: &Path) -> Result<(), InstallError> {
+    let metadata = tokio::fs::symlink_metadata(path)
+        .await
+        .map_err(|e| io_error(name, path, e))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(invalid_receipt(
+            name,
+            path,
+            "expected a real installation directory",
+        ));
+    }
+    Ok(())
+}
+
 async fn verify_active(
     name: &str,
     plugin_root: &Path,
@@ -1481,6 +1502,10 @@ async fn verify_active(
     accepted_keyset: Option<&VerifiedKeyset>,
 ) -> Result<ActiveInstallation, InstallError> {
     validate_plugin_name(name)?;
+    if let Some(plugins_dir) = plugin_root.parent() {
+        check_receipt_directory(name, plugins_dir).await?;
+    }
+    check_receipt_directory(name, plugin_root).await?;
     let active_path = plugin_root.join(ACTIVE_FILE);
     let active_bytes = read_regular_file_capped(name, &active_path, 16 * 1024)
         .await
@@ -1497,6 +1522,7 @@ async fn verify_active(
     validate_version(name, &active.version)?;
     validate_version(name, &active.directory)?;
     let version_dir = plugin_root.join(&active.directory);
+    check_receipt_directory(name, &version_dir).await?;
     let receipt_path = version_dir.join(RECEIPT_FILE);
     let receipt_bytes = read_regular_file_capped(name, &receipt_path, 2 * 1024 * 1024)
         .await
@@ -1518,7 +1544,14 @@ async fn verify_active(
         }
         Some("local-file") => {
             let receipt = parse_file_receipt(name, &active, &receipt_path, &receipt_bytes)?;
-            return verify_operator_binary(name, &active, &version_dir, &receipt.sha256).await;
+            return verify_operator_binary(
+                name,
+                &active,
+                &version_dir,
+                &receipt.sha256,
+                receipt.actor_source(),
+            )
+            .await;
         }
         _ => {}
     }
@@ -1602,6 +1635,7 @@ async fn verify_active(
         name: name.to_string(),
         version: receipt.version,
         sha256: signed_digest,
+        source_identity: crate::manager::registry_actor_source(&registry.url),
         binary_path,
     })
 }
@@ -1639,7 +1673,14 @@ async fn verify_repository_active(
             "repository provenance fields are invalid",
         ));
     }
-    verify_operator_binary(name, active, version_dir, &receipt.sha256).await
+    verify_operator_binary(
+        name,
+        active,
+        version_dir,
+        &receipt.sha256,
+        crate::manager::repository_actor_source(&receipt.repository, receipt.path.as_deref()),
+    )
+    .await
 }
 
 fn parse_file_receipt(
@@ -1668,6 +1709,7 @@ async fn verify_operator_binary(
     active: &ActiveRecord,
     version_dir: &Path,
     digest: &str,
+    source_identity: String,
 ) -> Result<ActiveInstallation, InstallError> {
     let expected = normalize_digest(name, &active.version, digest)?;
     let binary_path = version_dir.join(BINARY_FILE);
@@ -1684,6 +1726,7 @@ async fn verify_operator_binary(
         name: name.to_string(),
         version: active.version.clone(),
         sha256: actual,
+        source_identity,
         binary_path,
     })
 }
@@ -1748,7 +1791,14 @@ pub(crate) async fn active_source(
         .map_err(|error| invalid_receipt(name, &receipt_path, error.to_string()))?;
     if marker.source.as_deref() == Some("local-file") {
         let receipt = parse_file_receipt(name, &active, &receipt_path, &receipt_bytes)?;
-        verify_operator_binary(name, &active, &version_dir, &receipt.sha256).await?;
+        verify_operator_binary(
+            name,
+            &active,
+            &version_dir,
+            &receipt.sha256,
+            receipt.actor_source(),
+        )
+        .await?;
         return Ok(Some(ActiveSource::File(receipt)));
     }
     if marker.source.is_none() {
