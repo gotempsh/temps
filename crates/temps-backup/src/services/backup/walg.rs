@@ -222,10 +222,10 @@ impl BackupService {
             bucket_path: s3_source.bucket_path.clone(),
             force_path_style: s3_source.effective_path_style(true).force_path_style,
         };
-        if let Some(resolved_endpoint) = s3_creds
+        let resolved_endpoint = s3_creds
             .resolve_endpoint_for_container(&docker, &container_id)
-            .await
-        {
+            .await;
+        if let Some(resolved_endpoint) = &resolved_endpoint {
             env_vars.push(format!("AWS_ENDPOINT={}", resolved_endpoint));
         }
 
@@ -247,17 +247,19 @@ impl BackupService {
         let archiving_command = internal_walg_archive_command(&pgdata);
         let walg_env_path = internal_walg_env_path(&pgdata);
         if archive_before.archive_command == archiving_command {
-            let archiving_to = run_walg_env_script(
-                &docker,
-                &container_id,
-                walg_env_prefix_script(&walg_env_path),
-                "read the WAL-G destination from",
-            )
-            .await?;
+            let archiving_to = parse_walg_env_destination(
+                &run_walg_env_script(
+                    &docker,
+                    &container_id,
+                    walg_env_destination_script(&walg_env_path),
+                    "read the WAL-G destination from",
+                )
+                .await?,
+            );
             if let Some(reason) = archive_before.walg_destination_change_blocker(
                 &archiving_command,
-                Some(&archiving_to),
-                &walg_s3_prefix,
+                archiving_to.as_deref(),
+                &walg_destination(&walg_s3_prefix, resolved_endpoint.as_deref()),
             ) {
                 return Err(BackupError::Internal {
                     message: format!(
@@ -580,13 +582,43 @@ fn walg_env_replace_script(path: &str) -> String {
     )
 }
 
-/// Shell that prints the `WALG_S3_PREFIX` walg.env at `path` archives to, or
-/// nothing when there is no walg.env. It reads the file the way
-/// archive_command does, by sourcing it, in a subshell that prints nothing
-/// else.
-fn walg_env_prefix_script(path: &str) -> String {
+/// Shell that prints the `WALG_S3_PREFIX` and `AWS_ENDPOINT` walg.env at
+/// `path` archives to, as `prefix=` and `endpoint=` lines, or nothing when
+/// there is no walg.env. It reads the file the way archive_command does, by
+/// sourcing it, in a subshell that prints nothing else.
+fn walg_env_destination_script(path: &str) -> String {
     let env = shell_escape(path);
-    format!("[ -e {env} ] || exit 0; ( . {env} >/dev/null 2>&1; printf '%s' \"$WALG_S3_PREFIX\" )")
+    format!(
+        "[ -e {env} ] || exit 0; ( . {env} >/dev/null 2>&1; \
+         printf 'prefix=%s\\nendpoint=%s' \"$WALG_S3_PREFIX\" \"$AWS_ENDPOINT\" )"
+    )
+}
+
+/// The destination [`walg_env_destination_script`] printed, as
+/// [`walg_destination`] describes it, or `None` when walg.env sets no prefix.
+fn parse_walg_env_destination(output: &str) -> Option<String> {
+    let value = |key: &str| {
+        output
+            .lines()
+            .find_map(|line| line.strip_prefix(key))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    };
+    value("prefix=").map(|prefix| walg_destination(prefix, value("endpoint=")))
+}
+
+/// Where WAL-G ships WAL: the S3 prefix, and the endpoint when one is set.
+/// Two destinations are the same only if both match; without an endpoint
+/// WAL-G uses AWS's default for the region, which is not assumed to equal
+/// any explicit endpoint.
+fn walg_destination(prefix: &str, endpoint: Option<&str>) -> String {
+    match endpoint
+        .map(|endpoint| endpoint.trim().trim_end_matches('/'))
+        .filter(|endpoint| !endpoint.is_empty())
+    {
+        Some(endpoint) => format!("{} at {}", prefix.trim(), endpoint),
+        None => prefix.trim().to_string(),
+    }
 }
 
 /// Shell that undoes [`walg_env_replace_script`] if walg.env is the one the
@@ -790,15 +822,16 @@ mod tests {
         assert!(!std::path::Path::new(&prev).exists());
     }
 
-    /// What [`walg_env_prefix_script`] prints for walg.env at `path`.
-    fn read_prefix(path: &str) -> String {
+    /// The destination walg.env at `path` archives to, read the way a
+    /// backup reads it.
+    fn read_destination(path: &str) -> Option<String> {
         let output = std::process::Command::new("sh")
             .arg("-c")
-            .arg(walg_env_prefix_script(path))
+            .arg(walg_env_destination_script(path))
             .output()
             .expect("sh runs");
         assert!(output.status.success(), "{output:?}");
-        String::from_utf8(output.stdout).unwrap()
+        parse_walg_env_destination(String::from_utf8(output.stdout).unwrap().trim())
     }
 
     #[test]
@@ -809,7 +842,7 @@ mod tests {
         let path_str = path.to_str().unwrap();
 
         // No walg.env yet: nothing archives with WAL-G.
-        assert_eq!(read_prefix(path_str), "");
+        assert_eq!(read_destination(path_str), None);
 
         let env_vars = [
             "WALG_S3_PREFIX=s3://backups/it's/internal_db/walg".to_string(),
@@ -819,7 +852,49 @@ mod tests {
             &walg_env_replace_script(path_str),
             &walg_env_file_contents(&env_vars, ATTEMPT)
         ));
-        assert_eq!(read_prefix(path_str), "s3://backups/it's/internal_db/walg");
+        assert_eq!(
+            read_destination(path_str).as_deref(),
+            Some("s3://backups/it's/internal_db/walg")
+        );
+
+        let env_vars = [
+            "WALG_S3_PREFIX=s3://backups/internal_db/walg".to_string(),
+            "AWS_ENDPOINT=http://minio:9000/".to_string(),
+        ];
+        assert!(run_script(
+            &walg_env_replace_script(path_str),
+            &walg_env_file_contents(&env_vars, ATTEMPT)
+        ));
+        assert_eq!(
+            read_destination(path_str),
+            Some(walg_destination(
+                "s3://backups/internal_db/walg",
+                Some("http://minio:9000")
+            ))
+        );
+    }
+
+    #[test]
+    fn a_walg_destination_is_its_prefix_and_endpoint() {
+        let prefix = "s3://backups/internal_db/walg";
+        // Credential rotation keeps both, so it is the same destination.
+        assert_eq!(
+            walg_destination(prefix, Some("http://minio:9000/")),
+            walg_destination(prefix, Some("http://minio:9000"))
+        );
+        assert_eq!(
+            walg_destination(prefix, None),
+            walg_destination(prefix, Some(" "))
+        );
+        // Another endpoint with the same bucket and prefix is another archive.
+        assert_ne!(
+            walg_destination(prefix, Some("http://minio:9000")),
+            walg_destination(prefix, Some("https://s3.example.test"))
+        );
+        assert_ne!(
+            walg_destination(prefix, None),
+            walg_destination(prefix, Some("http://minio:9000"))
+        );
     }
 
     #[test]

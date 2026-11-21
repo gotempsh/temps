@@ -88,7 +88,12 @@ fn exec_ok() -> MockExecResult {
 }
 
 fn file_entry_row(sourcefile: &str, setting: &str) -> BTreeMap<&'static str, Value> {
+    setting_row("archive_command", sourcefile, setting)
+}
+
+fn setting_row(name: &str, sourcefile: &str, setting: &str) -> BTreeMap<&'static str, Value> {
     BTreeMap::from([
+        ("name", Value::from(name)),
         ("sourcefile", Value::from(sourcefile)),
         ("setting", Value::from(setting)),
     ])
@@ -1404,7 +1409,7 @@ async fn base_backup_does_not_start_before_the_walg_command_runs() {
 fn identity_probe_reaches_the_database_url_port_and_database() {
     let url = url::Url::parse("postgres://temps:s3cret@temps-postgres:6543/temps").unwrap();
 
-    let cmd = identity_probe_command(&url);
+    let cmd = identity_probe_command(&url).unwrap();
 
     let flag = |name: &str| {
         cmd.iter()
@@ -1422,8 +1427,170 @@ fn identity_probe_reaches_the_database_url_port_and_database() {
 fn identity_probe_keeps_the_libpq_defaults_the_url_leaves_out() {
     let url = url::Url::parse("postgres://postgres@temps-postgres").unwrap();
 
-    let cmd = identity_probe_command(&url);
+    let cmd = identity_probe_command(&url).unwrap();
 
     assert!(!cmd.contains(&"-p".to_string()), "{cmd:?}");
     assert!(!cmd.contains(&"-d".to_string()), "{cmd:?}");
+}
+
+#[test]
+fn identity_probe_decodes_the_database_url_user_and_database() {
+    // A name or password with reserved characters is percent-encoded in a
+    // URL; psql needs the raw value.
+    let url = url::Url::parse("postgres://backup%40ops:p%40ss@temps-postgres/backup%20db").unwrap();
+
+    let cmd = identity_probe_command(&url).unwrap();
+
+    assert!(
+        cmd.windows(2).any(|pair| pair == ["-U", "backup@ops"]),
+        "{cmd:?}"
+    );
+    assert!(
+        cmd.windows(2).any(|pair| pair == ["-d", "backup db"]),
+        "{cmd:?}"
+    );
+    assert_eq!(
+        decode_url_component(url.password().unwrap(), "password").unwrap(),
+        "p@ss"
+    );
+}
+
+#[test]
+fn identity_probe_rejects_a_database_url_that_is_not_utf8() {
+    let url = url::Url::parse("postgres://postgres@temps-postgres/temps%FF").unwrap();
+
+    let error = identity_probe_command(&url).unwrap_err().to_string();
+
+    assert!(error.contains("database name in DATABASE_URL"), "{error}");
+}
+
+#[tokio::test]
+async fn an_archive_library_staged_but_not_loaded_is_not_overridden_on_startup() {
+    // PostgreSQL refuses archive_command alongside archive_library, so the
+    // placeholder would stop archiving once the library loads. No exec
+    // result is queued: an ALTER SYSTEM would fail the mock.
+    let retaining = settings_row(&settings("on", "", None));
+    let db = MockDatabase::new(DatabaseBackend::Postgres)
+        .append_query_results([
+            vec![retaining.clone()],
+            vec![retaining],
+            vec![setting_row("archive_library", AUTO_CONF, "basic_archive")],
+        ])
+        .into_connection();
+    let service = make_scope_test_service(Arc::new(db));
+
+    let outcome = service
+        .reconcile_internal_wal_archiving_with(|| async { Ok("temps-postgres".to_string()) })
+        .await
+        .unwrap();
+
+    let InternalArchiveReconcile::LeftToOperator { reason } = outcome else {
+        panic!("expected the database to be left to its operator, got {outcome:?}");
+    };
+    assert!(reason.contains("archive_library"), "{reason}");
+    assert!(reason.contains("basic_archive"), "{reason}");
+}
+
+#[tokio::test]
+async fn an_archive_library_whose_staged_value_is_empty_does_not_block_startup() {
+    let retaining = settings_row(&settings("on", "", None));
+    let db = Arc::new(
+        MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([
+                vec![retaining.clone()],
+                vec![retaining],
+                vec![
+                    setting_row(
+                        "archive_library",
+                        "/etc/postgresql/postgresql.conf",
+                        "basic_archive",
+                    ),
+                    setting_row("archive_library", AUTO_CONF, ""),
+                ],
+                vec![reload_row(true)],
+            ])
+            .append_exec_results([exec_ok()])
+            .into_connection(),
+    );
+    let service = make_scope_test_service(db.clone());
+
+    let outcome = service
+        .reconcile_internal_wal_archiving_with(|| async { Ok("temps-postgres".to_string()) })
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(outcome, InternalArchiveReconcile::Released { .. }),
+        "{outcome:?}"
+    );
+}
+
+#[tokio::test]
+async fn base_backup_does_not_add_a_command_beside_a_staged_archive_library() {
+    let db = mock(
+        vec![vec![setting_row(
+            "archive_library",
+            AUTO_CONF,
+            "basic_archive",
+        )]],
+        0,
+    );
+    let service = make_scope_test_service(db.clone());
+    let steps = Steps::default();
+
+    let error = service
+        .archive_then_push(
+            &settings_in(NO_ARCHIVE_DESTINATION_COMMAND, None, AUTO_CONF),
+            WALG_COMMAND,
+            "temps-postgres",
+            recorded_steps(&steps, true, true),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("archive_library"), "{error}");
+    assert!(steps.lock().unwrap().is_empty());
+    drop(service);
+    assert_eq!(logged_sql(db).len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_probe_that_never_answers_ends_at_the_wait_deadline() {
+    // The outer timeout only fails the test instead of hanging it.
+    let waited = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        wait_until_running(
+            "temps-postgres",
+            WALG_COMMAND,
+            std::time::Duration::from_secs(10),
+            std::future::pending::<Result<Option<String>, BackupError>>,
+        ),
+    )
+    .await
+    .expect("the wait must end at its own deadline");
+
+    let error = waited.unwrap_err().to_string();
+    assert!(error.contains("still did not run"), "{error}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn work_run_to_completion_finishes_after_its_caller_stops_waiting() {
+    // A write whose reload is cut off by the caller's timeout would sit in
+    // postgresql.auto.conf, not in effect.
+    let reloaded = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let work = {
+        let reloaded = Arc::clone(&reloaded);
+        async move {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            reloaded.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    };
+
+    let gave_up =
+        tokio::time::timeout(std::time::Duration::from_secs(1), run_to_completion(work)).await;
+    assert!(gave_up.is_err());
+
+    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+    assert!(reloaded.load(std::sync::atomic::Ordering::SeqCst));
 }

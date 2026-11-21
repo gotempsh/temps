@@ -76,8 +76,10 @@ services:
     # overridden by ALTER SYSTEM. With archive_mode=on and no archive_command
     # PostgreSQL keeps every WAL segment, so on startup Temps sets it with
     # ALTER SYSTEM to a command that discards WAL. Control-plane backups are
-    # logical dumps and need no WAL archive; to archive WAL yourself, set
-    # archive_command with ALTER SYSTEM and Temps leaves it alone.
+    # logical dumps and need no WAL archive; to archive WAL yourself, run
+    # ALTER SYSTEM SET archive_command = '...', then SELECT pg_reload_conf()
+    # (ALTER SYSTEM alone does not apply it) and check it with
+    # SHOW archive_command. Temps leaves a command you set alone.
     command: >
       postgres
       -c wal_level=replica

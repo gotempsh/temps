@@ -173,7 +173,7 @@ impl ArchiveSettings {
 
     /// Why a WAL-G base backup to `backing_up_to` must not switch WAL-G
     /// archiving that already ships this database's WAL to `archiving_to`
-    /// (walg.env's `WALG_S3_PREFIX`, `None` when there is no walg.env).
+    /// (walg.env's S3 prefix and endpoint, `None` when there is no walg.env).
     ///
     /// Segments archived to the new destination while the attempt runs never
     /// reach the old one, so a failed attempt would leave gaps in the chain
@@ -232,10 +232,58 @@ impl ArchiveSettings {
 
 /// An `archive_command` line in a configuration file, loaded or not
 /// (`pg_file_settings`).
-#[derive(Debug, Clone, PartialEq, Eq, FromQueryResult)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ArchiveCommandFileEntry {
     pub sourcefile: Option<String>,
     pub setting: Option<String>,
+}
+
+/// An `archive_command` or `archive_library` line in a configuration file.
+#[derive(Debug, FromQueryResult)]
+struct ArchiveFileEntry {
+    name: String,
+    sourcefile: Option<String>,
+    setting: Option<String>,
+}
+
+/// What the configuration files say about archiving, loaded or not.
+#[derive(Debug, Default)]
+struct ArchiveFileSettings {
+    /// Every `archive_command` line, in the order PostgreSQL reads them.
+    command: Vec<ArchiveCommandFileEntry>,
+    /// The `archive_library` the files hold, which PostgreSQL loads on its
+    /// next reload, when it is not empty.
+    library: Option<String>,
+}
+
+impl ArchiveFileSettings {
+    fn from_entries(entries: Vec<ArchiveFileEntry>) -> Self {
+        let mut settings = Self::default();
+        for entry in entries {
+            if entry.name == "archive_library" {
+                // Later files and lines override earlier ones.
+                settings.library = entry.setting.filter(|library| !library.trim().is_empty());
+            } else {
+                settings.command.push(ArchiveCommandFileEntry {
+                    sourcefile: entry.sourcefile,
+                    setting: entry.setting,
+                });
+            }
+        }
+        settings
+    }
+
+    /// Why Temps must not write `archive_command` while an `archive_library`
+    /// staged in a file waits for a reload: PostgreSQL's archiver refuses to
+    /// run with both set, so the reload would stop all archiving.
+    fn pending_library_blocker(&self) -> Option<String> {
+        self.library.as_ref().map(|library| {
+            format!(
+                "archive_library is set to '{library}' in a configuration file but not loaded \
+                 yet, and PostgreSQL refuses an archive_command alongside it"
+            )
+        })
+    }
 }
 
 /// The value `postgresql.auto.conf` holds for `archive_command`: the last
@@ -433,10 +481,16 @@ impl BackupService {
         // replace it before it ever applies. The placeholder itself, left
         // pending by a reload that failed on an earlier start, is Temps' own
         // and is written and reloaded again.
-        match self.archive_command_file_entries().await {
-            Ok(entries) if entries.is_empty() || only_pending_placeholder(&entries) => {}
-            Ok(entries) => {
-                let files = entries
+        match self.archive_file_settings().await {
+            Ok(files) if files.pending_library_blocker().is_some() => {
+                return Ok(InternalArchiveReconcile::LeftToOperator {
+                    reason: files.pending_library_blocker().unwrap_or_default(),
+                });
+            }
+            Ok(files) if files.command.is_empty() || only_pending_placeholder(&files.command) => {}
+            Ok(files) => {
+                let files = files
+                    .command
                     .iter()
                     .filter_map(|entry| entry.sourcefile.as_deref())
                     .collect::<Vec<_>>()
@@ -506,8 +560,11 @@ impl BackupService {
         let url = url::Url::parse(&database_url).map_err(|e| BackupError::Internal {
             message: format!("Invalid DATABASE_URL: {}", e),
         })?;
-        let cmd = identity_probe_command(&url);
-        let password_env = format!("PGPASSWORD={}", url.password().unwrap_or(""));
+        let cmd = identity_probe_command(&url)?;
+        let password_env = format!(
+            "PGPASSWORD={}",
+            decode_url_component(url.password().unwrap_or(""), "password")?
+        );
         let in_container = temps_providers::externalsvc::exec_util::run_exec(
             docker,
             container_id,
@@ -567,8 +624,8 @@ impl BackupService {
         // A command staged in a file but not loaded yet would be replaced by
         // the WAL-G one, and the rollback would put back the running value,
         // not it.
-        let pending = match self.archive_command_file_entries().await {
-            Ok(entries) => file_value(&entries).map(str::to_string),
+        let files = match self.archive_file_settings().await {
+            Ok(files) => files,
             Err(error) => {
                 return Err(BackupError::Internal {
                     message: format!(
@@ -580,6 +637,16 @@ impl BackupService {
                 })
             }
         };
+        if let Some(reason) = files.pending_library_blocker() {
+            return Err(BackupError::Internal {
+                message: format!(
+                    "Not taking a WAL-G base backup of the control-plane database in container \
+                     '{}': {}",
+                    container_id, reason
+                ),
+            });
+        }
+        let pending = file_value(&files.command).map(str::to_string);
         if let Some(pending) = pending.filter(|pending| {
             *pending != before.archive_command
                 && pending != NO_ARCHIVE_DESTINATION_COMMAND
@@ -678,10 +745,10 @@ impl BackupService {
         let ownership = temps_core::retry::RetryConfig::new(3)
             .with_base_delay(std::time::Duration::from_millis(200))
             .with_max_delay(std::time::Duration::from_secs(1))
-            .retry(|| self.archive_command_file_entries())
+            .retry(|| self.archive_file_settings())
             .await;
         match ownership {
-            Ok(entries) if auto_conf_value(&entries) == Some(archiving_command) => {}
+            Ok(files) if auto_conf_value(&files.command) == Some(archiving_command) => {}
             Ok(_) => {
                 warn!(
                     container_id = %container_id,
@@ -725,23 +792,22 @@ impl BackupService {
         }
     }
 
-    /// Every `archive_command` line in the configuration files, loaded or
-    /// not, in the order PostgreSQL reads them.
-    async fn archive_command_file_entries(
-        &self,
-    ) -> Result<Vec<ArchiveCommandFileEntry>, BackupError> {
-        ArchiveCommandFileEntry::find_by_statement(Statement::from_string(
+    /// Every `archive_command` and `archive_library` line in the
+    /// configuration files, loaded or not, in the order PostgreSQL reads them.
+    async fn archive_file_settings(&self) -> Result<ArchiveFileSettings, BackupError> {
+        ArchiveFileEntry::find_by_statement(Statement::from_string(
             DatabaseBackend::Postgres,
-            "SELECT sourcefile, setting FROM pg_file_settings \
-             WHERE name = 'archive_command' ORDER BY seqno"
+            "SELECT name, sourcefile, setting FROM pg_file_settings \
+             WHERE name IN ('archive_command', 'archive_library') ORDER BY seqno"
                 .to_string(),
         ))
         .all(self.db.as_ref())
         .await
+        .map(ArchiveFileSettings::from_entries)
         .map_err(|e| BackupError::Internal {
             message: format!(
-                "Failed to read the archive_command entries in the configuration files of the \
-                 control-plane database: {}",
+                "Failed to read the archive_command and archive_library entries in the \
+                 configuration files of the control-plane database: {}",
                 e
             ),
         })
@@ -758,85 +824,48 @@ impl BackupService {
         archiving_command: &str,
         timeout: std::time::Duration,
     ) -> Result<(), BackupError> {
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            let running = RunningArchiveCommand::find_by_statement(Statement::from_string(
+        wait_until_running(container_id, archiving_command, timeout, || async {
+            RunningArchiveCommand::find_by_statement(Statement::from_string(
                 DatabaseBackend::Postgres,
                 "SELECT current_setting('archive_command') AS archive_command".to_string(),
             ))
             .one(self.db.as_ref())
             .await
+            .map(|row| row.map(|row| row.archive_command))
             .map_err(|e| BackupError::Internal {
                 message: format!(
                     "Failed to read the running archive_command of the control-plane database \
                      in container '{}': {}",
                     container_id, e
                 ),
-            })?
-            .map(|row| row.archive_command);
-            if running.as_deref() == Some(archiving_command) {
-                return Ok(());
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return Err(BackupError::Internal {
-                    message: format!(
-                        "The control-plane database in container '{}' still did not run the \
-                         WAL-G archive_command {:?} after its configuration was reloaded",
-                        container_id, timeout
-                    ),
-                });
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
+            })
+        })
+        .await
     }
 
     /// Change the control-plane database's `archive_command` and reload.
+    ///
+    /// The write and the reload finish together even if the caller stops
+    /// waiting (the startup check's timeout, a cancelled backup): a write left
+    /// without its reload would sit in postgresql.auto.conf, not in effect,
+    /// until something else reloads the configuration.
     async fn apply_archive_command(
         &self,
         container_id: &str,
         change: &ArchiveCommandChange,
     ) -> Result<(), BackupError> {
-        // ALTER SYSTEM cannot run in a transaction block, so each statement
-        // runs on its own.
-        self.db
-            .execute_unprepared(&change.sql())
+        let db = Arc::clone(&self.db);
+        let container_id = container_id.to_string();
+        let change = change.clone();
+        run_to_completion(async move { write_and_reload(&db, &container_id, &change).await })
             .await
             .map_err(|e| BackupError::Internal {
                 message: format!(
-                    "Failed {} on the control-plane database in container '{}': {}",
-                    change.describe(),
-                    container_id,
+                    "Changing archive_command on the control-plane database stopped \
+                     unexpectedly: {}",
                     e
                 ),
-            })?;
-        let reloaded = ReloadResult::find_by_statement(Statement::from_string(
-            DatabaseBackend::Postgres,
-            "SELECT pg_reload_conf() AS reloaded".to_string(),
-        ))
-        .one(self.db.as_ref())
-        .await
-        .map_err(|e| BackupError::Internal {
-            message: format!(
-                "Wrote {} to postgresql.auto.conf of the control-plane database in container \
-                 '{}', but reloading the configuration failed, so it is not in effect: {}",
-                change.describe(),
-                container_id,
-                e
-            ),
-        })?
-        .is_some_and(|row| row.reloaded);
-        if !reloaded {
-            return Err(BackupError::Internal {
-                message: format!(
-                    "Wrote {} to postgresql.auto.conf of the control-plane database in \
-                     container '{}', but pg_reload_conf() could not signal the server, so it is \
-                     not in effect",
-                    change.describe(),
-                    container_id
-                ),
-            });
-        }
-        Ok(())
+            })?
     }
 
     pub(super) async fn read_archive_settings(&self) -> Result<ArchiveSettings, BackupError> {
@@ -867,27 +896,131 @@ impl BackupService {
     }
 }
 
+/// ALTER SYSTEM `change` and reload, on `db`. ALTER SYSTEM cannot run in a
+/// transaction block, so each statement runs on its own.
+async fn write_and_reload(
+    db: &DatabaseConnection,
+    container_id: &str,
+    change: &ArchiveCommandChange,
+) -> Result<(), BackupError> {
+    db.execute_unprepared(&change.sql())
+        .await
+        .map_err(|e| BackupError::Internal {
+            message: format!(
+                "Failed {} on the control-plane database in container '{}': {}",
+                change.describe(),
+                container_id,
+                e
+            ),
+        })?;
+    let reloaded = ReloadResult::find_by_statement(Statement::from_string(
+        DatabaseBackend::Postgres,
+        "SELECT pg_reload_conf() AS reloaded".to_string(),
+    ))
+    .one(db)
+    .await
+    .map_err(|e| BackupError::Internal {
+        message: format!(
+            "Wrote {} to postgresql.auto.conf of the control-plane database in container \
+             '{}', but reloading the configuration failed, so it is not in effect: {}",
+            change.describe(),
+            container_id,
+            e
+        ),
+    })?
+    .is_some_and(|row| row.reloaded);
+    if !reloaded {
+        return Err(BackupError::Internal {
+            message: format!(
+                "Wrote {} to postgresql.auto.conf of the control-plane database in \
+                 container '{}', but pg_reload_conf() could not signal the server, so it is \
+                 not in effect",
+                change.describe(),
+                container_id
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Run `work` to completion on its own task, so the caller stopping to wait
+/// (a timeout, a dropped future) cannot cut it short halfway.
+async fn run_to_completion<T: Send + 'static>(
+    work: impl std::future::Future<Output = T> + Send + 'static,
+) -> Result<T, tokio::task::JoinError> {
+    tokio::spawn(work).await
+}
+
+/// Poll `probe` for the running archive_command until it is
+/// `archiving_command`, for at most `timeout`. Each probe is bounded by the
+/// same deadline, so a slow query cannot stretch the wait.
+async fn wait_until_running<Probe, Fut>(
+    container_id: &str,
+    archiving_command: &str,
+    timeout: std::time::Duration,
+    mut probe: Probe,
+) -> Result<(), BackupError>
+where
+    Probe: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<Option<String>, BackupError>>,
+{
+    let deadline = tokio::time::Instant::now() + timeout;
+    let gave_up = || BackupError::Internal {
+        message: format!(
+            "The control-plane database in container '{}' still did not run the WAL-G \
+             archive_command {:?} after its configuration was reloaded",
+            container_id, timeout
+        ),
+    };
+    loop {
+        let running = tokio::time::timeout_at(deadline, probe())
+            .await
+            .map_err(|_| gave_up())??;
+        if running.as_deref() == Some(archiving_command) {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(gave_up());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
 /// The psql command that reads [`INSTANCE_IDENTITY_SQL`] inside the database
 /// container, as the DATABASE_URL user, database and port. The password goes
 /// in the exec environment, never in the command.
-fn identity_probe_command(url: &url::Url) -> Vec<String> {
-    let database = url.path().trim_start_matches('/');
+fn identity_probe_command(url: &url::Url) -> Result<Vec<String>, BackupError> {
+    let database = decode_url_component(url.path().trim_start_matches('/'), "database name")?;
     let mut cmd = vec![
         "psql".to_string(),
         "-U".to_string(),
-        url.username().to_string(),
+        decode_url_component(url.username(), "user name")?,
         "-tAc".to_string(),
         INSTANCE_IDENTITY_SQL.to_string(),
     ];
     if !database.is_empty() {
-        cmd.extend(["-d".to_string(), database.to_string()]);
+        cmd.extend(["-d".to_string(), database]);
     }
     // The server listens on the DATABASE_URL port inside its container too:
     // the URL reaches it on its network, not a published port.
     if let Some(port) = url.port() {
         cmd.extend(["-p".to_string(), port.to_string()]);
     }
-    cmd
+    Ok(cmd)
+}
+
+/// One DATABASE_URL component (`what`) as the raw value psql takes: `Url`
+/// keeps the percent-encoding a password or name with reserved characters
+/// needs in a URL.
+fn decode_url_component(component: &str, what: &str) -> Result<String, BackupError> {
+    urlencoding::decode(component)
+        .map(|decoded| decoded.into_owned())
+        .map_err(|e| BackupError::Internal {
+            message: format!(
+                "The {} in DATABASE_URL is not valid percent-encoded UTF-8: {}",
+                what, e
+            ),
+        })
 }
 
 /// The image `container_id` was created from, as configured (not the
