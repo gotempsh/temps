@@ -92,8 +92,13 @@ export function TempsAnalyticsProvider({
   );
 
   const trackNotFound = useCallback<AnalyticsContextValue["trackNotFound"]>(
-    (data = {}) => trackEvent(NOT_FOUND_EVENT, notFoundEventData(data)),
-    [trackEvent]
+    // Checks `enabled` before reading the page, so a call while rendering
+    // on the server does nothing, like the other tracking methods.
+    async (data = {}) => {
+      if (!enabled) return;
+      await trackEvent(NOT_FOUND_EVENT, notFoundEventData(data));
+    },
+    [enabled, trackEvent]
   );
 
   // Looks for the `data-temps-404` marker after each page view (ADR 109 D1).

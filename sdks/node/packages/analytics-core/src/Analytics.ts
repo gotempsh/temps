@@ -92,8 +92,12 @@ export function createAnalytics(options: AnalyticsOptions = {}): AnalyticsApi {
     );
   };
 
-  const trackNotFound: AnalyticsApi["trackNotFound"] = (data = {}) =>
-    trackEvent(NOT_FOUND_EVENT, notFoundEventData(data));
+  // Checks `enabled` before reading the page, so a call while rendering on
+  // the server does nothing, like the other tracking methods.
+  const trackNotFound: AnalyticsApi["trackNotFound"] = async (data = {}) => {
+    if (!enabled) return;
+    await trackEvent(NOT_FOUND_EVENT, notFoundEventData(data));
+  };
 
   // Created before the first page view so that page view is checked too.
   const notFoundWatcher =

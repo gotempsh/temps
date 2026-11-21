@@ -9,6 +9,7 @@ import {
   NOT_FOUND_RECHECK_DELAY_MS,
   OUTBOUND_CLICK_EVENT,
   classifyLink,
+  notFoundEventData,
   pathExtension,
   type ClassifyLinkOptions,
   type LinkLike,
@@ -328,5 +329,25 @@ describe("createAnalytics auto-tracking", () => {
     document.body.innerHTML = "<main data-temps-404></main>";
     start({ autoTrackPageviews: true, autoTrackNotFound: false });
     expect(sentEvents().map((event) => event.event_name)).toEqual(["page_view"]);
+  });
+});
+
+describe("trackNotFound outside an enabled browser page", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it("reads nothing from the page when analytics is off", async () => {
+    const referrer = vi.spyOn(document, "referrer", "get");
+    const analytics = createAnalytics({ disabled: true, autoTrackPageviews: false });
+    await analytics.trackNotFound({ section: "docs" });
+    expect(referrer).not.toHaveBeenCalled();
+    analytics.destroy();
+  });
+
+  it("describes no page without a window, as during server rendering", () => {
+    vi.stubGlobal("window", undefined);
+    expect(notFoundEventData({ section: "docs" })).toEqual({ section: "docs" });
   });
 });

@@ -84,6 +84,23 @@ describe("TempsAnalyticsProvider auto-tracking (ADR 109 D1)", () => {
     expect(sentEventNames()).toEqual(["page_view", "not_found"]);
   });
 
+  it("trackNotFound reads nothing from the page when analytics is off", async () => {
+    const referrer = vi.spyOn(document, "referrer", "get");
+    const { result } = renderHook(() => useTempsAnalytics(), {
+      wrapper: ({ children }) => (
+        <TempsAnalyticsProvider disabled autoTrackPageviews={false} autoTrackEngagement={false} autoTrackSpeedAnalytics={false}>
+          {children}
+        </TempsAnalyticsProvider>
+      ),
+    });
+
+    await result.current.trackNotFound({ section: "docs" });
+
+    expect(referrer).not.toHaveBeenCalled();
+    expect(sentEventNames()).toEqual([]);
+    referrer.mockRestore();
+  });
+
   it("exposes trackNotFound on the context", async () => {
     const { result } = renderHook(() => useTempsAnalytics(), {
       wrapper: ({ children }) => (
