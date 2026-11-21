@@ -80,11 +80,16 @@ impl ArchiveSettings {
     /// Whether PostgreSQL is keeping every completed WAL segment because
     /// archiving is on and neither a command nor a library receives them.
     pub(super) fn retains_wal_without_destination(&self) -> bool {
-        let archiving = matches!(
+        self.archiving_on() && self.archive_command.trim().is_empty() && !self.has_archive_library()
+    }
+
+    /// Whether the archiver runs. `archive_mode` only changes on a restart,
+    /// so with it off no `archive_command` ships any WAL.
+    fn archiving_on(&self) -> bool {
+        matches!(
             self.archive_mode.trim().to_ascii_lowercase().as_str(),
             "on" | "always"
-        );
-        archiving && self.archive_command.trim().is_empty() && !self.has_archive_library()
+        )
     }
 
     fn has_archive_library(&self) -> bool {
@@ -126,14 +131,24 @@ impl ArchiveSettings {
         None
     }
 
-    /// Why Temps must not point this database's archiving at WAL-G, or
-    /// `None` when archiving is Temps' own: off, the startup placeholder, a
-    /// WAL-G command, or paused.
+    /// Why Temps must not take a WAL-G base backup by pointing this
+    /// database's archiving at `archiving_command`, or `None` when archiving
+    /// runs and is Temps' own: unset, the startup placeholder, that command,
+    /// or paused.
     ///
-    /// Another archiver is the operator's, and switching it for a base
-    /// backup would send segments to the WAL-G archive that the operator's
-    /// archive then never receives, even if the backup is rolled back.
-    pub(super) fn walg_takeover_blocker(&self) -> Option<String> {
+    /// Without a running archiver the base backup's WAL is never shipped, so
+    /// the backup could not be restored. Any other archiver is the
+    /// operator's, even one that runs WAL-G: switching it for a base backup
+    /// would send segments to Temps' archive that the operator's archive then
+    /// never receives, even if the backup is rolled back.
+    pub(super) fn walg_takeover_blocker(&self, archiving_command: &str) -> Option<String> {
+        if !self.archiving_on() {
+            return Some(format!(
+                "archive_mode is '{}', so no WAL would be archived while the base backup runs; \
+                 it needs archive_mode=on, which takes a restart",
+                self.archive_mode
+            ));
+        }
         if self.has_archive_library() {
             return Some(
                 "archive_library is set, so WAL is archived by a module Temps does not manage, \
@@ -144,7 +159,7 @@ impl ArchiveSettings {
         let command = self.archive_command.trim();
         if !command.is_empty()
             && command != NO_ARCHIVE_DESTINATION_COMMAND
-            && !command.contains("wal-g wal-push")
+            && command != archiving_command
         {
             return Some(format!(
                 "archive_command (setting source: {}) archives WAL to a destination Temps does \
@@ -183,6 +198,29 @@ impl ArchiveSettings {
     }
 }
 
+/// An `archive_command` line in a configuration file, loaded or not
+/// (`pg_file_settings`).
+#[derive(Debug, Clone, PartialEq, Eq, FromQueryResult)]
+pub(super) struct ArchiveCommandFileEntry {
+    pub sourcefile: Option<String>,
+    pub setting: Option<String>,
+}
+
+/// The value `postgresql.auto.conf` holds for `archive_command`: the last
+/// entry there, which is the one PostgreSQL loads.
+fn auto_conf_value(entries: &[ArchiveCommandFileEntry]) -> Option<&str> {
+    entries
+        .iter()
+        .rev()
+        .find(|entry| {
+            entry
+                .sourcefile
+                .as_deref()
+                .is_some_and(|file| file.ends_with("postgresql.auto.conf"))
+        })
+        .and_then(|entry| entry.setting.as_deref())
+}
+
 /// Identifies one running PostgreSQL server: the cluster's system identifier,
 /// which a physical replica shares with its primary, and the time this server
 /// started, which it does not.
@@ -219,15 +257,15 @@ struct ReloadResult {
     reloaded: bool,
 }
 
-/// The steps of a WAL-G base backup that [`BackupService::archive_then_push`]
-/// orders and undoes.
-pub(super) struct BaseBackupSteps<Enable, Push, RestoreEnv, DiscardPreviousEnv> {
-    /// Writes walg.env, keeping the previous one, and points archive_command
-    /// at WAL-G.
-    pub enable: Enable,
+/// The container-side steps of a WAL-G base backup that
+/// [`BackupService::archive_then_push`] orders and undoes.
+pub(super) struct BaseBackupSteps<WriteEnv, Push, RestoreEnv, DiscardPreviousEnv> {
+    /// Writes walg.env with the destination's credentials, keeping the
+    /// previous one.
+    pub write_env: WriteEnv,
     /// Runs the base backup.
     pub push: Push,
-    /// Puts back the walg.env `enable` replaced, if it replaced one.
+    /// Puts back the walg.env `write_env` replaced, if it replaced it.
     pub restore_env: RestoreEnv,
     /// Deletes the kept copy of the previous walg.env.
     pub discard_previous_env: DiscardPreviousEnv,
@@ -293,6 +331,39 @@ impl BackupService {
         if let Some(outcome) = self.read_archive_settings().await?.release_blocked() {
             return Ok(outcome);
         }
+        // A command written with ALTER SYSTEM, or edited into a file, is not
+        // running until the next reload; writing the placeholder would
+        // replace it before it ever applies.
+        match self.archive_command_file_entries().await {
+            Ok(entries) if entries.is_empty() => {}
+            Ok(entries) => {
+                let files = entries
+                    .iter()
+                    .filter_map(|entry| entry.sourcefile.as_deref())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Ok(InternalArchiveReconcile::LeftToOperator {
+                    reason: format!(
+                        "archive_command is set in {} but not loaded yet; it applies on the \
+                         next configuration reload",
+                        if files.is_empty() {
+                            "a configuration file"
+                        } else {
+                            &files
+                        }
+                    ),
+                });
+            }
+            Err(error) => {
+                return Ok(InternalArchiveReconcile::LeftToOperator {
+                    reason: format!(
+                        "could not check the configuration files for an archive_command that \
+                         is not loaded yet: {}",
+                        error
+                    ),
+                })
+            }
+        }
 
         self.apply_archive_command(
             &container_id,
@@ -347,6 +418,11 @@ impl BackupService {
         if !database.is_empty() {
             cmd.extend(["-d".to_string(), database.to_string()]);
         }
+        // The server listens on the DATABASE_URL port inside its container
+        // too: the URL reaches it on its network, not a published port.
+        if let Some(port) = url.port() {
+            cmd.extend(["-p".to_string(), port.to_string()]);
+        }
         let password_env = format!("PGPASSWORD={}", url.password().unwrap_or(""));
         let in_container = temps_providers::externalsvc::exec_util::run_exec(
             docker,
@@ -367,33 +443,34 @@ impl BackupService {
         same_instance(container_id, &connected, &in_container)
     }
 
-    /// Take a WAL-G base backup in the only safe order: `enable` points
-    /// archive_command at WAL-G, then `push` runs the base backup, so the WAL
-    /// written while it runs reaches the archive.
+    /// Take a WAL-G base backup in the only safe order: write walg.env, point
+    /// archive_command at WAL-G (`archiving_command`), then `push` the base
+    /// backup, so the WAL written while it runs reaches the archive.
     ///
-    /// Archiving that belongs to an operator
+    /// Archiving that is not Temps' own
     /// ([`ArchiveSettings::walg_takeover_blocker`]) is never switched; the
-    /// error makes the caller fall back to pg_dump. If `enable` fails, `push`
-    /// never starts: a base backup without its WAL cannot be restored. If
-    /// either fails, walg.env and archive_command are put back as they were
-    /// in `before`, because a command left failing on every segment makes
-    /// PostgreSQL keep all WAL until the disk fills, and a walg.env left
-    /// pointing at the failed destination redirects working WAL-G archiving.
-    /// The step's error is returned either way; a failed rollback is logged.
-    pub(super) async fn archive_then_push<T, Enable, Push, RestoreEnv, DiscardPreviousEnv>(
+    /// error makes the caller fall back to pg_dump. If enabling archiving
+    /// fails, `push` never starts: a base backup without its WAL cannot be
+    /// restored. On any failure walg.env and archive_command are put back as
+    /// they were in `before`, because a command left failing on every segment
+    /// makes PostgreSQL keep all WAL until the disk fills, and a walg.env
+    /// left pointing at the failed destination redirects working WAL-G
+    /// archiving. The step's error is returned either way; a failed rollback
+    /// is logged.
+    pub(super) async fn archive_then_push<T, WriteEnv, Push, RestoreEnv, DiscardPreviousEnv>(
         &self,
         before: &ArchiveSettings,
         archiving_command: &str,
         container_id: &str,
-        steps: BaseBackupSteps<Enable, Push, RestoreEnv, DiscardPreviousEnv>,
+        steps: BaseBackupSteps<WriteEnv, Push, RestoreEnv, DiscardPreviousEnv>,
     ) -> Result<T, BackupError>
     where
-        Enable: std::future::Future<Output = Result<(), BackupError>>,
+        WriteEnv: std::future::Future<Output = Result<(), BackupError>>,
         Push: std::future::Future<Output = Result<T, BackupError>>,
         RestoreEnv: std::future::Future<Output = Result<(), BackupError>>,
         DiscardPreviousEnv: std::future::Future<Output = Result<(), BackupError>>,
     {
-        if let Some(reason) = before.walg_takeover_blocker() {
+        if let Some(reason) = before.walg_takeover_blocker(archiving_command) {
             return Err(BackupError::Internal {
                 message: format!(
                     "Not taking a WAL-G base backup of the control-plane database in container \
@@ -403,23 +480,39 @@ impl BackupService {
             });
         }
 
-        let result = match steps.enable.await {
-            Ok(()) => steps.push.await,
-            Err(error) => Err(error),
+        let enabling_failed = |error: BackupError| BackupError::Internal {
+            message: format!(
+                "Cannot take a WAL-G base backup of the internal database in container '{}': \
+                 continuous WAL archiving could not be enabled: {}",
+                container_id, error
+            ),
         };
-        let error = match result {
-            Ok(value) => {
-                if let Err(error) = steps.discard_previous_env.await {
-                    warn!(
-                        container_id = %container_id,
-                        "WAL-G base backup succeeded, but the copy of the previous walg.env \
-                         could not be deleted: {}",
-                        error
-                    );
-                }
-                return Ok(value);
-            }
-            Err(error) => error,
+        // Whether archive_command may have been changed when it failed.
+        let (error, command_changed) = match steps.write_env.await {
+            Err(error) => (enabling_failed(error), false),
+            Ok(()) => match self
+                .apply_archive_command(
+                    container_id,
+                    &ArchiveCommandChange::Set(archiving_command.to_string()),
+                )
+                .await
+            {
+                Err(error) => (enabling_failed(error), true),
+                Ok(()) => match steps.push.await {
+                    Err(error) => (error, true),
+                    Ok(value) => {
+                        if let Err(error) = steps.discard_previous_env.await {
+                            warn!(
+                                container_id = %container_id,
+                                "WAL-G base backup succeeded, but the copy of the previous \
+                                 walg.env could not be deleted: {}",
+                                error
+                            );
+                        }
+                        return Ok(value);
+                    }
+                },
+            },
         };
 
         if let Err(env_error) = steps.restore_env.await {
@@ -431,26 +524,85 @@ impl BackupService {
                 error
             );
         }
-        if let Some(change) = before.rollback(archiving_command) {
-            match self.apply_archive_command(container_id, &change).await {
-                Ok(()) => warn!(
-                    container_id = %container_id,
-                    "WAL-G base backup failed; undid archive_command by {} so WAL does not \
-                     accumulate: {}",
-                    change.describe(),
-                    error
-                ),
-                Err(rollback_error) => error!(
-                    container_id = %container_id,
-                    "WAL-G base backup failed, and undoing archive_command by {} failed too, \
-                     so the database may retain WAL until archiving works: {}. Backup error: {}",
-                    change.describe(),
-                    rollback_error,
-                    error
-                ),
-            }
+        if command_changed {
+            self.roll_back_archive_command(before, archiving_command, container_id, &error)
+                .await;
         }
         Err(error)
+    }
+
+    /// Undo setting archive_command to `archiving_command` after `error`, if
+    /// postgresql.auto.conf still holds it. An attempt whose ALTER SYSTEM
+    /// never ran left nothing to undo, and a value someone wrote since is
+    /// theirs. When the file cannot be read the change is undone anyway: a
+    /// WAL-G command left failing would make PostgreSQL keep all WAL.
+    async fn roll_back_archive_command(
+        &self,
+        before: &ArchiveSettings,
+        archiving_command: &str,
+        container_id: &str,
+        error: &BackupError,
+    ) {
+        let Some(change) = before.rollback(archiving_command) else {
+            return;
+        };
+        match self.archive_command_file_entries().await {
+            Ok(entries) if auto_conf_value(&entries) != Some(archiving_command) => {
+                warn!(
+                    container_id = %container_id,
+                    "WAL-G base backup failed; archive_command in postgresql.auto.conf is not \
+                     the one this attempt set, so it is left as it is: {}",
+                    error
+                );
+                return;
+            }
+            Ok(_) => {}
+            Err(read_error) => warn!(
+                container_id = %container_id,
+                "Could not check whether postgresql.auto.conf still holds the archive_command \
+                 this attempt set; undoing it anyway: {}",
+                read_error
+            ),
+        }
+        match self.apply_archive_command(container_id, &change).await {
+            Ok(()) => warn!(
+                container_id = %container_id,
+                "WAL-G base backup failed; undid archive_command by {} so WAL does not \
+                 accumulate: {}",
+                change.describe(),
+                error
+            ),
+            Err(rollback_error) => error!(
+                container_id = %container_id,
+                "WAL-G base backup failed, and undoing archive_command by {} failed too, so \
+                 the database may retain WAL until archiving works: {}. Backup error: {}",
+                change.describe(),
+                rollback_error,
+                error
+            ),
+        }
+    }
+
+    /// Every `archive_command` line in the configuration files, loaded or
+    /// not, in the order PostgreSQL reads them.
+    async fn archive_command_file_entries(
+        &self,
+    ) -> Result<Vec<ArchiveCommandFileEntry>, BackupError> {
+        ArchiveCommandFileEntry::find_by_statement(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT sourcefile, setting FROM pg_file_settings \
+             WHERE name = 'archive_command' ORDER BY seqno"
+                .to_string(),
+        ))
+        .all(self.db.as_ref())
+        .await
+        .map_err(|e| BackupError::Internal {
+            message: format!(
+                "Failed to read the archive_command entries in the configuration files of the \
+                 control-plane database: {}",
+                e
+            ),
+        })
     }
 
     /// Change the control-plane database's `archive_command` and reload.
@@ -608,12 +760,28 @@ mod tests {
         }
     }
 
-    /// A database that accepts one `archive_command` change and its reload.
-    fn accepts_one_change() -> Arc<DatabaseConnection> {
+    fn file_entry_row(sourcefile: &str, setting: &str) -> BTreeMap<&'static str, Value> {
+        BTreeMap::from([
+            ("sourcefile", Value::from(sourcefile)),
+            ("setting", Value::from(setting)),
+        ])
+    }
+
+    /// pg_file_settings once Temps wrote the WAL-G command.
+    fn walg_in_auto_conf() -> Vec<BTreeMap<&'static str, Value>> {
+        vec![file_entry_row(AUTO_CONF, WALG_COMMAND)]
+    }
+
+    /// A database answering `queries` in order and accepting `changes`
+    /// statements (ALTER SYSTEM).
+    fn mock(
+        queries: Vec<Vec<BTreeMap<&'static str, Value>>>,
+        changes: usize,
+    ) -> Arc<DatabaseConnection> {
         Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
-                .append_exec_results([exec_ok()])
-                .append_query_results([vec![reload_row(true)]])
+                .append_query_results(queries)
+                .append_exec_results((0..changes).map(|_| exec_ok()))
                 .into_connection(),
         )
     }
@@ -628,21 +796,22 @@ mod tests {
     type StepFuture<'a> =
         std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), BackupError>> + 'a>>;
 
-    /// Base backup steps that record themselves, with `enable` and `push`
-    /// succeeding or failing as asked.
+    /// Base backup steps that record themselves, with writing walg.env and
+    /// the push succeeding or failing as asked.
     fn recorded_steps(
         steps: &Steps,
-        enable_ok: bool,
+        write_ok: bool,
         push_ok: bool,
     ) -> BaseBackupSteps<StepFuture<'_>, StepFuture<'_>, StepFuture<'_>, StepFuture<'_>> {
         BaseBackupSteps {
-            enable: Box::pin(async move {
-                step(steps, "enable archiving");
-                if enable_ok {
+            write_env: Box::pin(async move {
+                step(steps, "write walg.env");
+                if write_ok {
                     Ok(())
                 } else {
                     Err(BackupError::Internal {
-                        message: "continuous WAL archiving could not be enabled".to_string(),
+                        message: "Failed to write walg.env in container 'temps-postgres'"
+                            .to_string(),
                     })
                 }
             }),
@@ -689,6 +858,7 @@ mod tests {
             .append_query_results([
                 vec![retaining.clone()],
                 vec![retaining],
+                vec![],
                 vec![reload_row(true)],
             ])
             .append_exec_results([exec_ok()])
@@ -709,9 +879,10 @@ mod tests {
         );
         drop(service);
         let sql = logged_sql(db);
-        assert_eq!(sql.len(), 4, "unexpected statements: {sql:?}");
-        assert_eq!(sql[2], "ALTER SYSTEM SET archive_command = '/bin/true'");
-        assert_eq!(sql[3], "SELECT pg_reload_conf() AS reloaded");
+        assert_eq!(sql.len(), 5, "unexpected statements: {sql:?}");
+        assert!(sql[2].contains("pg_file_settings"), "{sql:?}");
+        assert_eq!(sql[3], "ALTER SYSTEM SET archive_command = '/bin/true'");
+        assert_eq!(sql[4], "SELECT pg_reload_conf() AS reloaded");
     }
 
     /// The reported failure, against a real PostgreSQL started the way the
@@ -812,15 +983,16 @@ mod tests {
         assert!(matches!(outcome, InternalArchiveReconcile::Released { .. }));
 
         // The archiver works through the backlog once it has a command.
+        // The archiver drops a segment's .ready file before it counts the
+        // segment, so wait for both.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        while scalar(&db, READY).await > 0 {
+        while scalar(&db, READY).await > 0 || scalar(&db, ARCHIVED).await < pending {
             assert!(
                 std::time::Instant::now() < deadline,
                 "segments still waiting for the archiver after 30s"
             );
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         }
-        assert!(scalar(&db, ARCHIVED).await >= pending);
 
         // A second start leaves the database as it is.
         let outcome = service
@@ -956,10 +1128,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_command_written_but_not_yet_loaded_is_not_replaced() {
+        // ALTER SYSTEM without a reload: the running value is still the
+        // default, the file already holds the operator's command. No exec
+        // result is queued: an ALTER SYSTEM would fail the mock.
+        let retaining = settings_row(&settings("on", "", None));
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([
+                vec![retaining.clone()],
+                vec![retaining],
+                vec![file_entry_row(AUTO_CONF, "cp %p /archive/%f")],
+            ])
+            .into_connection();
+        let service = make_scope_test_service(Arc::new(db));
+
+        let outcome = service
+            .reconcile_internal_wal_archiving_with(|| async { Ok("temps-postgres".to_string()) })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            InternalArchiveReconcile::LeftToOperator {
+                reason: format!(
+                    "archive_command is set in {AUTO_CONF} but not loaded yet; it applies on \
+                     the next configuration reload"
+                )
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn configuration_files_that_cannot_be_read_leave_the_database_alone() {
+        let retaining = settings_row(&settings("on", "", None));
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![retaining.clone()], vec![retaining]])
+            .append_query_errors([sea_orm::DbErr::Custom(
+                "permission denied for view pg_file_settings".to_string(),
+            )])
+            .into_connection();
+        let service = make_scope_test_service(Arc::new(db));
+
+        let outcome = service
+            .reconcile_internal_wal_archiving_with(|| async { Ok("temps-postgres".to_string()) })
+            .await
+            .unwrap();
+
+        let InternalArchiveReconcile::LeftToOperator { reason } = outcome else {
+            panic!("expected LeftToOperator, got {outcome:?}");
+        };
+        assert!(reason.contains("permission denied"), "{reason}");
+    }
+
+    #[tokio::test]
     async fn failing_alter_system_names_the_container_and_the_command() {
         let retaining = settings_row(&settings("on", "", Some("")));
         let db = MockDatabase::new(DatabaseBackend::Postgres)
-            .append_query_results([vec![retaining.clone()], vec![retaining]])
+            .append_query_results([vec![retaining.clone()], vec![retaining], vec![]])
             .append_exec_errors([sea_orm::DbErr::Custom(
                 "permission denied to set parameter \"archive_command\"".to_string(),
             )])
@@ -984,6 +1209,7 @@ mod tests {
             .append_query_results([
                 vec![retaining.clone()],
                 vec![retaining],
+                vec![],
                 vec![reload_row(false)],
             ])
             .append_exec_results([exec_ok()])
@@ -1097,33 +1323,35 @@ mod tests {
 
     #[test]
     fn archiving_temps_does_not_manage_is_never_switched_to_walg() {
-        assert!(settings_in("cp %p /archive/%f", None, AUTO_CONF)
-            .walg_takeover_blocker()
-            .is_some());
-        assert!(settings("on", "", Some("basic_archive"))
-            .walg_takeover_blocker()
-            .is_some());
+        let blocked = |settings: ArchiveSettings| settings.walg_takeover_blocker(WALG_COMMAND);
+        assert!(blocked(settings_in("cp %p /archive/%f", None, AUTO_CONF)).is_some());
+        assert!(blocked(settings("on", "", Some("basic_archive"))).is_some());
+        // WAL-G run by someone else, to their own archive.
+        assert!(blocked(settings_in(
+            "env WALG_S3_PREFIX=s3://operator/archive wal-g wal-push %p",
+            None,
+            AUTO_CONF
+        ))
+        .is_some());
+        // The managed-service images' command, not the control plane's.
+        assert!(blocked(settings_in(
+            ". /var/lib/postgresql/walg.env && wal-g wal-push %p",
+            None,
+            AUTO_CONF
+        ))
+        .is_some());
+        // No archiver runs, so the base backup's WAL would never be shipped.
+        let off = blocked(settings("off", "", None)).unwrap();
+        assert!(off.contains("archive_mode is 'off'"), "{off}");
 
-        // Temps' own states: unset, the placeholder, paused, WAL-G (also an
-        // older WAL-G command with another env file path).
-        assert_eq!(settings("on", "", Some("")).walg_takeover_blocker(), None);
+        // Temps' own states: unset, the placeholder, paused, its WAL-G command.
+        assert_eq!(blocked(settings("on", "", Some(""))), None);
         assert_eq!(
-            settings_in(NO_ARCHIVE_DESTINATION_COMMAND, None, AUTO_CONF).walg_takeover_blocker(),
+            blocked(settings_in(NO_ARCHIVE_DESTINATION_COMMAND, None, AUTO_CONF)),
             None
         );
-        assert_eq!(
-            settings_in("", None, AUTO_CONF).walg_takeover_blocker(),
-            None
-        );
-        assert_eq!(
-            settings_in(
-                ". /var/lib/postgresql/walg.env && wal-g wal-push %p",
-                None,
-                AUTO_CONF
-            )
-            .walg_takeover_blocker(),
-            None
-        );
+        assert_eq!(blocked(settings_in("", None, AUTO_CONF)), None);
+        assert_eq!(blocked(settings_in(WALG_COMMAND, None, AUTO_CONF)), None);
     }
 
     #[tokio::test]
@@ -1153,7 +1381,7 @@ mod tests {
 
     #[tokio::test]
     async fn base_backup_starts_only_after_archiving_is_enabled() {
-        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let db = mock(vec![vec![reload_row(true)]], 1);
         let service = make_scope_test_service(db.clone());
         let steps = Steps::default();
 
@@ -1169,26 +1397,28 @@ mod tests {
 
         assert_eq!(
             *steps.lock().unwrap(),
-            [
-                "enable archiving",
-                "backup-push",
-                "discard previous walg.env"
-            ]
+            ["write walg.env", "backup-push", "discard previous walg.env"]
         );
         drop(service);
-        assert!(logged_sql(db).is_empty());
+        assert_eq!(
+            logged_sql(db),
+            [
+                format!("ALTER SYSTEM SET archive_command = '{WALG_COMMAND}'"),
+                "SELECT pg_reload_conf() AS reloaded".to_string()
+            ]
+        );
     }
 
     #[tokio::test]
-    async fn archiving_that_could_not_be_enabled_is_rolled_back_without_a_base_backup() {
-        // The enable step may have written archive_command before failing.
-        let db = accepts_one_change();
+    async fn walg_env_that_cannot_be_written_changes_no_setting() {
+        // Nothing is queued: any statement would fail the mock.
+        let db = mock(vec![], 0);
         let service = make_scope_test_service(db.clone());
         let steps = Steps::default();
 
         let error = service
             .archive_then_push(
-                &settings("on", "", Some("")),
+                &settings_in(NO_ARCHIVE_DESTINATION_COMMAND, None, AUTO_CONF),
                 WALG_COMMAND,
                 "temps-postgres",
                 recorded_steps(&steps, false, true),
@@ -1200,21 +1430,98 @@ mod tests {
         assert!(error.contains("could not be enabled"), "{error}");
         assert_eq!(
             *steps.lock().unwrap(),
-            ["enable archiving", "restore walg.env"]
+            ["write walg.env", "restore walg.env"]
         );
         drop(service);
+        assert!(logged_sql(db).is_empty());
+    }
+
+    #[tokio::test]
+    async fn archive_command_that_was_never_written_is_not_rolled_back() {
+        // ALTER SYSTEM is refused, so postgresql.auto.conf does not hold the
+        // WAL-G command and there is nothing to undo.
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_exec_errors([sea_orm::DbErr::Custom(
+                    "permission denied to set parameter \"archive_command\"".to_string(),
+                )])
+                .append_query_results([Vec::<BTreeMap<&'static str, Value>>::new()])
+                .into_connection(),
+        );
+        let service = make_scope_test_service(db.clone());
+        let steps = Steps::default();
+
+        let error = service
+            .archive_then_push(
+                &settings_in(NO_ARCHIVE_DESTINATION_COMMAND, None, AUTO_CONF),
+                WALG_COMMAND,
+                "temps-postgres",
+                recorded_steps(&steps, true, true),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("could not be enabled"), "{error}");
+        assert!(error.contains("permission denied"), "{error}");
         assert_eq!(
-            logged_sql(db),
-            [
-                "ALTER SYSTEM SET archive_command = '/bin/true'",
-                "SELECT pg_reload_conf() AS reloaded"
-            ]
+            *steps.lock().unwrap(),
+            ["write walg.env", "restore walg.env"]
+        );
+        drop(service);
+        let sql = logged_sql(db);
+        assert!(
+            !sql.iter().any(|statement| statement.contains("/bin/true")),
+            "{sql:?}"
         );
     }
 
     #[tokio::test]
+    async fn archiving_whose_reload_failed_is_rolled_back_without_a_base_backup() {
+        let db = mock(
+            vec![
+                vec![reload_row(false)],
+                walg_in_auto_conf(),
+                vec![reload_row(true)],
+            ],
+            2,
+        );
+        let service = make_scope_test_service(db.clone());
+        let steps = Steps::default();
+
+        let error = service
+            .archive_then_push(
+                &settings("on", "", Some("")),
+                WALG_COMMAND,
+                "temps-postgres",
+                recorded_steps(&steps, true, true),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("could not be enabled"), "{error}");
+        assert!(error.contains("not in effect"), "{error}");
+        assert_eq!(
+            *steps.lock().unwrap(),
+            ["write walg.env", "restore walg.env"]
+        );
+        drop(service);
+        let sql = logged_sql(db);
+        assert_eq!(sql[3], "ALTER SYSTEM SET archive_command = '/bin/true'");
+        assert_eq!(sql.len(), 5, "{sql:?}");
+    }
+
+    #[tokio::test]
     async fn failed_first_base_backup_puts_back_the_placeholder_and_walg_env() {
-        let db = accepts_one_change();
+        let db = mock(
+            vec![
+                vec![reload_row(true)],
+                walg_in_auto_conf(),
+                vec![reload_row(true)],
+            ],
+            2,
+        );
         let service = make_scope_test_service(db.clone());
         let steps = Steps::default();
 
@@ -1232,11 +1539,12 @@ mod tests {
         assert!(error.contains("wal-g backup-push failed"), "{error}");
         assert_eq!(
             *steps.lock().unwrap(),
-            ["enable archiving", "backup-push", "restore walg.env"]
+            ["write walg.env", "backup-push", "restore walg.env"]
         );
         drop(service);
+        let sql = logged_sql(db);
         assert_eq!(
-            logged_sql(db),
+            sql[3..],
             [
                 "ALTER SYSTEM SET archive_command = '/bin/true'",
                 "SELECT pg_reload_conf() AS reloaded"
@@ -1246,7 +1554,14 @@ mod tests {
 
     #[tokio::test]
     async fn failed_base_backup_removes_the_override_of_a_pause_in_the_operator_file() {
-        let db = accepts_one_change();
+        let db = mock(
+            vec![
+                vec![reload_row(true)],
+                walg_in_auto_conf(),
+                vec![reload_row(true)],
+            ],
+            2,
+        );
         let service = make_scope_test_service(db.clone());
         let steps = Steps::default();
 
@@ -1261,14 +1576,78 @@ mod tests {
 
         assert!(result.is_err());
         drop(service);
-        assert_eq!(logged_sql(db)[0], "ALTER SYSTEM RESET archive_command");
+        assert_eq!(logged_sql(db)[3], "ALTER SYSTEM RESET archive_command");
+    }
+
+    #[tokio::test]
+    async fn failed_base_backup_leaves_a_command_written_since_by_someone_else() {
+        // Only the enabling change is accepted: a rollback would fail the mock.
+        let db = mock(
+            vec![
+                vec![reload_row(true)],
+                vec![
+                    file_entry_row(AUTO_CONF, WALG_COMMAND),
+                    file_entry_row(AUTO_CONF, "cp %p /archive/%f"),
+                ],
+            ],
+            1,
+        );
+        let service = make_scope_test_service(db.clone());
+        let steps = Steps::default();
+
+        let error = service
+            .archive_then_push(
+                &settings_in(NO_ARCHIVE_DESTINATION_COMMAND, None, AUTO_CONF),
+                WALG_COMMAND,
+                "temps-postgres",
+                recorded_steps(&steps, true, false),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("wal-g backup-push failed"), "{error}");
+        drop(service);
+        assert_eq!(logged_sql(db).len(), 3);
+    }
+
+    #[tokio::test]
+    async fn failed_base_backup_is_rolled_back_when_ownership_cannot_be_checked() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![reload_row(true)]])
+                .append_query_errors([sea_orm::DbErr::Custom(
+                    "permission denied for view pg_file_settings".to_string(),
+                )])
+                .append_query_results([vec![reload_row(true)]])
+                .append_exec_results([exec_ok(), exec_ok()])
+                .into_connection(),
+        );
+        let service = make_scope_test_service(db.clone());
+        let steps = Steps::default();
+
+        let result = service
+            .archive_then_push(
+                &settings("on", "", None),
+                WALG_COMMAND,
+                "temps-postgres",
+                recorded_steps(&steps, true, false),
+            )
+            .await;
+
+        assert!(result.is_err());
+        drop(service);
+        assert_eq!(
+            logged_sql(db)[3],
+            "ALTER SYSTEM SET archive_command = '/bin/true'"
+        );
     }
 
     #[tokio::test]
     async fn failed_base_backup_keeps_walg_archiving_but_puts_back_its_walg_env() {
-        // No exec results are queued: any ALTER SYSTEM would fail the mock.
-        // walg.env is what tells WAL-G where the working archive is.
-        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        // walg.env is what tells WAL-G where the working archive is; the
+        // command was already WAL-G's, so only the enabling change runs.
+        let db = mock(vec![vec![reload_row(true)]], 1);
         let service = make_scope_test_service(db.clone());
         let steps = Steps::default();
 
@@ -1284,15 +1663,15 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(
             *steps.lock().unwrap(),
-            ["enable archiving", "backup-push", "restore walg.env"]
+            ["write walg.env", "backup-push", "restore walg.env"]
         );
         drop(service);
-        assert!(logged_sql(db).is_empty());
+        assert_eq!(logged_sql(db).len(), 2);
     }
 
     #[tokio::test]
     async fn successful_base_backup_returns_the_push_result() {
-        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let db = mock(vec![vec![reload_row(true)]], 1);
         let service = make_scope_test_service(db.clone());
 
         let value = service
@@ -1301,7 +1680,7 @@ mod tests {
                 WALG_COMMAND,
                 "temps-postgres",
                 BaseBackupSteps {
-                    enable: async { Ok(()) },
+                    write_env: async { Ok(()) },
                     push: async { Ok::<_, BackupError>(42) },
                     restore_env: async { panic!("a successful backup keeps the new walg.env") },
                     discard_previous_env: async {
@@ -1316,14 +1695,14 @@ mod tests {
 
         // Failing to delete the copy of the old walg.env does not fail it.
         assert_eq!(value, 42);
-        drop(service);
-        assert!(logged_sql(db).is_empty());
     }
 
     #[tokio::test]
     async fn failed_rollback_still_reports_the_backup_failure() {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_exec_results([exec_ok()])
             .append_exec_errors([sea_orm::DbErr::Custom("connection reset".to_string())])
+            .append_query_results([vec![reload_row(true)], walg_in_auto_conf()])
             .into_connection();
         let service = make_scope_test_service(Arc::new(db));
 
@@ -1333,7 +1712,7 @@ mod tests {
                 WALG_COMMAND,
                 "temps-postgres",
                 BaseBackupSteps {
-                    enable: async { Ok(()) },
+                    write_env: async { Ok(()) },
                     push: async { Err::<(), _>(push_failure()) },
                     restore_env: async {
                         Err(BackupError::Internal {

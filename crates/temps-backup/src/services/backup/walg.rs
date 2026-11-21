@@ -245,50 +245,24 @@ impl BackupService {
         // can put back what was there. `archive_then_push` owns that order.
         let archive_before = self.read_archive_settings().await?;
         let walg_env_path = internal_walg_env_path(&pgdata);
-        // Set once this attempt has replaced walg.env (keeping the old one),
-        // so only then is there a walg.env to put back or a copy to delete.
-        let env_replaced = std::sync::atomic::AtomicBool::new(false);
-        let enable = async {
-            self.enable_internal_wal_archiving(
-                &docker,
-                &container_id,
-                &env_vars,
-                &pgdata,
-                &env_replaced,
-            )
-            .await
-            .map_err(|e| BackupError::Internal {
-                message: format!(
-                    "Cannot take a WAL-G base backup of the internal database in container \
-                     '{}': continuous WAL archiving could not be enabled: {}",
-                    container_id, e
-                ),
-            })
-        };
-        let restore_env = async {
-            if !env_replaced.load(std::sync::atomic::Ordering::SeqCst) {
-                return Ok(());
-            }
-            run_walg_env_script(
-                &docker,
-                &container_id,
-                walg_env_restore_script(&walg_env_path),
-                "put back the previous",
-            )
-            .await
-        };
-        let discard_previous_env = async {
-            if !env_replaced.load(std::sync::atomic::Ordering::SeqCst) {
-                return Ok(());
-            }
-            run_walg_env_script(
-                &docker,
-                &container_id,
-                format!("rm -f {}", shell_escape(&format!("{walg_env_path}.prev"))),
-                "delete the copy of the previous",
-            )
-            .await
-        };
+        // Marks the walg.env this attempt writes, so a failure puts back the
+        // previous one exactly when this attempt replaced it, including when
+        // Docker loses the result of the write.
+        let attempt = format!("# temps-walg-attempt {}", Uuid::new_v4());
+        let write_env =
+            self.write_internal_walg_env(&docker, &container_id, &env_vars, &pgdata, &attempt);
+        let restore_env = run_walg_env_script(
+            &docker,
+            &container_id,
+            walg_env_restore_script(&walg_env_path, &attempt),
+            "put back the previous",
+        );
+        let discard_previous_env = run_walg_env_script(
+            &docker,
+            &container_id,
+            format!("rm -f {}", shell_escape(&format!("{walg_env_path}.prev"))),
+            "delete the copy of the previous",
+        );
 
         // A push that fails from inside the container (an endpoint or bucket
         // only the Temps process can reach, a credential wal-g rejects) would
@@ -361,7 +335,7 @@ impl BackupService {
             &internal_walg_archive_command(&pgdata),
             &container_id,
             BaseBackupSteps {
-                enable,
+                write_env,
                 push,
                 restore_env,
                 discard_previous_env,
@@ -412,23 +386,21 @@ impl BackupService {
         Ok((walg_s3_prefix, total_size))
     }
 
-    /// Write WAL-G credentials to an env file on the shared volume and enable
-    /// continuous WAL archiving for the internal database via `ALTER SYSTEM`.
+    /// Write WAL-G credentials to an env file on the shared volume, which the
+    /// internal database's archive_command sources.
     ///
     /// Same approach as external PostgreSQL services: the env file is refreshed on
     /// every backup so credential rotations are picked up automatically. The
-    /// file it replaces is kept as `walg.env.prev`, and `env_replaced` is set,
-    /// so a failed backup can put it back.
-    async fn enable_internal_wal_archiving(
+    /// file it replaces is kept as `walg.env.prev`, and the new one starts with
+    /// the `attempt` line, so a failed backup can put the old one back.
+    async fn write_internal_walg_env(
         &self,
         docker: &bollard::Docker,
         container_id: &str,
         env_vars: &[String],
         pgdata: &str,
-        env_replaced: &std::sync::atomic::AtomicBool,
+        attempt: &str,
     ) -> Result<(), BackupError> {
-        use bollard::exec::{CreateExecOptions, StartExecOptions};
-
         let walg_env_path = internal_walg_env_path(pgdata);
 
         // The credentials reach the shell through the exec's environment,
@@ -436,7 +408,7 @@ impl BackupService {
         let contents = format!(
             "{}={}",
             WALG_ENV_CONTENTS_VAR,
-            walg_env_file_contents(env_vars)
+            walg_env_file_contents(env_vars, attempt)
         );
         temps_providers::externalsvc::exec_util::run_exec_as(
             docker,
@@ -457,101 +429,11 @@ impl BackupService {
                 walg_env_path, container_id, e
             ),
         })?;
-        env_replaced.store(true, std::sync::atomic::Ordering::SeqCst);
 
         info!(
             "Written WAL-G credentials to {} in container '{}'",
             walg_env_path, container_id
         );
-
-        // Parse DATABASE_URL for psql credentials
-        let database_url = self.config_service.get_database_url();
-        let url = url::Url::parse(&database_url).map_err(|e| BackupError::Internal {
-            message: format!("Invalid DATABASE_URL for ALTER SYSTEM: {}", e),
-        })?;
-        let pg_user = url.username();
-        let pg_password = url.password().unwrap_or("");
-
-        // Enable archive_command via ALTER SYSTEM + pg_reload_conf().
-        // Use two separate -c flags because ALTER SYSTEM cannot run inside a
-        // transaction block, and psql wraps multiple statements in a single -c
-        // into a transaction.
-        let archive_command = internal_walg_archive_command(pgdata);
-        let alter_sql = format!(
-            "ALTER SYSTEM SET archive_command = '{}'",
-            archive_command.replace('\'', "''")
-        );
-        let reload_sql = "SELECT pg_reload_conf()";
-
-        let password_env = format!("PGPASSWORD={}", pg_password);
-        let exec = docker
-            .create_exec(
-                container_id,
-                CreateExecOptions {
-                    cmd: Some(vec![
-                        // Without ON_ERROR_STOP a failed ALTER SYSTEM still
-                        // exits 0 when the reload after it succeeds.
-                        "psql",
-                        "-v",
-                        "ON_ERROR_STOP=1",
-                        "-U",
-                        pg_user,
-                        "-c",
-                        &alter_sql,
-                        "-c",
-                        reload_sql,
-                    ]),
-                    attach_stdout: Some(false),
-                    attach_stderr: Some(false),
-                    env: Some(vec![&password_env]),
-                    ..Default::default()
-                },
-            )
-            .await
-            .map_err(|e| BackupError::Internal {
-                message: format!("Failed to create ALTER SYSTEM exec: {}", e),
-            })?;
-
-        docker
-            .start_exec(
-                &exec.id,
-                Some(StartExecOptions {
-                    detach: true,
-                    ..Default::default()
-                }),
-            )
-            .await
-            .map_err(|e| BackupError::Internal {
-                message: format!("Failed to start ALTER SYSTEM exec: {}", e),
-            })?;
-
-        loop {
-            let inspect =
-                docker
-                    .inspect_exec(&exec.id)
-                    .await
-                    .map_err(|e| BackupError::Internal {
-                        message: format!("Failed to inspect ALTER SYSTEM exec: {}", e),
-                    })?;
-            if inspect.running == Some(false) {
-                if inspect.exit_code != Some(0) {
-                    return Err(BackupError::Internal {
-                        message: format!(
-                            "ALTER SYSTEM SET archive_command failed (exit code {:?})",
-                            inspect.exit_code
-                        ),
-                    });
-                }
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-
-        info!(
-            "Enabled continuous WAL archiving for internal DB in container '{}'",
-            container_id
-        );
-
         Ok(())
     }
 }
@@ -636,13 +518,16 @@ fn internal_walg_env_path(pgdata: &str) -> String {
 /// script writing it.
 const WALG_ENV_CONTENTS_VAR: &str = "TEMPS_WALG_ENV";
 
-/// walg.env's contents: an `export` line for each WAL-G and S3 variable (no
-/// PGDATA, no PostgreSQL connection variables).
-fn walg_env_file_contents(env_vars: &[String]) -> String {
-    env_vars
-        .iter()
-        .filter(|line| line.starts_with("WALG_") || line.starts_with("AWS_"))
-        .filter_map(|line| shell_export_assignment(line))
+/// walg.env's contents: the `attempt` comment line, then an `export` line for
+/// each WAL-G and S3 variable (no PGDATA, no PostgreSQL connection variables).
+fn walg_env_file_contents(env_vars: &[String], attempt: &str) -> String {
+    std::iter::once(attempt.to_string())
+        .chain(
+            env_vars
+                .iter()
+                .filter(|line| line.starts_with("WALG_") || line.starts_with("AWS_"))
+                .filter_map(|line| shell_export_assignment(line)),
+        )
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -664,12 +549,17 @@ fn walg_env_replace_script(path: &str) -> String {
     )
 }
 
-/// Shell that undoes [`walg_env_replace_script`]: the kept file goes back, or,
-/// when there was none, the new walg.env is removed.
-fn walg_env_restore_script(path: &str) -> String {
+/// Shell that undoes [`walg_env_replace_script`] if walg.env is the one the
+/// `attempt` wrote: the kept file goes back, or, when there was none, the new
+/// walg.env is removed. Any other walg.env is left as it is.
+fn walg_env_restore_script(path: &str, attempt: &str) -> String {
     let env = shell_escape(path);
     let prev = shell_escape(&format!("{path}.prev"));
-    format!("if [ -e {prev} ]; then mv -f {prev} {env}; else rm -f {env}; fi")
+    let attempt = shell_escape(attempt);
+    format!(
+        "if [ -e {env} ] && grep -qxF {attempt} {env}; then \
+         if [ -e {prev} ]; then mv -f {prev} {env}; else rm -f {env}; fi; fi"
+    )
 }
 
 /// Run a walg.env maintenance `script` as the postgres user; `action` says
@@ -793,6 +683,14 @@ mod tests {
             .success()
     }
 
+    const ATTEMPT: &str = "# temps-walg-attempt 1b4e28ba-2fa1-11d2-883f-0016d3cca427";
+    const WORKING: &str = "export WALG_S3_PREFIX='s3://working'\n";
+
+    /// walg.env as an attempt writes it.
+    fn new_walg_env() -> String {
+        format!("{ATTEMPT}\nexport WALG_S3_PREFIX='s3://new'")
+    }
+
     #[test]
     fn walg_env_credentials_stay_out_of_the_command_line() {
         let env_vars = [
@@ -801,16 +699,24 @@ mod tests {
             "PGDATA=/home/postgres/pgdata/pgroot/data".to_string(),
         ];
 
-        let contents = walg_env_file_contents(&env_vars);
-        let script = walg_env_replace_script("/home/postgres/pgdata/pgroot/walg.env");
+        let contents = walg_env_file_contents(&env_vars, ATTEMPT);
+        let path = "/home/postgres/pgdata/pgroot/walg.env";
 
         assert_eq!(
             contents,
-            "export WALG_S3_PREFIX='s3://backups/internal_db/walg'\n\
-             export AWS_SECRET_ACCESS_KEY='s3cr3t'\\''key'"
+            format!(
+                "{ATTEMPT}\n\
+                 export WALG_S3_PREFIX='s3://backups/internal_db/walg'\n\
+                 export AWS_SECRET_ACCESS_KEY='s3cr3t'\\''key'"
+            )
         );
-        assert!(!script.contains("s3cr3t"), "{script}");
-        assert!(!script.contains("WALG_S3_PREFIX"), "{script}");
+        for script in [
+            walg_env_replace_script(path),
+            walg_env_restore_script(path, ATTEMPT),
+        ] {
+            assert!(!script.contains("s3cr3t"), "{script}");
+            assert!(!script.contains("WALG_S3_PREFIX"), "{script}");
+        }
     }
 
     #[test]
@@ -821,20 +727,17 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let path_str = path.to_str().unwrap();
         let prev = format!("{path_str}.prev");
-        std::fs::write(&path, "export WALG_S3_PREFIX='s3://working'\n").unwrap();
+        std::fs::write(&path, WORKING).unwrap();
 
         assert!(run_script(
             &walg_env_replace_script(path_str),
-            "export WALG_S3_PREFIX='s3://new'"
+            &new_walg_env()
         ));
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
-            "export WALG_S3_PREFIX='s3://new'\n"
+            format!("{}\n", new_walg_env())
         );
-        assert_eq!(
-            std::fs::read_to_string(&prev).unwrap(),
-            "export WALG_S3_PREFIX='s3://working'\n"
-        );
+        assert_eq!(std::fs::read_to_string(&prev).unwrap(), WORKING);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -842,11 +745,8 @@ mod tests {
             assert_eq!(mode & 0o777, 0o600);
         }
 
-        assert!(run_script(&walg_env_restore_script(path_str), ""));
-        assert_eq!(
-            std::fs::read_to_string(&path).unwrap(),
-            "export WALG_S3_PREFIX='s3://working'\n"
-        );
+        assert!(run_script(&walg_env_restore_script(path_str, ATTEMPT), ""));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), WORKING);
         assert!(!std::path::Path::new(&prev).exists());
     }
 
@@ -858,10 +758,33 @@ mod tests {
 
         assert!(run_script(
             &walg_env_replace_script(path_str),
-            "export WALG_S3_PREFIX='s3://new'"
+            &new_walg_env()
         ));
         assert!(path.exists());
-        assert!(run_script(&walg_env_restore_script(path_str), ""));
+        assert!(run_script(&walg_env_restore_script(path_str, ATTEMPT), ""));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn putting_back_leaves_a_walg_env_the_attempt_did_not_write() {
+        // The attempt's write never happened (or its result was lost before
+        // it ran): a copy from an earlier attempt must not replace the file.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("walg.env");
+        let path_str = path.to_str().unwrap();
+        std::fs::write(&path, WORKING).unwrap();
+        std::fs::write(
+            dir.path().join("walg.env.prev"),
+            "export WALG_S3_PREFIX='s3://stale'\n",
+        )
+        .unwrap();
+
+        assert!(run_script(&walg_env_restore_script(path_str, ATTEMPT), ""));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), WORKING);
+
+        // Nor is a missing walg.env created.
+        std::fs::remove_file(&path).unwrap();
+        assert!(run_script(&walg_env_restore_script(path_str, ATTEMPT), ""));
         assert!(!path.exists());
     }
 
@@ -870,17 +793,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("walg.env");
         let path_str = path.to_str().unwrap();
-        std::fs::write(&path, "export WALG_S3_PREFIX='s3://working'\n").unwrap();
+        std::fs::write(&path, WORKING).unwrap();
         // A directory where the new file would be written makes the write fail.
         std::fs::create_dir_all(dir.path().join("walg.env.tmp").join("busy")).unwrap();
 
         assert!(!run_script(
             &walg_env_replace_script(path_str),
-            "export WALG_S3_PREFIX='s3://new'"
+            &new_walg_env()
         ));
-        assert_eq!(
-            std::fs::read_to_string(&path).unwrap(),
-            "export WALG_S3_PREFIX='s3://working'\n"
-        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), WORKING);
+        // Putting it back after that failure changes nothing.
+        assert!(run_script(&walg_env_restore_script(path_str, ATTEMPT), ""));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), WORKING);
     }
 }
