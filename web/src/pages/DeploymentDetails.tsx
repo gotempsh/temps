@@ -108,6 +108,7 @@ import { Link, useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
 import { announceOperation } from '@/components/operations/operations-tray-store'
 import { ReachabilityWarningBanner } from '@/components/reachability/ReachabilityWarningBanner'
+import { RootUserBadge } from '@/components/deployments/RootUserBadge'
 
 type BadgeVariant =
   'default' | 'secondary' | 'destructive' | 'success' | 'warning' | 'outline'
@@ -387,6 +388,10 @@ function StatusBadges({
       {md?.deploymentSourceType === 'manual' && (
         <Badge variant="outline">Manual deploy</Badge>
       )}
+      <RootUserBadge
+        runsAsRoot={deployment.runs_as_root}
+        imageUser={deployment.image_user}
+      />
       {md?.labels?.map((label) => (
         <Badge key={label} variant="secondary">
           {label}

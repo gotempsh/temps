@@ -1101,7 +1101,7 @@ use temps_deployer::{
 // Mock ContainerDeployer for testing multi-replica deployments
 use std::sync::Mutex as StdMutex;
 
-struct TrackingMockContainerDeployer {
+pub(super) struct TrackingMockContainerDeployer {
     deployed_containers: Arc<StdMutex<Vec<String>>>,
     stopped_containers: Arc<StdMutex<Vec<String>>>,
     removed_containers: Arc<StdMutex<Vec<String>>>,
@@ -1111,7 +1111,7 @@ struct TrackingMockContainerDeployer {
 }
 
 impl TrackingMockContainerDeployer {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             deployed_containers: Arc::new(StdMutex::new(Vec::new())),
             stopped_containers: Arc::new(StdMutex::new(Vec::new())),

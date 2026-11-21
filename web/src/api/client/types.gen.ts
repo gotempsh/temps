@@ -11942,10 +11942,24 @@ export type DeploymentResponse = {
     failure?: DeploymentFailureInfo | null;
     finished_at?: number | null;
     id: number;
+    /**
+     * The `USER` the image declares, as written (`nodejs`, `10001:10001`).
+     * `null` when it declares none (it then runs as root) or the deployment
+     * was not checked.
+     */
+    image_user?: string | null;
     is_current: boolean;
     metadata?: DeploymentMetadata | null;
     project_id: number;
     reachability_warning?: ReachabilityWarning | null;
+    /**
+     * Whether this deployment's image runs its process as root (uid 0).
+     * Resolved once by the deploy pipeline, before any replica started,
+     * against the image's own `/etc/passwd`. `false` when the image runs as
+     * another user, its user could not be resolved, or the deployment
+     * predates the check. Advisory: a root image still deploys.
+     */
+    runs_as_root?: boolean;
     screenshot_location?: string | null;
     started_at?: number | null;
     status: string;
@@ -19432,6 +19446,11 @@ export type ImageConfig = {
      * `USER`, when the image sets one.
      */
     user?: string | null;
+    /**
+     * The image sets a `USER` longer than `MAX_IMAGE_CONFIG_USER_BYTES`,
+     * which `user` leaves out: the user it runs as is unknown, not root.
+     */
+    user_omitted?: boolean;
 };
 
 /**

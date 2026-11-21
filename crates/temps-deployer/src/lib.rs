@@ -462,6 +462,10 @@ pub struct ImageConfig {
     /// `USER`, when the image sets one.
     #[serde(default)]
     pub user: Option<String>,
+    /// The image sets a `USER` longer than `MAX_IMAGE_CONFIG_USER_BYTES`,
+    /// which `user` leaves out: the user it runs as is unknown, not root.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub user_omitted: bool,
     /// `ENV` entries as `NAME=value`. Values are whatever the Dockerfile
     /// baked in; callers must not persist or log them.
     #[serde(default)]
@@ -490,14 +494,14 @@ impl ImageConfig {
         exposed_ports.dedup();
         exposed_ports.truncate(MAX_IMAGE_CONFIG_PORTS);
 
-        let user = user
-            .map(str::trim)
-            .filter(|user| !user.is_empty() && user.len() <= MAX_IMAGE_CONFIG_USER_BYTES)
-            .map(str::to_string);
+        let user = user.map(str::trim).filter(|user| !user.is_empty());
+        let user_omitted = user.is_some_and(|user| user.len() > MAX_IMAGE_CONFIG_USER_BYTES);
+        let user = user.filter(|_| !user_omitted).map(str::to_string);
 
         Self {
             exposed_ports,
             user,
+            user_omitted,
             env: bounded_strings(
                 env,
                 MAX_IMAGE_CONFIG_ENV_ENTRIES,
@@ -1537,7 +1541,14 @@ mod tests {
             &[],
         );
         assert_eq!(config.user, None);
-        assert_eq!(ImageConfig::from_raw(&[], Some("  "), &[], &[]).user, None);
+        assert!(config.user_omitted, "a dropped USER is not an unset USER");
+        let unset = ImageConfig::from_raw(&[], Some("  "), &[], &[]);
+        assert_eq!((unset.user, unset.user_omitted), (None, false));
+        let kept = ImageConfig::from_raw(&[], Some(" app "), &[], &[]);
+        assert_eq!(
+            (kept.user.as_deref(), kept.user_omitted),
+            (Some("app"), false)
+        );
     }
 
     /// The image configuration is added to a wire type older agents already
