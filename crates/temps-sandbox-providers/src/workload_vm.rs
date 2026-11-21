@@ -43,7 +43,8 @@
 //! networks and UDP ports.
 //!
 //! The image's `USER` is resolved the way Docker does, against the image's
-//! own `/etc/passwd` and `/etc/group` (see [`super::image_user`]), so
+//! own `/etc/passwd` and `/etc/group` (see [`temps_docker_util::image_user`],
+//! the same lookup the deploy pipeline's root-user warning uses), so
 //! `USER nextjs` and `USER 1001:1001` both run as the identity a container
 //! of the same image would; the guest agent only ever receives numbers.
 //!
@@ -72,9 +73,9 @@ use temps_workload::{
 };
 
 use super::firecracker::{FirecrackerSandboxProvider, GuestProcessStatus, GuestSpawn, VmIoLimits};
-use super::image_user::{read_image_identity, resolve_image_user, ResolvedUser};
 use super::{SandboxBackend, SandboxCreateConfig, SandboxHandle, SandboxProvider};
 use temps_agent_core::error::AgentError;
+use temps_docker_util::image_user::{read_image_identity, resolve_image_user, ResolvedUser};
 
 /// The driver's name, recorded on every instance it runs.
 pub const WORKLOAD_VM_DRIVER: &str = "firecracker";
@@ -543,8 +544,18 @@ impl FirecrackerWorkloadDriver {
         image: &str,
         user_spec: &str,
     ) -> Result<ResolvedUser, DriverError> {
-        let identity = read_image_identity(&self.docker, image)
-            .await
+        let read = read_image_identity(&self.docker, image).await;
+        if let Some(leftover) = &read.leftover {
+            tracing::warn!(
+                instance,
+                image,
+                container_id = %leftover.container_id,
+                error = %leftover.reason,
+                "could not remove the container used to read an image's identity files"
+            );
+        }
+        let identity = read
+            .identity
             .map_err(|e| runtime_error("read the user database of", instance, e))?;
         let resolved = resolve_image_user(
             user_spec,

@@ -30,6 +30,7 @@ use temps_entities::deployment_containers;
 use temps_entities::environment_workload_mode::EnvironmentWorkloadMode;
 use tokio::time::{sleep, Duration};
 
+mod image_user;
 mod replica;
 
 /// An image a node holds under a tag, resolved for a platform the node does
@@ -4144,6 +4145,11 @@ impl WorkflowTask for DeployImageJob {
             // Standard workflow - get from build job output
             BuildImageOutput::from_context(&context, &self.build_job_id)?
         };
+
+        // Advisory, once per deployment, before any replica starts: which
+        // user the image runs as, warned about when it is root.
+        self.check_and_record_image_user(&image_output, &context)
+            .await;
 
         // Apply .temps.yaml health config if the build job found one.
         // The BuildImageJob reads .temps.yaml and stores health_check_path as an output.
