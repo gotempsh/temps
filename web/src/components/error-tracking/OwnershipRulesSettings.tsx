@@ -35,6 +35,7 @@ import { Label } from '@/components/ui/label'
 import { Skeleton } from '@/components/ui/skeleton'
 import { readFailureServerDetail } from '@/lib/read-failure'
 import {
+  editedSinceSave,
   MAX_OWNERSHIP_RULES,
   ownershipRulesSchema,
   rulesFormReset,
@@ -247,11 +248,14 @@ function RulesForm({
   const save = useMutation({
     ...replaceErrorOwnershipRulesMutation(),
     meta: { errorTitle: 'Failed to save the ownership rules' },
-    onSuccess: (next) => {
+    onSuccess: (next, variables) => {
       toast.success('Ownership rules saved')
-      // The saved rules are now the form's: clean again, so later
-      // changes from the server show.
-      reset(rulesToForm(next.data))
+      // The saved rules are now the form's baseline. Without later edits
+      // the form shows them and is clean again, so later changes from the
+      // server show; edits made while the save ran are kept, still unsaved.
+      reset(rulesToForm(next.data), {
+        keepValues: editedSinceSave(form.getValues(), variables.body.rules),
+      })
       queryClient.setQueryData(
         listErrorOwnershipRulesQueryKey({ path: { project_id: projectId } }),
         next
@@ -339,11 +343,18 @@ export function OwnershipRulesSettings({ projectId }: { projectId: number }) {
             covers a directory, <code>*.py</code> a file name anywhere, and{' '}
             <code>src/**/cart.ts</code> any depth.
           </p>
-          {rules.isPending ? (
-            <div className="space-y-2">
-              <Skeleton className="h-12 w-full" />
-              <Skeleton className="h-12 w-full" />
-            </div>
+          {rules.data ? (
+            <>
+              {rules.isError && (
+                <Alert variant="destructive">
+                  <AlertDescription>
+                    The ownership rules could not be refreshed; these are the
+                    rules last loaded.
+                  </AlertDescription>
+                </Alert>
+              )}
+              <RulesForm projectId={projectId} rules={rules.data.data} />
+            </>
           ) : rules.isError ? (
             <Alert variant="destructive">
               <AlertDescription>
@@ -352,7 +363,10 @@ export function OwnershipRulesSettings({ projectId }: { projectId: number }) {
               </AlertDescription>
             </Alert>
           ) : (
-            <RulesForm projectId={projectId} rules={rules.data.data} />
+            <div className="space-y-2">
+              <Skeleton className="h-12 w-full" />
+              <Skeleton className="h-12 w-full" />
+            </div>
           )}
         </CardContent>
       </Card>

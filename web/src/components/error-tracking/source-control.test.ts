@@ -3,6 +3,7 @@
 
 import { describe, expect, test } from 'bun:test'
 import {
+  editedSinceSave,
   issueLabel,
   linkIssueSchema,
   MAX_OWNERSHIP_RULES,
@@ -133,5 +134,28 @@ describe('rulesFormReset', () => {
         { pattern: 'src/billing/', owner_user_id: 4, owner_label: 'Ana' },
       ],
     })
+  })
+})
+
+describe('editedSinceSave', () => {
+  const form = (...rules: [string, number][]) => ({
+    rules: rules.map(([pattern, owner_user_id]) => ({
+      pattern,
+      owner_user_id,
+      owner_label: 'Sam Doe',
+    })),
+  })
+  const sent = [{ pattern: 'src/a/', owner_user_id: 7 }]
+
+  test('the form as it was sent is not edited, spaces aside', () => {
+    expect(editedSinceSave(form(['src/a/', 7]), sent)).toBe(false)
+    expect(editedSinceSave(form([' src/a/ ', 7]), sent)).toBe(false)
+  })
+
+  test('a changed pattern, owner or rule count is an edit', () => {
+    expect(editedSinceSave(form(['src/b/', 7]), sent)).toBe(true)
+    expect(editedSinceSave(form(['src/a/', 8]), sent)).toBe(true)
+    expect(editedSinceSave(form(['src/a/', 7], ['', 0]), sent)).toBe(true)
+    expect(editedSinceSave(form(), sent)).toBe(true)
   })
 })

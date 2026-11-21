@@ -2,7 +2,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { z } from 'zod'
-import type { OwnershipRuleView } from '@/api/client/types.gen'
+import type {
+  OwnershipRuleRequest,
+  OwnershipRuleView,
+} from '@/api/client/types.gen'
 
 /** Most issues linked to one group (the server's limit). */
 export const MAX_LINKS_PER_GROUP = 10
@@ -175,6 +178,23 @@ export function rulesFormReset(
   rules: OwnershipRuleView[]
 ): OwnershipRulesFormData | null {
   return isDirty ? null : rulesToForm(rules)
+}
+
+/**
+ * Whether the form was changed after `submitted` was sent: then the saved
+ * answer becomes the form's baseline but does not replace what is in it,
+ * so edits made while a save runs are kept.
+ */
+export function editedSinceSave(
+  current: OwnershipRulesFormData,
+  submitted: OwnershipRuleRequest[]
+): boolean {
+  if (current.rules.length !== submitted.length) return true
+  return current.rules.some(
+    (rule, i) =>
+      rule.pattern.trim() !== submitted[i].pattern ||
+      rule.owner_user_id !== submitted[i].owner_user_id
+  )
 }
 
 /** "acme/shop#12", or the host of a plain link. */
