@@ -154,6 +154,9 @@ pub(crate) struct FakeRepository {
     pub states: Mutex<HashMap<i64, IssueState>>,
     pub commit_calls: Mutex<Vec<(String, Option<String>)>>,
     pub refuse: AtomicBool,
+    /// When set, `create_issue` says it was called and waits for this.
+    pub hold: Mutex<Option<Arc<tokio::sync::Notify>>>,
+    pub entered: tokio::sync::Notify,
 }
 
 impl FakeRepository {
@@ -179,6 +182,11 @@ impl ProjectSourceControl for FakeRepository {
         title: &str,
         body: &str,
     ) -> Result<RepositoryIssue, SourceControlError> {
+        let hold = self.hold.lock().expect("lock").clone();
+        if let Some(hold) = hold {
+            self.entered.notify_one();
+            hold.notified().await;
+        }
         if self.refuse.load(Ordering::SeqCst) {
             return Err(SourceControlError::Forbidden {
                 project_id,
@@ -674,6 +682,102 @@ mod database {
         assert!(
             fake.opened.lock().expect("lock").is_empty(),
             "no issue is opened in the repository that could not be linked"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_slow_provider_holds_no_lock_and_an_unlinkable_issue_is_named() {
+        let test_db = test_db!("slow provider");
+        let db = test_db.connection_arc();
+        let project = create_project(db.as_ref()).await;
+        let group = create_group(db.as_ref(), project, GroupSpec::default()).await;
+        event_with_frames(db.as_ref(), project, group).await;
+        let service = Arc::new(service(&db));
+        let fake = FakeRepository::on(github());
+        service.set_source_control(fake.clone());
+        for n in 0..(MAX_LINKS_PER_GROUP - 1) {
+            service
+                .link_issue(
+                    project,
+                    group,
+                    &format!("https://tracker.example.test/{n}"),
+                    None,
+                    None,
+                )
+                .await
+                .expect("under the limit");
+        }
+        let release = Arc::new(tokio::sync::Notify::new());
+        *fake.hold.lock().expect("lock") = Some(release.clone());
+
+        let opening = tokio::spawn({
+            let service = service.clone();
+            async move { service.create_issue(project, group, None, None, None).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(10), fake.entered.notified())
+            .await
+            .expect("the provider is called");
+
+        // A second request for the group is refused while the first runs.
+        let error = service
+            .create_issue(project, group, None, None, None)
+            .await
+            .expect_err("one at a time");
+        assert!(
+            matches!(error, ErrorTrackingError::IssueCreationInProgress { group_id } if group_id == group),
+            "{error}"
+        );
+        // Nothing in the database waits on the provider: a link to the same
+        // group is stored meanwhile, and takes the last free slot.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            service.link_issue(
+                project,
+                group,
+                "https://tracker.example.test/meanwhile",
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect("a link is not blocked by the provider call")
+        .expect("the last slot");
+
+        release.notify_one();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(10), opening)
+            .await
+            .expect("the request finishes")
+            .expect("task")
+            .expect_err("the group filled up meanwhile");
+        match &error {
+            ErrorTrackingError::IssueOpenedNotLinked {
+                group_id,
+                number,
+                url,
+                source,
+            } => {
+                assert_eq!(*group_id, group);
+                assert_eq!(*number, 1);
+                assert_eq!(url, "https://github.com/acme/shop/issues/1");
+                assert!(
+                    matches!(**source, ErrorTrackingError::IssueLinkLimit { .. }),
+                    "{source}"
+                );
+            }
+            other => panic!("expected an opened but unlinked issue, got {other}"),
+        }
+        assert!(error.to_string().contains("/issues/1"), "{error}");
+        assert_eq!(fake.opened.lock().expect("lock").len(), 1);
+
+        // The request released the group: another may be tried.
+        *fake.hold.lock().expect("lock") = None;
+        let error = service
+            .create_issue(project, group, None, None, None)
+            .await
+            .expect_err("the group is full");
+        assert!(
+            matches!(error, ErrorTrackingError::IssueLinkLimit { .. }),
+            "{error}"
         );
     }
 

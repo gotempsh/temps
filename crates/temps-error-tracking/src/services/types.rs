@@ -174,6 +174,21 @@ pub enum ErrorTrackingError {
     #[error("An issue is already being opened for error group {group_id}; try again in a moment")]
     IssueCreationInProgress { group_id: i32 },
 
+    /// The issue was opened in the repository, but its link could not be
+    /// stored afterwards (the group filled up meanwhile, or the database
+    /// failed). The issue exists; it can be linked by its URL. 409 when the
+    /// group is full or already has it, 500 otherwise.
+    #[error(
+        "Opened issue #{number} ({url}) for error group {group_id}, but could not link it: {source}; link it by its URL to keep it with the group"
+    )]
+    IssueOpenedNotLinked {
+        group_id: i32,
+        number: i64,
+        url: String,
+        #[source]
+        source: Box<ErrorTrackingError>,
+    },
+
     /// The server has no way to reach repositories. 503.
     #[error("Source control is unavailable for project {project_id}: {reason}")]
     SourceControlUnavailable { project_id: i32, reason: String },

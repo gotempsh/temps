@@ -10,7 +10,8 @@
 //! git provider connection. Nothing here runs on ingest except the
 //! ownership match, which reads rules the service keeps in memory.
 
-use std::sync::{Arc, OnceLock};
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use chrono::{DateTime, Utc};
 use sea_orm::{
@@ -91,6 +92,37 @@ pub struct SourceControlService {
     db: Arc<DatabaseConnection>,
     source_control: OnceLock<Arc<dyn ProjectSourceControl>>,
     pub ownership: Arc<ownership::OwnershipService>,
+    /// Groups an issue is being opened for in this process.
+    issues_in_flight: Arc<Mutex<HashSet<i32>>>,
+}
+
+/// A group an issue is being opened for, released when dropped (on every
+/// return path, including a cancelled request). The set is touched only
+/// to claim and release, never across an await.
+struct IssueInFlight {
+    groups: Arc<Mutex<HashSet<i32>>>,
+    group_id: i32,
+}
+
+impl IssueInFlight {
+    fn claim(groups: &Arc<Mutex<HashSet<i32>>>, group_id: i32) -> Option<Self> {
+        let mut set = groups
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        set.insert(group_id).then(|| Self {
+            groups: groups.clone(),
+            group_id,
+        })
+    }
+}
+
+impl Drop for IssueInFlight {
+    fn drop(&mut self) {
+        self.groups
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.group_id);
+    }
 }
 
 const LINK_COLUMNS: &str = "id, error_group_id, provider, repository, number, url, title, \
@@ -263,6 +295,7 @@ impl SourceControlService {
             ownership,
             db,
             source_control: OnceLock::new(),
+            issues_in_flight: Arc::default(),
         }
     }
 
@@ -578,7 +611,10 @@ impl SourceControlService {
     ///
     /// One issue per group and repository is opened while it is open: a
     /// second request answers that it exists. Two requests at once do not
-    /// both open one; the second is refused while the first runs.
+    /// both open one; the second is refused while the first runs. No
+    /// transaction is open while the provider answers, so a link added
+    /// meanwhile can fill the group: the issue is then reported as opened
+    /// but not linked ([`ErrorTrackingError::IssueOpenedNotLinked`]).
     pub async fn create_issue(
         &self,
         project_id: i32,
@@ -631,45 +667,39 @@ impl SourceControlService {
             });
         }
 
-        let txn = self.db.begin().await?;
-        // Serialise issue creation per group without locking the group row,
-        // which ingest updates: a concurrent request is refused, not queued.
-        let locked: bool = txn
-            .query_one(Statement::from_sql_and_values(
-                DatabaseBackend::Postgres,
-                "SELECT pg_try_advisory_xact_lock(hashtext('error_group_issue'), $1) AS locked",
-                [group_id.into()],
-            ))
-            .await?
-            .map(|row| row.try_get("", "locked"))
-            .transpose()?
-            .unwrap_or(false);
-        if !locked {
+        // One request at a time opens an issue for a group; a concurrent one
+        // is refused, not queued. The guard is in memory, so nothing in the
+        // database is held while the provider answers.
+        let Some(_in_flight) = IssueInFlight::claim(&self.issues_in_flight, group_id) else {
             return Err(ErrorTrackingError::IssueCreationInProgress { group_id });
-        }
-        if let Some(row) = txn
-            .query_one(Statement::from_sql_and_values(
-                DatabaseBackend::Postgres,
-                "SELECT url FROM error_group_issue_links \
-                 WHERE error_group_id = $1 AND provider = $2 AND repository = $3 \
-                   AND COALESCE(state, 'open') = 'open' ORDER BY id LIMIT 1",
-                [
-                    group_id.into(),
-                    repository.provider.clone().into(),
-                    repository.repository.clone().into(),
-                ],
-            ))
-            .await?
+        };
+        // Refuse a group that already has an open issue in the repository,
+        // or is full, before the issue is opened. This transaction is only
+        // read and ends before the provider is called.
         {
-            return Err(ErrorTrackingError::IssueAlreadyLinked {
-                group_id,
-                url: row.try_get("", "url")?,
-            });
+            let txn = self.db.begin().await?;
+            Self::reserve_link(&txn, group_id).await?;
+            if let Some(row) = txn
+                .query_one(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    "SELECT url FROM error_group_issue_links \
+                     WHERE error_group_id = $1 AND provider = $2 AND repository = $3 \
+                       AND COALESCE(state, 'open') = 'open' ORDER BY id LIMIT 1",
+                    [
+                        group_id.into(),
+                        repository.provider.clone().into(),
+                        repository.repository.clone().into(),
+                    ],
+                ))
+                .await?
+            {
+                return Err(ErrorTrackingError::IssueAlreadyLinked {
+                    group_id,
+                    url: row.try_get("", "url")?,
+                });
+            }
+            txn.rollback().await?;
         }
-        // A group at the limit is refused before the issue is opened, and
-        // the slot stays reserved while the provider answers, so an issue
-        // is never opened that cannot then be linked.
-        Self::reserve_link(&txn, group_id).await?;
         let title = title.unwrap_or_else(|| truncate_chars(&source.title, MAX_ISSUE_TITLE_CHARS));
         let issue = source_control
             .create_issue(project_id, &title, &issue_body(&source))
@@ -679,21 +709,37 @@ impl SourceControlService {
                 source: error,
             })?;
         tracing::info!(project_id, group_id, number = issue.number, repository = %repository.repository, "Opened an issue for an error group");
-        let link = Self::insert_link(
-            &txn,
-            project_id,
-            group_id,
-            &repository.provider,
-            Some(&repository.repository),
-            Some(issue.number),
-            &issue.url,
-            &truncate_chars(&issue.title, MAX_ISSUE_TITLE_CHARS),
-            Some(issue.state.as_str()),
-            actor_user_id,
-        )
-        .await?;
-        txn.commit().await?;
-        Ok(link)
+        // The issue exists now whatever happens here: a failure to store
+        // its link says which issue it was, so it can be linked by URL
+        // instead of opened again.
+        let stored = async {
+            let txn = self.db.begin().await?;
+            let link = Self::insert_link(
+                &txn,
+                project_id,
+                group_id,
+                &repository.provider,
+                Some(&repository.repository),
+                Some(issue.number),
+                &issue.url,
+                &truncate_chars(&issue.title, MAX_ISSUE_TITLE_CHARS),
+                Some(issue.state.as_str()),
+                actor_user_id,
+            )
+            .await?;
+            txn.commit().await?;
+            Ok::<_, ErrorTrackingError>(link)
+        }
+        .await;
+        stored.map_err(|error| {
+            tracing::error!(project_id, group_id, number = issue.number, url = %issue.url, %error, "Opened an issue for an error group but could not link it");
+            ErrorTrackingError::IssueOpenedNotLinked {
+                group_id,
+                number: issue.number,
+                url: issue.url.clone(),
+                source: Box::new(error),
+            }
+        })
     }
 
     /// Remove a link. The issue itself is left as it is.

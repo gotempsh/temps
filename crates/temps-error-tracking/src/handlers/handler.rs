@@ -509,6 +509,22 @@ impl From<ErrorTrackingError> for temps_core::problemdetails::Problem {
                     .value("group_id", group_id)
                     .build()
             }
+            ErrorTrackingError::IssueOpenedNotLinked {
+                group_id,
+                number,
+                ref url,
+                ref source,
+            } => {
+                let url = url.clone();
+                temps_core::error_builder::ErrorBuilder::new(issue_not_linked_status(source))
+                    .type_("https://temps.sh/probs/error-issue-opened-not-linked")
+                    .title("Issue Opened But Not Linked")
+                    .detail(err.to_string())
+                    .value("group_id", group_id)
+                    .value("number", number)
+                    .value("url", url)
+                    .build()
+            }
             ErrorTrackingError::SourceControlUnavailable { project_id, .. } => {
                 temps_core::error_builder::ErrorBuilder::new(StatusCode::SERVICE_UNAVAILABLE)
                     .type_("https://temps.sh/probs/source-control-unavailable")
@@ -672,6 +688,9 @@ impl axum::response::IntoResponse for ErrorTrackingError {
             | ErrorTrackingError::IssueLinkLimit { .. }
             | ErrorTrackingError::IssueCreationInProgress { .. } => {
                 (StatusCode::CONFLICT, self.to_string())
+            }
+            ErrorTrackingError::IssueOpenedNotLinked { ref source, .. } => {
+                (issue_not_linked_status(source), self.to_string())
             }
             ErrorTrackingError::SourceControlUnavailable { .. } => {
                 (StatusCode::SERVICE_UNAVAILABLE, self.to_string())
@@ -1315,6 +1334,16 @@ pub async fn list_global_error_groups(
             total_pages: total_count.div_ceil(page_size),
         },
     }))
+}
+
+/// The status of an issue opened but not linked: a conflict when the group
+/// filled up or already has the URL, an internal error otherwise.
+fn issue_not_linked_status(source: &ErrorTrackingError) -> StatusCode {
+    match source {
+        ErrorTrackingError::IssueLinkLimit { .. }
+        | ErrorTrackingError::IssueAlreadyLinked { .. } => StatusCode::CONFLICT,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
 }
 
 /// The HTTP status, problem type and title of a repository failure.
