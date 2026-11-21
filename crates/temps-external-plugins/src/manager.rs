@@ -1477,7 +1477,8 @@ impl ExternalPluginManager {
         };
         info!(plugin = %plugin_name, "Reloading external plugin");
         old.shutdown().await;
-        old.cleanup_files();
+        // Drop owns socket and PID cleanup. Finish it before reusing either path.
+        drop(old);
         self.start_plugin(&active).await
     }
 

@@ -2719,6 +2719,13 @@ except Exception:
 
         service.reload_plugins().await.unwrap();
         service.manager.reload_plugin(name).await.unwrap();
+        let socket = service.manager.socket_path_for(name).await.unwrap();
+        tokio::net::UnixStream::connect(socket)
+            .await
+            .expect("replacement socket accepts connections");
+        let pid = std::fs::read_to_string(config.pids_dir.join(format!("{name}.pid")))
+            .expect("replacement PID file");
+        assert!(pid.trim().parse::<u32>().is_ok_and(|pid| pid > 0));
         let reloaded = service.plugin_ai_tools(name).await.unwrap();
         assert_eq!(reloaded.actor_id, actor);
         assert_eq!(reloaded.installation_revision, receipt.sha256);
