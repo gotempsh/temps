@@ -2651,6 +2651,84 @@ except Exception:
             "a rejected queued install must not create plugin state"
         );
     }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn single_reload_preserves_the_process_and_actor_when_a_different_file_is_active() {
+        use crate::install::{LocalFileReceipt, LocalFileSource};
+        if !std::path::Path::new("/usr/bin/python3").exists() {
+            return;
+        }
+        let database = match temps_test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error)
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+            {
+                eprintln!("Skipping single plugin reload fixture: Docker unavailable");
+                return;
+            }
+            Err(error) => panic!("fixture database: {error}"),
+        };
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let name = "reload-fixture";
+        let version = "1.0.0";
+        let mut config =
+            ExternalPluginConfig::new(root.path().into(), "postgres://localhost/test".into());
+        config.sockets_dir = root.path().join("sockets");
+        std::fs::create_dir_all(&config.sockets_dir).unwrap();
+        let service =
+            ExternalPluginsService::new_empty(config.clone(), None, database.connection_arc());
+        let binary = root.path().join("upload");
+        let mut bytes = protocol_v2_fixture(name, version);
+        std::fs::write(&binary, &bytes).unwrap();
+        let mut receipt = LocalFileReceipt {
+            source: LocalFileSource::File,
+            plugin_name: name.into(),
+            version: version.into(),
+            platform: platform_target().unwrap(),
+            sha256: hex::encode(Sha256::digest(&bytes)),
+        };
+        service.install_file(&receipt, &binary).await.unwrap();
+        let original = service.manager.socket_path_for(name).await.unwrap();
+
+        // The new receipt and actor have committed, while the original process remains live.
+        bytes.extend_from_slice(b"\n# replacement release\n");
+        std::fs::write(&binary, &bytes).unwrap();
+        receipt.sha256 = hex::encode(Sha256::digest(&bytes));
+        let candidate = PluginInstaller::prepare_file(&config.plugins_dir, &receipt, &binary)
+            .await
+            .unwrap();
+        PluginInstaller::new(config.registry.clone())
+            .unwrap()
+            .activate(&candidate)
+            .await
+            .unwrap();
+        let grants = crate::grants::PluginGrantService::new(database.connection_arc());
+        let source = receipt.actor_source();
+        let actor = grants.prepare_actor(name, &source).await.unwrap().actor.id;
+        grants
+            .commit_actor(name, &actor, &receipt.sha256, &source)
+            .await
+            .unwrap();
+
+        let error = service.manager.reload_plugin(name).await.unwrap_err();
+        assert!(error.contains("different release"), "{error}");
+        assert_eq!(
+            service.manager.socket_path_for(name).await.as_ref(),
+            Some(&original)
+        );
+        assert!(original.exists());
+        let settings = service.plugin_ai_tools(name).await.unwrap();
+        assert_eq!(settings.actor_id, actor);
+        assert_eq!(settings.installation_revision, receipt.sha256);
+
+        service.reload_plugins().await.unwrap();
+        service.manager.reload_plugin(name).await.unwrap();
+        let reloaded = service.plugin_ai_tools(name).await.unwrap();
+        assert_eq!(reloaded.actor_id, actor);
+        assert_eq!(reloaded.installation_revision, receipt.sha256);
+        service.shutdown_all().await;
+    }
+
     #[tokio::test]
     #[cfg(unix)]
     async fn installed_plugin_tools_are_discoverable_gated_and_callable_over_http() {

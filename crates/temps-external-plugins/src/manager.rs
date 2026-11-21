@@ -656,15 +656,7 @@ impl ExternalPluginManager {
         let mut manifests = Vec::new();
 
         for installation in binaries {
-            match self
-                .start_plugin(
-                    &installation.name,
-                    &installation.version,
-                    &installation.sha256,
-                    &installation.binary_path,
-                )
-                .await
-            {
+            match self.start_plugin(&installation).await {
                 Ok(manifest) => {
                     info!(
                         plugin = %manifest.name,
@@ -1219,35 +1211,18 @@ impl ExternalPluginManager {
     /// Start a verified active install and register it under its signed name.
     async fn start_plugin(
         &self,
-        expected_name: &str,
-        expected_version: &str,
-        expected_sha256: &str,
-        binary_path: &Path,
+        installation: &crate::install::ActiveInstallation,
     ) -> Result<PluginManifest, String> {
-        let source_identity =
-            match crate::install::active_source(&self.config.plugins_dir, expected_name).await {
-                Ok(Some(crate::install::ActiveSource::File(receipt))) => receipt.actor_source(),
-                Ok(Some(crate::install::ActiveSource::Repository(receipt))) => {
-                    repository_actor_source(&receipt.repository, receipt.path.as_deref())
-                }
-                Ok(None | Some(crate::install::ActiveSource::Registry)) => {
-                    registry_actor_source(&self.config.registry.url)
-                }
-                Err(error) => {
-                    return Err(format!(
-                        "Cannot resolve verified source identity for {expected_name}: {error}"
-                    ));
-                }
-            };
+        let expected_name = &installation.name;
         let process = self
             .spawn_plugin(
-                binary_path,
-                expected_sha256,
+                &installation.binary_path,
+                &installation.sha256,
                 expected_name,
-                expected_version,
+                &installation.version,
                 expected_name,
                 expected_name,
-                source_identity,
+                installation.source_identity.clone(),
                 false,
             )
             .await?;
@@ -1490,32 +1465,48 @@ impl ExternalPluginManager {
     ///
     /// Returns the new manifest on success, or an error string on failure.
     pub async fn reload_plugin(&self, plugin_name: &str) -> Result<PluginManifest, String> {
-        // Find the binary path before shutting down
-        let (binary_path, version, sha256) = {
-            let plugins = self.plugins.read().await;
-            match plugins.get(plugin_name) {
-                Some(process) => (
-                    process.binary_path.clone(),
-                    process.manifest.version.clone(),
-                    process.sha256.clone(),
-                ),
-                None => {
-                    return Err(format!(
-                        "Plugin '{}' is not running; cannot reload",
-                        plugin_name
-                    ))
+        if !self.plugins.read().await.contains_key(plugin_name) {
+            return Err(format!(
+                "Plugin '{plugin_name}' is not running; cannot reload"
+            ));
+        }
+        let active = crate::install::verified_active_installation(
+            plugin_name,
+            &self.config.plugins_dir,
+            &self.config.registry,
+        )
+        .await
+        .map_err(|error| {
+            format!("Cannot verify the active release of plugin '{plugin_name}': {error}")
+        })?;
+        // Check the same table entry that we remove. A divergent selector must
+        // not stop the healthy process or rebind its actor to another release.
+        let mut old = {
+            let mut plugins = self.plugins.write().await;
+            let entry = match plugins.entry(plugin_name.to_owned()) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry,
+                std::collections::hash_map::Entry::Vacant(_) => {
+                    return Err(format!("Plugin '{plugin_name}' stopped during reload"))
                 }
+            };
+            let process = entry.get();
+            if process.sha256 != active.sha256
+                || process.binary_path != active.binary_path
+                || process.manifest.version != active.version
+                || process
+                    .channel
+                    .as_ref()
+                    .map(|channel| channel.actor_binding().1)
+                    != Some(active.source_identity.as_str())
+            {
+                return Err(format!("Plugin '{plugin_name}' is running a different release than its verified active receipt. Reload all plugins to reconcile the installation."));
             }
+            entry.remove()
         };
-
         info!(plugin = %plugin_name, "Reloading external plugin");
-
-        // Phase 1: Shut down
-        self.shutdown_plugin(plugin_name).await;
-
-        // Phase 2: Re-start
-        self.start_plugin(plugin_name, &version, &sha256, &binary_path)
-            .await
+        old.shutdown().await;
+        old.cleanup_files();
+        self.start_plugin(&active).await
     }
 
     /// Get the config.
