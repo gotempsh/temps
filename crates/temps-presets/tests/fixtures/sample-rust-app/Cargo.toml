@@ -7,3 +7,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+
+# Its own workspace root, so `cargo build` inside the fixture does not
+# attach it to the repository's workspace.
+[workspace]
