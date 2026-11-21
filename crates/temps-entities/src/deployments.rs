@@ -206,7 +206,10 @@ pub struct Model {
     /// Whether this deployment's image runs its process as root (uid 0),
     /// resolved once by the deploy pipeline against the image's own
     /// `/etc/passwd`. `false` when the image runs as another user, its user
-    /// could not be resolved, or it was never checked.
+    /// could not be resolved, or it was never checked. A serialized row
+    /// written before the column existed reads as `false`, the column's own
+    /// default.
+    #[serde(default)]
     pub runs_as_root: bool,
     /// The `USER` the deployment's image declares, as written; `None` when
     /// it declares none (it then runs as root) or was never checked.
@@ -319,5 +322,20 @@ mod tests {
             DeploymentMetadata::default().container_runtime(),
             ContainerRuntimeOverrides::default()
         );
+    }
+
+    /// A deployment serialized before the image-user columns existed still
+    /// reads, as "not checked": the columns' own defaults.
+    #[test]
+    fn a_deployment_without_the_image_user_fields_reads_as_not_checked() {
+        let now = chrono::Utc::now();
+        let deployment: Model = serde_json::from_value(serde_json::json!({
+            "id": 1, "project_id": 1, "environment_id": 1, "slug": "my-app-1",
+            "state": "running", "created_at": now, "updated_at": now,
+            "docker_socket_mounted": false
+        }))
+        .unwrap();
+        assert!(!deployment.runs_as_root);
+        assert_eq!(deployment.image_user, None);
     }
 }
