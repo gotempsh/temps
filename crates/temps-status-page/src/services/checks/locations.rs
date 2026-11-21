@@ -15,7 +15,7 @@
 //! sealed to that node's key; a check with headers or a body is not sent to a
 //! node that cannot receive it sealed.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -395,6 +395,16 @@ struct NodeClient {
     sealing: NodeSealing,
 }
 
+/// Drop the cached clients that are past [`CLIENT_MAX_AGE`] and, when
+/// `active` is given, those of nodes no longer active workers, so a removed
+/// or replaced worker's client and decrypted token do not stay in memory.
+fn prune_clients(clients: &mut HashMap<i32, Arc<NodeClient>>, active: Option<&HashSet<i32>>) {
+    clients.retain(|node_id, client| {
+        client.built.elapsed() < CLIENT_MAX_AGE
+            && active.is_none_or(|active| active.contains(node_id))
+    });
+}
+
 /// Worker nodes as probe locations, reached over the same authenticated
 /// (mutual TLS when the node is `https://`) agent API as deployments.
 pub struct NodeProbeLocations {
@@ -471,10 +481,9 @@ impl NodeProbeLocations {
             token,
             sealing: node.request_sealing(),
         });
-        self.clients
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(node_id, client.clone());
+        let mut clients = self.clients.lock().unwrap_or_else(PoisonError::into_inner);
+        prune_clients(&mut clients, None);
+        clients.insert(node_id, client.clone());
         Ok(client)
     }
 
@@ -575,6 +584,11 @@ impl ProbeLocations for NodeProbeLocations {
             .order_by_asc(nodes::Column::Id)
             .all(self.db.as_ref())
             .await?;
+        let active: HashSet<i32> = candidates.iter().map(|node| node.id).collect();
+        prune_clients(
+            &mut self.clients.lock().unwrap_or_else(PoisonError::into_inner),
+            Some(&active),
+        );
         let candidates: Vec<NodeCandidate> = candidates.iter().map(NodeCandidate::from).collect();
         Ok(pick_nodes(&candidates, chrono::Utc::now()))
     }
@@ -625,6 +639,36 @@ mod tests {
                 .filter(|status| *status != ProbeStatus::Operational)
                 .map(|_| format!("{location} failed")),
         }
+    }
+
+    fn cached_client(age: Duration) -> Arc<NodeClient> {
+        Arc::new(NodeClient {
+            built: Instant::now()
+                .checked_sub(age)
+                .expect("the clock is past the age"),
+            client: reqwest::Client::new(),
+            url: "https://worker.example.test/probe".to_string(),
+            token: "node-token".to_string(),
+            sealing: NodeSealing::NoKey,
+        })
+    }
+
+    #[test]
+    fn clients_of_expired_or_removed_workers_are_dropped() {
+        let fresh = Duration::from_secs(1);
+        let mut clients = HashMap::from([
+            (1, cached_client(fresh)),
+            (2, cached_client(CLIENT_MAX_AGE + fresh)),
+            (3, cached_client(fresh)),
+        ]);
+        prune_clients(&mut clients, None);
+        let mut kept: Vec<i32> = clients.keys().copied().collect();
+        kept.sort_unstable();
+        assert_eq!(kept, [1, 3], "an expired client is dropped");
+
+        prune_clients(&mut clients, Some(&HashSet::from([3, 4])));
+        let kept: Vec<i32> = clients.keys().copied().collect();
+        assert_eq!(kept, [3], "a worker no longer active loses its client");
     }
 
     #[test]
