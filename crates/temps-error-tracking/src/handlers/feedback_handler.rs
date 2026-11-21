@@ -147,7 +147,7 @@ pub async fn get_project_feedback(
     ))
 }
 
-#[utoipa::path(delete,path="/projects/{project_id}/feedback/{feedback_id}",params(("project_id"=i32,Path),("feedback_id"=i64,Path)),responses((status=204,description="Feedback permanently deleted"),(status=404,description="Feedback not found")),tag="feedback")]
+#[utoipa::path(delete,path="/projects/{project_id}/feedback/{feedback_id}",params(("project_id"=i32,Path),("feedback_id"=i64,Path)),responses((status=204,description="Feedback and its attachments permanently deleted"),(status=404,description="Feedback not found")),tag="feedback")]
 pub async fn delete_project_feedback(
     State(state): State<Arc<AppState>>,
     RequireAuth(auth): RequireAuth,
@@ -159,8 +159,7 @@ pub async fn delete_project_feedback(
     project_access_guard!(auth, project_id, state.project_access_checker);
     state
         .error_tracking_service
-        .feedback
-        .delete(project_id, feedback_id)
+        .delete_feedback(project_id, feedback_id)
         .await?;
     let audit = FeedbackTriagedAudit {
         context: AuditContext {

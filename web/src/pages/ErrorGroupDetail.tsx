@@ -24,6 +24,8 @@ import { IgnoreMenu } from '@/components/error-tracking/IgnoreMenu'
 import { ResolveMenu } from '@/components/error-tracking/ResolveMenu'
 import { AssigneeMenu } from '@/components/error-tracking/AssigneeMenu'
 import { GroupActivity } from '@/components/error-tracking/GroupActivity'
+import { GroupIssues } from '@/components/error-tracking/GroupIssues'
+import { SuspectCommits } from '@/components/error-tracking/SuspectCommits'
 import { PerformanceIssueCard } from '@/components/error-tracking/PerformanceIssueCard'
 import { performanceEvidence } from '@/components/error-tracking/performance-evidence'
 import {
@@ -514,6 +516,26 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
 
         {/* Overview Tab - Show Sentry Event Detail or Fallback */}
         <TabsContent value="overview" className="space-y-4 mt-6">
+          {/* Issues and suspect commits (ADR 111, D5) */}
+          <div className="grid gap-4 lg:grid-cols-2">
+            <Card>
+              <CardContent className="pt-6">
+                <GroupIssues
+                  projectId={project.id}
+                  groupId={parseInt(errorGroupId!)}
+                  groupTitle={errorGroup.title}
+                />
+              </CardContent>
+            </Card>
+            <Card>
+              <CardContent className="pt-6">
+                <SuspectCommits
+                  projectId={project.id}
+                  groupId={parseInt(errorGroupId!)}
+                />
+              </CardContent>
+            </Card>
+          </div>
           {sentryEvent ? (
             <SentryEventDetail
               event={sentryEvent}

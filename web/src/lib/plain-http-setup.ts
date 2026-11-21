@@ -237,13 +237,34 @@ async function pack(events) {
   return btoa(Array.from(bytes, (b) => String.fromCharCode(b)).join(''));
 }
 
+// Events for a session the server never registered are refused, so
+// recording starts only once init succeeds. Server errors, 429 and network
+// failures are retried with backoff; other 4xx answers will not change.
+async function initSession() {
+  const attempts = 6;
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    try {
+      const res = await fetch(${JSON.stringify(endpointUrl(setup, 'init'))}, {
+        method: 'POST', headers,
+        body: JSON.stringify({ sessionId, visitorId, url: location.href, userAgent: navigator.userAgent,
+          language: navigator.language, viewportWidth: innerWidth, viewportHeight: innerHeight }),
+      });
+      if (res.ok) return true;
+      if (res.status < 500 && res.status !== 429) return false;
+    } catch {
+      // Network error: retry.
+    }
+    // No wait after the last attempt: there is nothing left to retry.
+    if (attempt < attempts - 1) {
+      await new Promise((resolve) => setTimeout(resolve, 1000 * 2 ** attempt));
+    }
+  }
+  return false;
+}
+
 // Call after the visitor consents, where the law requires it.
 export async function startReplay() {
-  await fetch(${JSON.stringify(endpointUrl(setup, 'init'))}, {
-    method: 'POST', headers,
-    body: JSON.stringify({ sessionId, visitorId, url: location.href, userAgent: navigator.userAgent,
-      language: navigator.language, viewportWidth: innerWidth, viewportHeight: innerHeight }),
-  });
+  if (!(await initSession())) return;
   let buffer = [];
   let pending = null; // kept, with the same batchId, until the server accepts it
   let sending = false;

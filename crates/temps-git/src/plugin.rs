@@ -83,6 +83,13 @@ impl TempsPlugin for GitPlugin {
             // PR preview commenter — turns deployment lifecycle events into
             // sticky PR/MR comments. Failures never block deploys (see
             // GitPrCommenter::upsert_preview_comment).
+            // Issues and commits of a project's repository, for error tracking
+            // (ADR 111, D5).
+            let source_control: Arc<dyn temps_core::ProjectSourceControl> = Arc::new(
+                crate::GitSourceControl::new(db.clone(), git_provider_trait.clone()),
+            );
+            context.register_service(source_control);
+
             let pr_commenter: Arc<dyn crate::PrCommenter> =
                 Arc::new(crate::GitPrCommenter::new(db.clone(), git_provider_trait));
             context.register_service(pr_commenter.clone());

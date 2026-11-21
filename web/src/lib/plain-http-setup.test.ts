@@ -406,3 +406,76 @@ test('the rrweb example stops recording once failed uploads queue too many event
   emit({ type: 3, i: 'last' })
   expect(stopped).toBe(1)
 })
+
+describe('the rrweb example starts recording only after init succeeds', () => {
+  function run(initAnswers: number[]) {
+    const code = sessionReplayExamples(signalFixture('session_replay'))[1]
+      .code.replace(/^import .*$/m, '')
+      .replace('export async function', 'async function')
+    let recording = false
+    const inits: number[] = []
+    const waits: number[] = []
+    const startReplay = new Function(
+      'record',
+      'fetch',
+      'setInterval',
+      'setTimeout',
+      'sessionStorage',
+      'localStorage',
+      'location',
+      'navigator',
+      'innerWidth',
+      'innerHeight',
+      `${code}\nreturn startReplay;`
+    )(
+      () => {
+        recording = true
+        return () => {}
+      },
+      async (url: string) => {
+        if (!url.endsWith('/session-replay/init'))
+          return { ok: true, status: 200 }
+        const status = initAnswers.shift() ?? 201
+        inits.push(status)
+        return { ok: status < 300, status }
+      },
+      () => {},
+      // No real backoff in the test; record each requested delay.
+      (resolve: () => void, ms: number) => {
+        waits.push(ms)
+        resolve()
+      },
+      {},
+      {},
+      { href: 'https://apps.example.com/' },
+      { userAgent: 'test', language: 'en' },
+      1280,
+      800
+    ) as () => Promise<void>
+    return { startReplay, inits, waits, isRecording: () => recording }
+  }
+
+  test('a temporary init failure is retried, then recording starts', async () => {
+    const replay = run([503, 429, 201])
+    await replay.startReplay()
+    expect(replay.inits).toEqual([503, 429, 201])
+    expect(replay.waits).toEqual([1000, 2000])
+    expect(replay.isRecording()).toBe(true)
+  })
+
+  test('a refused init does not start recording or retry', async () => {
+    const replay = run([400])
+    await replay.startReplay()
+    expect(replay.inits).toEqual([400])
+    expect(replay.isRecording()).toBe(false)
+  })
+
+  test('init gives up after repeated server errors without recording', async () => {
+    const replay = run([500, 500, 500, 500, 500, 500, 500])
+    await replay.startReplay()
+    expect(replay.inits).toHaveLength(6)
+    // Backoff only between attempts: no wait after the last one.
+    expect(replay.waits).toEqual([1000, 2000, 4000, 8000, 16000])
+    expect(replay.isRecording()).toBe(false)
+  })
+})

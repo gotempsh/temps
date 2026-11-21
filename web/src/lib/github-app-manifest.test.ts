@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { installBrowserWindow } from '@/test/dom'
 import {
   createManifestSetupTracker,
+  githubAppManifest,
   GITHUB_APP_WINDOW,
   githubAppWindowName,
   githubManifestAction,
@@ -296,5 +297,47 @@ describe('githubAppWindowName', () => {
 
     expect(first.startsWith(GITHUB_APP_WINDOW)).toBe(true)
     expect(first).not.toBe(second)
+  })
+})
+
+describe('githubAppManifest', () => {
+  const manifest = githubAppManifest({
+    name: 'temps-abc123',
+    origin: 'https://temps.example.test',
+    eventsUrl: 'https://temps.example.test/api/webhook/git/github/events',
+  })
+
+  test('asks for the permission to open issues from an error group', () => {
+    expect(manifest.default_permissions.issues).toBe('write')
+  })
+
+  test('keeps the permissions deployments need', () => {
+    expect(manifest.default_permissions).toMatchObject({
+      contents: 'write',
+      metadata: 'read',
+      emails: 'read',
+      administration: 'write',
+      pull_requests: 'write',
+      members: 'read',
+    })
+    expect(manifest.default_events).toEqual(['push', 'pull_request'])
+  })
+
+  test('points GitHub back at this server', () => {
+    expect(manifest.url).toBe('https://temps.example.test')
+    expect(manifest.redirect_url).toBe(
+      'https://temps.example.test/api/webhook/git/github/auth'
+    )
+    expect(manifest.callback_urls).toEqual([
+      'https://temps.example.test/api/webhook/git/github/auth',
+      'https://temps.example.test/api/webhook/git/github/callback',
+    ])
+    expect(manifest.setup_url).toBe(
+      'https://temps.example.test/api/webhook/git/github/install'
+    )
+    expect(manifest.hook_attributes).toEqual({
+      url: 'https://temps.example.test/api/webhook/git/github/events',
+      active: true,
+    })
   })
 })

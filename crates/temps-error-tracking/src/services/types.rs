@@ -147,6 +147,61 @@ pub enum ErrorTrackingError {
     #[error("Error event not found")]
     EventNotFound,
 
+    /// An attachment id that is not one of the project's, or whose stored
+    /// object is gone (ADR 111, D4). Maps to HTTP 404 Not Found.
+    #[error("Attachment {attachment_id} not found in project {project_id}")]
+    AttachmentNotFound { project_id: i32, attachment_id: i64 },
+
+    /// Blob storage is not set up or cannot be reached, so an attachment
+    /// cannot be read or deleted. Maps to HTTP 503 Service Unavailable.
+    #[error("Attachment storage is unavailable for project {project_id}: {reason}")]
+    AttachmentStorageUnavailable { project_id: i32, reason: String },
+
+    /// No issue link with that id on the group (ADR 111, D5). 404.
+    #[error("Issue link {link_id} not found on error group {group_id}")]
+    IssueLinkNotFound { group_id: i32, link_id: i64 },
+
+    /// The URL is already linked to the group, or an issue opened for the
+    /// group is still open in the repository. 409.
+    #[error("Error group {group_id} is already linked to {url}")]
+    IssueAlreadyLinked { group_id: i32, url: String },
+
+    /// The group has as many linked issues as it may. 409.
+    #[error("Error group {group_id} already has the maximum of {limit} linked issues")]
+    IssueLinkLimit { group_id: i32, limit: usize },
+
+    /// Another request is opening an issue for the group. 409.
+    #[error("An issue is already being opened for error group {group_id}; try again in a moment")]
+    IssueCreationInProgress { group_id: i32 },
+
+    /// The issue was opened in the repository, but its link could not be
+    /// stored afterwards (the group filled up meanwhile, or the database
+    /// failed). The issue exists; it can be linked by its URL. 409 when the
+    /// group is full or already has it, 500 otherwise.
+    #[error(
+        "Opened issue #{number} ({url}) for error group {group_id}, but could not link it: {source}; link it by its URL to keep it with the group"
+    )]
+    IssueOpenedNotLinked {
+        group_id: i32,
+        number: i64,
+        url: String,
+        #[source]
+        source: Box<ErrorTrackingError>,
+    },
+
+    /// The server has no way to reach repositories. 503.
+    #[error("Source control is unavailable for project {project_id}: {reason}")]
+    SourceControlUnavailable { project_id: i32, reason: String },
+
+    /// The project's repository is not connected, not supported, or refused
+    /// or failed the request; the status follows the cause.
+    #[error("{source}")]
+    SourceControl {
+        project_id: i32,
+        #[source]
+        source: temps_core::SourceControlError,
+    },
+
     #[error("Invalid fingerprint")]
     InvalidFingerprint,
 
