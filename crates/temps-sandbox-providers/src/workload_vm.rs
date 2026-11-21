@@ -82,7 +82,7 @@ pub const WORKLOAD_VM_DRIVER: &str = "firecracker";
 
 /// Prefix of a workload VM's id inside the sandbox backend's namespace, so
 /// workload VMs and sandboxes never collide.
-const WORKLOAD_VM_ID_PREFIX: &str = "wl-";
+pub(crate) const WORKLOAD_VM_ID_PREFIX: &str = "wl-";
 
 /// What the driver persists next to the VM (`<vm dir>/workload.json`).
 const STATE_FILE: &str = "workload.json";
