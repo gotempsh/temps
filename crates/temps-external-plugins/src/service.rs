@@ -544,29 +544,17 @@ impl ExternalPluginsService {
             let _ = installer.discard(candidate).await;
             return Err(error.into());
         }
-        let grant_service = crate::grants::PluginGrantService::new(self.db.clone());
-        if let Err(error) = grant_service
-            .commit_actor(
-                &candidate.name,
+        if let Err(error) = self
+            .commit_candidate_actor(
+                &installer,
+                candidate,
                 &candidate_actor_id,
-                &candidate.sha256,
                 &candidate_source_identity,
+                activation_rollback,
             )
             .await
         {
-            let first_install = activation_rollback.was_first_install();
-            if let Err(rollback_error) = installer
-                .rollback_candidate(candidate, activation_rollback)
-                .await
-            {
-                tracing::error!(plugin = %candidate.name, error = %rollback_error, "Failed to roll back plugin candidate after actor identity commit failed");
-            }
             self.manager.discard_candidate(pending).await;
-            if first_install {
-                if let Err(revoke_error) = grant_service.revoke_actor(&candidate.name).await {
-                    tracing::error!(plugin = %candidate.name, error = %revoke_error, "Failed to revoke actor created for rejected first installation");
-                }
-            }
             return Err(error.into());
         }
         self.ai_tools
@@ -574,6 +562,41 @@ impl ExternalPluginsService {
         self.manager.promote_candidate(pending).await;
         self.refresh_runtime_surfaces().await;
         Ok(candidate_actor_id)
+    }
+
+    async fn commit_candidate_actor(
+        &self,
+        installer: &PluginInstaller,
+        candidate: &crate::install::InstallCandidate,
+        actor_id: &str,
+        source_identity: &str,
+        rollback: crate::install::ActivationRollback,
+    ) -> Result<(), crate::grants::GrantError> {
+        let grants = crate::grants::PluginGrantService::new(self.db.clone());
+        let result = grants
+            .commit_actor(
+                &candidate.name,
+                actor_id,
+                &candidate.sha256,
+                source_identity,
+            )
+            .await;
+        match &result {
+            Ok(()) => {}
+            Err(crate::grants::GrantError::ActivationUnconfirmed { .. }) => {
+                // Keep the verified receipt and release for reconciliation on reload.
+                self.ai_tools
+                    .publish(self.ai_tools.snapshot().without_plugin(&candidate.name));
+            }
+            Err(_) => {
+                // Preparation is provisional. A rolled-back transaction leaves the
+                // previous actor and its grants intact, including on first install.
+                if let Err(error) = installer.rollback_candidate(candidate, rollback).await {
+                    tracing::error!(plugin = %candidate.name, %error, "Failed to restore the previous plugin activation");
+                }
+            }
+        }
+        result
     }
 
     /// Install the bridge plugins use to call the platform's own HTTP API.
@@ -1018,29 +1041,17 @@ impl ExternalPluginsService {
             }
             return Err(error.into());
         }
-        let grant_service = crate::grants::PluginGrantService::new(self.db.clone());
-        if let Err(error) = grant_service
-            .commit_actor(
-                &candidate.name,
+        if let Err(error) = self
+            .commit_candidate_actor(
+                &installer,
+                &candidate,
                 &candidate_actor_id,
-                &candidate.sha256,
                 &candidate_source_identity,
+                activation_rollback,
             )
             .await
         {
-            let first_install = activation_rollback.was_first_install();
-            if let Err(rollback_error) = installer
-                .rollback_candidate(&candidate, activation_rollback)
-                .await
-            {
-                tracing::error!(plugin = %candidate.name, error = %rollback_error, "Failed to roll back plugin candidate after actor identity commit failed");
-            }
             self.manager.discard_candidate(pending).await;
-            if first_install {
-                if let Err(revoke_error) = grant_service.revoke_actor(&candidate.name).await {
-                    tracing::error!(plugin = %candidate.name, error = %revoke_error, "Failed to revoke actor created for rejected first installation");
-                }
-            }
             return Err(error.into());
         }
         self.ai_tools

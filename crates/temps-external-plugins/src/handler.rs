@@ -48,6 +48,12 @@ fn grant_problem(error: crate::grants::GrantError) -> Problem {
                 .with_title("Plugin Actor Changed")
                 .with_detail(error.to_string())
         }
+        crate::grants::GrantError::ActivationUnconfirmed { .. } => {
+            tracing::error!(%error, "Plugin activation could not be confirmed");
+            temps_core::problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+                .with_title("Plugin Activation Unconfirmed")
+                .with_detail("The verified release was retained. Reload plugins after the database recovers to reconcile its activation.")
+        }
         crate::grants::GrantError::Database { .. } => {
             tracing::error!(error = %error, "Plugin grant database operation failed");
             temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
@@ -971,6 +977,8 @@ fn public_error_detail(error: &ExternalPluginsError) -> String {
         ExternalPluginsError::CandidateRejected { name, version, .. } => {
             format!("Plugin '{name}' v{version} did not pass startup verification")
         }
+        ExternalPluginsError::Grant(crate::grants::GrantError::ActivationUnconfirmed { plugin_name, .. }) =>
+            format!("Activation of plugin '{plugin_name}' could not be confirmed. The verified release was retained. Reload plugins after the database recovers."),
         ExternalPluginsError::Grant(_) => {
             "The plugin actor identity could not be committed after activation".to_string()
         }
@@ -3113,6 +3121,19 @@ mod tests {
             assert_eq!(body["tools"], serde_json::json!([]));
         }
         assert_eq!(audit.operations.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn uncertain_activation_explains_how_to_recover_the_verified_release() {
+        let error = ExternalPluginsError::Grant(crate::grants::GrantError::ActivationUnconfirmed {
+            plugin_name: "fixture".into(),
+            source: sea_orm::DbErr::Custom("private database diagnostic".into()),
+        });
+        let detail = public_error_detail(&error);
+        assert!(detail.contains("fixture"));
+        assert!(detail.contains("verified release was retained"));
+        assert!(detail.contains("Reload plugins"));
+        assert!(!detail.contains("private database diagnostic"));
     }
 
     #[tokio::test]

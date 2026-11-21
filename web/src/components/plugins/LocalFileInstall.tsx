@@ -39,10 +39,17 @@ const schema = z.object({
       value.size <= 256 * 1024 * 1024,
     'Choose a non-empty executable of at most 256 MiB.'
   ),
-  trusted: z
-    .boolean()
-    .refine((value) => value, 'Confirm that you trust this executable.'),
+  approvedDestination: z
+    .string()
+    .min(1, 'Confirm that you trust this executable.'),
 })
+
+function installDestination() {
+  const baseUrl = client.getConfig().baseUrl ?? '/api'
+  return typeof document === 'undefined'
+    ? baseUrl
+    : new URL(baseUrl, document.baseURI).href
+}
 
 export function LocalFileInstall({
   open,
@@ -58,7 +65,7 @@ export function LocalFileInstall({
   const queries = useQueryClient()
   const form = useForm<z.infer<typeof schema>>({
     resolver: zodResolver(schema),
-    defaultValues: { name: '', version: '', trusted: false },
+    defaultValues: { name: '', version: '', approvedDestination: '' },
   })
   const digest = useMutation({
     gcTime: 0,
@@ -83,13 +90,13 @@ export function LocalFileInstall({
   const resetDigest = digest.reset
   useEffect(() => {
     resetDigest()
-    reset({ name: expectedName, version: '', trusted: false })
+    reset({ name: expectedName, version: '', approvedDestination: '' })
   }, [expectedName, open, reset, resetDigest])
-  const baseUrl = client.getConfig().baseUrl ?? '/api'
-  const destination =
-    open && typeof document !== 'undefined'
-      ? new URL(baseUrl, document.baseURI).href
-      : baseUrl
+  const destination = installDestination()
+  const { resetField } = form
+  useEffect(() => {
+    resetField('approvedDestination')
+  }, [destination, resetField])
   const install = useMutation({
     mutationFn: async ({
       file,
@@ -117,12 +124,19 @@ export function LocalFileInstall({
     },
   })
   async function submit(values: z.infer<typeof schema>) {
-    if (!digest.data || digest.variables !== values.file) return
+    if (
+      !digest.data ||
+      digest.variables !== values.file ||
+      form.getValues('file') !== values.file ||
+      form.getValues('approvedDestination') !== values.approvedDestination ||
+      installDestination() !== values.approvedDestination
+    )
+      return
     try {
       await install.mutateAsync({
         ...values,
         sha256: digest.data,
-        target: destination,
+        target: values.approvedDestination,
       })
     } catch (error) {
       onSensitiveError(error, () => void submit(values))
@@ -159,7 +173,7 @@ export function LocalFileInstall({
                       {...props}
                       type="file"
                       onChange={(event) => {
-                        form.resetField('trusted')
+                        form.resetField('approvedDestination')
                         const file = event.target.files?.[0]
                         field.onChange(file)
                         if (file) digest.mutate(file)
@@ -200,19 +214,19 @@ export function LocalFileInstall({
             </div>
             <Controller
               control={form.control}
-              name="trusted"
+              name="approvedDestination"
               render={({ field }) => (
                 <Field
                   label="I trust this executable to run native code on the Temps host"
-                  error={errors.trusted?.message}
+                  error={errors.approvedDestination?.message}
                 >
                   {(props) => (
                     <Checkbox
                       {...props}
                       disabled={!digest.isSuccess}
-                      checked={field.value}
+                      checked={field.value === destination}
                       onCheckedChange={(value) =>
-                        field.onChange(value === true)
+                        field.onChange(value === true ? destination : '')
                       }
                     />
                   )}
