@@ -38,8 +38,10 @@ export interface IdentifyOptions {
   /** Merged into the visitor's attributes; `null` removes a key. 32 keys, 8 KB. */
   traits?: Record<string, IdentifyTraitValue>;
   /**
-   * The visitor, when the request carries no `_temps_visitor_id` cookie.
-   * A deployment token only accepts the sealed `enc_…` cookie value.
+   * The visitor, when the request carries no `_temps_visitor_id` cookie,
+   * sent as given. A deployment token only accepts the sealed reference:
+   * `enc_` followed by the cookie's value (what `visitorIdFromRequest`
+   * returns).
    */
   visitorId?: string;
   /**
@@ -69,6 +71,8 @@ export interface IdentifyResult {
 }
 
 export const VISITOR_COOKIE = '_temps_visitor_id';
+/** Marks a visitor reference as the proxy's sealed cookie value. */
+const SEALED_PREFIX = 'enc_';
 const DEFAULT_TIMEOUT_MS = 5_000;
 
 function envVar(name: string): string | undefined {
@@ -85,8 +89,17 @@ function header(request: RequestLike, name: string): string | undefined {
   return Array.isArray(value) ? value.join('; ') : value;
 }
 
-/** The value of the `_temps_visitor_id` cookie of `request`, if any. */
+/**
+ * The API reference of the visitor named by the request's
+ * `_temps_visitor_id` cookie: `enc_` and the sealed value the proxy stores
+ * there (it stores no prefix). `undefined` without the cookie.
+ */
 export function visitorIdFromRequest(request: RequestLike): string | undefined {
+  const sealed = visitorCookie(request);
+  return sealed ? `${SEALED_PREFIX}${sealed}` : undefined;
+}
+
+function visitorCookie(request: RequestLike): string | undefined {
   const cookies = header(request, 'cookie');
   if (!cookies) return undefined;
   for (const part of cookies.split(';')) {

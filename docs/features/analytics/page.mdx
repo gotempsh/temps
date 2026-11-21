@@ -1140,7 +1140,7 @@ async function clearTrialData(visitorId: string) {
 ### Getting Visitor ID from Frontend
 
 To attach your user to a visitor, use [`identify()`](#identify-users): it needs no visitor id at all. To call enrichment yourself, you need the visitor's id, which can be:
-- A sealed, encrypted ID (e.g., `"enc_..."`), the value Temps sets in the `_temps_visitor_id` cookie on every request it proxies. Your backend reads it from the request; deployment tokens accept only this form.
+- A sealed, encrypted ID (e.g., `"enc_..."`): `enc_` followed by the value of the `_temps_visitor_id` cookie, which Temps sets on every request it proxies (the cookie itself has no prefix). Your backend reads it from the request; deployment tokens accept only this form. The Node SDK's `visitorIdFromRequest(request)` builds it for you.
 - A GUID (e.g., `"550e8400-e29b-41d4-a716-446655440000"`), which the browser tracker stores when Temps does not serve the page. `getVisitorId()` returns it, for a backend calling with an API key.
 - A numeric ID (e.g., `123`), as shown in the console.
 
@@ -1163,11 +1163,13 @@ An app that Temps deploys doesn't need an API key to enrich its own visitors. Te
 // `_temps_visitor_id` is set by the Temps proxy on every request it serves.
 export async function POST(request: Request) {
   const cookie = request.headers.get('cookie') ?? '';
-  const sealedVisitorId = cookie.match(/_temps_visitor_id=([^;]+)/)?.[1];
+  const sealedValue = cookie.match(/_temps_visitor_id=([^;]+)/)?.[1];
 
-  if (!sealedVisitorId) {
+  if (!sealedValue) {
     return Response.json({ error: 'no visitor cookie' }, { status: 400 });
   }
+  // The cookie holds the sealed value alone; the API reference adds `enc_`.
+  const sealedVisitorId = `enc_${sealedValue}`;
 
   // TEMPS_API_URL is injected by Temps and already ends in /api
   const response = await fetch(
@@ -1198,7 +1200,7 @@ Deployment tokens are deliberately more restricted than an API key:
 
 <Properties>
   <Property name="Sealed IDs only">
-    A deployment token may only address a visitor by the sealed `enc_...` ID from the `_temps_visitor_id` cookie. Numeric IDs and raw GUIDs are rejected with `403`, so a token baked into a container can't walk through other people's visitors by guessing IDs.
+    A deployment token may only address a visitor by the sealed `enc_...` ID: `enc_` and the value of the `_temps_visitor_id` cookie. Numeric IDs and raw GUIDs are rejected with `403`, so a token baked into a container can't walk through other people's visitors by guessing IDs.
   </Property>
   <Property name="Own project only">
     The token is confined to its own project. A sealed ID belonging to another project reads as "visitor not found", not as an error that confirms the visitor exists.
