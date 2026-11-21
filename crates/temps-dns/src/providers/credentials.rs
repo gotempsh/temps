@@ -102,6 +102,22 @@ pub struct DigitalOceanCredentials {
     pub api_token: String,
 }
 
+/// deSEC credentials. The token is stored encrypted at rest.
+#[derive(Clone, Serialize, Deserialize, ToSchema)]
+pub struct DeSecCredentials {
+    /// deSEC API token with permission to list domains and read/write RRsets
+    #[schema(example = "your-desec-api-token")]
+    pub api_token: String,
+}
+
+impl std::fmt::Debug for DeSecCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeSecCredentials")
+            .field("api_token", &"[REDACTED]")
+            .finish()
+    }
+}
+
 /// Google Cloud DNS credentials
 ///
 /// GCP uses service account credentials for authentication.
@@ -172,6 +188,7 @@ pub enum ProviderCredentials {
     Namecheap(NamecheapCredentials),
     Route53(Route53Credentials),
     DigitalOcean(DigitalOceanCredentials),
+    DeSec(DeSecCredentials),
     Gcp(GcpCredentials),
     Azure(AzureCredentials),
     Pebble(PebbleCredentials),
@@ -209,6 +226,12 @@ impl ProviderCredentials {
             ProviderCredentials::DigitalOcean(c) => {
                 serde_json::json!({
                     "type": "digitalocean",
+                    "api_token": mask_string(&c.api_token),
+                })
+            }
+            ProviderCredentials::DeSec(c) => {
+                serde_json::json!({
+                    "type": "desec",
                     "api_token": mask_string(&c.api_token),
                 })
             }
@@ -283,6 +306,33 @@ mod tests {
         assert_eq!(masked["type"], "cloudflare");
         assert_eq!(masked["api_token"], "very...here");
         assert_eq!(masked["account_id"], "acco...2345");
+    }
+
+    #[test]
+    fn test_desec_credentials_are_masked() {
+        let creds = ProviderCredentials::DeSec(DeSecCredentials {
+            api_token: "desec-api-token-long-enough-to-mask".to_string(),
+        });
+
+        let masked = creds.masked();
+        assert_eq!(masked["type"], "desec");
+        assert_eq!(masked["api_token"], "dese...mask");
+    }
+
+    #[test]
+    fn test_desec_credentials_use_the_api_discriminator_for_storage() {
+        let credentials = ProviderCredentials::DeSec(DeSecCredentials {
+            api_token: "desec-token".to_string(),
+        });
+
+        let value = serde_json::to_value(&credentials).unwrap();
+        assert_eq!(value["type"], "desec");
+        assert_eq!(
+            serde_json::from_value::<ProviderCredentials>(value)
+                .unwrap()
+                .masked()["type"],
+            "desec"
+        );
     }
 
     #[test]
