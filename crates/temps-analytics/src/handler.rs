@@ -1486,7 +1486,18 @@ async fn identify_visitor_in_project(
         }
     }
 
-    Ok(Json(IdentifyVisitorResponse::from(result.outcome)))
+    // A write-only caller (a `visitors:enrich` deployment token) must not
+    // learn whether the stored identity already matched what it sent, the
+    // same rule enrichment follows: a repeat answers like an update. (The
+    // write budget and timing still narrow, not remove, what it can infer.)
+    let outcome = if result.outcome == IdentifyOutcome::Unchanged
+        && !auth.has_permission(&Permission::AnalyticsRead)
+    {
+        IdentifyOutcome::Updated
+    } else {
+        result.outcome
+    };
+    Ok(Json(IdentifyVisitorResponse::from(outcome)))
 }
 
 #[utoipa::path(
@@ -2988,6 +2999,9 @@ mod enrich_handler_tests {
             .await
             .expect("identified");
         assert_eq!(ok.status(), StatusCode::OK);
+        let first_answer = axum::body::to_bytes(ok.into_body(), usize::MAX)
+            .await
+            .expect("first body");
         let stored = temps_entities::visitor::Entity::find_by_id(visitor.id)
             .one(db.as_ref())
             .await
@@ -3009,11 +3023,19 @@ mod enrich_handler_tests {
             "the user id stays out of the audit trail"
         );
 
-        // Repeating it changes nothing and writes no audit row.
-        call(can_enrich(project), project, &sealed, "u_1")
+        // Repeating it changes nothing and writes no audit row, and the
+        // write-only token gets the same answer as for the change.
+        let repeat = call(can_enrich(project), project, &sealed, "u_1")
             .await
             .expect("unchanged");
         assert_eq!(audit.0.lock().unwrap().len(), 1);
+        let repeat_answer = axum::body::to_bytes(repeat.into_body(), usize::MAX)
+            .await
+            .expect("repeat body");
+        assert_eq!(
+            first_answer, repeat_answer,
+            "a write-only token cannot tell a repeat from an update"
+        );
 
         // The token-scoped route takes the project from the token.
         let by_token = |auth: AuthContext, user_id: &str| {
