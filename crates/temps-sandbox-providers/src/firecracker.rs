@@ -2788,7 +2788,19 @@ impl SandboxProvider for FirecrackerSandboxProvider {
     async fn start(&self, handle: &SandboxHandle) -> Result<(), AgentError> {
         let name = &handle.sandbox_name;
         if self.vm_pid(name).is_some() {
-            return Ok(()); // already running
+            // Already running. A VM whose user was never confirmed (a boot
+            // cut short after launch) is confirmed now rather than left
+            // refusing its commands.
+            if super::fc_sandbox_user::needs_confirmation(name, &self.config.vm_dir(name)) {
+                if let Err(reason) = self.confirm_sandbox_user(name).await {
+                    let _ = self.stop(handle).await;
+                    return Err(self.err(
+                        name,
+                        format!("the running sandbox cannot run as the sandbox user: {reason}"),
+                    ));
+                }
+            }
+            return Ok(());
         }
         if !self.config.vm_dir(name).join("vm.json").exists() {
             return Err(self.err(name, "no persisted VM config; sandbox was destroyed"));
@@ -2803,7 +2815,12 @@ impl SandboxProvider for FirecrackerSandboxProvider {
             )
         })?;
         // Rootfs persisted across stop — the VM resumes its filesystem state.
-        self.spawn_vm(name).await?;
+        // A VMM that launched but never became ready is stopped, so the next
+        // start boots it again and confirms its user.
+        if let Err(e) = self.spawn_vm(name).await {
+            let _ = self.stop(handle).await;
+            return Err(e);
+        }
         // The guest prepares the sandbox user again at every boot.
         if let Err(reason) = self.confirm_sandbox_user(name).await {
             let _ = self.stop(handle).await;
@@ -4015,6 +4032,43 @@ mod tests {
         assert!(
             crate::fc_sandbox_user::recorded_uid(&vm_dir).is_err(),
             "commands are refused, not run as the previous boot's root"
+        );
+    }
+
+    /// A VM left running without a confirmed user (its boot was cut short)
+    /// has the user confirmed by the next start instead of staying refused.
+    /// Linux only: the provider recognises its VMM through `/proc`.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn starting_a_running_vm_confirms_a_user_it_never_confirmed() {
+        let name = sandbox_vm_name();
+        let (provider, dir) = provider_with_agent_answers(&name, vec![USER_READY]);
+        let vm_dir = provider.config.vm_dir(&name);
+        boot_with_sandbox_user(&vm_dir);
+        // A process the provider takes for this VM's VMM: the kernel names a
+        // process after the path it was started through, so a link named
+        // `firecracker` will do (and, unlike a fresh copy, cannot be "text
+        // file busy" while other tests fork).
+        let sleep = ["/bin/sleep", "/usr/bin/sleep"]
+            .into_iter()
+            .find(|path| Path::new(path).exists())
+            .expect("a sleep binary");
+        let vmm = dir.path().join("firecracker");
+        std::os::unix::fs::symlink(sleep, &vmm).unwrap();
+        let mut child = std::process::Command::new(&vmm).arg("30").spawn().unwrap();
+        std::fs::write(vm_dir.join("fc.pid"), child.id().to_string()).unwrap();
+        assert!(
+            provider.vm_pid(&name).is_some(),
+            "the fake VMM is recognised"
+        );
+
+        let started = provider.start(&provider.handle_for(&name)).await;
+        let _ = child.kill();
+        let _ = child.wait();
+        started.unwrap();
+        assert_eq!(
+            crate::fc_sandbox_user::recorded_uid(&vm_dir),
+            Ok(Some(1000))
         );
     }
 

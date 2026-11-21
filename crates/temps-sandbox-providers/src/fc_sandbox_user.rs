@@ -185,6 +185,14 @@ pub(crate) fn recorded_uid(vm_dir: &Path) -> Result<Option<u32>, String> {
     }
 }
 
+/// Whether the running VM `vm_name` (in `vm_dir`) still has to have its
+/// sandbox user confirmed: a sandbox whose record is missing while it
+/// booted with the user, or cannot be read. Its commands are refused until
+/// then.
+pub(crate) fn needs_confirmation(vm_name: &str, vm_dir: &Path) -> bool {
+    is_sandbox_vm(vm_name) && recorded_uid(vm_dir).is_err()
+}
+
 /// The uid for `exec_as_user(user)`. The guest agent runs commands by uid,
 /// so a name it cannot map without the image's `passwd` is refused rather
 /// than run as someone else.
@@ -368,6 +376,36 @@ mod tests {
             recorded_uid(dir.path()).is_err(),
             "a record that cannot be read"
         );
+    }
+
+    #[test]
+    fn only_a_sandbox_with_an_unsettled_user_needs_confirming() {
+        let dir = tempfile::tempdir().unwrap();
+        let sandbox = format!("{FC_SANDBOX_NAME_PREFIX}42");
+        assert!(
+            !needs_confirmation(&sandbox, dir.path()),
+            "booted without the user"
+        );
+        std::fs::write(
+            dir.path().join("vm.json"),
+            serde_json::json!({"boot-source": {"boot_args": sandbox_user().boot_arg()}})
+                .to_string(),
+        )
+        .unwrap();
+        assert!(needs_confirmation(&sandbox, dir.path()), "no record yet");
+        let workload = format!("{FC_SANDBOX_NAME_PREFIX}{WORKLOAD_VM_ID_PREFIX}my-app");
+        assert!(
+            !needs_confirmation(&workload, dir.path()),
+            "workload VMs have no user"
+        );
+        record(
+            dir.path(),
+            Some(&UserRecord::SandboxUser {
+                user: sandbox_user(),
+            }),
+        )
+        .unwrap();
+        assert!(!needs_confirmation(&sandbox, dir.path()), "confirmed");
     }
 
     #[test]
