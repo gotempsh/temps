@@ -47,6 +47,10 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        "installing a native executable requires the operator to select the file and explicitly trust its digest",
+        &["install_local_file"],
+    ),
+    (
         "plugin AI consent is inspected in the operator console; assistant discovery already lists declared tools and disabled access",
         &["get_plugin_ai_tools"],
     ),
