@@ -6,7 +6,7 @@ import { readFile, writeFile, mkdir } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { colors } from '../ui/output.js'
-import { getActiveContextSync } from './contexts.js'
+import { getActiveContextSync, type CliContext } from './contexts.js'
 
 export interface TempsConfig {
   apiUrl: string
@@ -129,14 +129,7 @@ export const config = {
     //   3. The legacy single-instance `conf` store (back-compat for users
     //      who haven't run `temps login` since this feature shipped)
     if (key === 'apiUrl') {
-      const envUrl = process.env.TEMPS_API_URL
-      if (envUrl) {
-        return envUrl as TempsConfig[K]
-      }
-      const ctx = getActiveContextSync()
-      if (ctx?.url) {
-        return ctx.url as TempsConfig[K]
-      }
+      return getApiUrl() as TempsConfig[K]
     }
     return configStore.get(key)
   },
@@ -255,14 +248,14 @@ export const credentials = {
     return !!secrets[SECRET_KEYS.apiKey]
   },
 
-  async getApiKey(): Promise<string | undefined> {
+  async getApiKey(context?: CliContext | null): Promise<string | undefined> {
     // Resolution order: env vars > active context > legacy single-instance.
     const envToken =
       process.env.TEMPS_TOKEN || process.env.TEMPS_API_TOKEN || process.env.TEMPS_API_KEY
     if (envToken) {
       return envToken
     }
-    const ctx = getActiveContextSync()
+    const ctx = context === undefined ? getActiveContextSync() : context
     if (ctx?.apiKey) {
       return ctx.apiKey
     }
@@ -275,15 +268,23 @@ export const credentials = {
   },
 }
 
-export function getApiUrl(): string {
-  return config.get('apiUrl')
+export function getApiUrl(context?: CliContext | null): string {
+  if (process.env.TEMPS_API_URL) return process.env.TEMPS_API_URL
+  const ctx = context === undefined ? getActiveContextSync() : context
+  return ctx?.url || configStore.get('apiUrl')
 }
 
-export async function requireAuth(): Promise<string> {
-  const apiKey = await credentials.getApiKey()
+export async function requireAuth(context?: CliContext | null): Promise<string> {
+  const apiKey = await credentials.getApiKey(context)
   if (!apiKey) {
     console.error(colors.error('Not authenticated. Please run: temps login'))
     process.exit(1)
   }
   return apiKey
+}
+
+// Resolve the URL and credential from the same context file snapshot before asking for consent.
+export async function requireAuthTarget(): Promise<{ apiUrl: string; apiKey: string }> {
+  const context = getActiveContextSync()
+  return { apiUrl: getApiUrl(context), apiKey: await requireAuth(context) }
 }

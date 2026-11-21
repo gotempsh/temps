@@ -10,11 +10,13 @@ import { join } from "node:path";
 test("install-local requires consent and uploads the approved bytes without a client path", async () => {
   const dir = await mkdtemp(join(tmpdir(), "plugin-upload-"));
   const path = join(dir, "private-fixture");
+  const switchContext = join(dir, "switch-context.ts");
   const bytes = "fixture bytes";
   const digest = createHash("sha256").update(bytes).digest("hex");
   const uploads: {
     query: string;
     digest: string | null;
+    authorization: string | null;
     bytes?: string;
     filename?: string;
   }[] = [];
@@ -28,6 +30,7 @@ test("install-local requires consent and uploads the approved bytes without a cl
       const file = (await req.formData()).get("file");
       uploads.push({
         query: url.search,
+        authorization: req.headers.get("Authorization"),
         digest: req.headers.get("X-Temps-Trust-Sha256"),
         bytes: file instanceof File ? await file.text() : undefined,
         filename: file instanceof File ? file.name : undefined,
@@ -46,6 +49,8 @@ test("install-local requires consent and uploads the approved bytes without a cl
       [
         process.execPath,
         "run",
+        "--preload",
+        switchContext,
         new URL("../../index.ts", import.meta.url).pathname,
         "plugin",
         "install-local",
@@ -76,6 +81,17 @@ test("install-local requires consent and uploads the approved bytes without a cl
   }
   try {
     await writeFile(path, bytes);
+    // Change the active credential after the operator sees the reviewed destination and digest.
+    await writeFile(switchContext, `
+      const log = console.log;
+      console.log = (...args) => {
+        log(...args);
+        if (String(args[0]).includes("SHA-256")) {
+          process.env.TEMPS_TOKEN = "tk_other_fixture";
+          process.env.TEMPS_API_URL = "http://127.0.0.1:1";
+        }
+      };
+    `);
     const unapproved = await run();
     expect(unapproved.code).not.toBe(0);
     expect(unapproved.stderr).toContain("--yes");
@@ -83,6 +99,7 @@ test("install-local requires consent and uploads the approved bytes without a cl
     const approved = await run("--yes");
     expect(approved.code, approved.stderr).toBe(0);
     expect(uploads).toHaveLength(1);
+    expect(uploads[0]?.authorization).toBe("Bearer tk_test");
     expect(uploads[0]?.digest).toBe(digest);
     expect(uploads[0]?.bytes).toBe(bytes);
     expect(uploads[0]?.query).toBe("?name=fixture&version=1");

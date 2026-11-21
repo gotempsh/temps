@@ -725,10 +725,16 @@ impl PluginInstaller {
         })
     }
 
-    pub(crate) async fn restore_activation(
+    pub(crate) async fn rollback_candidate(
         &self,
+        candidate: &InstallCandidate,
         rollback: ActivationRollback,
     ) -> Result<(), InstallError> {
+        // If activation restoration fails, the current record may still point to this release.
+        let retains_candidate = rollback
+            .previous
+            .as_ref()
+            .is_some_and(|before| before.directory == candidate.install_directory);
         let active_path = rollback.plugin_root.join(ACTIVE_FILE);
         match rollback.previous {
             Some(previous) => {
@@ -740,11 +746,15 @@ impl PluginInstaller {
                 Err(error) => return Err(io_error(&rollback.plugin_name, &active_path, error)),
             },
         }
-        sync_directory(&rollback.plugin_name, &rollback.plugin_root).await
+        sync_directory(&rollback.plugin_name, &rollback.plugin_root).await?;
+        if !retains_candidate {
+            self.discard(candidate).await?;
+        }
+        Ok(())
     }
 
-    /// Remove a prepared release that never reached the activation commit
-    /// point. The exact immutable directory is carried by the candidate, so
+    /// Remove a prepared release after rejection or completed rollback.
+    /// The exact immutable directory is carried by the candidate, so
     /// cleanup never derives a recursive target from caller input.
     pub async fn discard(&self, candidate: &InstallCandidate) -> Result<(), InstallError> {
         let directory = candidate.plugin_root.join(&candidate.install_directory);
@@ -2561,6 +2571,10 @@ mod tests {
             install_directory: "2.0.0".to_string(),
         };
 
+        let release_dir = plugin_root.join(&candidate.install_directory);
+        tokio::fs::create_dir(&release_dir)
+            .await
+            .expect("first release");
         let first_install = installer
             .capture_activation(&candidate)
             .await
@@ -2571,11 +2585,15 @@ mod tests {
             .await
             .expect("activate first install");
         installer
-            .restore_activation(first_install)
+            .rollback_candidate(&candidate, first_install)
             .await
             .expect("remove rejected first activation");
         assert!(!plugin_root.join(ACTIVE_FILE).exists());
 
+        assert!(!release_dir.exists());
+        tokio::fs::create_dir(&release_dir)
+            .await
+            .expect("upgrade release");
         write_json_atomically(
             &candidate.name,
             &plugin_root.join(ACTIVE_FILE),
@@ -2596,7 +2614,7 @@ mod tests {
             .await
             .expect("activate upgrade");
         installer
-            .restore_activation(upgrade)
+            .rollback_candidate(&candidate, upgrade)
             .await
             .expect("restore previous activation");
         let restored: ActiveRecord = serde_json::from_slice(
@@ -2607,6 +2625,29 @@ mod tests {
         .expect("decode restored activation");
         assert_eq!(restored.version, "1.0.0");
         assert_eq!(restored.directory, "1.0.0");
+        assert!(!release_dir.exists());
+
+        tokio::fs::create_dir(&release_dir)
+            .await
+            .expect("rejected release");
+        let rollback = installer
+            .capture_activation(&candidate)
+            .await
+            .expect("capture");
+        tokio::fs::remove_file(plugin_root.join(ACTIVE_FILE))
+            .await
+            .expect("remove pointer");
+        tokio::fs::create_dir(plugin_root.join(ACTIVE_FILE))
+            .await
+            .expect("prevent restoring pointer");
+        assert!(installer
+            .rollback_candidate(&candidate, rollback)
+            .await
+            .is_err());
+        assert!(
+            release_dir.exists(),
+            "retain the candidate when restoration fails"
+        );
     }
 
     fn rotated_keyset(

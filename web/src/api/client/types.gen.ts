@@ -108337,20 +108337,56 @@ export type InstallLocalFileData = {
 };
 
 export type InstallLocalFileErrors = {
+    /**
+     * Invalid plugin identity, digest header or multipart upload
+     */
     400: unknown;
+    /**
+     * Authentication required
+     */
     401: unknown;
+    /**
+     * Administrator permission or sensitive-action authorization required
+     */
     403: unknown;
+    /**
+     * Upload timed out
+     */
     408: unknown;
+    /**
+     * Persistent storage is required or the existing installation uses a different source
+     */
     409: unknown;
+    /**
+     * Executable exceeds the upload limit
+     */
     413: unknown;
+    /**
+     * Additional verification required for this sensitive action
+     */
     428: unknown;
+    /**
+     * Another file upload is in progress
+     */
     429: unknown;
+    /**
+     * Could not stage, activate or persist the installation
+     */
     500: unknown;
+    /**
+     * Plugin verification or startup failed
+     */
     502: unknown;
+    /**
+     * Plugin actor activation is unavailable or the service is shutting down
+     */
     503: unknown;
 };
 
 export type InstallLocalFileResponses = {
+    /**
+     * Plugin verified, installed and started
+     */
     200: InstallPluginResponse;
 };
 

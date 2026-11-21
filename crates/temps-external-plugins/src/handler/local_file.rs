@@ -81,7 +81,20 @@ async fn receive_file(mut multipart: Multipart) -> Result<tempfile::TempPath, Pr
 #[utoipa::path(post, path = "/x/plugins/install/file", tag = "External Plugins",
     params(FileIdentity, ("X-Temps-Trust-Sha256" = String, Header, description = "Operator approval to execute the file with this SHA-256")),
     request_body(content = FileUpload, content_type = "multipart/form-data"),
-    responses((status = 200, body = InstallPluginResponse), (status = 400), (status = 401), (status = 403), (status = 408), (status = 409), (status = 413), (status = 428), (status = 429), (status = 500), (status = 502), (status = 503)),
+    responses(
+        (status = 200, description = "Plugin verified, installed and started", body = InstallPluginResponse),
+        (status = 400, description = "Invalid plugin identity, digest header or multipart upload"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Administrator permission or sensitive-action authorization required"),
+        (status = 408, description = "Upload timed out"),
+        (status = 409, description = "Persistent storage is required or the existing installation uses a different source"),
+        (status = 413, description = "Executable exceeds the upload limit"),
+        (status = 428, description = "Additional verification required for this sensitive action"),
+        (status = 429, description = "Another file upload is in progress"),
+        (status = 500, description = "Could not stage, activate or persist the installation"),
+        (status = 502, description = "Plugin verification or startup failed"),
+        (status = 503, description = "Plugin actor activation is unavailable or the service is shutting down"),
+    ),
     security(("bearer_auth" = [])))]
 pub(super) async fn install_local_file(
     RequireAuth(auth): RequireAuth,
@@ -213,6 +226,24 @@ pub(super) async fn install_local_file(
 mod tests {
     use super::*;
     use axum::{body::Body, extract::FromRequest, http::Request};
+
+    #[test]
+    fn upload_responses_explain_each_outcome() {
+        let doc = serde_json::to_value(super::ExternalPluginsApiDoc::openapi()).expect("OpenAPI");
+        let responses = doc["paths"]["/x/plugins/install/file"]["post"]["responses"]
+            .as_object()
+            .expect("upload responses");
+        for status in [
+            "200", "400", "401", "403", "408", "409", "413", "428", "429", "500", "502", "503",
+        ] {
+            assert!(
+                responses[status]["description"]
+                    .as_str()
+                    .is_some_and(|text| !text.is_empty()),
+                "missing description for {status}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn receive_one_complete_file_without_interpreting_its_filename() {

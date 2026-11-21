@@ -8,6 +8,7 @@ import { Controller, useForm } from 'react-hook-form'
 import { z } from 'zod'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { toast } from 'sonner'
+import { client } from '@/api/client/client.gen'
 import { installLocalFile } from '@/api/client/sdk.gen'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
@@ -59,13 +60,13 @@ export function LocalFileInstall({
     resolver: zodResolver(schema),
     defaultValues: { name: '', version: '', trusted: false },
   })
-  const { reset } = form
-  useEffect(() => {
-    if (open) reset({ name: expectedName, version: '', trusted: false })
-  }, [expectedName, open, reset])
-  const install = useMutation({
-    mutationFn: async ({ file, name, version }: z.infer<typeof schema>) => {
-      if (!crypto.subtle)
+  const digest = useMutation({
+    gcTime: 0,
+    retry: false,
+    mutationFn: async (file: File) => {
+      const valid = schema.shape.file.safeParse(file)
+      if (!valid.success) throw new Error(valid.error.issues[0].message)
+      if (!globalThis.crypto?.subtle)
         throw new Error(
           'Use HTTPS or localhost to verify the file digest, or use temps plugin install-local.'
         )
@@ -73,13 +74,35 @@ export function LocalFileInstall({
         'SHA-256',
         await file.arrayBuffer()
       )
-      const digest = Array.from(new Uint8Array(bytes), (byte) =>
+      return Array.from(new Uint8Array(bytes), (byte) =>
         byte.toString(16).padStart(2, '0')
       ).join('')
+    },
+  })
+  const { reset } = form
+  const resetDigest = digest.reset
+  useEffect(() => {
+    resetDigest()
+    reset({ name: expectedName, version: '', trusted: false })
+  }, [expectedName, open, reset, resetDigest])
+  const baseUrl = client.getConfig().baseUrl ?? '/api'
+  const destination =
+    open && typeof document !== 'undefined'
+      ? new URL(baseUrl, document.baseURI).href
+      : baseUrl
+  const install = useMutation({
+    mutationFn: async ({
+      file,
+      name,
+      version,
+      sha256,
+      target,
+    }: z.infer<typeof schema> & { sha256: string; target: string }) => {
       return (
         await installLocalFile({
+          baseUrl: target,
           query: { name, version },
-          headers: { 'X-Temps-Trust-Sha256': digest },
+          headers: { 'X-Temps-Trust-Sha256': sha256 },
           body: { file },
           throwOnError: true,
         })
@@ -94,8 +117,13 @@ export function LocalFileInstall({
     },
   })
   async function submit(values: z.infer<typeof schema>) {
+    if (!digest.data || digest.variables !== values.file) return
     try {
-      await install.mutateAsync(values)
+      await install.mutateAsync({
+        ...values,
+        sha256: digest.data,
+        target: destination,
+      })
     } catch (error) {
       onSensitiveError(error, () => void submit(values))
     }
@@ -134,6 +162,8 @@ export function LocalFileInstall({
                         form.resetField('trusted')
                         const file = event.target.files?.[0]
                         field.onChange(file)
+                        if (file) digest.mutate(file)
+                        else digest.reset()
                       }}
                     />
                   )}
@@ -152,6 +182,22 @@ export function LocalFileInstall({
             <Field label="Manifest version" error={errors.version?.message}>
               {(props) => <Input {...props} {...form.register('version')} />}
             </Field>
+            <div className="space-y-1 break-all text-sm">
+              <p>
+                Install destination <code>{destination}</code>
+              </p>
+              {digest.isPending && <p role="status">Computing SHA-256…</p>}
+              {digest.data && (
+                <p>
+                  SHA-256 <code>{digest.data}</code>
+                </p>
+              )}
+              {digest.error && (
+                <p role="alert" className="text-destructive">
+                  {digest.error.message}
+                </p>
+              )}
+            </div>
             <Controller
               control={form.control}
               name="trusted"
@@ -163,6 +209,7 @@ export function LocalFileInstall({
                   {(props) => (
                     <Checkbox
                       {...props}
+                      disabled={!digest.isSuccess}
                       checked={field.value}
                       onCheckedChange={(value) =>
                         field.onChange(value === true)
@@ -181,7 +228,10 @@ export function LocalFileInstall({
               )}
             </p>
           )}
-          <Button type="submit" disabled={install.isPending}>
+          <Button
+            type="submit"
+            disabled={install.isPending || !digest.isSuccess}
+          >
             {install.isPending ? 'Installing…' : 'Install plugin'}
           </Button>
         </form>
