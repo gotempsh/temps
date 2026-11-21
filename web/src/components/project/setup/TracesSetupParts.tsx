@@ -2,78 +2,43 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 /**
- * Pieces of the OpenTelemetry setup wizard: the environment picker and the
- * `.env` block for apps Temps does not run, which loads its URL from
+ * Pieces of the OpenTelemetry setup wizard for apps Temps does not run: the
+ * project-wide note and the `.env` block, which loads its URL from
  * `GET /projects/{id}/ingest-setup`.
  */
-import type { EnvironmentResponse } from '@/api/client'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { CodeBlock } from '@/components/ui/code-block'
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from '@/components/ui/select'
+
 import { Skeleton } from '@/components/ui/skeleton'
 import { externalOtelEnvBlock } from '@/lib/plain-http-setup'
 
 import { findSignal, useIngestSetup } from './use-ingest-setup'
 
 /**
- * "Environment:" and its select. The trigger is named by the visible label
- * and its own value, so screen readers hear "Environment: production".
+ * OTLP data from an app Temps does not run is stored for the whole project:
+ * the environment filter finds environments through deployments, and these
+ * exports carry none. Say so instead of offering an environment picker that
+ * would change nothing.
  */
-export function SetupEnvironmentSelect({
-  id,
-  environments,
-  value,
-  onValueChange,
-}: {
-  id: string
-  environments: EnvironmentResponse[] | undefined
-  value: string
-  onValueChange: (value: string) => void
-}) {
-  const labelId = `${id}-label`
+export function ProjectWideOtlpNote() {
   return (
-    <div className="flex items-center gap-3">
-      <span id={labelId} className="shrink-0 text-xs text-muted-foreground">
-        Environment:
-      </span>
-      <Select value={value} onValueChange={onValueChange}>
-        <SelectTrigger
-          id={id}
-          aria-labelledby={`${labelId} ${id}`}
-          className="h-8 w-full sm:w-[200px]"
-        >
-          <SelectValue placeholder="Select environment" />
-        </SelectTrigger>
-        <SelectContent>
-          {environments?.map((env) => (
-            <SelectItem key={env.id} value={String(env.id)}>
-              {env.name}
-            </SelectItem>
-          ))}
-        </SelectContent>
-      </Select>
-    </div>
+    <p className="text-xs text-muted-foreground">
+      Traces and logs from apps outside Temps belong to the whole project and
+      show under All environments.
+    </p>
   )
 }
 
 /** The OTel SDK `.env` for an app hosted elsewhere, with load and error states. */
 export function ExternalOtelEnvBlock({
   projectId,
-  environmentId,
   serviceName,
 }: {
   projectId: number
-  environmentId?: number
   serviceName: string
 }) {
-  const query = useIngestSetup(projectId, environmentId)
+  const query = useIngestSetup(projectId)
   const traces = findSignal(query.data, 'traces')
 
   if (traces) {

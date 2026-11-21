@@ -4,17 +4,13 @@
 import { expect, test } from 'bun:test'
 import { QueryClientProvider } from '@tanstack/react-query'
 import { renderToStaticMarkup } from 'react-dom/server'
-import type { EnvironmentResponse } from '@/api/client'
 import { ingestSetupFixture } from '@/lib/ingest-setup.fixture'
 import {
   FAILURE_DETAIL,
   ingestSetupClient,
   type IngestSetupCacheState,
 } from './ingest-setup-cache.test-helpers'
-import {
-  ExternalOtelEnvBlock,
-  SetupEnvironmentSelect,
-} from './TracesSetupParts'
+import { ExternalOtelEnvBlock, ProjectWideOtlpNote } from './TracesSetupParts'
 
 function renderEnvBlock(state: IngestSetupCacheState) {
   return renderToStaticMarkup(
@@ -24,19 +20,10 @@ function renderEnvBlock(state: IngestSetupCacheState) {
   )
 }
 
-test('the environment select is named by its visible label and value', () => {
-  const html = renderToStaticMarkup(
-    <SetupEnvironmentSelect
-      id="traces-env"
-      environments={[{ id: 7, name: 'production' } as EnvironmentResponse]}
-      value="7"
-      onValueChange={() => {}}
-    />
-  )
-  expect(html).toContain('id="traces-env-label"')
-  expect(html).toContain('id="traces-env"')
-  expect(html).toContain('aria-labelledby="traces-env-label traces-env"')
-  expect(html).toContain('Environment:')
+test('the OTLP setup says the data belongs to the whole project', () => {
+  const html = renderToStaticMarkup(<ProjectWideOtlpNote />)
+  expect(html).toContain('belong to the whole project')
+  expect(html).toContain('All environments')
 })
 
 test('the external .env shows the server-resolved OTLP variables once loaded', () => {
