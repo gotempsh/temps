@@ -6,19 +6,20 @@
 //!
 //! The bundled Compose files start PostgreSQL with `archive_mode=on`, because
 //! `archive_mode` only changes on a restart and Temps cannot restart the
-//! database it runs on when a backup is first configured. `archive_command`
-//! is left to Temps, which sets it to `wal-g wal-push` before the first
-//! internal backup. Until then PostgreSQL has archiving enabled with nothing
-//! to archive to, and in that state it keeps every completed WAL segment in
-//! `pg_wal` and waits for a command. An install that never configures backups
-//! fills its disk this way.
+//! database it runs on, and leave `archive_command` unset. PostgreSQL then has
+//! archiving enabled with nothing to archive to, and in that state it keeps
+//! every completed WAL segment in `pg_wal` and waits for a command, until the
+//! disk fills.
 //!
 //! On startup Temps gives such a database a command that accepts each segment
 //! without storing it. PostgreSQL then recycles WAL as it would with archiving
-//! off, and clears any backlog already built up. WAL written before the first
-//! base backup is not needed to restore it, so nothing restorable is lost. The
-//! first internal backup replaces the command with a real one before it starts,
-//! and puts back what was there if its base backup then fails.
+//! off, and clears any backlog already built up. No WAL archive exists to
+//! receive those segments, and WAL written before a base backup is not needed
+//! to restore it, so nothing restorable is lost. Control-plane backups
+//! (`ControlPlaneEngine`) are logical dumps and need no WAL archive, so the
+//! command stays until an operator sets their own. A WAL-G base backup
+//! through [`BackupService::archive_then_push`] replaces it with WAL-G
+//! archiving before it starts, and puts back what was there if it fails.
 //!
 //! Only a command nobody ever set is replaced. PostgreSQL's documented way to
 //! pause archiving is to set `archive_command` to an empty string, and a
@@ -179,17 +180,19 @@ impl ArchiveSettings {
     /// A value from the operator's own configuration file is restored by
     /// removing Temps' override, so their later edits to that file apply.
     pub(super) fn rollback(&self, archiving_command: &str) -> Option<ArchiveCommandChange> {
+        let from_alter_system = self.archive_command_source.as_deref()
+            == Some("configuration file")
+            && self.set_by_alter_system().unwrap_or(true);
         if self.archive_command == archiving_command {
-            return None;
+            // The same command from the operator's own file gained an
+            // override that would mask their later edits to that file.
+            return (!from_alter_system).then_some(ArchiveCommandChange::Reset);
         }
         if self.archive_command_never_set() {
             return Some(ArchiveCommandChange::Set(
                 NO_ARCHIVE_DESTINATION_COMMAND.to_string(),
             ));
         }
-        let from_alter_system = self.archive_command_source.as_deref()
-            == Some("configuration file")
-            && self.set_by_alter_system().unwrap_or(true);
         if from_alter_system {
             Some(ArchiveCommandChange::Set(self.archive_command.clone()))
         } else {
@@ -219,6 +222,28 @@ fn auto_conf_value(entries: &[ArchiveCommandFileEntry]) -> Option<&str> {
                 .is_some_and(|file| file.ends_with("postgresql.auto.conf"))
         })
         .and_then(|entry| entry.setting.as_deref())
+}
+
+/// The `archive_command` the configuration files hold, which PostgreSQL loads
+/// on its next reload: the last entry, since later files and lines override
+/// earlier ones. `None` when no file sets it.
+fn file_value(entries: &[ArchiveCommandFileEntry]) -> Option<&str> {
+    entries
+        .last()
+        .map(|entry| entry.setting.as_deref().unwrap_or(""))
+}
+
+/// Whether `entries` hold only the startup placeholder, in
+/// postgresql.auto.conf: Temps wrote it, and its reload did not take effect.
+fn only_pending_placeholder(entries: &[ArchiveCommandFileEntry]) -> bool {
+    file_value(entries) == Some(NO_ARCHIVE_DESTINATION_COMMAND)
+        && auto_conf_value(entries) == Some(NO_ARCHIVE_DESTINATION_COMMAND)
+        && entries.iter().all(|entry| {
+            entry
+                .sourcefile
+                .as_deref()
+                .is_some_and(|file| file.ends_with("postgresql.auto.conf"))
+        })
 }
 
 /// Identifies one running PostgreSQL server: the cluster's system identifier,
@@ -333,9 +358,11 @@ impl BackupService {
         }
         // A command written with ALTER SYSTEM, or edited into a file, is not
         // running until the next reload; writing the placeholder would
-        // replace it before it ever applies.
+        // replace it before it ever applies. The placeholder itself, left
+        // pending by a reload that failed on an earlier start, is Temps' own
+        // and is written and reloaded again.
         match self.archive_command_file_entries().await {
-            Ok(entries) if entries.is_empty() => {}
+            Ok(entries) if entries.is_empty() || only_pending_placeholder(&entries) => {}
             Ok(entries) => {
                 let files = entries
                     .iter()
@@ -480,6 +507,38 @@ impl BackupService {
             });
         }
 
+        // A command staged in a file but not loaded yet would be replaced by
+        // the WAL-G one, and the rollback would put back the running value,
+        // not it.
+        let pending = match self.archive_command_file_entries().await {
+            Ok(entries) => file_value(&entries).map(str::to_string),
+            Err(error) => {
+                return Err(BackupError::Internal {
+                    message: format!(
+                        "Not taking a WAL-G base backup of the control-plane database in \
+                         container '{}': could not check its configuration files for an \
+                         archive_command that is not loaded yet: {}",
+                        container_id, error
+                    ),
+                })
+            }
+        };
+        if let Some(pending) = pending.filter(|pending| {
+            *pending != before.archive_command
+                && pending != NO_ARCHIVE_DESTINATION_COMMAND
+                && pending != archiving_command
+        }) {
+            return Err(BackupError::Internal {
+                message: format!(
+                    "Not taking a WAL-G base backup of the control-plane database in container \
+                     '{}': its configuration files set an archive_command that is not loaded \
+                     yet ({} characters), which Temps does not manage",
+                    container_id,
+                    pending.len()
+                ),
+            });
+        }
+
         let enabling_failed = |error: BackupError| BackupError::Internal {
             message: format!(
                 "Cannot take a WAL-G base backup of the internal database in container '{}': \
@@ -546,8 +605,14 @@ impl BackupService {
         let Some(change) = before.rollback(archiving_command) else {
             return;
         };
-        match self.archive_command_file_entries().await {
-            Ok(entries) if auto_conf_value(&entries) != Some(archiving_command) => {
+        let ownership = temps_core::retry::RetryConfig::new(3)
+            .with_base_delay(std::time::Duration::from_millis(200))
+            .with_max_delay(std::time::Duration::from_secs(1))
+            .retry(|| self.archive_command_file_entries())
+            .await;
+        match ownership {
+            Ok(entries) if auto_conf_value(&entries) == Some(archiving_command) => {}
+            Ok(_) => {
                 warn!(
                     container_id = %container_id,
                     "WAL-G base backup failed; archive_command in postgresql.auto.conf is not \
@@ -556,13 +621,20 @@ impl BackupService {
                 );
                 return;
             }
-            Ok(_) => {}
-            Err(read_error) => warn!(
-                container_id = %container_id,
-                "Could not check whether postgresql.auto.conf still holds the archive_command \
-                 this attempt set; undoing it anyway: {}",
-                read_error
-            ),
+            // Writing blind could replace a command someone set since with
+            // one that discards WAL; a WAL-G command left in place fails
+            // loudly instead, and the WAL archiving alerts report it.
+            Err(read_error) => {
+                error!(
+                    container_id = %container_id,
+                    "WAL-G base backup failed, and whether postgresql.auto.conf still holds the \
+                     archive_command it set could not be checked, so it was not undone: {}. \
+                     Check archive_command on the control-plane database. Backup error: {}",
+                    read_error,
+                    error
+                );
+                return;
+            }
         }
         match self.apply_archive_command(container_id, &change).await {
             Ok(()) => warn!(

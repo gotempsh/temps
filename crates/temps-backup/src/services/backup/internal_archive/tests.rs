@@ -519,6 +519,67 @@ async fn failing_alter_system_names_the_container_and_the_command() {
 }
 
 #[tokio::test]
+async fn a_placeholder_whose_reload_failed_is_reloaded_on_the_next_start() {
+    // An earlier start wrote /bin/true but could not reload: the running
+    // command is still the default, and only postgresql.auto.conf has it.
+    let retaining = settings_row(&settings("on", "", None));
+    let db = mock(
+        vec![
+            vec![retaining.clone()],
+            vec![retaining],
+            vec![file_entry_row(AUTO_CONF, NO_ARCHIVE_DESTINATION_COMMAND)],
+            vec![reload_row(true)],
+        ],
+        1,
+    );
+    let service = make_scope_test_service(db.clone());
+
+    let outcome = service
+        .reconcile_internal_wal_archiving_with(|| async { Ok("temps-postgres".to_string()) })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        outcome,
+        InternalArchiveReconcile::Released {
+            container_id: "temps-postgres".to_string()
+        }
+    );
+    drop(service);
+    assert_eq!(
+        logged_sql(db)[3],
+        "ALTER SYSTEM SET archive_command = '/bin/true'"
+    );
+}
+
+#[tokio::test]
+async fn a_pending_placeholder_does_not_hide_a_pending_operator_command() {
+    let retaining = settings_row(&settings("on", "", None));
+    let db = mock(
+        vec![
+            vec![retaining.clone()],
+            vec![retaining],
+            vec![
+                file_entry_row("/etc/postgresql/postgresql.conf", "cp %p /archive/%f"),
+                file_entry_row(AUTO_CONF, NO_ARCHIVE_DESTINATION_COMMAND),
+            ],
+        ],
+        0,
+    );
+    let service = make_scope_test_service(db);
+
+    let outcome = service
+        .reconcile_internal_wal_archiving_with(|| async { Ok("temps-postgres".to_string()) })
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(outcome, InternalArchiveReconcile::LeftToOperator { .. }),
+        "{outcome:?}"
+    );
+}
+
+#[tokio::test]
 async fn a_reload_that_cannot_signal_the_server_is_not_a_release() {
     let retaining = settings_row(&settings("on", "", Some("")));
     let db = MockDatabase::new(DatabaseBackend::Postgres)
@@ -635,6 +696,13 @@ fn a_failed_base_backup_puts_back_what_archive_command_was() {
         settings_in(WALG_COMMAND, None, AUTO_CONF).rollback(WALG_COMMAND),
         None
     );
+    // The same command from the operator's own file: remove the override
+    // the attempt added, so later edits to that file apply.
+    assert_eq!(
+        settings_in(WALG_COMMAND, None, "/etc/postgresql/conf.d/archive.conf")
+            .rollback(WALG_COMMAND),
+        Some(ArchiveCommandChange::Reset)
+    );
 }
 
 #[test]
@@ -697,7 +765,7 @@ async fn base_backup_refuses_to_take_over_an_operator_archive() {
 
 #[tokio::test]
 async fn base_backup_starts_only_after_archiving_is_enabled() {
-    let db = mock(vec![vec![reload_row(true)]], 1);
+    let db = mock(vec![vec![], vec![reload_row(true)]], 1);
     let service = make_scope_test_service(db.clone());
     let steps = Steps::default();
 
@@ -716,8 +784,10 @@ async fn base_backup_starts_only_after_archiving_is_enabled() {
         ["write walg.env", "backup-push", "discard previous walg.env"]
     );
     drop(service);
+    let sql = logged_sql(db);
+    assert!(sql[0].contains("pg_file_settings"), "{sql:?}");
     assert_eq!(
-        logged_sql(db),
+        sql[1..],
         [
             format!("ALTER SYSTEM SET archive_command = '{WALG_COMMAND}'"),
             "SELECT pg_reload_conf() AS reloaded".to_string()
@@ -727,8 +797,9 @@ async fn base_backup_starts_only_after_archiving_is_enabled() {
 
 #[tokio::test]
 async fn walg_env_that_cannot_be_written_changes_no_setting() {
-    // Nothing is queued: any statement would fail the mock.
-    let db = mock(vec![], 0);
+    // Only the configuration files are read: any ALTER SYSTEM would fail
+    // the mock.
+    let db = mock(vec![vec![]], 0);
     let service = make_scope_test_service(db.clone());
     let steps = Steps::default();
 
@@ -749,7 +820,7 @@ async fn walg_env_that_cannot_be_written_changes_no_setting() {
         ["write walg.env", "restore walg.env"]
     );
     drop(service);
-    assert!(logged_sql(db).is_empty());
+    assert_eq!(logged_sql(db).len(), 1);
 }
 
 #[tokio::test]
@@ -761,7 +832,7 @@ async fn archive_command_that_was_never_written_is_not_rolled_back() {
             .append_exec_errors([sea_orm::DbErr::Custom(
                 "permission denied to set parameter \"archive_command\"".to_string(),
             )])
-            .append_query_results([Vec::<BTreeMap<&'static str, Value>>::new()])
+            .append_query_results([Vec::<BTreeMap<&'static str, Value>>::new(), Vec::new()])
             .into_connection(),
     );
     let service = make_scope_test_service(db.clone());
@@ -796,6 +867,7 @@ async fn archive_command_that_was_never_written_is_not_rolled_back() {
 async fn archiving_whose_reload_failed_is_rolled_back_without_a_base_backup() {
     let db = mock(
         vec![
+            vec![],
             vec![reload_row(false)],
             walg_in_auto_conf(),
             vec![reload_row(true)],
@@ -824,14 +896,15 @@ async fn archiving_whose_reload_failed_is_rolled_back_without_a_base_backup() {
     );
     drop(service);
     let sql = logged_sql(db);
-    assert_eq!(sql[3], "ALTER SYSTEM SET archive_command = '/bin/true'");
-    assert_eq!(sql.len(), 5, "{sql:?}");
+    assert_eq!(sql[4], "ALTER SYSTEM SET archive_command = '/bin/true'");
+    assert_eq!(sql.len(), 6, "{sql:?}");
 }
 
 #[tokio::test]
 async fn failed_first_base_backup_puts_back_the_placeholder_and_walg_env() {
     let db = mock(
         vec![
+            vec![],
             vec![reload_row(true)],
             walg_in_auto_conf(),
             vec![reload_row(true)],
@@ -860,7 +933,7 @@ async fn failed_first_base_backup_puts_back_the_placeholder_and_walg_env() {
     drop(service);
     let sql = logged_sql(db);
     assert_eq!(
-        sql[3..],
+        sql[4..],
         [
             "ALTER SYSTEM SET archive_command = '/bin/true'",
             "SELECT pg_reload_conf() AS reloaded"
@@ -872,6 +945,7 @@ async fn failed_first_base_backup_puts_back_the_placeholder_and_walg_env() {
 async fn failed_base_backup_removes_the_override_of_a_pause_in_the_operator_file() {
     let db = mock(
         vec![
+            vec![],
             vec![reload_row(true)],
             walg_in_auto_conf(),
             vec![reload_row(true)],
@@ -892,7 +966,7 @@ async fn failed_base_backup_removes_the_override_of_a_pause_in_the_operator_file
 
     assert!(result.is_err());
     drop(service);
-    assert_eq!(logged_sql(db)[3], "ALTER SYSTEM RESET archive_command");
+    assert_eq!(logged_sql(db)[4], "ALTER SYSTEM RESET archive_command");
 }
 
 #[tokio::test]
@@ -900,6 +974,7 @@ async fn failed_base_backup_leaves_a_command_written_since_by_someone_else() {
     // Only the enabling change is accepted: a rollback would fail the mock.
     let db = mock(
         vec![
+            vec![],
             vec![reload_row(true)],
             vec![
                 file_entry_row(AUTO_CONF, WALG_COMMAND),
@@ -924,21 +999,28 @@ async fn failed_base_backup_leaves_a_command_written_since_by_someone_else() {
 
     assert!(error.contains("wal-g backup-push failed"), "{error}");
     drop(service);
-    assert_eq!(logged_sql(db).len(), 3);
+    assert_eq!(logged_sql(db).len(), 4);
+}
+
+/// A database whose pg_file_settings reads fail `failures` times while a
+/// failed backup checks it still owns archive_command, then show the WAL-G
+/// command, and that accepts a rollback.
+fn ownership_read_fails(failures: usize) -> Arc<DatabaseConnection> {
+    let permission_denied =
+        || sea_orm::DbErr::Custom("permission denied for view pg_file_settings".to_string());
+    Arc::new(
+        MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![], vec![reload_row(true)]])
+            .append_query_errors((0..failures).map(|_| permission_denied()))
+            .append_query_results([walg_in_auto_conf(), vec![reload_row(true)]])
+            .append_exec_results([exec_ok(), exec_ok()])
+            .into_connection(),
+    )
 }
 
 #[tokio::test]
-async fn failed_base_backup_is_rolled_back_when_ownership_cannot_be_checked() {
-    let db = Arc::new(
-        MockDatabase::new(DatabaseBackend::Postgres)
-            .append_query_results([vec![reload_row(true)]])
-            .append_query_errors([sea_orm::DbErr::Custom(
-                "permission denied for view pg_file_settings".to_string(),
-            )])
-            .append_query_results([vec![reload_row(true)]])
-            .append_exec_results([exec_ok(), exec_ok()])
-            .into_connection(),
-    );
+async fn failed_base_backup_is_rolled_back_once_ownership_is_confirmed_on_a_retry() {
+    let db = ownership_read_fails(1);
     let service = make_scope_test_service(db.clone());
     let steps = Steps::default();
 
@@ -953,17 +1035,113 @@ async fn failed_base_backup_is_rolled_back_when_ownership_cannot_be_checked() {
 
     assert!(result.is_err());
     drop(service);
+    let sql = logged_sql(db);
     assert_eq!(
-        logged_sql(db)[3],
-        "ALTER SYSTEM SET archive_command = '/bin/true'"
+        sql.iter()
+            .filter(|statement| statement.contains("pg_file_settings"))
+            .count(),
+        3,
+        "{sql:?}"
     );
+    assert!(
+        sql.contains(&"ALTER SYSTEM SET archive_command = '/bin/true'".to_string()),
+        "{sql:?}"
+    );
+}
+
+#[tokio::test]
+async fn failed_base_backup_is_not_rolled_back_while_ownership_is_unknown() {
+    // Every check fails: writing blind could replace a command someone set
+    // since with one that discards WAL.
+    let db = ownership_read_fails(3);
+    let service = make_scope_test_service(db.clone());
+    let steps = Steps::default();
+
+    let error = service
+        .archive_then_push(
+            &settings("on", "", None),
+            WALG_COMMAND,
+            "temps-postgres",
+            recorded_steps(&steps, true, false),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("wal-g backup-push failed"), "{error}");
+    drop(service);
+    let sql = logged_sql(db);
+    assert!(
+        !sql.iter().any(|statement| statement.contains("/bin/true")),
+        "{sql:?}"
+    );
+}
+
+#[tokio::test]
+async fn base_backup_leaves_a_command_staged_but_not_loaded_yet() {
+    // The running command is the placeholder; postgresql.auto.conf already
+    // holds the operator's. Nothing else is queued: an ALTER SYSTEM would
+    // fail the mock.
+    let db = mock(
+        vec![vec![
+            file_entry_row(AUTO_CONF, NO_ARCHIVE_DESTINATION_COMMAND),
+            file_entry_row(AUTO_CONF, "cp %p /archive/%f"),
+        ]],
+        0,
+    );
+    let service = make_scope_test_service(db.clone());
+    let steps = Steps::default();
+
+    let error = service
+        .archive_then_push(
+            &settings_in(NO_ARCHIVE_DESTINATION_COMMAND, None, AUTO_CONF),
+            WALG_COMMAND,
+            "temps-postgres",
+            recorded_steps(&steps, true, true),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("not loaded"), "{error}");
+    assert!(!error.contains("/archive/"), "{error}");
+    assert!(steps.lock().unwrap().is_empty());
+    drop(service);
+    assert_eq!(logged_sql(db).len(), 1);
+}
+
+#[tokio::test]
+async fn base_backup_needs_the_configuration_files_to_be_readable() {
+    let db = Arc::new(
+        MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_errors([sea_orm::DbErr::Custom(
+                "permission denied for view pg_file_settings".to_string(),
+            )])
+            .into_connection(),
+    );
+    let service = make_scope_test_service(db.clone());
+    let steps = Steps::default();
+
+    let error = service
+        .archive_then_push(
+            &settings("on", "", None),
+            WALG_COMMAND,
+            "temps-postgres",
+            recorded_steps(&steps, true, true),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("permission denied"), "{error}");
+    assert!(steps.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
 async fn failed_base_backup_keeps_walg_archiving_but_puts_back_its_walg_env() {
     // walg.env is what tells WAL-G where the working archive is; the
     // command was already WAL-G's, so only the enabling change runs.
-    let db = mock(vec![vec![reload_row(true)]], 1);
+    let db = mock(vec![vec![], vec![reload_row(true)]], 1);
     let service = make_scope_test_service(db.clone());
     let steps = Steps::default();
 
@@ -982,12 +1160,12 @@ async fn failed_base_backup_keeps_walg_archiving_but_puts_back_its_walg_env() {
         ["write walg.env", "backup-push", "restore walg.env"]
     );
     drop(service);
-    assert_eq!(logged_sql(db).len(), 2);
+    assert_eq!(logged_sql(db).len(), 3);
 }
 
 #[tokio::test]
 async fn successful_base_backup_returns_the_push_result() {
-    let db = mock(vec![vec![reload_row(true)]], 1);
+    let db = mock(vec![vec![], vec![reload_row(true)]], 1);
     let service = make_scope_test_service(db.clone());
 
     let value = service
@@ -1018,7 +1196,7 @@ async fn failed_rollback_still_reports_the_backup_failure() {
     let db = MockDatabase::new(DatabaseBackend::Postgres)
         .append_exec_results([exec_ok()])
         .append_exec_errors([sea_orm::DbErr::Custom("connection reset".to_string())])
-        .append_query_results([vec![reload_row(true)], walg_in_auto_conf()])
+        .append_query_results([vec![], vec![reload_row(true)], walg_in_auto_conf()])
         .into_connection();
     let service = make_scope_test_service(Arc::new(db));
 
