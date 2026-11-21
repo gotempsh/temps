@@ -1343,15 +1343,31 @@ impl AnalyticsService {
     ///
     /// Skips the write when nothing changes, so a client that re-sends the same
     /// identity on every page load costs a read, not a row rewrite.
+    ///
+    /// The merge reads the row under the same row lock `identify` takes
+    /// (ADR 109 D4), inside one transaction: merged from an unlocked read, a
+    /// write could replace a trait and its `server` mark that an identify
+    /// committed in between.
     async fn apply_visitor_enrichment(
         &self,
-        visitor_model: temps_entities::visitor::Model,
+        found: temps_entities::visitor::Model,
         project_scoped: bool,
         incoming: serde_json::Value,
         response_visitor_id: String,
     ) -> Result<EnrichVisitorResponse, AnalyticsError> {
-        use sea_orm::{ActiveModelTrait, Set};
+        use sea_orm::{ActiveModelTrait, EntityTrait, QuerySelect, Set, TransactionTrait};
         use temps_entities::visitor;
+
+        let txn = self.db.begin().await.map_err(AnalyticsError::from)?;
+        let Some(visitor_model) = visitor::Entity::find_by_id(found.id)
+            .lock_exclusive()
+            .one(&txn)
+            .await
+            .map_err(AnalyticsError::from)?
+        else {
+            // Deleted since the lookup.
+            return Ok(visitor_not_found(response_visitor_id));
+        };
 
         let merged = merge_custom_data(visitor_model.custom_data.as_ref(), &incoming);
         // Keys set here come from an authenticated caller, so a later browser
@@ -1387,9 +1403,10 @@ impl AnalyticsService {
         active_model.custom_data = Set(Some(merged));
         active_model.trait_sources = Set(trait_sources);
         active_model
-            .update(self.db.as_ref())
+            .update(&txn)
             .await
             .map_err(AnalyticsError::from)?;
+        txn.commit().await.map_err(AnalyticsError::from)?;
 
         Ok(EnrichVisitorResponse {
             success: true,

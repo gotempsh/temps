@@ -69,6 +69,94 @@ async fn test_enrich_visitor_by_guid_is_confined_to_project() -> anyhow::Result<
     Ok(())
 }
 
+/// ADR 109 D4: an enrichment that starts while an identify holds the
+/// visitor's row must merge into what that identify committed, not write back
+/// the row it read before, which would drop the identified trait and its
+/// `server` mark.
+#[tokio::test]
+async fn test_enrichment_waits_for_a_concurrent_identify_and_keeps_its_traits() -> anyhow::Result<()>
+{
+    use sea_orm::{ConnectionTrait, DatabaseBackend, EntityTrait, Statement, TransactionTrait};
+    let (service, db, _container) = create_test_analytics_service!(
+        "test_enrichment_waits_for_a_concurrent_identify_and_keeps_its_traits"
+    );
+    let crypto = temps_core::CookieCrypto::new("test_key_32_bytes_long_for_tests").unwrap();
+    let sealed = format!("enc_{}", crypto.encrypt("test_visitor_1").unwrap());
+    let visitor = temps_entities::visitor::Entity::find()
+        .one(db.as_ref())
+        .await?
+        .unwrap();
+
+    // The identify: holds the row lock and sets a backend trait.
+    let identify = db.begin().await?;
+    identify
+        .execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT id FROM visitor WHERE id = $1 FOR UPDATE",
+            [visitor.id.into()],
+        ))
+        .await?;
+    identify
+        .execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "UPDATE visitor SET custom_data = '{\"plan\":\"pro\"}'::jsonb, \
+             trait_sources = '{\"plan\":\"server\"}'::jsonb WHERE id = $1",
+            [visitor.id.into()],
+        ))
+        .await?;
+
+    let enrich = service.enrich_visitor_by_guid(
+        &sealed,
+        Some(visitor.project_id),
+        serde_json::json!({ "company": "Example Co" }),
+    );
+    let commit_once_enrichment_waits = async {
+        let mut waiting = false;
+        for _ in 0..200 {
+            let row = db
+                .query_one(Statement::from_string(
+                    DatabaseBackend::Postgres,
+                    "SELECT COUNT(*) AS waiting FROM pg_stat_activity \
+                     WHERE datname = current_database() AND wait_event_type = 'Lock'"
+                        .to_string(),
+                ))
+                .await?
+                .expect("one row");
+            if row.try_get::<i64>("", "waiting")? > 0 {
+                waiting = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        identify.commit().await?;
+        Ok::<bool, anyhow::Error>(waiting)
+    };
+    let (enriched, waited) = tokio::join!(enrich, commit_once_enrichment_waits);
+    assert!(
+        waited?,
+        "the enrichment must wait for the identify's row lock"
+    );
+    assert!(enriched?.updated);
+
+    let row = temps_entities::visitor::Entity::find_by_id(visitor.id)
+        .one(db.as_ref())
+        .await?
+        .unwrap();
+    assert_eq!(
+        row.custom_data,
+        Some(serde_json::json!({ "plan": "pro", "company": "Example Co" })),
+        "the identified trait survives the enrichment"
+    );
+    assert_eq!(
+        row.trait_sources,
+        Some(serde_json::json!({ "plan": "server", "company": "server" })),
+        "and so does its backend mark"
+    );
+
+    cleanup_test_analytics!(db);
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_scoped_enrichment_cannot_grow_a_row_past_the_cap() -> anyhow::Result<()> {
     let (service, db, _container) =
