@@ -2721,7 +2721,10 @@ websocket_key = headers["sec-websocket-key"]"#);
         let spec = serde_json::from_value(spec).unwrap();
         registry.bind(
             InternalApiCaller::new_allowlisted(
-                service.proxy_router.read().await.clone(),
+                crate::plugin::DynamicPluginRouter {
+                    inner: service.proxy_router(),
+                }
+                .router(),
                 &spec,
                 vec![],
             ),
@@ -2752,6 +2755,60 @@ websocket_key = headers["sec-websocket-key"]"#);
                 crate::ai_tools::UpdatePluginAiTools {
                     actor_id: settings.actor_id.clone(),
                     installation_revision: settings.installation_revision.clone(),
+                    enabled: true,
+                },
+            )
+            .await
+            .unwrap();
+        // The actor commit can be durable while the previous verified process
+        // still serves requests. Consent for B must never expose A's schema.
+        let grants = crate::grants::PluginGrantService::new(database.connection_arc());
+        let other_digest = "ab".repeat(32);
+        grants
+            .commit_binary_hash("reports", &other_digest)
+            .await
+            .unwrap();
+        let other = service
+            .update_plugin_ai_tools(
+                "reports",
+                crate::ai_tools::UpdatePluginAiTools {
+                    actor_id: settings.actor_id.clone(),
+                    installation_revision: other_digest,
+                    enabled: true,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(other.enabled);
+        assert!(other.tools.is_empty());
+        service.rebuild_ai_tools().await;
+        assert!(handle
+            .get()
+            .unwrap()
+            .search("plugin.reports", &scope)
+            .is_empty());
+        assert!(handle
+            .get()
+            .unwrap()
+            .call("plugin.reports.list", serde_json::json!({}), &scope)
+            .await
+            .is_err());
+
+        // Reload reconciles the installed binary and requires its own approval.
+        service.reload_plugins().await.unwrap();
+        let reloaded = service.plugin_ai_tools("reports").await.unwrap();
+        assert_eq!(
+            reloaded.installation_revision,
+            settings.installation_revision
+        );
+        assert!(!reloaded.enabled);
+        assert_eq!(reloaded.tools.len(), 1);
+        service
+            .update_plugin_ai_tools(
+                "reports",
+                crate::ai_tools::UpdatePluginAiTools {
+                    actor_id: reloaded.actor_id,
+                    installation_revision: reloaded.installation_revision,
                     enabled: true,
                 },
             )

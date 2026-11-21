@@ -244,17 +244,24 @@ async fn load_ai_tools(
                 retryable_consent_load,
             )
             .await?;
-        let enabled: std::collections::HashMap<_, _> = actors
+        let consents: std::collections::HashMap<_, _> = actors
             .into_iter()
-            .map(|a| (a.plugin_name, a.ai_tools_enabled))
+            .map(|actor| {
+                (
+                    actor.plugin_name,
+                    (actor.binary_sha256, actor.ai_tools_enabled),
+                )
+            })
             .collect();
         let mut index = PluginToolsIndex::default();
-        for (name, spec) in manager.openapi_schemas().await {
-            match PluginToolsIndex::from_openapi(
-                &name,
-                &spec,
-                enabled.get(&name).copied().unwrap_or(false),
-            ) {
+        for (name, digest, spec) in manager.runtime_openapi_schemas().await {
+            let enabled = match consents.get(&name) {
+                Some((revision, enabled)) if revision == &digest => *enabled,
+                // Never offer a different binary's schema for approval or execution.
+                Some(_) => continue,
+                None => false,
+            };
+            match PluginToolsIndex::from_openapi(&name, &spec, enabled) {
                 Ok(tools) => index.extend(tools),
                 Err(error) => {
                     tracing::warn!(plugin=%name,%error,"Invalid plugin AI declarations excluded")
