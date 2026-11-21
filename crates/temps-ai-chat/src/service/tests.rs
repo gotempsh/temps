@@ -326,6 +326,7 @@ async fn startup_missing_session_reacquires_once_before_answering() {
             None,
             false,
             None,
+            None,
         )
         .await;
     let mut stream = stream;
@@ -389,6 +390,7 @@ async fn streamed_missing_session_discards_stale_metadata_before_retry() {
             None,
             false,
             None,
+            None,
         )
         .await;
     let output = drain(stream).await;
@@ -437,6 +439,7 @@ async fn absent_durable_session_resets_stale_retained_runtime_on_first_round() {
             vec![],
             None,
             false,
+            None,
             None,
         )
         .await;
@@ -1768,6 +1771,7 @@ async fn authorization_revocation_stops_an_active_native_provider_stream() {
             None,
             false,
             None,
+            None,
         )
         .await;
 
@@ -1864,6 +1868,7 @@ async fn project_revocation_stops_an_active_native_provider_stream() {
             None,
             false,
             None,
+            None,
         )
         .await;
 
@@ -1953,6 +1958,7 @@ async fn runtime_permission_downgrade_stops_an_active_native_provider_stream() {
             Vec::new(),
             None,
             false,
+            None,
             None,
         )
         .await;
@@ -2072,6 +2078,7 @@ async fn newly_linked_project_is_authorized_during_an_active_native_provider_str
             Vec::new(),
             None,
             false,
+            None,
             None,
         )
         .await;
@@ -2835,6 +2842,7 @@ async fn first_application_turn_persists_and_publishes_harness_session_title() {
             None,
             true,
             None,
+            None,
         )
         .await;
     drain(stream).await;
@@ -3030,6 +3038,7 @@ async fn native_tool_provider_error_is_not_reported_as_round_backstop_exhaustion
             Vec::new(),
             None,
             false,
+            None,
             None,
         )
         .await;
@@ -4150,6 +4159,7 @@ async fn cancelled_claim_never_starts_provider_execution_after_registration() {
             Vec::new(),
             Some("turn-cancelled-during-setup".to_string()),
             false,
+            None,
             None,
         )
         .await;

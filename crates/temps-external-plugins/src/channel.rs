@@ -263,6 +263,7 @@ impl PluginChannel {
                             &capabilities,
                             &host_permissions,
                             &declared_events,
+                            &watch_ready,
                             &grant_service,
                             &bound_actor_id,
                             &binary_sha256,
@@ -271,11 +272,6 @@ impl PluginChannel {
                             &req,
                         )
                         .await;
-                        if matches!(&req.call, PlatformCallRequest::PublishWatchEvent(_))
-                            && matches!(&response.outcome, CallOutcome::Ok(_))
-                        {
-                            watch_ready.notify_one();
-                        }
                         let _ = reader_tx.send(ChannelMessage::Response(response)).await;
                     }
                     _ => {
@@ -411,6 +407,7 @@ async fn dispatch_request(
     capabilities: &[PluginCapability],
     host_permissions: &[PluginHostPermission],
     declared_events: &[temps_plugin_protocol::watch::PublishedEvent],
+    watch_ready: &tokio::sync::Notify,
     grants: &PluginGrantService,
     bound_actor_id: &str,
     digest: &str,
@@ -570,7 +567,7 @@ async fn dispatch_request(
                         == Some(event.subject.as_str())
             });
             if valid {
-                crate::watches::publish(db, plugin_name, bound_actor_id, digest, event)
+                crate::watches::publish(watch_ready, db, plugin_name, bound_actor_id, digest, event)
                     .await
                     .map(PlatformCallResponse::PublishWatchEvent)
             } else {

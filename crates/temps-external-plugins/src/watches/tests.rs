@@ -42,19 +42,21 @@ async fn committed_receipts_match_only_current_authorized_watches_and_deduplicat
         Err(e) => panic!("watch migration fixture: {e}"),
     };
     let db = fixture.connection_arc();
+    let ready = tokio::sync::Notify::new();
     let actor = "5127c44a-a841-46bb-b69e-597f3204c7ac";
     db.execute_unprepared(r#"
 INSERT INTO users(id,name,email) VALUES (9901,'Owner','owner@example.test');
+INSERT INTO sessions(id,user_id,session_token,expires_at,mfa_pending) VALUES(9901,9901,'synthetic-session',now()+interval '1 day',false);
 INSERT INTO ai_conversations(id,public_id,context_type,context_id,created_by) VALUES
  (9911,'chat-1','assistant','assistant',9901),(9912,'chat-2','assistant','assistant',9901),
  (9913,'chat-3','assistant','assistant',9901);
 INSERT INTO external_plugin_actors(id,plugin_name,binary_sha256,source_identity,active,ai_tools_enabled)
 VALUES ('5127c44a-a841-46bb-b69e-597f3204c7ac','reports','hash','file',true,true);
 INSERT INTO plugin_chat_watches(conversation_id,actor_id,digest,source,subject,predicate,mode,session_id,active_since)
-SELECT id,'5127c44a-a841-46bb-b69e-597f3204c7ac','hash','changed','1','{"resource":1}','notify',1,to_timestamp(1000)
+SELECT id,'5127c44a-a841-46bb-b69e-597f3204c7ac','hash','changed','1','{"resource":1}','notify',9901,to_timestamp(1000)
 FROM ai_conversations WHERE id IN (9911,9912);
 INSERT INTO plugin_chat_watches(conversation_id,actor_id,digest,source,subject,predicate,mode,session_id,active_since)
-VALUES(9913,'5127c44a-a841-46bb-b69e-597f3204c7ac','hash','changed','2','{"resource":2}','notify',1,to_timestamp(1000));
+VALUES(9913,'5127c44a-a841-46bb-b69e-597f3204c7ac','hash','changed','2','{"resource":2}','notify',9901,to_timestamp(1000));
 "#).await.unwrap();
     let event = PublishWatchEvent {
         occurred_at_ms: 1_000_001,
@@ -64,22 +66,25 @@ VALUES(9913,'5127c44a-a841-46bb-b69e-597f3204c7ac','hash','changed','2','{"resou
         origin_chat_id: Some("9911".into()),
         attributes: json!({"resource":1}),
     };
-    assert!(publish(&db, "reports", actor, "stale", &event)
+    assert!(publish(&ready, &db, "reports", actor, "stale", &event)
         .await
         .is_err());
     for _ in 0..2 {
         assert!(
-            publish(&db, "reports", actor, "hash", &event)
+            publish(&ready, &db, "reports", actor, "hash", &event)
                 .await
                 .unwrap()
                 .accepted
         );
     }
+    tokio::time::timeout(std::time::Duration::from_secs(1), ready.notified())
+        .await
+        .expect("publish signals the worker before returning to the channel audit");
     let rows=db.query_all(Statement::from_string(DatabaseBackend::Postgres,"SELECT w.conversation_id FROM plugin_watch_deliveries d JOIN plugin_chat_watches w ON w.id=d.watch_id")).await.unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].try_get::<i64>("", "conversation_id").unwrap(), 9912);
-    // The real Chat write boundary claims the delivery and inserts the user
-    // message atomically. A retry, even after another turn, cannot wake twice.
+    // Preparing a wake reserves one transcript message. Recovery may start a model
+    // task from that message without appending the same event a second time.
     db.execute_unprepared("UPDATE plugin_chat_watches SET mode='wake' WHERE conversation_id=9912")
         .await
         .unwrap();
@@ -102,7 +107,12 @@ VALUES(9913,'5127c44a-a841-46bb-b69e-597f3204c7ac','hash','changed','2','{"resou
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(delivered.status, "delivered");
+    assert_eq!(
+        delivered.status, "pending",
+        "a crash before the model task starts must leave the wake retryable"
+    );
+    assert!(delivered.wake_message_id.is_some());
+    assert!(delivered.delivered_at.is_none());
     db.execute_unprepared(
         "UPDATE external_plugin_actors SET ai_tools_enabled=false WHERE plugin_name='reports'",
     )
@@ -114,7 +124,7 @@ VALUES(9913,'5127c44a-a841-46bb-b69e-597f3204c7ac','hash','changed','2','{"resou
         ..event
     };
     assert!(
-        publish(&db, "reports", actor, "hash", &ignored)
+        publish(&ready, &db, "reports", actor, "hash", &ignored)
             .await
             .unwrap()
             .accepted
@@ -134,7 +144,7 @@ VALUES(9913,'5127c44a-a841-46bb-b69e-597f3204c7ac','hash','changed','2','{"resou
     .await
     .unwrap();
     assert!(
-        publish(&db, "reports", actor, "hash", &ignored)
+        publish(&ready, &db, "reports", actor, "hash", &ignored)
             .await
             .unwrap()
             .accepted
@@ -158,7 +168,7 @@ VALUES(9913,'5127c44a-a841-46bb-b69e-597f3204c7ac','hash','changed','2','{"resou
         event_id: "during-pause".into(),
         ..ignored
     };
-    let publication = publish(&db, "reports", actor, "hash", &overlapping);
+    let publication = publish(&ready, &db, "reports", actor, "hash", &overlapping);
     tokio::pin!(publication);
     assert!(
         tokio::time::timeout(std::time::Duration::from_millis(200), &mut publication)
@@ -173,5 +183,67 @@ VALUES(9913,'5127c44a-a841-46bb-b69e-597f3204c7ac','hash','changed','2','{"resou
             .await
             .unwrap(),
         1
+    );
+    db.execute_unprepared("UPDATE plugin_chat_watches SET paused=false,mode='notify' WHERE conversation_id=9912; UPDATE sessions SET mfa_pending=true WHERE id=9901").await.unwrap();
+    let notification_id = "2f7d7ba9-ed3e-4d7e-9e88-b0b5200326b7";
+    db.execute_unprepared("INSERT INTO plugin_watch_deliveries(id,watch_id,event_id) SELECT '2f7d7ba9-ed3e-4d7e-9e88-b0b5200326b7',id,'notify-fixture' FROM plugin_chat_watches WHERE conversation_id=9912").await.unwrap();
+    assert!(append_watch_notification(&db, notification_id, "reports")
+        .await
+        .is_err());
+    db.execute_unprepared("UPDATE sessions SET mfa_pending=false WHERE id=9901")
+        .await
+        .unwrap();
+    append_watch_notification(&db, notification_id, "reports")
+        .await
+        .unwrap();
+    assert!(append_watch_notification(&db, notification_id, "reports")
+        .await
+        .is_err());
+    let completed = temps_entities::plugin_watch_deliveries::Entity::find_by_id(
+        uuid::Uuid::parse_str(notification_id).unwrap(),
+    )
+    .one(db.as_ref())
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(completed
+        .delivered_at
+        .is_some_and(|time| time > completed.created_at));
+    // Fresh unmatched receipts still guard retries. Only expired, unmatched receipts are pruned.
+    db.execute_unprepared("UPDATE plugin_watch_events SET received_at=now()-interval '8 days' WHERE event_id IN ('ignored','evt1')").await.unwrap();
+    assert_eq!(prune_unmatched_events(&db).await.unwrap(), 1);
+    assert!(temps_entities::plugin_watch_events::Entity::find_by_id((
+        uuid::Uuid::parse_str(actor).unwrap(),
+        "evt1".to_owned()
+    ))
+    .one(db.as_ref())
+    .await
+    .unwrap()
+    .is_some());
+
+    let transaction = db.begin().await.unwrap();
+    transaction
+        .execute_unprepared("SELECT transaction_timestamp()")
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    transaction
+        .execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            RESUME_WATCH,
+            [
+                delivered.watch_id.to_string().into(),
+                9912i64.into(),
+                9901i32.into(),
+            ],
+        ))
+        .await
+        .unwrap();
+    transaction.execute_unprepared("INSERT INTO plugin_chat_watches(conversation_id,actor_id,digest,source,subject,predicate,mode,session_id)
+        SELECT 9912,id,'hash','second','1','{}','notify',9901 FROM external_plugin_actors WHERE plugin_name='reports'").await.unwrap();
+    let cutoff = transaction.query_one(Statement::from_string(DatabaseBackend::Postgres, "SELECT bool_and(active_since>transaction_timestamp()) AS valid FROM plugin_chat_watches WHERE conversation_id=9912")).await.unwrap().unwrap();
+    assert!(
+        cutoff.try_get::<bool>("", "valid").unwrap(),
+        "creation and resumption begin after subject authorization"
     );
 }

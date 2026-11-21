@@ -19,6 +19,48 @@ use temps_core::{
 };
 use tower::ServiceExt;
 
+/// Recover the original transcript message when a prior process stopped during preparation.
+pub(crate) async fn prepared_message(
+    db: &sea_orm::DatabaseConnection,
+    conversation_id: i64,
+    delivery: &str,
+) -> Result<Option<temps_entities::ai_messages::Model>, sea_orm::DbErr> {
+    use sea_orm::{DatabaseBackend, EntityTrait, Statement};
+    temps_entities::ai_messages::Entity::find()
+        .from_raw_sql(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            r#"
+        SELECT m.* FROM plugin_watch_deliveries d JOIN ai_messages m ON m.id=d.wake_message_id
+        JOIN plugin_chat_watches w ON w.id=d.watch_id
+        WHERE d.id=$1::text::uuid AND d.status='pending' AND w.conversation_id=$2
+          AND m.conversation_id=$2 AND m.role='user'
+    "#,
+            [delivery.into(), conversation_id.into()],
+        ))
+        .one(db)
+        .await
+}
+
+/// Called inside the registered model task, after the startup and cancellation barrier.
+/// Exactly one task can start this delivery. A failed preparation leaves it pending.
+pub(crate) async fn start_delivery(
+    db: &sea_orm::DatabaseConnection,
+    conversation_id: i64,
+    delivery: &str,
+) -> Result<bool, sea_orm::DbErr> {
+    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+    let result = db.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres, r#"
+        UPDATE plugin_watch_deliveries d SET status='delivered', delivered_at=statement_timestamp()
+        FROM plugin_chat_watches w, external_plugin_actors a, ai_conversations c, sessions s
+        WHERE d.id=$1::text::uuid AND w.conversation_id=$2 AND d.watch_id=w.id
+          AND d.wake_message_id IS NOT NULL AND d.status='pending' AND NOT w.paused AND w.mode='wake'
+          AND a.id=w.actor_id AND a.binary_sha256=w.digest AND a.active AND a.ai_tools_enabled
+          AND c.id=w.conversation_id AND s.id=w.session_id AND s.user_id=c.created_by
+          AND NOT s.mfa_pending AND s.expires_at>statement_timestamp()
+    "#, [delivery.into(), conversation_id.into()])).await?;
+    Ok(result.rows_affected() == 1)
+}
+
 pub(crate) const TOOL: &str = "temps_watch";
 
 #[derive(Clone, Default)]
@@ -109,5 +151,65 @@ pub(crate) fn tool() -> ChatTool {
                 "where":{"type":"object","description":"Exact matches on the source's declared filterable fields using their declared JSON types."},
                 "mode":{"type":"string","enum":["notify","wake"],"default":"wake"}, "id":{"type":"string"}
             }}),
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::{prepared_message, start_delivery};
+    use sea_orm::ConnectionTrait;
+
+    #[tokio::test]
+    async fn interrupted_watch_preparation_reuses_one_message_and_starts_only_once() {
+        let fixture = match temps_test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) if temps_test_utils::is_container_runtime_unavailable(&e.to_string()) => {
+                eprintln!("Skipping watch recovery test: Docker unavailable");
+                return;
+            }
+            Err(e) => panic!("watch recovery fixture: {e}"),
+        };
+        let db = fixture.connection_arc();
+        let delivery = "a5d0ad5c-7f29-4757-aa6a-f32d6b35d663";
+        db.execute_unprepared(r#"
+            INSERT INTO users(id,name,email) VALUES(9901,'Owner','owner@example.test');
+            INSERT INTO sessions(id,user_id,expires_at,session_token,mfa_pending) VALUES(9901,9901,now()+interval '1 day','fixture',false);
+            INSERT INTO ai_conversations(id,public_id,created_by,context_type,context_id) VALUES(9910,'fixture',9901,'assistant','assistant');
+            INSERT INTO external_plugin_actors(id,plugin_name,binary_sha256,source_identity,active,ai_tools_enabled)
+            VALUES('db8821b7-04c6-4ea0-9d88-72ed7152b06c','reports','digest','file',true,true);
+            INSERT INTO plugin_chat_watches(conversation_id,actor_id,digest,source,subject,predicate,mode,session_id)
+            SELECT 9910,id,'digest','changed','1','{}','wake',9901 FROM external_plugin_actors WHERE plugin_name='reports';
+            INSERT INTO plugin_watch_deliveries(id,watch_id,event_id)
+            SELECT 'a5d0ad5c-7f29-4757-aa6a-f32d6b35d663',id,'fixture-event' FROM plugin_chat_watches WHERE conversation_id=9910;
+        "#).await.unwrap();
+        assert!(prepared_message(&db, 9910, delivery)
+            .await
+            .unwrap()
+            .is_none());
+        let insert = r#"INSERT INTO ai_messages(conversation_id,role,content,metadata) VALUES(9910,'user','Resource changed','{"plugin_watch_delivery":"a5d0ad5c-7f29-4757-aa6a-f32d6b35d663"}')"#;
+        db.execute_unprepared(insert).await.unwrap();
+        let recovered = prepared_message(&db, 9910, delivery)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.content, "Resource changed");
+        assert!(prepared_message(&db, 9911, delivery)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(db.execute_unprepared(insert).await.is_err());
+        db.execute_unprepared("UPDATE sessions SET mfa_pending=true WHERE id=9901")
+            .await
+            .unwrap();
+        assert!(!start_delivery(&db, 9910, delivery).await.unwrap());
+        db.execute_unprepared("UPDATE sessions SET mfa_pending=false WHERE id=9901")
+            .await
+            .unwrap();
+        assert!(start_delivery(&db, 9910, delivery).await.unwrap());
+        assert!(!start_delivery(&db, 9910, delivery).await.unwrap());
+        assert!(prepared_message(&db, 9910, delivery)
+            .await
+            .unwrap()
+            .is_none());
     }
 }

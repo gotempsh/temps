@@ -27,6 +27,7 @@ fn access_path(plugin: &str, source: &str, subject: &str) -> String {
 }
 
 pub async fn publish(
+    ready: &tokio::sync::Notify,
     db: &DatabaseConnection,
     plugin: &str,
     actor: &str,
@@ -59,7 +60,7 @@ WITH actor AS (
  JOIN actor a ON a.id=w.actor_id AND a.binary_sha256=w.digest AND a.ai_tools_enabled
  JOIN ai_conversations c ON c.id=w.conversation_id
  WHERE NOT w.paused AND w.source=$4 AND w.subject=$5 AND $8::jsonb @> w.predicate
- AND floor(extract(epoch from w.active_since)*1000) <= $9::bigint
+ AND ceil(extract(epoch from w.active_since)*1000) <= $9::bigint
  AND c.id::text IS DISTINCT FROM $6 AND c.public_id IS DISTINCT FROM $6
  FOR SHARE OF w
 ), receipt AS (
@@ -98,7 +99,26 @@ WITH actor AS (
             format!("Plugin {plugin} is not the active installed revision"),
         ));
     }
+    ready.notify_one();
     Ok(WatchEventAck { accepted: true })
+}
+
+/// Retain unmatched event IDs for seven days from host acceptance, including across restarts.
+/// A matched receipt always has a nonempty source and is kept with its deliveries.
+async fn prune_unmatched_events(db: &DatabaseConnection) -> Result<u64, WatchError> {
+    let result = db
+        .execute(Statement::from_string(
+            DatabaseBackend::Postgres,
+            r#"
+        DELETE FROM plugin_watch_events WHERE (actor_id,event_id) IN (
+            SELECT actor_id,event_id FROM plugin_watch_events
+            WHERE source='' AND received_at < now()-interval '7 days'
+            ORDER BY received_at LIMIT 2048 FOR UPDATE SKIP LOCKED
+        )"#,
+        ))
+        .await
+        .map_err(store("expire unmatched watch receipts"))?;
+    Ok(result.rows_affected())
 }
 
 #[cfg(test)]
@@ -118,7 +138,7 @@ mod key_tests {
 
     #[test]
     fn keys_are_bounded_and_cannot_introduce_routes_or_prompt_text() {
-        assert!(key("channel:example.1", 160));
+        assert!(key("resource:example.1", 160));
         for input in ["", "bad/path", "../bad", "bad\nvalue", "too long"] {
             assert!(!key(input, 160));
         }
@@ -343,6 +363,9 @@ impl WatchHost {
         }))
     }
 }
+// Use the post-authorization statement time for both the insert default and resumption.
+const RESUME_WATCH: &str = "UPDATE plugin_chat_watches SET paused=false,active_since=statement_timestamp(),session_id=$3 WHERE id=$1::uuid AND conversation_id=$2";
+
 impl ExternalPluginsService {
     pub fn start_watch_delivery(
         self: &Arc<Self>,
@@ -364,9 +387,24 @@ impl ExternalPluginsService {
         let ready = self.manager.watch_ready.clone();
         let weak = Arc::downgrade(self);
         tokio::spawn(async move {
+            let sweep_interval = std::time::Duration::from_secs(60);
+            let mut next_sweep = tokio::time::Instant::now();
             while let Some(service) = weak.upgrade() {
                 if service.closing.load(std::sync::atomic::Ordering::Acquire) {
                     break;
+                }
+                if tokio::time::Instant::now() >= next_sweep {
+                    next_sweep = tokio::time::Instant::now() + sweep_interval;
+                    match prune_unmatched_events(&service.db).await {
+                        Ok(2048) => {
+                            next_sweep =
+                                tokio::time::Instant::now() + std::time::Duration::from_secs(1)
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            tracing::warn!(%error, "Could not expire unmatched watch receipts")
+                        }
+                    }
                 }
                 let delay = match service.drain_watch().await {
                     Ok(true) => continue,
@@ -381,11 +419,11 @@ impl ExternalPluginsService {
                     tracing::warn!(%error, "Could not schedule pending watch delivery");
                     Some(std::time::Duration::from_secs(2))
                 });
-                if let Some(delay) = delay {
-                    tokio::select! { _ = ready.notified() => {}, _ = tokio::time::sleep(delay) => {} }
-                } else {
-                    ready.notified().await;
-                }
+                // A channel can disconnect immediately after PostgreSQL commits and before
+                // its in-memory notification. Recheck the indexed queue on the maintenance tick.
+                let until_sweep = next_sweep.saturating_duration_since(tokio::time::Instant::now());
+                let delay = delay.unwrap_or(until_sweep).min(until_sweep);
+                tokio::select! { _ = ready.notified() => {}, _ = tokio::time::sleep(delay) => {} }
             }
         });
     }
@@ -422,7 +460,7 @@ impl ExternalPluginsService {
         let watches=ChatWatch::find_by_statement(Statement::from_sql_and_values(DatabaseBackend::Postgres,r#"
 SELECT w.id::text,a.plugin_name AS plugin,w.source,w.subject,w.label,w.predicate,w.mode,w.paused,
  (SELECT count(*) FROM plugin_watch_deliveries d WHERE d.watch_id=w.id AND d.status='delivered') AS delivered,
- (SELECT max(d.created_at) FROM plugin_watch_deliveries d WHERE d.watch_id=w.id AND d.status='delivered') AS last_delivery,
+ (SELECT max(d.delivered_at) FROM plugin_watch_deliveries d WHERE d.watch_id=w.id AND d.status='delivered') AS last_delivery,
  (NOT a.active OR NOT a.ai_tools_enabled OR a.binary_sha256<>w.digest OR EXISTS(SELECT 1 FROM plugin_watch_deliveries d WHERE d.watch_id=w.id AND d.status='blocked')) AS blocked
  FROM plugin_chat_watches w JOIN ai_conversations c ON c.id=w.conversation_id JOIN external_plugin_actors a ON a.id=w.actor_id
  WHERE c.public_id=$1 AND c.created_by=$2 ORDER BY w.created_at DESC LIMIT 32"#,[chat.into(),auth.user_id().into()])).all(self.db.as_ref()).await.map_err(store("list conversation watches"))?;
@@ -538,7 +576,7 @@ SELECT w.id::text,a.plugin_name AS plugin,w.source,w.subject,w.label,w.predicate
                 .await?;
                 Statement::from_sql_and_values(
                     DatabaseBackend::Postgres,
-                    "UPDATE plugin_chat_watches SET paused=false,active_since=now(),session_id=$3 WHERE id=$1::uuid AND conversation_id=$2",
+                    RESUME_WATCH,
                     [id.to_string().into(), conv.into(), (*session).into()],
                 )
             }
@@ -621,7 +659,7 @@ WITH due AS (SELECT id FROM plugin_watch_deliveries WHERE status='pending' AND n
         let _lifecycle = self.lifecycle.lock().await;
         let result = self.deliver_watch(&d).await;
         match result {
-            // The notification insert or the wake-message trigger owns the
+            // The notification insert or the registered model task owns the
             // durable acknowledgement. HTTP acceptance alone is insufficient.
             Ok(()) => return Ok(true),
             Err(WatchError::Rejected {
@@ -719,14 +757,28 @@ UPDATE plugin_watch_deliveries SET status='skipped' FROM suspended
                 ));
             }
         } else {
-            // Claim and append one notification in one statement. A retry after
-            // a committed write cannot append it twice or revive a paused watch.
-            self.db.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,r#"
+            append_watch_notification(&self.db, &d.id, &d.plugin).await?;
+        }
+        Ok(())
+    }
+}
+
+async fn append_watch_notification(
+    db: &DatabaseConnection,
+    delivery: &str,
+    plugin: &str,
+) -> Result<(), WatchError> {
+    // Claim and append one notification in one statement. A retry after
+    // a committed write cannot append it twice or revive a paused watch.
+    let appended = db.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,r#"
 WITH claimed AS (
- UPDATE plugin_watch_deliveries d SET status='delivered'
+ UPDATE plugin_watch_deliveries d SET status='delivered', delivered_at=statement_timestamp()
  FROM plugin_chat_watches w,external_plugin_actors a
  WHERE d.id=$1::text::uuid AND d.status='pending' AND w.id=d.watch_id AND NOT w.paused
  AND a.id=w.actor_id AND a.active AND a.ai_tools_enabled AND a.binary_sha256=w.digest
+ AND w.mode='notify' AND d.wake_message_id IS NULL
+ AND EXISTS (SELECT 1 FROM sessions s JOIN ai_conversations c ON c.created_by=s.user_id
+             WHERE s.id=w.session_id AND c.id=w.conversation_id AND NOT s.mfa_pending AND s.expires_at>statement_timestamp())
  RETURNING w.conversation_id,w.source,w.subject,coalesce(w.label,w.subject) AS label
 ), message AS (
  INSERT INTO ai_messages(conversation_id,role,content,metadata,created_at)
@@ -735,10 +787,14 @@ WITH claimed AS (
  FROM claimed RETURNING conversation_id
 )
 UPDATE ai_conversations SET last_activity_at=now() FROM message WHERE ai_conversations.id=message.conversation_id"#,
-                [d.id.clone().into(),d.plugin.clone().into()])).await.map_err(store("append chat watch notification"))?;
-        }
-        Ok(())
+                [delivery.into(),plugin.into()])).await.map_err(store("append chat watch notification"))?;
+    if appended.rows_affected() == 0 {
+        return Err(reject(
+            StatusCode::FORBIDDEN,
+            "Watch notification is no longer authorized",
+        ));
     }
+    Ok(())
 }
 
 #[cfg(test)]

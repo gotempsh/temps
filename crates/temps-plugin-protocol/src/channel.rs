@@ -653,6 +653,7 @@ macro_rules! define_platform_calls {
 }
 
 /// Durable change signal. The host derives plugin identity from the channel.
+/// The host remembers an unmatched event ID for seven days after receipt.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PublishWatchEvent {
     /// Original commit time. Retries keep this value so a new watch never receives old events.

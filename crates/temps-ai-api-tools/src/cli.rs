@@ -63,6 +63,7 @@ impl Section<'_> {
         let id = operation.operation_id.as_str();
         id.strip_prefix(&self.slug)
             .and_then(|tail| tail.strip_prefix('.'))
+            .filter(|tail| !is_help(tail))
             .unwrap_or(id)
     }
 }
@@ -935,6 +936,34 @@ mod tests {
     }
 
     use crate::index::ParamSpec;
+
+    #[test]
+    fn plugin_help_operation_keeps_its_executable_name() {
+        let spec = serde_json::from_value(serde_json::json!({
+            "openapi":"3.1.0","info":{"title":"Reports","version":"1"},
+            "paths":{"/guide":{"get":{"operationId":"Help","x-temps-ai-tool":{},
+                "responses":{"200":{"description":"OK"}}}}}
+        }))
+        .unwrap();
+        let plugin = crate::PluginToolsIndex::from_openapi("reports", &spec, true).unwrap();
+        let mut index = analytics_discovery_index();
+        plugin.append_to(&mut index, crate::PluginToolAccess::Read);
+        let CliAction::Terminal(help) =
+            resolve(&index, "plugin.reports help", &|_| true, CliMode::ReadOnly)
+        else {
+            panic!("missing section help")
+        };
+        assert!(help.to_lowercase().contains("plugin.reports.help"));
+        assert!(matches!(
+            resolve(
+                &index,
+                "plugin.reports plugin.reports.help",
+                &|_| true,
+                CliMode::ReadOnly
+            ),
+            CliAction::Execute(_, _)
+        ));
+    }
 
     #[test]
     fn dotted_plugin_commands_and_section_help_resolve_the_same_operation() {

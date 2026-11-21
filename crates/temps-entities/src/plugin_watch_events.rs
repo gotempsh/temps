@@ -11,6 +11,7 @@ pub struct Model {
     pub actor_id: Uuid,
     #[sea_orm(primary_key, auto_increment = false)]
     pub event_id: String,
+    pub received_at: temps_core::DBDateTime,
     pub source: String,
     pub subject: String,
     pub attributes: Json,

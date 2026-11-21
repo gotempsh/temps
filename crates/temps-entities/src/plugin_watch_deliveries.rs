@@ -15,6 +15,8 @@ pub struct Model {
     pub status: String,
     pub next_attempt: DBDateTime,
     pub created_at: DBDateTime,
+    pub delivered_at: Option<DBDateTime>,
+    pub wake_message_id: Option<i64>,
 }
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
 pub enum Relation {}

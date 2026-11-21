@@ -252,6 +252,7 @@ impl ConversationService {
             None,
             false,
             None,
+            None,
         )
         .await
     }
@@ -273,6 +274,7 @@ impl ConversationService {
         active_turn_id: Option<String>,
         should_capture_session_title: bool,
         draft_message_id: Option<i64>,
+        watch_delivery: Option<String>,
     ) -> Pin<Box<dyn Stream<Item = Result<ChatStreamEvent, ChatError>> + Send>> {
         let time_limit = self.turn_time_limit().await;
         let harness_internal_api_url = match harness_workspace {
@@ -411,6 +413,16 @@ impl ConversationService {
             // exact turn still owns the server-side claim.
             if startup_receiver.await.is_err() {
                 return true;
+            }
+            if let Some(delivery) = watch_delivery {
+                match crate::watches::start_delivery(&inputs.db, conv_id, &delivery).await {
+                    Ok(true) => {}
+                    Ok(false) => return true,
+                    Err(error) => {
+                        tracing::error!(conversation_id=conv_id,%error,"Could not start pending plugin watch delivery");
+                        return true;
+                    }
+                }
             }
             ToolLoop::prepare(inputs).run().await
         });

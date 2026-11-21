@@ -974,6 +974,8 @@ impl ExternalPluginManager {
                 HandshakeMessage::Hello(hello)
                     if hello.protocol_version == EXTERNAL_PLUGIN_PROTOCOL_VERSION =>
                 {
+                    temps_plugin_protocol::watch::PublishedEvent::validate_declarations(&hello.manifest.published_events)
+                        .map_err(|reason| format!("Plugin {binary_name}: {reason}"))?;
                     Ok(*hello.manifest)
                 }
                 HandshakeMessage::Hello(hello) => Err(format!(

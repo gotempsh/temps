@@ -10403,3 +10403,39 @@ async fn test_image_user_columns_on_deployments_up_and_down() -> anyhow::Result<
     assert!(deployments_column(&db, "runs_as_root").await?.is_some());
     Ok(())
 }
+
+#[tokio::test]
+async fn watch_delivery_recovery_migration_preserves_existing_receipts() -> anyhow::Result<()> {
+    use sea_orm::{DatabaseBackend, Statement};
+    let container = start_pg_container!("watch delivery recovery");
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    let target = "m20261121_130001_plugin_watch_delivery_recovery";
+    let before = Migrator::migrations()
+        .iter()
+        .position(|m| m.name() == target)
+        .expect("registered migration");
+    Migrator::up(&db, Some(before as u32)).await?;
+    db.execute_unprepared(
+        r#"
+        INSERT INTO external_plugin_actors(id,plugin_name,binary_sha256,source_identity,active)
+        VALUES('176aa5c4-24ca-474d-a983-a43031e46794','reports','digest','file',true);
+        INSERT INTO plugin_watch_events(actor_id,event_id,source,subject,attributes)
+        VALUES('176aa5c4-24ca-474d-a983-a43031e46794','replay','','','{}');
+    "#,
+    )
+    .await?;
+    for _ in 0..2 {
+        Migrator::up(&db, Some(1)).await?;
+        assert!(column_exists(&db, "plugin_watch_deliveries", "wake_message_id").await?);
+        let row = db.query_one(Statement::from_string(DatabaseBackend::Postgres,
+            "SELECT received_at IS NOT NULL AS retained FROM plugin_watch_events WHERE event_id='replay'")).await?.expect("existing receipt");
+        assert!(row.try_get::<bool>("", "retained")?);
+        Migrator::down(&db, Some(1)).await?;
+        assert!(!column_exists(&db, "plugin_watch_deliveries", "wake_message_id").await?);
+    }
+    Ok(())
+}

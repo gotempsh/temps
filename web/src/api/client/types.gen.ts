@@ -47255,6 +47255,9 @@ export type CreateGlobalConversationResponse = CreateGlobalConversationResponses
 export type ListChatPluginWatchesData = {
     body?: never;
     path: {
+        /**
+         * Conversation ID
+         */
         chat: string;
     };
     query?: never;
@@ -47262,13 +47265,40 @@ export type ListChatPluginWatchesData = {
 };
 
 export type ListChatPluginWatchesErrors = {
+    /**
+     * Invalid conversation ID
+     */
+    400: unknown;
+    /**
+     * Authentication required
+     */
     401: unknown;
+    /**
+     * Caller cannot access watches in this conversation
+     */
     403: unknown;
+    /**
+     * Conversation or watch resource not found
+     */
     404: unknown;
+    /**
+     * Could not access watch storage
+     */
     500: unknown;
+    /**
+     * Watch service unavailable
+     */
+    503: unknown;
+    /**
+     * Conversation access check timed out
+     */
+    504: unknown;
 };
 
 export type ListChatPluginWatchesResponses = {
+    /**
+     * Watches and event sources for the conversation
+     */
     200: WatchPanel;
 };
 
@@ -47277,6 +47307,9 @@ export type ListChatPluginWatchesResponse = ListChatPluginWatchesResponses[keyof
 export type ChangeChatPluginWatchData = {
     body: WatchChange;
     path: {
+        /**
+         * Conversation ID
+         */
         chat: string;
     };
     query?: never;
@@ -47284,15 +47317,48 @@ export type ChangeChatPluginWatchData = {
 };
 
 export type ChangeChatPluginWatchErrors = {
+    /**
+     * Invalid watch request
+     */
     400: unknown;
+    /**
+     * Authentication required
+     */
     401: unknown;
+    /**
+     * Caller cannot access watches in this conversation
+     */
     403: unknown;
+    /**
+     * Conversation or watch resource not found
+     */
     404: unknown;
+    /**
+     * Watch configuration conflict
+     */
     409: unknown;
+    /**
+     * Could not access watch storage
+     */
     500: unknown;
+    /**
+     * Invalid plugin access response
+     */
+    502: unknown;
+    /**
+     * Watch service or plugin unavailable
+     */
+    503: unknown;
+    /**
+     * Access check timed out
+     */
+    504: unknown;
 };
 
 export type ChangeChatPluginWatchResponses = {
+    /**
+     * Watch changed
+     */
     204: void;
 };
 

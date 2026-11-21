@@ -3465,9 +3465,23 @@ impl ConversationService {
             None
         };
         log_phase("application_workspace_ready");
-        let user_message = self
-            .insert_message(conv.id, "user", user_text, user_metadata)
-            .await?;
+        let watch_delivery = user_metadata
+            .as_ref()
+            .and_then(|m| m.get("plugin_watch_delivery"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let prepared = match watch_delivery.as_deref() {
+            Some(delivery) => crate::watches::prepared_message(&self.db, conv.id, delivery).await?,
+            None => None,
+        };
+        let retrying_wake = prepared.is_some();
+        let user_message = match prepared {
+            Some(message) => message,
+            None => {
+                self.insert_message(conv.id, "user", user_text, user_metadata)
+                    .await?
+            }
+        };
         self.touch(conv.id).await;
         log_phase("user_message_persisted");
 
@@ -3475,22 +3489,30 @@ impl ConversationService {
         // the outgoing POST, so without this it has no way to learn a new
         // turn started or what the user typed. Best-effort (see
         // `publish_wire_event`) — never blocks or fails the turn.
-        self.publish_wire_event(
-            conv.id,
-            "user_message",
-            serde_json::json!({
-                "turn_id": turn_id,
-                "content": user_message.content,
-                "created_at": user_message.created_at.to_rfc3339(),
-                "attachments": user_message
-                    .metadata
-                    .as_ref()
-                    .and_then(|metadata| metadata.get("attachments")),
-            })
-            .to_string(),
-        );
+        if !retrying_wake {
+            self.publish_wire_event(
+                conv.id,
+                "user_message",
+                serde_json::json!({
+                    "turn_id": turn_id,
+                    "content": user_message.content,
+                    "created_at": user_message.created_at.to_rfc3339(),
+                    "attachments": user_message
+                        .metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.get("attachments")),
+                })
+                .to_string(),
+            );
+        }
 
-        let history = self.messages(conv.id).await?;
+        let mut history = self.messages(conv.id).await?;
+        if retrying_wake {
+            // The display order remains durable. Present the resumed request after any
+            // intervening messages in the model input, including after compaction.
+            history.retain(|m| m.id != user_message.id);
+            history.push(user_message.clone());
+        }
         log_phase("history_loaded");
         let is_first_user_turn = history.iter().filter(|m| m.role == "user").count() == 1;
         let should_capture_session_title = conv.context_type == "application"
@@ -3535,7 +3557,8 @@ impl ConversationService {
             .filter(|m| {
                 m.role == "system"
                     || (matches!(m.role.as_str(), "user" | "assistant")
-                        && m.id > summarized_through)
+                        && (m.id > summarized_through
+                            || (retrying_wake && m.id == user_message.id)))
             })
             .map(|m| {
                 let mut content = m.content.clone();
@@ -3876,6 +3899,7 @@ impl ConversationService {
                 Some(turn_id.to_string()),
                 should_capture_session_title,
                 Some(draft_message.id),
+                watch_delivery,
             )
             .await;
         log_phase("execution_task_spawned");

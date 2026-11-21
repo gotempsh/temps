@@ -72,6 +72,26 @@ impl ScalarType {
 }
 
 impl PublishedEvent {
+    /// Each event type names one schema for discovery, authorization and publication.
+    pub fn validate_declarations(events: &[Self]) -> Result<(), String> {
+        let mut seen = std::collections::HashSet::new();
+        for event in events {
+            if !event.is_valid() {
+                return Err(format!(
+                    "Invalid published event declaration {:?}",
+                    event.event_type
+                ));
+            }
+            if !seen.insert(&event.event_type) {
+                return Err(format!(
+                    "Duplicate published event type {:?}",
+                    event.event_type
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub fn is_valid(&self) -> bool {
         let valid_name = |s: &str| {
             !s.is_empty()
@@ -161,6 +181,8 @@ mod tests {
             "attributes_schema":{"type":"object","properties":{"project":{"type":"integer"},
             "success":{"type":"boolean"},"build":{"type":"string"}},"required":["project","success","build"]}
         })).unwrap();
+        assert!(PublishedEvent::validate_declarations(std::slice::from_ref(&event)).is_ok());
+        assert!(PublishedEvent::validate_declarations(&[event.clone(), event.clone()]).is_err());
         assert!(event.is_valid());
         let data = json!({"project":4,"success":false,"build":"b1"});
         assert_eq!(event.subject(&data, false).as_deref(), Some("4"));

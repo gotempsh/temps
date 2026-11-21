@@ -99780,6 +99780,7 @@
         "operationId": "list_chat_plugin_watches",
         "parameters": [
           {
+            "description": "Conversation ID",
             "in": "path",
             "name": "chat",
             "required": true,
@@ -99796,12 +99797,30 @@
                   "$ref": "#/components/schemas/WatchPanel"
                 }
               }
-            }
+            },
+            "description": "Watches and event sources for the conversation"
           },
-          "401": {},
-          "403": {},
-          "404": {},
-          "500": {}
+          "400": {
+            "description": "Invalid conversation ID"
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "Caller cannot access watches in this conversation"
+          },
+          "404": {
+            "description": "Conversation or watch resource not found"
+          },
+          "500": {
+            "description": "Could not access watch storage"
+          },
+          "503": {
+            "description": "Watch service unavailable"
+          },
+          "504": {
+            "description": "Conversation access check timed out"
+          }
         },
         "security": [
           {
@@ -99810,13 +99829,13 @@
         ],
         "tags": [
           "External Plugins"
-        ],
-        "x-maturity": "beta"
+        ]
       },
       "post": {
         "operationId": "change_chat_plugin_watch",
         "parameters": [
           {
+            "description": "Conversation ID",
             "in": "path",
             "name": "chat",
             "required": true,
@@ -99836,13 +99855,36 @@
           "required": true
         },
         "responses": {
-          "204": {},
-          "400": {},
-          "401": {},
-          "403": {},
-          "404": {},
-          "409": {},
-          "500": {}
+          "204": {
+            "description": "Watch changed"
+          },
+          "400": {
+            "description": "Invalid watch request"
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "Caller cannot access watches in this conversation"
+          },
+          "404": {
+            "description": "Conversation or watch resource not found"
+          },
+          "409": {
+            "description": "Watch configuration conflict"
+          },
+          "500": {
+            "description": "Could not access watch storage"
+          },
+          "502": {
+            "description": "Invalid plugin access response"
+          },
+          "503": {
+            "description": "Watch service or plugin unavailable"
+          },
+          "504": {
+            "description": "Access check timed out"
+          }
         },
         "security": [
           {
@@ -99851,8 +99893,7 @@
         ],
         "tags": [
           "External Plugins"
-        ],
-        "x-maturity": "beta"
+        ]
       }
     },
     "/ai/conversations/{public_id}": {
