@@ -263,7 +263,7 @@ async fn protect(fx: &Fx, password: Option<&str>) {
         .set_password(
             fx.page_id,
             SetPagePasswordRequest {
-                password: password.map(str::to_string),
+                password: password.map(Into::into),
             },
         )
         .await
@@ -462,7 +462,7 @@ async fn setting_the_password_is_authorized_validated_and_audited_without_the_pa
         metadata(),
         Path(fx.page_id),
         Json(SetPagePasswordRequest {
-            password: Some(PASSWORD.to_string()),
+            password: Some(PASSWORD.into()),
         }),
     )
     .await
@@ -476,7 +476,7 @@ async fn setting_the_password_is_authorized_validated_and_audited_without_the_pa
         metadata(),
         Path(fx.page_id),
         Json(SetPagePasswordRequest {
-            password: Some("short".to_string()),
+            password: Some("short".into()),
         }),
     )
     .await
@@ -502,7 +502,7 @@ async fn setting_the_password_is_authorized_validated_and_audited_without_the_pa
         metadata(),
         Path(fx.page_id),
         Json(SetPagePasswordRequest {
-            password: Some(PASSWORD.to_string()),
+            password: Some(PASSWORD.into()),
         }),
     )
     .await

@@ -4,6 +4,7 @@
 //! Request and response shapes of status page passwords.
 
 use serde::{Deserialize, Serialize};
+use temps_core::secret_string::SecretString;
 use utoipa::ToSchema;
 
 /// Whether a page needs a password. The password is never returned.
@@ -14,8 +15,9 @@ pub struct PagePasswordResponse {
 }
 
 /// `password` set: protect the page with it (8 to 256 characters), ending
-/// every visitor's session. `null`: remove the password.
+/// every visitor's session. `null`: remove the password. A credential: the
+/// AI assistant can only pass it through a secret slot.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SetPagePasswordRequest {
-    pub password: Option<String>,
+    pub password: Option<SecretString>,
 }

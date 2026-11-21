@@ -111,6 +111,7 @@ impl PageAccessService {
     ) -> Result<PagePasswordResponse, PageAccessError> {
         let hash = match request.password {
             Some(password) => {
+                let password = password.into_exposed();
                 validate(status_page_id, &password)?;
                 // The same permits as unlock: hashing is as heavy as
                 // verifying, so concurrent changes cannot exhaust memory.
@@ -270,7 +271,7 @@ mod tests {
             .set_password(
                 7,
                 SetPagePasswordRequest {
-                    password: Some("correct horse battery".to_string()),
+                    password: Some("correct horse battery".into()),
                 },
             )
             .await

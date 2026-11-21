@@ -75610,12 +75610,16 @@
         "type": "object"
       },
       "SetPagePasswordRequest": {
-        "description": "`password` set: protect the page with it (8 to 256 characters), ending\nevery visitor's session. `null`: remove the password.",
+        "description": "`password` set: protect the page with it (8 to 256 characters), ending\nevery visitor's session. `null`: remove the password. A credential: the\nAI assistant can only pass it through a secret slot.",
         "properties": {
           "password": {
-            "type": [
-              "string",
-              "null"
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/SecretString"
+              },
+              {
+                "type": "null"
+              }
             ]
           }
         },

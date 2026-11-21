@@ -34979,10 +34979,11 @@ export type SetNodeResourcesRequest = {
 
 /**
  * `password` set: protect the page with it (8 to 256 characters), ending
- * every visitor's session. `null`: remove the password.
+ * every visitor's session. `null`: remove the password. A credential: the
+ * AI assistant can only pass it through a secret slot.
  */
 export type SetPagePasswordRequest = {
-    password?: string | null;
+    password?: SecretString | null;
 };
 
 export type SetPreviewPasswordBody = {

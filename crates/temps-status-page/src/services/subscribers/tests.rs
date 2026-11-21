@@ -1143,7 +1143,7 @@ async fn a_protected_page_takes_subscriptions_only_from_visitors_who_unlocked_it
         .set_password(
             fx.page_id,
             crate::services::page_access::SetPagePasswordRequest {
-                password: Some("page password".to_string()),
+                password: Some("page password".into()),
             },
         )
         .await
