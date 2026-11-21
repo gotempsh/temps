@@ -414,6 +414,7 @@ describe('the rrweb example starts recording only after init succeeds', () => {
       .replace('export async function', 'async function')
     let recording = false
     const inits: number[] = []
+    const waits: number[] = []
     const startReplay = new Function(
       'record',
       'fetch',
@@ -439,7 +440,11 @@ describe('the rrweb example starts recording only after init succeeds', () => {
         return { ok: status < 300, status }
       },
       () => {},
-      (resolve: () => void) => resolve(), // no real backoff in the test
+      // No real backoff in the test; record each requested delay.
+      (resolve: () => void, ms: number) => {
+        waits.push(ms)
+        resolve()
+      },
       {},
       {},
       { href: 'https://apps.example.com/' },
@@ -447,13 +452,14 @@ describe('the rrweb example starts recording only after init succeeds', () => {
       1280,
       800
     ) as () => Promise<void>
-    return { startReplay, inits, isRecording: () => recording }
+    return { startReplay, inits, waits, isRecording: () => recording }
   }
 
   test('a temporary init failure is retried, then recording starts', async () => {
     const replay = run([503, 429, 201])
     await replay.startReplay()
     expect(replay.inits).toEqual([503, 429, 201])
+    expect(replay.waits).toEqual([1000, 2000])
     expect(replay.isRecording()).toBe(true)
   })
 
@@ -468,6 +474,8 @@ describe('the rrweb example starts recording only after init succeeds', () => {
     const replay = run([500, 500, 500, 500, 500, 500, 500])
     await replay.startReplay()
     expect(replay.inits).toHaveLength(6)
+    // Backoff only between attempts: no wait after the last one.
+    expect(replay.waits).toEqual([1000, 2000, 4000, 8000, 16000])
     expect(replay.isRecording()).toBe(false)
   })
 })

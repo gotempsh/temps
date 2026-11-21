@@ -241,7 +241,8 @@ async function pack(events) {
 // recording starts only once init succeeds. Server errors, 429 and network
 // failures are retried with backoff; other 4xx answers will not change.
 async function initSession() {
-  for (let attempt = 0; attempt < 6; attempt++) {
+  const attempts = 6;
+  for (let attempt = 0; attempt < attempts; attempt++) {
     try {
       const res = await fetch(${JSON.stringify(endpointUrl(setup, 'init'))}, {
         method: 'POST', headers,
@@ -253,7 +254,10 @@ async function initSession() {
     } catch {
       // Network error: retry.
     }
-    await new Promise((resolve) => setTimeout(resolve, 1000 * 2 ** attempt));
+    // No wait after the last attempt: there is nothing left to retry.
+    if (attempt < attempts - 1) {
+      await new Promise((resolve) => setTimeout(resolve, 1000 * 2 ** attempt));
+    }
   }
   return false;
 }
