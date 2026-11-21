@@ -82,6 +82,11 @@ impl AnalyticsService {
             param_index += 1;
         }
 
+        if let Some(user_id) = &segment.filter_user_id {
+            where_conditions.push(format!("v.user_id = ${}", param_index));
+            values.push(user_id.clone().into());
+            param_index += 1;
+        }
         if let Some(channel) = &segment.filter_channel {
             where_conditions.push(format!("v.first_channel = ${}", param_index));
             values.push(channel.clone().into());
@@ -1267,7 +1272,7 @@ fn custom_data_footprint(custom_data: Option<&serde_json::Value>) -> (usize, usi
 /// existed) stays editable as long as the write does not make it larger, so
 /// identity enrichment does not stop working for that visitor; it just can't
 /// grow it.
-fn validate_merge(
+pub(crate) fn validate_merge(
     existing: Option<&serde_json::Value>,
     merged: &serde_json::Value,
     project_scoped: bool,
@@ -1338,17 +1343,40 @@ impl AnalyticsService {
     ///
     /// Skips the write when nothing changes, so a client that re-sends the same
     /// identity on every page load costs a read, not a row rewrite.
+    ///
+    /// The merge reads the row under the same row lock `identify` takes
+    /// (ADR 109 D4), inside one transaction: merged from an unlocked read, a
+    /// write could replace a trait and its `server` mark that an identify
+    /// committed in between.
     async fn apply_visitor_enrichment(
         &self,
-        visitor_model: temps_entities::visitor::Model,
+        found: temps_entities::visitor::Model,
         project_scoped: bool,
         incoming: serde_json::Value,
         response_visitor_id: String,
     ) -> Result<EnrichVisitorResponse, AnalyticsError> {
-        use sea_orm::{ActiveModelTrait, Set};
+        use sea_orm::{ActiveModelTrait, EntityTrait, QuerySelect, Set, TransactionTrait};
         use temps_entities::visitor;
 
+        let txn = self.db.begin().await.map_err(AnalyticsError::from)?;
+        let Some(visitor_model) = visitor::Entity::find_by_id(found.id)
+            .lock_exclusive()
+            .one(&txn)
+            .await
+            .map_err(AnalyticsError::from)?
+        else {
+            // Deleted since the lookup.
+            return Ok(visitor_not_found(response_visitor_id));
+        };
+
         let merged = merge_custom_data(visitor_model.custom_data.as_ref(), &incoming);
+        // Keys set here come from an authenticated caller, so a later browser
+        // `identify` must not overwrite them (ADR 109 D4).
+        let trait_sources = crate::visitor_identity::mark_enriched_keys(
+            visitor_model.trait_sources.as_ref(),
+            &incoming,
+        );
+        let sources_unchanged = trait_sources == visitor_model.trait_sources;
         let visitor_row_id = visitor_model.id;
         // Nothing to store: an identical document, or removing keys from a row
         // that has no data. The response text is the same for both outcomes, so
@@ -1356,9 +1384,10 @@ impl AnalyticsService {
         // below and the token's write budget still let a write-only caller
         // infer a little about stored state; that residual is narrowed, not
         // eliminated.)
-        let unchanged = visitor_model.custom_data.as_ref() == Some(&merged)
-            || (visitor_model.custom_data.is_none()
-                && merged.as_object().is_some_and(|map| map.is_empty()));
+        let unchanged = sources_unchanged
+            && (visitor_model.custom_data.as_ref() == Some(&merged)
+                || (visitor_model.custom_data.is_none()
+                    && merged.as_object().is_some_and(|map| map.is_empty())));
         if unchanged {
             return Ok(EnrichVisitorResponse {
                 success: true,
@@ -1372,10 +1401,12 @@ impl AnalyticsService {
 
         let mut active_model: visitor::ActiveModel = visitor_model.into();
         active_model.custom_data = Set(Some(merged));
+        active_model.trait_sources = Set(trait_sources);
         active_model
-            .update(self.db.as_ref())
+            .update(&txn)
             .await
             .map_err(AnalyticsError::from)?;
+        txn.commit().await.map_err(AnalyticsError::from)?;
 
         Ok(EnrichVisitorResponse {
             success: true,
@@ -1659,6 +1690,11 @@ impl Analytics for AnalyticsService {
 
         // Visitor-side: first-touch channel / referrer.
         // "Direct" referrer is stored as NULL in the visitor table.
+        if let Some(user_id) = &segment.filter_user_id {
+            where_conditions.push(format!("v.user_id = ${}", param_index));
+            values.push(user_id.clone().into());
+            param_index += 1;
+        }
         if let Some(channel) = &segment.filter_channel {
             where_conditions.push(format!("v.first_channel = ${}", param_index));
             values.push(channel.clone().into());
@@ -1743,7 +1779,9 @@ impl Analytics for AnalyticsService {
                 last_event.page_path as current_page,
                 v.first_referrer,
                 v.first_referrer_hostname,
-                v.first_channel
+                v.first_channel,
+                v.user_id,
+                v.identity_source
             FROM visitor v
             LEFT JOIN ip_geolocations ig ON v.ip_address_id = ig.id
             LEFT JOIN LATERAL (
@@ -1792,6 +1830,8 @@ impl Analytics for AnalyticsService {
             first_referrer: Option<String>,
             first_referrer_hostname: Option<String>,
             first_channel: Option<String>,
+            user_id: Option<String>,
+            identity_source: Option<String>,
         }
 
         let results = VisitorResult::find_by_statement(Statement::from_sql_and_values(
@@ -1829,6 +1869,8 @@ impl Analytics for AnalyticsService {
                 first_referrer: r.first_referrer,
                 first_referrer_hostname: r.first_referrer_hostname,
                 first_channel: r.first_channel,
+                user_id: r.user_id,
+                identity_source: r.identity_source,
             })
             .collect();
 
@@ -2197,7 +2239,11 @@ impl Analytics for AnalyticsService {
                 ig.asn AS asn_org,
                 v.first_referrer,
                 v.first_referrer_hostname,
-                v.first_channel
+                v.first_channel,
+                v.user_id,
+                v.identity_source,
+                v.identified_at,
+                v.trait_sources
             FROM visitor v
             LEFT JOIN ip_geolocations ig ON v.ip_address_id = ig.id
             WHERE v.id = $1
@@ -2230,6 +2276,10 @@ impl Analytics for AnalyticsService {
             first_referrer: Option<String>,
             first_referrer_hostname: Option<String>,
             first_channel: Option<String>,
+            user_id: Option<String>,
+            identity_source: Option<String>,
+            identified_at: Option<UtcDateTime>,
+            trait_sources: Option<serde_json::Value>,
         }
 
         let result = DetailResult::find_by_statement(Statement::from_sql_and_values(
@@ -2266,6 +2316,10 @@ impl Analytics for AnalyticsService {
             first_referrer: r.first_referrer,
             first_referrer_hostname: r.first_referrer_hostname,
             first_channel: r.first_channel,
+            user_id: r.user_id,
+            identity_source: r.identity_source,
+            identified_at: r.identified_at,
+            trait_sources: r.trait_sources,
         }))
     }
 
@@ -5467,6 +5521,159 @@ WHERE project_id = $1
             entries,
         })
     }
+
+    async fn get_event_properties(
+        &self,
+        project_id: i32,
+        event_name: &str,
+        property: &str,
+        start_date: UtcDateTime,
+        end_date: UtcDateTime,
+        environment_id: Option<i32>,
+        limit: u64,
+    ) -> Result<crate::types::responses::EventPropertiesResponse, AnalyticsError> {
+        validate_event_property_key(property)?;
+        if event_name.is_empty() {
+            return Err(AnalyticsError::InvalidQuery {
+                field: "event_name",
+                reason: format!(
+                    "an event name is required to break down property '{}' in project {}",
+                    property, project_id
+                ),
+            });
+        }
+        let limit = limit.clamp(1, 100) as i64;
+
+        let mut values: Vec<sea_orm::Value> = vec![
+            project_id.into(),
+            event_name.into(),
+            start_date.into(),
+            end_date.into(),
+            property.into(),
+        ];
+        let env_filter = match environment_id {
+            Some(env_id) => {
+                values.push(env_id.into());
+                format!("AND e.environment_id = ${}", values.len())
+            }
+            None => String::new(),
+        };
+        values.push(limit.into());
+        let limit_param = values.len();
+
+        // `props ->> $5::text` is the property's value as text whatever its JSON
+        // type, and NULL when the event did not carry it. The key is bound,
+        // never interpolated. Grouping by ordinal keeps the bound expression
+        // identical in SELECT and GROUP BY.
+        let sql = format!(
+            r#"
+            WITH value_stats AS (
+                SELECT
+                    e.props ->> $5::text AS value,
+                    COUNT(*)::bigint AS count,
+                    COUNT(DISTINCT e.visitor_id)::bigint AS unique_visitors
+                FROM events e
+                WHERE e.project_id = $1
+                  AND COALESCE(e.event_name, e.event_type) = $2
+                  AND e.timestamp >= $3
+                  AND e.timestamp < $4
+                  AND e.is_crawler = false
+                  {env_filter}
+                GROUP BY 1
+            ),
+            total AS (
+                SELECT COALESCE(SUM(count), 0)::bigint AS total_count FROM value_stats
+            )
+            SELECT
+                vs.value,
+                vs.count,
+                vs.unique_visitors,
+                t.total_count,
+                CASE WHEN t.total_count > 0
+                     THEN vs.count::float8 / t.total_count::float8 * 100
+                     ELSE 0 END AS percentage
+            FROM value_stats vs
+            CROSS JOIN total t
+            ORDER BY vs.count DESC, vs.value ASC NULLS LAST
+            LIMIT ${limit_param}
+            "#
+        );
+
+        #[derive(FromQueryResult)]
+        struct ValueRow {
+            value: Option<String>,
+            count: i64,
+            unique_visitors: i64,
+            total_count: i64,
+            percentage: f64,
+        }
+
+        let rows = ValueRow::find_by_statement(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            &sql,
+            values,
+        ))
+        .all(self.db.as_ref())
+        .await?;
+
+        let total_count = rows.first().map(|row| row.total_count).unwrap_or(0);
+        Ok(crate::types::responses::EventPropertiesResponse {
+            event_name: event_name.to_string(),
+            property: property.to_string(),
+            total_count,
+            items: rows
+                .into_iter()
+                .map(|row| crate::types::responses::EventPropertyValue {
+                    value: row.value,
+                    count: row.count,
+                    unique_visitors: row.unique_visitors,
+                    percentage: row.percentage,
+                })
+                .collect(),
+        })
+    }
+}
+
+/// Longest event property key accepted by the property breakdown.
+pub const MAX_EVENT_PROPERTY_KEY_LEN: usize = 64;
+
+/// Check a key of an event's custom properties before it is used in a query.
+///
+/// The key is always bound as a parameter, so this is not what keeps SQL
+/// injection out; it keeps the accepted keys to the shape the SDKs produce
+/// (`url`, `extension`, `plan_tier`, `checkout.step`) and gives a clear error
+/// for anything else.
+pub fn validate_event_property_key(key: &str) -> Result<(), AnalyticsError> {
+    if key.is_empty() {
+        return Err(AnalyticsError::InvalidQuery {
+            field: "property",
+            reason: "the property name is empty".to_string(),
+        });
+    }
+    if key.len() > MAX_EVENT_PROPERTY_KEY_LEN {
+        return Err(AnalyticsError::InvalidQuery {
+            field: "property",
+            reason: format!(
+                "property name '{}…' is {} characters long; the limit is {}",
+                &key[..key.char_indices().nth(16).map_or(key.len(), |(i, _)| i)],
+                key.len(),
+                MAX_EVENT_PROPERTY_KEY_LEN
+            ),
+        });
+    }
+    if !key
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+    {
+        return Err(AnalyticsError::InvalidQuery {
+            field: "property",
+            reason: format!(
+                "property name '{}' may only contain letters, digits, '_', '-' and '.'",
+                key
+            ),
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]

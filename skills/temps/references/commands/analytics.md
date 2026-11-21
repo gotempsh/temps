@@ -7,8 +7,13 @@ Apply [the CLI runtime and safety contract](../cli-runtime.md) before executing 
 ## Contents
 
 - [`analytics keys`](#analytics-keys)
+- [`analytics conversions`](#analytics-conversions)
+- [`analytics identity`](#analytics-identity)
 - [`analytics overview`](#analytics-overview)
 - [`analytics top`](#analytics-top)
+- [`analytics outbound`](#analytics-outbound)
+- [`analytics downloads`](#analytics-downloads)
+- [`analytics not-found`](#analytics-not-found)
 - [`analytics funnels`](#analytics-funnels)
 - [`analytics performance`](#analytics-performance)
 - [`analytics ai-agents`](#analytics-ai-agents)
@@ -22,6 +27,7 @@ Apply [the CLI runtime and safety contract](../cli-runtime.md) before executing 
 - [`analytics api-query`](#analytics-api-query)
 - [`analytics api-summary`](#analytics-api-summary)
 - [`analytics enrich`](#analytics-enrich)
+- [`analytics identify`](#analytics-identify)
 
 ## `analytics` (alias: `stats`)
 
@@ -30,8 +36,13 @@ View project analytics
 **Subcommands:**
 
 - `keys` - Manage analytics ingest keys (pa_...) for apps Temps does not deploy
+- `conversions` (`goals`) - Conversion goals: events or pages that count as success
+- `identity` - Whether visitors are recognised by a stored id or tracked cookieless, and who may identify them
 - `overview` (`o`) - Show analytics dashboard overview
 - `top` - Show breakdown by dimension: pages, referrers, browsers, os, devices, countries, regions, cities, channels, events, languages, utm_source, utm_medium, utm_campaign
+- `outbound` - Show the outbound links visitors clicked (outbound_click events)
+- `downloads` - Show the files visitors downloaded (file_download events)
+- `not-found` - Show pages visitors could not find: 404s Temps answered and not_found events
 - `funnels` - Show funnel conversion metrics for all funnels
 - `performance` (`speed`) - Show real-user Web Vitals and optional dimension breakdowns
 - `ai-agents` - Show AI crawler / provider breakdown (web /analytics/ai-agents)
@@ -45,6 +56,7 @@ View project analytics
 - `api-query` - Run a typed multi-dimensional API traffic aggregation
 - `api-summary` - Show an AI-generated summary of API traffic from /api-analytics/summary (requires AI Assistance to be configured and enabled on the project)
 - `enrich` - Attach identity or attributes to a visitor (merges into custom_data; a null value removes a key)
+- `identify` - Label a visitor with your app's user id, as your backend would (browser identify cannot replace it)
 
 ### `analytics keys`
 
@@ -129,6 +141,127 @@ Revoke (deactivate) an analytics ingest key
 | `-f, --force` | Skip confirmation | - | No |
 | `-y, --yes` | Skip confirmation (alias for --force) | - | No |
 
+### `analytics conversions` (alias: `goals`)
+
+Conversion goals: events or pages that count as success
+
+**Subcommands:**
+
+- `list` - List conversions with visitors, rate and revenue in a period
+- `create` - Define a conversion
+- `update` - Replace a conversion's definition
+- `delete` - Delete a conversion (recorded events are kept)
+- `breakdown` - Where the visitors who converted came from
+
+#### `analytics conversions list`
+
+List conversions with visitors, rate and revenue in a period
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 7d, 30d, 3m) | `30d` | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `analytics conversions create`
+
+Define a conversion
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `-n, --name <name>` | Name shown in reports, e.g. Signup | - | No |
+| `--event <name>` | Count this event, e.g. signup | - | No |
+| `--page <path>` | Count visits to this path; * matches anything, e.g. /docs/* | - | No |
+| `--property <key=value>` | Only events whose property has this value, e.g. plan=pro | - | No |
+| `--revenue-property <key>` | Event property holding the amount, e.g. amount | - | No |
+| `--currency <code>` | ISO 4217 currency of the amount, e.g. EUR | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `analytics conversions update`
+
+Replace a conversion's definition
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--goal-id <id>` | Conversion ID (see list) | - | Yes |
+| `-n, --name <name>` | Name shown in reports, e.g. Signup | - | No |
+| `--event <name>` | Count this event, e.g. signup | - | No |
+| `--page <path>` | Count visits to this path; * matches anything, e.g. /docs/* | - | No |
+| `--property <key=value>` | Only events whose property has this value, e.g. plan=pro | - | No |
+| `--revenue-property <key>` | Event property holding the amount, e.g. amount | - | No |
+| `--currency <code>` | ISO 4217 currency of the amount, e.g. EUR | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `analytics conversions delete`
+
+Delete a conversion (recorded events are kept)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--goal-id <id>` | Conversion ID (see list) | - | Yes |
+| `-f, --force` | Skip confirmation | - | No |
+| `-y, --yes` | Skip confirmation (alias for --force) | - | No |
+
+#### `analytics conversions breakdown`
+
+Where the visitors who converted came from
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--goal-id <id>` | Conversion ID (see list) | - | Yes |
+| `--by <dimension>` | One of channel, referrer, utm_source, utm_medium, utm_campaign, page, country, device_type, browser, operating_system | `channel` | No |
+| `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 7d, 30d, 3m) | `30d` | No |
+| `--limit <n>` | Rows (default: 10, max: 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics identity`
+
+Whether visitors are recognised by a stored id or tracked cookieless, and who may identify them
+
+**Subcommands:**
+
+- `show` - Show the identity mode, whether browser identify is accepted, and what they change
+- `set` - Switch between persistent and cookieless tracking, or accept/refuse browser identify
+
+#### `analytics identity show`
+
+Show the identity mode, whether browser identify is accepted, and what they change
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `analytics identity set`
+
+Switch between persistent and cookieless tracking, or accept/refuse browser identify
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--mode <mode>` | One of persistent, cookieless | - | No |
+| `--browser-identify <accept|refuse>` | Whether identify() from the browser is applied; refuse leaves identify to the app's backend | - | No |
+| `-y, --yes` | Skip confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
 ### `analytics overview` (alias: `o`)
 
 Show analytics dashboard overview
@@ -153,6 +286,45 @@ Show breakdown by dimension: pages, referrers, browsers, os, devices, countries,
 |------|-------------|---------|----------|
 | `-p, --project <project>` | Project slug or ID | - | No |
 | `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `24h` | No |
+| `--limit <n>` | Number of results (default: 20, max: 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics outbound`
+
+Show the outbound links visitors clicked (outbound_click events)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `7d` | No |
+| `--limit <n>` | Number of results (default: 20, max: 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics downloads`
+
+Show the files visitors downloaded (file_download events)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `7d` | No |
+| `--limit <n>` | Number of results (default: 20, max: 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics not-found`
+
+Show pages visitors could not find: 404s Temps answered and not_found events
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `7d` | No |
 | `--limit <n>` | Number of results (default: 20, max: 100) | - | No |
 | `--json` | Output in JSON format | - | No |
 
@@ -376,4 +548,21 @@ Attach identity or attributes to a visitor (merges into custom_data; a null valu
 | `-f, --file <path>` | Read the JSON object to merge from a file | - | No |
 | `--set <key=value>` | Set one key to a string value (repeatable; use --data for numbers, booleans, or nested values) | `` | No |
 | `--unset <key>` | Remove one top-level key (repeatable; sends null) | `` | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics identify`
+
+Label a visitor with your app's user id, as your backend would (browser identify cannot replace it)
+
+**Usage:** `analytics identify <visitor-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--user-id <id>` | Your app's id for this person (at most 256 characters) | - | Yes |
+| `-d, --data <json>` | Traits as a JSON object, e.g. '{"plan":"pro"}' | - | No |
+| `--set <key=value>` | Set one trait to a string value (repeatable) | `` | No |
+| `--unset <key>` | Remove one trait (repeatable; sends null) | `` | No |
 | `--json` | Output in JSON format | - | No |

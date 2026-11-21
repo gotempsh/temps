@@ -137,6 +137,21 @@ impl ManifestCache {
             .map(|entry| entry.result.clone())
     }
 
+    /// Every successfully read manifest, by environment id. Bounded by
+    /// [`MAX_ENTRIES`]; read without contacting any executor.
+    pub fn manifests(&self) -> Vec<(i32, Arc<Manifest>)> {
+        self.read()
+            .iter()
+            .filter_map(|(environment_id, entry)| {
+                entry
+                    .result
+                    .as_ref()
+                    .ok()
+                    .map(|manifest| (*environment_id, manifest.clone()))
+            })
+            .collect()
+    }
+
     pub fn invalidate(&self, environment_id: i32) {
         self.write().remove(&environment_id);
     }

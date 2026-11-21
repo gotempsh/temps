@@ -10,6 +10,8 @@ import {
   getVisitorSessionsOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { VisitorJourney } from './VisitorJourney'
+import { VisitorIdentityPanel } from './VisitorIdentityPanel'
+import { traitSources } from '@/lib/visitor-identity'
 import { buildEnrichPayload, isPayloadTooLargeError } from './enrich-payload'
 import { problemDetail } from '@/lib/api-problem'
 import { ProjectResponse } from '@/api/client/types.gen'
@@ -253,6 +255,8 @@ export function VisitorDetail({
       },
     }),
   })
+  // Who set each custom_data key, when identify or enrichment recorded it.
+  const sources = traitSources(visitorDetails?.trait_sources)
 
   const {
     data: sessions,
@@ -709,6 +713,11 @@ export function VisitorDetail({
             </CardContent>
           </Card>
 
+          <VisitorIdentityPanel
+            project={project}
+            visitor={visitorDetails ?? {}}
+          />
+
           {/* Custom Data Section */}
           {visitorDetails?.custom_data &&
             Object.keys(visitorDetails.custom_data).length > 0 && (
@@ -732,6 +741,13 @@ export function VisitorDetail({
                           {key
                             .replace(/_/g, ' ')
                             .replace(/\b\w/g, (l) => l.toUpperCase())}
+                          {sources[key] && (
+                            <span className="block text-xs font-normal">
+                              {sources[key] === 'server'
+                                ? 'from backend'
+                                : 'from browser'}
+                            </span>
+                          )}
                         </div>
                         <div className="flex-1 text-sm">
                           {typeof value === 'object' && value !== null ? (

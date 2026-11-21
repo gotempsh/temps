@@ -895,6 +895,12 @@ export const projectNavItems: NavigationItem[] = [
     keywords: ['funnels', 'conversion', 'flow', 'analytics'],
   },
   {
+    title: 'Surveys',
+    url: 'analytics/surveys',
+    icon: MessageSquare,
+    keywords: ['surveys', 'nps', 'feedback', 'questions', 'analytics'],
+  },
+  {
     title: 'Analytics setup',
     url: 'analytics/setup',
     icon: Settings,

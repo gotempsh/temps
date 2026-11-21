@@ -58,6 +58,7 @@ use management::*;
         list_workflow_project_keys,
         shred_workflow_project_key,
         list_all_workflow_runs,
+        list_workflow_definitions,
         get_workflows_overview,
         list_workflow_runs,
         start_workflow_run,
@@ -90,6 +91,10 @@ use management::*;
         keys::WorkflowProjectKeyResponse,
         keys::WorkflowProjectKeysResponse,
         keys::ShredWorkflowKeyRequest,
+        global::GlobalWorkflowRunResponse,
+        global::WorkflowDefinitionState,
+        global::WorkflowDefinitionResponse,
+        global::WorkflowDefinitionsResponse,
         global::GlobalWorkflowRunsResponse,
         WorkflowsOverviewResponse,
         ExecutorCapabilityResponse,
@@ -169,6 +174,7 @@ pub fn configure_routes() -> Router<Arc<WorkflowsAppState>> {
             post(respond_workflow_dev),
         )
         .route("/workflows/runs", get(list_all_workflow_runs))
+        .route("/workflows/definitions", get(list_workflow_definitions))
         .route(RUNS, get(get_workflows_overview))
         .route(
             &format!("{RUNS}/runs"),

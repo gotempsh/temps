@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import tarfile
 import time
 import tempfile
@@ -52,6 +53,14 @@ def manifest(package, root=ROOT):
     return tomllib.loads((path / file).read_text())[field]
 
 
+# Protocol before the Rust SDK, analytics core before its consumers.
+PUBLISH_FIRST = ('analytics-core', 'temps-plugin-protocol')
+
+
+def publish_order(key):
+    return (key not in PUBLISH_FIRST, key)
+
+
 def package_tag(key, package, version):
     return f"{package['path']}/v{version}" if package['kind'] == 'go' else f'sdk/{key}/v{version}'
 
@@ -67,7 +76,7 @@ def catalog_packages(root=ROOT):
         packages.append(dict(package, key=key, version=version,
                              channel=channel(version, package['kind']),
                              tag=package_tag(key, package, version)))
-    return sorted(packages, key=lambda p: (p['key'] not in ('analytics-core', 'temps-plugin-protocol'), p['key']))
+    return sorted(packages, key=lambda p: publish_order(p['key']))
 
 
 def validate(root=ROOT):
@@ -116,9 +125,7 @@ def plan(tag, root=ROOT):
             raise ValueError('Go v2+ requires a new /v2 module path and catalog entry')
         result.append(dict(package, key=key, version=version, channel=expected_channel,
                            tag=package_tag(key, package, version)))
-    # Protocol before the Rust SDK, analytics core before its consumers.
-    priority = {'temps-plugin-protocol': 0, 'analytics-core': 0}
-    return sorted(result, key=lambda p: (priority.get(p['key'], 1), p['key']))
+    return sorted(result, key=lambda p: publish_order(p['key']))
 
 
 def notes(packages):
@@ -175,6 +182,11 @@ def build(packages, output):
                 run('bun', 'install', '--frozen-lockfile', cwd=install)
                 installed.add(install)
             data = manifest(p)
+            # Packing runs with --ignore-scripts, so honour a prepublishOnly that
+            # regenerates sources first: @temps-sdk/api is selected by changes to
+            # apps/temps-cli/openapi.json and must ship the client for that spec.
+            if runs_generate(data['scripts'].get('prepublishOnly', '')):
+                run('bun', 'run', 'generate', cwd=path)
             # Workspace consumers require core declarations before their build.
             if '@temps-sdk/analytics-core' in data.get('dependencies', {}):
                 run('bun', 'run', 'build', cwd=ROOT / 'sdks/node/packages/analytics-core')
@@ -232,15 +244,21 @@ def build(packages, output):
     (output / 'sha256.json').write_text(json.dumps(inventory, sort_keys=True) + '\n')
 
 
-def registry_json(url):
+def runs_generate(script):
+    """Whether a package script runs `bun run generate` itself (`generate:types` is another script)."""
+    return bool(re.search(r'(?:^|[\s;&|(])bun run generate(?=$|[\s;&|)])', script))
+
+
+def registry_json(url, parse=json.load, missing=(404,)):
+    """Fetch registry metadata; only the listed statuses mean "does not exist"."""
     request = urllib.request.Request(url, headers={'User-Agent': 'temps-sdk-release (https://github.com/gotempsh/temps)'})
     for attempt in range(3):
         try:
             with urllib.request.urlopen(request, timeout=30) as response:
-                return json.load(response)
+                return parse(response)
         except urllib.error.HTTPError as error:
             error.close()
-            if error.code == 404:
+            if error.code in missing:
                 return None
             if error.code not in (429, 500, 502, 503, 504) or attempt == 2:
                 raise
@@ -435,16 +453,77 @@ def verify_artifact_plan(output, packages, revision):
         raise ValueError('Artifact inventory/checksums differ from tested packages')
 
 
+def prepare_command(args, parser):
+    """Exit 0 when prepared, 1 when files would change (--check), 2 when the check itself failed."""
+    if not args.tag:
+        parser.error('--tag is required for prepare')
+    if args.at_tag and (not args.check or args.candidate):
+        parser.error('--at-tag re-derives a tagged selection; use it with --check and without --candidate')
+    # Everything but the verdict runs inside this block, outputs included: a failure
+    # anywhere must never read as "files would change" (exit 1).
+    try:
+        pending = run_prepare(args)
+    except Exception as error:  # noqa: BLE001 -- every failure maps to exit 2, with its message
+        parser.exit(2, f'error: {error}\n' if isinstance(error, ValueError) else f'error: {type(error).__name__}: {error}\n')
+    if pending:
+        print(pending, file=sys.stderr)
+        sys.exit(1)
+
+
+def run_prepare(args):
+    """Run prepare and write its outputs; returns the pending-edits message, or None."""
+    import sdk_prepare
+    if args.at_tag:
+        files, released = sdk_prepare.verify_tag(args.tag)
+        if released:
+            print(f"{args.tag}: {', '.join(released)} already released; verifying against the pre-release state")
+        if files:
+            return (f'error: the SDK selection prepared for {args.tag} is stale at the tag: commits since the '
+                    f'prep PR need different versions. These files would change: ' + ', '.join(files))
+        print(f'{args.tag}: the prepared SDK selection matches the tagged commit')
+        return None
+    if args.candidate:
+        if found := sdk_prepare.branch_only_changes(args.candidate):
+            changes = '; '.join(f"{key}: {', '.join(files)}" for key, files in found)
+            raise ValueError(f'{args.candidate} changes SDK files that main does not have ({changes}); '
+                             f'land them on main first so they are versioned')
+    report, files = sdk_prepare.prepare(args.tag, write=not args.check)
+    text = sdk_prepare.summary(args.tag, report)
+    print(text, flush=True)
+    if args.summary:
+        args.summary.write_text(text)
+    if args.changed_files:
+        args.changed_files.write_text(''.join(path + '\n' for path in files))
+    if file := os.environ.get('GITHUB_OUTPUT'):
+        with open(file, 'a') as stream:
+            stream.write(f'selected={str(bool(report)).lower()}\n')
+            stream.write(f"kinds={json.dumps(sorted({entry['kind'] for entry in report}))}\n")
+            stream.write(f'changed={str(bool(files)).lower()}\n')
+    if args.check and files:
+        return f'SDK releases for {args.tag} are not prepared; these files would change: ' + ', '.join(files)
+    return None
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=['plan', 'notes', 'build', 'check', 'publish', 'publish-tags', 'check-tags', 'validate', 'verify'])
+    parser.add_argument('command', choices=['plan', 'notes', 'build', 'check', 'publish', 'publish-tags', 'check-tags', 'validate', 'verify', 'prepare'])
     parser.add_argument('--tag')
     parser.add_argument('--all', action='store_true', help='Build all current SDKs for validation only')
     parser.add_argument('--output', type=Path, default=Path('sdk-artifacts'))
     parser.add_argument('--kind', choices=['npm', 'pypi', 'crate', 'go'])
+    parser.add_argument('--check', action='store_true',
+                        help='prepare: change nothing; exit 1 when files would change, 2 when the check fails')
+    parser.add_argument('--summary', type=Path, help='prepare: write the per-package changelog table here')
+    parser.add_argument('--changed-files', type=Path, help='prepare: write the changed paths here, one per line')
+    parser.add_argument('--candidate', help='prepare: fail when this release branch has SDK commits that main lacks')
+    parser.add_argument('--at-tag', action='store_true',
+                        help='prepare --check: re-derive the selection on the checked-out, already tagged commit')
     args = parser.parse_args()
     if args.command == 'validate':
         validate()
+        return
+    if args.command == 'prepare':
+        prepare_command(args, parser)
         return
     if args.all and args.command != 'build':
         parser.error('--all is only allowed for build')

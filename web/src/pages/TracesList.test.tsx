@@ -2,7 +2,13 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { afterEach, expect, test } from 'bun:test'
-import { cleanup, fireEvent, render, waitFor } from '@testing-library/react'
+import {
+  cleanup,
+  fireEvent,
+  render,
+  waitFor,
+  within,
+} from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter, useLocation } from 'react-router'
 import type { EnvironmentResponse, ProjectResponse } from '@/api/client'
@@ -156,3 +162,26 @@ test('without the hash a service with traces keeps the setup closed', async () =
   await new Promise((resolve) => setTimeout(resolve, 50))
   expect(view.container.querySelector('#traces-setup')).toBeNull()
 })
+
+// OTLP data from an app Temps does not run is stored project-wide, so an
+// environment picker in its setup would change nothing.
+test.each([
+  { option: /Any language or framework/, label: 'any framework' },
+  { option: /Next\.js/, label: 'a framework preset' },
+])(
+  'the OTLP setup for $label offers no environment picker and says the data is project-wide',
+  async ({ option }) => {
+    layout.place('#traces-setup', NEAR_THE_END)
+    const view = renderWithTraces('/traces#traces-setup')
+    fireEvent.click((await view.findAllByRole('button', { name: option }))[0])
+    fireEvent.click(view.getByRole('button', { name: /^Continue/ }))
+    await waitFor(() =>
+      expect(view.container.textContent).toContain(
+        'belong to the whole project'
+      )
+    )
+    const setup = view.container.querySelector('#traces-setup')!
+    expect(setup.textContent).not.toContain('Environment:')
+    expect(within(setup as HTMLElement).queryByRole('combobox')).toBeNull()
+  }
+)

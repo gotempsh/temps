@@ -46,12 +46,18 @@ jobs:
   #         main built instead of compiling one
   #   web   "true" when web/ changed, or rust is "true"
   #   cli   "true" when apps/temps-cli/ changed, or rust is "true"
+  #   console  "true" when web/ itself changed (or the workflow files that run
+  #         the full Playwright report). A Rust change does not set it; it
+  #         gates only the non-blocking `e2e-ui` report
   #
   # .github/scripts/ci-affected-crates.py then narrows the Rust tests:
   #   tests         nextest filterset of the crates the change can reach (the
-  #                 changed crates, everything depending on them, and any
-  #                 crate reading a changed file); `all()` for anything it
-  #                 cannot place, such as Cargo.lock or .github/
+  #                 changed crates, everything linking them, the tests of
+  #                 anything dev-depending on them, any crate reading a
+  #                 changed file, and the crates a Cargo.lock or
+  #                 [workspace.dependencies] change reaches); CI-only files
+  #                 reach only their readers; `all()` for anything it cannot
+  #                 place, such as this workflow, .cargo/ or scripts/
   #   docker_tests  "false" when temps-providers and temps-backup are out of
   #                 reach, so their docker-tests archive is not built
   # Every test group still runs, on its share of that set: a pull request to
@@ -78,6 +84,7 @@ jobs:
       rust: ${{ steps.classify.outputs.rust }}
       web: ${{ steps.classify.outputs.web }}
       cli: ${{ steps.classify.outputs.cli }}
+      console: ${{ steps.classify.outputs.console }}
       release: ${{ steps.classify.outputs.release }}
       tests: ${{ steps.affected.outputs.tests }}
       docker_tests: ${{ steps.affected.outputs.docker_tests }}
@@ -96,7 +103,7 @@ jobs:
         run: |
           if [[ "$GITHUB_EVENT_NAME" != "pull_request" ]]; then
             echo "Not a pull request ($GITHUB_EVENT_NAME); running every job."
-            printf '%s\n' code=true rust=true web=true cli=true release=true >> "$GITHUB_OUTPUT"
+            printf '%s\n' code=true rust=true web=true cli=true console=true release=true >> "$GITHUB_OUTPUT"
             exit 0
           fi
           python3 .github/scripts/classify-ci-changes.py --base HEAD^1 --head HEAD
@@ -582,16 +589,21 @@ jobs:
 
   # Every Playwright spec, on its own runner so it adds no wall-clock time to
   # the gate above. Non-blocking by construction (see the `suite` input in
-  # e2e-tests.yml): failures surface as a warning and a step summary. Runs
-  # whenever the console could have changed (`web` is also set by any Rust
-  # change), and on every push to `main`.
+  # e2e-tests.yml): failures surface as a warning and a step summary.
+  #
+  # Runs when a pull request changes web/ itself (`console`), and on every
+  # push to `main` and in the merge queue. A Rust-only pull request skips it:
+  # the specs beyond the smoke suite mostly route-mock the API and assert on
+  # UI copy, so they test what web/ changed, while the ~55-minute run held a
+  # runner on every Rust push. The `e2e` smoke gate above still runs for Rust
+  # changes and drives the real API through the browser.
   e2e-ui:
     name: E2E UI
     needs: [changes, build-binary, build-test-binaries]
     if: >-
       ${{ !cancelled()
       && (needs.build-binary.result == 'success' || needs.build-test-binaries.result == 'success')
-      && needs.changes.outputs.web != 'false' }}
+      && needs.changes.outputs.console != 'false' }}
     uses: ./.github/workflows/e2e-tests.yml
     with:
       binary-artifact: ${{ needs.build-binary.result == 'success' && 'temps-binary-musl-fast' || 'temps-binary-debug' }}
@@ -1216,6 +1228,7 @@ jobs:
               package(temps-credential-checks) or package(temps-edge) or
               package(temps-edge-rules) or package(temps-email-tracking) or
               package(temps-file-store) or package(temps-flags) or package(temps-service-access) or package(temps-service-access-runtime) or
+              package(temps-surveys) or
               package(temps-log-aggregator) or package(temps-mcp-server) or
               package(temps-memory) or package(temps-observability) or
               package(temps-product-telemetry) or package(temps-project-groups) or

@@ -395,9 +395,12 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
             "ofrep_public_single",
             "ofrep_server_bulk",
             "ofrep_server_single",
+            "public_surveys",
             "list_analytics_ingest_keys",
+            "record_browser_identify",
             "record_event_metrics",
             "record_speed_metrics",
+            "reset_browser_identity",
             "revoke_analytics_ingest_key",
             "rotate_analytics_ingest_key",
             // Status page subscription links and form (ADR 108 D2): used
@@ -418,6 +421,10 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
             "upload_artifact_chunk",
             "upload_release_file",
         ],
+    ),
+    (
+        "free text typed by the project's visitors (open-text survey answers); read in the console, not passed through the chat",
+        &["list_survey_responses"],
     ),
     (
         "reassigns every user's rollout and split bucket for a flag, which silently invalidates a running experiment; an operator decision made in the console or CLI",
@@ -467,6 +474,8 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
             "get_data_import",
             "get_data_import_availability",
             "get_event_entries",
+            // Raw property values of visitors' events, e.g. the URLs they clicked.
+            "get_event_properties",
             "get_ingest_errors",
             "get_log_context",
             "get_preview_gateway_logs",
@@ -833,6 +842,8 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
         "personal data written or ingested on behalf of end users, not an operator action",
         &[
             "enrich_visitor",
+            "identify_visitor",
+            "identify_visitor_for_token",
             "record_console_event",
             "record_flag_exposure",
             "revenue_import_invoices_csv",
@@ -991,6 +1002,24 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
             "create_error_saved_search",
             "update_error_saved_search",
             "delete_error_saved_search",
+        ],
+    ),
+    (
+        "the bytes of an error or feedback attachment (ADR 111, D4) can hold anything an SDK captured (screenshots, logs, request dumps) and are served for a person to open; deleting one and setting the attachment quota are made in the console or CLI",
+        &[
+            "get_error_attachment_content",
+            "delete_error_attachment",
+            "set_error_attachment_quota",
+        ],
+    ),
+    (
+        "opening, linking and unlinking an error group's issue (ADR 111, D5) writes to the project's GitHub or GitLab repository or to the group's record, and refreshing reads every linked issue from the provider with the project's credentials; replacing the ownership rules decides who new errors are assigned to. A person does these in the console or CLI",
+        &[
+            "create_error_group_issue",
+            "link_error_group_issue",
+            "unlink_error_group_issue",
+            "refresh_error_group_issues",
+            "replace_error_ownership_rules",
         ],
     ),
 ];

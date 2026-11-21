@@ -848,6 +848,17 @@ pub async fn init_session_replay(
         IngestBranch::HostResolved
     };
 
+    // ADR 109 D3: a replay needs an id stored on the device, which a
+    // cookieless project never has. Checked before the visitor check, so an
+    // outdated tracker is told why rather than to send a visitor id.
+    refuse_cookieless_replay(
+        &state,
+        keyed_scope.as_ref().map(|scope| scope.project_id),
+        &metadata.host,
+        &request.session_id,
+    )
+    .await?;
+
     // Only reject the request if the client sent neither a cookie nor a
     // fallback id, which means it's an SDK version too old to generate one
     // (or, on the Host-resolved branch, that no cookie is present at all —
@@ -964,6 +975,51 @@ pub async fn init_session_replay(
     }
 }
 
+/// ADR 109 D3: refuse replay data for a cookieless project, at init and on
+/// every batch, so a recorder started before the project switched stops
+/// being stored. The keyed path reads the mode through the shared cache; the
+/// Host path from the route table.
+async fn refuse_cookieless_replay(
+    state: &AppState,
+    keyed_project_id: Option<i32>,
+    host: &str,
+    session_id: &str,
+) -> Result<(), Problem> {
+    let cookieless = match keyed_project_id {
+        Some(project_id) => state
+            .cookieless_identity
+            .identity_mode(project_id)
+            .await
+            .map_err(|e| {
+                ErrorBuilder::new(StatusCode::SERVICE_UNAVAILABLE)
+                    .title("Visitor identity unavailable")
+                    .detail(e.to_string())
+                    .build()
+            })?
+            .is_cookieless(),
+        None => state
+            .route_table
+            .get_route(host)
+            .and_then(|route| {
+                route
+                    .project
+                    .as_ref()
+                    .map(|project| project.analytics_identity_mode.is_cookieless())
+            })
+            .unwrap_or(false),
+    };
+    if cookieless {
+        return Err(ErrorBuilder::new(StatusCode::FORBIDDEN)
+            .title("Session replay is off for cookieless projects")
+            .detail(format!(
+                "Session {session_id} was not recorded: the project on host {host} tracks \
+                 visitors without cookies, and a replay needs an id stored on the device."
+            ))
+            .build());
+    }
+    Ok(())
+}
+
 /// Add events to existing session replay
 #[utoipa::path(
     post,
@@ -976,6 +1032,7 @@ pub async fn init_session_replay(
     responses(
         (status = 200, description = "Events added successfully", body = AddEventsResponse),
         (status = 400, description = "Bad request", body = ErrorResponse),
+        (status = 403, description = "The project tracks visitors cookieless, so replay data is not stored", body = ErrorResponse),
         (status = 404, description = "Session not found", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
@@ -1020,6 +1077,7 @@ pub async fn add_session_replay_events(
     // init_session_replay.  This binds the event-append operation to the
     // project that owns the originating host, preventing a cross-tenant
     // attacker from injecting rrweb events into another project's session.
+    let keyed_project_id = keyed_scope.as_ref().map(|scope| scope.project_id);
     let project_id = match keyed_scope {
         Some(scope) => scope.project_id,
         None => match state.route_table.get_route(&metadata.host) {
@@ -1043,6 +1101,14 @@ pub async fn add_session_replay_events(
             }
         },
     };
+
+    refuse_cookieless_replay(
+        &state,
+        keyed_project_id,
+        &metadata.host,
+        &request.session_id,
+    )
+    .await?;
 
     match state
         .session_replay_service
@@ -1289,6 +1355,15 @@ mod tests {
             project_access_checker: None,
             ingest_key_service: Arc::new(AnalyticsIngestKeyService::new(db.clone())),
             ingest_rate_limiter: Arc::new(AnalyticsIngestRateLimiter::new()),
+            cookieless_identity: Arc::new(temps_analytics::cookieless::CookielessIdentity::new(
+                db.clone(),
+                Arc::new(
+                    temps_core::EncryptionService::new(
+                        "0000000000000000000000000000000000000000000000000000000000000000",
+                    )
+                    .expect("valid test key"),
+                ),
+            )),
         })
     }
 
@@ -1455,6 +1530,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_cookieless_project_records_no_replay() {
+        use sea_orm::ConnectionTrait;
+        let mut test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let project = insert_db_project(db.as_ref()).await;
+        insert_db_visitor(db.as_ref(), project.id, "client-generated-visitor").await;
+        db.execute_unprepared(&format!(
+            "UPDATE projects SET analytics_identity_mode = 'cookieless' WHERE id = {}",
+            project.id
+        ))
+        .await
+        .expect("switch the project to cookieless");
+        let state = build_state(db.clone());
+        let key = state
+            .ingest_key_service
+            .create(project.id, None, None, None, None, None)
+            .await
+            .expect("minting an ingest key must succeed");
+
+        let response = setup_public_app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_temps/session-replay/init")
+                    .header("host", "app.not-deployed-by-temps.test")
+                    .header("content-type", "application/json")
+                    .header("x-temps-analytics-key", &key.public_key)
+                    .body(Body::from(init_payload("session-c").to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(stored_sessions(db.as_ref()).await.is_empty());
+
+        test_db.cleanup().await;
+    }
+
+    #[tokio::test]
     async fn keyed_session_replay_events_append_accepts_the_query_param_fallback() {
         let mut test_db: TestDatabase = match TestDatabase::with_migrations().await {
             Ok(db) => db,
@@ -1517,6 +1638,76 @@ mod tests {
             .unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed["event_count"], 1);
+
+        test_db.cleanup().await;
+    }
+
+    /// A recorder started while the project was persistent stops being
+    /// stored once the project switches to cookieless (ADR 109 D3).
+    #[tokio::test]
+    async fn replay_batches_are_refused_after_a_switch_to_cookieless() {
+        use sea_orm::ConnectionTrait;
+        let mut test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let project = insert_db_project(db.as_ref()).await;
+        insert_db_visitor(db.as_ref(), project.id, "client-generated-visitor").await;
+        let state = build_state(db.clone());
+        let key = state
+            .ingest_key_service
+            .create(project.id, None, None, None, None, None)
+            .await
+            .expect("minting an ingest key must succeed");
+        let send = |uri: String, body: serde_json::Value| {
+            let state = state.clone();
+            let key = key.public_key.clone();
+            async move {
+                setup_public_app(state)
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri(uri)
+                            .header("host", "app.not-deployed-by-temps.test")
+                            .header("content-type", "application/json")
+                            .header("x-temps-analytics-key", key)
+                            .body(Body::from(body.to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+                    .status()
+            }
+        };
+        assert_eq!(
+            send(
+                "/_temps/session-replay/init".into(),
+                init_payload("session-s")
+            )
+            .await,
+            StatusCode::CREATED
+        );
+
+        db.execute_unprepared(&format!(
+            "UPDATE projects SET analytics_identity_mode = 'cookieless' WHERE id = {}",
+            project.id
+        ))
+        .await
+        .expect("switch the project to cookieless");
+        state
+            .cookieless_identity
+            .forget_identity_mode(project.id)
+            .await;
+
+        let batch = serde_json::json!({ "sessionId": "session-s", "events": encoded_events() });
+        assert_eq!(
+            send("/_temps/session-replay/events".into(), batch).await,
+            StatusCode::FORBIDDEN
+        );
 
         test_db.cleanup().await;
     }

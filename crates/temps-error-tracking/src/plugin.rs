@@ -437,6 +437,39 @@ impl TempsPlugin for ErrorTrackingPlugin {
                 .require_service::<ErrorTrackingService>()
                 .release_health
                 .start(sink);
+            // Attachments (ADR 111, D4) live in the project's blob storage.
+            // Without it they are dropped at ingest, and the usage endpoint
+            // says Blob storage is what is missing.
+            let attachments = context
+                .require_service::<ErrorTrackingService>()
+                .attachments
+                .clone();
+            match context.get_service::<dyn temps_core::PayloadBlobStore>() {
+                Some(store) => {
+                    attachments.set_store(store);
+                    attachments.start();
+                    tracing::debug!("Attachment uploader and sweeper started");
+                }
+                None => tracing::info!(
+                    "Blob storage not available - attachments sent by SDKs will be dropped"
+                ),
+            }
+            // Issues, suspect commits and ownership (ADR 111, D5) reach the
+            // project's repository through the git plugin. Without it the
+            // status endpoint says no git provider integration is installed.
+            let source_control = context
+                .require_service::<ErrorTrackingService>()
+                .source_control
+                .clone();
+            match context.get_service::<dyn temps_core::ProjectSourceControl>() {
+                Some(repositories) => source_control.set_source_control(repositories),
+                None => tracing::info!(
+                    "Git provider integration not available - issues cannot be opened from errors"
+                ),
+            }
+            if let Err(error) = source_control.ownership.reload().await {
+                tracing::warn!(%error, "Ownership rules could not be loaded at startup; they load when the first new group arrives");
+            }
             // Performance issues (ADR 111, D2) read stored traces. Without
             // the OTel plugin there are no traces, so the scanner does not
             // start and the status endpoint says why.
@@ -540,6 +573,8 @@ impl TempsPlugin for ErrorTrackingPlugin {
             route_table,
             dsn_service: tunnel_dsn_service,
             rate_limiter: crate::sentry::rate_limiter::IngestRateLimiter::new(),
+            cookieless_identity: context
+                .require_service::<temps_analytics::cookieless::CookielessIdentity>(),
         });
         let sentry_routes = crate::sentry::handlers::configure_routes().with_state(sentry_state);
 
@@ -564,6 +599,13 @@ impl TempsPlugin for ErrorTrackingPlugin {
 
         schema
             .merge(<crate::handlers::feedback_handler::FeedbackApiDoc as OpenApiTrait>::openapi());
+        schema.merge(
+            <crate::handlers::attachment_handler::AttachmentApiDoc as OpenApiTrait>::openapi(),
+        );
+        schema.merge(
+            <crate::handlers::source_control_handler::SourceControlApiDoc as OpenApiTrait>::openapi(
+            ),
+        );
         schema.merge(<crate::handlers::release_handler::ReleaseApiDoc as OpenApiTrait>::openapi());
         schema.merge(
             <crate::handlers::release_health_handler::ReleaseHealthApiDoc as OpenApiTrait>::openapi(

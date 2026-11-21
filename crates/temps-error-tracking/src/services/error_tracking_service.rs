@@ -42,6 +42,10 @@ pub struct ErrorTrackingService {
     pub releases: super::release_service::ReleaseService,
     /// Crash-free sessions and users per release (ADR 111, D3).
     pub release_health: Arc<super::release_health::ReleaseHealthService>,
+    /// Files sent with events and feedback (ADR 111, D4).
+    pub attachments: Arc<super::attachments::AttachmentService>,
+    /// Issues, suspect commits and ownership rules (ADR 111, D5).
+    pub source_control: Arc<super::source_control::SourceControlService>,
     pub workflow: GroupWorkflowService,
     /// Inbound filter rules (ADR 111, D1.4).
     pub inbound_filters: super::inbound_filters::InboundFilterService,
@@ -63,15 +67,23 @@ impl ErrorTrackingService {
     pub fn new(db: Arc<DatabaseConnection>) -> Self {
         let inbound_filter_registry =
             Arc::new(super::inbound_filters::InboundFilterRegistry::new());
+        let ownership = Arc::new(super::source_control::ownership::OwnershipService::new(
+            db.clone(),
+        ));
         Self {
             db: db.clone(),
-            ingestion: ErrorIngestionService::new(db.clone()),
+            ingestion: ErrorIngestionService::new(db.clone()).with_ownership(ownership.clone()),
             crud: ErrorCRUDService::new(db.clone()),
             analytics: ErrorAnalyticsService::new(db.clone()),
             feedback: super::feedback_service::FeedbackService::new(db.clone()),
             client_outcomes: super::client_outcome_service::ClientOutcomeService::new(db.clone()),
             releases: super::release_service::ReleaseService::new(db.clone()),
             release_health: Arc::new(super::release_health::ReleaseHealthService::new(db.clone())),
+            attachments: Arc::new(super::attachments::AttachmentService::new(db.clone())),
+            source_control: Arc::new(super::source_control::SourceControlService::new(
+                db.clone(),
+                ownership.clone(),
+            )),
             workflow: GroupWorkflowService::new(db.clone()),
             inbound_filters: super::inbound_filters::InboundFilterService::new(
                 db.clone(),
@@ -106,6 +118,66 @@ impl ErrorTrackingService {
     /// Only notifications with trigger_type "new_issue" or "regression" are forwarded.
     pub fn set_autopilot_callback(&self, callback: NotificationCallback) {
         let _ = self.autopilot_callback.set(callback);
+    }
+
+    /// The attachments of an error event of `group_id` (ADR 111, D4). An
+    /// event that is not in the group or project is not found.
+    pub async fn list_event_attachments(
+        &self,
+        project_id: i32,
+        group_id: i32,
+        event_id: i64,
+    ) -> Result<Vec<super::attachments::AttachmentView>, ErrorTrackingError> {
+        self.crud
+            .get_error_event_by_ids(event_id, group_id, project_id)
+            .await?;
+        self.attachments
+            .list(
+                project_id,
+                super::attachments::AttachmentOwner::Error(event_id),
+            )
+            .await
+    }
+
+    /// The attachments of a feedback, such as its screenshot (ADR 111, D4).
+    pub async fn list_feedback_attachments(
+        &self,
+        project_id: i32,
+        feedback_id: i64,
+    ) -> Result<Vec<super::attachments::AttachmentView>, ErrorTrackingError> {
+        self.feedback.get(project_id, feedback_id).await?;
+        self.attachments
+            .list(
+                project_id,
+                super::attachments::AttachmentOwner::Feedback(feedback_id),
+            )
+            .await
+    }
+
+    /// Delete a feedback and its attachments (ADR 111, D4). A failure to
+    /// delete the attachments never fails the delete: the sweeper removes
+    /// those of a feedback that is gone.
+    pub async fn delete_feedback(
+        &self,
+        project_id: i32,
+        feedback_id: i64,
+    ) -> Result<(), ErrorTrackingError> {
+        self.feedback.delete(project_id, feedback_id).await?;
+        if let Err(error) = self
+            .attachments
+            .delete_owner(
+                project_id,
+                super::attachments::AttachmentOwner::Feedback(feedback_id),
+            )
+            .await
+        {
+            tracing::warn!(
+                project_id,
+                feedback_id,
+                "could not delete the attachments of feedback {feedback_id} in project {project_id}, leaving them to the sweeper: {error}"
+            );
+        }
+        Ok(())
     }
 
     /// Mail assignees through this service (ADR 111, D1.6).
@@ -438,6 +510,18 @@ impl ErrorTrackingService {
             None => self.ingestion.process_with_outcome(error_data).await?,
         };
         let group_id = outcome.group_id;
+        // An ownership rule matched the event that created the group
+        // (ADR 111, D5): assign it, unless someone already did.
+        if let Some(owner) = outcome.owner.as_ref() {
+            if let Err(error) = self
+                .source_control
+                .ownership
+                .assign_matched(project_id, group_id, owner)
+                .await
+            {
+                tracing::warn!(project_id, group_id, %error, "Ownership rules could not assign a new error group");
+            }
+        }
         if !outcome.inserted {
             return Ok(super::types::ErrorIngestReceipt {
                 group_id,

@@ -217,6 +217,9 @@ impl ProjectAnalyticsSettingsService {
             exclude_spam_referrers: Set(patch
                 .exclude_spam_referrers
                 .unwrap_or(previous.exclude_spam_referrers)),
+            // Owned by the identity settings (ADR 109 D4): left to the
+            // column default on insert and never written here.
+            accept_browser_identify: sea_orm::ActiveValue::NotSet,
             created_at: Set(now),
             updated_at: Set(now),
         };
@@ -315,6 +318,7 @@ mod tests {
             project_id,
             exclude_datacenter_traffic: exclude,
             exclude_spam_referrers: true,
+            accept_browser_identify: true,
             created_at: now,
             updated_at: now,
         }

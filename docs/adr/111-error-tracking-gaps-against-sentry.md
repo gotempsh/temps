@@ -11,8 +11,9 @@ and regressions after a deployment), D2.3 (Apdex), D2.4 (pages joined to
 backend requests) and D2.5 (breakdown inside an operation) have shipped, so
 D2 is complete. D3.1 (session counters), D3.2 (the release page),
 D3.3 (the crash-free alert) and D3.4 (releases tied to deployments) have
-shipped, so D3 is complete; D4 to D7 are not scheduled. The questions they settled
-are recorded under "Settled while implementing".
+shipped, so D3 is complete. D4 (attachments) and D5 (links to issue trackers
+and source control) have shipped; D6 and D7 are not scheduled. The questions they settled are recorded under "Settled while
+implementing".
 
 Related: ADR 016 (ClickHouse traces backend), ADR 027 (cross-project trace
 linking), ADR 033 (release identity for symbolication), ADR 054 (autofix
@@ -608,3 +609,117 @@ deploys, which is web services. It comes last and may never be worth building.
 - The open question whether D3 should wait for mobile or desktop demand was
   settled by building it at this size: counters only, no new store and no
   new alerting system.
+
+### D4 Attachments
+
+- **Plain files only.** An attachment item whose `attachment_type` is
+  `event.attachment` (the default) is kept; an `attachment_type` that is not a
+  string is unsupported. Minidumps, Apple crash reports and
+  Unreal files belong to D7 and stay unsupported. An attachment never rejects
+  its envelope: one that is too large, past the count, or sent in an envelope
+  with no event or feedback to belong to is reported unsupported in the
+  envelope's answer, and the events are stored. A file that passes those
+  checks is queued, which does not guarantee it is stored: the uploader
+  resolves its owner later (see **Owner**), and a file whose event or
+  feedback is not found then (never stored, or deleted meanwhile) is dropped
+  and counted as without an owner, after the envelope was answered, so it
+  cannot appear in that answer. The same holds for the quota, the per-event
+  limit and a failed write, which are also decided by the uploader.
+- **Limits.** 2 MiB per file and 4 MiB or 8 files per event or feedback, under
+  the envelope's own 2 MiB body and 10 MiB decompressed limits. The 4 MiB
+  counts files earlier envelopes stored for the same owner, so a retry that
+  adds files cannot pass it. Each project
+  has a quota of 256 MiB of attachments until the admin changes it (0 to
+  100 GiB, a column on `error_attachment_usage`, audited). Lowering it deletes
+  nothing: new attachments are dropped until use falls under it.
+- **Off the hot path.** Attachments are queued only when the envelope is
+  answered 200, after their event or feedback is stored, so an SDK retry after
+  a failure stores nothing twice. A file's identity is its owner, name and
+  SHA-256, checked under the project's usage row lock before any limit, so a
+  resent file is a duplicate even once the quota is full (a resend of a write
+  that never finished completes it, charged once, and renews its reservation;
+  one the sweeper already claimed for removal, `removing_at`, is left to the
+  sweeper and is never marked stored), and a different file
+  sent later for the same owner is new; its display position is the owner's
+  next one.
+  Ingest does one `try_send` into a queue bounded at 256 envelopes and 16 MiB;
+  past either bound the batch is dropped and counted
+  (`x-temps-sentry-attachments-dropped`). One task reserves each file against
+  the quota in a transaction, writes it to the project's blob storage, then
+  marks the row stored. Envelopes without a DSN (tunneled) carry no
+  attachments.
+- **Owner.** The envelope's event id, else its only event, else its only
+  feedback, resolved through `error_event_source_keys` or the feedback's
+  source id, and only under the same environment and deployment as the DSN
+  that sent the file, so one DSN cannot attach files to another scope's event. The owner's timestamp is kept so the sweeper can find events that
+  expired.
+- **Lifetime.** An attachment lives as long as what it came with. Every ten
+  minutes a bounded sweeper deletes those whose event expired with its chunk,
+  writes that never finished (after an hour), attachments of deleted feedback,
+  and every attachment of a deleted project (soft-deleted counts). Deleting a
+  feedback deletes its attachments. An object that cannot be deleted keeps its
+  row, so a later pass retries; each pass pages past such rows instead of
+  stopping at them, a pass whose step budget runs out continues on the next
+  pass where it stopped (deleted projects too, a page per pass), and a walk
+  that reaches the end starts over. Deleting rows, a deleted project's
+  included, takes the project's usage row lock first, as a reservation does,
+  so the two cannot deadlock. Rolling the
+  migration back refuses while any attachment is listed, since dropping the
+  rows would strand their objects.
+  A write that failed or timed out deletes its object before its row, since a
+  store may have kept a file it never acknowledged; until then the row counts
+  against the quota and the sweeper retries it as an unfinished write. The
+  uploader and sweeper hold the service weakly and end when it is dropped. Without blob storage nothing is stored, and
+  the usage endpoint says so and links `/storage`.
+- **Serving.** PNG, JPEG, GIF and WebP are served inline so the console can
+  show a feedback screenshot. Everything else is served as
+  `application/octet-stream` to save, with `nosniff` and a sandbox CSP, so a
+  stored HTML or SVG file never runs in the console's origin. File names lose
+  directories and control characters.
+
+### D5 Links to issue trackers and source control
+
+- **GitHub and GitLab, through the project's own repository.** Opening an
+  issue and reading commits use the repository and git provider connection
+  the project already deploys from, with its credentials. Other providers and
+  projects without a repository answer "not connected" with a link to
+  `/git-providers` or the project's git settings, and the console shows that
+  onboarding state instead of hiding the panels. Jira, Linear and any other
+  tracker are plain links: an http(s) URL without credentials, at most ten
+  links per group.
+- **One-way and on request.** Temps never closes, reopens or comments on an
+  issue, and an issue's state never resolves a group. The state of a GitHub or
+  GitLab issue is read when it is linked and again when someone presses
+  refresh; a read that fails keeps the last state and is counted in the
+  answer. There is no webhook and no polling job.
+- **One open issue per group and repository.** Opening one takes a
+  transaction-scoped advisory lock on the group, so two people pressing the
+  button at once get one issue and a conflict, and an open issue already
+  linked in the same repository is a conflict too. A closed one can be
+  followed by a new one.
+- **What the issue says.** Title (the group's, or the one given, at most 255
+  characters), exception type and message, first and last seen, event count,
+  up to ten application frames shown as repository paths, and a link back to the
+  group. Text is escaped as Markdown. Nothing from the request, the user, tags
+  or breadcrumbs is copied out: the repository's audience may be wider than
+  the project's.
+- **Suspect commits are not blame.** They are the newest five commits that
+  touched the file of the latest event's innermost in-app frame that maps to a
+  repository path (the location source maps resolved, webpack, `app://` and
+  `file://` prefixes removed, and the project's source root, the repository
+  directory frame paths are relative to, put in front; dependency
+  directories, URLs and paths with `..` ignored), read at the deployment's
+  commit, or the default branch when the event has none. Line-level blame would need one provider call per frame and
+  is left out. When nothing matches, the answer says why.
+- **Ownership rules assign new groups only.** A project has at most 50
+  ordered rules of a path pattern (`src/billing/` a directory, `*.py` a file
+  name anywhere, `**` any depth) and an owner. When a group is created, its
+  frames are tried innermost first against the rules in order; the first match
+  assigns the group if it is still unassigned, and the activity names the
+  rule. Existing groups are never reassigned and no mail is sent. Every owner
+  must be able to open the project when the rules are saved. The rules are
+  held in memory and reloaded on every save, so ingest makes no extra query
+  for a project without rules.
+- **Assistant.** The console assistant may read the repository status, the
+  linked issues, suspect commits and the ownership rules. Opening, linking,
+  unlinking and refreshing issues and replacing the rules stay with people.

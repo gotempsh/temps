@@ -16,6 +16,7 @@ import { useQueries } from '@tanstack/react-query'
 import { getEnvironmentsOptions } from '@/api/client/@tanstack/react-query.gen'
 import type { LogLevel, LogSourceKind } from '@/api/client/types.gen'
 import { QueryContent } from '@/components/observability/GlobalPage'
+import { ObservabilitySetupGuide } from '@/components/observability/ObservabilitySetupGuide'
 import { PageContainer, PageHeader } from '@/components/layout/PageContainer'
 import { DateTimeRange } from '@/components/ui/date-time-range'
 import { Button } from '@/components/ui/button'
@@ -260,6 +261,17 @@ export default function GlobalLogs() {
         error={search.error}
         empty={!lines.length}
         retry={search.retry}
+        setup={
+          !text &&
+          !level &&
+          !node &&
+          !deploy &&
+          !env &&
+          attrs.length === 0 &&
+          source === 'collected' ? (
+            <ObservabilitySetupGuide kind="logs" projectId={projectId} />
+          ) : undefined
+        }
       >
         {null}
       </QueryContent>

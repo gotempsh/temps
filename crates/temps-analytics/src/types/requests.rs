@@ -131,6 +131,9 @@ pub struct VisitorSegmentFilters {
     pub filter_channel: Option<String>,
     /// First-touch referrer hostname (matches `visitor.first_referrer_hostname`)
     pub filter_referrer: Option<String>,
+    /// The app's user id set by `identify()` (matches `visitor.user_id`):
+    /// every device and browser the same user was identified on.
+    pub filter_user_id: Option<String>,
 }
 
 #[derive(Deserialize, Clone, ToSchema)]
@@ -371,6 +374,22 @@ pub struct EventEntriesQuery {
     pub page: Option<u64>,
     /// Items per page (default: 20, max: 100)
     pub per_page: Option<u64>,
+}
+
+/// Query parameters for the breakdown of one event by one of its properties
+#[derive(Deserialize, Clone, ToSchema)]
+pub struct EventPropertiesQuery {
+    /// The event to break down, e.g. `outbound_click`
+    pub event_name: String,
+    /// Top-level key of the event's custom properties to group by, e.g. `url`.
+    /// Letters, digits, `_`, `-` and `.`; at most 64 characters.
+    pub property: String,
+    pub project_id: i32,
+    pub environment_id: Option<i32>,
+    pub start_date: DateTime,
+    pub end_date: DateTime,
+    /// Maximum number of values to return (default: 20, max: 100)
+    pub limit: Option<u64>,
 }
 
 /// Query parameters for page flow analytics

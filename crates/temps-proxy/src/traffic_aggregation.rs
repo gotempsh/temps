@@ -49,6 +49,10 @@ pub enum TrafficDimension {
     OperatingSystem,
     DeviceType,
     CacheStatus,
+    /// The `Referer` the request arrived with, as sent (full URL). Grouping
+    /// by it answers "which page links here", e.g. for the not-found report
+    /// (ADR 109 D1). Empty referrers group as null.
+    Referrer,
 }
 
 impl TrafficDimension {
@@ -68,6 +72,7 @@ impl TrafficDimension {
             Self::OperatingSystem => "operating_system",
             Self::DeviceType => "device_type",
             Self::CacheStatus => "cache_status",
+            Self::Referrer => "referrer",
         }
     }
 }
@@ -391,6 +396,7 @@ fn validate_filter(filter: &TrafficFilter) -> Result<(), ProxyLogServiceError> {
             | TrafficDimension::OperatingSystem
             | TrafficDimension::DeviceType
             | TrafficDimension::CacheStatus
+            | TrafficDimension::Referrer
     ) {
         return Err(invalid(format!(
             "filter '{}' does not support {:?}",
@@ -430,6 +436,30 @@ mod tests {
     #[test]
     fn accepts_multiple_dimensions_and_client_selected_metrics() {
         assert!(request().validate().is_ok());
+    }
+
+    #[test]
+    fn referrer_can_be_grouped_and_searched() {
+        let mut request = request();
+        request.dimensions = vec![TrafficDimension::Path, TrafficDimension::Referrer];
+        request.filters = vec![
+            TrafficFilter {
+                dimension: TrafficDimension::StatusCode,
+                operator: TrafficFilterOperator::Eq,
+                values: vec!["404".to_string()],
+            },
+            TrafficFilter {
+                dimension: TrafficDimension::Referrer,
+                operator: TrafficFilterOperator::Contains,
+                values: vec!["example.org".to_string()],
+            },
+        ];
+        assert!(request.validate().is_ok());
+        assert_eq!(TrafficDimension::Referrer.api_name(), "referrer");
+        assert_eq!(
+            serde_json::to_value(TrafficDimension::Referrer).ok(),
+            Some(serde_json::json!("referrer"))
+        );
     }
 
     #[test]

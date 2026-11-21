@@ -29,9 +29,7 @@ import {
 import { useGlobalView } from '@/hooks/useGlobalView'
 import type { GlobalView } from '@/hooks/useGlobalView'
 import type { AnalyticsFacet } from '@/api/client/types.gen'
-import { EmptyState } from '@/components/ui/empty-state'
-import { BarChart3 } from 'lucide-react'
-import { Link } from 'react-router'
+import { ObservabilitySetupGuide } from '@/components/observability/ObservabilitySetupGuide'
 import { useGlobalPageInRange } from '@/hooks/useGlobalView'
 import { useWindowQuery } from '@/hooks/useWindowQuery'
 
@@ -182,6 +180,8 @@ export default function GlobalAnalytics() {
   const expandedTitle = selectedBreakdown
     ? breakdowns[selectedBreakdown]
     : undefined
+  // A search narrows breakdowns, not the totals, so it never explains an
+  // empty page; this is a page that has received nothing in the window.
   const hasNoAnalytics =
     !summary.isPending &&
     !traffic.isPending &&
@@ -235,19 +235,10 @@ export default function GlobalAnalytics() {
             />
           </QueryContent>
           {hasNoAnalytics ? (
-            <DataSection title="Traffic">
-              <EmptyState
-                size="compact"
-                icon={BarChart3}
-                title="No analytics data yet"
-                description="Open a service to finish analytics setup and start collecting page views, sessions, and visitors."
-                action={
-                  <Button asChild size="sm">
-                    <Link to="/projects">Open projects</Link>
-                  </Button>
-                }
-              />
-            </DataSection>
+            <ObservabilitySetupGuide
+              kind="analytics"
+              projectId={view.projectId}
+            />
           ) : (
             <AnalyticsTrafficChart
               data={traffic.data?.rows.map((row) => ({

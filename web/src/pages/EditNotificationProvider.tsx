@@ -26,7 +26,9 @@ import { ProviderForm } from '@/components/monitoring/ProviderForm'
 import {
   ProviderFormData,
   providerUpdateSchema,
+  telegramConfigFromForm,
 } from '@/components/monitoring/schemas'
+import { useLoadProviderIntoForm } from '@/components/monitoring/provider-form-values'
 import { Button } from '@/components/ui/button'
 import {
   Card,
@@ -101,46 +103,8 @@ export function EditNotificationProvider() {
     },
   })
 
-  // Load provider data into form
-  useEffect(() => {
-    if (provider) {
-      const config = provider.config as Record<string, unknown>
-      form.reset({
-        name: provider.name,
-        provider_type: provider.provider_type as
-          'email' | 'slack' | 'webhook' | 'cloudflare',
-        config: {
-          // Slack config
-          webhook_url: config.webhook_url as string,
-          channel: config.channel as string,
-
-          // Cloudflare config
-          account_id: config.account_id as string,
-          api_token: config.api_token as string,
-
-          // Email config
-          smtp_host: config.smtp_host as string,
-          smtp_port: config.smtp_port as number,
-          use_credentials: !!(config.username || config.password),
-          smtp_username: config.username as string,
-          password: config.password as string,
-          from_name: config.from_name as string,
-          from_address: config.from_address as string,
-          to_addresses: config.to_addresses as string[],
-          tls_mode:
-            (config.tls_mode as 'None' | 'Starttls' | 'Tls') || undefined,
-          starttls_required: config.starttls_required as boolean,
-          accept_invalid_certs: config.accept_invalid_certs as boolean,
-
-          // Webhook config
-          url: config.url as string,
-          method: (config.method as 'POST' | 'PUT' | 'PATCH') || 'POST',
-          headers: (config.headers as Record<string, string>) || {},
-          timeout_secs: (config.timeout_secs as number) || 30,
-        },
-      })
-    }
-  }, [provider, form])
+  // Newer provider data refreshes untouched fields and keeps unsaved edits.
+  useLoadProviderIntoForm(provider, form)
 
   // Update mutations
   const updateEmailMutation = useMutation({
@@ -188,6 +152,18 @@ export function EditNotificationProvider() {
     },
     onSuccess: () => {
       toast.success('Cloudflare provider updated successfully')
+      queryClient.invalidateQueries({ queryKey: ['getNotificationProviders'] })
+      navigate('/settings/notifications')
+    },
+  })
+
+  const updateTelegramMutation = useMutation({
+    ...updateNotificationProviderMutation(),
+    meta: {
+      errorTitle: 'Failed to update Telegram provider',
+    },
+    onSuccess: () => {
+      toast.success('Telegram provider updated successfully')
       queryClient.invalidateQueries({ queryKey: ['getNotificationProviders'] })
       navigate('/settings/notifications')
     },
@@ -257,6 +233,15 @@ export function EditNotificationProvider() {
             from_name: data.config.from_name || undefined,
             to_addresses: data.config.to_addresses!,
           },
+        },
+      })
+    } else if (data.provider_type === 'telegram') {
+      await updateTelegramMutation.mutateAsync({
+        path: { id: provider.id },
+        body: {
+          name: data.name,
+          enabled: provider.enabled,
+          config: telegramConfigFromForm(data.config),
         },
       })
     } else {
@@ -358,7 +343,8 @@ export function EditNotificationProvider() {
     updateEmailMutation.isPending ||
     updateSlackMutation.isPending ||
     updateWebhookMutation.isPending ||
-    updateCloudflareMutation.isPending
+    updateCloudflareMutation.isPending ||
+    updateTelegramMutation.isPending
 
   return (
     <div className="w-full min-w-0 space-y-6">

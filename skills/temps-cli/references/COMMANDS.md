@@ -59,7 +59,7 @@ Use this index or search for a top-level command heading to load only the releva
 - [`providers`](#providers) - Manage Git providers
 - [`backups`](#backups) - Manage backup schedules and backups
 - [`runtime-logs`](#runtime-logs) - View runtime container logs (use -f to follow in real-time)
-- [`notifications`](#notifications) - Manage notification providers (Slack, Email, Webhook, etc.)
+- [`notifications`](#notifications) - Manage notification providers (Slack, Email, Webhook, Telegram, etc.)
 - [`dns`](#dns) - Manage DNS providers and Temps-managed DNS records
 - [`services`](#services) - Manage external services (databases, caches, storage)
 - [`settings`](#settings) - Manage platform settings
@@ -84,6 +84,7 @@ Use this index or search for a top-level command heading to load only the releva
 - [`otel-forward`](#otel-forward) - Manage OTel forwarding destinations that relay ingested traces, metrics, and logs to an external OTLP-compatible collector
 - [`otel`](#otel) - Inspect the OTLP ingest pipeline itself — throughput, drops and failure reasons (server-wide, not project-scoped; see "temps metrics" to query ingested application metrics)
 - [`flags`](#flags) - Manage feature flags (runtime config that changes without a redeploy)
+- [`surveys`](#surveys) - Manage in-app surveys (NPS, ratings, choices, open text) and read their answers
 - [`data`](#data) - Browse the data inside a service (tables, collections, keys, objects) — read-only
 - [`dsn`](#dsn) - Manage Data Source Names (DSNs) for error tracking and analytics
 - [`scans`](#scans) - Manage vulnerability scans
@@ -2017,7 +2018,7 @@ View runtime container logs (use -f to follow in real-time)
 
 ## `notifications` (alias: `notify`)
 
-Manage notification providers (Slack, Email, Webhook, etc.)
+Manage notification providers (Slack, Email, Webhook, Telegram, etc.)
 
 **Subcommands:**
 
@@ -2049,7 +2050,7 @@ Add a new notification provider
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-t, --type <type>` | Provider type (slack, email, webhook) | - | No |
+| `-t, --type <type>` | Provider type (slack, email, webhook, telegram) | - | No |
 | `-n, --name <name>` | Provider name | - | No |
 | `-w, --webhook-url <url>` | Webhook URL (for slack) | - | No |
 | `-c, --channel <channel>` | Channel name (for slack, optional) | - | No |
@@ -2063,6 +2064,9 @@ Add a new notification provider
 | `--url <url>` | Webhook URL (for webhook) | - | No |
 | `--method <method>` | HTTP method: POST, PUT, PATCH (for webhook, default: POST) | - | No |
 | `--header <header>` | Request header "Name: value" (for webhook, repeatable) | - | No |
+| `--bot-token <token>` | Bot token from @BotFather (for telegram) | - | No |
+| `--chat-id <id>` | Chat ID, e.g. -1001234567890 or @channelname (for telegram) | - | No |
+| `--topic-id <id>` | Forum topic ID (for telegram, optional) | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 
 ### `notifications update`
@@ -2088,6 +2092,9 @@ Update a notification provider
 | `--url <url>` | Webhook URL (for webhook) | - | No |
 | `--method <method>` | HTTP method: POST, PUT, PATCH (for webhook) | - | No |
 | `--header <header>` | Request header "Name: value" (for webhook, repeatable; replaces the stored headers) | - | No |
+| `--bot-token <token>` | Bot token from @BotFather (for telegram) | - | No |
+| `--chat-id <id>` | Chat ID, e.g. -1001234567890 or @channelname (for telegram) | - | No |
+| `--topic-id <id>` | Forum topic ID (for telegram; empty string clears it) | - | No |
 | `--json` | Output in JSON format | - | No |
 | `-y, --yes` | Skip confirmation prompts | - | No |
 
@@ -4728,6 +4735,10 @@ Manage error tracking and error groups
 - `performance` - Show whether traces are checked for performance issues, and what is detected
 - `releases` - Show the health of each release: crash-free sessions and users, adoption and deployment
 - `release` - Show one release's sessions and crash-free rate per hour
+- `attachments` - Files SDKs send with errors and feedback, kept in blob storage
+- `issues` - Issues that track an error group, in the project's repository or any tracker
+- `commits` - Show the commits that last touched the code an error group fails in
+- `ownership` - Rules that assign new error groups by the path of the failing code
 - `events` - List events in an error group
 - `event` - Show a specific error event
 - `stats` - Get error statistics for a project
@@ -5061,6 +5072,189 @@ Show one release's sessions and crash-free rate per hour
 | `--project-id <id>` | Project ID | - | Yes |
 | `--environment <name>` | SDK environment (as the SDK sends it) | - | No |
 | `--days <n>` | Window in days, 1 to 14 | `7` | No |
+| `--json` | Output in JSON format | - | No |
+
+### `errors attachments`
+
+Files SDKs send with errors and feedback, kept in blob storage
+
+**Subcommands:**
+
+- `list` (`ls`) - List the attachments of an error event (--group-id with --event-id) or of a feedback (--feedback-id)
+- `download` - Save an attachment to a file
+- `delete` (`rm`) - Delete an attachment and return its space to the quota
+- `usage` - Show whether attachments are kept and how much of the quota they use
+- `quota` - Set how much attachment storage the project may use
+
+#### `errors attachments list` (alias: `ls`)
+
+List the attachments of an error event (--group-id with --event-id) or of a feedback (--feedback-id)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--group-id <id>` | Error group of the event; give it with --event-id, not with --feedback-id | - | No |
+| `--event-id <id>` | Error event ID; give it with --group-id, not with --feedback-id | - | No |
+| `--feedback-id <id>` | Feedback ID; give it alone, instead of --group-id and --event-id | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `errors attachments download`
+
+Save an attachment to a file
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--attachment-id <id>` | Attachment ID | - | Yes |
+| `-o, --output <path>` | File to write (default: the attachment name, in this directory) | - | No |
+| `-f, --force` | Overwrite the file if it exists | - | No |
+
+#### `errors attachments delete` (alias: `rm`)
+
+Delete an attachment and return its space to the quota
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--attachment-id <id>` | Attachment ID | - | Yes |
+| `-y, --yes` | Skip confirmation | - | No |
+
+#### `errors attachments usage`
+
+Show whether attachments are kept and how much of the quota they use
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `errors attachments quota`
+
+Set how much attachment storage the project may use
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--mib <n>` | Quota in MiB, 0 to 102400 | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `errors issues`
+
+Issues that track an error group, in the project's repository or any tracker
+
+**Subcommands:**
+
+- `list` (`ls`) - List the issues linked to an error group
+- `open` - Open an issue for an error group in the project's GitHub or GitLab repository
+- `link` - Link an existing issue from any tracker to an error group
+- `unlink` - Unlink an issue from an error group; the issue itself is left as it is
+
+#### `errors issues list` (alias: `ls`)
+
+List the issues linked to an error group
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--group-id <id>` | Error group ID | - | Yes |
+| `--refresh` | Read again whether each GitHub or GitLab issue is open | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `errors issues open`
+
+Open an issue for an error group in the project's GitHub or GitLab repository
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--group-id <id>` | Error group ID | - | Yes |
+| `--title <title>` | Issue title (default: the group's title) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `errors issues link`
+
+Link an existing issue from any tracker to an error group
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--group-id <id>` | Error group ID | - | Yes |
+| `--url <url>` | The issue URL | - | Yes |
+| `--title <title>` | What to call it (default: the issue's title, or its URL) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `errors issues unlink`
+
+Unlink an issue from an error group; the issue itself is left as it is
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--group-id <id>` | Error group ID | - | Yes |
+| `--link-id <id>` | Issue link ID (from `temps errors issues list`) | - | Yes |
+| `-y, --yes` | Skip confirmation | - | No |
+
+### `errors commits`
+
+Show the commits that last touched the code an error group fails in
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--group-id <id>` | Error group ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `errors ownership`
+
+Rules that assign new error groups by the path of the failing code
+
+**Subcommands:**
+
+- `list` (`ls`) - List the project's ownership rules in the order they are tried
+- `set` - Replace the ownership rules with those in a file: one "<pattern> <user-id>" per line
+
+#### `errors ownership list` (alias: `ls`)
+
+List the project's ownership rules in the order they are tried
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `errors ownership set`
+
+Replace the ownership rules with those in a file: one "<pattern> <user-id>" per line
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--file <path>` | Rules file; "-" reads standard input | - | No |
+| `--clear` | Remove every rule | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `errors events`
@@ -6013,6 +6207,166 @@ Archive a flag (callers fall back to their own default)
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `-p, --project <project>` | Project slug or ID | - | No |
+
+## `surveys` (alias: `survey`)
+
+Manage in-app surveys (NPS, ratings, choices, open text) and read their answers
+
+**Subcommands:**
+
+- `list` (`ls`) - List surveys
+- `get` - Show a survey: its questions and when it is shown
+- `create` - Create a survey (a draft unless --status active)
+- `update` - Change a survey; only the options given are changed
+- `launch` - Start showing a survey to visitors
+- `pause` - Stop showing a survey for now
+- `complete` - Stop showing a survey for good (its results stay)
+- `delete` - Delete a survey (answers already recorded stay in analytics events)
+- `results` - Summarise the answers: counts, averages and NPS per question
+- `responses` - List individual responses, newest first
+
+### `surveys list` (alias: `ls`)
+
+List surveys
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--status <status>` | Only surveys in this status: draft, active, paused, completed | - | No |
+| `--page <n>` | Page number (default: 1) | - | No |
+| `--page-size <n>` | Items per page (default: 20, max: 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `surveys get`
+
+Show a survey: its questions and when it is shown
+
+**Usage:** `surveys get <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `surveys create`
+
+Create a survey (a draft unless --status active)
+
+**Usage:** `surveys create <name> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `-q, --questions <json|@file|->` | Questions as a JSON array of {id, kind, prompt, optional?, choices?, scale?, lower_label?, upper_label?} | - | Yes |
+| `-t, --targeting <json|@file|->` | When to show it: {path_pattern?, trigger_event?, sample_rate?, once_per_visitor?, flag?: {key, value}} | - | No |
+| `--description <text>` | Internal description | - | No |
+| `--status <status>` | draft (default) or active | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `surveys update`
+
+Change a survey; only the options given are changed
+
+**Usage:** `surveys update <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--name <name>` | New name | - | No |
+| `--description <text>` | New description ("" clears it) | - | No |
+| `-q, --questions <json|@file|->` | Replace the questions | - | No |
+| `-t, --targeting <json|@file|->` | Replace when it is shown | - | No |
+| `--status <status>` | draft, active, paused or completed | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `surveys launch`
+
+Start showing a survey to visitors
+
+**Usage:** `surveys launch <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+
+### `surveys pause`
+
+Stop showing a survey for now
+
+**Usage:** `surveys pause <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+
+### `surveys complete`
+
+Stop showing a survey for good (its results stay)
+
+**Usage:** `surveys complete <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+
+### `surveys delete`
+
+Delete a survey (answers already recorded stay in analytics events)
+
+**Usage:** `surveys delete <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `-y, --yes` | Skip the confirmation | - | No |
+
+### `surveys results`
+
+Summarise the answers: counts, averages and NPS per question
+
+**Usage:** `surveys results <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `-e, --environment <name>` | Only answers from this environment | - | No |
+| `--days <n>` | Look back this many days (default: 30, max: 366) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `surveys responses`
+
+List individual responses, newest first
+
+**Usage:** `surveys responses <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `-e, --environment <name>` | Only answers from this environment | - | No |
+| `--days <n>` | Look back this many days (default: 30, max: 366) | - | No |
+| `--page <n>` | Page number (default: 1) | - | No |
+| `--page-size <n>` | Items per page (default: 20, max: 100) | - | No |
+| `--json` | Output in JSON format | - | No |
 
 ## `data`
 
@@ -8980,8 +9334,13 @@ View project analytics
 **Subcommands:**
 
 - `keys` - Manage analytics ingest keys (pa_...) for apps Temps does not deploy
+- `conversions` (`goals`) - Conversion goals: events or pages that count as success
+- `identity` - Whether visitors are recognised by a stored id or tracked cookieless, and who may identify them
 - `overview` (`o`) - Show analytics dashboard overview
 - `top` - Show breakdown by dimension: pages, referrers, browsers, os, devices, countries, regions, cities, channels, events, languages, utm_source, utm_medium, utm_campaign
+- `outbound` - Show the outbound links visitors clicked (outbound_click events)
+- `downloads` - Show the files visitors downloaded (file_download events)
+- `not-found` - Show pages visitors could not find: 404s Temps answered and not_found events
 - `funnels` - Show funnel conversion metrics for all funnels
 - `performance` (`speed`) - Show real-user Web Vitals and optional dimension breakdowns
 - `ai-agents` - Show AI crawler / provider breakdown (web /analytics/ai-agents)
@@ -8995,6 +9354,7 @@ View project analytics
 - `api-query` - Run a typed multi-dimensional API traffic aggregation
 - `api-summary` - Show an AI-generated summary of API traffic from /api-analytics/summary (requires AI Assistance to be configured and enabled on the project)
 - `enrich` - Attach identity or attributes to a visitor (merges into custom_data; a null value removes a key)
+- `identify` - Label a visitor with your app's user id, as your backend would (browser identify cannot replace it)
 
 ### `analytics keys`
 
@@ -9079,6 +9439,127 @@ Revoke (deactivate) an analytics ingest key
 | `-f, --force` | Skip confirmation | - | No |
 | `-y, --yes` | Skip confirmation (alias for --force) | - | No |
 
+### `analytics conversions` (alias: `goals`)
+
+Conversion goals: events or pages that count as success
+
+**Subcommands:**
+
+- `list` - List conversions with visitors, rate and revenue in a period
+- `create` - Define a conversion
+- `update` - Replace a conversion's definition
+- `delete` - Delete a conversion (recorded events are kept)
+- `breakdown` - Where the visitors who converted came from
+
+#### `analytics conversions list`
+
+List conversions with visitors, rate and revenue in a period
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 7d, 30d, 3m) | `30d` | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `analytics conversions create`
+
+Define a conversion
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `-n, --name <name>` | Name shown in reports, e.g. Signup | - | No |
+| `--event <name>` | Count this event, e.g. signup | - | No |
+| `--page <path>` | Count visits to this path; * matches anything, e.g. /docs/* | - | No |
+| `--property <key=value>` | Only events whose property has this value, e.g. plan=pro | - | No |
+| `--revenue-property <key>` | Event property holding the amount, e.g. amount | - | No |
+| `--currency <code>` | ISO 4217 currency of the amount, e.g. EUR | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `analytics conversions update`
+
+Replace a conversion's definition
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--goal-id <id>` | Conversion ID (see list) | - | Yes |
+| `-n, --name <name>` | Name shown in reports, e.g. Signup | - | No |
+| `--event <name>` | Count this event, e.g. signup | - | No |
+| `--page <path>` | Count visits to this path; * matches anything, e.g. /docs/* | - | No |
+| `--property <key=value>` | Only events whose property has this value, e.g. plan=pro | - | No |
+| `--revenue-property <key>` | Event property holding the amount, e.g. amount | - | No |
+| `--currency <code>` | ISO 4217 currency of the amount, e.g. EUR | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `analytics conversions delete`
+
+Delete a conversion (recorded events are kept)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--goal-id <id>` | Conversion ID (see list) | - | Yes |
+| `-f, --force` | Skip confirmation | - | No |
+| `-y, --yes` | Skip confirmation (alias for --force) | - | No |
+
+#### `analytics conversions breakdown`
+
+Where the visitors who converted came from
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--goal-id <id>` | Conversion ID (see list) | - | Yes |
+| `--by <dimension>` | One of channel, referrer, utm_source, utm_medium, utm_campaign, page, country, device_type, browser, operating_system | `channel` | No |
+| `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 7d, 30d, 3m) | `30d` | No |
+| `--limit <n>` | Rows (default: 10, max: 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics identity`
+
+Whether visitors are recognised by a stored id or tracked cookieless, and who may identify them
+
+**Subcommands:**
+
+- `show` - Show the identity mode, whether browser identify is accepted, and what they change
+- `set` - Switch between persistent and cookieless tracking, or accept/refuse browser identify
+
+#### `analytics identity show`
+
+Show the identity mode, whether browser identify is accepted, and what they change
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `analytics identity set`
+
+Switch between persistent and cookieless tracking, or accept/refuse browser identify
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--mode <mode>` | One of persistent, cookieless | - | No |
+| `--browser-identify <accept|refuse>` | Whether identify() from the browser is applied; refuse leaves identify to the app's backend | - | No |
+| `-y, --yes` | Skip confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
 ### `analytics overview` (alias: `o`)
 
 Show analytics dashboard overview
@@ -9103,6 +9584,45 @@ Show breakdown by dimension: pages, referrers, browsers, os, devices, countries,
 |------|-------------|---------|----------|
 | `-p, --project <project>` | Project slug or ID | - | No |
 | `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `24h` | No |
+| `--limit <n>` | Number of results (default: 20, max: 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics outbound`
+
+Show the outbound links visitors clicked (outbound_click events)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `7d` | No |
+| `--limit <n>` | Number of results (default: 20, max: 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics downloads`
+
+Show the files visitors downloaded (file_download events)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `7d` | No |
+| `--limit <n>` | Number of results (default: 20, max: 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics not-found`
+
+Show pages visitors could not find: 404s Temps answered and not_found events
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `7d` | No |
 | `--limit <n>` | Number of results (default: 20, max: 100) | - | No |
 | `--json` | Output in JSON format | - | No |
 
@@ -9326,6 +9846,23 @@ Attach identity or attributes to a visitor (merges into custom_data; a null valu
 | `-f, --file <path>` | Read the JSON object to merge from a file | - | No |
 | `--set <key=value>` | Set one key to a string value (repeatable; use --data for numbers, booleans, or nested values) | `` | No |
 | `--unset <key>` | Remove one top-level key (repeatable; sends null) | `` | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics identify`
+
+Label a visitor with your app's user id, as your backend would (browser identify cannot replace it)
+
+**Usage:** `analytics identify <visitor-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--user-id <id>` | Your app's id for this person (at most 256 characters) | - | Yes |
+| `-d, --data <json>` | Traits as a JSON object, e.g. '{"plan":"pro"}' | - | No |
+| `--set <key=value>` | Set one trait to a string value (repeatable) | `` | No |
+| `--unset <key>` | Remove one trait (repeatable; sends null) | `` | No |
 | `--json` | Output in JSON format | - | No |
 
 ## `funnels` (alias: `funnel`)

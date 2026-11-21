@@ -99,6 +99,7 @@ members = [
     "crates/temps-vulnerability-scanner",
     "crates/temps-kv",
     "crates/temps-flags",
+    "crates/temps-surveys",
     "crates/temps-workflows",
     "crates/temps-workflows-sdk",
     "crates/temps-service-access",

@@ -42,6 +42,8 @@ pub struct ParsedSentryEnvelope {
     pub sessions: Vec<relay_event_schema::protocol::SessionUpdate>,
     /// Pre-aggregated sessions of server-mode SDKs.
     pub session_aggregates: Vec<relay_event_schema::protocol::SessionAggregates>,
+    /// Files sent with the envelope's event or feedback (ADR 111, D4).
+    pub attachments: Option<crate::sentry::attachments::ParsedAttachments>,
     pub unsupported: std::collections::BTreeMap<&'static str, usize>,
 }
 
@@ -80,6 +82,7 @@ impl SentryProvider {
         let mut sessions = Vec::new();
         let mut session_aggregates = Vec::new();
         let mut session_aggregate_items = 0usize;
+        let mut attachments = crate::sentry::attachments::AttachmentCollector::default();
 
         let envelope_id = envelope.event_id();
         // Process each item in the envelope
@@ -459,11 +462,30 @@ impl SentryProvider {
                         _ => *unsupported.entry(header.ty.name()).or_insert(0) += 1,
                     }
                 }
+                // Attachments (ADR 111, D4): kept when they are plain files
+                // within the limits, otherwise unsupported; never rejected.
+                EnvelopeItem::Unsupported(payload)
+                    if header.ty == crate::sentry::envelope::ItemType::Attachment =>
+                {
+                    if !attachments.push(header, payload) {
+                        *unsupported.entry(header.ty.name()).or_insert(0) += 1;
+                    }
+                }
                 _ => {
                     *unsupported.entry(header.ty.name()).or_insert(0) += 1;
                 }
             }
         }
+        let event_ids: Vec<&str> = parsed_events.iter().map(|e| e.event_id.as_str()).collect();
+        let feedback_ids: Vec<&str> = feedback.iter().map(|f| f.source_id.as_str()).collect();
+        let attachments =
+            match attachments.finish(envelope_id.as_deref(), &event_ids, &feedback_ids) {
+                Ok(attachments) => attachments,
+                Err(without_owner) => {
+                    *unsupported.entry("attachment").or_insert(0) += without_owner;
+                    None
+                }
+            };
 
         let replay = match (replay_event, replay_recording) {
             (None, None) => None,
@@ -495,6 +517,7 @@ impl SentryProvider {
             client_outcomes,
             sessions,
             session_aggregates,
+            attachments,
             unsupported,
         })
     }

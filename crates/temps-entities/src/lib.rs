@@ -25,6 +25,10 @@ pub mod ai_thread_artifacts;
 pub mod ai_usage_logs;
 pub mod ai_user_preferences;
 pub mod alarms;
+pub mod analytics_goals;
+// Cookieless tracking (ADR 109 D3).
+pub mod analytics_identity_mode;
+pub mod analytics_identity_salts;
 pub mod analytics_ingest_keys;
 pub mod analytics_traffic_filters;
 pub mod audience;
@@ -189,6 +193,7 @@ pub mod stateless_control_plane;
 pub mod static_asset_cache;
 pub mod static_bundles;
 pub mod suppressed_recipients;
+pub mod surveys;
 pub mod tailnet_serve_entries;
 pub mod tailnet_serve_refs;
 pub mod template_instantiations;
@@ -219,6 +224,7 @@ pub mod session_replay_sessions;
 pub mod settings;
 pub mod telemetry_gap_windows;
 pub mod visitor;
+pub mod visitor_identity_source;
 
 // Error tracking entities
 pub mod error_alert_fires;

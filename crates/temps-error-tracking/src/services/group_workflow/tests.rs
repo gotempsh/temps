@@ -44,11 +44,11 @@ pub(crate) async fn create_project(db: &DatabaseConnection) -> i32 {
     .id
 }
 
-pub(super) struct GroupSpec<'a> {
-    pub(super) title: &'a str,
-    pub(super) error_type: &'a str,
-    pub(super) status: &'a str,
-    pub(super) last_seen_offset_secs: i64,
+pub(crate) struct GroupSpec<'a> {
+    pub(crate) title: &'a str,
+    pub(crate) error_type: &'a str,
+    pub(crate) status: &'a str,
+    pub(crate) last_seen_offset_secs: i64,
 }
 
 impl Default for GroupSpec<'_> {
@@ -62,7 +62,7 @@ impl Default for GroupSpec<'_> {
     }
 }
 
-pub(super) async fn create_group(
+pub(crate) async fn create_group(
     db: &DatabaseConnection,
     project_id: i32,
     spec: GroupSpec<'_>,

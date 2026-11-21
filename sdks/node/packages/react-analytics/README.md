@@ -404,6 +404,34 @@ variant on a page sends a `flag_exposure` event (`flag_key`, `variant`,
 `reason`). Flags keep working when analytics is off for localhost; only
 `disabled` turns them off.
 
+## Surveys
+
+Show in-app surveys defined in the Temps console (**Analytics → Surveys**).
+Place `<TempsSurveys />` once inside the provider; it fetches the surveys this
+visitor should see from your own origin (`POST /api/_temps/surveys`) and opens
+the built-in widget when one's page, event and once-per-visitor conditions
+are met.
+
+```tsx
+import { TempsAnalyticsProvider, TempsSurveys } from "@temps-sdk/react-analytics";
+import { usePathname } from "next/navigation";
+
+export function Providers({ children }: { children: React.ReactNode }) {
+  return (
+    <TempsAnalyticsProvider>
+      {children}
+      {/* visitorKey and attributes feed sampling and flag conditions. */}
+      <TempsSurveys pathname={usePathname()} visitorKey={user?.id} />
+    </TempsAnalyticsProvider>
+  );
+}
+```
+
+A survey with a triggering event opens when you call `trackEvent` with that
+name. Answers are recorded as `survey_shown`, `survey_dismissed` and
+`survey_sent` events, so surveys only appear where analytics is enabled (not
+on localhost unless `ignoreLocalhost={false}`).
+
 ## Session Recording
 
 Session recording captures DOM mutations and user interactions using [rrweb](https://www.rrweb.io/) and streams them to your Temps instance for replay.

@@ -5,7 +5,7 @@
 //!
 //! An address is personal data. It is stored per page, cascades with the
 //! page, and is never shown to anyone but the page's administrators. No token
-//! is stored in plaintext; see `m20261121_108001_status_page_subscriptions`.
+//! is stored in plaintext; see `m20261121_112101_status_page_subscriptions`.
 
 use async_trait::async_trait;
 use sea_orm::entity::prelude::*;
