@@ -412,15 +412,16 @@ pub fn address_reachability(
                 )
             }
             "error" => {
+                // A DNS write can fail while an existing record still serves traffic.
                 return verdict(
-                    ReachState::NotReachable,
+                    ReachState::Unknown,
                     way_in,
                     tunnel.detail.clone(),
                     Some(
                         ReachAction::new(ActionKind::OpenIngress, "Open the tunnel")
                             .with_href(INGRESS_SETUP_PATH),
                     ),
-                )
+                );
             }
             // A tunnel covers it but does not publish it: that is the reason
             // if nothing else serves it either.
@@ -1404,8 +1405,10 @@ mod tests {
             ReachState::Checking
         );
         let error = address_reachability(&tunneled("error"), &[], true, "production");
-        assert_eq!(error.state, ReachState::NotReachable);
+        assert_eq!(error.state, ReachState::Unknown);
         assert_eq!(error.reason, "error detail");
+        assert!(summary(&[error], true, "production", &[])
+            .contains("cannot tell whether app.example.com is reachable"));
         assert!(!needs_lookup(
             "app.example.com",
             true,

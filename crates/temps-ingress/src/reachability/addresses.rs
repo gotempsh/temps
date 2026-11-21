@@ -413,7 +413,7 @@ mod tests {
 
     #[test]
     fn a_way_in_that_broke_is_an_outage_not_no_address() {
-        // A tunnel host whose tunnel is in error.
+        // A failed tunnel publication leaves reachability unconfirmed.
         let tunnel = judged(
             "app-production.example.com",
             AddressSource::TunnelHost,
@@ -426,7 +426,7 @@ mod tests {
             Resolution::NoRecord,
             &[],
         );
-        assert_eq!(tunnel.state, ReachState::NotReachable);
+        assert_eq!(tunnel.state, ReachState::Unknown);
         assert!(!tunnel.nothing_set_up);
         let local = judged(
             "app-production.localho.st",

@@ -40525,6 +40525,14 @@
               "null"
             ]
           },
+          "retry_dns_connector_id": {
+            "description": "Connector on which DNS setup for this failed publication can be retried.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "served_by_workers": {
             "description": "Whether workers serve it. A tunnel only publishes those.",
             "type": "boolean"
@@ -127796,6 +127804,69 @@
         "summary": "Turn a tunnel's environment hosts on or off.",
         "tags": [
           "Reachability"
+        ]
+      }
+    },
+    "/ingress/connectors/{id}/hostnames/{hostname}/retry-dns": {
+      "post": {
+        "operationId": "retry_ingress_hostname_dns",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "path",
+            "name": "hostname",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HostnameView"
+                }
+              }
+            },
+            "description": "Publication result, including any DNS conflict"
+          },
+          "400": {
+            "description": "Invalid hostname"
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "Settings write permission required"
+          },
+          "409": {
+            "description": "Hostname is no longer eligible on this connector"
+          },
+          "500": {
+            "description": "Could not load or save the publication"
+          },
+          "502": {
+            "description": "Could not resolve the managed zone"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Retry DNS setup for a failed hostname publication on its current tunnel.",
+        "tags": [
+          "Ingress"
         ]
       }
     },

@@ -6,6 +6,7 @@ import { cleanup, fireEvent, render, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter, Route, Routes, useParams } from 'react-router'
 import { toast } from 'sonner'
+import { listIngressHostnamesQueryKey } from '@/api/client/@tanstack/react-query.gen'
 import type { DomainResponse } from '@/api/client/types.gen'
 import { PlatformAccessContext } from '@/contexts/PlatformAccessContext-shared'
 import { installBrowserWindow } from '@/test/dom'
@@ -168,4 +169,87 @@ test('a real failure of the tunnel reads is still reported, not shown as an empt
     expect(errored.length).toBe(2)
   })
   expect(collectRouteQueryFailures(client)).toHaveLength(2)
+})
+
+test('retry targets one failed hostname and refreshes its row after a conflict or success', async () => {
+  const conflict = spyOn(toast, 'error').mockImplementation(() => 'id')
+  const success = spyOn(toast, 'success').mockImplementation(() => 'id')
+  const hostname = 'shop.example.com'
+  const failed = {
+    hostname,
+    connector_id: 9,
+    retry_dns_connector_id: 9,
+    state: 'error',
+    detail: 'DNS record is managed elsewhere',
+  }
+  const published = {
+    ...failed,
+    retry_dns_connector_id: null,
+    state: 'published',
+  }
+  let current: typeof failed | typeof published = failed
+  let finish = (_response: Response) => {}
+  let reads = 0
+  let writes = 0
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  const view = renderTable(client, {
+    'GET /ingress/connectors': () => jsonResponse({ connectors: [], total: 0 }),
+    'GET /ingress/hostnames': () => {
+      reads++
+      return jsonResponse([current])
+    },
+    'POST /ingress/connectors/9/hostnames/shop.example.com/retry-dns': () => {
+      writes++
+      return new Promise((resolve) => {
+        finish = resolve
+      })
+    },
+  })
+  try {
+    fireEvent.click(
+      await view.findByRole('button', { name: 'Retry DNS setup' })
+    )
+    expect(
+      (
+        (await view.findByRole('button', {
+          name: 'Retrying DNS setup…',
+        })) as HTMLButtonElement
+      ).disabled
+    ).toBe(true)
+    await waitFor(() => expect(writes).toBe(1))
+    finish(jsonResponse(failed))
+    await waitFor(() =>
+      expect(conflict).toHaveBeenCalledWith(
+        `DNS setup failed for ${hostname}`,
+        { description: failed.detail }
+      )
+    )
+    await waitFor(() => expect(reads).toBeGreaterThan(1))
+    fireEvent.click(
+      await view.findByRole('button', { name: 'Retry DNS setup' })
+    )
+    await waitFor(() => expect(writes).toBe(2))
+    current = published
+    await client.invalidateQueries({ queryKey: listIngressHostnamesQueryKey() })
+    await view.findByText('Live')
+    expect(
+      (
+        view.getByRole('button', {
+          name: 'Retrying DNS setup…',
+        }) as HTMLButtonElement
+      ).disabled
+    ).toBe(true)
+    finish(jsonResponse(current))
+    await waitFor(() =>
+      expect(
+        view.queryByRole('button', { name: 'Retrying DNS setup…' })
+      ).toBeNull()
+    )
+    expect(success).toHaveBeenCalledWith(`DNS setup completed for ${hostname}`)
+    expect(view.queryByRole('button', { name: 'Retry DNS setup' })).toBeNull()
+  } finally {
+    success.mockRestore()
+  }
 })

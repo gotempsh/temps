@@ -1068,7 +1068,7 @@ impl ManagedDnsRecordService {
             (_, RegistryState::Owned(marker, _)) if !scope.permits(marker) => {
                 return Err(scope.refusal(zone, &request.name, record_type, marker));
             }
-            (Some(_), RegistryState::Owned(marker, _)) => {
+            (Some(record), RegistryState::Owned(marker, _)) => {
                 let current = current_fingerprint.as_deref().unwrap_or_default();
                 if !marker.matches_fingerprint(current) {
                     return Err(Self::record_conflict(
@@ -1077,6 +1077,15 @@ impl ManagedDnsRecordService {
                         record_type,
                         "the ownership marker is stale and does not match the provider record; explicitly import the record to adopt its current value",
                     ));
+                }
+                // The prior write may have landed before publication was saved.
+                // A committed match needs no target or ownership-marker write.
+                if marker.record_fingerprint == desired_fingerprint
+                    && marker.pending_fingerprint.is_none()
+                    && marker.run_id == scope.run_id
+                    && request.ttl == Some(record.ttl)
+                {
+                    return Ok(record.clone());
                 }
             }
             (None, RegistryState::Owned(marker, _))
@@ -3012,6 +3021,29 @@ mod tests {
 
         assert!(matches!(err, DnsError::RecordConflict { .. }));
         assert!(provider.has_record("app", DnsRecordType::A));
+    }
+
+    #[tokio::test]
+    async fn retry_preserves_matching_tunnel_cname_and_ownership_marker() {
+        let mut provider = MockProvider::new();
+        let scope = OwnershipScope::for_controller("ingress-connector");
+        let request = DnsRecordRequest {
+            name: "app".into(),
+            content: DnsRecordContent::CNAME {
+                target: "tunnel.example.net".into(),
+            },
+            ttl: Some(1),
+            proxied: true,
+        };
+        let created = test_guarded_set_scoped(&provider, request.clone(), scope)
+            .await
+            .unwrap();
+        provider.fail_target_updates = true;
+        *provider.txt_updates_before_failure.lock().unwrap() = Some(0);
+        let result = test_guarded_set_scoped(&provider, request, scope)
+            .await
+            .unwrap();
+        assert_eq!(created.id, result.id);
     }
 
     #[tokio::test]
