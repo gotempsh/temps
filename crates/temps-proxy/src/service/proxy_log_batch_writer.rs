@@ -914,6 +914,38 @@ mod tests {
         assert_eq!(received.unwrap().path, "/");
     }
 
+    #[tokio::test]
+    async fn send_or_drop_blanks_status_page_subscription_tokens_in_paths() {
+        let db = Arc::new(DatabaseConnection::default());
+        let ip_service = create_test_ip_service(db.clone());
+        let storage = create_test_storage(db.clone(), ip_service.clone());
+        let (handle, _tracking_handle, mut writer) =
+            ProxyLogBatchWriter::new(db, ip_service, storage);
+        let token = "d".repeat(temps_core::public_status_page::SUBSCRIPTION_TOKEN_LEN);
+
+        // A custom hostname rewrites `/confirm/{token}` to the console route.
+        let mut request = make_test_log_request(&format!("/api/status/ab12/confirm/{token}"));
+        request.referrer = Some(format!("https://status.example.test/unsubscribe/{token}"));
+        request.request_headers = Some(serde_json::json!({
+            "referer": format!("https://status.example.test/unsubscribe/{token}?x=1"),
+        }));
+        handle.send_or_drop(request);
+
+        let stored = writer
+            .receiver
+            .try_recv()
+            .expect("entry should be queued for persistence");
+        assert_eq!(stored.path, "/api/status/ab12/confirm/[REDACTED]");
+        assert_eq!(
+            stored.referrer.as_deref(),
+            Some("https://status.example.test/unsubscribe/[REDACTED]")
+        );
+        assert_eq!(
+            stored.request_headers.as_ref().expect("headers")["referer"],
+            serde_json::json!("https://status.example.test/unsubscribe/[REDACTED]?x=1")
+        );
+    }
+
     /// Regression: proxy logs used to persist `Cookie`/`Authorization` headers
     /// and raw OAuth callback query strings verbatim, so an access-log row (and
     /// every backup containing it) held live credentials in plaintext.

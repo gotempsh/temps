@@ -20,7 +20,7 @@ pub use domain_service::{
 };
 pub use email_service::{
     EmailService, EmailStats, ListEmailsOptions, SendEmailRequest, SendEmailResponse,
-    TrackingRewriter,
+    TrackingRewriter, SUPPRESSED_RECIPIENTS_ERROR, WITHHELD_BODY, WITHHELD_RECIPIENT, WITHHELD_TAG,
 };
 pub use provider_service::{
     CreateProviderRequest, ListProviderDomainsResult, ProviderCredentials, ProviderService,

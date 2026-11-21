@@ -50,6 +50,17 @@ export function useGlobalView() {
   return {
     params,
     patch,
+    /**
+     * Replaces the query in one composed update, for changes `patch` cannot
+     * express (repeated params such as `attr`).
+     */
+    update: (transform: (current: URLSearchParams) => URLSearchParams) =>
+      updateParams((current) => {
+        const next = transform(new URLSearchParams(current))
+        next.delete('page')
+        next.delete('cursor')
+        return next
+      }),
     ...window,
     page: positiveInteger(params.get('page')) ?? 1,
     projectId: positiveInteger(params.get('project_id')),

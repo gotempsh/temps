@@ -93,6 +93,63 @@ impl From<LogAggregatorError> for Problem {
             LogAggregatorError::Validation { .. } => problemdetails::new(StatusCode::BAD_REQUEST)
                 .with_title("Validation Error")
                 .with_detail(error.to_string()),
+            // ── Saved searches and log ingest (ADR 108 D1) ──────────────
+            LogAggregatorError::SavedSearchNotFound { .. } => {
+                problemdetails::new(StatusCode::NOT_FOUND)
+                    .with_title("Saved Log Search Not Found")
+                    .with_detail(error.to_string())
+            }
+            LogAggregatorError::SavedSearchNameTaken { .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Saved Log Search Name Taken")
+                    .with_detail(error.to_string())
+            }
+            LogAggregatorError::SavedSearchInUse { .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Saved Log Search In Use")
+                    .with_detail(error.to_string())
+            }
+            LogAggregatorError::SavedSearchLimitReached { .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Saved Log Search Limit Reached")
+                    .with_detail(error.to_string())
+            }
+            LogAggregatorError::IngestKeyNotFound { .. } => {
+                problemdetails::new(StatusCode::NOT_FOUND)
+                    .with_title("Log Ingest Key Not Found")
+                    .with_detail(error.to_string())
+            }
+            // The presented key is not usable. Deliberately carries no hint
+            // about which part was wrong: a collector operator reads their
+            // own key from their own configuration.
+            LogAggregatorError::IngestKeyRejected => problemdetails::new(StatusCode::UNAUTHORIZED)
+                .with_title("Log Ingest Key Rejected")
+                .with_detail(error.to_string()),
+            LogAggregatorError::IngestKeyEnvironmentNotFound { .. } => {
+                problemdetails::new(StatusCode::NOT_FOUND)
+                    .with_title("Environment Not Found")
+                    .with_detail(error.to_string())
+            }
+            LogAggregatorError::ProjectNotFound { .. } => {
+                problemdetails::new(StatusCode::NOT_FOUND)
+                    .with_title("Project Not Found")
+                    .with_detail(error.to_string())
+            }
+            LogAggregatorError::IngestBudgetExceeded { .. } => {
+                problemdetails::new(StatusCode::TOO_MANY_REQUESTS)
+                    .with_title("Log Ingestion Budget Exceeded")
+                    .with_detail(error.to_string())
+            }
+            LogAggregatorError::IngestLineInvalid { .. } => {
+                problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_title("Invalid Log Ingest Line")
+                    .with_detail(error.to_string())
+            }
+            LogAggregatorError::IngestBodyTooLarge { .. } => {
+                problemdetails::new(StatusCode::PAYLOAD_TOO_LARGE)
+                    .with_title("Log Ingest Body Too Large")
+                    .with_detail(error.to_string())
+            }
             LogAggregatorError::Database(_) => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Database Error")
@@ -427,7 +484,17 @@ pub struct PurgeLogsRequest {
         search_logs,
         get_log_context,
         tail_logs,
-        purge_project_logs
+        purge_project_logs,
+        super::saved_searches::list_saved_searches,
+        super::saved_searches::create_saved_search,
+        super::saved_searches::get_saved_search,
+        super::saved_searches::update_saved_search,
+        super::saved_searches::delete_saved_search,
+        super::saved_searches::saved_search_series,
+        super::ingest::ingest_logs,
+        super::ingest::list_log_ingest_keys,
+        super::ingest::create_log_ingest_key,
+        super::ingest::revoke_log_ingest_key
     ),
     components(
         schemas(
@@ -469,6 +536,19 @@ pub struct PurgeLogsRequest {
             LineContext,
             LogLevel,
             LogStream,
+            super::saved_searches::CreateSavedSearchRequest,
+            super::saved_searches::UpdateSavedSearchRequest,
+            super::saved_searches::SavedSearchResponse,
+            super::saved_searches::SavedSearchesResponse,
+            crate::services::SavedSearchQuery,
+            crate::services::LogSeries,
+            crate::services::LogSeriesPoint,
+            crate::services::LogSeriesMethod,
+            super::ingest::LogIngestResponse,
+            super::ingest::CreateLogIngestKeyRequest,
+            super::ingest::LogIngestKeyResponse,
+            super::ingest::CreatedLogIngestKeyResponse,
+            super::ingest::LogIngestKeysResponse,
         )
     ),
     info(
@@ -498,6 +578,8 @@ pub fn configure_routes() -> Router<Arc<LogAggregatorAppState>> {
         .route("/logs/context", get(get_log_context))
         .route("/logs/tail", get(tail_logs))
         .route("/projects/{project_id}/logs", delete(purge_project_logs))
+        .merge(super::saved_searches::configure_routes())
+        .merge(super::ingest::configure_routes())
 }
 
 // ── Handlers ────────────────────────────────────────────────────────────
@@ -973,6 +1055,17 @@ mod tests {
         );
         let audit_service = Arc::new(MockAuditLogger) as Arc<dyn temps_core::AuditLogger>;
 
+        let ingest_keys = Arc::new(crate::ingest::LogIngestKeyService::new(db.connection_arc()));
+        let saved_searches = Arc::new(crate::services::LogSavedSearchService::new(
+            db.connection_arc(),
+        ));
+        let log_series_service = Arc::new(crate::services::LogSeriesService::new(
+            saved_searches.clone(),
+            store.clone(),
+            Arc::new(crate::index::NoLineIndex::new("test")),
+            Arc::new(crate::store::ManifestRepo::new(db.connection_arc())),
+            db.connection_arc(),
+        ));
         let app_state = Arc::new(LogAggregatorAppState {
             search_service,
             metadata_service: metadata_service.clone(),
@@ -990,6 +1083,18 @@ mod tests {
             ingest_budget: Arc::new(crate::services::IngestBudget::new(
                 crate::services::IngestLimits::UNLIMITED,
             )),
+            saved_search_service: saved_searches,
+            log_series_service,
+            // One key service for both paths, as the plugin wires it, so a
+            // revoke reaches the ingest path's cache.
+            ingest_service: Arc::new(crate::ingest::LogIngestService::new(
+                ingest_keys.clone(),
+                Arc::new(chunk_writer.clone()),
+                Arc::new(crate::services::IngestBudget::new(
+                    crate::services::IngestLimits::UNLIMITED,
+                )),
+            )),
+            ingest_key_service: ingest_keys,
         });
 
         TestContext {
@@ -1138,6 +1243,216 @@ mod tests {
     }
 
     // ── Tests ───────────────────────────────────────────────────────────
+
+    // ── HTTP log ingest (ADR 108 D1) ────────────────────────────────────
+
+    async fn seed_project(db: &sea_orm::DatabaseConnection) -> i32 {
+        use sea_orm::{ActiveModelTrait, Set};
+        temps_entities::projects::ActiveModel {
+            name: Set("Ingest project".to_string()),
+            repo_name: Set("repo".to_string()),
+            repo_owner: Set("owner".to_string()),
+            directory: Set("/".to_string()),
+            main_branch: Set("main".to_string()),
+            slug: Set(format!("ingest-{}", Uuid::new_v4())),
+            preset: Set(temps_entities::preset::Preset::NextJs),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .expect("seed project")
+        .id
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_collector_sends_ndjson_with_a_key_and_the_lines_are_searchable() {
+        let ctx = create_test_context().await;
+        let project_id = seed_project(ctx._db.db.as_ref()).await;
+        // The test session is user 1; the key records who created it.
+        {
+            use sea_orm::{ActiveModelTrait, Set};
+            temps_entities::users::ActiveModel {
+                id: Set(1),
+                name: Set("Test User".to_string()),
+                email: Set(format!("ingest-{}@example.com", Uuid::new_v4())),
+                password_hash: Set(None),
+                email_verified: Set(true),
+                mfa_enabled: Set(false),
+                ..Default::default()
+            }
+            .insert(ctx._db.db.as_ref())
+            .await
+            .expect("seed user 1");
+        }
+        let admin = build_test_server(ctx.app_state.clone());
+
+        let created = admin
+            .post(&format!("/projects/{project_id}/logs/ingest-keys"))
+            .json(&serde_json::json!({ "name": "edge collector", "default_service": "edge" }))
+            .await;
+        assert_eq!(
+            created.status_code(),
+            StatusCode::CREATED,
+            "{}",
+            created.text()
+        );
+        assert_eq!(
+            created.header("cache-control").to_str().ok(),
+            Some("no-store"),
+            "a response carrying a secret is never cached"
+        );
+        let created: serde_json::Value = created.json();
+        let key = created["key"].as_str().expect("plaintext key").to_string();
+        let key_id = created["id"].as_i64().expect("key id");
+        assert!(key.starts_with("tlk_"));
+        assert_eq!(
+            created["key_prefix"].as_str(),
+            Some(&key[..12]),
+            "the prefix is the start of the key"
+        );
+
+        // The list never carries the plaintext.
+        let listed = admin
+            .get(&format!("/projects/{project_id}/logs/ingest-keys"))
+            .await;
+        assert_eq!(listed.status_code(), StatusCode::OK);
+        assert!(
+            !listed.text().contains(&key[12..]),
+            "plaintext leaked into the list"
+        );
+
+        // No key, a wrong key, a compressed body.
+        // The receiver is on the public router, not the admin one.
+        let on_admin = admin.post("/logs/ingest").text("{\"msg\":\"x\"}").await;
+        assert!(
+            matches!(
+                on_admin.status_code(),
+                StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
+            ),
+            "ingest must not be mounted behind the admin gate: {}",
+            on_admin.status_code()
+        );
+        let collector = TestServer::new(
+            super::super::configure_public_routes()
+                .with_state(ctx.app_state.ingest_service.clone()),
+        );
+        let missing = collector.post("/logs/ingest").text("{\"msg\":\"x\"}").await;
+        assert_eq!(missing.status_code(), StatusCode::UNAUTHORIZED);
+        let wrong = collector
+            .post("/logs/ingest")
+            .add_header("authorization", format!("Bearer tlk_{}", "0".repeat(64)))
+            .text("{\"msg\":\"x\"}")
+            .await;
+        assert_eq!(wrong.status_code(), StatusCode::UNAUTHORIZED);
+        let gzip = collector
+            .post("/logs/ingest")
+            .add_header("authorization", format!("Bearer {key}"))
+            .add_header("content-encoding", "gzip")
+            .text("{\"msg\":\"x\"}")
+            .await;
+        assert_eq!(gzip.status_code(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        let bad_line = collector
+            .post("/logs/ingest")
+            .add_header("x-temps-log-key", key.clone())
+            .text("{\"msg\":\"x\"}\nnot json")
+            .await;
+        assert_eq!(bad_line.status_code(), StatusCode::BAD_REQUEST);
+
+        // Every slot taken: refused at once with a retry hint, body unread.
+        {
+            let service = ctx.app_state.ingest_service.clone();
+            let held: Vec<_> = (0..crate::ingest::service::MAX_CONCURRENT_INGEST_REQUESTS)
+                .map(|_| service.try_admit_request().expect("a free slot"))
+                .collect();
+            let busy = collector
+                .post("/logs/ingest")
+                .add_header("authorization", format!("Bearer {key}"))
+                .text("{\"msg\":\"x\"}")
+                .await;
+            assert_eq!(busy.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(busy.header("retry-after").to_str().ok(), Some("1"));
+            drop(held);
+        }
+
+        let now = Utc::now();
+        let body = format!(
+            "{{\"timestamp\":\"{}\",\"level\":\"error\",\"message\":\"payment failed\",\"service\":\"checkout\"}}\n\
+             {{\"message\":\"cache warmed\"}}\n",
+            (now - Duration::seconds(10)).to_rfc3339()
+        );
+        let ingested = collector
+            .post("/logs/ingest")
+            .add_header("authorization", format!("Bearer {key}"))
+            .text(body)
+            .await;
+        assert_eq!(ingested.status_code(), StatusCode::ACCEPTED);
+        assert_eq!(ingested.json::<serde_json::Value>()["accepted"], 2);
+
+        let found = admin
+            .post("/logs/search")
+            .json(&serde_json::json!({
+                "project_id": project_id,
+                "start_time": (now - Duration::hours(1)).to_rfc3339(),
+                "end_time": (now + Duration::hours(1)).to_rfc3339(),
+            }))
+            .await;
+        assert_eq!(found.status_code(), StatusCode::OK);
+        let found: serde_json::Value = found.json();
+        let lines = found["lines"].as_array().expect("lines");
+        assert_eq!(lines.len(), 2, "both lines are searchable: {found}");
+        let payment = lines
+            .iter()
+            .find(|line| line["message"] == "payment failed")
+            .expect("the error line is found");
+        assert_eq!(payment["service"], "checkout");
+        assert_eq!(payment["level"], "ERROR");
+        assert!(lines.iter().any(|line| line["service"] == "edge"));
+
+        // Revoking stops the key at once.
+        let revoked = admin
+            .post(&format!(
+                "/projects/{project_id}/logs/ingest-keys/{key_id}/revoke"
+            ))
+            .await;
+        assert_eq!(revoked.status_code(), StatusCode::OK);
+        assert_eq!(revoked.json::<serde_json::Value>()["is_active"], false);
+        let after = collector
+            .post("/logs/ingest")
+            .add_header("authorization", format!("Bearer {key}"))
+            .text("{\"msg\":\"x\"}")
+            .await;
+        assert_eq!(after.status_code(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn log_ingest_keys_need_a_session_and_logs_write() {
+        let ctx = create_test_context().await;
+        let unauthenticated = TestServer::new(configure_routes().with_state(ctx.app_state.clone()));
+        let list = unauthenticated.get("/projects/1/logs/ingest-keys").await;
+        assert_eq!(list.status_code(), StatusCode::UNAUTHORIZED);
+        let create = unauthenticated
+            .post("/projects/1/logs/ingest-keys")
+            .json(&serde_json::json!({ "name": "x" }))
+            .await;
+        assert_eq!(create.status_code(), StatusCode::UNAUTHORIZED);
+        let revoke = unauthenticated
+            .post("/projects/1/logs/ingest-keys/1/revoke")
+            .await;
+        assert_eq!(revoke.status_code(), StatusCode::UNAUTHORIZED);
+
+        let reader = build_test_server_with_role(ctx.app_state.clone(), temps_authz::Role::Reader);
+        let refused = reader
+            .post("/projects/1/logs/ingest-keys")
+            .json(&serde_json::json!({ "name": "x" }))
+            .await;
+        assert_eq!(refused.status_code(), StatusCode::FORBIDDEN);
+        let refused = reader.post("/projects/1/logs/ingest-keys/1/revoke").await;
+        assert_eq!(refused.status_code(), StatusCode::FORBIDDEN);
+    }
 
     #[tokio::test]
     #[serial_test::serial]
@@ -2207,6 +2522,10 @@ mod tests {
             manifests: base_state.manifests.clone(),
             chunk_writer: base_state.chunk_writer.clone(),
             ingest_budget: base_state.ingest_budget.clone(),
+            saved_search_service: base_state.saved_search_service.clone(),
+            log_series_service: base_state.log_series_service.clone(),
+            ingest_service: base_state.ingest_service.clone(),
+            ingest_key_service: base_state.ingest_key_service.clone(),
         });
         build_test_server_with_role(app_state, temps_authz::Role::User)
     }

@@ -15,7 +15,7 @@ import { toast } from 'sonner'
 import type { ProjectResponse } from '@/api/client'
 import { installBrowserWindow } from '@/test/dom'
 import { jsonResponse, mockApi } from '@/test/fetch-mock'
-import { MonitorDetail } from './MonitorDetail'
+import { MONITOR_REFRESH_MS, MonitorDetail } from './MonitorDetail'
 
 installBrowserWindow()
 afterEach(() => {
@@ -82,4 +82,59 @@ test('a failed Refresh keeps the loaded monitor on screen', async () => {
   await screen.findByText("Couldn't refresh monitor")
   expect(screen.getByRole('heading', { name: 'Homepage check' })).toBeTruthy()
   expect(screen.queryByText('Failed to load monitor')).toBeNull()
+})
+
+test('the monitor, which carries the latest location answers, refreshes with its history', async () => {
+  mockApi({
+    'GET /monitors/5': () =>
+      jsonResponse({
+        id: 5,
+        name: 'Homepage check',
+        monitor_type: 'web',
+        monitor_url: 'https://app.example.test/',
+        check_interval_seconds: 60,
+        created_at: '2026-01-01T00:00:00Z',
+        is_active: true,
+        is_managed: false,
+      }),
+    'GET /monitors/5/current-status': () =>
+      jsonResponse({ current_status: 'operational', uptime_percentage: 99 }),
+    'GET /monitors/5/bucketed': () => jsonResponse({ buckets: [] }),
+  })
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  render(
+    <QueryClientProvider client={client}>
+      <MemoryRouter initialEntries={['/monitors/5']}>
+        <Routes>
+          <Route
+            path="/monitors/:monitorId"
+            element={
+              <MonitorDetail
+                project={{ id: 17, slug: 'demo' } as ProjectResponse}
+              />
+            }
+          />
+        </Routes>
+      </MemoryRouter>
+    </QueryClientProvider>
+  )
+  await screen.findByRole('heading', { name: 'Homepage check' })
+  const intervals = (match: (key: string) => boolean) =>
+    client
+      .getQueryCache()
+      .getAll()
+      .filter((query) => match(JSON.stringify(query.queryKey)))
+      .flatMap((query) =>
+        query.observers.map((observer) => observer.options.refetchInterval)
+      )
+  expect(
+    intervals(
+      (key) => key.includes('getMonitor"') || key.includes('"getMonitor')
+    )
+  ).toContain(MONITOR_REFRESH_MS)
+  expect(intervals((key) => key.includes('Bucketed'))).toContain(
+    MONITOR_REFRESH_MS
+  )
 })

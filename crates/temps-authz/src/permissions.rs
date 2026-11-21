@@ -121,6 +121,7 @@ pub enum Permission {
 
     // Logs permissions
     LogsRead,
+    LogsWrite,
     LogsDelete,
 
     // Metrics permissions
@@ -339,6 +340,7 @@ impl fmt::Display for Permission {
             Permission::LoadBalancerRead => "load_balancer:read",
             Permission::LoadBalancerWrite => "load_balancer:write",
             Permission::LogsRead => "logs:read",
+            Permission::LogsWrite => "logs:write",
             Permission::LogsDelete => "logs:delete",
             Permission::MetricsRead => "metrics:read",
             Permission::NotificationsRead => "notifications:read",
@@ -513,6 +515,7 @@ impl Permission {
             "load_balancer:read" => Some(Permission::LoadBalancerRead),
             "load_balancer:write" => Some(Permission::LoadBalancerWrite),
             "logs:read" => Some(Permission::LogsRead),
+            "logs:write" => Some(Permission::LogsWrite),
             "logs:delete" => Some(Permission::LogsDelete),
             "metrics:read" => Some(Permission::MetricsRead),
             "notifications:read" => Some(Permission::NotificationsRead),
@@ -677,6 +680,7 @@ impl Permission {
             Permission::LoadBalancerRead,
             Permission::LoadBalancerWrite,
             Permission::LogsRead,
+            Permission::LogsWrite,
             Permission::LogsDelete,
             Permission::MetricsRead,
             Permission::NotificationsRead,
@@ -879,6 +883,7 @@ impl Role {
                 Permission::LoadBalancerRead,
                 Permission::LoadBalancerWrite,
                 Permission::LogsRead,
+                Permission::LogsWrite,
                 Permission::LogsDelete,
                 Permission::MetricsRead,
                 Permission::NotificationsRead,
@@ -1040,6 +1045,7 @@ impl Role {
                 Permission::LoadBalancerRead,
                 Permission::LoadBalancerWrite,
                 Permission::LogsRead,
+                Permission::LogsWrite,
                 Permission::LogsDelete,
                 Permission::MetricsRead,
                 Permission::NotificationsRead,
@@ -1184,6 +1190,7 @@ impl Role {
                 Permission::GithubConnect,
                 Permission::LoadBalancerRead,
                 Permission::LogsRead,
+                Permission::LogsWrite,
                 Permission::LogsDelete,
                 Permission::MetricsRead,
                 Permission::NotificationsRead,

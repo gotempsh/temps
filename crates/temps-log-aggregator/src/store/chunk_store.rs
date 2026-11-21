@@ -114,6 +114,12 @@ pub struct HeadSummary {
 pub struct HeadSnapshot {
     pub identity: ChunkIdentity,
     pub segments: Vec<Arc<Vec<LogLine>>>,
+    /// How many leading `segments` belong to a seal whose chunk is already
+    /// in the line index. A count that adds the index must skip them.
+    pub indexed_segments: usize,
+    /// The buffer's seal epoch when the snapshot was taken; see
+    /// [`HeadSource::seal_epoch`].
+    pub seal_epoch: u64,
 }
 
 impl HeadSnapshot {
@@ -236,6 +242,11 @@ pub trait HeadSource: Send + Sync {
     async fn summaries(&self) -> Vec<HeadSummary>;
     /// Unsealed lines of one container, if any.
     async fn snapshot(&self, container_id: &str) -> Option<HeadSnapshot>;
+    /// A value that changes whenever the container's lines move into or
+    /// out of the line index (a seal starting, its chunk indexed), or
+    /// `None` once the container has no head. Equal before and after a
+    /// read of the index means no seal crossed it.
+    async fn seal_epoch(&self, container_id: &str) -> Option<u64>;
 }
 
 /// A head source with nothing in it — for tests and read-only processes.
@@ -247,6 +258,9 @@ impl HeadSource for NoHeads {
         Vec::new()
     }
     async fn snapshot(&self, _container_id: &str) -> Option<HeadSnapshot> {
+        None
+    }
+    async fn seal_epoch(&self, _container_id: &str) -> Option<u64> {
         None
     }
 }
@@ -1151,6 +1165,49 @@ impl LogLineStore for ChunkStore {
             .collect())
     }
 
+    async fn unsealed_histogram_before_index(
+        &self,
+        query: &LogQuery,
+        bucket_secs: u32,
+    ) -> Result<super::UnsealedCount, LogAggregatorError> {
+        query.validate()?;
+        if query.chunk_seqs.is_some() {
+            return Ok(super::UnsealedCount::default());
+        }
+        let filter = LineFilter::compile(query);
+        let mut counts = BTreeMap::new();
+        let mut heads = Vec::new();
+        for candidate in self.head_candidates(query, &filter).await {
+            let Candidate::Head(labels) = candidate else {
+                continue;
+            };
+            let Some(mut snapshot) = self.heads.snapshot(&labels.container_id).await else {
+                continue;
+            };
+            heads.push((labels.container_id.clone(), snapshot.seal_epoch));
+            // A seal whose chunk is already indexed is counted by the index.
+            let indexed = snapshot.indexed_segments.min(snapshot.segments.len());
+            snapshot.segments.drain(..indexed);
+            count_head_lines(&snapshot, &labels, &filter, bucket_secs, None, &mut counts);
+        }
+        Ok(super::UnsealedCount {
+            buckets: counts
+                .into_iter()
+                .map(|((ts, group), count)| HistogramBucket { ts, group, count })
+                .collect(),
+            heads,
+        })
+    }
+
+    async fn heads_unchanged(&self, heads: &[(String, u64)]) -> bool {
+        for (container_id, epoch) in heads {
+            if self.heads.seal_epoch(container_id).await != Some(*epoch) {
+                return false;
+            }
+        }
+        true
+    }
+
     async fn context(
         &self,
         scope: &LogAccessScope,
@@ -1760,6 +1817,8 @@ mod tests {
                 mk("Connection refused", LogLevel::Error, 1),
                 mk("retrying", LogLevel::Warn, 2),
             ])],
+            indexed_segments: 0,
+            seal_epoch: 0,
         };
         let labels = head_snapshot_labels(&snap).unwrap();
         let mut q = query(LogAccessScope::All);
@@ -1893,6 +1952,8 @@ mod tests {
                     mk("GET / 200", LogLevel::Info, 3600 * 5),
                 ]),
             ],
+            indexed_segments: 0,
+            seal_epoch: 0,
         };
         let labels = head_snapshot_labels(&snap).unwrap();
         let mut q = query(LogAccessScope::All);
@@ -1980,7 +2041,12 @@ mod tests {
                 Arc::new(lines)
             })
             .collect();
-        let snap = HeadSnapshot { identity, segments };
+        let snap = HeadSnapshot {
+            identity,
+            segments,
+            indexed_segments: 0,
+            seal_epoch: 0,
+        };
 
         assert_eq!(snap.len(), 30);
         assert!(!snap.is_empty());
@@ -2078,6 +2144,71 @@ mod tests {
                 w[1].key()
             );
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_seal_after_the_heads_are_counted_is_detected() {
+        let db = match temps_test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(_) => {
+                println!("Docker/DB not available, skipping test");
+                return;
+            }
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn LogStorage> =
+            Arc::new(crate::storage::FilesystemStorage::new(tmp.path().join("objects")).unwrap());
+        let manifests = Arc::new(ManifestRepo::new(db.connection_arc()));
+        let cache = ChunkCache::open(Some(tmp.path().join("cache")), 64 * 1024 * 1024)
+            .await
+            .unwrap();
+        let writer = crate::services::ChunkWriterService::open(
+            storage.clone(),
+            manifests.clone(),
+            Some(tmp.path().join("wal")),
+            Some(cache.clone()),
+        )
+        .await
+        .unwrap();
+        let base: DateTime<Utc> = "2026-03-01T00:00:00Z".parse().unwrap();
+        for i in 0..3 {
+            writer
+                .write_line(e2e_line(
+                    "dddddddddddd4",
+                    7,
+                    None,
+                    base + chrono::Duration::seconds(i),
+                    LogLevel::Info,
+                    "counted",
+                ))
+                .await
+                .unwrap();
+        }
+        let store = ChunkStore::new(
+            ManifestRepo::new(db.connection_arc()),
+            storage.clone(),
+            cache.clone(),
+            writer.clone(),
+        );
+        let mut q = LogQuery::for_scope(LogAccessScope::All);
+        q.start_time = base - chrono::Duration::minutes(1);
+        q.end_time = base + chrono::Duration::minutes(1);
+
+        let counted = store
+            .unsealed_histogram_before_index(&q, 3600)
+            .await
+            .unwrap();
+        let total: i64 = counted.buckets.iter().map(|b| b.count).sum();
+        assert_eq!(total, 3);
+        assert_eq!(counted.heads.len(), 1);
+        assert!(store.heads_unchanged(&counted.heads).await);
+
+        writer.flush_all().await;
+        assert!(
+            !store.heads_unchanged(&counted.heads).await,
+            "a seal after the head count must be noticed"
+        );
     }
 
     #[tokio::test]

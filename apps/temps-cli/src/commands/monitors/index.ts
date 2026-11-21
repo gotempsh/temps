@@ -19,6 +19,7 @@ import { withSpinner } from '../../ui/spinner.js'
 import { printTable, statusBadge, type TableColumn } from '../../ui/table.js'
 import { promptText, promptSelect, promptConfirm } from '../../ui/prompts.js'
 import { newline, header, icons, json, colors, success, info, warning, keyValue } from '../../ui/output.js'
+import { printLocations, registerTargetMonitorCommands } from './targets.js'
 
 const MONITOR_TYPES = ['http', 'tcp', 'ping']
 const CHECK_INTERVALS = [
@@ -129,6 +130,8 @@ export function registerMonitorsCommands(program: Command): void {
     .option('--environment-id <id>', 'Environment ID (default: 0 for production)')
     .option('-y, --yes', 'Skip confirmation prompts (for automation)')
     .action(createMonitorAction)
+
+  registerTargetMonitorCommands(monitors)
 
   monitors
     .command('show')
@@ -338,6 +341,7 @@ async function showMonitor(options: ShowOptions): Promise<void> {
   keyValue('Project ID', monitor.project_id)
   keyValue('Created', new Date(monitor.created_at).toLocaleString())
   keyValue('Updated', new Date(monitor.updated_at).toLocaleString())
+  printLocations(monitor)
   newline()
 }
 

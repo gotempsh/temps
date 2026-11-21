@@ -1973,7 +1973,7 @@ pub(super) mod status_page_host_tests {
         Forwarded {
             path: String,
             status_host: Option<String>,
-            cookie: bool,
+            cookie: Option<String>,
             peer: Option<String>,
         },
         /// The proxy answered itself.
@@ -2000,7 +2000,11 @@ pub(super) mod status_page_host_tests {
                 .get(STATUS_HOST_HEADER)
                 .and_then(|v| v.to_str().ok())
                 .map(str::to_string);
-            let cookie = header.headers.get("cookie").is_some();
+            let cookie = header
+                .headers
+                .get("cookie")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
             let peer = if ctx.status_page_host {
                 Some(
                     h.lb.upstream_peer(&mut session, &mut ctx)
@@ -2075,7 +2079,7 @@ pub(super) mod status_page_host_tests {
                 } => {
                     assert_eq!(forwarded, expected);
                     assert_eq!(status_host.as_deref(), Some(HOST));
-                    assert!(!cookie, "credentials never reach the public listener");
+                    assert_eq!(cookie, None, "credentials never reach the public listener");
                     assert_eq!(peer.as_deref(), Some(INGRESS));
                 }
                 Outcome::Answered { head, .. } => panic!("{path} must be forwarded: {head}"),
@@ -2115,6 +2119,104 @@ pub(super) mod status_page_host_tests {
             .await?,
             false,
         );
+        Ok(())
+    }
+
+    /// The subscription routes of ADR 108 D2: the subscribe form only posts,
+    /// a confirm or unsubscribe link answers GET (a button) and POST, and
+    /// nothing else reaches the console.
+    #[tokio::test]
+    async fn verified_host_forwards_only_the_status_page_access_cookie() -> Result<()> {
+        let Some(h) = harness(Some(INGRESS), true).await? else {
+            return Ok(());
+        };
+        h.route_table
+            .insert_status_page_host_for_test(HOST, Some(SLUG));
+        let with_cookie =
+            |cookie: &str| format!("GET / HTTP/1.1\r\nHost: {HOST}\r\nCookie: {cookie}\r\n\r\n");
+        let forwarded = |outcome: Outcome| match outcome {
+            Outcome::Forwarded { cookie, .. } => cookie,
+            Outcome::Answered { head, .. } => panic!("must be forwarded: {head}"),
+        };
+        let access = "v1.7.1.1767225600.00ff";
+        assert_eq!(
+            forwarded(
+                send(
+                    &h,
+                    &with_cookie(&format!(
+                        "session=secret; temps_status_access={access}; other=1"
+                    ))
+                )
+                .await?
+            ),
+            Some(format!("temps_status_access={access}")),
+            "only the access cookie survives"
+        );
+        assert_eq!(
+            forwarded(send(&h, &with_cookie("temps_status_access=bad%20value")).await?),
+            None,
+            "a malformed access cookie is dropped"
+        );
+        assert_eq!(
+            forwarded(send(&h, &with_cookie("session=secret")).await?),
+            None
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verified_host_forwards_the_subscription_routes_with_their_methods() -> Result<()> {
+        let Some(h) = harness(Some(INGRESS), true).await? else {
+            return Ok(());
+        };
+        h.route_table
+            .insert_status_page_host_for_test(HOST, Some(SLUG));
+        let token = "c".repeat(temps_core::public_status_page::SUBSCRIPTION_TOKEN_LEN);
+        let post = |path: &str| {
+            format!(
+                "POST {path} HTTP/1.1\r\nHost: {HOST}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 0\r\n\r\n"
+            )
+        };
+        for (request, expected) in [
+            (
+                get("/feed.atom", HOST),
+                format!("/api/status/{SLUG}/feed.atom"),
+            ),
+            (post("/subscribe"), format!("/api/status/{SLUG}/subscribe")),
+            (post("/unlock"), format!("/api/status/{SLUG}/unlock")),
+            (
+                get(&format!("/confirm/{token}"), HOST),
+                format!("/api/status/{SLUG}/confirm/{token}"),
+            ),
+            (
+                post(&format!("/confirm/{token}")),
+                format!("/api/status/{SLUG}/confirm/{token}"),
+            ),
+            (
+                post(&format!("/unsubscribe/{token}")),
+                format!("/api/status/{SLUG}/unsubscribe/{token}"),
+            ),
+        ] {
+            match send(&h, &request).await? {
+                Outcome::Forwarded {
+                    path, status_host, ..
+                } => {
+                    assert_eq!(path, expected);
+                    assert_eq!(status_host.as_deref(), Some(HOST));
+                }
+                Outcome::Answered { head, .. } => panic!("{expected} must be forwarded: {head}"),
+            }
+        }
+        for request in [
+            post("/feed.atom"),
+            get("/subscribe", HOST),
+            get("/unlock", HOST),
+            format!("DELETE /confirm/{token} HTTP/1.1\r\nHost: {HOST}\r\n\r\n"),
+            post("/confirm/not-a-token"),
+            post(&format!("/api/status/{SLUG}/subscribe")),
+        ] {
+            assert_not_found(send(&h, &request).await?, false);
+        }
         Ok(())
     }
 

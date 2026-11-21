@@ -140,6 +140,63 @@ pub struct HistogramBucket {
     pub count: i64,
 }
 
+/// Parse repeatable `attr=<key><op><value>` query parameters (and
+/// `attr=<key>?` for "exists") into index predicates.
+pub fn parse_attr_predicates(raws: &[String]) -> Result<Vec<AttrPredicate>, LogAggregatorError> {
+    raws.iter().map(|s| parse_attr_predicate(s)).collect()
+}
+
+pub(crate) fn attr_filter_error(raw: &str) -> LogAggregatorError {
+    LogAggregatorError::Validation {
+        message: format!(
+            "invalid attribute filter {raw:?}: expected <key><op><value> with op in =, !=, ^= \
+             (prefix), >, < or <key>? for \"exists\""
+        ),
+    }
+}
+
+pub fn parse_attr_predicate(raw: &str) -> Result<AttrPredicate, LogAggregatorError> {
+    if let Some(key) = raw.strip_suffix('?') {
+        if key.is_empty() {
+            return Err(attr_filter_error(raw));
+        }
+        return Ok(AttrPredicate {
+            key: key.to_string(),
+            op: AttrOp::Exists,
+            value: None,
+        });
+    }
+    // Two-character operators first: `!=`/`^=` both contain `=`, so checking
+    // the single-`=` case first would split them in the wrong place.
+    for (token, op) in [("!=", AttrOp::Neq), ("^=", AttrOp::Prefix)] {
+        if let Some(idx) = raw.find(token) {
+            let (key, rest) = (&raw[..idx], &raw[idx + token.len()..]);
+            if key.is_empty() {
+                return Err(attr_filter_error(raw));
+            }
+            return Ok(AttrPredicate {
+                key: key.to_string(),
+                op,
+                value: Some(rest.to_string()),
+            });
+        }
+    }
+    for (ch, op) in [('=', AttrOp::Eq), ('>', AttrOp::Gt), ('<', AttrOp::Lt)] {
+        if let Some(idx) = raw.find(ch) {
+            let (key, rest) = (&raw[..idx], &raw[idx + 1..]);
+            if key.is_empty() {
+                return Err(attr_filter_error(raw));
+            }
+            return Ok(AttrPredicate {
+                key: key.to_string(),
+                op,
+                value: Some(rest.to_string()),
+            });
+        }
+    }
+    Err(attr_filter_error(raw))
+}
+
 /// Add the counts of lines the index does not hold yet to an indexed
 /// histogram.
 ///
@@ -875,6 +932,78 @@ pub(crate) fn test_cloud_link(dir: &std::path::Path) -> Arc<temps_cloud_client::
     .expect("apply feature switches");
     link
 }
+
+/// Parse one `group_by`/`keys` item: a label facet name (`env`, `service`,
+/// `level`, `stream`, `project`, `external_service`, `node`, `deploy`,
+/// `container`) or `attr:<name>` for an attribute.
+pub fn parse_group_key(raw: &str) -> Result<GroupKey, LogAggregatorError> {
+    let raw = raw.trim();
+    if let Some(attr) = raw.strip_prefix("attr:") {
+        if attr.is_empty() {
+            return Err(LogAggregatorError::Validation {
+                message: "attr: group key needs a name, e.g. attr:worker".to_string(),
+            });
+        }
+        return Ok(GroupKey::Attr(attr.to_string()));
+    }
+    let field: FacetField = serde_json::from_value(serde_json::Value::String(raw.to_string()))
+        .map_err(|_| LogAggregatorError::Validation {
+            message: format!(
+                "unknown group key {raw:?}; expected one of env, service, level, stream, \
+                 project, external_service, node, deploy, container, or attr:<name>"
+            ),
+        })?;
+    Ok(GroupKey::Label(field))
+}
+
+/// Parse a comma-separated list of group keys.
+pub fn parse_group_keys(raw: &str) -> Result<Vec<GroupKey>, LogAggregatorError> {
+    let keys: Result<Vec<GroupKey>, LogAggregatorError> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(parse_group_key)
+        .collect();
+    let keys = keys?;
+    if keys.is_empty() {
+        return Err(LogAggregatorError::Validation {
+            message: "at least one group-by key is required".to_string(),
+        });
+    }
+    Ok(keys)
+}
+
+/// Parse a `metric` parameter: `count`, or `<fn>:<attr>` for
+/// `count_distinct`, `avg`, `p50`, `p95`, `p99`, `max`, `sum`.
+pub fn parse_metric(raw: &str) -> Result<Metric, LogAggregatorError> {
+    let invalid = || LogAggregatorError::Validation {
+        message: format!(
+            "invalid metric {raw:?}; expected count, or one of count_distinct, avg, p50, p95, \
+             p99, max, sum followed by :<attr>"
+        ),
+    };
+    if raw == "count" {
+        return Ok(Metric::Count);
+    }
+    let (name, attr) = raw.split_once(':').ok_or_else(invalid)?;
+    if attr.is_empty() {
+        return Err(invalid());
+    }
+    Ok(match name {
+        "count_distinct" => Metric::CountDistinct(attr.to_string()),
+        "avg" => Metric::Avg(attr.to_string()),
+        "p50" => Metric::P50(attr.to_string()),
+        "p95" => Metric::P95(attr.to_string()),
+        "p99" => Metric::P99(attr.to_string()),
+        "max" => Metric::Max(attr.to_string()),
+        "sum" => Metric::Sum(attr.to_string()),
+        _ => return Err(invalid()),
+    })
+}
+
+/// Upper bound on any of these endpoints' `limit`/`max_groups`, regardless of
+/// what the caller asks for.
+pub const MAX_ANALYTICS_LIMIT: u32 = 1000;
 
 #[cfg(test)]
 mod tests {
