@@ -4042,7 +4042,7 @@ mod tests {
     #[tokio::test]
     async fn starting_a_running_vm_confirms_a_user_it_never_confirmed() {
         let name = sandbox_vm_name();
-        let (provider, dir) = provider_with_agent_answers(&name, vec![USER_READY]);
+        let (provider, _dir) = provider_with_agent_answers(&name, vec![USER_READY]);
         let vm_dir = provider.config.vm_dir(&name);
         boot_with_sandbox_user(&vm_dir);
         // A process the provider takes for this VM's VMM: the kernel names a
@@ -4053,7 +4053,10 @@ mod tests {
             .into_iter()
             .find(|path| Path::new(path).exists())
             .expect("a sleep binary");
-        let vmm = dir.path().join("firecracker");
+        // Its own directory: the provider's data dir already holds a
+        // `firecracker` directory.
+        let bin = tempfile::tempdir().unwrap();
+        let vmm = bin.path().join("firecracker");
         std::os::unix::fs::symlink(sleep, &vmm).unwrap();
         let mut child = std::process::Command::new(&vmm).arg("30").spawn().unwrap();
         std::fs::write(vm_dir.join("fc.pid"), child.id().to_string()).unwrap();
