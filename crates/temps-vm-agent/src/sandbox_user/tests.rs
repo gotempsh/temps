@@ -24,6 +24,15 @@ fn me() -> SandboxUser {
     }
 }
 
+/// An id the test runner's own uid and gid are not, for fixture accounts
+/// that must not collide with the runner (a CI service account may well be
+/// 65534 or 4242).
+fn an_id_other_than(taken: &[u32]) -> u32 {
+    (4242..)
+        .find(|id| !taken.contains(id))
+        .expect("an unused id")
+}
+
 #[test]
 fn the_boot_argument_round_trips_through_the_kernel_command_line() {
     let user = temps();
@@ -176,6 +185,11 @@ fn writes_into_the_home_or_workspace_run_as_the_user() {
         "/home/temps/.claude/settings.json",
         "/workspace",
         "/workspace/src/main.rs",
+        // The same files, spelled the ways the kernel also accepts.
+        "//workspace/config",
+        "/workspace//src/./main.rs",
+        "/home/temps/",
+        "workspace/config",
     ] {
         assert_eq!(is_user_file(path, &user, "/workspace"), Ok(true), "{path}");
     }
@@ -269,16 +283,17 @@ fn a_file_op_writes_with_its_mode_and_creates_parents() {
 fn prepare_adds_the_accounts_creates_the_home_and_is_idempotent() {
     let root = tempfile_dir();
     std::fs::create_dir_all(root.join("etc")).unwrap();
+    let user = me();
     // Accounts that cannot collide with the test runner's own uid and gid.
+    let other = an_id_other_than(&[user.uid, user.gid]);
     std::fs::write(
         root.join("etc/passwd"),
-        "nobody:x:65534:65534::/:/sbin/nologin\n",
+        format!("nobody:x:{other}:{other}::/:/sbin/nologin\n"),
     )
     .unwrap();
-    std::fs::write(root.join("etc/group"), "nogroup:x:65534:\n").unwrap();
+    std::fs::write(root.join("etc/group"), format!("nogroup:x:{other}:\n")).unwrap();
     std::fs::create_dir_all(root.join("workspace/src")).unwrap();
     std::fs::write(root.join("workspace/src/main.rs"), "fn main() {}").unwrap();
-    let user = me();
 
     let report = prepare(&root, &user, "/workspace").unwrap();
     assert!(report.added_user && report.added_group, "{report:?}");
@@ -314,22 +329,19 @@ fn prepare_adds_the_accounts_creates_the_home_and_is_idempotent() {
 fn prepare_refuses_a_conflicting_account_without_touching_files() {
     let root = tempfile_dir();
     std::fs::create_dir_all(root.join("etc")).unwrap();
-    let passwd = "root:x:0:0:root:/root:/bin/sh\ntemps:x:4242:4242::/home/temps:/bin/sh\n";
-    std::fs::write(root.join("etc/passwd"), passwd).unwrap();
     let user = me();
-    assert_ne!(
-        user.uid, 4242,
-        "the test needs a uid other than the image's"
-    );
+    let other = an_id_other_than(&[user.uid]);
+    let passwd =
+        format!("root:x:0:0:root:/root:/bin/sh\ntemps:x:{other}:{other}::/home/temps:/bin/sh\n");
+    std::fs::write(root.join("etc/passwd"), &passwd).unwrap();
+    // The image has no group file: the group the user would need is
+    // missing too, and must not be created for a user that is refused.
 
     let error = prepare(&root, &user, "/workspace").unwrap_err();
     assert!(
         matches!(
             error,
-            SandboxUserError::NameTakenByOtherUid {
-                existing_uid: 4242,
-                ..
-            }
+            SandboxUserError::NameTakenByOtherUid { existing_uid, .. } if existing_uid == other
         ),
         "{error:?}"
     );
@@ -337,8 +349,148 @@ fn prepare_refuses_a_conflicting_account_without_touching_files() {
         std::fs::read_to_string(root.join("etc/passwd")).unwrap(),
         passwd
     );
+    assert!(
+        !root.join("etc/group").exists(),
+        "a refused user leaves no group behind"
+    );
     assert!(!root.join("home/temps").exists());
     std::fs::remove_dir_all(&root).unwrap();
+}
+
+/// A host write replaces the file: one left read-only can be rewritten, and
+/// a symlink planted at the target is replaced rather than written through.
+#[test]
+fn a_write_replaces_a_read_only_file_and_a_planted_symlink() {
+    let dir = tempfile_dir();
+    let path = dir.join("token");
+    let write = |contents: &'static [u8]| {
+        run_file_op(
+            &FileOp::Write {
+                path: path.display().to_string(),
+                mode: 0o400,
+            },
+            contents,
+            1024,
+        )
+    };
+    write(b"first").unwrap();
+    write(b"second").unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), b"second");
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o400
+    );
+
+    let elsewhere = dir.join("elsewhere");
+    std::fs::write(&elsewhere, b"keep").unwrap();
+    std::fs::remove_file(&path).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, &path).unwrap();
+    write(b"third").unwrap();
+    assert!(!std::fs::symlink_metadata(&path)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert_eq!(std::fs::read(&elsewhere).unwrap(), b"keep");
+    assert_eq!(
+        std::fs::read_dir(&dir).unwrap().count(),
+        2,
+        "no staged file is left behind"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The size limit applies to what is read: a symlink to a large file, or to
+/// something that is not a file at all, is refused, not read.
+#[test]
+fn an_account_file_is_measured_as_opened() {
+    let dir = tempfile_dir();
+    assert_eq!(read_account_file(&dir.join("missing")).unwrap(), "");
+
+    let big = dir.join("big");
+    std::fs::write(&big, vec![b'x'; MAX_ACCOUNT_FILE_BYTES as usize + 1]).unwrap();
+    let link = dir.join("passwd");
+    std::os::unix::fs::symlink(&big, &link).unwrap();
+    assert!(matches!(
+        read_account_file(&link),
+        Err(SandboxUserError::AccountFileTooLarge { .. })
+    ));
+
+    let to_dir = dir.join("group");
+    std::os::unix::fs::symlink(&dir, &to_dir).unwrap();
+    assert!(matches!(
+        read_account_file(&to_dir),
+        Err(SandboxUserError::AccountFileNotRegular { .. })
+    ));
+
+    let small = dir.join("small");
+    std::fs::write(&small, "root:x:0:0::/root:/bin/sh\n").unwrap();
+    assert_eq!(
+        read_account_file(&small).unwrap(),
+        "root:x:0:0::/root:/bin/sh\n"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The converter to hand back is recorded before the walk and `done` only
+/// after it, so a walk cut short (by which point the agent binary may
+/// already be root's) resumes for the same owner at the next boot.
+#[test]
+fn owner_normalisation_resumes_until_it_has_finished() {
+    let dir = tempfile_dir();
+    let record = dir.join("var/lib/temps-vm-agent/rootfs-owner");
+
+    // A rootfs extracted as root: nothing to do, nothing recorded.
+    assert_eq!(
+        normalize_rootfs_owner(&record, (0, 0), |_| panic!("no walk")).unwrap(),
+        None
+    );
+    assert_eq!(
+        read_normalization(&record).unwrap(),
+        Normalization::NotStarted
+    );
+
+    // The walk fails part way: the record still names the converter.
+    let error = normalize_rootfs_owner(&record, (1000, 1000), |converter| {
+        assert_eq!(converter, (1000, 1000));
+        assert_eq!(
+            read_normalization(&record).unwrap(),
+            Normalization::Pending {
+                uid: 1000,
+                gid: 1000
+            },
+            "recorded before anything changes"
+        );
+        Err(SandboxUserError::Io {
+            operation: "chown",
+            path: "/usr/bin/env".to_string(),
+            reason: "interrupted".to_string(),
+        })
+    })
+    .unwrap_err();
+    assert!(error.to_string().contains("interrupted"), "{error}");
+
+    // Next boot: the binary is root's now, but the walk runs again for the
+    // recorded converter, and finishes.
+    assert_eq!(
+        normalize_rootfs_owner(&record, (0, 0), |converter| {
+            assert_eq!(converter, (1000, 1000));
+            Ok(7)
+        })
+        .unwrap(),
+        Some(7)
+    );
+    assert_eq!(read_normalization(&record).unwrap(), Normalization::Done);
+    assert_eq!(
+        normalize_rootfs_owner(&record, (1000, 1000), |_| panic!("already done")).unwrap(),
+        None
+    );
+
+    std::fs::write(&record, "garbage").unwrap();
+    assert!(matches!(
+        read_normalization(&record),
+        Err(SandboxUserError::BadNormalizationRecord { .. })
+    ));
+    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]

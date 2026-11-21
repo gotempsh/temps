@@ -84,6 +84,12 @@ pub enum SandboxUserError {
     #[error("{path} is larger than {MAX_ACCOUNT_FILE_BYTES} bytes; refusing to edit it")]
     AccountFileTooLarge { path: String },
 
+    #[error("{path} is not a regular file; refusing to read it as an account file")]
+    AccountFileNotRegular { path: String },
+
+    #[error("{path} does not record a rootfs owner normalisation: '{contents}'")]
+    BadNormalizationRecord { path: String, contents: String },
+
     #[error("{operation} {path}: {reason}")]
     Io {
         operation: &'static str,
@@ -176,16 +182,18 @@ pub fn prepare(
 ) -> Result<PrepareReport, SandboxUserError> {
     let mut report = PrepareReport::default();
 
+    // Both files are checked before either is written, so a conflict in
+    // one never leaves a half-made account on the VM's persistent disk.
     let group_path = root.join("etc/group");
-    let group = read_account_file(&group_path)?;
-    if let Some(updated) = ensure_group_entry(&group, &user.name, user.gid)? {
+    let group_update = ensure_group_entry(&read_account_file(&group_path)?, &user.name, user.gid)?;
+    let passwd_path = root.join("etc/passwd");
+    let passwd_update = ensure_passwd_entry(&read_account_file(&passwd_path)?, user)?;
+
+    if let Some(updated) = group_update {
         write_account_file(&group_path, &updated)?;
         report.added_group = true;
     }
-
-    let passwd_path = root.join("etc/passwd");
-    let passwd = read_account_file(&passwd_path)?;
-    match ensure_passwd_entry(&passwd, user)? {
+    match passwd_update {
         PasswdEntry::Present => {}
         PasswdEntry::PresentAs(name) => report.existing_name = Some(name),
         PasswdEntry::Added(updated) => {
@@ -358,11 +366,38 @@ pub fn run_file_op(op: &FileOp, input: impl std::io::Read, max_bytes: u64) -> st
                     format!("contents for {path} exceed {max_bytes} bytes"),
                 ));
             }
-            if let Some(parent) = Path::new(path).parent() {
-                std::fs::create_dir_all(parent)?;
+            let target = Path::new(path);
+            let parent = target.parent().unwrap_or(Path::new("/"));
+            std::fs::create_dir_all(parent)?;
+            // Staged beside the target and renamed over it, so a file the
+            // user left read-only (a `0400` upload) can still be replaced,
+            // and a planted symlink at the target is replaced, not followed.
+            let name = target.file_name().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("{path} names no file"),
+                )
+            })?;
+            let mut staged_name = std::ffi::OsString::from(".");
+            staged_name.push(name);
+            staged_name.push(format!(".temps-write-{}", std::process::id()));
+            let staged = parent.join(staged_name);
+            let written = (|| {
+                use std::io::Write;
+                use std::os::unix::fs::OpenOptionsExt;
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&staged)?;
+                file.write_all(&data)?;
+                file.set_permissions(std::fs::Permissions::from_mode(*mode))?;
+                std::fs::rename(&staged, target)
+            })();
+            if written.is_err() {
+                let _ = std::fs::remove_file(&staged);
             }
-            std::fs::write(path, &data)?;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(*mode))
+            written
         }
         FileOp::Mkdir { path, mode } => {
             std::fs::create_dir_all(path)?;
@@ -391,10 +426,12 @@ pub fn is_user_file(
     user: &SandboxUser,
     work_dir: &str,
 ) -> Result<bool, OwnedWriteError> {
-    if !(path_is_within(path, &user.home) || path_is_within(path, work_dir)) {
+    // A relative path is resolved from `/`, the writers' working directory.
+    let absolute = Path::new("/").join(path);
+    if !(absolute.starts_with(&user.home) || absolute.starts_with(work_dir)) {
         return Ok(false);
     }
-    if Path::new(path)
+    if absolute
         .components()
         .any(|component| matches!(component, std::path::Component::ParentDir))
     {
@@ -403,14 +440,6 @@ pub fn is_user_file(
         });
     }
     Ok(true)
-}
-
-fn path_is_within(path: &str, tree: &str) -> bool {
-    let tree = tree.trim_end_matches('/');
-    path == tree
-        || path
-            .strip_prefix(tree)
-            .is_some_and(|rest| rest.starts_with('/'))
 }
 
 fn passwd_home(passwd: &str, uid: u32) -> Option<&str> {
@@ -455,35 +484,140 @@ fn is_account_name(name: &str) -> bool {
         && !name.starts_with('-')
 }
 
-fn read_account_file(path: &Path) -> Result<String, SandboxUserError> {
-    match std::fs::symlink_metadata(path) {
-        Ok(meta) if meta.len() > MAX_ACCOUNT_FILE_BYTES => {
-            Err(SandboxUserError::AccountFileTooLarge {
-                path: path.display().to_string(),
-            })
-        }
-        Ok(_) => std::fs::read_to_string(path).map_err(|e| SandboxUserError::io("read", path, e)),
-        // A distroless image may ship no account files at all.
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
-        Err(error) => Err(SandboxUserError::io("inspect", path, error)),
+/// Read an account file (`passwd`, `group`) of at most
+/// [`MAX_ACCOUNT_FILE_BYTES`]. The file is opened once and measured as
+/// opened, so a symlink to something huge (or to a device) is refused
+/// instead of read. A missing file reads as empty: a distroless image may
+/// ship no account files at all.
+pub fn read_account_file(path: &Path) -> Result<String, SandboxUserError> {
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(String::new()),
+        Err(error) => return Err(SandboxUserError::io("open", path, error)),
+    };
+    let meta = file
+        .metadata()
+        .map_err(|e| SandboxUserError::io("inspect", path, e))?;
+    if !meta.is_file() {
+        return Err(SandboxUserError::AccountFileNotRegular {
+            path: path.display().to_string(),
+        });
     }
+    let mut contents = String::new();
+    file.take(MAX_ACCOUNT_FILE_BYTES + 1)
+        .read_to_string(&mut contents)
+        .map_err(|e| SandboxUserError::io("read", path, e))?;
+    if contents.len() as u64 > MAX_ACCOUNT_FILE_BYTES {
+        return Err(SandboxUserError::AccountFileTooLarge {
+            path: path.display().to_string(),
+        });
+    }
+    Ok(contents)
 }
 
 /// Replace an account file through a sibling temporary file, so a crash
 /// mid-write never leaves the image without a `passwd`. A symlinked file is
 /// replaced by a regular one rather than written through.
 fn write_account_file(path: &Path, contents: &str) -> Result<(), SandboxUserError> {
+    replace_file(path, contents, 0o644)
+}
+
+/// Write `contents` to `path` (mode `mode`) through a sibling temporary file
+/// renamed over it, creating missing parents.
+fn replace_file(path: &Path, contents: &str, mode: u32) -> Result<(), SandboxUserError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| SandboxUserError::io("create", parent, e))?;
     }
     let temporary = path.with_extension("temps-new");
     std::fs::write(&temporary, contents)
-        .and_then(|()| std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o644)))
+        .and_then(|()| std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(mode)))
         .and_then(|()| std::fs::rename(&temporary, path))
         .map_err(|e| {
             let _ = std::fs::remove_file(&temporary);
             SandboxUserError::io("write", path, e)
         })
+}
+
+/// Where the guest records how far handing the converter's files back to
+/// root got (see [`normalize_rootfs_owner`]).
+pub const NORMALIZATION_RECORD: &str = "/var/lib/temps-vm-agent/rootfs-owner";
+
+/// How far [`normalize_converter_owner`] got on this rootfs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Normalization {
+    /// Never started: the rootfs has no record.
+    NotStarted,
+    /// Started for the converter `uid:gid` and not known to have finished;
+    /// the next boot runs it again for the same owner.
+    Pending { uid: u32, gid: u32 },
+    /// Finished.
+    Done,
+}
+
+/// Read the record at `path`.
+pub fn read_normalization(path: &Path) -> Result<Normalization, SandboxUserError> {
+    let contents = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Normalization::NotStarted)
+        }
+        Err(error) => return Err(SandboxUserError::io("read", path, error)),
+    };
+    let bad = || SandboxUserError::BadNormalizationRecord {
+        path: path.display().to_string(),
+        contents: contents.chars().take(64).collect(),
+    };
+    let mut words = contents.split_ascii_whitespace();
+    match (words.next(), words.next(), words.next(), words.next()) {
+        (Some("done"), None, None, None) => Ok(Normalization::Done),
+        (Some("pending"), Some(uid), Some(gid), None) => Ok(Normalization::Pending {
+            uid: uid.parse().map_err(|_| bad())?,
+            gid: gid.parse().map_err(|_| bad())?,
+        }),
+        _ => Err(bad()),
+    }
+}
+
+fn write_normalization(path: &Path, state: Normalization) -> Result<(), SandboxUserError> {
+    let contents = match state {
+        Normalization::NotStarted => return Ok(()),
+        Normalization::Pending { uid, gid } => format!("pending {uid} {gid}\n"),
+        Normalization::Done => "done\n".to_string(),
+    };
+    replace_file(path, &contents, 0o600)
+}
+
+/// Hand the converter's files back to root, once per rootfs, resumably.
+///
+/// `exe_owner` is the owner of the agent binary, which the host injected
+/// with the converted files, so it names the converter until the walk
+/// reaches it. Which converter to hand back is therefore recorded at
+/// `record` *before* the walk changes anything, and `done` only after it
+/// returns `Ok`: a walk that fails half-way runs again at the next boot for
+/// the same owner, even though the binary is root's by then. `normalize`
+/// does the walk ([`normalize_converter_owner`] in the guest). Returns the
+/// entries it changed, `None` when nothing needed doing.
+pub fn normalize_rootfs_owner(
+    record: &Path,
+    exe_owner: (u32, u32),
+    normalize: impl FnOnce((u32, u32)) -> Result<u64, SandboxUserError>,
+) -> Result<Option<u64>, SandboxUserError> {
+    let converter = match read_normalization(record)? {
+        Normalization::Done => return Ok(None),
+        Normalization::Pending { uid, gid } => (uid, gid),
+        Normalization::NotStarted if exe_owner.0 == 0 => return Ok(None),
+        Normalization::NotStarted => exe_owner,
+    };
+    write_normalization(
+        record,
+        Normalization::Pending {
+            uid: converter.0,
+            gid: converter.1,
+        },
+    )?;
+    let changed = normalize(converter)?;
+    write_normalization(record, Normalization::Done)?;
+    Ok(Some(changed))
 }
 
 /// Hand back to root every entry of the filesystem at `root` still owned by

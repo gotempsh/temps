@@ -365,35 +365,40 @@ fn prepare_sandbox_user() -> SandboxUserStatus {
     // The host extracts the rootfs unprivileged, so its files carry the
     // host account's uid, which this binary (injected with them) shows. Hand
     // them back to root before anything runs as the sandbox user, who would
-    // otherwise own the system if the two uids match. The walk chowns this
-    // binary too, so a later boot of the same disk skips it.
-    if let Ok(meta) = std::fs::metadata("/proc/self/exe") {
-        use std::os::unix::fs::MetadataExt;
-        if meta.uid() != 0 {
-            let home = Path::new(&user.home).to_path_buf();
-            let work = Path::new(WORK_DIR).to_path_buf();
-            match sandbox_user::normalize_converter_owner(
-                Path::new("/"),
-                (meta.uid(), meta.gid()),
-                &[&home, &work],
-            ) {
-                Ok(changed) => info(
-                    "rootfs_owner_normalized",
-                    &[("from_uid", json!(meta.uid())), ("changed", json!(changed))],
-                ),
-                Err(e) => {
-                    error(
-                        "rootfs_owner_normalize_failed",
-                        &[
-                            ("from_uid", json!(meta.uid())),
-                            ("error", json!(e.to_string())),
-                        ],
-                    );
-                    return SandboxUserStatus::Failed {
-                        reason: e.to_string(),
-                    };
-                }
-            }
+    // otherwise own the system if the two uids match. Which owner to hand
+    // back is recorded before the walk starts and `done` only after it
+    // finishes, so a walk cut short resumes at the next boot.
+    let exe_owner = match std::fs::metadata("/proc/self/exe") {
+        Ok(meta) => {
+            use std::os::unix::fs::MetadataExt;
+            (meta.uid(), meta.gid())
+        }
+        Err(e) => {
+            let reason = format!("inspect /proc/self/exe: {e}");
+            error("rootfs_owner_unknown", &[("error", json!(reason))]);
+            return SandboxUserStatus::Failed { reason };
+        }
+    };
+    let home = Path::new(&user.home).to_path_buf();
+    let work = Path::new(WORK_DIR).to_path_buf();
+    let normalized = sandbox_user::normalize_rootfs_owner(
+        Path::new(sandbox_user::NORMALIZATION_RECORD),
+        exe_owner,
+        |converter| {
+            sandbox_user::normalize_converter_owner(Path::new("/"), converter, &[&home, &work])
+        },
+    );
+    match normalized {
+        Ok(None) => {}
+        Ok(Some(changed)) => info("rootfs_owner_normalized", &[("changed", json!(changed))]),
+        Err(e) => {
+            error(
+                "rootfs_owner_normalize_failed",
+                &[("error", json!(e.to_string()))],
+            );
+            return SandboxUserStatus::Failed {
+                reason: e.to_string(),
+            };
         }
     }
     match sandbox_user::prepare(Path::new("/"), &user, WORK_DIR) {
@@ -1048,8 +1053,10 @@ fn exec(
     }
     // Only read when the uid is neither root nor the sandbox user.
     let passwd = match user {
+        // Bounded like every account file the agent reads; anything it
+        // cannot read gives the `/` home.
         Some(uid) if uid != 0 && ready_sandbox_user().is_none_or(|u| u.uid != uid) => {
-            std::fs::read_to_string("/etc/passwd").unwrap_or_default()
+            sandbox_user::read_account_file(Path::new("/etc/passwd")).unwrap_or_default()
         }
         _ => String::new(),
     };

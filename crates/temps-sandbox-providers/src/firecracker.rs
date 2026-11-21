@@ -1532,17 +1532,29 @@ impl FirecrackerSandboxProvider {
     /// answer next to the VM so default commands run as it. `Err` is the
     /// reason the VM cannot run as its user. A workload VM has no user.
     async fn confirm_sandbox_user(&self, name: &str) -> Result<(), String> {
-        use super::fc_sandbox_user::{interpret, is_sandbox_vm, record, UserCheck};
+        use super::fc_sandbox_user::{
+            boot_requested_user, interpret, is_sandbox_vm, record, UserCheck,
+        };
         let vm_dir = self.config.vm_dir(name);
         if !is_sandbox_vm(name) {
             return record(&vm_dir, None).map_err(|e| e.to_string());
         }
+        let requested = boot_requested_user(&vm_dir)?;
         let response = self
             .rpc(name, &Request::SandboxUser, Duration::from_secs(10))
             .await
             .map_err(|e| e.to_string())?;
         let user = match interpret(response)? {
             UserCheck::Ready(user) => Some(user),
+            // The VM booted with the user on its command line, so an agent
+            // that says it saw none is not a legacy restore: never root.
+            UserCheck::NotRequested if requested => {
+                return Err(
+                    "the VM booted with the sandbox user, but its guest agent reports that \
+                     none was requested (it could not read its kernel command line)"
+                        .to_string(),
+                )
+            }
             check => {
                 tracing::warn!(
                     sandbox = name,
@@ -1677,6 +1689,7 @@ impl FirecrackerSandboxProvider {
         // the empty home back to the sandbox user at boot.
         let sandbox_home = SANDBOX_HOME.trim_start_matches('/');
         for relative in ["root", sandbox_home, "etc/temps", "tmp", "run", "var/tmp"] {
+            Self::require_real_parents(root, relative)?;
             let path = root.join(relative);
             match std::fs::remove_dir_all(&path) {
                 Ok(()) => {}
@@ -1692,6 +1705,38 @@ impl FirecrackerSandboxProvider {
         )?;
         for relative in ["tmp", "run", "var/tmp"] {
             std::fs::set_permissions(root.join(relative), std::fs::Permissions::from_mode(0o1777))?;
+        }
+        Ok(())
+    }
+
+    /// Refuse to scrub `relative` under `root` unless each of its parents is
+    /// a real directory: the tree holds the guest's own entries, and a
+    /// guest symlink at `home` (with a host-absolute target) would make
+    /// `home/temps` name a directory outside the tree. The final component
+    /// is safe as it is (`remove_dir_all` removes a symlink, not its
+    /// target). Only the host writes this staging tree while it is
+    /// scrubbed, so the guest cannot race the check.
+    fn require_real_parents(root: &Path, relative: &str) -> std::io::Result<()> {
+        let mut parent = root.to_path_buf();
+        let components: Vec<&str> = relative.split('/').filter(|c| !c.is_empty()).collect();
+        for component in components.iter().take(components.len().saturating_sub(1)) {
+            parent.push(component);
+            match std::fs::symlink_metadata(&parent) {
+                Ok(meta) if meta.file_type().is_dir() => {}
+                // Missing: `create_dir_all` makes it a real directory.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Ok(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "refusing to scrub '{relative}' from the snapshot: '{}' is not a \
+                             directory (a symlink in the guest's filesystem)",
+                            parent.strip_prefix(root).unwrap_or(&parent).display()
+                        ),
+                    ))
+                }
+                Err(error) => return Err(error),
+            }
         }
         Ok(())
     }
@@ -2485,7 +2530,12 @@ impl SandboxProvider for FirecrackerSandboxProvider {
         env: HashMap<String, String>,
         on_output: Option<OnEventCallback>,
     ) -> Result<SandboxExecResult, AgentError> {
-        let uid = super::fc_sandbox_user::recorded_uid(&self.config.vm_dir(&handle.sandbox_name));
+        let uid = super::fc_sandbox_user::recorded_uid(&self.config.vm_dir(&handle.sandbox_name))
+            .map_err(|reason| AgentError::SandboxExecFailed {
+            run_id: 0,
+            sandbox_id: handle.sandbox_id.clone(),
+            reason,
+        })?;
         self.exec_as_uid(handle, uid, cmd, env, on_output).await
     }
 
@@ -4163,6 +4213,28 @@ mod tests {
         );
     }
 
+    /// A guest symlink in a scrub target's parent (`home` → a host path)
+    /// stops the scrub before it touches anything outside the tree.
+    #[test]
+    fn snapshot_scrub_refuses_a_symlinked_parent() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(outside.path().join("temps")).unwrap();
+        std::fs::write(outside.path().join("temps/keep"), b"host file").unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("home")).unwrap();
+
+        let error = FirecrackerSandboxProvider::scrub_snapshot_tree(root.path()).unwrap_err();
+        assert!(
+            error.to_string().contains("'home' is not a directory"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read(outside.path().join("temps/keep")).unwrap(),
+            b"host file",
+            "nothing outside the tree was removed"
+        );
+    }
+
     fn sandbox_vm_name() -> String {
         format!("{FC_SANDBOX_NAME_PREFIX}42")
     }
@@ -4277,7 +4349,7 @@ mod tests {
         provider.confirm_sandbox_user(&name).await.unwrap();
         assert_eq!(
             crate::fc_sandbox_user::recorded_uid(&provider.config.vm_dir(&name)),
-            Some(1000)
+            Ok(Some(1000))
         );
     }
 
@@ -4295,8 +4367,81 @@ mod tests {
         assert!(reason.contains("uid 1001"), "{reason}");
         assert_eq!(
             crate::fc_sandbox_user::recorded_uid(&provider.config.vm_dir(&name)),
-            None
+            Ok(None)
         );
+    }
+
+    /// A VM that booted with the sandbox user on its command line is never
+    /// let fall back to root because its agent says it saw none.
+    #[tokio::test]
+    async fn a_sandbox_booted_with_the_user_must_have_it_ready() {
+        let name = sandbox_vm_name();
+        let (provider, _handle, _dir) = provider_with_vsock(&name, |stream| {
+            serve_agent_rpc(stream, |_| {
+                r#"{"result":"sandbox_user","state":"not_requested"}"#.to_string()
+            })
+        });
+        let vm_dir = provider.config.vm_dir(&name);
+        std::fs::write(
+            vm_dir.join("vm.json"),
+            serde_json::json!({"boot-source": {
+                "boot_args": format!("console=ttyS0 {}", crate::fc_sandbox_user::sandbox_user().boot_arg())
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        let reason = provider.confirm_sandbox_user(&name).await.unwrap_err();
+        assert!(reason.contains("none was requested"), "{reason}");
+        assert_eq!(crate::fc_sandbox_user::recorded_uid(&vm_dir), Ok(None));
+    }
+
+    /// Without the boot argument (a VM configured before the sandbox user
+    /// existed), "not requested" keeps root, as before.
+    #[tokio::test]
+    async fn a_sandbox_booted_without_the_user_keeps_root_when_none_is_requested() {
+        let name = sandbox_vm_name();
+        let (provider, _handle, _dir) = provider_with_vsock(&name, |stream| {
+            serve_agent_rpc(stream, |_| {
+                r#"{"result":"sandbox_user","state":"not_requested"}"#.to_string()
+            })
+        });
+        let vm_dir = provider.config.vm_dir(&name);
+        std::fs::write(
+            vm_dir.join("vm.json"),
+            serde_json::json!({"boot-source": {"boot_args": "console=ttyS0"}}).to_string(),
+        )
+        .unwrap();
+        provider.confirm_sandbox_user(&name).await.unwrap();
+        assert_eq!(crate::fc_sandbox_user::recorded_uid(&vm_dir), Ok(None));
+    }
+
+    /// A record that cannot be read fails the command instead of running it
+    /// as root.
+    #[tokio::test]
+    async fn an_unreadable_user_record_fails_the_command_instead_of_running_as_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = provider_at(dir.path().to_path_buf());
+        let name = sandbox_vm_name();
+        let vm_dir = provider.config.vm_dir(&name);
+        std::fs::create_dir_all(&vm_dir).unwrap();
+        std::fs::write(
+            vm_dir.join(crate::fc_sandbox_user::SANDBOX_USER_FILE),
+            "{truncated",
+        )
+        .unwrap();
+        // No vsock listener: a command that reached the guest would fail
+        // differently.
+        let error = provider
+            .exec(
+                &provider.handle_for(&name),
+                vec!["id".to_string()],
+                HashMap::new(),
+                None,
+            )
+            .await
+            .err()
+            .expect("the command is refused");
+        assert!(error.to_string().contains("unreadable"), "{error}");
     }
 
     #[tokio::test]
@@ -4311,7 +4456,7 @@ mod tests {
         provider.confirm_sandbox_user(&name).await.unwrap();
         assert_eq!(
             crate::fc_sandbox_user::recorded_uid(&provider.config.vm_dir(&name)),
-            None
+            Ok(None)
         );
     }
 
@@ -4328,7 +4473,7 @@ mod tests {
         provider.confirm_sandbox_user(&name).await.unwrap();
         assert_eq!(
             crate::fc_sandbox_user::recorded_uid(&provider.config.vm_dir(&name)),
-            None
+            Ok(None)
         );
     }
 

@@ -17,6 +17,7 @@
 use std::path::Path;
 
 use temps_agent_core::sandbox_user::{SANDBOX_GID, SANDBOX_HOME, SANDBOX_UID, SANDBOX_USER};
+use temps_vm_agent::sandbox_user::SANDBOX_USER_BOOT_ARG;
 use temps_vm_agent::{Response, SandboxUser, SandboxUserStatus};
 
 use crate::firecracker::FC_SANDBOX_NAME_PREFIX;
@@ -64,6 +65,28 @@ pub(crate) enum UserCheck {
     NotRequested,
 }
 
+/// Whether the VM in `vm_dir` was configured to boot with the sandbox user
+/// (its persisted `vm.json` carries the boot argument). A VM without that
+/// file, or booted without the argument, was not.
+pub(crate) fn boot_requested_user(vm_dir: &Path) -> Result<bool, String> {
+    let path = vm_dir.join("vm.json");
+    let data = match std::fs::read(&path) {
+        Ok(data) => data,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(format!("read '{}': {error}", path.display())),
+    };
+    let config: serde_json::Value = serde_json::from_slice(&data)
+        .map_err(|error| format!("parse '{}': {error}", path.display()))?;
+    let marker = format!("{SANDBOX_USER_BOOT_ARG}=");
+    Ok(config
+        .pointer("/boot-source/boot_args")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|args| {
+            args.split_ascii_whitespace()
+                .any(|token| token.starts_with(&marker))
+        }))
+}
+
 /// Interpret the agent's answer to `Request::SandboxUser`. An error is the
 /// reason the sandbox cannot run as its user, which fails the create.
 pub(crate) fn interpret(response: Response) -> Result<UserCheck, String> {
@@ -86,13 +109,20 @@ pub(crate) fn interpret(response: Response) -> Result<UserCheck, String> {
     }
 }
 
-/// Record (or clear) the user the VM in `vm_dir` runs commands as.
+/// Record (or clear) the user the VM in `vm_dir` runs commands as. The
+/// record is written beside its final name and renamed over it, so a
+/// concurrent exec reads the old record or the new one, never part of one.
 pub(crate) fn record(vm_dir: &Path, user: Option<&SandboxUser>) -> std::io::Result<()> {
     let path = vm_dir.join(SANDBOX_USER_FILE);
     match user {
         Some(user) => {
             let json = serde_json::to_vec(user).map_err(std::io::Error::other)?;
-            std::fs::write(path, json)
+            let staged = vm_dir.join(format!("{SANDBOX_USER_FILE}.new"));
+            std::fs::write(&staged, json)
+                .and_then(|()| std::fs::rename(&staged, &path))
+                .inspect_err(|_| {
+                    let _ = std::fs::remove_file(&staged);
+                })
         }
         None => match std::fs::remove_file(path) {
             Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
@@ -102,12 +132,29 @@ pub(crate) fn record(vm_dir: &Path, user: Option<&SandboxUser>) -> std::io::Resu
 }
 
 /// The uid default commands run as in the VM in `vm_dir`: the recorded
-/// sandbox user, or `None` (root) when none is recorded.
-pub(crate) fn recorded_uid(vm_dir: &Path) -> Option<u32> {
-    let data = std::fs::read(vm_dir.join(SANDBOX_USER_FILE)).ok()?;
+/// sandbox user, or `None` (root) only when no record exists (a workload VM,
+/// or a sandbox whose agent predates the sandbox user). A record that cannot
+/// be read is an error, never a reason to run as root.
+pub(crate) fn recorded_uid(vm_dir: &Path) -> Result<Option<u32>, String> {
+    let path = vm_dir.join(SANDBOX_USER_FILE);
+    let data = match std::fs::read(&path) {
+        Ok(data) => data,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "read the sandbox user '{}': {error}",
+                path.display()
+            ))
+        }
+    };
     serde_json::from_slice::<SandboxUser>(&data)
-        .ok()
-        .map(|user| user.uid)
+        .map(|user| Some(user.uid))
+        .map_err(|error| {
+            format!(
+                "the sandbox user record '{}' is unreadable: {error}",
+                path.display()
+            )
+        })
 }
 
 /// The uid for `exec_as_user(user)`. The guest agent runs commands by uid,
@@ -227,17 +274,54 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(
             recorded_uid(dir.path()),
-            None,
+            Ok(None),
             "nothing recorded runs as root"
         );
         record(dir.path(), Some(&sandbox_user())).unwrap();
-        assert_eq!(recorded_uid(dir.path()), Some(SANDBOX_UID));
+        assert_eq!(recorded_uid(dir.path()), Ok(Some(SANDBOX_UID)));
+        assert!(
+            !dir.path().join(format!("{SANDBOX_USER_FILE}.new")).exists(),
+            "the staged record was renamed into place"
+        );
         record(dir.path(), None).unwrap();
-        assert_eq!(recorded_uid(dir.path()), None);
+        assert_eq!(recorded_uid(dir.path()), Ok(None));
         record(dir.path(), None).unwrap();
+    }
 
+    /// A record that exists but cannot be read never downgrades the
+    /// sandbox's commands to root.
+    #[test]
+    fn an_unreadable_record_is_an_error_not_root() {
+        let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(SANDBOX_USER_FILE), "not json").unwrap();
-        assert_eq!(recorded_uid(dir.path()), None);
+        let error = recorded_uid(dir.path()).unwrap_err();
+        assert!(error.contains("unreadable"), "{error}");
+
+        std::fs::remove_file(dir.path().join(SANDBOX_USER_FILE)).unwrap();
+        std::fs::create_dir(dir.path().join(SANDBOX_USER_FILE)).unwrap();
+        assert!(
+            recorded_uid(dir.path()).is_err(),
+            "a record that cannot be read"
+        );
+    }
+
+    #[test]
+    fn the_persisted_boot_arguments_say_whether_the_user_was_requested() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(boot_requested_user(dir.path()), Ok(false), "no vm.json");
+        let write = |args: &str| {
+            std::fs::write(
+                dir.path().join("vm.json"),
+                serde_json::json!({"boot-source": {"boot_args": args}}).to_string(),
+            )
+            .unwrap()
+        };
+        write("console=ttyS0 init=/sbin/temps-vm-agent");
+        assert_eq!(boot_requested_user(dir.path()), Ok(false));
+        write(&format!("console=ttyS0 {}", sandbox_user().boot_arg()));
+        assert_eq!(boot_requested_user(dir.path()), Ok(true));
+        std::fs::write(dir.path().join("vm.json"), "{").unwrap();
+        assert!(boot_requested_user(dir.path()).is_err());
     }
 
     #[test]
