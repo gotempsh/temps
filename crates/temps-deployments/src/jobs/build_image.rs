@@ -612,6 +612,10 @@ impl BuiltImageConfig {
     }
 }
 
+/// Build job output naming the preset Temps generated the Dockerfile from.
+/// Absent when the repository brought its own Dockerfile.
+pub const DOCKERFILE_PRESET_OUTPUT: &str = "dockerfile_preset";
+
 /// Typed output from BuildImageJob
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageOutput {
@@ -646,6 +650,11 @@ pub struct ImageOutput {
     /// that predates the field.
     #[serde(default)]
     pub image_config: Option<BuiltImageConfig>,
+    /// The preset Temps generated the Dockerfile from; `None` when the
+    /// repository brought its own. The deploy job names it when the image
+    /// runs as root, so the advice points at what actually built the image.
+    #[serde(default)]
+    pub dockerfile_preset: Option<String>,
 }
 
 /// What [`BuildImageJob::build_on_platform_workers`] produced.
@@ -741,6 +750,9 @@ impl ImageOutput {
             builder_node_ids_by_platform,
             image_ids_by_platform,
             image_config,
+            dockerfile_preset: context
+                .get_output(build_job_id, DOCKERFILE_PRESET_OUTPUT)?
+                .flatten(),
         })
     }
 }
@@ -1050,6 +1062,8 @@ struct GeneratedDockerfile {
     build_root: PathBuf,
     /// Whether Temps wrote the Dockerfile (false: the repository's own).
     generated: bool,
+    /// The preset it was generated from, when `generated`.
+    preset_slug: Option<String>,
 }
 
 /// A worker build's build arguments, split by whether their values may leave
@@ -1554,6 +1568,7 @@ impl BuildImageJob {
                 build_args: HashMap::new(),
                 build_root: build_context_dir.clone(),
                 generated: false,
+                preset_slug: None,
             });
         }
 
@@ -1812,6 +1827,7 @@ impl BuildImageJob {
             build_args: dockerfile_with_args.build_args,
             build_root: preset_root,
             generated: true,
+            preset_slug: Some(preset_slug.to_string()),
         })
     }
 
@@ -2378,6 +2394,7 @@ impl BuildImageJob {
                 builder_node_ids_by_platform: built.builder_node_ids_by_platform,
                 image_ids_by_platform: built.image_ids_by_platform,
                 image_config: None,
+                dockerfile_preset: dockerfile.preset_slug.clone(),
             });
         }
 
@@ -2585,6 +2602,7 @@ impl BuildImageJob {
             builder_node_ids_by_platform: HashMap::new(),
             image_ids_by_platform: HashMap::new(),
             image_config: None,
+            dockerfile_preset: dockerfile.preset_slug.clone(),
         })
     }
 
@@ -3141,6 +3159,9 @@ impl BuildImageJob {
         context.set_output(&self.job_id, "builder_node_id", self.remote_builder_node_id)?;
         if let Some(config) = &image_output.image_config {
             context.set_output(&self.job_id, "image_config", config)?;
+        }
+        if let Some(preset) = &image_output.dockerfile_preset {
+            context.set_output(&self.job_id, DOCKERFILE_PRESET_OUTPUT, preset)?;
         }
         // Only a mixed-architecture worker build has more than one builder.
         if !image_output.builder_node_ids_by_platform.is_empty() {
@@ -4397,6 +4418,7 @@ mod tests {
             user: Some("app".to_string()),
             env: vec!["SYNTHETIC_SETTING=1".to_string()],
             entrypoint: vec!["/app/server".to_string()],
+            ..Default::default()
         });
         let worker = Arc::new(worker);
         let control_plane = Arc::new(FakeImageStore::default());
@@ -4527,6 +4549,7 @@ mod tests {
             builder_node_ids_by_platform: HashMap::new(),
             image_ids_by_platform: HashMap::new(),
             image_config: None,
+            dockerfile_preset: None,
         };
         assert_eq!(output.expected_image_id(), Some("sha256:primary"));
 

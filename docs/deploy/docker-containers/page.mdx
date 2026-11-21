@@ -489,6 +489,29 @@ Temps applies security best practices to every container automatically:
 - **Init process** — proper signal handling and zombie process reaping via `--init`
 - **Log rotation** — container logs are capped at 150 MB (3 files x 50 MB) to prevent disk exhaustion
 
+### Run as a non-root user {{ anchor: true, id: 'non-root-user' }}
+
+A container runs as the `USER` its image sets. An image that sets none runs as root (uid 0). Dropped capabilities and `no-new-privileges` limit what root can do, but a non-root user is the stronger default: a compromised process cannot write the image's system files or keep root if a capability is ever granted back.
+
+Temps checks each deployment's image once, before its containers start, by resolving its `USER` against the image's own `/etc/passwd`. When the answer is uid 0, the deployment log shows a warning and the deployment page shows a **Runs as root** badge. The deployment still goes ahead.
+
+To fix it, create a user with a fixed uid in your Dockerfile, give it only what the app writes, and switch to it last:
+
+```dockerfile
+FROM python:3.12-slim
+WORKDIR /app
+COPY . .
+RUN pip install --no-cache-dir -r requirements.txt
+# Debian/Ubuntu images; on Alpine use `adduser -S -u 10001 app`
+RUN useradd -r -u 10001 app && chown -R app /app
+USER app
+CMD ["python", "main.py"]
+```
+
+- Listen on a port above 1024: a non-root process cannot bind lower ports.
+- `USER 10001:10001` works too and needs no entry in `/etc/passwd`.
+- A named `USER` the image's `/etc/passwd` does not list cannot be checked, so it is not reported as root; Docker refuses to start such an image anyway. A numeric `USER` needs no entry.
+
 ---
 
 ## Zero-downtime deployments {{ anchor: true, id: 'zero-downtime' }}

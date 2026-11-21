@@ -512,6 +512,8 @@ impl DeploymentService {
             cancelled_reason: db_deployment.cancelled_reason.clone(),
             deployment_config: db_deployment.deployment_config,
             metadata: db_deployment.metadata,
+            runs_as_root: db_deployment.runs_as_root,
+            image_user: db_deployment.image_user,
         }
     }
 
