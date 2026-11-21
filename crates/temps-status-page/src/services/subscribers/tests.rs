@@ -1277,6 +1277,96 @@ async fn two_dispatchers_on_one_database_mail_each_subscriber_once() {
 }
 
 #[tokio::test]
+async fn a_send_that_fails_while_another_console_runs_is_still_retried() {
+    let Some(fx) = fixture().await else {
+        return;
+    };
+    enable(&fx).await;
+    let emails: Vec<String> = (0..3).map(|i| format!("r{i}@example.test")).collect();
+    for email in &emails {
+        confirmed_subscriber(&fx, email).await;
+    }
+    post_update(&fx, PUBLIC_UPDATE, true).await;
+    let other = Arc::new(StatusPageSubscriberService::new(
+        fx.db.clone(),
+        fx.cache.clone(),
+        Arc::new(EncryptionService::new_from_password("subscriber-tests")),
+        fx.mailer.clone(),
+        fx.config.clone(),
+    ));
+    // While this console is mailing the first subscriber, a second console
+    // sharing the database runs a whole tick; then the first send fails.
+    let mailer = fx.mailer.clone();
+    let during_send = other.clone();
+    *fx.mailer.before_send.lock().expect("hook") = hook(async move {
+        during_send
+            .dispatch_tick(&mut DispatcherState::default(), chrono::Utc::now())
+            .await
+            .expect("the other console's tick");
+        mailer
+            .failing_sends
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+    });
+    let mut state = DispatcherState::default();
+    let report = tick(&fx, &mut state).await;
+    assert_eq!(report.failures, 1, "{report:?}");
+    assert!(
+        fx.mailer.sent().is_empty(),
+        "the other console waits while a send is under way"
+    );
+
+    let report = tick(&fx, &mut state).await;
+    assert_eq!(report.notices_sent, emails.len(), "{report:?}");
+    assert_eq!(
+        notice_recipients(&fx, PUBLIC_UPDATE),
+        emails,
+        "the failed subscriber is retried and nobody is mailed twice"
+    );
+    let notice = status_page_notices::Entity::find()
+        .one(fx.db.as_ref())
+        .await
+        .expect("notice")
+        .expect("queued");
+    assert_eq!(notice.sending_until, None, "the lease is released");
+    assert_eq!(notice.sent_count, emails.len() as i32);
+}
+
+#[tokio::test]
+async fn an_update_edited_while_its_notice_is_sending_goes_out_as_edited() {
+    let Some(fx) = fixture().await else {
+        return;
+    };
+    enable(&fx).await;
+    for email in ["a@example.test", "b@example.test"] {
+        confirmed_subscriber(&fx, email).await;
+    }
+    post_update(&fx, PUBLIC_UPDATE, true).await;
+    const EDITED: &str = "We are investigating elevated errors on one region.";
+    // While the first mail is going out, the admin rewords the update.
+    let (db, cache, page_id) = (fx.db.clone(), fx.cache.clone(), fx.page_id);
+    *fx.mailer.before_send.lock().expect("hook") = hook(async move {
+        status_incident_updates::Entity::update_many()
+            .col_expr(
+                status_incident_updates::Column::Message,
+                sea_orm::sea_query::Expr::value(EDITED),
+            )
+            .filter(status_incident_updates::Column::Message.eq(PUBLIC_UPDATE))
+            .exec(db.as_ref())
+            .await
+            .expect("edit the update");
+        cache.refresh_page(page_id).await.expect("refresh");
+    });
+    let report = tick(&fx, &mut DispatcherState::default()).await;
+    assert_eq!(report.notices_sent, 2, "{report:?}");
+    assert_eq!(notice_recipients(&fx, PUBLIC_UPDATE), ["a@example.test"]);
+    assert_eq!(
+        notice_recipients(&fx, EDITED),
+        ["b@example.test"],
+        "a mail sent after the edit carries the edited text"
+    );
+}
+
+#[tokio::test]
 async fn a_confirmation_that_failed_to_send_is_sent_on_the_next_tick() {
     let Some(fx) = fixture().await else {
         return;

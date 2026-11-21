@@ -29,6 +29,9 @@ pub struct Model {
     /// Highest subscriber id this notice has been sent to.
     pub cursor_subscriber_id: i32,
     pub sent_count: i32,
+    /// Set while a console is mailing the recipient at the cursor; no other
+    /// console moves the cursor until it is cleared or has passed.
+    pub sending_until: Option<DBDateTime>,
     pub created_at: DBDateTime,
     pub completed_at: Option<DBDateTime>,
 }

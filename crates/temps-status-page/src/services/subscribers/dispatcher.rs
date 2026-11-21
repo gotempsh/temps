@@ -27,11 +27,16 @@
 //! Delivery is at most once per recipient and notice, across every console
 //! sharing the database: before the provider is called, the recipient is
 //! claimed by moving the notice's cursor past it in one conditional update,
-//! which also checks the recipient is still confirmed. A second console that
-//! read the same cursor loses the claim and sends nothing. A send that fails
-//! hands its claim back, so the recipient is retried; a crash between the
-//! claim and the send loses at most that one mail. Right before each send the
-//! page is checked again as it is served now, so mail never outruns the page.
+//! which also checks the recipient is still confirmed and takes the notice's
+//! send lease (`sending_until`, [`SEND_LEASE_SECS`]). A second console that
+//! read the same cursor, or finds the lease taken, loses the claim and sends
+//! nothing. The lease is released when the send ends; a send that fails hands
+//! its claim back with it, and since nobody could move the cursor meanwhile,
+//! the recipient is always retried. A crash between the claim and the send
+//! loses at most that one mail and holds the notice until the lease expires.
+//! Right before each send the page is checked again as it is served now, and
+//! the mail is built from the notice as the page shows it then, so mail never
+//! outruns the page and an edited update is sent as edited.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -49,7 +54,7 @@ use tracing::{debug, info, warn};
 
 use super::error::SubscriptionError;
 use super::mailer::{OutgoingMail, Sent};
-use super::notices::{confirmation_message, with_footer};
+use super::notices::{confirmation_message, with_footer, PageNotice};
 use super::service::{PageLinks, StatusPageSubscriberService, CONFIRMATION_VALID_HOURS};
 use super::tokens::{random_hex, token_hash, unsubscribe_token};
 use crate::services::public_pages::PublishedSnapshot;
@@ -58,6 +63,10 @@ use crate::services::public_pages::PublishedSnapshot;
 pub const TICK: Duration = Duration::from_secs(20);
 /// Most mails sent per tick, all pages together.
 pub const SENDS_PER_TICK: usize = 200;
+/// How long one console may hold a notice's send lease for one mail. The
+/// email stack bounds a send well below this (provider timeouts and one retry
+/// inside about 45 seconds), so a live send always ends inside its lease.
+const SEND_LEASE_SECS: i32 = 300;
 /// Most recipients fetched per notice per tick.
 const RECIPIENT_BATCH: u64 = 50;
 /// Most open notices of sendable pages looked at per tick.
@@ -403,18 +412,22 @@ impl StatusPageSubscriberService {
         Ok(cancelled)
     }
 
-    /// Whether `notice_key` is still announced by the page as it is served
-    /// right now, not as it was when the tick began.
-    fn still_announced(&self, page: &LivePage, notice_key: &str) -> bool {
+    /// The notice `notice_key` as the page announces it right now, not as it
+    /// was when the tick began or when the notice was queued: `None` once the
+    /// page no longer announces it.
+    fn current_notice(&self, page: &LivePage, notice_key: &str) -> Option<PageNotice> {
         self.cache
             .get(&page.snapshot.slug)
-            .filter(|current| current.status_page_id == page.snapshot.status_page_id)
-            .is_some_and(|current| {
-                current.accepts_subscriptions()
-                    && current
-                        .notices
-                        .iter()
-                        .any(|notice| notice.key == notice_key)
+            .filter(|current| {
+                current.status_page_id == page.snapshot.status_page_id
+                    && current.accepts_subscriptions()
+            })
+            .and_then(|current| {
+                current
+                    .notices
+                    .iter()
+                    .find(|notice| notice.key == notice_key)
+                    .cloned()
             })
     }
 
@@ -545,7 +558,10 @@ impl StatusPageSubscriberService {
     }
 
     /// Move a notice's cursor from `from` to `recipient`, if it is still at
-    /// `from`, and say whether the recipient is still confirmed.
+    /// `from` and no console holds the notice's send lease, and say whether
+    /// the recipient is still confirmed. A confirmed recipient takes the
+    /// lease (on the database clock, shared by every console) until
+    /// [`Self::release_recipient`] or [`Self::hand_back_recipient`].
     async fn claim_recipient(
         &self,
         notice_id: i32,
@@ -556,11 +572,19 @@ impl StatusPageSubscriberService {
             .db
             .query_one(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
-                "UPDATE status_page_notices SET cursor_subscriber_id = $3 \
+                "UPDATE status_page_notices SET cursor_subscriber_id = $3, \
+                     sending_until = CASE WHEN EXISTS (SELECT 1 FROM status_page_subscribers \
+                         WHERE id = $3 AND state = 'confirmed') \
+                         THEN now() + $4 * INTERVAL '1 second' END \
                  WHERE id = $1 AND cursor_subscriber_id = $2 AND completed_at IS NULL \
-                 RETURNING EXISTS (SELECT 1 FROM status_page_subscribers \
-                     WHERE id = $3 AND state = 'confirmed') AS deliver",
-                [notice_id.into(), from.into(), recipient.into()],
+                     AND (sending_until IS NULL OR sending_until < now()) \
+                 RETURNING sending_until IS NOT NULL AS deliver",
+                [
+                    notice_id.into(),
+                    from.into(),
+                    recipient.into(),
+                    SEND_LEASE_SECS.into(),
+                ],
             ))
             .await?;
         Ok(match row {
@@ -618,7 +642,7 @@ impl StatusPageSubscriberService {
             let mut cursor = notice.cursor_subscriber_id;
             let mut stalled = false;
             for recipient in recipients {
-                if !self.still_announced(page, &notice.notice_key) {
+                let Some(current) = self.current_notice(page, &notice.notice_key) else {
                     self.complete_notice(notice.id, now).await?;
                     report.notices_cancelled += 1;
                     info!(
@@ -628,7 +652,7 @@ impl StatusPageSubscriberService {
                     );
                     stalled = true;
                     break;
-                }
+                };
                 match self
                     .claim_recipient(notice.id, cursor, recipient.id)
                     .await?
@@ -648,8 +672,8 @@ impl StatusPageSubscriberService {
                     &recipient.unsubscribe_nonce,
                 ));
                 let (text, html) = with_footer(
-                    &notice.body_text,
-                    &notice.body_html,
+                    &current.body_text,
+                    &current.body_html,
                     &page.snapshot.title,
                     &links.page(),
                     &unsubscribe,
@@ -662,7 +686,7 @@ impl StatusPageSubscriberService {
                         from: sender.clone(),
                         from_name: page.snapshot.title.clone(),
                         to: recipient.email.clone(),
-                        subject: notice.subject.clone(),
+                        subject: current.subject,
                         text,
                         html,
                     })
@@ -672,18 +696,14 @@ impl StatusPageSubscriberService {
                     Ok(Sent::Delivered) => {
                         state.failures.remove(&key);
                         report.notices_sent += 1;
-                        status_page_notices::Entity::update_many()
-                            .col_expr(
-                                status_page_notices::Column::SentCount,
-                                Expr::col(status_page_notices::Column::SentCount).add(1),
-                            )
-                            .filter(status_page_notices::Column::Id.eq(notice.id))
-                            .exec(self.db.as_ref())
+                        self.release_recipient(notice.id, recipient.id, true)
                             .await?;
                     }
                     Ok(Sent::Suppressed) => {
                         state.failures.remove(&key);
                         report.suppressed += 1;
+                        self.release_recipient(notice.id, recipient.id, false)
+                            .await?;
                     }
                     Err(error) => {
                         report.failures += 1;
@@ -701,20 +721,12 @@ impl StatusPageSubscriberService {
                         );
                         if give_up {
                             state.failures.remove(&key);
+                            self.release_recipient(notice.id, recipient.id, false)
+                                .await?;
                         } else {
                             // Hand the claim back and retry this recipient
                             // next tick, before anyone after it.
-                            status_page_notices::Entity::update_many()
-                                .col_expr(
-                                    status_page_notices::Column::CursorSubscriberId,
-                                    Expr::value(cursor),
-                                )
-                                .filter(status_page_notices::Column::Id.eq(notice.id))
-                                .filter(
-                                    status_page_notices::Column::CursorSubscriberId
-                                        .eq(recipient.id),
-                                )
-                                .exec(self.db.as_ref())
+                            self.hand_back_recipient(notice.id, cursor, recipient.id)
                                 .await?;
                             stalled = true;
                             break;
@@ -736,6 +748,65 @@ impl StatusPageSubscriberService {
                     "status page notice delivered to every subscriber"
                 );
             }
+        }
+        Ok(())
+    }
+
+    /// End the send to `recipient`: count it when it was delivered and
+    /// release the lease, unless another console took the notice over after
+    /// the lease expired.
+    async fn release_recipient(
+        &self,
+        notice_id: i32,
+        recipient: i32,
+        delivered: bool,
+    ) -> Result<(), SubscriptionError> {
+        self.db
+            .execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "UPDATE status_page_notices SET sent_count = sent_count + $3, \
+                     sending_until = CASE WHEN cursor_subscriber_id = $2 THEN NULL \
+                         ELSE sending_until END \
+                 WHERE id = $1",
+                [
+                    notice_id.into(),
+                    recipient.into(),
+                    i32::from(delivered).into(),
+                ],
+            ))
+            .await?;
+        Ok(())
+    }
+
+    /// Give `recipient` back after a failed send: the cursor returns to
+    /// `previous` and the lease is released, so the recipient is retried
+    /// before anyone after it. While the lease is held nobody else moves the
+    /// cursor, so this only misses after the lease expired.
+    async fn hand_back_recipient(
+        &self,
+        notice_id: i32,
+        previous: i32,
+        recipient: i32,
+    ) -> Result<(), SubscriptionError> {
+        let handed_back = status_page_notices::Entity::update_many()
+            .col_expr(
+                status_page_notices::Column::CursorSubscriberId,
+                Expr::value(previous),
+            )
+            .col_expr(
+                status_page_notices::Column::SendingUntil,
+                Expr::value(Option::<UtcDateTime>::None),
+            )
+            .filter(status_page_notices::Column::Id.eq(notice_id))
+            .filter(status_page_notices::Column::CursorSubscriberId.eq(recipient))
+            .exec(self.db.as_ref())
+            .await?;
+        if handed_back.rows_affected == 0 {
+            warn!(
+                notice_id,
+                subscriber_id = recipient,
+                "a failed status page notice send outlived its lease and is not retried"
+            );
         }
         Ok(())
     }
