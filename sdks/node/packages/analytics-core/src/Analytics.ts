@@ -18,10 +18,17 @@ import {
   notFoundEventData,
   setupLinkTracking,
 } from "./AutoTracking";
-import { enableCookielessIdentity, isCookielessIdentity, onCookielessIdentity } from "./identity";
+import {
+  enableCookielessIdentity,
+  getStoredVisitorId,
+  isCookielessIdentity,
+  onCookielessIdentity,
+  onIdentityReset,
+} from "./identity";
 import { exposureEventData, FeatureFlags } from "./FeatureFlags";
 import { Surveys, type Survey } from "./Surveys";
 import { renderSurveyWidget } from "./SurveyWidget";
+import { identifyVisitor, resetVisitor } from "./Identify";
 
 interface InternalCleanup {
   (): void;
@@ -91,8 +98,12 @@ export function createAnalytics(options: AnalyticsOptions = {}): AnalyticsApi {
     );
   };
 
-  const trackNotFound: AnalyticsApi["trackNotFound"] = (data = {}) =>
-    trackEvent(NOT_FOUND_EVENT, notFoundEventData(data));
+  // Checks `enabled` before reading the page, so a call while rendering on
+  // the server does nothing, like the other tracking methods.
+  const trackNotFound: AnalyticsApi["trackNotFound"] = async (data = {}) => {
+    if (!enabled) return;
+    await trackEvent(NOT_FOUND_EVENT, notFoundEventData(data));
+  };
 
   // Created before the first page view so that page view is checked too.
   const notFoundWatcher =
@@ -101,9 +112,13 @@ export function createAnalytics(options: AnalyticsOptions = {}): AnalyticsApi {
       : null;
   if (notFoundWatcher) cleanups.push(() => notFoundWatcher.cancel());
 
+  // The last page view in flight: identify waits for it, because a first
+  // visit's visitor only exists once its first event has been recorded.
+  let pendingPageview: Promise<void> = Promise.resolve();
+
   const trackPageview: AnalyticsApi["trackPageview"] = () => {
     if (!enabled) return;
-    void sendAnalytics(
+    pendingPageview = sendAnalytics(
       "event",
       {
         event_name: "page_view",
@@ -189,8 +204,16 @@ export function createAnalytics(options: AnalyticsOptions = {}): AnalyticsApi {
     await sendEvent(eventName, data);
   };
 
-  const identify: AnalyticsApi["identify"] = async () => {
-    // Placeholder for SDK parity; implement when identity endpoint is available.
+  const identify: AnalyticsApi["identify"] = async (userId, traits) => {
+    if (!enabled) {
+      return { applied: false, outcome: "disabled", message: "Analytics is disabled on this page." };
+    }
+    return identifyVisitor({ basePath, ingestKey, userId, traits, ready: pendingPageview });
+  };
+
+  const reset: AnalyticsApi["reset"] = async () => {
+    if (!enabled) return;
+    await resetVisitor({ basePath, ingestKey });
   };
 
   if (enabled) {
@@ -276,6 +299,14 @@ export function createAnalytics(options: AnalyticsOptions = {}): AnalyticsApi {
       runtimeRecorder = null;
     })
   );
+  // `reset()` (from any instance) gives the page a new visitor: the replay
+  // in progress ends, and a new one starts once the server confirmed it.
+  cleanups.push(
+    onIdentityReset((phase) => {
+      if (phase === "started") runtimeRecorder?.endForReset();
+      else runtimeRecorder?.resumeAfterReset();
+    })
+  );
 
   return {
     get enabled(): boolean {
@@ -288,6 +319,8 @@ export function createAnalytics(options: AnalyticsOptions = {}): AnalyticsApi {
     trackPageview,
     trackNotFound,
     identify,
+    reset,
+    getVisitorId: getStoredVisitorId,
     enableSessionRecording(): void {
       if (!enabled || !recordingAllowed()) return;
       if (runtimeRecorder) {

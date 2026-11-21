@@ -175,6 +175,8 @@ export class SessionRecorder {
   private paused: boolean = false;
   private lastActivityAt: number = Date.now();
   private droppedEvents: number = 0;
+  /** Set by `endForReset()` when it stopped a recording. */
+  private resumeAfterResetPending = false;
   /**
    * Sampling verdict for this recorder, decided once. Re-rolling per call (the
    * previous behaviour) let a recorded session flip itself off on any later
@@ -556,10 +558,19 @@ export class SessionRecorder {
     }
   }
 
-  /** Forget the server session and any client state pointing at it. */
+  /**
+   * Forget the server session and any client state pointing at it, including
+   * events not delivered yet: they belong to that session, and a later one
+   * must never send them under its own id (another visitor's replay after a
+   * `reset()`). The final upload `stopRecording` starts has already built its
+   * payload with the old id, so it still reaches the old replay.
+   */
   private clearSession(): void {
     this.sessionInitialized = false;
     this.sessionId = "";
+    this.pending = [];
+    this.inflight = null;
+    this.sendRetryCount = 0;
     rememberRecordingSessionId(null);
   }
 
@@ -735,6 +746,27 @@ export class SessionRecorder {
     this.pending = [];
     this.inflight = null;
     this.destroy();
+  }
+
+  /**
+   * `reset()` started (a sign-out): end the current replay, sending what it
+   * has to that replay, and remember whether recording was on so
+   * `resumeAfterReset()` can start a new one.
+   */
+  public endForReset(): void {
+    if (this.enabled) this.resumeAfterResetPending = true;
+    this.stop();
+  }
+
+  /**
+   * The server confirmed the reset: start a new session if `endForReset()`
+   * stopped a recording. Until then nothing is recorded, so activity after a
+   * sign-out never joins the previous visitor's replay.
+   */
+  public resumeAfterReset(): void {
+    if (!this.resumeAfterResetPending) return;
+    this.resumeAfterResetPending = false;
+    this.start();
   }
 
   public getSessionId(): string | null {

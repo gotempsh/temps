@@ -50,7 +50,7 @@
     "temps-analytics-events": {
       "lazy_error_variants": 2,
       "anyhow_in_library": 2,
-      "functions_over_300_lines": 2
+      "functions_over_300_lines": 1
     },
     "temps-analytics-funnels": {
       "handler_db_access": 2

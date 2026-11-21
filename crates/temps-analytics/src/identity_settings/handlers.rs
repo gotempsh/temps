@@ -53,6 +53,11 @@ pub fn routes() -> Router<Arc<AnalyticsIdentityState>> {
 impl From<AnalyticsIdentityError> for Problem {
     fn from(error: AnalyticsIdentityError) -> Self {
         match &error {
+            AnalyticsIdentityError::Validation { .. } => {
+                problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_title("Invalid Identity Settings")
+                    .with_detail(error.to_string())
+            }
             AnalyticsIdentityError::ProjectNotFound { .. } => {
                 problemdetails::new(StatusCode::NOT_FOUND)
                     .with_title("Project Not Found")
@@ -96,6 +101,36 @@ impl AuditOperation for IdentityModeChangedAudit {
     }
 }
 
+/// Whether the browser may identify visitors (ADR 109 D4). Recorded
+/// separately from a mode change so either can be found in the log.
+#[derive(Serialize)]
+struct BrowserIdentifyChangedAudit {
+    project_id: i32,
+    previous_accept_browser_identify: bool,
+    accept_browser_identify: bool,
+    user_id: Option<i32>,
+    ip_address: String,
+    user_agent: String,
+}
+
+impl AuditOperation for BrowserIdentifyChangedAudit {
+    fn operation_type(&self) -> String {
+        "ANALYTICS_BROWSER_IDENTIFY_UPDATED".to_string()
+    }
+    fn user_id(&self) -> Option<i32> {
+        self.user_id
+    }
+    fn ip_address(&self) -> Option<String> {
+        Some(self.ip_address.clone())
+    }
+    fn user_agent(&self) -> &str {
+        &self.user_agent
+    }
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
+    }
+}
+
 /// How the project identifies visitors: stored ids or cookieless
 #[utoipa::path(
     get,
@@ -122,11 +157,15 @@ async fn get_analytics_identity_settings(
     Ok(Json(state.service.get(project_id).await?))
 }
 
-/// Switch between stored visitor ids and cookieless tracking
+/// Change how the project identifies visitors
 ///
-/// `cookieless` stores nothing on the visitor's device: the proxy stops
-/// setting analytics cookies and visitors are counted by a hash that changes
-/// every day. Visitors already counted keep their history.
+/// `mode`: `cookieless` stores nothing on the visitor's device: the proxy
+/// stops setting analytics cookies and visitors are counted by a hash that
+/// changes every day. Visitors already counted keep their history.
+///
+/// `accept_browser_identify`: `false` ignores `identify()` from the browser,
+/// so only the app's backend (a deployment token) can attach a user id.
+/// Omitted fields keep their value.
 #[utoipa::path(
     put,
     path = "/projects/{project_id}/analytics/identity",
@@ -135,7 +174,7 @@ async fn get_analytics_identity_settings(
     request_body = UpdateAnalyticsIdentitySettings,
     responses(
         (status = 200, description = "Identity settings updated", body = AnalyticsIdentitySettings),
-        (status = 400, description = "Unknown mode"),
+        (status = 400, description = "Unknown mode, or nothing to change"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Project not found"),
@@ -154,12 +193,29 @@ async fn update_analytics_identity_settings(
     deny_deployment_token!(auth);
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
-    let change = state.service.set(project_id, request.mode).await?;
-    if change.previous != change.settings.mode {
+    let change = state.service.set(project_id, &request).await?;
+    if change.previous_mode != change.settings.mode {
         let audit = IdentityModeChangedAudit {
             project_id,
-            previous_mode: change.previous,
+            previous_mode: change.previous_mode,
             mode: change.settings.mode,
+            user_id: auth.user_id_opt(),
+            ip_address: metadata.ip_address.clone(),
+            user_agent: metadata.user_agent.clone(),
+        };
+        if let Err(error) = state.audit.create_audit_log(&audit).await {
+            tracing::error!(
+                project_id,
+                error = %error,
+                "Failed to audit analytics identity mode change"
+            );
+        }
+    }
+    if change.previous_accept_browser_identify != change.settings.accept_browser_identify {
+        let audit = BrowserIdentifyChangedAudit {
+            project_id,
+            previous_accept_browser_identify: change.previous_accept_browser_identify,
+            accept_browser_identify: change.settings.accept_browser_identify,
             user_id: auth.user_id_opt(),
             ip_address: metadata.ip_address,
             user_agent: metadata.user_agent,
@@ -168,7 +224,7 @@ async fn update_analytics_identity_settings(
             tracing::error!(
                 project_id,
                 error = %error,
-                "Failed to audit analytics identity mode change"
+                "Failed to audit browser identify setting change"
             );
         }
     }
@@ -192,16 +248,52 @@ mod tests {
             source: sea_orm::DbErr::Custom("down".into()),
         });
         assert_eq!(db.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+
+        let invalid = Problem::from(AnalyticsIdentityError::Validation {
+            project_id: 4,
+            message: "nothing to change".into(),
+        });
+        assert_eq!(invalid.status_code, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn an_update_may_name_either_setting_alone() {
+        let only_browser: UpdateAnalyticsIdentitySettings =
+            serde_json::from_str(r#"{"accept_browser_identify":false}"#).expect("parse");
+        assert!(only_browser.mode.is_none());
+        assert_eq!(only_browser.accept_browser_identify, Some(false));
+
+        let only_mode: UpdateAnalyticsIdentitySettings =
+            serde_json::from_str(r#"{"mode":"cookieless"}"#).expect("parse");
+        assert_eq!(only_mode.mode, Some(AnalyticsIdentityMode::Cookieless));
+        assert!(only_mode.accept_browser_identify.is_none());
+    }
+
+    #[test]
+    fn the_browser_identify_audit_records_both_values() {
+        let audit = BrowserIdentifyChangedAudit {
+            project_id: 3,
+            previous_accept_browser_identify: true,
+            accept_browser_identify: false,
+            user_id: Some(1),
+            ip_address: "127.0.0.1".into(),
+            user_agent: "test".into(),
+        };
+        assert_eq!(audit.operation_type(), "ANALYTICS_BROWSER_IDENTIFY_UPDATED");
+        let json = AuditOperation::serialize(&audit).expect("serialize");
+        assert!(json.contains("\"accept_browser_identify\":false"), "{json}");
     }
 
     #[test]
     fn cookieless_settings_name_the_sdk_option_and_the_limits() {
         let now = chrono::Utc::now();
-        let cookieless = AnalyticsIdentitySettings::new(1, AnalyticsIdentityMode::Cookieless, now);
+        let cookieless =
+            AnalyticsIdentitySettings::new(1, AnalyticsIdentityMode::Cookieless, true, now);
         assert_eq!(cookieless.sdk_option.as_deref(), Some("cookieless: true"));
         assert_eq!(cookieless.limitations.len(), COOKIELESS_LIMITATIONS.len());
 
-        let persistent = AnalyticsIdentitySettings::new(1, AnalyticsIdentityMode::Persistent, now);
+        let persistent =
+            AnalyticsIdentitySettings::new(1, AnalyticsIdentityMode::Persistent, true, now);
         assert!(persistent.sdk_option.is_none());
         assert!(persistent.limitations.is_empty());
     }

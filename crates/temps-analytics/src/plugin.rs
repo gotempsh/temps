@@ -104,6 +104,13 @@ impl TempsPlugin for AnalyticsPlugin {
                 ),
             ));
             context.register_service(cookieless);
+            // ADR 109 D4: identify, from the browser (ingest) and the backend.
+            context.register_service(Arc::new(
+                crate::visitor_identity::VisitorIdentityService::new(
+                    db.clone(),
+                    cookie_crypto.clone(),
+                ),
+            ));
 
             tracing::debug!("Analytics plugin services registered successfully");
             Ok(())
@@ -127,6 +134,8 @@ impl TempsPlugin for AnalyticsPlugin {
                 300,
                 std::time::Duration::from_secs(60),
             )),
+            visitor_identity: context
+                .require_service::<crate::visitor_identity::VisitorIdentityService>(),
         });
 
         // ADR-040 ingest-key admin CRUD. Its own state so the key service and

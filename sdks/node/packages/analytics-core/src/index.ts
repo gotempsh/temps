@@ -25,7 +25,23 @@ export {
   type LinkLike,
   type ClassifyLinkOptions,
 } from "./AutoTracking";
-export { enableCookielessIdentity, isCookielessIdentity, onCookielessIdentity } from "./identity";
+export {
+  enableCookielessIdentity,
+  isCookielessIdentity,
+  onCookielessIdentity,
+  onIdentityReset,
+  type IdentityResetPhase,
+  clearStoredIdentity,
+  getStoredVisitorId,
+} from "./identity";
+export {
+  identifyVisitor,
+  resetVisitor,
+  ResetFailedError,
+  IDENTIFY_ENDPOINT,
+  RESET_ENDPOINT,
+  type IdentifyVisitorOptions,
+} from "./Identify";
 export { createAnalytics } from "./Analytics";
 export {
   FeatureFlags,

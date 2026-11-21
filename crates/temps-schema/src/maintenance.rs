@@ -99,6 +99,17 @@ const REFERENCE_INDEXES: &[ReferenceIndex] = &[
         partial: true,
         hypertable: false,
     },
+    // Not an IP reference either: the visitors list filters by the user id
+    // `identify` sets (ADR 109 D4), and finding a person's other devices asks
+    // for every visitor with that id. Only identified visitors carry one, so
+    // the partial index stays small.
+    ReferenceIndex {
+        name: "idx_visitor_user_id",
+        table: "visitor",
+        column: "user_id",
+        partial: true,
+        hypertable: false,
+    },
 ];
 
 impl ReferenceIndex {
@@ -1536,6 +1547,19 @@ mod tests {
             index.create_sql(),
             "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_deployments_image_name ON deployments \
              (image_name) WHERE image_name IS NOT NULL"
+        );
+    }
+
+    #[test]
+    fn visitors_are_indexed_by_user_id_for_identity_lookups() {
+        let index = REFERENCE_INDEXES
+            .iter()
+            .find(|index| index.name == "idx_visitor_user_id")
+            .expect("the visitor user id index is built");
+        assert_eq!(
+            index.create_sql(),
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_visitor_user_id ON visitor \
+             (user_id) WHERE user_id IS NOT NULL"
         );
     }
 

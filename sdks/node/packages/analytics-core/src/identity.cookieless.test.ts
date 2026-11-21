@@ -100,4 +100,14 @@ describe("cookieless identity (ADR 109 D3)", () => {
     expect(replayCalls).toHaveLength(0);
     expect(localStorage.length).toBe(0);
   });
+
+  it("identify sends nothing and stores no user id", async () => {
+    analytics = createAnalytics({ cookieless: true, ignoreLocalhost: false, autoTrackPageviews: false });
+    const result = await analytics.identify("user-42", { plan: "pro" });
+
+    expect(result).toMatchObject({ applied: false, outcome: "cookieless_project" });
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(localStorage.length).toBe(0);
+    expect(analytics.getVisitorId()).toBeUndefined();
+  });
 });

@@ -224,6 +224,7 @@ pub mod session_replay_sessions;
 pub mod settings;
 pub mod telemetry_gap_windows;
 pub mod visitor;
+pub mod visitor_identity_source;
 
 // Error tracking entities
 pub mod error_alert_fires;

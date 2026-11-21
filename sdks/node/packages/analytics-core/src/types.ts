@@ -204,8 +204,30 @@ export interface AnalyticsApi {
    * `data-temps-404` attribute on that view and let the tracker do it.
    */
   trackNotFound(data?: Record<string, JsonValue>): Promise<void>;
-  /** Identify a user. No-op placeholder for now. */
-  identify(userId: string, traits?: Record<string, JsonValue>): Promise<void> | void;
+  /**
+   * Attach your app's user id (and optional traits) to this visitor, e.g.
+   * right after signup or sign-in. The server labels the visitor this
+   * browser already is; it cannot name another one. Repeating the same call
+   * sends nothing. In cookieless mode it sends nothing and resolves to
+   * `cookieless_project`.
+   */
+  identify(userId: string, traits?: Record<string, JsonValue>): Promise<IdentifyResult>;
+  /**
+   * Forget the identity on sign-out: the next event belongs to a new,
+   * anonymous visitor. Rejects with `ResetFailedError` when the server did
+   * not confirm it (its tracking cookie still names the old visitor), so
+   * retry; the ids stored in the browser are cleared either way.
+   */
+  reset(): Promise<void>;
+  /**
+   * The visitor id this tracker stored. `undefined` in cookieless mode,
+   * before the first event, or when storage is blocked. A backend on Temps
+   * does not need it: the Node SDK's `analytics.identify(request, …)` reads
+   * the proxy's `_temps_visitor_id` cookie from the request. It is for a
+   * backend calling with a personal API key (`visitorId` option), since
+   * deployment tokens only accept that sealed cookie value.
+   */
+  getVisitorId(): string | undefined;
   /** Enable session recording at runtime. */
   enableSessionRecording(): void;
   /** Disable session recording at runtime. */
@@ -228,4 +250,19 @@ export interface SpeedMetric {
   inp?: number | null;
   path?: string | null;
   query?: string | null;
+}
+
+/** What `identify()` did. */
+export interface IdentifyResult {
+  /** Whether the visitor now carries this identity. */
+  applied: boolean;
+  /**
+   * The server's outcome (`updated`, `unchanged`, `visitor_not_found`,
+   * `cookieless_project`, `browser_identify_refused`,
+   * `server_identity_kept`), or a local one when nothing was sent:
+   * `already_sent`, `invalid_user_id`, `network_error`, `http_<status>`,
+   * or `reset` when `reset()` ran while it waited for the page view.
+   */
+  outcome: string;
+  message: string;
 }

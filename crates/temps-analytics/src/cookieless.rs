@@ -451,7 +451,7 @@ impl CookielessIdentity {
 
 /// A stored mode, read leniently: the CHECK constraint allows only the two
 /// values, and anything else (or no row) keeps today's behaviour.
-fn mode_from_stored(stored: Option<&str>) -> AnalyticsIdentityMode {
+pub(crate) fn mode_from_stored(stored: Option<&str>) -> AnalyticsIdentityMode {
     match stored {
         Some("cookieless") => AnalyticsIdentityMode::Cookieless,
         _ => AnalyticsIdentityMode::Persistent,

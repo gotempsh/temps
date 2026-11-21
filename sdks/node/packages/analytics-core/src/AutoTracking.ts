@@ -196,6 +196,8 @@ export function setupLinkTracking(
 
 /** Properties of a `not_found` event. `path` is the page the visitor asked for. */
 export function notFoundEventData(extra: Record<string, JsonValue> = {}): Record<string, JsonValue> {
+  // Outside a browser there is no page to describe.
+  if (typeof window === "undefined" || typeof document === "undefined") return { ...extra };
   return {
     path: window.location.pathname,
     referrer: document.referrer,

@@ -909,18 +909,15 @@ export default function RootLayout({ children }) {
 }
 
 // components/CheckoutButton.tsx
-import { useTrackEvent, useAnalytics } from '@temps-sdk/react-analytics';
+import { useTrackEvent, useTempsAnalytics } from '@temps-sdk/react-analytics';
 
 export function CheckoutButton() {
   const trackEvent = useTrackEvent();
-  const analytics = useAnalytics();
+  const { identify } = useTempsAnalytics();
 
   const handleCheckout = async (userId: string) => {
-    // Identify the user
-    analytics.identify(userId, {
-      email: 'user@example.com',
-      plan: 'pro'
-    });
+    // Identify the user (see "Identifying Users")
+    void identify(userId, { plan: 'pro' });
 
     // Track checkout event
     trackEvent('checkout_completed', {
@@ -955,6 +952,99 @@ Track events using data attributes (no JavaScript required):
 ```
 
 `temps-event-name` names the event and every `temps-data-*` attribute becomes a property (`temps-data-button="signup"` sends `{ "button": "signup" }`).
+
+---
+
+## Identifying Users {{ anchor: true, id: 'identify-users' }}
+
+Call `identify()` when a visitor signs up or signs in, and Temps attaches your app's user id to that visitor. The visit that produced the signup, its referrer and campaign, and the same person on their phone and laptop then show up under one user. Traits you pass are merged into the visitor's attributes, like [enrichment](#enrich-visitors).
+
+<CodeGroup title="Identify from the page">
+```tsx {{ title: 'React' }}
+import { useTempsAnalytics } from '@temps-sdk/react-analytics';
+
+function useAuthAnalytics(user) {
+  const { identify, reset } = useTempsAnalytics();
+
+  // After signup or sign-in:
+  useEffect(() => {
+    if (user) void identify(user.id, { plan: user.plan });
+  }, [user, identify]);
+
+  // On sign-out:
+  return { signOut: () => reset() };
+}
+```
+
+```html {{ title: 'Script tag' }}
+<script>
+  window.temps.identify('user_123', { plan: 'pro' });
+  // On sign-out:
+  window.temps.reset();
+</script>
+```
+
+```ts {{ title: 'Vue, Svelte, plain JS' }}
+const analytics = createAnalytics();
+await analytics.identify('user_123', { plan: 'pro' });
+await analytics.reset();
+```
+</CodeGroup>
+
+The browser can only label the visitor it already is: the server applies the call to the visitor the request resolves to, the same way it does for events, and never takes a visitor id from the caller. Calling `identify()` again with the same user and traits sends nothing, so it is safe to call on every page load. `reset()` deletes the ids the tracker stored and expires the proxy's tracking cookies, so the next event starts a new, anonymous visitor. A session replay in progress ends there, and a new replay starts once the server has confirmed the reset, so two people sharing a device never appear in one recording. `reset()` rejects with a `ResetFailedError` when the server did not confirm it (the device was offline, say): the ids stored in the browser are already gone, but on a site Temps serves the tracking cookie still names the signed-out visitor, so retry the call; session replay stays off until a reset succeeds. An `identify()` still waiting for its page view when `reset()` runs sends nothing.
+
+### From your backend
+
+An identity sent from the browser is a claim by that browser: any page script could send any id. When your backend identifies the visitor instead, the identity is marked as **verified by backend**, and a later `identify()` from the browser cannot replace it or any trait your backend set.
+
+```ts {{ title: 'Node — in the signup handler' }}
+import { analytics } from '@temps-sdk/node-sdk';
+
+export async function POST(request: Request) {
+  const user = await createUser(request);
+  await analytics.identify(request, { userId: user.id, traits: { plan: user.plan } });
+  return Response.json(user);
+}
+```
+
+On Temps this needs no configuration: the visitor is the request's `_temps_visitor_id` cookie, which the Temps proxy sets, and `TEMPS_API_URL` and `TEMPS_API_TOKEN` are injected into every deployment. The deployment token needs the `visitors:enrich` permission and has the [same limits as enrichment](#enriching-from-a-deployed-app): sealed visitor ids only, its own project only, 32 keys and 8 KB, and 300 visitor-changing writes per minute. Every change is written to the audit log with the trait names, never the user id or the values. `analytics.identify` never throws; its result says what happened.
+
+From the CLI:
+
+```bash
+temps analytics identify enc_AbC123 -p my-site --user-id user_123 --set plan=pro
+```
+
+### Require your backend
+
+For an app where a user id must be verified, refuse identify from the browser under **Analytics → Settings → Identify signed-in users**, or:
+
+```bash
+temps analytics identity set -p my-site --browser-identify refuse
+```
+
+`identify()` from the page then stores nothing and answers `browser_identify_refused`; only your backend can identify visitors. It is accepted by default.
+
+### What identify answers
+
+Both calls resolve to `{ applied, outcome, message }`. `outcome` is one of:
+
+<Properties>
+  <Property name="updated">The user id or traits were stored.</Property>
+  <Property name="unchanged">The visitor already had exactly this identity.</Property>
+  <Property name="visitor_not_found">The request has no visitor yet, for example before its first page view was recorded. The browser tracker waits for the page view in flight before identifying.</Property>
+  <Property name="cookieless_project">The project is cookieless, so nothing was stored (see below).</Property>
+  <Property name="browser_identify_refused">The project only accepts identify from the backend.</Property>
+  <Property name="server_identity_kept">The browser named a different user than the one your backend set; the backend's identity stays.</Property>
+</Properties>
+
+### Cookieless projects
+
+In a [cookieless](#cookieless) project identify stores nothing, from the browser or from your backend, and answers `cookieless_project`. A cookieless visitor is a new visitor every day, and putting the same user id on each day's visitor would link those days together, which is exactly what cookieless tracking rules out. The browser tracker in cookieless mode does not send the call at all.
+
+### Finding a user
+
+A visitor's page shows their user id with **Verified by backend** or **Claimed by browser**, which trait came from where, and a **Same user on other devices** link to every visitor with that user id. The visitors API filters on it with `filter_user_id`.
 
 ---
 
@@ -1049,36 +1139,18 @@ async function clearTrialData(visitorId: string) {
 
 ### Getting Visitor ID from Frontend
 
-To enrich a visitor, you need their visitor ID from the frontend. The visitor ID can be:
-- A GUID (e.g., `"550e8400-e29b-41d4-a716-446655440000"`)
-- A numeric ID (e.g., `123`)
-- A sealed, encrypted ID (e.g., `"enc_..."`) — the value Temps sets in the `_temps_visitor_id` cookie on every request it proxies
+To attach your user to a visitor, use [`identify()`](#identify-users): it needs no visitor id at all. To call enrichment yourself, you need the visitor's id, which can be:
+- A sealed, encrypted ID (e.g., `"enc_..."`), the value Temps sets in the `_temps_visitor_id` cookie on every request it proxies. Your backend reads it from the request; deployment tokens accept only this form.
+- A GUID (e.g., `"550e8400-e29b-41d4-a716-446655440000"`), which the browser tracker stores when Temps does not serve the page. `getVisitorId()` returns it, for a backend calling with an API key.
+- A numeric ID (e.g., `123`), as shown in the console.
 
-```typescript {{ title: 'React - Get Visitor ID' }}
-import { useAnalytics } from '@temps-sdk/react-analytics';
+```typescript {{ title: 'React - Get the stored visitor ID' }}
+import { useTempsAnalytics } from '@temps-sdk/react-analytics';
 
-function UserProfile() {
-  const analytics = useAnalytics();
-
-  useEffect(() => {
-    // Get current visitor ID (returns GUID or numeric ID)
-    const visitorId = analytics.getVisitorId();
-
-    // Send to your backend when user logs in
-    if (visitorId && user) {
-      fetch('/api/enrich-visitor', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          visitorId, // Can be string GUID or numeric ID
-          userId: user.id,
-          email: user.email
-        })
-      });
-    }
-  }, [user, analytics]);
-
-  return <div>Profile</div>;
+function useVisitorId() {
+  const { getVisitorId } = useTempsAnalytics();
+  // undefined before the first event, in cookieless mode, or when storage is blocked
+  return getVisitorId();
 }
 ```
 
@@ -1402,6 +1474,7 @@ The tracker option also deletes the ids an earlier visit stored. The server igno
 - Visitors on the same network with the same browser version are counted once per day.
 - Request logs carry no visitor, since the proxy no longer recognises one.
 - Events your backend sends with an ingest key are counted by the address that sent them, so send cookieless events from the browser.
+- [Identify](#identify-users) stores nothing: a user id on each day's visitor would link the days together.
 
 Switching applies to new visits. History recorded in either mode stays as it is.
 

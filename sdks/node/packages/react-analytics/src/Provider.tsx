@@ -17,8 +17,11 @@ import {
   NotFoundMarkerWatcher,
   enableCookielessIdentity,
   exposureEventData,
+  getStoredVisitorId,
+  identifyVisitor,
   isCookielessIdentity,
   notFoundEventData,
+  resetVisitor,
   setupLinkTracking,
 } from "@temps-sdk/analytics-core";
 
@@ -89,8 +92,13 @@ export function TempsAnalyticsProvider({
   );
 
   const trackNotFound = useCallback<AnalyticsContextValue["trackNotFound"]>(
-    (data = {}) => trackEvent(NOT_FOUND_EVENT, notFoundEventData(data)),
-    [trackEvent]
+    // Checks `enabled` before reading the page, so a call while rendering
+    // on the server does nothing, like the other tracking methods.
+    async (data = {}) => {
+      if (!enabled) return;
+      await trackEvent(NOT_FOUND_EVENT, notFoundEventData(data));
+    },
+    [enabled, trackEvent]
   );
 
   // Looks for the `data-temps-404` marker after each page view (ADR 109 D1).
@@ -103,10 +111,14 @@ export function TempsAnalyticsProvider({
   );
   useEffect(() => () => notFoundWatcher?.cancel(), [notFoundWatcher]);
 
+  // The last page view in flight: identify waits for it, because a first
+  // visit's visitor only exists once its first event has been recorded.
+  const pendingPageviewRef = useRef<Promise<void>>(Promise.resolve());
+
   const trackPageview = useCallback<AnalyticsContextValue["trackPageview"]>(
     () => {
       if (!enabled) return;
-      void sendAnalytics("event", {
+      pendingPageviewRef.current = sendAnalytics("event", {
         event_name: "page_view",
         request_query: window.location.search,
         request_path: window.location.pathname,
@@ -124,9 +136,26 @@ export function TempsAnalyticsProvider({
     [enabled, basePath, domain, ingestKey, notFoundWatcher]
   );
 
-  const identify = useCallback<AnalyticsContextValue["identify"]>(async () => {
-    // no-op placeholder for SDK parity; implement when identity endpoint is available
-  }, []);
+  const identify = useCallback<AnalyticsContextValue["identify"]>(
+    async (userId, traits) => {
+      if (!enabled) {
+        return { applied: false, outcome: "disabled", message: "Analytics is disabled on this page." };
+      }
+      return identifyVisitor({
+        basePath,
+        ingestKey,
+        userId,
+        traits,
+        ready: pendingPageviewRef.current,
+      });
+    },
+    [enabled, basePath, ingestKey]
+  );
+
+  const reset = useCallback<AnalyticsContextValue["reset"]>(async () => {
+    if (!enabled) return;
+    await resetVisitor({ basePath, ingestKey });
+  }, [enabled, basePath, ingestKey]);
 
   // Route change monitoring (pushState/popstate)
   const currentPathRef = useRef<string>(typeof window !== "undefined" ? window.location.pathname : "");
@@ -341,8 +370,18 @@ export function TempsAnalyticsProvider({
   }, [flags, flagContext]);
 
   const value = useMemo<AnalyticsContextValue>(
-    () => ({ trackEvent, identify, trackPageview, trackNotFound, enabled, flags, basePath }),
-    [trackEvent, identify, trackPageview, trackNotFound, enabled, flags, basePath]
+    () => ({
+      trackEvent,
+      identify,
+      reset,
+      getVisitorId: getStoredVisitorId,
+      trackPageview,
+      trackNotFound,
+      enabled,
+      flags,
+      basePath,
+    }),
+    [trackEvent, identify, reset, trackPageview, trackNotFound, enabled, flags, basePath]
   );
 
   return (

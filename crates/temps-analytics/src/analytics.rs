@@ -82,6 +82,11 @@ impl AnalyticsService {
             param_index += 1;
         }
 
+        if let Some(user_id) = &segment.filter_user_id {
+            where_conditions.push(format!("v.user_id = ${}", param_index));
+            values.push(user_id.clone().into());
+            param_index += 1;
+        }
         if let Some(channel) = &segment.filter_channel {
             where_conditions.push(format!("v.first_channel = ${}", param_index));
             values.push(channel.clone().into());
@@ -1267,7 +1272,7 @@ fn custom_data_footprint(custom_data: Option<&serde_json::Value>) -> (usize, usi
 /// existed) stays editable as long as the write does not make it larger, so
 /// identity enrichment does not stop working for that visitor; it just can't
 /// grow it.
-fn validate_merge(
+pub(crate) fn validate_merge(
     existing: Option<&serde_json::Value>,
     merged: &serde_json::Value,
     project_scoped: bool,
@@ -1338,17 +1343,40 @@ impl AnalyticsService {
     ///
     /// Skips the write when nothing changes, so a client that re-sends the same
     /// identity on every page load costs a read, not a row rewrite.
+    ///
+    /// The merge reads the row under the same row lock `identify` takes
+    /// (ADR 109 D4), inside one transaction: merged from an unlocked read, a
+    /// write could replace a trait and its `server` mark that an identify
+    /// committed in between.
     async fn apply_visitor_enrichment(
         &self,
-        visitor_model: temps_entities::visitor::Model,
+        found: temps_entities::visitor::Model,
         project_scoped: bool,
         incoming: serde_json::Value,
         response_visitor_id: String,
     ) -> Result<EnrichVisitorResponse, AnalyticsError> {
-        use sea_orm::{ActiveModelTrait, Set};
+        use sea_orm::{ActiveModelTrait, EntityTrait, QuerySelect, Set, TransactionTrait};
         use temps_entities::visitor;
 
+        let txn = self.db.begin().await.map_err(AnalyticsError::from)?;
+        let Some(visitor_model) = visitor::Entity::find_by_id(found.id)
+            .lock_exclusive()
+            .one(&txn)
+            .await
+            .map_err(AnalyticsError::from)?
+        else {
+            // Deleted since the lookup.
+            return Ok(visitor_not_found(response_visitor_id));
+        };
+
         let merged = merge_custom_data(visitor_model.custom_data.as_ref(), &incoming);
+        // Keys set here come from an authenticated caller, so a later browser
+        // `identify` must not overwrite them (ADR 109 D4).
+        let trait_sources = crate::visitor_identity::mark_enriched_keys(
+            visitor_model.trait_sources.as_ref(),
+            &incoming,
+        );
+        let sources_unchanged = trait_sources == visitor_model.trait_sources;
         let visitor_row_id = visitor_model.id;
         // Nothing to store: an identical document, or removing keys from a row
         // that has no data. The response text is the same for both outcomes, so
@@ -1356,9 +1384,10 @@ impl AnalyticsService {
         // below and the token's write budget still let a write-only caller
         // infer a little about stored state; that residual is narrowed, not
         // eliminated.)
-        let unchanged = visitor_model.custom_data.as_ref() == Some(&merged)
-            || (visitor_model.custom_data.is_none()
-                && merged.as_object().is_some_and(|map| map.is_empty()));
+        let unchanged = sources_unchanged
+            && (visitor_model.custom_data.as_ref() == Some(&merged)
+                || (visitor_model.custom_data.is_none()
+                    && merged.as_object().is_some_and(|map| map.is_empty())));
         if unchanged {
             return Ok(EnrichVisitorResponse {
                 success: true,
@@ -1372,10 +1401,12 @@ impl AnalyticsService {
 
         let mut active_model: visitor::ActiveModel = visitor_model.into();
         active_model.custom_data = Set(Some(merged));
+        active_model.trait_sources = Set(trait_sources);
         active_model
-            .update(self.db.as_ref())
+            .update(&txn)
             .await
             .map_err(AnalyticsError::from)?;
+        txn.commit().await.map_err(AnalyticsError::from)?;
 
         Ok(EnrichVisitorResponse {
             success: true,
@@ -1659,6 +1690,11 @@ impl Analytics for AnalyticsService {
 
         // Visitor-side: first-touch channel / referrer.
         // "Direct" referrer is stored as NULL in the visitor table.
+        if let Some(user_id) = &segment.filter_user_id {
+            where_conditions.push(format!("v.user_id = ${}", param_index));
+            values.push(user_id.clone().into());
+            param_index += 1;
+        }
         if let Some(channel) = &segment.filter_channel {
             where_conditions.push(format!("v.first_channel = ${}", param_index));
             values.push(channel.clone().into());
@@ -1743,7 +1779,9 @@ impl Analytics for AnalyticsService {
                 last_event.page_path as current_page,
                 v.first_referrer,
                 v.first_referrer_hostname,
-                v.first_channel
+                v.first_channel,
+                v.user_id,
+                v.identity_source
             FROM visitor v
             LEFT JOIN ip_geolocations ig ON v.ip_address_id = ig.id
             LEFT JOIN LATERAL (
@@ -1792,6 +1830,8 @@ impl Analytics for AnalyticsService {
             first_referrer: Option<String>,
             first_referrer_hostname: Option<String>,
             first_channel: Option<String>,
+            user_id: Option<String>,
+            identity_source: Option<String>,
         }
 
         let results = VisitorResult::find_by_statement(Statement::from_sql_and_values(
@@ -1829,6 +1869,8 @@ impl Analytics for AnalyticsService {
                 first_referrer: r.first_referrer,
                 first_referrer_hostname: r.first_referrer_hostname,
                 first_channel: r.first_channel,
+                user_id: r.user_id,
+                identity_source: r.identity_source,
             })
             .collect();
 
@@ -2197,7 +2239,11 @@ impl Analytics for AnalyticsService {
                 ig.asn AS asn_org,
                 v.first_referrer,
                 v.first_referrer_hostname,
-                v.first_channel
+                v.first_channel,
+                v.user_id,
+                v.identity_source,
+                v.identified_at,
+                v.trait_sources
             FROM visitor v
             LEFT JOIN ip_geolocations ig ON v.ip_address_id = ig.id
             WHERE v.id = $1
@@ -2230,6 +2276,10 @@ impl Analytics for AnalyticsService {
             first_referrer: Option<String>,
             first_referrer_hostname: Option<String>,
             first_channel: Option<String>,
+            user_id: Option<String>,
+            identity_source: Option<String>,
+            identified_at: Option<UtcDateTime>,
+            trait_sources: Option<serde_json::Value>,
         }
 
         let result = DetailResult::find_by_statement(Statement::from_sql_and_values(
@@ -2266,6 +2316,10 @@ impl Analytics for AnalyticsService {
             first_referrer: r.first_referrer,
             first_referrer_hostname: r.first_referrer_hostname,
             first_channel: r.first_channel,
+            user_id: r.user_id,
+            identity_source: r.identity_source,
+            identified_at: r.identified_at,
+            trait_sources: r.trait_sources,
         }))
     }
 

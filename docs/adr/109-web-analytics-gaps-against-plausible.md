@@ -2,9 +2,9 @@
 
 ## Status
 
-Proposed — 2026-11-19. D1 to D3 are implemented; what they settled is
-recorded under "Settled while implementing D1", "... D2" and "... D3". D4
-to D9 are not started.
+Proposed — 2026-11-19. D1 to D4 are implemented; what they settled is
+recorded under "Settled while implementing D1" to "... D4". D5 to D9 are
+not started.
 
 Related: ADR 012 (ClickHouse analytics backend), ADR 076 (analytics ingest
 keys), ADR 110 (product analytics gaps against PostHog; D2 here is the goal
@@ -408,8 +408,67 @@ they come last.
   analytics identity show | set --mode`.
 - **Left for later.** The geolocation table still stores the client
   address, under the existing IP retention policy; a cookieless project
-  could store only the derived location. D4's user-id join across days is
-  not built yet.
+  could store only the derived location. D4 settled that a cookieless
+  project stores no user id at all (see below).
+
+## Settled while implementing D4
+
+- **Cookieless projects store nothing.** This replaces the "joined across
+  days by `user_id`" paragraph above. Putting the same user id on each
+  day's visitor is a durable link between days, which is the one thing
+  cookieless mode promises not to keep. Both endpoints answer
+  `cookieless_project` without writing, and the browser tracker in
+  cookieless mode does not send the call. An app that wants signed-in users
+  joined across days runs the project in `persistent` mode.
+- **Where identity lives.** Four nullable columns on `visitor`: `user_id`,
+  `identity_source` (`browser` or `server`), `identified_at`, and
+  `trait_sources`, a JSON map from each `custom_data` key to who set it.
+  Adding them rewrites no rows. `idx_visitor_user_id` (partial, non-null
+  ids) is built `CONCURRENTLY` after boot with the other reference indexes,
+  since migrations run in a transaction. Traits stay in `custom_data`.
+  Visitors on other devices stay separate visitors linked by `user_id`; no
+  rows are merged.
+- **Browser path.** `POST /api/_temps/identify` resolves the visitor
+  exactly as events do (the proxy's cookie on a Temps-served site; the
+  tracker's stored id only on a keyed request), so a page can label only
+  itself. It is bounded at 600 visitor-changing writes per project per
+  minute per process and is not audited: it is end-user traffic, like
+  events. `POST /api/_temps/reset` answers with both tracking cookies
+  expired; the tracker also drops its stored ids and its memo of the last
+  identify. The tracker waits for the page view in flight, since a first
+  visit's visitor only exists after its first event.
+- **Server path.** `PUT /projects/{project_id}/analytics/visitors/{visitor_id}/identify`,
+  and `PUT /analytics/visitors/{visitor_id}/identify`, which takes the
+  project from a deployment token so a deployed app needs no project id.
+  Tokens follow the enrichment rules unchanged: `visitors:enrich`, sealed
+  `enc_` ids only, own project, 32 keys and 8 KB, and the same 300-per-minute
+  write budget. Every change is audited as `VISITOR_IDENTIFIED` with trait
+  key names only; neither the user id nor any value is recorded. The Node
+  SDK's `analytics.identify(request, { userId, traits })` reads the
+  `_temps_visitor_id` cookie and the injected `TEMPS_API_URL` and
+  `TEMPS_API_TOKEN`.
+- **Trust.** The browser cannot replace a user id the server set, cannot
+  overwrite a trait the server set, and repeating the server's own id keeps
+  it marked `server`. Enrichment through a deployment token or the console
+  marks its keys `server` as well. A `null` trait removes the key and its
+  mark. The per-project setting `accept_browser_identify`
+  (`project_analytics_settings`, default `true`) refuses browser identify
+  altogether with `browser_identify_refused`; changing it is audited as
+  `ANALYTICS_BROWSER_IDENTIFY_UPDATED`, separately from the mode.
+- **`getVisitorId()`.** Exported by the tracker; it returns the id the
+  tracker stored, without creating one. Deployment tokens do not accept that
+  raw id, so it is for a backend calling with an API key; on Temps the Node
+  helper needs no id from the page.
+- **Where it shows.** An "Identify signed-in users" card under Analytics →
+  Settings with the browser setting and snippets; the visitor page shows
+  the user id with "Verified by backend" or "Claimed by browser", where each
+  trait came from, and a link to the same user on other devices; the
+  visitors list shows the user id and filters on `filter_user_id`. CLI:
+  `temps analytics identify <visitor> --user-id`, and `temps analytics
+  identity set --browser-identify accept|refuse`.
+- **Left for later.** The same server helper in other languages (ADR 110
+  D9). Server identify for a site Temps does not serve, where there is no
+  sealed cookie for a deployment token to pass.
 
 ## Not doing
 
@@ -423,7 +482,8 @@ they come last.
 
 - Whether browser-origin identity (D4) should be accepted by default. It is
   what makes `identify()` a one-line integration, and it lets a visitor claim
-  any user id for their own profile.
+  any user id for their own profile. Implemented as accepted by default, with
+  `accept_browser_identify` to refuse it per project; awaiting confirmation.
 - Whether new projects should default to `cookieless`. It is the safer legal
   default and the worse product default.
 - Whether D6 should allow embedding in an iframe, which changes the framing
