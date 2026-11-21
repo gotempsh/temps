@@ -634,6 +634,10 @@ debug = false
 #
 # 4. astral-tokio-tar: RESOLVED by upgrading testcontainers 0.27.1 → 0.27.2
 #
+# RUSTSEC-2026-0253: aws-sdk-s3 1.138.1 still requires lru 0.16.
+# Moving to S3 1.144.0 requires compatible Smithy protocol types across
+# SDK clients. See the dependency-scan workflow for reachability.
+#
 # Previously resolved:
 # - zip 8.6.0 (RUSTSEC-2026-0367/-0368/-0369, GHSA-m665-v7pm-7grj): RESOLVED by
 #     dropping headless_chrome's `fetch` feature, the only thing that locked it

@@ -50,7 +50,7 @@ jobs:
   cargo-audit:
     name: Rust Dependency Audit (cargo-audit)
     env:
-      AUDIT_IGNORE: RUSTSEC-2025-0134,RUSTSEC-2023-0071,RUSTSEC-2024-0388,RUSTSEC-2024-0449,RUSTSEC-2025-0141,RUSTSEC-2026-0387,RUSTSEC-2026-0440,RUSTSEC-2026-0543,RUSTSEC-2026-0555
+      AUDIT_IGNORE: RUSTSEC-2025-0134,RUSTSEC-2023-0071,RUSTSEC-2024-0388,RUSTSEC-2026-0253,RUSTSEC-2024-0449,RUSTSEC-2025-0141,RUSTSEC-2026-0387,RUSTSEC-2026-0440,RUSTSEC-2026-0543,RUSTSEC-2026-0555
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -138,7 +138,7 @@ jobs:
       #   chrono-tz comes with it for timezone handling. Neither has a
       #   maintained drop-in replacement yet. Drop both once one exists.
       #
-      # The two below are vulnerability/unsoundness advisories (not "unmaintained"
+      # The three below are vulnerability/unsoundness advisories (not "unmaintained"
       # notices). A version bump here cannot clear any of them: either no fix is
       # released, or an upstream crate still requires the affected copy.
       # See also the RSA reachability analysis under Dependency Overrides in Cargo.toml.
@@ -176,10 +176,14 @@ jobs:
       #   network latency alone does not prove it unobservable. This exception
       #   requires maintainer risk review. No fixed `rsa` release exists upstream
       #   yet -- tracked for a ring/aws-lc-rs-backed signing migration.
+      # - RUSTSEC-2026-0253 (lru 0.16.4): the locked aws-sdk-s3 uses this
+      #   series for S3ExpressIdentityCache. Its key has no custom Drop,
+      #   and the cache uses get_or_insert_mut. Moving S3 to lru 0.18
+      #   requires coordinating the AWS SDK and Smithy protocol types.
       # - RUSTSEC-2026-0387 (crypto-bigint: arithmetic meant to be
       #   constant-time can branch on secret values; fixed in >= 0.7.6).
       #   Cargo.lock has 0.7.11 for the copy that russh/rsa pulls in. The 0.5.5
-      #   copy is required by elliptic-curve 0.13 and aws-sigv4 1.6.3.
+      #   copy is required by elliptic-curve 0.13 and aws-sigv4 1.5.1.
       #   Drop this entry once all consumers support the fixed series.
       # Remove an entry once its upstream is fixed/replaced.
       # Install a checksum-verified release binary before audit-check runs.

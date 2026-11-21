@@ -28,6 +28,7 @@ ignore = [
     { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained; migration to rustls-pki-types PemObject tracked separately" },
     { id = "RUSTSEC-2023-0071", reason = "rsa Marvin attack: no RSA decryption anywhere in the workspace; no fixed release upstream" },
     { id = "RUSTSEC-2024-0388", reason = "derivative unmaintained; proc-macro only (pingora)" },
+    { id = "RUSTSEC-2026-0253", reason = "lru 0.16 pop() UAF: aws-sdk-s3's only LruCache never calls pop and has no custom Drop key" },
     { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml via pingora-core's conf loader, which Temps never feeds" },
     { id = "RUSTSEC-2025-0141", reason = "bincode unmaintained; only the pinned microsandbox SDK uses it" },
     { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5 is still required by elliptic-curve 0.13 and aws-sigv4" },

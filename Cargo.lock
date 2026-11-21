@@ -708,9 +708,9 @@ dependencies = [
 
 [[package]]
 name = "aws-runtime"
-version = "1.10.2"
+version = "1.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9a0cc2144962cc5e358467b16e3d82981b1d424a7c3d34602be0036103814a1a"
+checksum = "7816e98ee912159f45d307e5ee6bfea4a335a55aee15f7f3e32f81a6f3000f1d"
 dependencies = [
  "aws-credential-types",
  "aws-sigv4",
@@ -736,9 +736,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-s3"
-version = "1.144.0"
+version = "1.138.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "30dc8bf6baaf7d46336a0ca2c69f223d9b90d7a801fb3e28f7ea17b00dc6b1de"
+checksum = "8fa59420755799fec8aac71f562aa37ba82263f5b1926bba8b5d3465d2f7a73f"
 dependencies = [
  "arc-swap",
  "aws-credential-types",
@@ -754,7 +754,7 @@ dependencies = [
  "aws-smithy-runtime-api",
  "aws-smithy-schema 0.2.0",
  "aws-smithy-types",
- "aws-smithy-xml 0.62.0",
+ "aws-smithy-xml",
  "aws-types",
  "bytes",
  "fastrand",
@@ -763,7 +763,7 @@ dependencies = [
  "http 0.2.12",
  "http 1.5.0",
  "http-body 1.0.1",
- "lru",
+ "lru 0.16.4",
  "percent-encoding",
  "regex-lite",
  "sha2 0.11.1",
@@ -815,7 +815,7 @@ dependencies = [
  "aws-smithy-runtime-api",
  "aws-smithy-schema 0.2.0",
  "aws-smithy-types",
- "aws-smithy-xml 0.61.1",
+ "aws-smithy-xml",
  "aws-types",
  "fastrand",
  "http 0.2.12",
@@ -894,7 +894,7 @@ dependencies = [
  "aws-smithy-runtime-api",
  "aws-smithy-schema 0.2.0",
  "aws-smithy-types",
- "aws-smithy-xml 0.61.1",
+ "aws-smithy-xml",
  "aws-types",
  "fastrand",
  "http 0.2.12",
@@ -905,9 +905,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sigv4"
-version = "1.6.3"
+version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9d3d48355cb86b15ccbb38b8bc6b87500c824ee4ed8cbc10a961b435242b5e16"
+checksum = "723c2234ad7511ceef63eab016b7ba6ff7c55590fefb96fa8467af014a07309f"
 dependencies = [
  "aws-credential-types",
  "aws-smithy-eventstream",
@@ -916,12 +916,12 @@ dependencies = [
  "aws-smithy-types",
  "bytes",
  "crypto-bigint 0.5.5",
- "ecdsa 0.17.0",
  "form_urlencoded",
  "hex",
  "hmac 0.13.0",
+ "http 0.2.12",
  "http 1.5.0",
- "p256 0.14.0",
+ "p256 0.13.2",
  "percent-encoding",
  "sha2 0.11.1",
  "subtle",
@@ -1132,9 +1132,7 @@ dependencies = [
  "bytes",
  "bytes-utils",
  "futures-core",
- "http 0.2.12",
  "http 1.5.0",
- "http-body 0.4.6",
  "http-body 1.0.1",
  "http-body-util",
  "itoa",
@@ -1160,27 +1158,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "aws-smithy-xml"
-version = "0.62.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ce84f71c72fee2cbbadde6e7d082f5fb466e3a84733855295fa7aafd1b31b7d8"
-dependencies = [
- "aws-smithy-runtime-api",
- "aws-smithy-schema 0.2.0",
- "aws-smithy-types",
- "xmlparser",
-]
-
-[[package]]
 name = "aws-types"
-version = "1.7.0"
+version = "1.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6ba0d970d3947bb064d2ae1d823efa186c1dbde88f88afa8f6549946e5d8deee"
+checksum = "e957a6c6dbce82b7a91f44231c09273159703769f447cbe85e854dfe9cf67f86"
 dependencies = [
  "aws-credential-types",
  "aws-smithy-async",
  "aws-smithy-runtime-api",
- "aws-smithy-schema 1.1.0",
+ "aws-smithy-schema 0.2.0",
  "aws-smithy-types",
  "rustc_version",
  "tracing",
@@ -5873,6 +5859,15 @@ dependencies = [
 
 [[package]]
 name = "lru"
+version = "0.16.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f66e8d5d03f609abc3a39e6f08e4164ebf1447a732906d39eb9b99b7919ef39"
+dependencies = [
+ "hashbrown 0.16.1",
+]
+
+[[package]]
+name = "lru"
 version = "0.18.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ff9840bcc50b71349309900da0ce7279aa336ae71d73250b07998932c7d97c25"
@@ -6783,7 +6778,7 @@ dependencies = [
  "libc",
  "libloading",
  "log",
- "lru",
+ "lru 0.16.4",
  "msb-imago",
  "msb-vm-memory",
  "msb_krun_arch",
@@ -8310,7 +8305,7 @@ dependencies = [
  "httpdate",
  "indexmap 1.9.3",
  "log",
- "lru",
+ "lru 0.18.4",
  "once_cell",
  "parking_lot 0.12.5",
  "pingora-core",
@@ -8484,7 +8479,7 @@ dependencies = [
  "dashmap 5.5.3",
  "futures",
  "log",
- "lru",
+ "lru 0.18.4",
  "parking_lot 0.12.5",
  "pingora-timeout",
  "tokio",
@@ -8936,7 +8931,7 @@ version = "0.14.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6e4d69d0fa3e7f6f9cf6b53a0e83e4fc99ba3586f65ce166cff30bd13bb4ad2"
 dependencies = [
- "heck 0.4.1",
+ "heck 0.5.0",
  "itertools",
  "log",
  "multimap",
@@ -11301,7 +11296,7 @@ version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c1c97747dbf44bb1ca44a561ece23508e99cb592e862f22222dcf42f51d1e451"
 dependencies = [
- "heck 0.4.1",
+ "heck 0.5.0",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
