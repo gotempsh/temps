@@ -155,9 +155,13 @@ export async function resetVisitor(options: { basePath: string; ingestKey?: stri
   identityGeneration += 1;
   writeMemo(null);
   clearStoredIdentity();
-  // A replay in progress belongs to the previous visitor; end it now.
-  notifyIdentityReset();
-  if (isCookielessIdentity()) return;
+  // A replay in progress belongs to the previous visitor; end it now. The
+  // next one starts once the server has expired the cookie naming it.
+  notifyIdentityReset("started");
+  if (isCookielessIdentity()) {
+    notifyIdentityReset("confirmed");
+    return;
+  }
   let response: Response;
   try {
     response = await fetch(`${options.basePath}/${RESET_ENDPOINT}`, {
@@ -172,4 +176,5 @@ export async function resetVisitor(options: { basePath: string; ingestKey?: stri
       `${options.basePath}/${RESET_ENDPOINT} answered ${response.status}; the visitor was not reset on the server`
     );
   }
+  notifyIdentityReset("confirmed");
 }

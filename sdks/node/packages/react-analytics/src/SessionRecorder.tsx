@@ -102,9 +102,12 @@ export function SessionRecorder(props: SessionRecorderProps): null {
       recorderRef.current = null;
     });
     // `reset()` after a sign-out gives the page a new visitor: end this
-    // replay and record what follows in a new session.
-    const unsubscribeReset = onIdentityReset(() => {
-      if (!discarded) recorder.restart();
+    // replay, and record what follows in a new session once the server
+    // confirmed the reset.
+    const unsubscribeReset = onIdentityReset((phase) => {
+      if (discarded) return;
+      if (phase === "started") recorder.endForReset();
+      else recorder.resumeAfterReset();
     });
 
     return () => {

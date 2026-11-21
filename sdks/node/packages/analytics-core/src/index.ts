@@ -30,6 +30,7 @@ export {
   isCookielessIdentity,
   onCookielessIdentity,
   onIdentityReset,
+  type IdentityResetPhase,
   clearStoredIdentity,
   getStoredVisitorId,
 } from "./identity";

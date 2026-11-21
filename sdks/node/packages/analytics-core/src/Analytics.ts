@@ -300,8 +300,13 @@ export function createAnalytics(options: AnalyticsOptions = {}): AnalyticsApi {
     })
   );
   // `reset()` (from any instance) gives the page a new visitor: the replay
-  // in progress ends and the next one starts a new session.
-  cleanups.push(onIdentityReset(() => runtimeRecorder?.restart()));
+  // in progress ends, and a new one starts once the server confirmed it.
+  cleanups.push(
+    onIdentityReset((phase) => {
+      if (phase === "started") runtimeRecorder?.endForReset();
+      else runtimeRecorder?.resumeAfterReset();
+    })
+  );
 
   return {
     get enabled(): boolean {

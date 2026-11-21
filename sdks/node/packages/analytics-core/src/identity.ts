@@ -100,26 +100,34 @@ export function onCookielessIdentity(listener: () => void): () => void {
   };
 }
 
-const identityResetListeners = new Set<() => void>();
+/**
+ * The two moments of a `reset()`: `started` once the ids stored in the
+ * browser are gone, `confirmed` once the server has expired its tracking
+ * cookies too (at once on a cookieless page, which has none). A `reset()`
+ * the server did not confirm reports only `started`.
+ */
+export type IdentityResetPhase = "started" | "confirmed";
+
+const identityResetListeners = new Set<(phase: IdentityResetPhase) => void>();
 
 /**
- * Run `listener` when `reset()` drops the page's visitor and session ids
- * (ADR 109 D4), so a session replay in progress ends and the next one starts
- * under the new ids instead of joining two people's activity into one
- * recording. Returns the unsubscribe function.
+ * Run `listener` at each phase of a `reset()` (ADR 109 D4), so a session
+ * replay in progress ends when it starts, and the next one begins only once
+ * nothing on the device still names the previous visitor: two people's
+ * activity never shares a recording. Returns the unsubscribe function.
  */
-export function onIdentityReset(listener: () => void): () => void {
+export function onIdentityReset(listener: (phase: IdentityResetPhase) => void): () => void {
   identityResetListeners.add(listener);
   return () => {
     identityResetListeners.delete(listener);
   };
 }
 
-/** Tell every `onIdentityReset` listener that the stored ids were dropped. */
-export function notifyIdentityReset(): void {
+/** Tell every `onIdentityReset` listener that a reset reached `phase`. */
+export function notifyIdentityReset(phase: IdentityResetPhase): void {
   for (const listener of Array.from(identityResetListeners)) {
     try {
-      listener();
+      listener(phase);
     } catch (error) {
       // eslint-disable-next-line no-console
       console.error("[temps] identity reset listener failed:", error);

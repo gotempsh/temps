@@ -15,10 +15,19 @@ describe("reset() and session replay (ADR 109 D4)", () => {
     autoTrackEngagement: false,
     autoTrackSpeedAnalytics: false,
   };
+  let resetResponse: () => Promise<Response>;
 
   beforeEach(() => {
     localStorage.clear();
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ status: 204, ok: true, json: async () => ({}) }));
+    resetResponse = async () => new Response(null, { status: 204 });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockImplementation((url: string) =>
+        String(url).endsWith("/reset")
+          ? resetResponse()
+          : Promise.resolve(new Response(null, { status: 204 }))
+      )
+    );
   });
 
   afterEach(() => {
@@ -27,49 +36,94 @@ describe("reset() and session replay (ADR 109 D4)", () => {
     vi.restoreAllMocks();
   });
 
-  it("ends the replay in progress and starts a new one, from any instance", async () => {
-    const restart = vi.spyOn(SessionRecorder.prototype, "restart");
+  it("ends the replay at once and starts a new one only after the server confirmed", async () => {
+    const end = vi.spyOn(SessionRecorder.prototype, "endForReset");
+    const resume = vi.spyOn(SessionRecorder.prototype, "resumeAfterReset");
+    let confirm: () => void = () => undefined;
+    resetResponse = () =>
+      new Promise<Response>((resolve) => {
+        confirm = () => resolve(new Response(null, { status: 204 }));
+      });
     const recording = createAnalytics({ ...quiet, enableSessionRecording: true });
     instances.push(recording);
-    const other = createAnalytics(quiet);
-    instances.push(other);
-    expect(restart).not.toHaveBeenCalled();
 
-    // Signing out on the same page, through either tracker.
-    await recording.reset();
-    expect(restart).toHaveBeenCalledTimes(1);
-    await other.reset();
-    expect(restart).toHaveBeenCalledTimes(2);
+    const pending = recording.reset();
+    expect(end).toHaveBeenCalledTimes(1);
+    expect(resume).not.toHaveBeenCalled();
+    confirm();
+    await pending;
+    expect(resume).toHaveBeenCalledTimes(1);
   });
 
-  it("stops listening once the instance is destroyed", async () => {
-    const restart = vi.spyOn(SessionRecorder.prototype, "restart");
+  it("starts no new replay when the server did not confirm the reset", async () => {
+    const resume = vi.spyOn(SessionRecorder.prototype, "resumeAfterReset");
+    resetResponse = async () => new Response(null, { status: 503 });
     const recording = createAnalytics({ ...quiet, enableSessionRecording: true });
-    recording.destroy();
+    instances.push(recording);
+    await expect(recording.reset()).rejects.toThrow(/503/);
+    expect(resume).not.toHaveBeenCalled();
+  });
+
+  it("follows a reset from another instance, and stops listening once destroyed", async () => {
+    const end = vi.spyOn(SessionRecorder.prototype, "endForReset");
+    const recording = createAnalytics({ ...quiet, enableSessionRecording: true });
     const other = createAnalytics(quiet);
     instances.push(other);
     await other.reset();
-    expect(restart).not.toHaveBeenCalled();
+    expect(end).toHaveBeenCalledTimes(1);
+    recording.destroy();
+    await other.reset();
+    expect(end).toHaveBeenCalledTimes(1);
   });
 });
 
-describe("SessionRecorder.restart", () => {
+describe("SessionRecorder across a reset", () => {
   afterEach(() => {
+    vi.unstubAllGlobals();
     vi.restoreAllMocks();
   });
 
-  it("stops the replay and starts a new one when recording was on", () => {
+  it("resumes only a recording endForReset stopped", () => {
     const recorder = new SessionRecorder({ enabled: false });
-    const stop = vi.spyOn(recorder, "stop");
     const start = vi.spyOn(recorder, "start").mockImplementation(() => undefined);
-
-    recorder.restart();
-    expect(stop).toHaveBeenCalledTimes(1);
+    recorder.endForReset();
+    recorder.resumeAfterReset();
     expect(start).not.toHaveBeenCalled();
 
     (recorder as unknown as { enabled: boolean }).enabled = true;
-    recorder.restart();
-    expect(stop).toHaveBeenCalledTimes(2);
+    recorder.endForReset();
+    recorder.resumeAfterReset();
+    recorder.resumeAfterReset();
     expect(start).toHaveBeenCalledTimes(1);
+  });
+
+  it("never sends an undelivered batch of the ended replay under the next one", async () => {
+    // The final upload of the ended replay fails: no beacon, and fetch rejects.
+    vi.stubGlobal("navigator", { userAgent: "test", language: "en", sendBeacon: () => false });
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new TypeError("offline")));
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const recorder = new SessionRecorder({ enabled: false });
+    const internal = recorder as unknown as {
+      enabled: boolean;
+      sessionInitialized: boolean;
+      sessionId: string;
+      pending: unknown[];
+      claimBatch(): { events: unknown[] } | null;
+    };
+    const oldEvent = { type: 3, timestamp: 1, data: { source: 0 } };
+    internal.enabled = true;
+    internal.sessionInitialized = true;
+    internal.sessionId = "replay-of-the-signed-out-visitor";
+    internal.pending = [oldEvent];
+
+    recorder.endForReset();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    // The next visitor's replay.
+    const newEvent = { type: 3, timestamp: 2, data: { source: 1 } };
+    internal.sessionInitialized = true;
+    internal.sessionId = "replay-of-the-next-visitor";
+    internal.pending = [newEvent];
+    expect(internal.claimBatch()?.events).toEqual([newEvent]);
   });
 });
