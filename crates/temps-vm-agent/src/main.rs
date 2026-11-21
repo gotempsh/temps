@@ -18,6 +18,13 @@ mod agent;
 #[cfg(target_os = "linux")]
 fn main() {
     std::hint::black_box(&temps_vm_agent::BUILD_MARKER);
+    // PID 1 re-executes itself as the sandbox user for a write into that
+    // user's files (`agent::as_sandbox_user`); that child does one
+    // operation and exits.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some(temps_vm_agent::sandbox_user::AS_USER_FLAG) {
+        std::process::exit(agent::run_as_user(&args[1..]));
+    }
     agent::run();
 }
 

@@ -13,6 +13,7 @@ pub mod docker_network_isolation;
 pub mod driver;
 pub mod facade;
 pub mod fc_launcher;
+mod fc_sandbox_user;
 pub mod firecracker;
 pub mod git_credential_bundle;
 pub mod guest_agent_build;
