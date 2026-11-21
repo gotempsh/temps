@@ -23,7 +23,10 @@ use temps_core::{AuditLogger, DateTime, RequestMetadata};
 use utoipa::OpenApi;
 
 use super::audit::{StatusPageMutationAction, StatusPageMutationAudit};
-use super::public::{__path_get_public_status_page, __path_get_public_status_page_json};
+use super::public::{
+    __path_get_public_status_page, __path_get_public_status_page_feed,
+    __path_get_public_status_page_json, __path_unlock_public_status_page,
+};
 use super::status_pages::{
     __path_add_status_page_domain, __path_create_status_page, __path_delete_status_page,
     __path_get_status_page, __path_list_status_page_domains, __path_list_status_pages,
@@ -38,12 +41,12 @@ use super::status_pages::{
 use crate::services::public_pages::{
     AddStatusPageDomainRequest, CreateStatusPageRequest, DnsRecordInstruction,
     PublicComponentStatus, PublicDayStatus, PublicIncident, PublicIncidentSeverity,
-    PublicIncidentStatus, PublicIncidentUpdate, PublicStatusComponent, PublicStatusPageResponse,
-    PublicUptimeDay, StatusPageAppearance, StatusPageAppearanceInput, StatusPageDomainResponse,
-    StatusPageDomainService, StatusPageDomainStatus, StatusPageListResponse,
-    StatusPageMonitorInput, StatusPageMonitorResponse, StatusPagePreviewResponse,
-    StatusPageProject, StatusPageResponse, StatusPageTheme, UpdateStatusPageRequest,
-    VerificationMethod,
+    PublicIncidentStatus, PublicIncidentUpdate, PublicMaintenance, PublicMaintenanceStatus,
+    PublicStatusComponent, PublicStatusPageResponse, PublicUptimeDay, StatusPageAppearance,
+    StatusPageAppearanceInput, StatusPageDomainResponse, StatusPageDomainService,
+    StatusPageDomainStatus, StatusPageListResponse, StatusPageMonitorInput,
+    StatusPageMonitorResponse, StatusPagePreviewResponse, StatusPageProject, StatusPageResponse,
+    StatusPageTheme, UpdateStatusPageRequest, VerificationMethod,
 };
 use crate::services::{
     CreateIncidentRequest, CreateMonitorRequest, CurrentStatusResponse, IncidentBucketedResponse,
@@ -104,6 +107,8 @@ pub trait StatusPageAppState: Send + Sync + 'static {
         remove_status_page_domain,
         get_public_status_page,
         get_public_status_page_json,
+        get_public_status_page_feed,
+        unlock_public_status_page,
     ),
     components(
         schemas(
@@ -144,6 +149,8 @@ pub trait StatusPageAppState: Send + Sync + 'static {
             PublicIncidentSeverity,
             PublicIncidentStatus,
             PublicIncidentUpdate,
+            PublicMaintenance,
+            PublicMaintenanceStatus,
             AddStatusPageDomainRequest,
             StatusPageDomainResponse,
             StatusPageDomainStatus,
@@ -1520,6 +1527,7 @@ where
 pub(crate) fn map_error(error: StatusPageError) -> Problem {
     match error {
         StatusPageError::NotFound => not_found().detail("Resource not found").build(),
+        StatusPageError::TargetMonitor(error) => Problem::from(error),
         error @ (StatusPageError::StatusPageNotFound { .. }
         | StatusPageError::IncidentUpdateNotFound { .. }
         | StatusPageError::IncidentNotFound { .. }

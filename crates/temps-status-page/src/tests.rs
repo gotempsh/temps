@@ -1133,8 +1133,13 @@ mod integration_tests {
         }
 
         let job_queue: Arc<dyn JobQueue> = Arc::new(MockJobQueue);
-        let health_check_service = HealthCheckService::new(db.clone(), config_service, job_queue)
-            .expect("test HTTP client should build");
+        let health_check_service = HealthCheckService::new(
+            db.clone(),
+            config_service,
+            job_queue,
+            crate::services::health_check_service::test_target_checks(),
+        )
+        .expect("test HTTP client should build");
 
         // Initialize monitors for all environments
         health_check_service.initialize_monitors().await.unwrap();

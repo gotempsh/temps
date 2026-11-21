@@ -758,6 +758,61 @@ impl IngestLimiter {
         }
     }
 
+    /// Decide a whole batch at once, at `now`: every line is admitted or none
+    /// is (ADR 108 D1, the HTTP log ingest endpoint).
+    ///
+    /// A collector that gets a `429` retries the batch, so storing part of
+    /// one and refusing the rest would duplicate the stored part on retry.
+    /// The bucket runs on arrival time here, never on the timestamps inside
+    /// the batch: those are written by the client, and a client choosing
+    /// timestamps far apart would otherwise refill its own budget.
+    ///
+    /// Like [`Self::admit`], a batch larger than a full bucket passes when
+    /// the bucket is full and leaves it in debt, so an oversized batch is
+    /// delayed rather than refused forever. A refused batch consumes nothing
+    /// and is counted as dropped lines, which is what lists the key on the
+    /// pipeline status page.
+    pub fn admit_batch(&mut self, lines: u64, bytes: u64, now: DateTime<Utc>) -> Admission {
+        let now_ms = now.timestamp_millis();
+        self.advance_window(now_ms);
+        self.refill(now_ms);
+
+        let limits = self.bucket.limits;
+        let lines_limited = limits.lines_per_sec > 0;
+        let bytes_limited = limits.bytes_per_sec > 0;
+        let lines_needed = (lines as f64).min(capacity(u64::from(limits.lines_per_sec)));
+        let bytes_needed = (bytes as f64).min(capacity(limits.bytes_per_sec));
+        let reason = if lines_limited && self.bucket.line_tokens < lines_needed {
+            Some(IngestDropReason::LinesPerSec)
+        } else if bytes_limited && self.bucket.byte_tokens < bytes_needed {
+            Some(IngestDropReason::BytesPerSec)
+        } else {
+            None
+        };
+
+        if let Some(window) = self.bucket.window.as_mut() {
+            window.lines += lines;
+            window.bytes += bytes;
+            window.last_ts = Some(window.last_ts.map_or(now, |last| last.max(now)));
+        }
+
+        match reason {
+            None => {
+                if lines_limited {
+                    self.bucket.line_tokens -= lines as f64;
+                }
+                if bytes_limited {
+                    self.bucket.byte_tokens -= bytes as f64;
+                }
+                Admission::Admit
+            }
+            Some(reason) => {
+                self.record_drops(lines, bytes, reason);
+                Admission::Drop(reason)
+            }
+        }
+    }
+
     /// The summary line for the last window that dropped lines, once. Write
     /// it alongside the stream's lines so the gap is explained where it is
     /// seen; it is not counted against the budget.
@@ -852,8 +907,12 @@ impl IngestLimiter {
     }
 
     fn record_drop(&mut self, bytes: u64, reason: IngestDropReason) {
+        self.record_drops(1, bytes, reason);
+    }
+
+    fn record_drops(&mut self, lines: u64, bytes: u64, reason: IngestDropReason) {
         let stats = &self.stats;
-        stats.dropped_lines.fetch_add(1, Ordering::Relaxed);
+        stats.dropped_lines.fetch_add(lines, Ordering::Relaxed);
         stats.dropped_bytes.fetch_add(bytes, Ordering::Relaxed);
         stats.last_reason.store(reason.code(), Ordering::Relaxed);
         let Some(window) = self.bucket.window.as_mut() else {
@@ -882,7 +941,7 @@ impl IngestLimiter {
                 );
             }
         }
-        window.dropped_lines += 1;
+        window.dropped_lines += lines;
         window.dropped_bytes += bytes;
         window.reason = Some(reason);
     }
@@ -1037,6 +1096,66 @@ mod tests {
             }
         }
         admitted
+    }
+
+    // ── Whole-batch admission (ADR 108 D1, HTTP log ingest) ────────────
+
+    #[test]
+    fn a_batch_within_the_budget_is_admitted_whole_and_consumes_it() {
+        // 100 lines/s with a 10 s burst: 1,000 lines fit in a full bucket.
+        let budget = budget(100, 0);
+        let mut limiter = budget.limiter(source("ingest-key-1"));
+        assert_eq!(limiter.admit_batch(600, 6_000, t0()), Admission::Admit);
+        // 400 tokens left, so a second batch of 600 at the same instant is
+        // refused whole, never split.
+        assert_eq!(
+            limiter.admit_batch(600, 6_000, t0()),
+            Admission::Drop(IngestDropReason::LinesPerSec)
+        );
+        assert_eq!(limiter.admit_batch(400, 4_000, t0()), Admission::Admit);
+    }
+
+    #[test]
+    fn a_refused_batch_consumes_nothing_and_is_counted_as_dropped() {
+        let budget = budget(10, 0);
+        let mut limiter = budget.limiter(source("ingest-key-2"));
+        assert_eq!(limiter.admit_batch(100, 1_000, t0()), Admission::Admit);
+        assert_eq!(
+            limiter.admit_batch(5, 50, t0()),
+            Admission::Drop(IngestDropReason::LinesPerSec)
+        );
+        // One second later ten tokens have come back: the refused batch did
+        // not spend any of them.
+        let later = at(t0(), Duration::from_secs(1));
+        assert_eq!(limiter.admit_batch(10, 100, later), Admission::Admit);
+        // The drop lists the key on the pipeline page with its count.
+        let throttled = budget.throttled_sources();
+        assert_eq!(throttled.len(), 1);
+        assert_eq!(throttled[0].container_id, "ingest-key-2");
+        assert_eq!(throttled[0].dropped_lines, 5);
+    }
+
+    #[test]
+    fn a_batch_over_the_byte_budget_is_refused_for_bytes() {
+        let budget = budget(0, 1_000);
+        let mut limiter = budget.limiter(source("ingest-key-3"));
+        assert_eq!(limiter.admit_batch(1, 9_000, t0()), Admission::Admit);
+        assert_eq!(
+            limiter.admit_batch(1, 2_000, t0()),
+            Admission::Drop(IngestDropReason::BytesPerSec)
+        );
+    }
+
+    #[test]
+    fn an_unlimited_budget_admits_any_batch() {
+        let budget = budget(0, 0);
+        let mut limiter = budget.limiter(source("ingest-key-4"));
+        for _ in 0..10 {
+            assert_eq!(
+                limiter.admit_batch(10_000, 10_000_000, t0()),
+                Admission::Admit
+            );
+        }
     }
 
     // The acceptance case: a container logging 1,000 lines/s against a

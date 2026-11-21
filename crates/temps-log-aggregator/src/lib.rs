@@ -24,6 +24,7 @@ pub mod chunk;
 pub mod error;
 pub mod handlers;
 pub mod index;
+pub mod ingest;
 pub mod parser;
 pub mod plugin;
 pub mod services;

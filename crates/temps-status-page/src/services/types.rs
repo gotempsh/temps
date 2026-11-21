@@ -18,6 +18,8 @@ pub enum StatusPageError {
     },
     #[error("Not found")]
     NotFound,
+    #[error(transparent)]
+    TargetMonitor(#[from] crate::services::checks::TargetMonitorError),
     #[error("Validation error: {0}")]
     Validation(String),
     #[error("Invalid request: {0}")]
@@ -288,6 +290,19 @@ pub struct MonitorResponse {
     pub monitor_type: String,
     pub check_path: Option<String>,
     pub monitor_url: String, // The URL being monitored (constructed from environment)
+    /// `environment` for a monitor of a Temps environment, otherwise the
+    /// check run against `check.target` (ADR 108 D3, D4).
+    pub check_kind: crate::services::checks::MonitorCheckKind,
+    /// How a monitor outside Temps is checked; `null` for an environment
+    /// monitor.
+    pub check: Option<crate::services::checks::MonitorCheckView>,
+    /// Also checked from worker nodes; down only when most locations agree
+    /// (ADR 108 D5).
+    pub probe_from_nodes: bool,
+    /// What each location reported on the latest check; `null` for a
+    /// monitor checked from the control plane only, or not checked since
+    /// its last change.
+    pub location_results: Option<crate::services::checks::MonitorLocationResults>,
     pub check_interval_seconds: i32,
     pub is_active: bool,
     /// When the scheduler will next probe this monitor. Read-only: it is
@@ -545,7 +560,18 @@ impl From<temps_entities::status_monitors::Model> for MonitorResponse {
             name: model.name,
             monitor_type: model.monitor_type,
             check_path: model.check_path,
-            monitor_url: String::new(), // Will be populated by service layer
+            // Environment monitors get theirs from the service layer.
+            monitor_url: model.target.clone().unwrap_or_default(),
+            check_kind: crate::services::checks::MonitorCheckKind::from_stored(&model.check_kind),
+            check: crate::services::checks::MonitorCheckView::from_row(
+                crate::services::checks::MonitorCheckKind::from_stored(&model.check_kind),
+                model.target.as_deref(),
+                model.check_spec.as_ref(),
+            ),
+            probe_from_nodes: model.probe_from_nodes,
+            location_results: model
+                .location_results
+                .and_then(|json| serde_json::from_value(json).ok()),
             check_interval_seconds: model.check_interval_seconds,
             is_active: model.is_active,
             next_check_at: model.next_check_at,

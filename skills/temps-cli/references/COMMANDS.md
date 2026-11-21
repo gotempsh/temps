@@ -3818,6 +3818,9 @@ Manage uptime monitors for status pages
 
 - `list` (`ls`) - List all monitors for a project
 - `create` (`add`) - Create a new monitor for a project
+- `add-target` - Monitor a URL, port, TLS certificate or DNS record outside Temps
+- `update-target` - Change a monitor of a target outside Temps; omitted flags keep their value
+- `locations` - List where monitors checked from worker nodes are checked from
 - `show` - Show monitor details and current status
 - `remove` (`rm`) - Delete a monitor
 - `status` - Get current status — all monitors for a project, or a single monitor by ID
@@ -3849,6 +3852,73 @@ Create a new monitor for a project
 | `--check-path <path>` | HTTP health-check path (must start with "/", e.g. /api/healthz). Defaults to "/" for HTTP monitors. | - | No |
 | `--environment-id <id>` | Environment ID (default: 0 for production) | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
+
+### `monitors add-target`
+
+Monitor a URL, port, TLS certificate or DNS record outside Temps
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--kind <kind>` | http, tcp, tls or dns | - | Yes |
+| `--target <target>` | URL (http), host:port (tcp, tls) or host name (dns) | - | Yes |
+| `-n, --name <name>` | Monitor name | - | Yes |
+| `-i, --interval <seconds>` | Check interval in seconds (default 60, at least 30) | - | No |
+| `--keyword-absent` | Fail when --keyword is present instead of missing | - | No |
+| `--from-nodes` | Also check from online worker nodes; down only when most locations agree | - | No |
+| `--method <method>` | HTTP method (default GET) | - | No |
+| `--expect-status <codes>` | Codes or classes counted as up, e.g. 200,204 or 2xx (default 2xx or 3xx) | - | No |
+| `--keyword <text>` | Text the response body must contain (first 256 KiB; never stored) | - | No |
+| `--degraded-after-ms <ms>` | Slower than this is degraded (http, tcp) | - | No |
+| `--warn-days <days>` | Degraded when the certificate expires within this many days (tls, default 14) | - | No |
+| `--record <type>` | DNS record type: A, AAAA, CNAME, MX, TXT, NS (default A) | - | No |
+| `--expect <values>` | Comma-separated DNS values; any match is up (default: any answer) | - | No |
+| `--header-file <path>` | File of "Name: value" request headers; stored encrypted, never shown | - | No |
+| `--body-file <path>` | File with the request body; stored encrypted | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `monitors update-target`
+
+Change a monitor of a target outside Temps; omitted flags keep their value
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--monitor-id <id>` | Monitor ID | - | Yes |
+| `--kind <kind>` | Change the check kind (pass the check flags for it) | - | No |
+| `--target <target>` | New target | - | No |
+| `-n, --name <name>` | New name | - | No |
+| `-i, --interval <seconds>` | Check interval in seconds | - | No |
+| `--keyword-absent` | Fail when --keyword is present instead of missing | - | No |
+| `--pause` | Stop checking | - | No |
+| `--resume` | Start checking again | - | No |
+| `--from-nodes` | Also check from online worker nodes | - | No |
+| `--no-from-nodes` | Check from this server only | - | No |
+| `--method <method>` | HTTP method (default GET) | - | No |
+| `--expect-status <codes>` | Codes or classes counted as up, e.g. 200,204 or 2xx (default 2xx or 3xx) | - | No |
+| `--keyword <text>` | Text the response body must contain (first 256 KiB; never stored) | - | No |
+| `--degraded-after-ms <ms>` | Slower than this is degraded (http, tcp) | - | No |
+| `--warn-days <days>` | Degraded when the certificate expires within this many days (tls, default 14) | - | No |
+| `--record <type>` | DNS record type: A, AAAA, CNAME, MX, TXT, NS (default A) | - | No |
+| `--expect <values>` | Comma-separated DNS values; any match is up (default: any answer) | - | No |
+| `--header-file <path>` | File of "Name: value" request headers; stored encrypted, never shown | - | No |
+| `--body-file <path>` | File with the request body; stored encrypted | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `monitors locations`
+
+List where monitors checked from worker nodes are checked from
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
 
 ### `monitors show`
 
@@ -7630,6 +7700,8 @@ Search collected logs across every project and database you can access
 - `histogram` - Line counts bucketed over time, optionally split by a label or attribute (requires the ClickHouse line index)
 - `aggregate` - Group-by aggregation over lines (requires the ClickHouse line index)
 - `capabilities` - Whether container logs are being collected, and whether attribute facets, histograms and aggregates are available
+- `saved` - Saved log searches: named filters you can reopen, chart on a dashboard and alert on
+- `keys` - Ingest keys for POST /api/logs/ingest (newline-delimited JSON from Vector, Fluent Bit or any HTTP client)
 
 ### `logs search`
 
@@ -7779,6 +7851,127 @@ Whether container logs are being collected, and whether attribute facets, histog
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--json` | Output in JSON format | - | No |
+
+### `logs saved`
+
+Saved log searches: named filters you can reopen, chart on a dashboard and alert on
+
+**Subcommands:**
+
+- `list` - List the saved searches of a project, pinned first
+- `create` - Save a log search
+- `delete` - Delete a saved search (refused while an alert rule counts it)
+- `series` - Chart a saved search over time: matching lines per bucket, or a numeric field
+
+#### `logs saved list`
+
+List the saved searches of a project, pinned first
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project <slug|id>` | Project (defaults to the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `logs saved create`
+
+Save a log search
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--name <name>` | Name, unique within the project | - | Yes |
+| `--project <slug|id>` | Project (defaults to the linked project) | - | No |
+| `--description <text>` | What the search is for | - | No |
+| `--source <kind>` | collected (default), application, or service | - | No |
+| `--level <level>` | Log level, repeatable | `` | No |
+| `--env <name>` | Environment, repeatable | `` | No |
+| `--service <name>` | Service label, repeatable | `` | No |
+| `--container <id>` | Container id, repeatable | `` | No |
+| `--node <id>` | Node id, repeatable | `` | No |
+| `--deploy <id>` | Deployment id | - | No |
+| `--text <needle>` | Text the message must contain | - | No |
+| `--attr <predicate>` | Attribute predicate, repeatable: key=value, key!=value, key^=prefix, key>n, key<n, key? | `` | No |
+| `--time-range <range>` | Range the search opens with: 15m, 1h, 6h, 24h, 7d, 30d (default 1h) | - | No |
+| `--pinned` | Pin it to the top of the list | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `logs saved delete`
+
+Delete a saved search (refused while an alert rule counts it)
+
+**Usage:** `logs saved delete <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project <slug|id>` | Project (defaults to the linked project) | - | No |
+
+#### `logs saved series`
+
+Chart a saved search over time: matching lines per bucket, or a numeric field
+
+**Usage:** `logs saved series <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project <slug|id>` | Project (defaults to the linked project) | - | No |
+| `--since <duration>` | Window ending now, e.g. 30m, 6h, 1d (default 1h) | - | No |
+| `--bucket-secs <n>` | Bucket width in seconds (default 60) | - | No |
+| `--metric <spec>` | count (default), or avg\|sum\|max\|p50\|p95\|p99\|count_distinct:<attribute> | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `logs keys`
+
+Ingest keys for POST /api/logs/ingest (newline-delimited JSON from Vector, Fluent Bit or any HTTP client)
+
+**Subcommands:**
+
+- `list` - List the ingest keys of a project
+- `create` - Create an ingest key; the key is printed once
+- `revoke` - Revoke an ingest key; collectors using it are refused
+
+#### `logs keys list`
+
+List the ingest keys of a project
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project <slug|id>` | Project (defaults to the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `logs keys create`
+
+Create an ingest key; the key is printed once
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--name <name>` | Name, e.g. the host or collector | - | Yes |
+| `--project <slug|id>` | Project (defaults to the linked project) | - | No |
+| `--service <name>` | Service label for lines that name none | - | No |
+| `--environment <id>` | Pin lines to an environment id | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `logs keys revoke`
+
+Revoke an ingest key; collectors using it are refused
+
+**Usage:** `logs keys revoke <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project <slug|id>` | Project (defaults to the linked project) | - | No |
 
 ## `email-domains` (alias: `edom`)
 
@@ -8146,6 +8339,11 @@ Publish public status pages showing monitors from any of your projects
 - `rotate-url` - Replace the public URL; the old one stops working
 - `delete` (`rm`) - Delete a status page; its public URL returns 404 immediately
 - `domains` (`domain`) - Serve a status page on your own hostname
+- `subscriptions` - Let visitors subscribe to a status page by email
+- `subscribers` - List, export or delete the subscribers of a status page
+- `maintenance` - Schedule maintenance windows: shown on the page, no outage alerts, no downtime counted
+- `webhooks` - Post every public update of a status page to signed HTTPS webhooks
+- `password` - Protect a status page with a password
 
 ### `status-pages list` (alias: `ls`)
 
@@ -8313,6 +8511,251 @@ Detach a hostname; it answers 404 immediately and its certificate is deleted
 | `--id <id>` | Status page ID | - | Yes |
 | `--domain-id <id>` | Custom domain ID (see `domains list`) | - | Yes |
 | `-y, --yes` | Skip the confirmation prompt | - | No |
+
+### `status-pages subscriptions`
+
+Let visitors subscribe to a status page by email
+
+**Subcommands:**
+
+- `show` - Show whether visitors can subscribe, the sender and what is missing
+- `set` - Switch subscriptions on or off, or set the sender address
+
+#### `status-pages subscriptions show`
+
+Show whether visitors can subscribe, the sender and what is missing
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Status page ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `status-pages subscriptions set`
+
+Switch subscriptions on or off, or set the sender address
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Status page ID | - | Yes |
+| `--enable` | Show the subscribe form on the public page | - | No |
+| `--disable` | Hide the subscribe form and stop sending | - | No |
+| `--sender <address>` | From address at a verified email domain ("" clears it) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `status-pages subscribers`
+
+List, export or delete the subscribers of a status page
+
+**Subcommands:**
+
+- `list` (`ls`) - List subscribers, newest first
+- `export` - Export every subscriber as CSV (email,state,subscribed_at,confirmed_at)
+- `delete` (`rm`) - Delete a subscriber; the address gets no more mail
+
+#### `status-pages subscribers list` (alias: `ls`)
+
+List subscribers, newest first
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Status page ID | - | Yes |
+| `--page <n>` | Page number | `1` | No |
+| `--page-size <n>` | Items per page (max 100) | `20` | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `status-pages subscribers export`
+
+Export every subscriber as CSV (email,state,subscribed_at,confirmed_at)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Status page ID | - | Yes |
+| `-o, --output <file>` | Write to a file instead of standard output | - | No |
+
+#### `status-pages subscribers delete` (alias: `rm`)
+
+Delete a subscriber; the address gets no more mail
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Status page ID | - | Yes |
+| `--subscriber-id <id>` | Subscriber ID (see `subscribers list`) | - | Yes |
+| `-y, --yes` | Skip the confirmation prompt | - | No |
+
+### `status-pages maintenance`
+
+Schedule maintenance windows: shown on the page, no outage alerts, no downtime counted
+
+**Subcommands:**
+
+- `list` (`ls`) - List maintenance windows, newest first
+- `schedule` - Schedule a window; subscribers and webhooks are told once
+- `update` - Change a window; once it has started only the title, description and end can change
+- `cancel` - Cancel a scheduled window, or end a running one now
+
+#### `status-pages maintenance list` (alias: `ls`)
+
+List maintenance windows, newest first
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Status page ID | - | Yes |
+| `--page <n>` | Page number | `1` | No |
+| `--page-size <n>` | Items per page (max 100) | `20` | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `status-pages maintenance schedule`
+
+Schedule a window; subscribers and webhooks are told once
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Status page ID | - | Yes |
+| `--title <title>` | Public title (at most 120 characters) | - | Yes |
+| `--description <text>` | Public description (at most 2000 characters) | - | No |
+| `--starts <when>` | now, or an ISO 8601 date with a zone | - | Yes |
+| `--ends <when>` | ISO 8601 date with a zone | - | No |
+| `--duration <span>` | Instead of --ends: 90m, 2h, 1d (at most 7d) | - | No |
+| `--monitor <id>` | Monitor on this page the window covers (repeat, or comma-separate) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `status-pages maintenance update`
+
+Change a window; once it has started only the title, description and end can change
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Status page ID | - | Yes |
+| `--maintenance-id <id>` | Maintenance ID (see `maintenance list`) | - | Yes |
+| `--title <title>` | Public title | - | No |
+| `--description <text>` | Public description ("" removes it) | - | No |
+| `--starts <when>` | now, or an ISO 8601 date with a zone | - | No |
+| `--ends <when>` | ISO 8601 date with a zone | - | No |
+| `--duration <span>` | With --starts, instead of --ends: 90m, 2h, 1d | - | No |
+| `--monitor <id>` | Replace the covered monitors (repeat, or comma-separate) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `status-pages maintenance cancel`
+
+Cancel a scheduled window, or end a running one now
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Status page ID | - | Yes |
+| `--maintenance-id <id>` | Maintenance ID (see `maintenance list`) | - | Yes |
+| `-y, --yes` | Skip the confirmation prompt | - | No |
+
+### `status-pages webhooks`
+
+Post every public update of a status page to signed HTTPS webhooks
+
+**Subcommands:**
+
+- `list` (`ls`) - List the webhooks of a status page and how deliveries are going
+- `add` - Add a webhook; its signing secret is printed once
+- `update` - Change the URL, or pause and resume deliveries
+- `remove` (`rm`) - Delete a webhook; events waiting for it are dropped
+
+#### `status-pages webhooks list` (alias: `ls`)
+
+List the webhooks of a status page and how deliveries are going
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Status page ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `status-pages webhooks add`
+
+Add a webhook; its signing secret is printed once
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Status page ID | - | Yes |
+| `--url <url>` | https:// URL with a public address | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `status-pages webhooks update`
+
+Change the URL, or pause and resume deliveries
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Status page ID | - | Yes |
+| `--webhook-id <id>` | Webhook ID (see `webhooks list`) | - | Yes |
+| `--url <url>` | New https:// URL | - | No |
+| `--enable` | Resume deliveries | - | No |
+| `--disable` | Pause deliveries; those still waiting are dropped | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `status-pages webhooks remove` (alias: `rm`)
+
+Delete a webhook; events waiting for it are dropped
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Status page ID | - | Yes |
+| `--webhook-id <id>` | Webhook ID (see `webhooks list`) | - | Yes |
+| `-y, --yes` | Skip the confirmation prompt | - | No |
+
+### `status-pages password`
+
+Protect a status page with a password
+
+**Subcommands:**
+
+- `show` - Show whether a status page is password-protected
+- `set` - Set or change the password (prompted, or read from stdin); signs every visitor out
+
+#### `status-pages password show`
+
+Show whether a status page is password-protected
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Status page ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `status-pages password set`
+
+Set or change the password (prompted, or read from stdin); signs every visitor out
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Status page ID | - | Yes |
+| `--password-stdin` | Read the password from the first line of stdin | - | No |
+| `--remove` | Remove the password and open the page again | - | No |
+| `--json` | Output in JSON format | - | No |
 
 ## `alarms` (alias: `alarm`)
 

@@ -32,12 +32,13 @@ use tracing::{debug, error, info, warn};
 use utoipa::ToSchema;
 
 use temps_alarms::{AlarmService, AlarmSeverity, AlarmStatus, AlarmType, FireAlarmRequest};
+use temps_core::log_series::{LogSeriesSample, LogSeriesSource};
 
 use crate::detectors::{
     AnomalyParams, BandModel, Comparator, DetectionConfig, StaticParams, DEFAULT_LOOKBACK_DAYS,
     MIN_BAND_SCALE, MIN_BASELINE_SAMPLES,
 };
-use crate::services::metric_alert_service::MetricAlertService;
+use crate::services::metric_alert_service::{AlertSeriesSource, MetricAlertService};
 use crate::services::OtelService;
 use crate::types::{MetricAggregation, MetricBucket, MetricQuery};
 use temps_entities::metric_alert_rules::Model as AlertRule;
@@ -516,6 +517,82 @@ fn humanize_static(
     )
 }
 
+/// How long rule `rule_id` has been breaching, updating its timer.
+///
+/// A confirmed non-breach clears the timer, so a later breach starts its
+/// `for_duration` from zero instead of inheriting the time since an earlier,
+/// interrupted one. Undecided samples never reach here (the caller keeps the
+/// state without deciding), so they leave the timer alone.
+fn track_breach(
+    starts: &mut HashMap<i32, Instant>,
+    rule_id: i32,
+    breaching: bool,
+    now: Instant,
+) -> u64 {
+    if breaching {
+        let start = starts.entry(rule_id).or_insert(now);
+        now.saturating_duration_since(*start).as_secs()
+    } else {
+        starts.remove(&rule_id);
+        0
+    }
+}
+
+/// Whether a line count breaches its threshold.
+///
+/// A saturated sample is a lower bound: the real count is at least
+/// `sample.count`. That is enough to say a count is above a threshold, but
+/// never that it is below one. `None` means undecided: a rule whose answer
+/// the lower bound cannot prove (any "fewer than", or a "more than" still
+/// under its threshold) keeps its state instead of raising a false alarm or
+/// resolving a real one while the count is incomplete.
+fn log_count_breaches(
+    comparator: Comparator,
+    sample: &LogSeriesSample,
+    threshold: f64,
+) -> Option<bool> {
+    let breaches = comparator.breaches(sample.count as f64, threshold);
+    if !sample.saturated {
+        return Some(breaches);
+    }
+    // A saturated count is a lower bound: the scan stopped at its cap or at
+    // the store's time/byte budget, and unscanned lines may add to it. It
+    // proves "more than" once it is past the threshold; it never proves
+    // "not more than", and it never proves "fewer than".
+    match comparator {
+        Comparator::Gt | Comparator::Gte if breaches => Some(true),
+        Comparator::Gt | Comparator::Gte | Comparator::Lt | Comparator::Lte => None,
+    }
+}
+
+/// One sentence for a log alert: how many lines matched, over what window,
+/// and which side of the threshold that is. Says explicitly when the count
+/// is a lower bound, so nobody reads a capped count as the real number.
+fn humanize_log(
+    sample: &LogSeriesSample,
+    comparator: Comparator,
+    threshold: f64,
+    window_secs: i64,
+) -> String {
+    let above = matches!(comparator, Comparator::Gt | Comparator::Gte);
+    let side = if above { "above" } else { "below" };
+    let counted = if sample.saturated {
+        format!("At least {}", fmt_compact(sample.count as f64))
+    } else {
+        fmt_compact(sample.count as f64)
+    };
+    let note = if sample.saturated {
+        " Counting stopped at the per-window cap, so this is a lower bound."
+    } else {
+        ""
+    };
+    format!(
+        "{counted} log lines matched the saved search {}, {side} the threshold of {}.{note}",
+        window_phrase(window_secs),
+        fmt_compact(threshold),
+    )
+}
+
 /// System prompt for the AI alert summary — constrain to one grounded sentence
 /// and forbid the two failure modes that would make a summary worse than the
 /// template: invented causes and invented numbers.
@@ -817,6 +894,37 @@ impl FireDetails {
         }
     }
 
+    /// A log alert's breach (ADR 108 D1). The payload names the saved
+    /// search by id, never the query text: an alarm is read by people who
+    /// can open the search, and a message needle can contain anything.
+    fn log_breach(rule: &AlertRule, sample: &LogSeriesSample, p: &StaticParams) -> Self {
+        let value = sample.count as f64;
+        FireDetails {
+            title: format!("Log alert: {}", rule.name),
+            message: humanize_log(
+                sample,
+                p.comparator,
+                p.threshold,
+                i64::from(rule.window_secs),
+            ),
+            metadata: json!({
+                "rule_id": rule.id,
+                "metric_name": rule.metric_name,
+                "aggregation": rule.aggregation,
+                "saved_search_id": rule.saved_search_id,
+                "value": value,
+                "lines_counted": sample.count,
+                "count_saturated": sample.saturated,
+                "threshold": p.threshold,
+                "comparator": p.comparator.symbol(),
+                "detection_kind": "static",
+                "window_secs": rule.window_secs,
+                "for_duration_secs": rule.for_duration_secs,
+                "source": "log_alert",
+            }),
+        }
+    }
+
     fn anomaly_breach(rule: &AlertRule, value: f64, p: &AnomalyParams, ev: &AnomalyEval) -> Self {
         let z = (value - ev.center) / ev.scale.max(MIN_BAND_SCALE);
         FireDetails {
@@ -963,6 +1071,49 @@ pub struct MetricAlertEvaluator {
     /// called inside a timeout on each fire and may replace the lead sentence,
     /// never block or fail the alert.
     ai: Option<Arc<dyn temps_ai::AiService>>,
+    /// ADR 108 D1: counts the lines a saved log search matches, for rules
+    /// whose source is `logs`. Provided by the log aggregator plugin.
+    ///
+    /// A `OnceLock` because the two plugins register independently: the
+    /// evaluator is built while the OTel plugin registers its services and
+    /// the counter may only be resolvable once every plugin has, so it is
+    /// filled in at most once, before the run loop is spawned. Unset means
+    /// no log rule can be evaluated in this process, and each tick says so
+    /// rather than treating the rule as healthy.
+    log_series: std::sync::OnceLock<Arc<dyn LogSeriesSource>>,
+    /// rule_id -> the `config_revision` the last tick evaluated. A different
+    /// revision means the rule was edited in a way that changes its verdict,
+    /// so a breach that started under the old configuration restarts.
+    seen_revision: Arc<RwLock<HashMap<i32, i64>>>,
+    /// rule_id -> the saved-search query fingerprint the last tick counted,
+    /// for log rules: editing the search's query restarts the breach too,
+    /// since the search lives outside the rule's own revision.
+    seen_log_query: Arc<RwLock<HashMap<i32, u64>>>,
+    /// alarm_id -> an alarm the evaluator decided to resolve but could not
+    /// (the database was unreachable, say). Its rule has already stopped
+    /// tracking it, so nothing else would close it: each cycle retries these
+    /// first. Bounded by the open alarms, which the per-rule series cap
+    /// bounds in turn.
+    pending_resolves: Arc<RwLock<HashMap<i32, PendingResolve>>>,
+}
+
+/// An alarm whose resolve failed, kept for [`MetricAlertEvaluator`] to retry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingResolve {
+    rule_id: i32,
+    project_id: i32,
+    /// A per-series alarm, resolved through the cooldown-free service.
+    per_series: bool,
+}
+
+/// Whether a rule still has the configuration a tick read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Currency {
+    Current,
+    /// Edited since: the tick's verdict is stale.
+    Changed,
+    /// The check itself failed; nothing is known either way.
+    Unknown,
 }
 
 impl MetricAlertEvaluator {
@@ -973,6 +1124,7 @@ impl MetricAlertEvaluator {
         alarm_service_dynamic: Arc<AlarmService>,
         db: Arc<sea_orm::DatabaseConnection>,
         ai: Option<Arc<dyn temps_ai::AiService>>,
+        log_series: Option<Arc<dyn LogSeriesSource>>,
     ) -> Self {
         Self {
             alert_service,
@@ -986,6 +1138,23 @@ impl MetricAlertEvaluator {
             baseline_cache: Arc::new(RwLock::new(HashMap::new())),
             db,
             ai,
+            log_series: match log_series {
+                Some(source) => std::sync::OnceLock::from(source),
+                None => std::sync::OnceLock::new(),
+            },
+            seen_revision: Arc::new(RwLock::new(HashMap::new())),
+            seen_log_query: Arc::new(RwLock::new(HashMap::new())),
+            pending_resolves: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Supply the log-line counter after construction (ADR 108 D1), for the
+    /// composition root that can only resolve it once every plugin has
+    /// registered. Ignored, with a warning, if one is already set: the
+    /// evaluator must not swap the series it counts mid-flight.
+    pub fn set_log_series(&self, source: Arc<dyn LogSeriesSource>) {
+        if self.log_series.set(source).is_err() {
+            warn!("A log series source is already set on the metric alert evaluator; keeping it");
         }
     }
 
@@ -1098,6 +1267,7 @@ impl MetricAlertEvaluator {
     /// `run()` loop's timer isn't test-friendly); production only calls it from
     /// within `run()`.
     pub async fn run_cycle(&self) -> Result<(), crate::error::OtelError> {
+        self.retry_pending_resolves().await;
         let rules = self.alert_service.list_enabled().await?;
         debug!(rule_count = rules.len(), "Evaluating metric alert rules");
 
@@ -1123,6 +1293,14 @@ impl MetricAlertEvaluator {
             .write()
             .await
             .retain(|(id, _), _| live.contains(id));
+        self.seen_revision
+            .write()
+            .await
+            .retain(|id, _| live.contains(id));
+        self.seen_log_query
+            .write()
+            .await
+            .retain(|id, _| live.contains(id));
 
         for rule in rules {
             let rule_id = rule.id;
@@ -1139,11 +1317,160 @@ impl MetricAlertEvaluator {
     /// set `group_by` runs the grouped path (collapse-to-max or, when
     /// `dynamic_alerts`, per-series). ADR-026 Phase 3.
     async fn evaluate_rule(&self, rule: AlertRule) -> Result<(), crate::error::OtelError> {
+        self.note_revision(&rule).await;
+        // A log rule counts lines instead of reducing a metric bucket, so it
+        // never reaches the metric query paths below (ADR 108 D1).
+        match AlertSeriesSource::from_columns(&rule.source, rule.saved_search_id) {
+            Some(AlertSeriesSource::Logs { saved_search_id }) => {
+                return self.evaluate_log_rule(rule, saved_search_id).await;
+            }
+            Some(AlertSeriesSource::Metric) => {}
+            None => {
+                // The two source columns disagree: skip loudly and preserve
+                // state rather than evaluating a series the rule did not ask
+                // for. `update` refuses such a rule until it is repaired.
+                error!(
+                    rule_id = rule.id,
+                    source = %rule.source,
+                    saved_search_id = ?rule.saved_search_id,
+                    "Alert rule has an unreadable series source; skipping it"
+                );
+                self.persist_unchanged(&rule, Utc::now()).await;
+                return Ok(());
+            }
+        }
         let (_, group_by) = rule_query_scope(&rule);
         if group_by.is_empty() {
             return self.evaluate_aggregate_rule(rule).await;
         }
         self.evaluate_grouped_rule(rule, group_by).await
+    }
+
+    /// Record that a rule was evaluated without changing its verdict.
+    ///
+    /// Used wherever a tick cannot produce an honest sample (no data, a
+    /// missing dependency, a corrupt row): the open alarm and the breach
+    /// timer are preserved, so a transient gap never resolves a real alert
+    /// and never fires a new one.
+    async fn persist_unchanged(&self, rule: &AlertRule, now: DateTime<Utc>) {
+        // Conditional like every tick's write: a snapshot read before the
+        // rule changed must not put its old state back.
+        if let Err(e) = self
+            .alert_service
+            .persist_evaluation_if_current(rule, &rule.last_state, rule.last_value, now)
+            .await
+        {
+            warn!(rule_id = rule.id, error = %e, "Failed to persist unchanged evaluation");
+        }
+    }
+
+    /// Evaluate a log alert (ADR 108 D1): count the lines the rule's saved
+    /// search matches in this window, then run the same static-threshold
+    /// decision the metric path runs.
+    ///
+    /// One bounded count per rule per tick. The counter never reads more
+    /// than its cap and reports a saturated sample as a lower bound, so a
+    /// busy project costs a bounded amount of work and can only ever
+    /// under-report a spike.
+    async fn evaluate_log_rule(
+        &self,
+        rule: AlertRule,
+        saved_search_id: i32,
+    ) -> Result<(), crate::error::OtelError> {
+        let now = Utc::now();
+        let Some(log_series) = self.log_series.get() else {
+            // Nothing can count lines in this process. Preserve state: the
+            // rule is not "ok", it is unevaluated.
+            warn!(
+                rule_id = rule.id,
+                saved_search_id,
+                "No log series source is registered; the log alert was not evaluated"
+            );
+            self.persist_unchanged(&rule, now).await;
+            return Ok(());
+        };
+
+        let window = chrono::Duration::seconds(i64::from(rule.window_secs.max(1)));
+        let sample = match log_series
+            .count_matching(rule.project_id, saved_search_id, now - window, now)
+            .await
+        {
+            Ok(sample) => sample,
+            Err(e) => {
+                // A deleted saved search or a storage failure: the rule
+                // cannot be judged this tick, so it keeps its state.
+                error!(
+                    rule_id = rule.id,
+                    saved_search_id,
+                    error = %e,
+                    "Counting a saved log search for an alert failed; state preserved"
+                );
+                self.persist_unchanged(&rule, now).await;
+                return Ok(());
+            }
+        };
+
+        self.note_log_query(rule.id, sample.query_fingerprint).await;
+        let value = sample.count as f64;
+        let config = DetectionConfig::from_value(&rule.detection_config)?;
+        let DetectionConfig::Static(params) = &config else {
+            // The service only accepts static detectors for log rules; a row
+            // that predates that is skipped rather than mis-evaluated.
+            debug!(
+                rule_id = rule.id,
+                kind = config.kind_str(),
+                "Skipping log alert: only static thresholds are evaluable"
+            );
+            self.persist_unchanged(&rule, now).await;
+            return Ok(());
+        };
+
+        let Some(breaching) = log_count_breaches(params.comparator, &sample, params.threshold)
+        else {
+            // A capped count cannot show it is below a threshold: keep the
+            // rule's state (and any open alarm) rather than decide either way.
+            debug!(
+                rule_id = rule.id,
+                saved_search_id,
+                count = sample.count,
+                "Log alert undecided: a capped count cannot establish a below-threshold breach"
+            );
+            self.persist_unchanged(&rule, now).await;
+            return Ok(());
+        };
+        // The count took a while; the saved search may have been edited
+        // meanwhile. A verdict reached under the old predicate must not fire,
+        // resolve, or start the new one's timer.
+        match log_series
+            .current_query_fingerprint(rule.project_id, saved_search_id)
+            .await
+        {
+            Ok(current) if current == sample.query_fingerprint => {}
+            Ok(current) => {
+                debug!(
+                    rule_id = rule.id,
+                    saved_search_id,
+                    "Saved log search edited while counting; discarding this tick's count"
+                );
+                self.note_log_query(rule.id, current).await;
+                self.persist_unchanged(&rule, now).await;
+                return Ok(());
+            }
+            Err(e) => {
+                warn!(
+                    rule_id = rule.id,
+                    saved_search_id,
+                    error = %e,
+                    "Could not confirm the saved log search is unchanged; state preserved"
+                );
+                self.persist_unchanged(&rule, now).await;
+                return Ok(());
+            }
+        }
+        let details = FireDetails::log_breach(&rule, &sample, params);
+        self.apply_decision(&rule, value, breaching, details, now)
+            .await;
+        Ok(())
     }
 
     /// The single-aggregate path (unchanged from before Phase 3): query the latest
@@ -1182,7 +1509,7 @@ impl MetricAlertEvaluator {
         let Some(latest) = buckets.last() else {
             if let Err(e) = self
                 .alert_service
-                .persist_evaluation(rule.id, &rule.last_state, rule.last_value, now)
+                .persist_evaluation_if_current(&rule, &rule.last_state, rule.last_value, now)
                 .await
             {
                 warn!(rule_id = rule.id, error = %e, "Failed to persist no-data evaluation");
@@ -1234,7 +1561,12 @@ impl MetricAlertEvaluator {
                     None => {
                         if let Err(e) = self
                             .alert_service
-                            .persist_evaluation(rule.id, &rule.last_state, rule.last_value, now)
+                            .persist_evaluation_if_current(
+                                rule,
+                                &rule.last_state,
+                                rule.last_value,
+                                now,
+                            )
                             .await
                         {
                             warn!(rule_id = rule.id, error = %e, "Failed to persist insufficient-baseline evaluation");
@@ -1254,7 +1586,7 @@ impl MetricAlertEvaluator {
                 );
                 if let Err(e) = self
                     .alert_service
-                    .persist_evaluation(rule.id, &rule.last_state, rule.last_value, now)
+                    .persist_evaluation_if_current(rule, &rule.last_state, rule.last_value, now)
                     .await
                 {
                     warn!(rule_id = rule.id, error = %e, "Failed to persist skipped evaluation");
@@ -1263,44 +1595,95 @@ impl MetricAlertEvaluator {
             }
         };
 
+        self.apply_decision(rule, value, breaching, fire_details, now)
+            .await;
+        Ok(())
+    }
+
+    /// The aggregate state machine: breach duration, transition, fire or
+    /// resolve, persist. Shared by the metric path and the log-count path
+    /// (ADR 108 D1) so both get identical `for_duration`, alarm and
+    /// persistence behaviour — a log alert is the same alert with a
+    /// different series.
+    async fn apply_decision(
+        &self,
+        rule: &AlertRule,
+        value: f64,
+        breaching: bool,
+        fire_details: FireDetails,
+        now: DateTime<Utc>,
+    ) {
         // Track breach duration (in-memory, approximated like temps-monitoring).
-        let breach_elapsed_secs = if breaching {
+        let breach_elapsed_secs = {
             let mut starts = self.breach_start.write().await;
-            let start = starts.entry(rule.id).or_insert_with(Instant::now);
-            start.elapsed().as_secs()
-        } else {
-            0
+            track_breach(&mut starts, rule.id, breaching, Instant::now())
         };
 
+        // An alarm this evaluator opened is firing even when the stored state
+        // says otherwise: a state write that failed after the alarm opened
+        // left "ok" behind, and deciding from it would never resolve that
+        // alarm (or would open a second one on the next breach).
+        let holds_alarm = self.firing.read().await.contains_key(&rule.id);
+        let previous_state = if holds_alarm {
+            "firing"
+        } else {
+            rule.last_state.as_str()
+        };
         let transition = evaluate_transition(
-            &rule.last_state,
+            previous_state,
             breaching,
             breach_elapsed_secs,
             rule.for_duration_secs.max(0) as u64,
         );
 
+        let fired = matches!(transition, AlertTransition::FireNow);
+        let resolving = matches!(transition, AlertTransition::Resolve);
         let next_state = match transition {
             AlertTransition::StayOk | AlertTransition::StartBreach => "ok",
             AlertTransition::StayFiring => "firing",
             AlertTransition::FireNow => {
+                // The series was read some time ago; page nobody with the
+                // verdict of a configuration that has since been edited.
+                if self.still_current(rule).await != Currency::Current {
+                    return;
+                }
                 self.fire(rule, fire_details).await;
                 "firing"
             }
-            AlertTransition::Resolve => {
-                self.resolve(rule.id, rule.project_id).await;
-                self.clear_breach(rule.id).await;
-                "ok"
-            }
+            // Resolved only once "ok" is stored for the revision this tick
+            // read (below): resolving first would leave a rule whose edit
+            // discards this write marked firing with no alarm behind it.
+            AlertTransition::Resolve => "ok",
         };
 
-        if let Err(e) = self
+        match self
             .alert_service
-            .persist_evaluation(rule.id, next_state, Some(value), now)
+            .persist_evaluation_if_current(rule, next_state, Some(value), now)
             .await
         {
-            warn!(rule_id = rule.id, error = %e, "Failed to persist rule evaluation");
+            Ok(true) => {
+                if resolving {
+                    self.resolve(rule.id, rule.project_id).await;
+                    self.clear_breach(rule.id).await;
+                }
+            }
+            Ok(false) => {
+                // The rule was edited while this tick read its series: its
+                // verdict is stale. An alarm it just opened answers a
+                // configuration the rule no longer has.
+                debug!(
+                    rule_id = rule.id,
+                    "Alert rule changed during evaluation; discarding this tick's decision"
+                );
+                if fired {
+                    self.resolve(rule.id, rule.project_id).await;
+                }
+                self.clear_breach(rule.id).await;
+            }
+            Err(e) => {
+                warn!(rule_id = rule.id, error = %e, "Failed to persist rule evaluation");
+            }
         }
-        Ok(())
     }
 
     /// The grouped path (ADR-026 Phase 3): query one series per distinct
@@ -1339,7 +1722,7 @@ impl MetricAlertEvaluator {
         let Some(latest_ts) = buckets.iter().map(|b| b.bucket).max() else {
             if let Err(e) = self
                 .alert_service
-                .persist_evaluation(rule.id, &rule.last_state, rule.last_value, now)
+                .persist_evaluation_if_current(&rule, &rule.last_state, rule.last_value, now)
                 .await
             {
                 warn!(rule_id = rule.id, error = %e, "Failed to persist no-data grouped evaluation");
@@ -1550,6 +1933,16 @@ impl MetricAlertEvaluator {
                 .remove(&(rule.id, ks));
         }
 
+        // The series were read some time ago; fire nothing for a
+        // configuration that has since been edited.
+        // A changed rule restarts its series' timers (`still_current` does
+        // that); a failed check only skips firing this tick, keeping them so
+        // the next tick fires on time.
+        if !to_fire.is_empty() && self.still_current(rule).await != Currency::Current {
+            return Ok(());
+        }
+        let mut fired_now: Vec<(String, i32)> = Vec::new();
+
         // Fire newly-breaching series. Notification grouping fallback: when more
         // than the rule's `grouped_notification_threshold` series fire in the same
         // tick, every series still gets its own alarm ROW (needed for per-series
@@ -1570,6 +1963,7 @@ impl MetricAlertEvaluator {
                         .await
                         .insert((rule.id, p.key_str.clone()), (p.key.clone(), alarm_id));
                     fired.push((p.label.clone(), p.value, alarm_id));
+                    fired_now.push((p.key_str.clone(), alarm_id));
                 }
             }
             if !fired.is_empty() {
@@ -1585,6 +1979,7 @@ impl MetricAlertEvaluator {
                         .write()
                         .await
                         .insert((rule.id, p.key_str.clone()), (p.key.clone(), alarm_id));
+                    fired_now.push((p.key_str.clone(), alarm_id));
                 }
             }
         }
@@ -1619,10 +2014,10 @@ impl MetricAlertEvaluator {
         let next_state = if any_firing { "firing" } else { "ok" };
         let series_states = serde_json::to_value(build_series_states(&kept, &final_firing))
             .unwrap_or_else(|_| json!({}));
-        if let Err(e) = self
+        match self
             .alert_service
-            .persist_dynamic_evaluation(
-                rule.id,
+            .persist_dynamic_evaluation_if_current(
+                rule,
                 next_state,
                 agg_value,
                 now,
@@ -1631,7 +2026,28 @@ impl MetricAlertEvaluator {
             )
             .await
         {
-            warn!(rule_id = rule.id, error = %e, "Failed to persist dynamic rule evaluation");
+            Ok(true) => {}
+            Ok(false) => {
+                // Edited between the check above and this write (switched to
+                // another source, say, after its alarms were resolved): the
+                // alarms this tick opened answer the old configuration, and
+                // nothing would evaluate them again. Resolve them and leave
+                // the state the edit wrote.
+                debug!(
+                    rule_id = rule.id,
+                    fired = fired_now.len(),
+                    "Dynamic alert rule changed during evaluation; discarding this tick"
+                );
+                for (key_str, alarm_id) in fired_now {
+                    self.resolve_series(rule.id, rule.project_id, alarm_id)
+                        .await;
+                    self.firing_series.write().await.remove(&(rule.id, key_str));
+                }
+                self.clear_series_breaches(rule.id).await;
+            }
+            Err(e) => {
+                warn!(rule_id = rule.id, error = %e, "Failed to persist dynamic rule evaluation");
+            }
         }
         Ok(())
     }
@@ -2164,23 +2580,83 @@ impl MetricAlertEvaluator {
     /// delete, where the row is about to disappear — resolving an alarm needs only
     /// the id and the project scope `AlarmService::resolve_alarm` enforces, not the
     /// metric/threshold fields.
+    ///
+    /// A resolve that fails is queued in `pending_resolves` and retried each
+    /// cycle, since the rule no longer tracks the alarm.
     async fn resolve(&self, rule_id: i32, project_id: i32) {
         let alarm_id = self.firing.write().await.remove(&rule_id);
         if let Some(alarm_id) = alarm_id {
-            if let Err(e) = self
-                .alarm_service
-                .resolve_alarm(alarm_id, Some(project_id))
-                .await
-            {
-                error!(
+            self.resolve_or_queue(
+                alarm_id,
+                PendingResolve {
                     rule_id,
+                    project_id,
+                    per_series: false,
+                },
+            )
+            .await;
+        }
+    }
+
+    /// Resolve `alarm_id`; on failure queue it for the next cycle. Returns
+    /// whether the alarm is now closed. An alarm that no longer exists counts
+    /// as closed: there is nothing left to resolve.
+    async fn resolve_or_queue(&self, alarm_id: i32, pending: PendingResolve) -> bool {
+        let service = if pending.per_series {
+            &self.alarm_service_dynamic
+        } else {
+            &self.alarm_service
+        };
+        match service
+            .resolve_alarm(alarm_id, Some(pending.project_id))
+            .await
+        {
+            Ok(()) => {
+                self.pending_resolves.write().await.remove(&alarm_id);
+                info!(
+                    rule_id = pending.rule_id,
                     alarm_id,
-                    error = %e,
-                    "Failed to resolve OTel metric alert"
+                    per_series = pending.per_series,
+                    "OTel metric alert resolved"
                 );
-            } else {
-                info!(rule_id, alarm_id, "OTel metric alert resolved");
+                true
             }
+            Err(temps_alarms::AlarmError::NotFound { .. }) => {
+                self.pending_resolves.write().await.remove(&alarm_id);
+                warn!(
+                    rule_id = pending.rule_id,
+                    alarm_id, "OTel metric alert to resolve no longer exists"
+                );
+                true
+            }
+            Err(e) => {
+                self.pending_resolves
+                    .write()
+                    .await
+                    .insert(alarm_id, pending);
+                error!(
+                    rule_id = pending.rule_id,
+                    alarm_id,
+                    per_series = pending.per_series,
+                    error = %e,
+                    "Failed to resolve OTel metric alert; retrying next cycle"
+                );
+                false
+            }
+        }
+    }
+
+    /// Retry every resolve that failed in an earlier cycle.
+    async fn retry_pending_resolves(&self) {
+        let pending: Vec<(i32, PendingResolve)> = self
+            .pending_resolves
+            .read()
+            .await
+            .iter()
+            .map(|(alarm_id, pending)| (*alarm_id, *pending))
+            .collect();
+        for (alarm_id, pending) in pending {
+            self.resolve_or_queue(alarm_id, pending).await;
         }
     }
 
@@ -2190,25 +2666,90 @@ impl MetricAlertEvaluator {
     /// as [`Self::resolve`] — so [`Self::resolve_all_for_rule`] can drive it on a
     /// delete where the row is disappearing.
     async fn resolve_series(&self, rule_id: i32, project_id: i32, alarm_id: i32) {
-        if let Err(e) = self
-            .alarm_service_dynamic
-            .resolve_alarm(alarm_id, Some(project_id))
-            .await
-        {
-            error!(
+        self.resolve_or_queue(
+            alarm_id,
+            PendingResolve {
                 rule_id,
-                alarm_id,
-                error = %e,
-                "Failed to resolve OTel per-series metric alert"
-            );
-        } else {
-            info!(rule_id, alarm_id, "OTel per-series metric alert resolved");
-        }
+                project_id,
+                per_series: true,
+            },
+        )
+        .await;
     }
 
     /// Drop any in-flight breach timer for a rule.
     async fn clear_breach(&self, rule_id: i32) {
         self.breach_start.write().await.remove(&rule_id);
+    }
+
+    /// Drop the breach timers of every series of `rule_id`.
+    async fn clear_series_breaches(&self, rule_id: i32) {
+        self.breach_start_series
+            .write()
+            .await
+            .retain(|(rid, _), _| *rid != rule_id);
+    }
+
+    /// Restart the rule's breach timers if it was edited since the last tick
+    /// in a way that changes its verdict (see `config_revision`): a breach
+    /// counted under the old threshold or series must not let the new one
+    /// fire before it has held for `for_duration` itself.
+    async fn note_revision(&self, rule: &AlertRule) {
+        let previous = self
+            .seen_revision
+            .write()
+            .await
+            .insert(rule.id, rule.config_revision);
+        if previous.is_some_and(|seen| seen != rule.config_revision) {
+            self.clear_breach(rule.id).await;
+            self.clear_series_breaches(rule.id).await;
+            // A baseline fetched for the old metric, filters or window would
+            // score the new configuration against the wrong history.
+            self.baseline_cache
+                .write()
+                .await
+                .retain(|(rid, _), _| *rid != rule.id);
+        }
+    }
+
+    /// The same for a log rule's saved search, whose query can be edited
+    /// without touching the rule.
+    async fn note_log_query(&self, rule_id: i32, fingerprint: u64) {
+        let previous = self
+            .seen_log_query
+            .write()
+            .await
+            .insert(rule_id, fingerprint);
+        if previous.is_some_and(|seen| seen != fingerprint) {
+            self.clear_breach(rule_id).await;
+        }
+    }
+
+    /// Whether `rule` still has the configuration this tick read. A stale
+    /// rule's breach timers (aggregate and per-series) restart. When the
+    /// check itself fails nothing fires this tick, but the timers are kept,
+    /// so the next tick can fire on time.
+    async fn still_current(&self, rule: &AlertRule) -> Currency {
+        match self.alert_service.is_current(rule).await {
+            Ok(true) => Currency::Current,
+            Ok(false) => {
+                debug!(
+                    rule_id = rule.id,
+                    "Alert rule changed during evaluation; not firing on the old configuration"
+                );
+                self.clear_breach(rule.id).await;
+                self.clear_series_breaches(rule.id).await;
+                Currency::Changed
+            }
+            Err(e) => {
+                warn!(
+                    rule_id = rule.id,
+                    error = %e,
+                    "Could not confirm the alert rule is unchanged; not firing this tick"
+                );
+                Currency::Unknown
+            }
+        }
     }
 
     /// Resolve every open alarm (aggregate or per-series) for a rule and drop its
@@ -2821,6 +3362,183 @@ mod tests {
         );
     }
 
+    // ── per-rule state across edits ─────────────────────────────────
+
+    struct SilentNotifications;
+
+    #[async_trait::async_trait]
+    impl temps_core::notifications::NotificationService for SilentNotifications {
+        async fn send_email(
+            &self,
+            _message: temps_core::notifications::EmailMessage,
+        ) -> Result<(), temps_core::notifications::NotificationError> {
+            Ok(())
+        }
+        async fn send_notification(
+            &self,
+            _notification: temps_core::notifications::NotificationData,
+        ) -> Result<(), temps_core::notifications::NotificationError> {
+            Ok(())
+        }
+        async fn is_configured(
+            &self,
+        ) -> Result<bool, temps_core::notifications::NotificationError> {
+            Ok(false)
+        }
+    }
+
+    struct SilentQueue;
+
+    #[async_trait::async_trait]
+    impl temps_core::JobQueue for SilentQueue {
+        async fn send(
+            &self,
+            _job: temps_core::jobs::Job,
+        ) -> Result<(), temps_core::jobs::QueueError> {
+            Ok(())
+        }
+        fn subscribe(&self) -> Box<dyn temps_core::jobs::JobReceiver> {
+            Box::new(SilentReceiver)
+        }
+    }
+
+    struct SilentReceiver;
+
+    #[async_trait::async_trait]
+    impl temps_core::jobs::JobReceiver for SilentReceiver {
+        async fn recv(&mut self) -> Result<temps_core::jobs::Job, temps_core::jobs::QueueError> {
+            Err(temps_core::jobs::QueueError::InvalidData(
+                "silent receiver".to_string(),
+            ))
+        }
+    }
+
+    /// An evaluator over a database no test query reaches.
+    fn offline_evaluator() -> MetricAlertEvaluator {
+        evaluator_on(sea_orm::MockDatabase::new(
+            sea_orm::DatabaseBackend::Postgres,
+        ))
+    }
+
+    /// An evaluator whose services all read `db`.
+    fn evaluator_on(db: sea_orm::MockDatabase) -> MetricAlertEvaluator {
+        let db = Arc::new(db.into_connection());
+        let storage = Arc::new(crate::storage::timescaledb::TimescaleDbStorage::new(
+            db.clone(),
+            None,
+        ));
+        let otel = Arc::new(OtelService::new(
+            storage,
+            Arc::new(crate::ingest::auth::OtelAuthService::new(db.clone())),
+            Arc::new(crate::ingest::rate_limit::RateLimiter::new(
+                10,
+                Duration::from_secs(60),
+            )),
+            crate::services::otel_service::DEFAULT_MAX_CONCURRENT_INGEST_REQUESTS,
+        ));
+        let notify: Arc<dyn temps_core::notifications::NotificationService> =
+            Arc::new(SilentNotifications);
+        let queue: Arc<dyn temps_core::JobQueue> = Arc::new(SilentQueue);
+        let alarms = Arc::new(AlarmService::new(db.clone(), notify, queue));
+        MetricAlertEvaluator::new(
+            Arc::new(MetricAlertService::new(db.clone())),
+            otel,
+            alarms.clone(),
+            alarms,
+            db,
+            None,
+            None,
+        )
+    }
+
+    fn cached_baseline() -> CachedBaseline {
+        CachedBaseline {
+            fetched_at: Instant::now(),
+            values: vec![(Utc::now(), 1.0)],
+        }
+    }
+
+    #[tokio::test]
+    async fn an_edit_drops_the_rules_cached_baselines_only() {
+        let evaluator = offline_evaluator();
+        let mut rule = make_rule_with_scope(json!([]), json!([]));
+        let other = AlertRule {
+            id: 2,
+            ..rule.clone()
+        };
+        {
+            let mut cache = evaluator.baseline_cache.write().await;
+            cache.insert(baseline_cache_key(rule.id, &[]), cached_baseline());
+            cache.insert(
+                baseline_cache_key(rule.id, &[("endpoint".to_string(), "/a".to_string())]),
+                cached_baseline(),
+            );
+            cache.insert(baseline_cache_key(other.id, &[]), cached_baseline());
+        }
+
+        evaluator.note_revision(&rule).await;
+        evaluator.note_revision(&other).await;
+        assert_eq!(
+            evaluator.baseline_cache.read().await.len(),
+            3,
+            "an unchanged revision keeps every baseline"
+        );
+
+        rule.config_revision += 1;
+        evaluator.note_revision(&rule).await;
+        let cache = evaluator.baseline_cache.read().await;
+        assert_eq!(cache.len(), 1, "the edited rule's baselines are gone");
+        assert!(cache.contains_key(&baseline_cache_key(other.id, &[])));
+    }
+
+    async fn arm_timers(evaluator: &MetricAlertEvaluator, rule_id: i32) {
+        evaluator
+            .breach_start
+            .write()
+            .await
+            .insert(rule_id, Instant::now());
+        evaluator
+            .breach_start_series
+            .write()
+            .await
+            .insert((rule_id, "endpoint=/a".to_string()), Instant::now());
+    }
+
+    #[tokio::test]
+    async fn a_failed_currency_check_keeps_the_breach_timers() {
+        // No result is scripted, so the check's query fails.
+        let evaluator = offline_evaluator();
+        let rule = make_rule_with_scope(json!([]), json!([]));
+        arm_timers(&evaluator, rule.id).await;
+
+        assert_eq!(evaluator.still_current(&rule).await, Currency::Unknown);
+        assert!(evaluator.breach_start.read().await.contains_key(&rule.id));
+        assert_eq!(evaluator.breach_start_series.read().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_edited_rule_restarts_every_breach_timer() {
+        let count = |n: i64| {
+            std::collections::BTreeMap::from([(
+                "num_items".to_string(),
+                sea_orm::Value::BigInt(Some(n)),
+            )])
+        };
+        let evaluator = evaluator_on(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results([[count(1)], [count(0)]]),
+        );
+        let rule = make_rule_with_scope(json!([]), json!([]));
+        arm_timers(&evaluator, rule.id).await;
+
+        assert_eq!(evaluator.still_current(&rule).await, Currency::Current);
+        assert_eq!(evaluator.breach_start_series.read().await.len(), 1);
+
+        assert_eq!(evaluator.still_current(&rule).await, Currency::Changed);
+        assert!(evaluator.breach_start.read().await.is_empty());
+        assert!(evaluator.breach_start_series.read().await.is_empty());
+    }
+
     // ── rule_query_scope ────────────────────────────────────────────
 
     fn make_rule_with_scope(
@@ -2849,7 +3567,10 @@ mod tests {
             last_value: None,
             series_states: serde_json::json!({}),
             last_dropped_series_count: 0,
+            config_revision: 0,
             last_evaluated_at: None,
+            source: "metric".to_string(),
+            saved_search_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -3022,5 +3743,199 @@ mod tests {
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].0, k);
         assert_eq!(selected[0].1, 42);
+    }
+
+    // ── Log alerts (ADR 108 D1) ─────────────────────────────────────────
+
+    fn log_rule(window_secs: i32, threshold: f64) -> AlertRule {
+        let mut rule = make_rule_with_scope(serde_json::json!([]), serde_json::json!([]));
+        rule.name = "Payment failures".to_string();
+        rule.source = "logs".to_string();
+        rule.saved_search_id = Some(3);
+        rule.metric_name = "logs.matched_lines".to_string();
+        rule.aggregation = "count".to_string();
+        rule.window_secs = window_secs;
+        rule.detection_config = serde_json::json!({
+            "kind": "static", "comparator": "gt", "threshold": threshold
+        });
+        rule
+    }
+
+    fn sample(count: u64, saturated: bool) -> LogSeriesSample {
+        LogSeriesSample {
+            count,
+            saturated,
+            query_fingerprint: 1,
+        }
+    }
+
+    #[test]
+    fn a_log_alert_message_says_how_many_lines_matched_and_over_what_window() {
+        let message = humanize_log(&sample(42, false), Comparator::Gt, 20.0, 300);
+        assert!(message.contains("42 log lines matched"), "{message}");
+        assert!(message.contains("5 minutes"), "{message}");
+        assert!(message.contains("above the threshold of 20"), "{message}");
+        assert!(
+            !message.contains("lower bound"),
+            "an exact count is not hedged: {message}"
+        );
+    }
+
+    #[test]
+    fn a_log_alert_message_names_the_other_side_of_the_comparison() {
+        let message = humanize_log(&sample(1, false), Comparator::Lt, 10.0, 60);
+        assert!(message.contains("below the threshold of 10"), "{message}");
+    }
+
+    #[test]
+    fn a_capped_count_is_reported_as_a_lower_bound() {
+        // Reading "1,000 lines matched" as the real number would be wrong,
+        // so the sentence says what the figure is.
+        let message = humanize_log(&sample(1_000, true), Comparator::Gt, 500.0, 300);
+        assert!(message.starts_with("At least"), "{message}");
+        assert!(message.contains("lower bound"), "{message}");
+    }
+
+    #[test]
+    fn a_log_alerts_payload_identifies_the_saved_search_and_never_quotes_the_query() {
+        let rule = log_rule(300, 20.0);
+        let params = StaticParams {
+            comparator: Comparator::Gt,
+            threshold: 20.0,
+        };
+        let details = FireDetails::log_breach(&rule, &sample(42, false), &params);
+        assert_eq!(details.title, "Log alert: Payment failures");
+        assert_eq!(details.metadata["saved_search_id"], serde_json::json!(3));
+        assert_eq!(details.metadata["lines_counted"], serde_json::json!(42));
+        assert_eq!(
+            details.metadata["count_saturated"],
+            serde_json::json!(false)
+        );
+        assert_eq!(details.metadata["value"], serde_json::json!(42.0));
+        assert_eq!(details.metadata["source"], serde_json::json!("log_alert"));
+        // The alarm payload reaches notification providers and the AI
+        // summary prompt. A message needle can contain anything, so the
+        // search is referenced by id, never by its text.
+        let rendered = details.metadata.to_string();
+        assert!(
+            !rendered.contains("query") && !rendered.contains("text"),
+            "the payload must not carry the search query: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_saturated_count_never_decides_a_below_threshold() {
+        // 1,000 lines counted and the counter stopped: the real count may be
+        // far higher, so "fewer than 1,010" can be neither confirmed nor ruled out.
+        assert_eq!(
+            log_count_breaches(Comparator::Lt, &sample(1000, true), 1010.0),
+            None
+        );
+        assert_eq!(
+            log_count_breaches(Comparator::Lte, &sample(1000, true), 1000.0),
+            None
+        );
+        // An exact count below the threshold still fires.
+        assert_eq!(
+            log_count_breaches(Comparator::Lt, &sample(3, false), 1010.0),
+            Some(true)
+        );
+        // A lower bound above the threshold is enough to fire an "above" rule.
+        assert_eq!(
+            log_count_breaches(Comparator::Gt, &sample(1000, true), 20.0),
+            Some(true)
+        );
+        assert_eq!(
+            log_count_breaches(Comparator::Gt, &sample(10, false), 20.0),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn a_non_breach_resets_the_breach_timer() {
+        // `> 20` for 60s: 42, then 3, then 42 thirty seconds apart. The second
+        // breach starts its own timer; it does not inherit the first one's.
+        let mut starts = HashMap::new();
+        let t0 = Instant::now();
+        assert_eq!(track_breach(&mut starts, 1, true, t0), 0);
+        assert_eq!(
+            track_breach(&mut starts, 1, false, t0 + Duration::from_secs(30)),
+            0
+        );
+        assert!(starts.is_empty());
+        assert_eq!(
+            track_breach(&mut starts, 1, true, t0 + Duration::from_secs(60)),
+            0
+        );
+        assert_eq!(
+            track_breach(&mut starts, 1, true, t0 + Duration::from_secs(90)),
+            30
+        );
+    }
+
+    #[test]
+    fn a_saturated_count_below_an_above_threshold_keeps_the_state() {
+        // The scan stopped on its time or byte budget after 10 lines: the
+        // real count may still be over 20, so a firing alarm must not resolve.
+        assert_eq!(
+            log_count_breaches(Comparator::Gt, &sample(10, true), 20.0),
+            None
+        );
+        assert_eq!(
+            log_count_breaches(Comparator::Gte, &sample(19, true), 20.0),
+            None
+        );
+        assert_eq!(
+            log_count_breaches(Comparator::Gte, &sample(20, true), 20.0),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn a_saturated_payload_says_the_count_was_capped() {
+        let rule = log_rule(300, 20.0);
+        let params = StaticParams {
+            comparator: Comparator::Gt,
+            threshold: 20.0,
+        };
+        let details = FireDetails::log_breach(&rule, &sample(1_000, true), &params);
+        assert_eq!(details.metadata["count_saturated"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn a_log_rules_series_source_is_read_from_its_columns() {
+        let rule = log_rule(300, 20.0);
+        assert_eq!(
+            AlertSeriesSource::from_columns(&rule.source, rule.saved_search_id),
+            Some(AlertSeriesSource::Logs { saved_search_id: 3 })
+        );
+        // A metric rule keeps taking the metric path.
+        let metric = make_rule_with_scope(serde_json::json!([]), serde_json::json!([]));
+        assert_eq!(
+            AlertSeriesSource::from_columns(&metric.source, metric.saved_search_id),
+            Some(AlertSeriesSource::Metric)
+        );
+    }
+
+    #[test]
+    fn a_log_count_decides_a_breach_the_same_way_a_metric_value_does() {
+        // The log path reuses the static comparator, so the transition
+        // behaviour below is the shared one tested above.
+        let params = StaticParams {
+            comparator: Comparator::Gt,
+            threshold: 20.0,
+        };
+        assert!(params.comparator.breaches(21.0, params.threshold));
+        assert!(!params.comparator.breaches(20.0, params.threshold));
+        // And a breach still has to persist for `for_duration` before it
+        // fires, exactly like a metric rule.
+        assert_eq!(
+            evaluate_transition("ok", true, 10, 60),
+            AlertTransition::StartBreach
+        );
+        assert_eq!(
+            evaluate_transition("ok", true, 61, 60),
+            AlertTransition::FireNow
+        );
     }
 }

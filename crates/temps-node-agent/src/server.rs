@@ -118,6 +118,7 @@ pub fn build_router(
 
     let runtime_health_routes = crate::runtime_health::router(runtime_docker, config, auth.clone());
     let worker_metrics_routes = crate::worker_metrics::router(config, auth.clone());
+    let uptime_probe_routes = crate::uptime_probe::router(auth.clone(), sealed_requests.clone());
 
     // API routes — all protected by bearer token auth
     let api_routes = Router::new()
@@ -315,12 +316,14 @@ pub fn build_router(
     let mut api = AgentApiDoc::openapi();
     api.merge(crate::runtime_health::RuntimeHealthApiDoc::openapi());
     api.merge(crate::worker_metrics::WorkerMetricsApiDoc::openapi());
+    api.merge(crate::uptime_probe::UptimeProbeApiDoc::openapi());
     let swagger_ui = SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", api);
 
     api_routes
         .merge(sandbox_routes)
         .merge(runtime_health_routes)
         .merge(worker_metrics_routes)
+        .merge(uptime_probe_routes)
         .merge(swagger_ui)
 }
 

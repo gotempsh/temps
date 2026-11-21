@@ -3954,6 +3954,47 @@
         ],
         "type": "object"
       },
+      "AlertSeriesSource": {
+        "description": "What series a rule is evaluated on (ADR 108 D1).\n\nA log rule carries its saved search in the same value, so \"a log alert\nwith nothing to count\" cannot be constructed.",
+        "oneOf": [
+          {
+            "description": "The OTel metric the rule names. Every rule before ADR 108.",
+            "properties": {
+              "kind": {
+                "enum": [
+                  "metric"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The number of log lines matching a saved search per window.",
+            "properties": {
+              "kind": {
+                "enum": [
+                  "logs"
+                ],
+                "type": "string"
+              },
+              "saved_search_id": {
+                "description": "`log_saved_searches.id`, in the rule's own project.",
+                "format": "int32",
+                "type": "integer"
+              }
+            },
+            "required": [
+              "saved_search_id",
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "AllocEntry": {
         "description": "Wire-format allocation. `null` in the JSON when the node hasn't been\nallocated yet — workers should treat that as \"single-host mode, do\nnot bring up the overlay\".",
         "properties": {
@@ -11600,6 +11641,129 @@
         ],
         "type": "string"
       },
+      "CheckRequest": {
+        "description": "The secret part of an HTTP check: headers and body, encrypted at rest.",
+        "properties": {
+          "body": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "headers": {
+            "items": {
+              "$ref": "#/components/schemas/CheckRequestHeader"
+            },
+            "type": "array"
+          }
+        },
+        "type": "object"
+      },
+      "CheckRequestHeader": {
+        "description": "One HTTP request header. The value is stored encrypted and never\nreturned.",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "value": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "value"
+        ],
+        "type": "object"
+      },
+      "CheckSpec": {
+        "description": "A target monitor's check, one shape per kind.",
+        "oneOf": [
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/HttpCheck"
+              },
+              {
+                "properties": {
+                  "kind": {
+                    "enum": [
+                      "http"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind"
+                ],
+                "type": "object"
+              }
+            ]
+          },
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/TcpCheck"
+              },
+              {
+                "properties": {
+                  "kind": {
+                    "enum": [
+                      "tcp"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind"
+                ],
+                "type": "object"
+              }
+            ]
+          },
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/TlsCheck"
+              },
+              {
+                "properties": {
+                  "kind": {
+                    "enum": [
+                      "tls"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind"
+                ],
+                "type": "object"
+              }
+            ]
+          },
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/DnsCheck"
+              },
+              {
+                "properties": {
+                  "kind": {
+                    "enum": [
+                      "dns"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind"
+                ],
+                "type": "object"
+              }
+            ]
+          }
+        ]
+      },
       "CheckStatus": {
         "enum": [
           "healthy",
@@ -19189,6 +19353,73 @@
         },
         "type": "object"
       },
+      "CreateLogIngestKeyRequest": {
+        "properties": {
+          "default_service": {
+            "description": "Service label for lines that do not name one. Default `external`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "environment_id": {
+            "description": "Pin the key to one environment of the project. Absent: lines are\nlabelled with the environment `external`.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "name": {
+            "description": "A label for the collector or host using the key.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
+      "CreateMaintenanceRequest": {
+        "properties": {
+          "description": {
+            "description": "Public description, at most 2000 characters.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ends_at": {
+            "description": "After `starts_at`, at most 7 days later.",
+            "format": "date-time",
+            "type": "string"
+          },
+          "monitor_ids": {
+            "description": "Monitors on this page the window covers; at least one.",
+            "items": {
+              "format": "int32",
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "starts_at": {
+            "description": "No earlier than a few minutes ago: a window cannot be backdated.",
+            "format": "date-time",
+            "type": "string"
+          },
+          "title": {
+            "description": "Public title, at most 120 characters.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "title",
+          "starts_at",
+          "ends_at",
+          "monitor_ids"
+        ],
+        "type": "object"
+      },
       "CreateMcpRequest": {
         "properties": {
           "config": {
@@ -19217,7 +19448,7 @@
       "CreateMetricAlertRequest": {
         "properties": {
           "aggregation": {
-            "description": "One of `avg|sum|min|max|count|rate|p50|p90|p95|p99`.",
+            "description": "One of `avg|sum|min|max|count|rate|p50|p90|p95|p99`. Forced to\n`count` for a log alert, which counts matching lines.",
             "type": "string"
           },
           "detection_config": {
@@ -19269,7 +19500,11 @@
             "type": "integer"
           },
           "metric_name": {
-            "type": "string"
+            "description": "The OTel metric to watch. Required unless `source` is a saved log\nsearch, in which case the series is named by the server.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "name": {
             "type": "string"
@@ -19282,6 +19517,10 @@
             "description": "One of `info|warning|critical`.",
             "type": "string"
           },
+          "source": {
+            "$ref": "#/components/schemas/AlertSeriesSource",
+            "description": "What the rule watches: the metric above (the default), or the number\nof log lines matching a saved search per window (ADR 108 D1):\n`{\"kind\":\"logs\",\"saved_search_id\":3}`."
+          },
           "window_secs": {
             "format": "int32",
             "type": "integer"
@@ -19290,7 +19529,6 @@
         "required": [
           "project_id",
           "name",
-          "metric_name",
           "aggregation",
           "detection_config",
           "window_secs",
@@ -20528,6 +20766,39 @@
         ],
         "type": "object"
       },
+      "CreateSavedSearchRequest": {
+        "properties": {
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "description": "Unique within the project.",
+            "type": "string"
+          },
+          "pinned": {
+            "description": "Pinned searches sort first. Default false.",
+            "type": "boolean"
+          },
+          "query": {
+            "$ref": "#/components/schemas/SavedSearchQuery",
+            "description": "The filter set. An empty query is allowed: \"everything in this\nproject\" is a legitimate thing to pin."
+          },
+          "time_range": {
+            "description": "One of `15m`, `1h`, `6h`, `24h`, `7d`, `30d`. Default `1h`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
       "CreateShieldEntryRequest": {
         "properties": {
           "expires_at": {
@@ -20680,6 +20951,18 @@
         ],
         "type": "object"
       },
+      "CreateStatusPageWebhookRequest": {
+        "properties": {
+          "url": {
+            "description": "`https://` URL with a public address, at most 2048 characters.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "type": "object"
+      },
       "CreateSurveyRequest": {
         "properties": {
           "description": {
@@ -20707,6 +20990,50 @@
         },
         "required": [
           "name"
+        ],
+        "type": "object"
+      },
+      "CreateTargetMonitorRequest": {
+        "properties": {
+          "check": {
+            "$ref": "#/components/schemas/CheckSpec"
+          },
+          "check_interval_seconds": {
+            "description": "How often to check, in seconds (default 60, at least 30).",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "name": {
+            "description": "Shown in the console and, unless renamed there, on status pages.",
+            "type": "string"
+          },
+          "probe_from_nodes": {
+            "description": "Also check from up to four online worker nodes, and count the\nmonitor down only when most locations agree (ADR 108 D5).",
+            "type": "boolean"
+          },
+          "request": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/CheckRequest",
+                "description": "Headers and body of an HTTP check. Stored encrypted; header values\nare never returned."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "target": {
+            "description": "What to check: a URL (`http`), `host:port` (`tcp`, `tls`; `tls`\ndefaults to 443) or a host name (`dns`). It must have a public\naddress.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "target",
+          "check"
         ],
         "type": "object"
       },
@@ -20947,6 +21274,26 @@
           "resource"
         ],
         "type": "object"
+      },
+      "CreatedLogIngestKeyResponse": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/LogIngestKeyResponse"
+          },
+          {
+            "properties": {
+              "key": {
+                "description": "The full key. Shown once; only its hash is stored.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "key"
+            ],
+            "type": "object"
+          }
+        ],
+        "description": "A key just created: the only response that carries the plaintext."
       },
       "CreatedRepositoryResponse": {
         "description": "The repository that was created. Carries no credentials.",
@@ -22098,6 +22445,10 @@
             "description": "The metric name to chart (e.g. `http.server.duration`).",
             "type": "string"
           },
+          "source": {
+            "$ref": "#/components/schemas/DashboardTileSource",
+            "description": "What the tile charts: the metric above (the default), or a saved log\nsearch over time (ADR 108 D1). A log tile ignores `metric_name`,\n`aggregation`, `label_filters` and `group_by`."
+          },
           "title": {
             "description": "Optional display title; falls back to the metric name in the UI.",
             "type": [
@@ -22112,6 +22463,50 @@
           "aggregation"
         ],
         "type": "object"
+      },
+      "DashboardTileSource": {
+        "description": "The series a tile charts.",
+        "oneOf": [
+          {
+            "description": "An OTel metric, named by the tile's `metric_name`.",
+            "properties": {
+              "kind": {
+                "enum": [
+                  "metric"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "A saved log search of the dashboard's project, charted by\n`GET /projects/{project_id}/logs/saved-searches/{id}/series`.",
+            "properties": {
+              "kind": {
+                "enum": [
+                  "logs"
+                ],
+                "type": "string"
+              },
+              "metric": {
+                "description": "`count` (lines per bucket), or `avg`, `sum`, `max`, `p50`, `p95`,\n`p99` or `count_distinct` followed by `:<attribute>`.",
+                "type": "string"
+              },
+              "saved_search_id": {
+                "format": "int32",
+                "type": "integer"
+              }
+            },
+            "required": [
+              "saved_search_id",
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
       },
       "DataEngine": {
         "description": "The engines Temps operates as managed services.",
@@ -25409,6 +25804,43 @@
           "removed_ids"
         ],
         "type": "object"
+      },
+      "DnsCheck": {
+        "properties": {
+          "expected": {
+            "description": "Up when any answer equals one of these (case-insensitive, trailing\ndot ignored). Empty: up when the name has any record of the type.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "record_type": {
+            "$ref": "#/components/schemas/DnsCheckRecordType"
+          },
+          "timeout_ms": {
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "record_type"
+        ],
+        "type": "object"
+      },
+      "DnsCheckRecordType": {
+        "enum": [
+          "A",
+          "AAAA",
+          "CNAME",
+          "MX",
+          "TXT",
+          "NS"
+        ],
+        "type": "string"
       },
       "DnsCompletionResponse": {
         "properties": {
@@ -40899,6 +41331,49 @@
         ],
         "type": "object"
       },
+      "HttpCheck": {
+        "properties": {
+          "degraded_after_ms": {
+            "description": "Slower than this many milliseconds is degraded, not up.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "expected_status": {
+            "description": "Status codes that count as up: exact codes (\"204\") or classes\n(\"2xx\"). Empty: any 2xx or 3xx.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "keyword": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/KeywordAssertion"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "method": {
+            "$ref": "#/components/schemas/HttpMethod"
+          },
+          "timeout_ms": {
+            "description": "Time limit of one request, 500 to 30,000 ms (default 10,000).",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "HttpCheckList": {
         "properties": {
           "items": {
@@ -41093,6 +41568,18 @@
           "alerts_setup_path"
         ],
         "type": "object"
+      },
+      "HttpMethod": {
+        "enum": [
+          "GET",
+          "HEAD",
+          "POST",
+          "PUT",
+          "PATCH",
+          "DELETE",
+          "OPTIONS"
+        ],
+        "type": "string"
       },
       "HttpPolicy": {
         "description": "What a tunnel address answers at Cloudflare's edge, as the user chose\nit (ADR 070 D1). Stored on the address (`project_custom_domains.\nhttp_policy`); `None` there means never chosen, and nothing is changed\nfor such an address until a run records a choice.",
@@ -45009,6 +45496,23 @@
         ],
         "type": "object"
       },
+      "KeywordAssertion": {
+        "description": "Text that must, or must not, appear in the response body.",
+        "properties": {
+          "present": {
+            "description": "`true`: the check fails unless the text is there. `false`: it fails\nwhen the text is there (e.g. \"maintenance mode\").",
+            "type": "boolean"
+          },
+          "text": {
+            "description": "Case-sensitive, at most 200 characters. Only the first 256 KiB of\nthe body is searched, and the body is never stored.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "type": "object"
+      },
       "KillJobBody": {
         "additionalProperties": false,
         "properties": {
@@ -46724,6 +47228,124 @@
         ],
         "type": "object"
       },
+      "LogIngestKeyResponse": {
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "created_by_user_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "default_service": {
+            "type": "string"
+          },
+          "environment_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "is_active": {
+            "type": "boolean"
+          },
+          "key_prefix": {
+            "description": "The first characters of the key, for recognising it.",
+            "type": "string"
+          },
+          "last_used_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "line_count": {
+            "description": "Lines ingested with this key. Updated every 30 seconds.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "revoked_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "project_id",
+          "name",
+          "key_prefix",
+          "default_service",
+          "is_active",
+          "line_count",
+          "created_at"
+        ],
+        "type": "object"
+      },
+      "LogIngestKeysResponse": {
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/LogIngestKeyResponse"
+            },
+            "type": "array"
+          },
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "data",
+          "total",
+          "page",
+          "page_size"
+        ],
+        "type": "object"
+      },
+      "LogIngestResponse": {
+        "properties": {
+          "accepted": {
+            "description": "Lines stored from this request.",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "accepted"
+        ],
+        "type": "object"
+      },
       "LogLevel": {
         "description": "Normalized log level",
         "enum": [
@@ -46882,6 +47504,63 @@
           "service",
           "message",
           "line_id"
+        ],
+        "type": "object"
+      },
+      "LogSeries": {
+        "description": "A bucketed log series.",
+        "properties": {
+          "method": {
+            "$ref": "#/components/schemas/LogSeriesMethod"
+          },
+          "partial_before": {
+            "description": "Set when a scan stopped before the window's start: the bucket this\ntime falls in and every older bucket have no value, since lines at or\nbefore it may not have been read.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "points": {
+            "items": {
+              "$ref": "#/components/schemas/LogSeriesPoint"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "points",
+          "method"
+        ],
+        "type": "object"
+      },
+      "LogSeriesMethod": {
+        "description": "How a series was computed.",
+        "enum": [
+          "index",
+          "scan"
+        ],
+        "type": "string"
+      },
+      "LogSeriesPoint": {
+        "description": "One bucket of a log series.",
+        "properties": {
+          "ts": {
+            "description": "Bucket start.",
+            "format": "date-time",
+            "type": "string"
+          },
+          "value": {
+            "description": "`None` when nothing was counted for the bucket (outside a capped\nscan) or no line contributed to a numeric aggregate.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "ts"
         ],
         "type": "object"
       },
@@ -47068,6 +47747,117 @@
           "count"
         ],
         "type": "object"
+      },
+      "MaintenanceListResponse": {
+        "properties": {
+          "items": {
+            "description": "Newest first.",
+            "items": {
+              "$ref": "#/components/schemas/MaintenanceResponse"
+            },
+            "type": "array"
+          },
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "items",
+          "total",
+          "page",
+          "page_size"
+        ],
+        "type": "object"
+      },
+      "MaintenanceResponse": {
+        "properties": {
+          "cancelled_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ends_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "monitor_ids": {
+            "description": "The page's monitors the window covers.",
+            "items": {
+              "format": "int32",
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "starts_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "state": {
+            "$ref": "#/components/schemas/MaintenanceState"
+          },
+          "status_page_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "title": {
+            "description": "Shown on the public page and in announcements.",
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "status_page_id",
+          "title",
+          "starts_at",
+          "ends_at",
+          "state",
+          "monitor_ids",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
+      },
+      "MaintenanceState": {
+        "description": "Where a window is in its life.",
+        "enum": [
+          "scheduled",
+          "in_progress",
+          "completed",
+          "cancelled"
+        ],
+        "type": "string"
       },
       "ManagedBackupArchiveConflict": {
         "description": "A service whose continuous archive (Postgres WAL-G, MariaDB binlogs) is\npinned to a source other than the managed destination. The nightly Cloud\nschedule cannot back it up: archiving must not silently move between\nsources, so every run of that service fails until the operator repoints\nit to Cloud or points its own schedule at the pinned source.",
@@ -49293,6 +50083,45 @@
         ],
         "type": "object"
       },
+      "MonitorCheckKind": {
+        "description": "What a monitor checks. `Environment` is the probe of a Temps\nenvironment; the others check an explicit target.",
+        "enum": [
+          "environment",
+          "http",
+          "tcp",
+          "tls",
+          "dns"
+        ],
+        "type": "string"
+      },
+      "MonitorCheckView": {
+        "description": "How a monitor outside Temps is checked. Header values are not included.",
+        "properties": {
+          "check": {
+            "$ref": "#/components/schemas/CheckSpec"
+          },
+          "has_body": {
+            "type": "boolean"
+          },
+          "header_names": {
+            "description": "Names of the request headers sent; their values are stored\nencrypted.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "target": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "target",
+          "check",
+          "header_names",
+          "has_body"
+        ],
+        "type": "object"
+      },
       "MonitorConfig": {
         "additionalProperties": false,
         "properties": {
@@ -49328,11 +50157,99 @@
         ],
         "type": "object"
       },
+      "MonitorLocationResult": {
+        "description": "What one location reported on a check.",
+        "properties": {
+          "location": {
+            "description": "`control plane`, or the worker node's name.",
+            "type": "string"
+          },
+          "message": {
+            "description": "Why it is not operational, or why the location did not answer.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "node_id": {
+            "description": "The worker node; `null` for the control plane.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "region": {
+            "description": "The node's `region` label, when it has one.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "response_time_ms": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "status": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ProbeStatus",
+                "description": "`null` when the location did not answer: it is then not counted."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "location"
+        ],
+        "type": "object"
+      },
+      "MonitorLocationResults": {
+        "description": "Every location's answer to the latest check.",
+        "properties": {
+          "checked_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "results": {
+            "items": {
+              "$ref": "#/components/schemas/MonitorLocationResult"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "checked_at",
+          "results"
+        ],
+        "type": "object"
+      },
       "MonitorResponse": {
         "properties": {
+          "check": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/MonitorCheckView",
+                "description": "How a monitor outside Temps is checked; `null` for an environment\nmonitor."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "check_interval_seconds": {
             "format": "int32",
             "type": "integer"
+          },
+          "check_kind": {
+            "$ref": "#/components/schemas/MonitorCheckKind",
+            "description": "`environment` for a monitor of a Temps environment, otherwise the\ncheck run against `check.target` (ADR 108 D3, D4)."
           },
           "check_path": {
             "type": [
@@ -49362,6 +50279,17 @@
             "description": "Temps-managed HTTP monitor; independent monitors remain visible for workers.",
             "type": "boolean"
           },
+          "location_results": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/MonitorLocationResults",
+                "description": "What each location reported on the latest check; `null` for a\nmonitor checked from the control plane only, or not checked since\nits last change."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "monitor_type": {
             "type": "string"
           },
@@ -49379,6 +50307,10 @@
               "null"
             ]
           },
+          "probe_from_nodes": {
+            "description": "Also checked from worker nodes; down only when most locations agree\n(ADR 108 D5).",
+            "type": "boolean"
+          },
           "project_id": {
             "format": "int32",
             "type": "integer"
@@ -49395,6 +50327,8 @@
           "name",
           "monitor_type",
           "monitor_url",
+          "check_kind",
+          "probe_from_nodes",
           "check_interval_seconds",
           "is_active",
           "created_at",
@@ -53612,6 +54546,10 @@
           "severity": {
             "type": "string"
           },
+          "source": {
+            "$ref": "#/components/schemas/AlertSeriesSource",
+            "description": "What the rule watches: the named metric, or a saved log search\n(ADR 108 D1)."
+          },
           "updated_at": {
             "example": "2025-10-12T12:15:47.609192Z",
             "type": "string"
@@ -53628,6 +54566,7 @@
           "metric_name",
           "aggregation",
           "detection_kind",
+          "source",
           "detection_config",
           "window_secs",
           "for_duration_secs",
@@ -54462,6 +55401,23 @@
           "hourly_data",
           "total_sessions",
           "hours"
+        ],
+        "type": "object"
+      },
+      "PagePasswordResponse": {
+        "description": "Whether a page needs a password. The password is never returned.",
+        "properties": {
+          "has_password": {
+            "type": "boolean"
+          },
+          "status_page_id": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "status_page_id",
+          "has_password"
         ],
         "type": "object"
       },
@@ -58240,6 +59196,78 @@
         ],
         "type": "object"
       },
+      "ProbeLocationView": {
+        "description": "One place checks can run from.",
+        "properties": {
+          "name": {
+            "description": "`control plane`, or the worker node's name.",
+            "type": "string"
+          },
+          "node_id": {
+            "description": "The worker node; `null` for the control plane.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "region": {
+            "description": "The node's `region` label, when it has one.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
+      "ProbeLocationsResponse": {
+        "description": "Where a monitor checked from worker nodes would be checked from now.",
+        "properties": {
+          "configured": {
+            "description": "Whether any worker node is available, so checking from worker\nnodes adds a location.",
+            "type": "boolean"
+          },
+          "locations": {
+            "description": "The control plane first, then each worker node that would be asked.",
+            "items": {
+              "$ref": "#/components/schemas/ProbeLocationView"
+            },
+            "type": "array"
+          },
+          "reason": {
+            "description": "What is missing when `configured` is false.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "setup_path": {
+            "description": "Where to fix it in the console.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "locations",
+          "configured"
+        ],
+        "type": "object"
+      },
+      "ProbeStatus": {
+        "description": "A check's verdict. Serialized as the value stored in\n`status_checks.status`.",
+        "enum": [
+          "operational",
+          "degraded",
+          "major_outage"
+        ],
+        "type": "string"
+      },
       "ProblemDetails": {
         "additionalProperties": {
           "description": "Additional properties of the problem"
@@ -61526,6 +62554,7 @@
         "description": "Current state of a public component (one selected monitor), or of the page\nas a whole.",
         "enum": [
           "unknown",
+          "maintenance",
           "operational",
           "degraded",
           "outage"
@@ -62235,6 +63264,53 @@
         },
         "type": "object"
       },
+      "PublicMaintenance": {
+        "description": "A scheduled maintenance window as visitors see it (ADR 108 D2): the\npublic title and description the admin wrote for the page, its times, and\nthe display names of the components it covers.",
+        "properties": {
+          "affected_components": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ends_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "starts_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/PublicMaintenanceStatus"
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "title",
+          "status",
+          "starts_at",
+          "ends_at",
+          "affected_components"
+        ],
+        "type": "object"
+      },
+      "PublicMaintenanceStatus": {
+        "description": "Whether a public maintenance window has started.",
+        "enum": [
+          "scheduled",
+          "in_progress"
+        ],
+        "type": "string"
+      },
       "PublicPresetResponse": {
         "description": "Response for preset detection",
         "properties": {
@@ -62394,6 +63470,13 @@
             },
             "type": "array"
           },
+          "maintenances": {
+            "description": "Maintenance windows in progress or scheduled, soonest first.",
+            "items": {
+              "$ref": "#/components/schemas/PublicMaintenance"
+            },
+            "type": "array"
+          },
           "status": {
             "$ref": "#/components/schemas/PublicComponentStatus",
             "description": "Worst current state across components and active public incidents."
@@ -62408,6 +63491,7 @@
           "status",
           "components",
           "incidents",
+          "maintenances",
           "history_days",
           "generated_at"
         ],
@@ -69724,6 +70808,181 @@
         },
         "type": "object"
       },
+      "SavedSearchQuery": {
+        "description": "The stored filter set of a saved search.\n\nMirrors `GlobalLogSearchRequest` without `start_time`/`end_time`,\n`cursor`, `page_size` and the project selector: the window is the\ncaller's and the project is the row's. External services are held as ids\nrather than names so counting a saved search needs no control-plane name\nresolution.",
+        "properties": {
+          "attrs": {
+            "description": "Attribute predicates in the wire form the search endpoints take:\n`<key><op><value>` with `op` one of `=`, `!=`, `^=`, `>`, `<`, or\n`<key>?` for \"exists\".",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "container_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "deploy_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "envs": {
+            "description": "Environment identifiers as the store holds them.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "external_service_ids": {
+            "description": "Narrow to these of the project's external services (databases,\nimported services). Empty means every source allowed by `source`.",
+            "items": {
+              "format": "int32",
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "levels": {
+            "items": {
+              "$ref": "#/components/schemas/LogLevel"
+            },
+            "type": "array"
+          },
+          "node_ids": {
+            "items": {
+              "format": "int32",
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "services": {
+            "description": "Container service labels (`web`, `worker`).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "source": {
+            "$ref": "#/components/schemas/LogSourceKind",
+            "description": "Which family of sources to search: everything the project has\n(`collected`), its application containers, or its databases."
+          },
+          "text": {
+            "description": "Case-insensitive substring match over the message.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "SavedSearchResponse": {
+        "properties": {
+          "alert_count": {
+            "description": "Log alert rules counting this search. A search with alerts cannot be\ndeleted until they are detached, so the console can say so before\noffering the button.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "created_by": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "pinned": {
+            "type": "boolean"
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "query": {
+            "$ref": "#/components/schemas/SavedSearchQuery"
+          },
+          "time_range": {
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "project_id",
+          "name",
+          "query",
+          "time_range",
+          "pinned",
+          "alert_count",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
+      },
+      "SavedSearchesResponse": {
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/SavedSearchResponse"
+            },
+            "type": "array"
+          },
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "time_ranges": {
+            "description": "Allowed `time_range` values, so a client never has to hard-code them.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "data",
+          "total",
+          "page",
+          "page_size",
+          "time_ranges"
+        ],
+        "type": "object"
+      },
       "ScalewayCredentialsRequest": {
         "properties": {
           "api_key": {
@@ -74365,6 +75624,22 @@
         },
         "type": "object"
       },
+      "SetPagePasswordRequest": {
+        "description": "`password` set: protect the page with it (8 to 256 characters), ending\nevery visitor's session. `null`: remove the password. A credential: the\nAI assistant can only pass it through a secret slot.",
+        "properties": {
+          "password": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/SecretString"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "type": "object"
+      },
       "SetPreviewPasswordBody": {
         "properties": {
           "password": {
@@ -78249,6 +79524,10 @@
               "null"
             ]
           },
+          "has_password": {
+            "description": "Visitors need a password to read the page (ADR 108 D2). The password\nitself is never returned.",
+            "type": "boolean"
+          },
           "id": {
             "format": "int32",
             "type": "integer"
@@ -78268,6 +79547,13 @@
               "$ref": "#/components/schemas/StatusPageProject"
             },
             "type": "array"
+          },
+          "public_feed_url": {
+            "description": "Atom feed of the page's public updates. `None` when `public_url` is,\nor while the page is password-protected (it has no feed then).",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "public_json_url": {
             "description": "Machine-readable form of the public page. `None` exactly when\n`public_url` is.",
@@ -78315,6 +79601,7 @@
           "public_url_status",
           "monitors",
           "appearance",
+          "has_password",
           "created_at",
           "updated_at"
         ],
@@ -78328,6 +79615,117 @@
           "dark"
         ],
         "type": "string"
+      },
+      "StatusPageWebhookCreatedResponse": {
+        "description": "The new webhook and its signing secret. The secret is shown only here.",
+        "properties": {
+          "secret": {
+            "description": "Verify `X-Temps-Signature` with it. Store it now: it is never shown\nagain.",
+            "type": "string"
+          },
+          "webhook": {
+            "$ref": "#/components/schemas/StatusPageWebhookResponse"
+          }
+        },
+        "required": [
+          "webhook",
+          "secret"
+        ],
+        "type": "object"
+      },
+      "StatusPageWebhookListResponse": {
+        "properties": {
+          "items": {
+            "description": "Newest first.",
+            "items": {
+              "$ref": "#/components/schemas/StatusPageWebhookResponse"
+            },
+            "type": "array"
+          },
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "items",
+          "total",
+          "page",
+          "page_size"
+        ],
+        "type": "object"
+      },
+      "StatusPageWebhookResponse": {
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "has_secret": {
+            "description": "The signing secret is stored encrypted and shown only when the\nwebhook is created.",
+            "type": "boolean"
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "last_attempt_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_failure_reason": {
+            "description": "Why the last delivery failed, until one succeeds.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_success_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status_page_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "url": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "status_page_id",
+          "url",
+          "enabled",
+          "has_secret",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
       },
       "StepConversionResponse": {
         "properties": {
@@ -78679,6 +80077,174 @@
         },
         "required": [
           "code"
+        ],
+        "type": "object"
+      },
+      "SubscriberListResponse": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/SubscriberResponse"
+            },
+            "type": "array"
+          },
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "items",
+          "total",
+          "page",
+          "page_size"
+        ],
+        "type": "object"
+      },
+      "SubscriberResponse": {
+        "description": "One subscriber, as the page's administrators see it. Never shown to\nanyone else.",
+        "properties": {
+          "confirmed_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "email": {
+            "type": "string"
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "state": {
+            "$ref": "#/components/schemas/SubscriberState"
+          }
+        },
+        "required": [
+          "id",
+          "email",
+          "state",
+          "created_at"
+        ],
+        "type": "object"
+      },
+      "SubscriberState": {
+        "enum": [
+          "pending",
+          "confirmed"
+        ],
+        "type": "string"
+      },
+      "SubscriptionCapability": {
+        "description": "Whether a prerequisite of subscriptions is in place, and if not, what is\nmissing and where to fix it.",
+        "properties": {
+          "configured": {
+            "type": "boolean"
+          },
+          "reason": {
+            "description": "What is missing, in words an operator can act on.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "setup_path": {
+            "description": "Console path that fixes it; `None` when the fix is on the same form.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "configured"
+        ],
+        "type": "object"
+      },
+      "SubscriptionSettingsResponse": {
+        "description": "Email subscription settings of one status page.",
+        "properties": {
+          "confirmed_count": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "email": {
+            "$ref": "#/components/schemas/SubscriptionCapability",
+            "description": "Whether mail can be sent from `sender`."
+          },
+          "enabled": {
+            "description": "Visitors see a subscribe form on the public page.",
+            "type": "boolean"
+          },
+          "enabled_at": {
+            "description": "When subscriptions were last switched on; only updates published\nafter it are announced.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "links": {
+            "$ref": "#/components/schemas/SubscriptionCapability",
+            "description": "Whether confirmation and unsubscribe links have an address people\noutside this network can open."
+          },
+          "max_subscribers": {
+            "description": "Most subscribers a page can have, confirmed and pending together.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "pending_count": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "sender": {
+            "description": "From address of subscriber mail.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status_page_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "verified_domains": {
+            "description": "Verified email domains with an active provider: valid sender domains.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "status_page_id",
+          "enabled",
+          "email",
+          "links",
+          "verified_domains",
+          "confirmed_count",
+          "pending_count",
+          "max_subscribers"
         ],
         "type": "object"
       },
@@ -79452,6 +81018,28 @@
           "sizing_basis",
           "rationale"
         ],
+        "type": "object"
+      },
+      "TcpCheck": {
+        "properties": {
+          "degraded_after_ms": {
+            "description": "Slower than this many milliseconds to connect is degraded.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "timeout_ms": {
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
         "type": "object"
       },
       "TeamListResponse": {
@@ -81136,6 +82724,28 @@
           "user_id": {
             "description": "Filter by user ID",
             "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "TlsCheck": {
+        "properties": {
+          "timeout_ms": {
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "warn_days": {
+            "description": "A certificate expiring within this many days is degraded\n(default 14, at most 90). An expired or untrusted one is down.",
+            "format": "int32",
+            "minimum": 0,
             "type": [
               "integer",
               "null"
@@ -84970,6 +86580,49 @@
         ],
         "type": "object"
       },
+      "UpdateMaintenanceRequest": {
+        "description": "Fields left out are unchanged. Once a window has started, only `title`,\n`description` and `ends_at` can change.",
+        "properties": {
+          "description": {
+            "description": "An empty string removes the description.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ends_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "monitor_ids": {
+            "items": {
+              "format": "int32",
+              "type": "integer"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "starts_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "title": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "UpdateManagedContainerName": {
         "description": "Request body of the container-name settings endpoints.",
         "properties": {
@@ -85153,6 +86806,17 @@
             "type": [
               "string",
               "null"
+            ]
+          },
+          "source": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/AlertSeriesSource",
+                "description": "Switches what the rule watches when present (absent = unchanged)."
+              },
+              {
+                "type": "null"
+              }
             ]
           },
           "window_secs": {
@@ -86062,6 +87726,48 @@
         ],
         "type": "object"
       },
+      "UpdateSavedSearchRequest": {
+        "properties": {
+          "description": {
+            "description": "Absent leaves the description unchanged; an empty string clears it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "description": "Absent leaves the name unchanged.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "pinned": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "query": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/SavedSearchQuery",
+                "description": "Replaces the filter set wholesale when present."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "time_range": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "UpdateSecretBody": {
         "properties": {
           "signing_secret": {
@@ -86347,6 +88053,24 @@
         },
         "type": "object"
       },
+      "UpdateStatusPageWebhookRequest": {
+        "description": "Fields left out are unchanged.",
+        "properties": {
+          "enabled": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "UpdateStatusResponse": {
         "description": "Result of the background release-update check, driving the web console's\nupgrade banner. All optional fields are set together iff\n`update_available` is true.",
         "properties": {
@@ -86405,6 +88129,26 @@
         ],
         "type": "object"
       },
+      "UpdateSubscriptionSettingsRequest": {
+        "description": "Change the email subscription settings of a status page. Absent fields are\nleft as they are.",
+        "properties": {
+          "enabled": {
+            "description": "Show the subscribe form. Switching on needs a working sender.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "sender": {
+            "description": "From address at a verified email domain; an empty string clears it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "UpdateSurveyRequest": {
         "properties": {
           "description": {
@@ -86455,6 +88199,66 @@
               {
                 "type": "null"
               }
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "UpdateTargetMonitorRequest": {
+        "properties": {
+          "check": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/CheckSpec",
+                "description": "Replaces the check, and may change its kind; the target must fit."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "check_interval_seconds": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "is_active": {
+            "description": "`false` pauses the monitor.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "probe_from_nodes": {
+            "description": "Check from worker nodes too, or from the control plane only.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "request": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/CheckRequest",
+                "description": "Replaces every header and the body. Omit to keep them."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "target": {
+            "type": [
+              "string",
+              "null"
             ]
           }
         },
@@ -89553,6 +91357,91 @@
           "success",
           "attempt_number",
           "created_at"
+        ],
+        "type": "object"
+      },
+      "WebhookEvent": {
+        "description": "One public happening on the page.",
+        "properties": {
+          "affected_components": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "ends_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "description": "Stable per page and event, the same as the Atom entry id: use it to\ndrop a repeated delivery.",
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "published_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "starts_at": {
+            "description": "When a maintenance window starts; absent for incident events.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "title",
+          "status",
+          "message",
+          "affected_components",
+          "published_at"
+        ],
+        "type": "object"
+      },
+      "WebhookPage": {
+        "description": "The page an event belongs to.",
+        "properties": {
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "title"
+        ],
+        "type": "object"
+      },
+      "WebhookPayload": {
+        "description": "The JSON body of every webhook delivery.",
+        "properties": {
+          "event": {
+            "$ref": "#/components/schemas/WebhookEvent"
+          },
+          "page": {
+            "$ref": "#/components/schemas/WebhookPage"
+          },
+          "type": {
+            "description": "`incident_update`, `incident_resolved` or `maintenance_scheduled`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "page",
+          "event"
         ],
         "type": "object"
       },
@@ -134612,6 +136501,124 @@
         ]
       }
     },
+    "/logs/ingest": {
+      "post": {
+        "description": "One JSON object per line; see the logs documentation for the keys read.\nA batch is parsed and charged to the budget whole before anything is\nstored, so a malformed or over-budget batch stores nothing. Storage is\nat least once: if storing fails part-way (a full disk), the lines before\nthe failure are kept and counted against the key, the request fails, and\na collector that resends the batch stores those lines again.",
+        "operationId": "ingest_logs",
+        "requestBody": {
+          "content": {
+            "application/x-ndjson": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          },
+          "description": "One JSON object per line",
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LogIngestResponse"
+                }
+              }
+            },
+            "description": "Lines stored"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "A line is not a JSON object"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Missing or unknown key"
+          },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The body did not arrive in time"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Body too large"
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Compressed body"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The project's log ingestion budget is exhausted"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Too many ingest requests in flight; retry after the Retry-After delay"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Ingest newline-delimited JSON log lines with a log ingest key.",
+        "tags": [
+          "Logs"
+        ]
+      }
+    },
     "/logs/ingest-budget": {
       "get": {
         "operationId": "log_ingest_budget",
@@ -174145,6 +176152,925 @@
         ]
       }
     },
+    "/projects/{project_id}/logs/ingest-keys": {
+      "get": {
+        "operationId": "list_log_ingest_keys",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "1-based page. Default 1.",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Default 20, maximum 100.",
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LogIngestKeysResponse"
+                }
+              }
+            },
+            "description": "Keys"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "List a project's log ingest keys. Never returns a key's plaintext.",
+        "tags": [
+          "Logs"
+        ]
+      },
+      "post": {
+        "operationId": "create_log_ingest_key",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateLogIngestKeyRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreatedLogIngestKeyResponse"
+                }
+              }
+            },
+            "description": "Key created; the plaintext is in `key`"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Validation error"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Project or environment not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Create a log ingest key. The response is the only time the key is shown.",
+        "tags": [
+          "Logs"
+        ]
+      }
+    },
+    "/projects/{project_id}/logs/ingest-keys/{key_id}/revoke": {
+      "post": {
+        "operationId": "revoke_log_ingest_key",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Log ingest key ID",
+            "in": "path",
+            "name": "key_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LogIngestKeyResponse"
+                }
+              }
+            },
+            "description": "Key revoked"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Key not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Revoke a log ingest key. Lines it already sent stay.",
+        "tags": [
+          "Logs"
+        ]
+      }
+    },
+    "/projects/{project_id}/logs/saved-searches": {
+      "get": {
+        "operationId": "list_saved_searches",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "1-based page number. Default 1.",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Rows per page. Default 20, maximum 100.",
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SavedSearchesResponse"
+                }
+              }
+            },
+            "description": "Saved searches"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "List a project's saved log searches, pinned first.",
+        "tags": [
+          "Logs"
+        ]
+      },
+      "post": {
+        "operationId": "create_saved_search",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateSavedSearchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SavedSearchResponse"
+                }
+              }
+            },
+            "description": "Saved search created"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Validation error"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Name taken or limit reached"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Save a log search for a project.",
+        "tags": [
+          "Logs"
+        ]
+      }
+    },
+    "/projects/{project_id}/logs/saved-searches/{saved_search_id}": {
+      "delete": {
+        "operationId": "delete_saved_search",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Saved search ID",
+            "in": "path",
+            "name": "saved_search_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Saved search deleted"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Saved search not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Still used by a log alert"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Delete a saved log search. Refused while a log alert counts it.",
+        "tags": [
+          "Logs"
+        ]
+      },
+      "get": {
+        "operationId": "get_saved_search",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Saved search ID",
+            "in": "path",
+            "name": "saved_search_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SavedSearchResponse"
+                }
+              }
+            },
+            "description": "Saved search"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Saved search not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Read one saved log search.",
+        "tags": [
+          "Logs"
+        ]
+      },
+      "patch": {
+        "operationId": "update_saved_search",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Saved search ID",
+            "in": "path",
+            "name": "saved_search_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateSavedSearchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SavedSearchResponse"
+                }
+              }
+            },
+            "description": "Saved search updated"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Validation error"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Saved search not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Name taken"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Change a saved log search.",
+        "tags": [
+          "Logs"
+        ]
+      }
+    },
+    "/projects/{project_id}/logs/saved-searches/{saved_search_id}/series": {
+      "get": {
+        "operationId": "saved_search_series",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Saved search ID",
+            "in": "path",
+            "name": "saved_search_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Window start, RFC 3339.",
+            "in": "query",
+            "name": "start_time",
+            "required": true,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Window end, RFC 3339.",
+            "in": "query",
+            "name": "end_time",
+            "required": true,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Bucket width in seconds. Default 60.",
+            "in": "query",
+            "name": "bucket_secs",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "`count` (default), or `avg`, `sum`, `max`, `p50`, `p95`, `p99` or\n`count_distinct` followed by `:<attribute>`, e.g. `p95:duration_ms`.",
+            "in": "query",
+            "name": "metric",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LogSeries"
+                }
+              }
+            },
+            "description": "The series"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid window, bucket or metric"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Saved search not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "A numeric series needs the line index, which is unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Chart a saved log search over time: matching lines per bucket, or a\nnumeric attribute aggregated per bucket.",
+        "tags": [
+          "Logs"
+        ]
+      }
+    },
     "/projects/{project_id}/mcp-servers": {
       "get": {
         "operationId": "list_mcps",
@@ -174566,6 +177492,198 @@
           }
         ],
         "summary": "Create a new monitor",
+        "tags": [
+          "Status Page"
+        ]
+      }
+    },
+    "/projects/{project_id}/monitors/probe-locations": {
+      "get": {
+        "description": "The control plane, plus the online worker nodes a monitor with\n`probe_from_nodes` would also be checked from (at most four, one per\n`region` label first). `configured` is false when there is no worker\nnode, with what to do about it.",
+        "operationId": "get_monitor_probe_locations",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProbeLocationsResponse"
+                }
+              }
+            },
+            "description": "Probe locations"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Where monitors can be checked from",
+        "tags": [
+          "Status Page"
+        ]
+      }
+    },
+    "/projects/{project_id}/monitors/targets": {
+      "post": {
+        "description": "Checks a URL (`http`), a port (`tcp`), a TLS certificate (`tls`) or a\nDNS record (`dns`) that is not a Temps environment. The target must have\na public address. The first check runs within about 15 seconds.",
+        "operationId": "create_target_monitor",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateTargetMonitorRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MonitorResponse"
+                }
+              }
+            },
+            "description": "Monitor created"
+          },
+          "400": {
+            "description": "Invalid target or check, or a non-public address"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Project not found"
+          },
+          "409": {
+            "description": "The project has too many target monitors"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Monitor a target outside Temps",
+        "tags": [
+          "Status Page"
+        ]
+      }
+    },
+    "/projects/{project_id}/monitors/{monitor_id}/target": {
+      "patch": {
+        "description": "Fields left out keep their value. `request` replaces every header and the\nbody. Changing the check may change its kind; the target must fit it.",
+        "operationId": "update_target_monitor",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Monitor ID",
+            "in": "path",
+            "name": "monitor_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateTargetMonitorRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MonitorResponse"
+                }
+              }
+            },
+            "description": "Monitor updated"
+          },
+          "400": {
+            "description": "Invalid target or check, or a non-public address"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Monitor not found in the project"
+          },
+          "409": {
+            "description": "The monitor checks a Temps environment"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Change a monitor of a target outside Temps",
         "tags": [
           "Status Page"
         ]
@@ -188096,6 +191214,469 @@
         "x-maturity": "beta"
       }
     },
+    "/status-pages/{status_page_id}/maintenances": {
+      "get": {
+        "description": "Newest first, cancelled and completed ones included.",
+        "operationId": "list_status_page_maintenances",
+        "parameters": [
+          {
+            "description": "Status page ID",
+            "in": "path",
+            "name": "status_page_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Page number, starting at 1 (default 1).",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Items per page (default 20, max 100).",
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MaintenanceListResponse"
+                }
+              }
+            },
+            "description": "Maintenance windows, newest first"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Status page not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Maintenance windows of a status page",
+        "tags": [
+          "Status Page"
+        ],
+        "x-maturity": "beta"
+      },
+      "post": {
+        "description": "While it runs, the covered monitors show \"Under maintenance\", their\nchecks are left out of uptime and no outage incident or alert is raised\nfor them. It is announced once, now, through the page's feed and\nsubscriptions. It cannot start in the past.",
+        "operationId": "create_status_page_maintenance",
+        "parameters": [
+          {
+            "description": "Status page ID",
+            "in": "path",
+            "name": "status_page_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateMaintenanceRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MaintenanceResponse"
+                }
+              }
+            },
+            "description": "Maintenance window scheduled"
+          },
+          "400": {
+            "description": "Invalid window"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Status page not found"
+          },
+          "409": {
+            "description": "The page has too many open windows"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Schedule a maintenance window",
+        "tags": [
+          "Status Page"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/status-pages/{status_page_id}/maintenances/{maintenance_id}": {
+      "delete": {
+        "description": "A scheduled window never runs; one in progress ends now. Checks taken\nwhile it ran stay out of uptime. The window is kept, marked cancelled.",
+        "operationId": "cancel_status_page_maintenance",
+        "parameters": [
+          {
+            "description": "Status page ID",
+            "in": "path",
+            "name": "status_page_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Maintenance window ID",
+            "in": "path",
+            "name": "maintenance_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MaintenanceResponse"
+                }
+              }
+            },
+            "description": "Maintenance window cancelled"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Status page or window not found"
+          },
+          "409": {
+            "description": "The window was already cancelled or has ended"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Cancel a maintenance window",
+        "tags": [
+          "Status Page"
+        ],
+        "x-maturity": "beta"
+      },
+      "get": {
+        "operationId": "get_status_page_maintenance",
+        "parameters": [
+          {
+            "description": "Status page ID",
+            "in": "path",
+            "name": "status_page_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Maintenance window ID",
+            "in": "path",
+            "name": "maintenance_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MaintenanceResponse"
+                }
+              }
+            },
+            "description": "Maintenance window"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Status page or window not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "A maintenance window",
+        "tags": [
+          "Status Page"
+        ],
+        "x-maturity": "beta"
+      },
+      "patch": {
+        "description": "Before it starts every field can change; once it has started, only the\ntitle, description and end. A cancelled or completed window cannot\nchange. Changes are shown on the page but not announced again.",
+        "operationId": "update_status_page_maintenance",
+        "parameters": [
+          {
+            "description": "Status page ID",
+            "in": "path",
+            "name": "status_page_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Maintenance window ID",
+            "in": "path",
+            "name": "maintenance_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateMaintenanceRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MaintenanceResponse"
+                }
+              }
+            },
+            "description": "Maintenance window updated"
+          },
+          "400": {
+            "description": "Invalid window"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Status page or window not found"
+          },
+          "409": {
+            "description": "The window can no longer change that way"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Change a maintenance window",
+        "tags": [
+          "Status Page"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/status-pages/{status_page_id}/password": {
+      "get": {
+        "operationId": "get_status_page_password",
+        "parameters": [
+          {
+            "description": "Status page ID",
+            "in": "path",
+            "name": "status_page_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PagePasswordResponse"
+                }
+              }
+            },
+            "description": "Whether the page has a password"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Status page not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Whether a status page needs a password",
+        "tags": [
+          "Status Page"
+        ],
+        "x-maturity": "beta"
+      },
+      "put": {
+        "description": "With a password (8 to 256 characters), visitors must type it to read the\npage, its JSON or subscribe, and the page's Atom feed is not served.\n`null` makes the page open again. Any change signs every visitor out.",
+        "operationId": "set_status_page_password",
+        "parameters": [
+          {
+            "description": "Status page ID",
+            "in": "path",
+            "name": "status_page_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetPagePasswordRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PagePasswordResponse"
+                }
+              }
+            },
+            "description": "Password changed"
+          },
+          "400": {
+            "description": "Invalid password"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Status page not found"
+          },
+          "429": {
+            "description": "Too many password checks or changes are running; retry in a moment"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Set, change or remove a status page's password",
+        "tags": [
+          "Status Page"
+        ],
+        "x-maturity": "beta"
+      }
+    },
     "/status-pages/{status_page_id}/preview": {
       "get": {
         "operationId": "preview_status_page",
@@ -188252,6 +191833,311 @@
         "x-maturity": "beta"
       }
     },
+    "/status-pages/{status_page_id}/subscribers": {
+      "get": {
+        "description": "Newest first. Addresses are personal data: only callers who may change the\npage see them.",
+        "operationId": "list_status_page_subscribers",
+        "parameters": [
+          {
+            "description": "Status page ID",
+            "in": "path",
+            "name": "status_page_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Page number, starting at 1 (default 1).",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Items per page (default 20, max 100).",
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SubscriberListResponse"
+                }
+              }
+            },
+            "description": "Subscribers, newest first"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Status page not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Subscribers of a status page",
+        "tags": [
+          "Status Page"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/status-pages/{status_page_id}/subscribers/export": {
+      "get": {
+        "description": "`email,state,subscribed_at,confirmed_at`, oldest first. Audit-logged.",
+        "operationId": "export_status_page_subscribers",
+        "parameters": [
+          {
+            "description": "Status page ID",
+            "in": "path",
+            "name": "status_page_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/csv": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Subscribers as CSV"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Status page not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Export the subscribers of a status page as CSV",
+        "tags": [
+          "Status Page"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/status-pages/{status_page_id}/subscribers/{subscriber_id}": {
+      "delete": {
+        "description": "Removes the address from the page. The subscriber gets no more mail.",
+        "operationId": "delete_status_page_subscriber",
+        "parameters": [
+          {
+            "description": "Status page ID",
+            "in": "path",
+            "name": "status_page_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Subscriber ID",
+            "in": "path",
+            "name": "subscriber_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Subscriber deleted"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Status page or subscriber not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Delete a subscriber",
+        "tags": [
+          "Status Page"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/status-pages/{status_page_id}/subscriptions": {
+      "get": {
+        "description": "Whether visitors can subscribe, the sender, whether mail and links can go\nout (with what is missing and where to fix it) and subscriber counts.",
+        "operationId": "get_status_page_subscriptions",
+        "parameters": [
+          {
+            "description": "Status page ID",
+            "in": "path",
+            "name": "status_page_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SubscriptionSettingsResponse"
+                }
+              }
+            },
+            "description": "Subscription settings"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Status page not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Email subscription settings of a status page",
+        "tags": [
+          "Status Page"
+        ],
+        "x-maturity": "beta"
+      },
+      "put": {
+        "description": "Switching subscriptions on needs a sender at a verified email domain with\nan active provider, and an address for the links (a public URL or a\nverified custom domain); otherwise 409 says what is missing.",
+        "operationId": "update_status_page_subscriptions",
+        "parameters": [
+          {
+            "description": "Status page ID",
+            "in": "path",
+            "name": "status_page_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateSubscriptionSettingsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SubscriptionSettingsResponse"
+                }
+              }
+            },
+            "description": "Settings saved"
+          },
+          "400": {
+            "description": "Invalid sender address"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Status page not found"
+          },
+          "409": {
+            "description": "Subscriptions cannot be switched on yet"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Change the email subscription settings of a status page",
+        "tags": [
+          "Status Page"
+        ],
+        "x-maturity": "beta"
+      }
+    },
     "/status-pages/{status_page_id}/unpublish": {
       "post": {
         "operationId": "unpublish_status_page",
@@ -188303,6 +192189,279 @@
         "x-maturity": "beta"
       }
     },
+    "/status-pages/{status_page_id}/webhooks": {
+      "get": {
+        "description": "Newest first, each with the outcome of its last delivery.",
+        "operationId": "list_status_page_webhooks",
+        "parameters": [
+          {
+            "description": "Status page ID",
+            "in": "path",
+            "name": "status_page_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Page number, starting at 1 (default 1).",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Items per page (default 20, max 100).",
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatusPageWebhookListResponse"
+                }
+              }
+            },
+            "description": "Webhooks, newest first"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Status page not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Webhooks of a status page",
+        "tags": [
+          "Status Page"
+        ],
+        "x-maturity": "beta"
+      },
+      "post": {
+        "description": "Each new public event of the page (an incident update or resolution, a\nscheduled maintenance window) is posted to the URL as JSON, signed in\n`X-Temps-Signature` with the secret returned here, once. The URL must be\n`https://` and resolve to a public address.",
+        "operationId": "create_status_page_webhook",
+        "parameters": [
+          {
+            "description": "Status page ID",
+            "in": "path",
+            "name": "status_page_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateStatusPageWebhookRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatusPageWebhookCreatedResponse"
+                }
+              }
+            },
+            "description": "Webhook registered; the secret is shown only now"
+          },
+          "400": {
+            "description": "Invalid URL or non-public address"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Status page not found"
+          },
+          "409": {
+            "description": "The page already has the most webhooks allowed"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Register a webhook on a status page",
+        "tags": [
+          "Status Page"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/status-pages/{status_page_id}/webhooks/{webhook_id}": {
+      "delete": {
+        "description": "Events still waiting for it are dropped.",
+        "operationId": "delete_status_page_webhook",
+        "parameters": [
+          {
+            "description": "Status page ID",
+            "in": "path",
+            "name": "status_page_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Webhook ID",
+            "in": "path",
+            "name": "webhook_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Webhook deleted"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Status page or webhook not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Delete a webhook",
+        "tags": [
+          "Status Page"
+        ],
+        "x-maturity": "beta"
+      },
+      "patch": {
+        "operationId": "update_status_page_webhook",
+        "parameters": [
+          {
+            "description": "Status page ID",
+            "in": "path",
+            "name": "status_page_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Webhook ID",
+            "in": "path",
+            "name": "webhook_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateStatusPageWebhookRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatusPageWebhookResponse"
+                }
+              }
+            },
+            "description": "Webhook updated"
+          },
+          "400": {
+            "description": "Invalid URL or non-public address"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Status page or webhook not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Change a webhook's URL or switch it on or off",
+        "tags": [
+          "Status Page"
+        ],
+        "x-maturity": "beta"
+      }
+    },
     "/status/{slug}": {
       "get": {
         "operationId": "get_public_status_page",
@@ -188324,6 +192483,12 @@
             },
             "description": "Rendered status page"
           },
+          "401": {
+            "content": {
+              "text/html": {}
+            },
+            "description": "The page is password-protected: the password form"
+          },
           "404": {
             "description": "No published status page at this URL"
           },
@@ -188332,6 +192497,184 @@
           }
         },
         "summary": "Public status page (HTML)",
+        "tags": [
+          "Status Page"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/status/{slug}/confirm/{token}": {
+      "get": {
+        "operationId": "status_page_confirm_form",
+        "parameters": [
+          {
+            "description": "Unguessable status page token",
+            "in": "path",
+            "name": "slug",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Confirmation token from the mail",
+            "in": "path",
+            "name": "token",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {}
+            },
+            "description": "Page with a confirm button"
+          },
+          "404": {
+            "description": "Unknown page or malformed link"
+          }
+        },
+        "summary": "Confirmation link: asks for a click",
+        "tags": [
+          "Status Page"
+        ],
+        "x-maturity": "beta"
+      },
+      "post": {
+        "operationId": "status_page_confirm",
+        "parameters": [
+          {
+            "description": "Unguessable status page token",
+            "in": "path",
+            "name": "slug",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Confirmation token from the mail",
+            "in": "path",
+            "name": "token",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {}
+            },
+            "description": "Subscription confirmed"
+          },
+          "404": {
+            "description": "Unknown page, or the link expired or was used"
+          },
+          "429": {
+            "description": "Rate limited"
+          }
+        },
+        "summary": "Confirm a subscription",
+        "tags": [
+          "Status Page"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/status/{slug}/feed.atom": {
+      "get": {
+        "description": "The page's public incident updates and maintenance announcements as an\nAtom feed, newest first, built with the page snapshot: it carries nothing\nthe page does not show. A password-protected page has no feed.",
+        "operationId": "get_public_status_page_feed",
+        "parameters": [
+          {
+            "description": "Unguessable status page token",
+            "in": "path",
+            "name": "slug",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/atom+xml": {}
+            },
+            "description": "Atom feed of the page's public updates"
+          },
+          "404": {
+            "description": "No published status page at this URL"
+          },
+          "429": {
+            "description": "Rate limited"
+          }
+        },
+        "summary": "Public status page (Atom feed)",
+        "tags": [
+          "Status Page"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/status/{slug}/subscribe": {
+      "post": {
+        "operationId": "status_page_subscribe",
+        "parameters": [
+          {
+            "description": "Unguessable status page token",
+            "in": "path",
+            "name": "slug",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/x-www-form-urlencoded": {}
+          },
+          "description": "`email=<address>`"
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {}
+            },
+            "description": "Request accepted; a confirmation link is sent"
+          },
+          "400": {
+            "content": {
+              "text/html": {}
+            },
+            "description": "Not an email address"
+          },
+          "401": {
+            "content": {
+              "text/html": {}
+            },
+            "description": "The page is password-protected and not unlocked"
+          },
+          "404": {
+            "description": "No published status page taking subscriptions at this URL"
+          },
+          "429": {
+            "description": "Rate limited"
+          },
+          "503": {
+            "content": {
+              "text/html": {}
+            },
+            "description": "The page cannot take more subscriptions"
+          }
+        },
+        "summary": "Subscribe to a status page by email",
         "tags": [
           "Status Page"
         ],
@@ -188363,6 +192706,9 @@
             },
             "description": "Status page snapshot"
           },
+          "401": {
+            "description": "The page is password-protected and not unlocked"
+          },
           "404": {
             "description": "No published status page at this URL"
           },
@@ -188371,6 +192717,143 @@
           }
         },
         "summary": "Public status page (JSON)",
+        "tags": [
+          "Status Page"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/status/{slug}/unlock": {
+      "post": {
+        "description": "The password form's post. The right password sets a cookie that opens\nthe page for 7 days and redirects to it; a wrong one shows the form\nagain. Repeated wrong passwords from one client are refused for a while.",
+        "operationId": "unlock_public_status_page",
+        "parameters": [
+          {
+            "description": "Unguessable status page token",
+            "in": "path",
+            "name": "slug",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/x-www-form-urlencoded": {}
+          },
+          "description": "`password=<password>`"
+        },
+        "responses": {
+          "303": {
+            "description": "Unlocked: redirect to the page with the access cookie set"
+          },
+          "401": {
+            "content": {
+              "text/html": {}
+            },
+            "description": "Wrong password: the form again"
+          },
+          "404": {
+            "description": "No published status page at this URL"
+          },
+          "429": {
+            "content": {
+              "text/html": {}
+            },
+            "description": "Too many wrong passwords from this client"
+          },
+          "503": {
+            "content": {
+              "text/html": {}
+            },
+            "description": "Too many unlocks at once; retry"
+          }
+        },
+        "summary": "Unlock a password-protected status page",
+        "tags": [
+          "Status Page"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/status/{slug}/unsubscribe/{token}": {
+      "get": {
+        "operationId": "status_page_unsubscribe_form",
+        "parameters": [
+          {
+            "description": "Unguessable status page token",
+            "in": "path",
+            "name": "slug",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Unsubscribe token from a mail",
+            "in": "path",
+            "name": "token",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {}
+            },
+            "description": "Page with an unsubscribe button"
+          },
+          "404": {
+            "description": "Unknown page or malformed link"
+          }
+        },
+        "summary": "Unsubscribe link: asks for a click",
+        "tags": [
+          "Status Page"
+        ],
+        "x-maturity": "beta"
+      },
+      "post": {
+        "operationId": "status_page_unsubscribe",
+        "parameters": [
+          {
+            "description": "Unguessable status page token",
+            "in": "path",
+            "name": "slug",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Unsubscribe token from a mail",
+            "in": "path",
+            "name": "token",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {}
+            },
+            "description": "Unsubscribed (also for a link already used)"
+          },
+          "404": {
+            "description": "Unknown page or malformed link"
+          },
+          "429": {
+            "description": "Rate limited"
+          }
+        },
+        "summary": "Unsubscribe",
         "tags": [
           "Status Page"
         ],

@@ -85,7 +85,7 @@ pub use facet_service::{
 };
 pub use health_service::HealthComputeService;
 pub use metric_alert_evaluator::MetricAlertEvaluator;
-pub use metric_alert_service::MetricAlertService;
+pub use metric_alert_service::{AlertSeriesSource, MetricAlertService};
 pub use operation_trends::OperationTrendService;
 pub use otel_service::OtelService;
 pub use telemetry_write_mode::{

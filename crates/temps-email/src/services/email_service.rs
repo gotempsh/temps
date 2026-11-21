@@ -313,7 +313,25 @@ impl EmailService {
     /// 4. If domain is configured and verified, send via provider and mark as "sent"
     /// 5. If domain is not configured or not verified, mark as "captured" (Mailhog-like behavior)
     pub async fn send(&self, request: SendEmailRequest) -> Result<SendEmailResponse, EmailError> {
-        self.send_with_context(request, None, None).await
+        self.send_with_context(request, None, None, History::Full)
+            .await
+    }
+
+    /// Send an email whose stored copy keeps no recipient and no content.
+    ///
+    /// For mail that carries a recipient's personal capability links (a
+    /// confirmation or unsubscribe link) to someone whose address is personal
+    /// data: the message is delivered through the normal pipeline (domain,
+    /// suppression list, provider), but the history row that `GET /emails`
+    /// shows holds [`WITHHELD_RECIPIENT`] and [`WITHHELD_BODY`] instead, so
+    /// neither the address nor a link outlives the send. Such an email is
+    /// never tracked and can never be resent.
+    pub async fn send_without_history(
+        &self,
+        request: SendEmailRequest,
+    ) -> Result<SendEmailResponse, EmailError> {
+        self.send_with_context(request, None, None, History::Withheld)
+            .await
     }
 
     /// Send from a deployment token's project scope.
@@ -326,8 +344,13 @@ impl EmailService {
         project_id: i32,
         idempotency_key: String,
     ) -> Result<SendEmailResponse, EmailError> {
-        self.send_with_context(request, Some((project_id, idempotency_key)), None)
-            .await
+        self.send_with_context(
+            request,
+            Some((project_id, idempotency_key)),
+            None,
+            History::Full,
+        )
+        .await
     }
 
     /// Deliver a captured email again, in place.
@@ -396,8 +419,13 @@ impl EmailService {
             });
         }
         info!(email_id = %email_id, project_id, "Resending captured project email");
-        self.send_with_context(request, Some((project_id, claim.idempotency_key)), None)
-            .await
+        self.send_with_context(
+            request,
+            Some((project_id, claim.idempotency_key)),
+            None,
+            History::Full,
+        )
+        .await
     }
 
     /// Claim and deliver an email that has no project, so no idempotency
@@ -477,7 +505,7 @@ impl EmailService {
             let result = match service.get(email_id).await {
                 Ok(queued) => {
                     service
-                        .send_with_context(request, None, Some((queued, &attempt)))
+                        .send_with_context(request, None, Some((queued, &attempt)), History::Full)
                         .await
                 }
                 Err(error) => Err(error),
@@ -656,6 +684,7 @@ impl EmailService {
         request: SendEmailRequest,
         project_context: Option<(i32, String)>,
         resend_of: Option<(emails::Model, &ResendAttempt)>,
+        history: History,
     ) -> Result<SendEmailResponse, EmailError> {
         let (resend_of, resend_attempt) = match resend_of {
             Some((email, attempt)) => (Some(email), Some(attempt)),
@@ -724,9 +753,11 @@ impl EmailService {
             .map(|email| email.id)
             .unwrap_or_else(Uuid::new_v4);
 
-        // Apply tracking transformations if enabled
-        let track_opens = request.track_opens;
-        let track_clicks = request.track_clicks;
+        // Apply tracking transformations if enabled. A withheld email is
+        // never tracked: its links would be stored for the click redirects.
+        let withheld = history == History::Withheld;
+        let track_opens = request.track_opens && !withheld;
+        let track_clicks = request.track_clicks && !withheld;
         let mut tracked_html = request.html.clone();
         let mut extracted_links = Vec::new();
 
@@ -741,31 +772,29 @@ impl EmailService {
             }
         }
 
-        // Create email record - always store for visualization
+        // Create email record - always store for visualization; a withheld
+        // email stores a placeholder instead of its recipients and content.
+        let stored = StoredCopy::of(&request, tracked_html.clone(), history);
         let email = emails::ActiveModel {
             id: Set(email_id),
             domain_id: Set(domain.as_ref().map(|d| d.id)),
             project_id: Set(project_context.as_ref().map(|(project_id, _)| *project_id)),
             from_address: Set(request.from.clone()),
             from_name: Set(request.from_name.clone()),
-            to_addresses: Set(serde_json::to_value(&request.to)?),
-            cc_addresses: Set(request.cc.as_ref().map(serde_json::to_value).transpose()?),
-            bcc_addresses: Set(request.bcc.as_ref().map(serde_json::to_value).transpose()?),
+            to_addresses: Set(serde_json::to_value(&stored.to)?),
+            cc_addresses: Set(stored.cc.as_ref().map(serde_json::to_value).transpose()?),
+            bcc_addresses: Set(stored.bcc.as_ref().map(serde_json::to_value).transpose()?),
             reply_to: Set(request.reply_to.clone()),
             subject: Set(request.subject.clone()),
-            html_body: Set(request.html.clone()),
-            tracked_html_body: Set(tracked_html.clone()),
-            text_body: Set(request.text.clone()),
-            headers: Set(request
+            html_body: Set(stored.html),
+            tracked_html_body: Set(stored.tracked_html),
+            text_body: Set(stored.text),
+            headers: Set(stored
                 .headers
                 .as_ref()
                 .map(serde_json::to_value)
                 .transpose()?),
-            tags: Set(request
-                .tags
-                .as_ref()
-                .map(serde_json::to_value)
-                .transpose()?),
+            tags: Set(stored.tags.as_ref().map(serde_json::to_value).transpose()?),
             status: Set("queued".to_string()),
             track_opens: Set(track_opens),
             track_clicks: Set(track_clicks),
@@ -1597,7 +1626,67 @@ fn delivery_status_is_retryable(status: &str, error_message: Option<&str>) -> bo
 }
 
 /// Prefix of the error recorded when every recipient was suppressed.
-const SUPPRESSED_RECIPIENTS_ERROR: &str = "Recipient(s) suppressed";
+pub const SUPPRESSED_RECIPIENTS_ERROR: &str = "Recipient(s) suppressed";
+
+/// Tag on an email sent with [`EmailService::send_without_history`].
+pub const WITHHELD_TAG: &str = "content-withheld";
+/// What the history shows instead of a withheld email's recipients.
+pub const WITHHELD_RECIPIENT: &str = "[withheld]";
+/// What the history shows instead of a withheld email's content.
+pub const WITHHELD_BODY: &str =
+    "The content of this email was not kept: it carried the recipient's personal links.";
+
+/// What the history row of an email keeps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum History {
+    /// Recipients, content and headers, as sent.
+    Full,
+    /// Placeholders only; see [`EmailService::send_without_history`].
+    Withheld,
+}
+
+/// The fields of an email's history row that a withheld email replaces.
+struct StoredCopy {
+    to: Vec<String>,
+    cc: Option<Vec<String>>,
+    bcc: Option<Vec<String>>,
+    html: Option<String>,
+    tracked_html: Option<String>,
+    text: Option<String>,
+    headers: Option<std::collections::HashMap<String, String>>,
+    tags: Option<Vec<String>>,
+}
+
+impl StoredCopy {
+    fn of(request: &SendEmailRequest, tracked_html: Option<String>, history: History) -> Self {
+        match history {
+            History::Full => Self {
+                to: request.to.clone(),
+                cc: request.cc.clone(),
+                bcc: request.bcc.clone(),
+                html: request.html.clone(),
+                tracked_html,
+                text: request.text.clone(),
+                headers: request.headers.clone(),
+                tags: request.tags.clone(),
+            },
+            History::Withheld => {
+                let mut tags = request.tags.clone().unwrap_or_default();
+                tags.push(WITHHELD_TAG.to_string());
+                Self {
+                    to: vec![WITHHELD_RECIPIENT.to_string()],
+                    cc: None,
+                    bcc: None,
+                    html: None,
+                    tracked_html: None,
+                    text: Some(WITHHELD_BODY.to_string()),
+                    headers: None,
+                    tags: Some(tags),
+                }
+            }
+        }
+    }
+}
 
 /// A non-project resend claim (`queued`, stamped with `sent_at`) older than
 /// this was abandoned by a crash, restart or stall and may be taken over.
@@ -1638,6 +1727,18 @@ fn fence_token(now: chrono::DateTime<Utc>) -> chrono::DateTime<Utc> {
 }
 
 fn ensure_resendable(email: &emails::Model, now: chrono::DateTime<Utc>) -> Result<(), EmailError> {
+    let withheld = email.tags.as_ref().is_some_and(|tags| {
+        tags.as_array()
+            .is_some_and(|tags| tags.iter().any(|tag| tag.as_str() == Some(WITHHELD_TAG)))
+    });
+    if withheld {
+        return Err(EmailError::NotResendable {
+            email_id: email.id,
+            status: email.status.clone(),
+            reason: "its recipients and content were not kept, so it cannot be sent again"
+                .to_string(),
+        });
+    }
     let reason = match email.status.as_str() {
         // A first send left `queued` has no `sent_at`; only an abandoned
         // resend claim of an email without a project carries one.
@@ -2967,6 +3068,58 @@ mod tests {
         assert!(result.is_ok());
         let response = result.unwrap();
         assert_eq!(response.status, "captured");
+    }
+
+    #[tokio::test]
+    async fn an_email_sent_without_history_keeps_no_recipient_or_link_and_cannot_be_resent() {
+        let Some((_db, email_service, _provider_service, _domain_service)) = setup_test_env().await
+        else {
+            return;
+        };
+        let link = "https://status.example.test/unsubscribe/0123456789abcdef";
+        let request = SendEmailRequest {
+            from: "status@unconfigured-domain.com".to_string(),
+            from_name: Some("Example status".to_string()),
+            to: vec!["subscriber@test.com".to_string()],
+            cc: None,
+            bcc: None,
+            reply_to: None,
+            subject: "Incident update".to_string(),
+            html: Some(format!("<a href=\"{link}\">Unsubscribe</a>")),
+            text: Some(format!("Unsubscribe: {link}")),
+            headers: None,
+            tags: Some(vec!["status-page".to_string()]),
+            track_opens: true,
+            track_clicks: true,
+        };
+
+        let response = email_service
+            .send_without_history(request)
+            .await
+            .expect("send");
+        let stored = email_service.get(response.id).await.expect("history row");
+        let row = serde_json::to_string(&(
+            &stored.to_addresses,
+            &stored.html_body,
+            &stored.tracked_html_body,
+            &stored.text_body,
+        ))
+        .expect("row json");
+        assert!(!row.contains("subscriber@test.com"), "{row}");
+        assert!(!row.contains("unsubscribe/"), "{row}");
+        assert_eq!(stored.to_addresses, serde_json::json!([WITHHELD_RECIPIENT]));
+        assert_eq!(stored.text_body.as_deref(), Some(WITHHELD_BODY));
+        assert!(!stored.track_opens && !stored.track_clicks);
+        assert_eq!(
+            stored.tags,
+            Some(serde_json::json!(["status-page", WITHHELD_TAG]))
+        );
+
+        let resend = email_service.resend(response.id).await;
+        assert!(
+            matches!(resend, Err(EmailError::NotResendable { .. })),
+            "{resend:?}"
+        );
     }
 
     #[tokio::test]

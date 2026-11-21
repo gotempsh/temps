@@ -123,6 +123,60 @@ pub enum LogAggregatorError {
     #[error("Validation error: {message}")]
     Validation { message: String },
 
+    // ── Saved searches and log ingest (ADR 108 D1) ──────────────────────
+    #[error("Saved log search {saved_search_id} not found in project {project_id}")]
+    SavedSearchNotFound {
+        project_id: i32,
+        saved_search_id: i32,
+    },
+
+    #[error("Project {project_id} already has a saved log search named '{name}'")]
+    SavedSearchNameTaken { project_id: i32, name: String },
+
+    #[error("Saved log search {saved_search_id} is used by {alert_count} log alert rule(s); detach or delete them first")]
+    SavedSearchInUse {
+        saved_search_id: i32,
+        alert_count: u64,
+    },
+
+    #[error("Project {project_id} already has {existing} saved log searches; the limit is {limit}. Delete or reuse an existing search")]
+    SavedSearchLimitReached {
+        project_id: i32,
+        existing: u64,
+        limit: u64,
+    },
+
+    #[error("Log ingest key {key_id} not found in project {project_id}")]
+    IngestKeyNotFound { project_id: i32, key_id: i32 },
+
+    #[error("The presented log ingest key is not an active key")]
+    IngestKeyRejected,
+
+    #[error(
+        "Project {project_id} has no environment {environment_id} to scope a log ingest key to"
+    )]
+    IngestKeyEnvironmentNotFound {
+        project_id: i32,
+        environment_id: i32,
+    },
+
+    #[error("Project {project_id} not found")]
+    ProjectNotFound { project_id: i32 },
+
+    #[error("Log ingest batch of {total} lines refused ({accepted} stored): project {project_id}'s log ingestion budget is exhausted ({reason}). Retry the whole batch after a few seconds")]
+    IngestBudgetExceeded {
+        project_id: i32,
+        accepted: usize,
+        total: usize,
+        reason: String,
+    },
+
+    #[error("Log ingest line {line} is not a usable JSON log record: {reason}")]
+    IngestLineInvalid { line: usize, reason: String },
+
+    #[error("Log ingest body exceeds the {limit_bytes} byte limit for one request")]
+    IngestBodyTooLarge { limit_bytes: usize },
+
     // ── Configuration errors ────────────────────────────────────────────
     #[error("Storage configuration error: {message}")]
     StorageConfiguration { message: String },
@@ -215,6 +269,20 @@ impl LogAggregatorError {
             | Self::LineNotFound { .. }
             | Self::AccessResolutionFailed { .. }
             | Self::Validation { .. }
+            // Saved-search and log-ingest failures are all decisions about a
+            // request or a row, not infrastructure that may recover: a name
+            // is taken, a key is not active, a line is not JSON.
+            | Self::SavedSearchNotFound { .. }
+            | Self::SavedSearchNameTaken { .. }
+            | Self::SavedSearchInUse { .. }
+            | Self::SavedSearchLimitReached { .. }
+            | Self::IngestKeyNotFound { .. }
+            | Self::IngestKeyRejected
+            | Self::IngestKeyEnvironmentNotFound { .. }
+            | Self::ProjectNotFound { .. }
+            | Self::IngestBudgetExceeded { .. }
+            | Self::IngestLineInvalid { .. }
+            | Self::IngestBodyTooLarge { .. }
             | Self::StorageConfiguration { .. }
             | Self::Serialization(_)
             | Self::ChunkFormat { .. }

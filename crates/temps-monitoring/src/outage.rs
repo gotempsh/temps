@@ -242,6 +242,47 @@ impl OutageDetectionService {
             .unwrap_or(false)
     }
 
+    /// Whether `monitor_id` is covered right now by a maintenance window of
+    /// a status page that still shows it (ADR 108 D2). A failed read counts
+    /// as "not in maintenance": an alert too many beats a silenced outage.
+    async fn is_in_maintenance(&self, monitor_id: i32, now: chrono::DateTime<Utc>) -> bool {
+        #[derive(Debug, sea_orm::FromQueryResult)]
+        struct InMaintenance {
+            covered: bool,
+        }
+        let statement = Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM status_page_maintenance_monitors mm
+                JOIN status_page_maintenances m ON m.id = mm.maintenance_id
+                JOIN status_page_monitors spm
+                  ON spm.status_page_id = m.status_page_id AND spm.monitor_id = mm.monitor_id
+                WHERE mm.monitor_id = $1
+                  AND m.cancelled_at IS NULL
+                  AND m.starts_at <= $2
+                  AND m.ends_at > $2
+            ) AS covered
+            "#,
+            [monitor_id.into(), now.into()],
+        );
+        match <InMaintenance as sea_orm::FromQueryResult>::find_by_statement(statement)
+            .one(self.db.as_ref())
+            .await
+        {
+            Ok(row) => row.is_some_and(|row| row.covered),
+            Err(e) => {
+                warn!(
+                    monitor_id,
+                    error = %e,
+                    "failed to read maintenance windows; processing the check as usual"
+                );
+                false
+            }
+        }
+    }
+
     /// Resolve a project's slug for display in human-facing notifications.
     /// Degrades gracefully to `project #{id}` if the lookup fails or the
     /// project no longer exists, rather than surfacing a raw numeric ID or
@@ -293,6 +334,18 @@ impl OutageDetectionService {
             debug!(
                 "Monitor {} - deployment is paused, ignoring status check",
                 monitor_id
+            );
+            return Ok(None);
+        }
+
+        // A scheduled maintenance window covers this monitor: the owner
+        // announced the downtime, so it raises no incident, notification or
+        // alarm, and the state machine does not move. When the window ends,
+        // the next check is judged against the state from before it.
+        if self.is_in_maintenance(monitor_id, now).await {
+            debug!(
+                monitor_id,
+                "monitor is in a maintenance window, ignoring status check"
             );
             return Ok(None);
         }
@@ -1665,6 +1718,12 @@ pub(crate) mod tests {
             is_active: true,
             is_managed: false,
             next_check_at: None,
+            check_kind: "environment".to_string(),
+            target: None,
+            check_spec: None,
+            request_encrypted: None,
+            probe_from_nodes: false,
+            location_results: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -2037,6 +2096,61 @@ pub(crate) mod tests {
         assert_eq!(job_queue.send_count(), 0);
     }
 
+    fn maintenance_row(covered: bool) -> std::collections::BTreeMap<&'static str, sea_orm::Value> {
+        std::collections::BTreeMap::from([("covered", sea_orm::Value::Bool(Some(covered)))])
+    }
+
+    /// A check for a monitor in a scheduled maintenance window (ADR 108 D2)
+    /// is dropped before the state machine: no outage event, incident,
+    /// notification or alarm, and the state from before the window is kept.
+    #[tokio::test]
+    async fn test_process_check_skips_monitor_in_maintenance() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![make_status_monitor_model(1, Some(1))]])
+            .append_query_results(vec![vec![make_environment_model(1, Some(10))]])
+            .append_query_results(vec![vec![make_deployment_model(10, "running")]])
+            .append_query_results(vec![vec![maintenance_row(true)]])
+            .into_connection();
+        let db = Arc::new(db);
+        let notification_service = Arc::new(TrackingNotificationService::new());
+        let job_queue = Arc::new(TrackingJobQueue::new());
+        let alarm_service = Arc::new(AlarmService::new(
+            db.clone(),
+            notification_service.clone(),
+            job_queue.clone(),
+        ));
+        let service =
+            OutageDetectionService::new(db.clone(), notification_service.clone(), alarm_service);
+        service.monitor_states.write().await.insert(
+            1,
+            MonitorState {
+                status: MonitorStatus::Operational,
+                active_incident_id: None,
+                consecutive_failures: 0,
+            },
+        );
+
+        let result = service
+            .process_check(1, MonitorStatus::Down, Some("planned restart".to_string()))
+            .await
+            .unwrap();
+
+        assert!(result.is_none(), "no outage event during maintenance");
+        assert_eq!(notification_service.send_count(), 0);
+        assert_eq!(job_queue.send_count(), 0);
+        let states = service.monitor_states.read().await;
+        assert_eq!(states.get(&1).map(|s| s.consecutive_failures), Some(0));
+        assert_eq!(
+            states.get(&1).map(|s| s.status),
+            Some(MonitorStatus::Operational)
+        );
+        drop(states);
+        drop(service);
+        let log = format!("{:?}", Arc::try_unwrap(db).unwrap().into_transaction_log());
+        assert!(log.contains("status_page_maintenances"), "{log}");
+        assert!(log.contains("cancelled_at IS NULL"), "{log}");
+    }
+
     /// Even narrower window than `test_process_check_skips_paused_deployment`:
     /// the deployment is still unpaused when `process_check`'s own guard
     /// runs, and only becomes paused afterward — while the in-memory
@@ -2052,6 +2166,8 @@ pub(crate) mod tests {
             // process_check's guard: still unpaused.
             .append_query_results(vec![vec![make_environment_model(1, Some(10))]])
             .append_query_results(vec![vec![make_deployment_model(10, "running")]])
+            // process_check's maintenance gate: not in a window.
+            .append_query_results(vec![vec![maintenance_row(false)]])
             // process_check resolves the project slug for the outage event
             // metadata before handing off to handle_outage_event.
             .append_query_results(vec![vec![make_project_model(1, "test-project")]])
@@ -2140,6 +2256,8 @@ pub(crate) mod tests {
             // process_check's guard: still unpaused.
             .append_query_results(vec![vec![make_environment_model(1, Some(10))]])
             .append_query_results(vec![vec![make_deployment_model(10, "running")]])
+            // process_check's maintenance gate: not in a window.
+            .append_query_results(vec![vec![maintenance_row(false)]])
             // handle_outage_event's locked guard: still unpaused.
             .append_exec_results(vec![sea_orm::MockExecResult {
                 last_insert_id: 0,

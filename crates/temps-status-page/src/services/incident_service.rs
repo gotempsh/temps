@@ -182,6 +182,7 @@ impl IncidentService {
                 message: Set(message),
                 is_public: Set(request.is_public),
                 is_system: Set(false),
+                published_at: Set(request.is_public.then(chrono::Utc::now)),
                 ..Default::default()
             },
             None => status_incident_updates::ActiveModel {
@@ -305,6 +306,7 @@ impl IncidentService {
             status: Set(request.status),
             message: Set(request.message),
             is_public: Set(request.is_public),
+            published_at: Set(request.is_public.then(chrono::Utc::now)),
             ..Default::default()
         };
 
@@ -339,8 +341,13 @@ impl IncidentService {
                 update_id,
             });
         }
+        let becomes_public = is_public && !update.is_public;
         let mut update: status_incident_updates::ActiveModel = update.into();
         update.is_public = Set(is_public);
+        if becomes_public {
+            // Subscribers hear of it from now, however old the draft is.
+            update.published_at = Set(Some(chrono::Utc::now()));
+        }
         let update = update.update(self.db.as_ref()).await?;
         Ok(update.into())
     }

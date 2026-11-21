@@ -60,6 +60,7 @@ pub mod tailscale_api;
 pub mod tailscale_serve;
 #[cfg(test)]
 mod test_engines;
+pub mod uptime_probe;
 pub mod worker_metrics;
 
 use serde::{Deserialize, Serialize};
