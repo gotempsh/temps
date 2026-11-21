@@ -50,11 +50,15 @@ const PTY_RESTART_DELAY: Duration = Duration::from_secs(1);
 /// Relays currently being served; bounded by [`MAX_PTY_RELAYS`].
 static ACTIVE_PTY_RELAYS: AtomicUsize = AtomicUsize::new(0);
 
-/// The sandbox user this boot prepared, set once before any RPC is served.
+/// The sandbox user this boot prepared, set once by the preparation thread.
+/// Unset while it runs: RPCs are served meanwhile, so a long first-boot walk
+/// of the rootfs never delays the agent's readiness.
 static SANDBOX_USER: std::sync::OnceLock<SandboxUserStatus> = std::sync::OnceLock::new();
 
+const PREPARING: SandboxUserStatus = SandboxUserStatus::Preparing;
+
 fn sandbox_user_status() -> &'static SandboxUserStatus {
-    SANDBOX_USER.get_or_init(|| SandboxUserStatus::NotRequested)
+    SANDBOX_USER.get().unwrap_or(&PREPARING)
 }
 
 /// The sandbox user, when it is ready to run commands.
@@ -70,7 +74,6 @@ pub fn run() {
     if is_init {
         setup_system();
     }
-    let _ = SANDBOX_USER.set(prepare_sandbox_user());
     info(
         "starting",
         &[
@@ -79,7 +82,19 @@ pub fn run() {
             ("pty_port", json!(PTY_PORT)),
         ],
     );
-    start_terminal_support();
+    // The user is prepared beside the RPC server, and terminals start only
+    // once it is settled, so they never run before their user exists.
+    let spawned = std::thread::Builder::new()
+        .name("sandbox-user".to_string())
+        .spawn(|| {
+            let _ = SANDBOX_USER.set(prepare_sandbox_user());
+            start_terminal_support();
+        });
+    if let Err(e) = spawned {
+        let reason = format!("start the sandbox user preparation: {e}");
+        error("sandbox_user_thread_failed", &[("error", json!(reason))]);
+        let _ = SANDBOX_USER.set(SandboxUserStatus::Failed { reason });
+    }
     serve();
 }
 

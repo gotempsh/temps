@@ -201,11 +201,24 @@ fn writes_into_the_home_or_workspace_run_as_the_user() {
     ] {
         assert_eq!(is_user_file(path, &user, "/workspace"), Ok(false), "{path}");
     }
+    for path in [
+        "/workspace/../etc/passwd",
+        "/tmp/../workspace/x",
+        "/etc/../home/temps/.bashrc",
+        "tmp/../workspace",
+    ] {
+        assert_eq!(
+            is_user_file(path, &user, "/workspace"),
+            Err(OwnedWriteError::ParentComponent {
+                path: path.to_string()
+            }),
+            "{path}"
+        );
+    }
+    // A `..` that stays outside the user's area is root's, as before.
     assert_eq!(
-        is_user_file("/workspace/../etc/passwd", &user, "/workspace"),
-        Err(OwnedWriteError::ParentComponent {
-            path: "/workspace/../etc/passwd".to_string()
-        })
+        is_user_file("/etc/../opt/x", &user, "/workspace"),
+        Ok(false)
     );
 }
 
@@ -396,6 +409,21 @@ fn a_write_replaces_a_read_only_file_and_a_planted_symlink() {
         2,
         "no staged file is left behind"
     );
+
+    // The longest name a file can have is written too: the staging name does
+    // not grow with it.
+    let longest = dir.join("n".repeat(255));
+    run_file_op(
+        &FileOp::Write {
+            path: longest.display().to_string(),
+            mode: 0o600,
+        },
+        &b"long"[..],
+        1024,
+    )
+    .unwrap();
+    assert_eq!(std::fs::read(&longest).unwrap(), b"long");
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 3);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -437,23 +465,25 @@ fn an_account_file_is_measured_as_opened() {
 #[test]
 fn owner_normalisation_resumes_until_it_has_finished() {
     let dir = tempfile_dir();
+    // The guest's own records are root's; here, the runner's.
+    let mine = me().uid;
     let record = dir.join("var/lib/temps-vm-agent/rootfs-owner");
 
     // A rootfs extracted as root: nothing to do, nothing recorded.
     assert_eq!(
-        normalize_rootfs_owner(&record, (0, 0), |_| panic!("no walk")).unwrap(),
+        normalize_rootfs_owner_as(&record, mine, (0, 0), |_| panic!("no walk")).unwrap(),
         None
     );
     assert_eq!(
-        read_normalization(&record).unwrap(),
+        read_normalization_owned_by(&record, mine).unwrap(),
         Normalization::NotStarted
     );
 
     // The walk fails part way: the record still names the converter.
-    let error = normalize_rootfs_owner(&record, (1000, 1000), |converter| {
+    let error = normalize_rootfs_owner_as(&record, mine, (1000, 1000), |converter| {
         assert_eq!(converter, (1000, 1000));
         assert_eq!(
-            read_normalization(&record).unwrap(),
+            read_normalization_owned_by(&record, mine).unwrap(),
             Normalization::Pending {
                 uid: 1000,
                 gid: 1000
@@ -472,24 +502,100 @@ fn owner_normalisation_resumes_until_it_has_finished() {
     // Next boot: the binary is root's now, but the walk runs again for the
     // recorded converter, and finishes.
     assert_eq!(
-        normalize_rootfs_owner(&record, (0, 0), |converter| {
+        normalize_rootfs_owner_as(&record, mine, (0, 0), |converter| {
             assert_eq!(converter, (1000, 1000));
             Ok(7)
         })
         .unwrap(),
         Some(7)
     );
-    assert_eq!(read_normalization(&record).unwrap(), Normalization::Done);
     assert_eq!(
-        normalize_rootfs_owner(&record, (1000, 1000), |_| panic!("already done")).unwrap(),
+        read_normalization_owned_by(&record, mine).unwrap(),
+        Normalization::Done
+    );
+    assert_eq!(
+        normalize_rootfs_owner_as(&record, mine, (1000, 1000), |_| panic!("already done")).unwrap(),
         None
     );
 
     std::fs::write(&record, "garbage").unwrap();
     assert!(matches!(
-        read_normalization(&record),
+        read_normalization_owned_by(&record, mine),
         Err(SandboxUserError::BadNormalizationRecord { .. })
     ));
+
+    // An oversized record, a FIFO or a symlink is refused without blocking
+    // or following it.
+    std::fs::write(&record, format!("done{}", " ".repeat(64))).unwrap();
+    assert!(matches!(
+        read_normalization_owned_by(&record, mine),
+        Err(SandboxUserError::BadNormalizationRecord { .. })
+    ));
+    std::fs::remove_file(&record).unwrap();
+    let fifo = std::ffi::CString::new(record.display().to_string()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    assert!(matches!(
+        read_normalization_owned_by(&record, mine),
+        Err(SandboxUserError::BadNormalizationRecord { .. })
+    ));
+    std::fs::remove_file(&record).unwrap();
+    let done = dir.join("done");
+    std::fs::write(&done, "done\n").unwrap();
+    std::os::unix::fs::symlink(&done, &record).unwrap();
+    assert!(matches!(
+        read_normalization_owned_by(&record, mine),
+        Err(SandboxUserError::Io { .. })
+    ));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A record the image shipped is the converter's, not root's, so it cannot
+/// tell the guest the walk already happened.
+#[test]
+fn a_record_shipped_in_the_image_does_not_skip_the_walk() {
+    let dir = tempfile_dir();
+    let record = dir.join("var/lib/temps-vm-agent/rootfs-owner");
+    std::fs::create_dir_all(record.parent().unwrap()).unwrap();
+    std::fs::write(&record, "done\n").unwrap();
+    let root = an_id_other_than(&[me().uid]);
+    assert_eq!(
+        read_normalization_owned_by(&record, root).unwrap(),
+        Normalization::NotStarted
+    );
+    let mut walked = None;
+    assert_eq!(
+        normalize_rootfs_owner_as(&record, root, (1000, 1000), |converter| {
+            walked = Some(converter);
+            Ok(3)
+        })
+        .unwrap(),
+        Some(3)
+    );
+    assert_eq!(walked, Some((1000, 1000)));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Root's own small writes never follow what the image left at the staging
+/// name, nor write under a symlinked directory.
+#[test]
+fn a_replaced_file_never_writes_through_a_planted_link() {
+    let dir = tempfile_dir();
+    let target = dir.join("state/record");
+    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+    let elsewhere = dir.join("elsewhere");
+    std::fs::write(&elsewhere, "keep").unwrap();
+    std::os::unix::fs::symlink(&elsewhere, target.with_extension("temps-new")).unwrap();
+    replace_file(&target, "done\n", 0o600).unwrap();
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "done\n");
+    assert_eq!(std::fs::read_to_string(&elsewhere).unwrap(), "keep");
+    assert!(!target.with_extension("temps-new").exists());
+
+    let real = dir.join("real");
+    std::fs::create_dir_all(&real).unwrap();
+    std::os::unix::fs::symlink(&real, dir.join("linked")).unwrap();
+    let error = replace_file(&dir.join("linked/sub/record"), "x", 0o600).unwrap_err();
+    assert!(error.to_string().contains("symbolic link"), "{error}");
+    assert_eq!(std::fs::read_dir(&real).unwrap().count(), 0);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -570,6 +676,7 @@ fn the_converter_walk_skips_the_users_trees_and_symlinks() {
 #[test]
 fn the_status_reaches_the_host_in_the_response_frame() {
     for status in [
+        SandboxUserStatus::Preparing,
         SandboxUserStatus::NotRequested,
         SandboxUserStatus::Ready { user: temps() },
         SandboxUserStatus::Failed {
@@ -582,6 +689,11 @@ fn the_status_reaches_the_host_in_the_response_frame() {
         };
         assert_eq!(back, status, "{json}");
     }
+    assert_eq!(
+        serde_json::to_string(&Response::SandboxUser(SandboxUserStatus::Preparing)).unwrap(),
+        r#"{"result":"sandbox_user","state":"preparing"}"#,
+        "the frame the host polls on"
+    );
 }
 
 /// A fresh, empty directory under the system temp dir.

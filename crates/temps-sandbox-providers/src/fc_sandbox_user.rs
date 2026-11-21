@@ -23,10 +23,24 @@ use temps_vm_agent::{Response, SandboxUser, SandboxUserStatus};
 use crate::firecracker::FC_SANDBOX_NAME_PREFIX;
 use crate::workload_vm::WORKLOAD_VM_ID_PREFIX;
 
-/// File in a VM's directory recording the sandbox user its agent prepared.
-/// Absent: commands run as root (a workload VM, or a sandbox restored from
-/// a snapshot whose agent predates the sandbox user).
+/// File in a VM's directory recording who its default commands run as
+/// ([`UserRecord`]). Absent: root for a VM that did not boot with the
+/// sandbox user (a workload VM, or one configured before the sandbox user
+/// existed); an error for one that did.
 pub(crate) const SANDBOX_USER_FILE: &str = "sandbox-user.json";
+
+/// Who a sandbox's default commands run as, recorded once its agent has
+/// answered after boot. Root is written down with its reason rather than
+/// implied by a missing file, so a lost or unwritten record never reads as
+/// root.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "runs_as", rename_all = "snake_case")]
+pub(crate) enum UserRecord {
+    /// The sandbox user, prepared by the guest agent.
+    SandboxUser { user: SandboxUser },
+    /// Root, for the reason given (the agent predates the sandbox user).
+    Root { reason: String },
+}
 
 /// The user every Firecracker sandbox runs as.
 pub(crate) fn sandbox_user() -> SandboxUser {
@@ -54,6 +68,8 @@ pub(crate) fn boot_arg_for(vm_name: &str) -> Option<String> {
 /// What the guest said about the sandbox user after boot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum UserCheck {
+    /// The agent is still preparing the user; ask again.
+    Preparing,
     /// The user is ready; commands run as it.
     Ready(SandboxUser),
     /// The guest agent predates the request (a sandbox restored from an
@@ -100,6 +116,7 @@ pub(crate) fn interpret(response: Response) -> Result<UserCheck, String> {
             user.uid, user.gid, user.name, wanted.uid, wanted.gid, wanted.name
         )),
         Response::SandboxUser(SandboxUserStatus::Failed { reason }) => Err(reason),
+        Response::SandboxUser(SandboxUserStatus::Preparing) => Ok(UserCheck::Preparing),
         Response::SandboxUser(SandboxUserStatus::NotRequested) => Ok(UserCheck::NotRequested),
         Response::Err { message } if crate::firecracker::is_unknown_request(&message) => {
             Ok(UserCheck::OlderAgent)
@@ -109,10 +126,10 @@ pub(crate) fn interpret(response: Response) -> Result<UserCheck, String> {
     }
 }
 
-/// Record (or clear) the user the VM in `vm_dir` runs commands as. The
-/// record is written beside its final name and renamed over it, so a
-/// concurrent exec reads the old record or the new one, never part of one.
-pub(crate) fn record(vm_dir: &Path, user: Option<&SandboxUser>) -> std::io::Result<()> {
+/// Record (or, with `None`, clear) who the VM in `vm_dir` runs commands
+/// as. The record is written beside its final name and renamed over it, so
+/// a concurrent exec reads the old record or the new one, never part of one.
+pub(crate) fn record(vm_dir: &Path, user: Option<&UserRecord>) -> std::io::Result<()> {
     let path = vm_dir.join(SANDBOX_USER_FILE);
     match user {
         Some(user) => {
@@ -132,14 +149,25 @@ pub(crate) fn record(vm_dir: &Path, user: Option<&SandboxUser>) -> std::io::Resu
 }
 
 /// The uid default commands run as in the VM in `vm_dir`: the recorded
-/// sandbox user, or `None` (root) only when no record exists (a workload VM,
-/// or a sandbox whose agent predates the sandbox user). A record that cannot
-/// be read is an error, never a reason to run as root.
+/// sandbox user, or `None` (root) for an explicit root record or a VM that
+/// did not boot with the sandbox user and so has none. A VM that booted
+/// with the user but has no record (its check never finished), or a record
+/// that cannot be read, is an error, never a reason to run as root.
 pub(crate) fn recorded_uid(vm_dir: &Path) -> Result<Option<u32>, String> {
     let path = vm_dir.join(SANDBOX_USER_FILE);
     let data = match std::fs::read(&path) {
         Ok(data) => data,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return if boot_requested_user(vm_dir)? {
+                Err(format!(
+                    "the VM booted with the sandbox user, but '{}' does not record whether it \
+                     is ready (the check after boot did not finish)",
+                    path.display()
+                ))
+            } else {
+                Ok(None)
+            };
+        }
         Err(error) => {
             return Err(format!(
                 "read the sandbox user '{}': {error}",
@@ -147,14 +175,14 @@ pub(crate) fn recorded_uid(vm_dir: &Path) -> Result<Option<u32>, String> {
             ))
         }
     };
-    serde_json::from_slice::<SandboxUser>(&data)
-        .map(|user| Some(user.uid))
-        .map_err(|error| {
-            format!(
-                "the sandbox user record '{}' is unreadable: {error}",
-                path.display()
-            )
-        })
+    match serde_json::from_slice::<UserRecord>(&data) {
+        Ok(UserRecord::SandboxUser { user }) => Ok(Some(user.uid)),
+        Ok(UserRecord::Root { .. }) => Ok(None),
+        Err(error) => Err(format!(
+            "the sandbox user record '{}' is unreadable: {error}",
+            path.display()
+        )),
+    }
 }
 
 /// The uid for `exec_as_user(user)`. The guest agent runs commands by uid,
@@ -266,6 +294,10 @@ mod tests {
             }),
             Err("boom".to_string())
         );
+        assert_eq!(
+            interpret(Response::SandboxUser(SandboxUserStatus::Preparing)),
+            Ok(UserCheck::Preparing)
+        );
         assert!(interpret(Response::Pong).is_err());
     }
 
@@ -277,15 +309,48 @@ mod tests {
             Ok(None),
             "nothing recorded runs as root"
         );
-        record(dir.path(), Some(&sandbox_user())).unwrap();
+        record(
+            dir.path(),
+            Some(&UserRecord::SandboxUser {
+                user: sandbox_user(),
+            }),
+        )
+        .unwrap();
         assert_eq!(recorded_uid(dir.path()), Ok(Some(SANDBOX_UID)));
         assert!(
             !dir.path().join(format!("{SANDBOX_USER_FILE}.new")).exists(),
             "the staged record was renamed into place"
         );
+        record(
+            dir.path(),
+            Some(&UserRecord::Root {
+                reason: "older agent".to_string(),
+            }),
+        )
+        .unwrap();
+        assert_eq!(recorded_uid(dir.path()), Ok(None), "root, recorded");
         record(dir.path(), None).unwrap();
         assert_eq!(recorded_uid(dir.path()), Ok(None));
         record(dir.path(), None).unwrap();
+    }
+
+    /// A VM that booted with the sandbox user and has no record never runs
+    /// its commands as root.
+    #[test]
+    fn a_missing_record_is_root_only_for_a_vm_booted_without_the_user() {
+        let dir = tempfile::tempdir().unwrap();
+        let boot = |args: String| {
+            std::fs::write(
+                dir.path().join("vm.json"),
+                serde_json::json!({"boot-source": {"boot_args": args}}).to_string(),
+            )
+            .unwrap()
+        };
+        boot("console=ttyS0".to_string());
+        assert_eq!(recorded_uid(dir.path()), Ok(None));
+        boot(format!("console=ttyS0 {}", sandbox_user().boot_arg()));
+        let error = recorded_uid(dir.path()).unwrap_err();
+        assert!(error.contains("did not finish"), "{error}");
     }
 
     /// A record that exists but cannot be read never downgrades the

@@ -110,6 +110,13 @@ const DEFAULT_DISK_MB: u64 = 1024;
 const CACHE_SLACK_MB: u64 = 64;
 
 const AGENT_READY_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long a sandbox's create waits for its guest agent to finish preparing
+/// the sandbox user. The agent answers meanwhile; the first boot of a
+/// rootfs hands every converted file back to root, which on a large image
+/// takes far longer than the agent takes to start.
+const SANDBOX_USER_READY_TIMEOUT: Duration = Duration::from_secs(300);
+/// How often a preparing guest is asked again.
+const SANDBOX_USER_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// How long opening a terminal stream may take (socket connect plus the
 /// hybrid-vsock handshake). The guest answers in milliseconds; this only
 /// bounds a wedged VMM.
@@ -1532,20 +1539,52 @@ impl FirecrackerSandboxProvider {
     /// answer next to the VM so default commands run as it. `Err` is the
     /// reason the VM cannot run as its user. A workload VM has no user.
     async fn confirm_sandbox_user(&self, name: &str) -> Result<(), String> {
+        self.confirm_sandbox_user_within(name, SANDBOX_USER_READY_TIMEOUT)
+            .await
+    }
+
+    /// [`Self::confirm_sandbox_user`], waiting at most `deadline` for a guest
+    /// that is still preparing the user (its first boot hands the
+    /// converter's files back to root, which can take a while on a large
+    /// image; the agent answers meanwhile).
+    async fn confirm_sandbox_user_within(
+        &self,
+        name: &str,
+        deadline: Duration,
+    ) -> Result<(), String> {
         use super::fc_sandbox_user::{
-            boot_requested_user, interpret, is_sandbox_vm, record, UserCheck,
+            boot_requested_user, interpret, is_sandbox_vm, record, UserCheck, UserRecord,
         };
         let vm_dir = self.config.vm_dir(name);
         if !is_sandbox_vm(name) {
             return record(&vm_dir, None).map_err(|e| e.to_string());
         }
+        // Cleared first: until this check settles, a VM booted with the user
+        // has no record, and its commands are refused rather than run as
+        // whoever a previous boot recorded.
+        record(&vm_dir, None).map_err(|e| e.to_string())?;
         let requested = boot_requested_user(&vm_dir)?;
-        let response = self
-            .rpc(name, &Request::SandboxUser, Duration::from_secs(10))
-            .await
-            .map_err(|e| e.to_string())?;
-        let user = match interpret(response)? {
-            UserCheck::Ready(user) => Some(user),
+        let started = tokio::time::Instant::now();
+        let check = loop {
+            let response = self
+                .rpc(name, &Request::SandboxUser, Duration::from_secs(10))
+                .await
+                .map_err(|e| e.to_string())?;
+            match interpret(response)? {
+                UserCheck::Preparing if started.elapsed() < deadline => {
+                    tokio::time::sleep(SANDBOX_USER_POLL_INTERVAL).await;
+                }
+                UserCheck::Preparing => {
+                    return Err(format!(
+                        "the guest agent was still preparing the sandbox user after {}s",
+                        deadline.as_secs()
+                    ))
+                }
+                check => break check,
+            }
+        };
+        let user = match check {
+            UserCheck::Ready(user) => UserRecord::SandboxUser { user },
             // The VM booted with the user on its command line, so an agent
             // that says it saw none is not a legacy restore: never root.
             UserCheck::NotRequested if requested => {
@@ -1555,18 +1594,37 @@ impl FirecrackerSandboxProvider {
                         .to_string(),
                 )
             }
-            check => {
+            // A snapshot's rootfs carries the agent it was taken with, and
+            // one that predates the sandbox user cannot be given a newer one
+            // without rewriting the image. Its commands ran as root when it
+            // was taken, so they still do, recorded as such.
+            UserCheck::OlderAgent => {
                 tracing::warn!(
                     sandbox = name,
-                    ?check,
-                    "Firecracker sandbox runs its commands as root: its guest agent did not \
-                     prepare the sandbox user (a sandbox restored from a snapshot taken before \
-                     the sandbox user existed)"
+                    "Firecracker sandbox runs its commands as root: it was restored from a \
+                     snapshot whose guest agent predates the sandbox user; take a new snapshot \
+                     to run as the sandbox user"
                 );
-                None
+                UserRecord::Root {
+                    reason: "restored from a snapshot whose guest agent predates the sandbox user"
+                        .to_string(),
+                }
+            }
+            UserCheck::NotRequested => {
+                tracing::warn!(
+                    sandbox = name,
+                    "Firecracker sandbox runs its commands as root: it was configured before \
+                     the sandbox user existed"
+                );
+                UserRecord::Root {
+                    reason: "configured before the sandbox user existed".to_string(),
+                }
+            }
+            UserCheck::Preparing => {
+                return Err("the guest agent is still preparing the sandbox user".to_string())
             }
         };
-        record(&vm_dir, user.as_ref()).map_err(|e| {
+        record(&vm_dir, Some(&user)).map_err(|e| {
             format!(
                 "record the sandbox user in '{}': {e}",
                 vm_dir
@@ -1689,7 +1747,7 @@ impl FirecrackerSandboxProvider {
         // the empty home back to the sandbox user at boot.
         let sandbox_home = SANDBOX_HOME.trim_start_matches('/');
         for relative in ["root", sandbox_home, "etc/temps", "tmp", "run", "var/tmp"] {
-            Self::require_real_parents(root, relative)?;
+            Self::require_real_dirs(root, relative)?;
             let path = root.join(relative);
             match std::fs::remove_dir_all(&path) {
                 Ok(()) => {}
@@ -1709,17 +1767,17 @@ impl FirecrackerSandboxProvider {
         Ok(())
     }
 
-    /// Refuse to scrub `relative` under `root` unless each of its parents is
-    /// a real directory: the tree holds the guest's own entries, and a
-    /// guest symlink at `home` (with a host-absolute target) would make
-    /// `home/temps` name a directory outside the tree. The final component
-    /// is safe as it is (`remove_dir_all` removes a symlink, not its
-    /// target). Only the host writes this staging tree while it is
-    /// scrubbed, so the guest cannot race the check.
-    fn require_real_parents(root: &Path, relative: &str) -> std::io::Result<()> {
+    /// Refuse to scrub `relative` under `root` unless it and each of its
+    /// parents is a real directory (or missing): the tree holds the guest's
+    /// own entries. A guest symlink at `home` (with a host-absolute target)
+    /// would make `home/temps` name a directory outside the tree, and a
+    /// symlink at `home/temps` itself would have only the link removed,
+    /// leaving what was written through it in the snapshot. Only the host
+    /// writes this staging tree while it is scrubbed, so the guest cannot
+    /// race the check.
+    fn require_real_dirs(root: &Path, relative: &str) -> std::io::Result<()> {
         let mut parent = root.to_path_buf();
-        let components: Vec<&str> = relative.split('/').filter(|c| !c.is_empty()).collect();
-        for component in components.iter().take(components.len().saturating_sub(1)) {
+        for component in relative.split('/').filter(|c| !c.is_empty()) {
             parent.push(component);
             match std::fs::symlink_metadata(&parent) {
                 Ok(meta) if meta.file_type().is_dir() => {}
@@ -3824,6 +3882,103 @@ mod tests {
         (provider, handle, dir)
     }
 
+    /// A provider whose sandbox `name` answers one RPC per connection with
+    /// each of `answers` in turn.
+    fn provider_with_agent_answers(
+        name: &str,
+        answers: Vec<&'static str>,
+    ) -> (FirecrackerSandboxProvider, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = provider_at(dir.path().to_path_buf());
+        let vm_dir = provider.config.vm_dir(name);
+        std::fs::create_dir_all(&vm_dir).unwrap();
+        let listener = tokio::net::UnixListener::bind(vm_dir.join("v.sock")).unwrap();
+        tokio::spawn(async move {
+            for answer in answers {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                serve_agent_rpc(stream, |request| {
+                    assert_eq!(request["op"], "sandbox_user");
+                    answer.to_string()
+                })
+                .await;
+            }
+        });
+        (provider, dir)
+    }
+
+    fn boot_with_sandbox_user(vm_dir: &Path) {
+        std::fs::write(
+            vm_dir.join("vm.json"),
+            serde_json::json!({"boot-source": {
+                "boot_args": format!("console=ttyS0 {}", crate::fc_sandbox_user::sandbox_user().boot_arg())
+            }})
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    const USER_PREPARING: &str = r#"{"result":"sandbox_user","state":"preparing"}"#;
+    const USER_READY: &str = r#"{"result":"sandbox_user","state":"ready",
+        "user":{"uid":1000,"gid":1000,"name":"temps","home":"/home/temps"}}"#;
+
+    /// A first boot's ownership walk keeps the user preparing after the
+    /// agent answers; the create waits for it instead of failing.
+    #[tokio::test]
+    async fn a_sandbox_still_preparing_its_user_is_asked_again_until_ready() {
+        let name = sandbox_vm_name();
+        let (provider, _dir) =
+            provider_with_agent_answers(&name, vec![USER_PREPARING, USER_PREPARING, USER_READY]);
+        let vm_dir = provider.config.vm_dir(&name);
+        boot_with_sandbox_user(&vm_dir);
+        provider.confirm_sandbox_user(&name).await.unwrap();
+        assert_eq!(
+            crate::fc_sandbox_user::recorded_uid(&vm_dir),
+            Ok(Some(1000))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sandbox_user_still_preparing_at_the_deadline_fails_the_create() {
+        let name = sandbox_vm_name();
+        let (provider, _dir) = provider_with_agent_answers(&name, vec![USER_PREPARING]);
+        let vm_dir = provider.config.vm_dir(&name);
+        boot_with_sandbox_user(&vm_dir);
+        let reason = provider
+            .confirm_sandbox_user_within(&name, Duration::ZERO)
+            .await
+            .unwrap_err();
+        assert!(reason.contains("still preparing"), "{reason}");
+        assert!(
+            crate::fc_sandbox_user::recorded_uid(&vm_dir).is_err(),
+            "no record, so commands are refused"
+        );
+    }
+
+    /// A restart whose check fails leaves no earlier record behind to run
+    /// its commands as.
+    #[tokio::test]
+    async fn a_failed_check_clears_the_previous_boots_record() {
+        let name = sandbox_vm_name();
+        let (provider, _dir) = provider_with_agent_answers(
+            &name,
+            vec![r#"{"result":"sandbox_user","state":"failed","reason":"no space left"}"#],
+        );
+        let vm_dir = provider.config.vm_dir(&name);
+        boot_with_sandbox_user(&vm_dir);
+        crate::fc_sandbox_user::record(
+            &vm_dir,
+            Some(&crate::fc_sandbox_user::UserRecord::Root {
+                reason: "older agent".to_string(),
+            }),
+        )
+        .unwrap();
+        let reason = provider.confirm_sandbox_user(&name).await.unwrap_err();
+        assert!(reason.contains("no space left"), "{reason}");
+        assert!(crate::fc_sandbox_user::recorded_uid(&vm_dir).is_err());
+    }
+
     /// Read the `CONNECT <port>\n` line a client sends first.
     async fn read_connect_line(stream: &mut UnixStream) -> String {
         let mut line = Vec::new();
@@ -4235,6 +4390,36 @@ mod tests {
         );
     }
 
+    /// A scrub target that is itself a symlink would have only the link
+    /// removed, leaving what was written through it in the snapshot.
+    #[test]
+    fn snapshot_scrub_refuses_a_symlinked_target() {
+        for target in ["root", "home/temps"] {
+            let root = tempfile::tempdir().unwrap();
+            let elsewhere = root.path().join("srv/credentials");
+            std::fs::create_dir_all(&elsewhere).unwrap();
+            std::fs::write(elsewhere.join("token"), b"secret").unwrap();
+            let link = root.path().join(target);
+            std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink("/srv/credentials", &link).unwrap();
+
+            let error = FirecrackerSandboxProvider::scrub_snapshot_tree(root.path()).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("'{target}' is not a directory")),
+                "{target}: {error}"
+            );
+            assert!(
+                std::fs::symlink_metadata(&link)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "{target}: the export fails instead of unlinking it"
+            );
+        }
+    }
+
     fn sandbox_vm_name() -> String {
         format!("{FC_SANDBOX_NAME_PREFIX}42")
     }
@@ -4254,7 +4439,9 @@ mod tests {
         });
         crate::fc_sandbox_user::record(
             &provider.config.vm_dir(&name),
-            Some(&crate::fc_sandbox_user::sandbox_user()),
+            Some(&crate::fc_sandbox_user::UserRecord::SandboxUser {
+                user: crate::fc_sandbox_user::sandbox_user(),
+            }),
         )
         .unwrap();
 
@@ -4291,7 +4478,9 @@ mod tests {
         });
         crate::fc_sandbox_user::record(
             &provider.config.vm_dir(&name),
-            Some(&crate::fc_sandbox_user::sandbox_user()),
+            Some(&crate::fc_sandbox_user::UserRecord::SandboxUser {
+                user: crate::fc_sandbox_user::sandbox_user(),
+            }),
         )
         .unwrap();
         provider
@@ -4392,7 +4581,10 @@ mod tests {
         .unwrap();
         let reason = provider.confirm_sandbox_user(&name).await.unwrap_err();
         assert!(reason.contains("none was requested"), "{reason}");
-        assert_eq!(crate::fc_sandbox_user::recorded_uid(&vm_dir), Ok(None));
+        assert!(
+            crate::fc_sandbox_user::recorded_uid(&vm_dir).is_err(),
+            "commands are refused, not run as root"
+        );
     }
 
     /// Without the boot argument (a VM configured before the sandbox user
@@ -4453,10 +4645,19 @@ mod tests {
                     .to_string()
             })
         });
+        // A restored snapshot boots with the argument; its older agent
+        // ignores it.
+        let vm_dir = provider.config.vm_dir(&name);
+        boot_with_sandbox_user(&vm_dir);
         provider.confirm_sandbox_user(&name).await.unwrap();
-        assert_eq!(
-            crate::fc_sandbox_user::recorded_uid(&provider.config.vm_dir(&name)),
-            Ok(None)
+        assert_eq!(crate::fc_sandbox_user::recorded_uid(&vm_dir), Ok(None));
+        let record: crate::fc_sandbox_user::UserRecord = serde_json::from_slice(
+            &std::fs::read(vm_dir.join(crate::fc_sandbox_user::SANDBOX_USER_FILE)).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            matches!(record, crate::fc_sandbox_user::UserRecord::Root { ref reason } if reason.contains("snapshot")),
+            "root is recorded with its reason: {record:?}"
         );
     }
 

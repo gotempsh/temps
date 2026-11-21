@@ -208,6 +208,10 @@ pub enum Request {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum SandboxUserStatus {
+    /// The agent is still preparing the user (the first boot of a rootfs
+    /// hands the converter's files back to root, which walks the whole
+    /// filesystem). The host asks again until it is settled.
+    Preparing,
     /// The kernel command line named no sandbox user: everything runs as
     /// root, as in a workload VM.
     NotRequested,

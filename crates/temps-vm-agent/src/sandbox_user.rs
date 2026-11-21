@@ -372,29 +372,35 @@ pub fn run_file_op(op: &FileOp, input: impl std::io::Read, max_bytes: u64) -> st
             // Staged beside the target and renamed over it, so a file the
             // user left read-only (a `0400` upload) can still be replaced,
             // and a planted symlink at the target is replaced, not followed.
-            let name = target.file_name().ok_or_else(|| {
-                std::io::Error::new(
+            if target.file_name().is_none() {
+                return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     format!("{path} names no file"),
-                )
-            })?;
-            let mut staged_name = std::ffi::OsString::from(".");
-            staged_name.push(name);
-            staged_name.push(format!(".temps-write-{}", std::process::id()));
-            let staged = parent.join(staged_name);
-            let written = (|| {
-                use std::io::Write;
-                use std::os::unix::fs::OpenOptionsExt;
-                let mut file = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .mode(0o600)
-                    .open(&staged)?;
-                file.write_all(&data)?;
-                file.set_permissions(std::fs::Permissions::from_mode(*mode))?;
-                std::fs::rename(&staged, target)
-            })();
+                ));
+            }
+            // A short sibling name, independent of the target's (a valid
+            // 255-byte name plus a prefix would not fit), unique per write.
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let staged = parent.join(format!(
+                ".temps-write-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            // Created exclusively: a name already taken (a planted file or
+            // symlink) fails here and is never touched.
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&staged)?;
+            let written = file
+                .write_all(&data)
+                .and_then(|()| file.set_permissions(std::fs::Permissions::from_mode(*mode)))
+                .and_then(|()| std::fs::rename(&staged, target));
             if written.is_err() {
+                // Only the file this write created.
                 let _ = std::fs::remove_file(&staged);
             }
             written
@@ -428,18 +434,38 @@ pub fn is_user_file(
 ) -> Result<bool, OwnedWriteError> {
     // A relative path is resolved from `/`, the writers' working directory.
     let absolute = Path::new("/").join(path);
-    if !(absolute.starts_with(&user.home) || absolute.starts_with(work_dir)) {
-        return Ok(false);
-    }
-    if absolute
+    let has_parent_dir = absolute
         .components()
-        .any(|component| matches!(component, std::path::Component::ParentDir))
-    {
+        .any(|component| matches!(component, std::path::Component::ParentDir));
+    let in_user_area =
+        |candidate: &Path| candidate.starts_with(&user.home) || candidate.starts_with(work_dir);
+    if !has_parent_dir {
+        return Ok(in_user_area(&absolute));
+    }
+    // A `..` is refused when the path is spelled inside the user's area or
+    // lands there (`/tmp/../workspace/x` is the workspace too, and must not
+    // reach the root writer).
+    if in_user_area(&absolute) || in_user_area(&lexically_normal(&absolute)) {
         return Err(OwnedWriteError::ParentComponent {
             path: path.to_string(),
         });
     }
-    Ok(true)
+    Ok(false)
+}
+
+/// `path` with `.` and `..` applied by name (`..` stops at `/`).
+fn lexically_normal(path: &Path) -> std::path::PathBuf {
+    let mut normal = std::path::PathBuf::from("/");
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(name) => normal.push(name),
+            std::path::Component::ParentDir => {
+                normal.pop();
+            }
+            _ => {}
+        }
+    }
+    normal
 }
 
 fn passwd_home(passwd: &str, uid: u32) -> Option<&str> {
@@ -525,17 +551,60 @@ fn write_account_file(path: &Path, contents: &str) -> Result<(), SandboxUserErro
 /// Write `contents` to `path` (mode `mode`) through a sibling temporary file
 /// renamed over it, creating missing parents.
 fn replace_file(path: &Path, contents: &str, mode: u32) -> Result<(), SandboxUserError> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
     if let Some(parent) = path.parent() {
+        require_real_dirs(parent)?;
         std::fs::create_dir_all(parent).map_err(|e| SandboxUserError::io("create", parent, e))?;
     }
     let temporary = path.with_extension("temps-new");
-    std::fs::write(&temporary, contents)
-        .and_then(|()| std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(mode)))
+    // A stale entry at the staging name (an image may ship one, a symlink
+    // included) is unlinked, never followed; the file is then created
+    // exclusively, its mode set on the open handle before it is written.
+    match std::fs::remove_file(&temporary) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            return Err(SandboxUserError::io("remove", &temporary, e))
+        }
+        _ => {}
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temporary)
+        .map_err(|e| SandboxUserError::io("create", &temporary, e))?;
+    file.set_permissions(std::fs::Permissions::from_mode(mode))
+        .and_then(|()| file.write_all(contents.as_bytes()))
         .and_then(|()| std::fs::rename(&temporary, path))
         .map_err(|e| {
             let _ = std::fs::remove_file(&temporary);
             SandboxUserError::io("write", path, e)
         })
+}
+
+/// Refuse a directory that is, or sits under, a symlink root does not own:
+/// exclusive creation protects only the last component of what root is
+/// about to write. Root's own links (a merged `/usr`'s `/lib`) are the
+/// system's layout; one the sandbox user, or the unconverted image, owns
+/// could aim root's write anywhere.
+fn require_real_dirs(dir: &Path) -> Result<(), SandboxUserError> {
+    let mut current = std::path::PathBuf::new();
+    for component in dir.components() {
+        current.push(component);
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta) if meta.file_type().is_symlink() && meta.uid() != 0 => {
+                return Err(SandboxUserError::Io {
+                    operation: "write under",
+                    path: current.display().to_string(),
+                    reason: format!("it is a symbolic link owned by uid {}", meta.uid()),
+                })
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(SandboxUserError::io("inspect", &current, e)),
+        }
+    }
+    Ok(())
 }
 
 /// Where the guest records how far handing the converter's files back to
@@ -554,15 +623,60 @@ pub enum Normalization {
     Done,
 }
 
+/// The longest record [`read_normalization`] reads (`pending <u32> <u32>`).
+const MAX_NORMALIZATION_RECORD_BYTES: u64 = 64;
+
 /// Read the record at `path`.
+///
+/// Only a record this guest wrote counts: it is root's, while anything the
+/// image shipped at that path was extracted with the converter's uid (the
+/// host converts unprivileged). An image cannot therefore mark the walk
+/// done; a record it ships reads as [`Normalization::NotStarted`] and is
+/// overwritten. The file is opened without following a symlink or blocking
+/// on a FIFO, must be regular, and is read only up to a few bytes.
 pub fn read_normalization(path: &Path) -> Result<Normalization, SandboxUserError> {
-    let contents = match std::fs::read_to_string(path) {
-        Ok(contents) => contents,
+    read_normalization_owned_by(path, 0)
+}
+
+fn read_normalization_owned_by(
+    path: &Path,
+    trusted_owner: u32,
+) -> Result<Normalization, SandboxUserError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(Normalization::NotStarted)
         }
-        Err(error) => return Err(SandboxUserError::io("read", path, error)),
+        Err(error) => return Err(SandboxUserError::io("open", path, error)),
     };
+    let meta = file
+        .metadata()
+        .map_err(|e| SandboxUserError::io("inspect", path, e))?;
+    if !meta.is_file() {
+        return Err(SandboxUserError::BadNormalizationRecord {
+            path: path.display().to_string(),
+            contents: "not a regular file".to_string(),
+        });
+    }
+    if meta.uid() != trusted_owner {
+        return Ok(Normalization::NotStarted);
+    }
+    let mut raw = Vec::new();
+    file.take(MAX_NORMALIZATION_RECORD_BYTES + 1)
+        .read_to_end(&mut raw)
+        .map_err(|e| SandboxUserError::io("read", path, e))?;
+    let contents = String::from_utf8_lossy(&raw);
+    if raw.len() as u64 > MAX_NORMALIZATION_RECORD_BYTES {
+        return Err(SandboxUserError::BadNormalizationRecord {
+            path: path.display().to_string(),
+            contents: format!("over {MAX_NORMALIZATION_RECORD_BYTES} bytes"),
+        });
+    }
     let bad = || SandboxUserError::BadNormalizationRecord {
         path: path.display().to_string(),
         contents: contents.chars().take(64).collect(),
@@ -602,7 +716,18 @@ pub fn normalize_rootfs_owner(
     exe_owner: (u32, u32),
     normalize: impl FnOnce((u32, u32)) -> Result<u64, SandboxUserError>,
 ) -> Result<Option<u64>, SandboxUserError> {
-    let converter = match read_normalization(record)? {
+    normalize_rootfs_owner_as(record, 0, exe_owner, normalize)
+}
+
+/// [`normalize_rootfs_owner`] for a guest whose own records are owned by
+/// `trusted_owner` (root in a VM; the test runner in tests).
+fn normalize_rootfs_owner_as(
+    record: &Path,
+    trusted_owner: u32,
+    exe_owner: (u32, u32),
+    normalize: impl FnOnce((u32, u32)) -> Result<u64, SandboxUserError>,
+) -> Result<Option<u64>, SandboxUserError> {
+    let converter = match read_normalization_owned_by(record, trusted_owner)? {
         Normalization::Done => return Ok(None),
         Normalization::Pending { uid, gid } => (uid, gid),
         Normalization::NotStarted if exe_owner.0 == 0 => return Ok(None),
