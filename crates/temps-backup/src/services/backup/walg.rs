@@ -244,25 +244,56 @@ impl BackupService {
         // falls back to pg_dump. The settings are read first so a failure
         // can put back what was there. `archive_then_push` owns that order.
         let archive_before = self.read_archive_settings().await?;
+        let archiving_command = internal_walg_archive_command(&pgdata);
         let walg_env_path = internal_walg_env_path(&pgdata);
+        if archive_before.archive_command == archiving_command {
+            let archiving_to = run_walg_env_script(
+                &docker,
+                &container_id,
+                walg_env_prefix_script(&walg_env_path),
+                "read the WAL-G destination from",
+            )
+            .await?;
+            if let Some(reason) = archive_before.walg_destination_change_blocker(
+                &archiving_command,
+                Some(&archiving_to),
+                &walg_s3_prefix,
+            ) {
+                return Err(BackupError::Internal {
+                    message: format!(
+                        "Not taking a WAL-G base backup of the control-plane database in \
+                         container '{}': {}",
+                        container_id, reason
+                    ),
+                });
+            }
+        }
         // Marks the walg.env this attempt writes, so a failure puts back the
         // previous one exactly when this attempt replaced it, including when
         // Docker loses the result of the write.
         let attempt = format!("# temps-walg-attempt {}", Uuid::new_v4());
         let write_env =
             self.write_internal_walg_env(&docker, &container_id, &env_vars, &pgdata, &attempt);
-        let restore_env = run_walg_env_script(
-            &docker,
-            &container_id,
-            walg_env_restore_script(&walg_env_path, &attempt),
-            "put back the previous",
-        );
-        let discard_previous_env = run_walg_env_script(
-            &docker,
-            &container_id,
-            format!("rm -f {}", shell_escape(&format!("{walg_env_path}.prev"))),
-            "delete the copy of the previous",
-        );
+        let restore_env = async {
+            run_walg_env_script(
+                &docker,
+                &container_id,
+                walg_env_restore_script(&walg_env_path, &attempt),
+                "put back the previous",
+            )
+            .await
+            .map(|_| ())
+        };
+        let discard_previous_env = async {
+            run_walg_env_script(
+                &docker,
+                &container_id,
+                format!("rm -f {}", shell_escape(&format!("{walg_env_path}.prev"))),
+                "delete the copy of the previous",
+            )
+            .await
+            .map(|_| ())
+        };
 
         // A push that fails from inside the container (an endpoint or bucket
         // only the Temps process can reach, a credential wal-g rejects) would
@@ -332,7 +363,7 @@ impl BackupService {
         };
         self.archive_then_push(
             &archive_before,
-            &internal_walg_archive_command(&pgdata),
+            &archiving_command,
             &container_id,
             BaseBackupSteps {
                 write_env,
@@ -549,6 +580,15 @@ fn walg_env_replace_script(path: &str) -> String {
     )
 }
 
+/// Shell that prints the `WALG_S3_PREFIX` walg.env at `path` archives to, or
+/// nothing when there is no walg.env. It reads the file the way
+/// archive_command does, by sourcing it, in a subshell that prints nothing
+/// else.
+fn walg_env_prefix_script(path: &str) -> String {
+    let env = shell_escape(path);
+    format!("[ -e {env} ] || exit 0; ( . {env} >/dev/null 2>&1; printf '%s' \"$WALG_S3_PREFIX\" )")
+}
+
 /// Shell that undoes [`walg_env_replace_script`] if walg.env is the one the
 /// `attempt` wrote: the kept file goes back, or, when there was none, the new
 /// walg.env is removed. Any other walg.env is left as it is.
@@ -562,14 +602,14 @@ fn walg_env_restore_script(path: &str, attempt: &str) -> String {
     )
 }
 
-/// Run a walg.env maintenance `script` as the postgres user; `action` says
-/// what it does to walg.env, for the error.
+/// Run a walg.env maintenance `script` as the postgres user and return what
+/// it printed; `action` says what it does to walg.env, for the error.
 async fn run_walg_env_script(
     docker: &bollard::Docker,
     container_id: &str,
     script: String,
     action: &str,
-) -> Result<(), BackupError> {
+) -> Result<String, BackupError> {
     temps_providers::externalsvc::exec_util::run_exec_as(
         docker,
         container_id,
@@ -579,7 +619,7 @@ async fn run_walg_env_script(
         Some("postgres"),
     )
     .await
-    .map(|_| ())
+    .map(|result| result.output.trim().to_string())
     .map_err(|e| BackupError::Internal {
         message: format!(
             "Failed to {} walg.env in container '{}': {}",
@@ -748,6 +788,38 @@ mod tests {
         assert!(run_script(&walg_env_restore_script(path_str, ATTEMPT), ""));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), WORKING);
         assert!(!std::path::Path::new(&prev).exists());
+    }
+
+    /// What [`walg_env_prefix_script`] prints for walg.env at `path`.
+    fn read_prefix(path: &str) -> String {
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(walg_env_prefix_script(path))
+            .output()
+            .expect("sh runs");
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8(output.stdout).unwrap()
+    }
+
+    #[test]
+    fn the_walg_destination_is_read_back_from_walg_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pg data's").join("walg.env");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let path_str = path.to_str().unwrap();
+
+        // No walg.env yet: nothing archives with WAL-G.
+        assert_eq!(read_prefix(path_str), "");
+
+        let env_vars = [
+            "WALG_S3_PREFIX=s3://backups/it's/internal_db/walg".to_string(),
+            "AWS_SECRET_ACCESS_KEY=s3cr3t".to_string(),
+        ];
+        assert!(run_script(
+            &walg_env_replace_script(path_str),
+            &walg_env_file_contents(&env_vars, ATTEMPT)
+        ));
+        assert_eq!(read_prefix(path_str), "s3://backups/it's/internal_db/walg");
     }
 
     #[test]

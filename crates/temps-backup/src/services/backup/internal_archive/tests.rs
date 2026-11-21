@@ -706,6 +706,49 @@ fn a_failed_base_backup_puts_back_what_archive_command_was() {
 }
 
 #[test]
+fn walg_archiving_is_not_moved_to_another_destination_by_a_backup() {
+    let archiving = settings_in(WALG_COMMAND, None, AUTO_CONF);
+    let old = "s3://old-bucket/temps/internal_db/walg";
+    let new = "s3://new-bucket/temps/internal_db/walg";
+
+    let reason = archiving
+        .walg_destination_change_blocker(WALG_COMMAND, Some(old), new)
+        .unwrap();
+    assert!(reason.contains(old) && reason.contains(new), "{reason}");
+    assert!(
+        reason.contains("ALTER SYSTEM SET archive_command = '/bin/true'"),
+        "{reason}"
+    );
+
+    // Same destination, e.g. rotated credentials.
+    assert_eq!(
+        archiving.walg_destination_change_blocker(WALG_COMMAND, Some(old), old),
+        None
+    );
+    // No walg.env to compare with.
+    assert_eq!(
+        archiving.walg_destination_change_blocker(WALG_COMMAND, Some(" "), new),
+        None
+    );
+    assert_eq!(
+        archiving.walg_destination_change_blocker(WALG_COMMAND, None, new),
+        None
+    );
+    // WAL-G is not what archives now (the placeholder, or a pause): there
+    // is no chain to protect.
+    for command in [NO_ARCHIVE_DESTINATION_COMMAND, ""] {
+        assert_eq!(
+            settings_in(command, None, AUTO_CONF).walg_destination_change_blocker(
+                WALG_COMMAND,
+                Some(old),
+                new
+            ),
+            None
+        );
+    }
+}
+
+#[test]
 fn archiving_temps_does_not_manage_is_never_switched_to_walg() {
     let blocked = |settings: ArchiveSettings| settings.walg_takeover_blocker(WALG_COMMAND);
     assert!(blocked(settings_in("cp %p /archive/%f", None, AUTO_CONF)).is_some());

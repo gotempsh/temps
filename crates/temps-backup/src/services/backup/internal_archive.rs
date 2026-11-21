@@ -171,6 +171,35 @@ impl ArchiveSettings {
         None
     }
 
+    /// Why a WAL-G base backup to `backing_up_to` must not switch WAL-G
+    /// archiving that already ships this database's WAL to `archiving_to`
+    /// (walg.env's `WALG_S3_PREFIX`, `None` when there is no walg.env).
+    ///
+    /// Segments archived to the new destination while the attempt runs never
+    /// reach the old one, so a failed attempt would leave gaps in the chain
+    /// that is still in use. Moving destinations ends that chain, which an
+    /// operator does on purpose by putting the placeholder back. Rotating
+    /// credentials on the same destination is not a move.
+    pub(super) fn walg_destination_change_blocker(
+        &self,
+        archiving_command: &str,
+        archiving_to: Option<&str>,
+        backing_up_to: &str,
+    ) -> Option<String> {
+        let archiving_to = archiving_to.map(str::trim).filter(|to| !to.is_empty())?;
+        if self.archive_command != archiving_command || archiving_to == backing_up_to {
+            return None;
+        }
+        Some(format!(
+            "WAL-G is archiving this database's WAL to '{archiving_to}', and switching it to \
+             '{backing_up_to}' for a base backup would leave gaps in that archive if the backup \
+             failed. To move to the new destination, which ends the WAL chain in \
+             '{archiving_to}', run ALTER SYSTEM SET archive_command = \
+             '{NO_ARCHIVE_DESTINATION_COMMAND}' and SELECT pg_reload_conf(); the next backup \
+             then starts archiving to '{backing_up_to}'"
+        ))
+    }
+
     /// The change that puts back what `archive_command` was after
     /// `archiving_command` was enabled for a base backup that then failed,
     /// or `None` when that was already the command.
