@@ -1602,8 +1602,9 @@ impl FirecrackerSandboxProvider {
                 tracing::warn!(
                     sandbox = name,
                     "Firecracker sandbox runs its commands as root: it was restored from a \
-                     snapshot whose guest agent predates the sandbox user; take a new snapshot \
-                     to run as the sandbox user"
+                     snapshot whose guest agent predates the sandbox user. A snapshot of this \
+                     sandbox keeps that agent; to run as the sandbox user, create a new sandbox, \
+                     move the workspace into it and snapshot that one"
                 );
                 UserRecord::Root {
                     reason: "restored from a snapshot whose guest agent predates the sandbox user"
@@ -2792,6 +2793,15 @@ impl SandboxProvider for FirecrackerSandboxProvider {
         if !self.config.vm_dir(name).join("vm.json").exists() {
             return Err(self.err(name, "no persisted VM config; sandbox was destroyed"));
         }
+        // The previous boot's identity is dropped before the replacement can
+        // serve commands: until it is confirmed, a VM booted with the user
+        // has no record, and its default commands are refused.
+        super::fc_sandbox_user::record(&self.config.vm_dir(name), None).map_err(|e| {
+            self.err(
+                name,
+                format!("clear the previous boot's sandbox user record: {e}"),
+            )
+        })?;
         // Rootfs persisted across stop — the VM resumes its filesystem state.
         self.spawn_vm(name).await?;
         // The guest prepares the sandbox user again at every boot.
@@ -3977,6 +3987,35 @@ mod tests {
         let reason = provider.confirm_sandbox_user(&name).await.unwrap_err();
         assert!(reason.contains("no space left"), "{reason}");
         assert!(crate::fc_sandbox_user::recorded_uid(&vm_dir).is_err());
+    }
+
+    /// A restart forgets the previous boot's user before it launches the VM,
+    /// so the replacement's commands are refused until it is confirmed,
+    /// even when the launch itself fails.
+    #[tokio::test]
+    async fn a_restart_drops_the_previous_boots_record_before_launching() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = provider_at(dir.path().to_path_buf());
+        let name = sandbox_vm_name();
+        let vm_dir = provider.config.vm_dir(&name);
+        std::fs::create_dir_all(&vm_dir).unwrap();
+        boot_with_sandbox_user(&vm_dir);
+        crate::fc_sandbox_user::record(
+            &vm_dir,
+            Some(&crate::fc_sandbox_user::UserRecord::Root {
+                reason: "older agent".to_string(),
+            }),
+        )
+        .unwrap();
+        assert_eq!(crate::fc_sandbox_user::recorded_uid(&vm_dir), Ok(None));
+
+        // No launcher is configured, so the launch fails after the record
+        // is gone.
+        assert!(provider.start(&provider.handle_for(&name)).await.is_err());
+        assert!(
+            crate::fc_sandbox_user::recorded_uid(&vm_dir).is_err(),
+            "commands are refused, not run as the previous boot's root"
+        );
     }
 
     /// Read the `CONNECT <port>\n` line a client sends first.

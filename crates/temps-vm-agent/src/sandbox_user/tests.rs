@@ -592,8 +592,22 @@ fn a_replaced_file_never_writes_through_a_planted_link() {
 
     let real = dir.join("real");
     std::fs::create_dir_all(&real).unwrap();
-    std::os::unix::fs::symlink(&real, dir.join("linked")).unwrap();
-    let error = replace_file(&dir.join("linked/sub/record"), "x", 0o600).unwrap_err();
+    let linked = dir.join("linked");
+    std::os::unix::fs::symlink(&real, &linked).unwrap();
+    if me().uid == 0 {
+        // A link root made is the system's own layout and is followed.
+        replace_file(&linked.join("own/record"), "x", 0o600).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(real.join("own/record")).unwrap(),
+            "x"
+        );
+        std::fs::remove_dir_all(real.join("own")).unwrap();
+        // The refused case needs a link someone else owns.
+        let path = std::ffi::CString::new(linked.display().to_string()).unwrap();
+        let other = an_id_other_than(&[0]);
+        assert_eq!(unsafe { libc::lchown(path.as_ptr(), other, other) }, 0);
+    }
+    let error = replace_file(&linked.join("sub/record"), "x", 0o600).unwrap_err();
     assert!(error.to_string().contains("symbolic link"), "{error}");
     assert_eq!(std::fs::read_dir(&real).unwrap().count(), 0);
     std::fs::remove_dir_all(&dir).unwrap();
@@ -671,6 +685,25 @@ fn the_converter_walk_skips_the_users_trees_and_symlinks() {
     assert_eq!(none, 0, "entries owned by another uid are left alone");
     std::fs::remove_dir_all(&root).unwrap();
     std::fs::remove_dir_all(&outside).unwrap();
+}
+
+/// Terminals start with the prepared user before `ready` is published, so a
+/// host that sees `ready` can attach a terminal at once.
+#[test]
+fn terminals_start_before_the_user_is_published() {
+    let events = std::cell::RefCell::new(Vec::new());
+    settle(
+        || SandboxUserStatus::Ready { user: temps() },
+        |status| {
+            assert_eq!(status, &SandboxUserStatus::Ready { user: temps() });
+            events.borrow_mut().push("terminals");
+        },
+        |status| {
+            assert_eq!(status, SandboxUserStatus::Ready { user: temps() });
+            events.borrow_mut().push("published");
+        },
+    );
+    assert_eq!(events.into_inner(), ["terminals", "published"]);
 }
 
 #[test]

@@ -82,13 +82,15 @@ pub fn run() {
             ("pty_port", json!(PTY_PORT)),
         ],
     );
-    // The user is prepared beside the RPC server, and terminals start only
-    // once it is settled, so they never run before their user exists.
+    // The user is prepared beside the RPC server. Terminals start once it is
+    // settled and before it is published, so the host never sees `ready`
+    // while the terminal listener is still missing.
     let spawned = std::thread::Builder::new()
         .name("sandbox-user".to_string())
         .spawn(|| {
-            let _ = SANDBOX_USER.set(prepare_sandbox_user());
-            start_terminal_support();
+            sandbox_user::settle(prepare_sandbox_user, start_terminal_support, |status| {
+                let _ = SANDBOX_USER.set(status);
+            })
         });
     if let Err(e) = spawned {
         let reason = format!("start the sandbox user preparation: {e}");
@@ -450,8 +452,8 @@ fn prepare_sandbox_user() -> SandboxUserStatus {
 /// best effort: a guest without the PTY agent (an older rootfs, or a host
 /// that never staged the binary) still serves exec/fs RPCs normally, it just
 /// has no terminals.
-fn start_terminal_support() {
-    if let SandboxUserStatus::Failed { reason } = sandbox_user_status() {
+fn start_terminal_support(status: &SandboxUserStatus) {
+    if let SandboxUserStatus::Failed { reason } = status {
         // A terminal must not fall back to root for a sandbox meant to run
         // as its user; the host fails the create with this reason.
         warn(
@@ -473,9 +475,14 @@ fn start_terminal_support() {
         );
         return;
     }
+    // The terminals' user, as settled; the published status is not set yet.
+    let user = match status {
+        SandboxUserStatus::Ready { user } => Some(user.clone()),
+        _ => None,
+    };
     if let Err(e) = std::thread::Builder::new()
         .name("pty-supervisor".to_string())
-        .spawn(supervise_pty_agent)
+        .spawn(move || supervise_pty_agent(user))
     {
         error(
             "pty_supervisor_spawn_failed",
@@ -506,11 +513,11 @@ fn start_terminal_support() {
 /// terminal feature is dead without it: a crash is retried after a short
 /// pause rather than leaving the guest with a listener that has nobody to
 /// talk to.
-fn supervise_pty_agent() {
+fn supervise_pty_agent(user: Option<SandboxUser>) {
     let socket_dir = Path::new(PTY_AGENT_SOCKET)
         .parent()
         .unwrap_or_else(|| Path::new("/run"));
-    let user = ready_sandbox_user();
+    let user = user.as_ref();
     loop {
         secure_pty_agent_binary();
         // 0700 and owned by whoever runs the PTY agent (the sandbox user, as

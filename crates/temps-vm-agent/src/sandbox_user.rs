@@ -607,6 +607,21 @@ fn require_real_dirs(dir: &Path) -> Result<(), SandboxUserError> {
     Ok(())
 }
 
+/// Settle the sandbox user in the order the host relies on: `prepare` it,
+/// hand the result to `start_terminals` (which registers the terminal
+/// listener, or decides terminals are unavailable), and only then `publish`
+/// it. The host treats a published `ready` as "the sandbox is usable",
+/// terminals included.
+pub fn settle(
+    prepare: impl FnOnce() -> crate::SandboxUserStatus,
+    start_terminals: impl FnOnce(&crate::SandboxUserStatus),
+    publish: impl FnOnce(crate::SandboxUserStatus),
+) {
+    let status = prepare();
+    start_terminals(&status);
+    publish(status);
+}
+
 /// Where the guest records how far handing the converter's files back to
 /// root got (see [`normalize_rootfs_owner`]).
 pub const NORMALIZATION_RECORD: &str = "/var/lib/temps-vm-agent/rootfs-owner";
