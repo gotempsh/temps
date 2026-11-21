@@ -83,7 +83,7 @@ pub(crate) struct WorkloadLogChunk {
 
 /// Whether an agent `Err` says it does not know the request (an agent built
 /// before that request existed), as opposed to the request failing.
-fn is_unknown_request(message: &str) -> bool {
+pub(crate) fn is_unknown_request(message: &str) -> bool {
     message.starts_with("bad request:") && message.contains("unknown variant")
 }
 
@@ -92,6 +92,7 @@ use super::{
     SandboxProvider,
 };
 use temps_agent_core::error::AgentError;
+use temps_agent_core::sandbox_user::SANDBOX_HOME;
 use temps_agent_core::OnEventCallback;
 
 /// VM name prefix — the routing provider dispatches handles on this.
@@ -1427,6 +1428,12 @@ impl FirecrackerSandboxProvider {
         }
         let mut boot_args =
             "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/temps-vm-agent".to_string();
+        // A sandbox runs its commands, harnesses and terminals as the sandbox
+        // user, which the guest agent prepares at boot from this parameter.
+        if let Some(arg) = super::fc_sandbox_user::boot_arg_for(&name) {
+            boot_args.push(' ');
+            boot_args.push_str(&arg);
+        }
         let mut network_interfaces = Vec::new();
         if networked {
             let net = self.net_state().filter(|n| n.tap_count > 0);
@@ -1505,9 +1512,118 @@ impl FirecrackerSandboxProvider {
                 reason: e.to_string(),
             });
         }
+        // `finish_create` tears the VM down when this fails.
+        if let Err(reason) = self.confirm_sandbox_user(&name).await {
+            return Err(AgentError::SandboxCreationFailed {
+                run_id: config.run_id,
+                provider: "firecracker".to_string(),
+                reason: format!(
+                    "the sandbox cannot run as the sandbox user ({}): {reason}",
+                    super::fc_sandbox_user::sandbox_user().boot_arg()
+                ),
+            });
+        }
 
         tracing::info!("firecracker sandbox {} up (image {})", name, image);
         Ok(self.handle_with_image(&name, image))
+    }
+
+    /// Ask the guest whether the sandbox user is ready, and record the
+    /// answer next to the VM so default commands run as it. `Err` is the
+    /// reason the VM cannot run as its user. A workload VM has no user.
+    async fn confirm_sandbox_user(&self, name: &str) -> Result<(), String> {
+        use super::fc_sandbox_user::{
+            boot_requested_user, interpret, is_sandbox_vm, record, UserCheck,
+        };
+        let vm_dir = self.config.vm_dir(name);
+        if !is_sandbox_vm(name) {
+            return record(&vm_dir, None).map_err(|e| e.to_string());
+        }
+        let requested = boot_requested_user(&vm_dir)?;
+        let response = self
+            .rpc(name, &Request::SandboxUser, Duration::from_secs(10))
+            .await
+            .map_err(|e| e.to_string())?;
+        let user = match interpret(response)? {
+            UserCheck::Ready(user) => Some(user),
+            // The VM booted with the user on its command line, so an agent
+            // that says it saw none is not a legacy restore: never root.
+            UserCheck::NotRequested if requested => {
+                return Err(
+                    "the VM booted with the sandbox user, but its guest agent reports that \
+                     none was requested (it could not read its kernel command line)"
+                        .to_string(),
+                )
+            }
+            check => {
+                tracing::warn!(
+                    sandbox = name,
+                    ?check,
+                    "Firecracker sandbox runs its commands as root: its guest agent did not \
+                     prepare the sandbox user (a sandbox restored from a snapshot taken before \
+                     the sandbox user existed)"
+                );
+                None
+            }
+        };
+        record(&vm_dir, user.as_ref()).map_err(|e| {
+            format!(
+                "record the sandbox user in '{}': {e}",
+                vm_dir
+                    .join(super::fc_sandbox_user::SANDBOX_USER_FILE)
+                    .display()
+            )
+        })
+    }
+
+    async fn exec_as_uid(
+        &self,
+        handle: &SandboxHandle,
+        uid: Option<u32>,
+        cmd: Vec<String>,
+        env: HashMap<String, String>,
+        on_output: Option<OnEventCallback>,
+    ) -> Result<SandboxExecResult, AgentError> {
+        let mut merged = self.base_env(&handle.sandbox_name);
+        merged.extend(env);
+        let response = self
+            .rpc(
+                &handle.sandbox_name,
+                &Request::Exec {
+                    cmd,
+                    env: merged,
+                    cwd: Some(handle.work_dir.to_string_lossy().into_owned()),
+                    user: uid,
+                    timeout_secs: None,
+                },
+                RPC_TIMEOUT,
+            )
+            .await?;
+        match response {
+            Response::Exec {
+                exit_code,
+                stdout,
+                stderr,
+            } => {
+                // v1 delivers output post-hoc (no mid-run streaming yet) —
+                // callback consumers still see every line.
+                if let Some(cb) = on_output {
+                    for line in stdout.lines() {
+                        cb(line.to_string()).await;
+                    }
+                }
+                Ok(SandboxExecResult {
+                    exit_code,
+                    stdout,
+                    stderr,
+                })
+            }
+            Response::Err { message } => Err(self.err(&handle.sandbox_name, message)),
+            other => Err(self.err(
+                &handle.sandbox_name,
+                format!("unexpected agent response: {:?}", other),
+            )),
+        }
     }
 
     async fn copy_sparse_file(
@@ -1564,11 +1680,16 @@ impl FirecrackerSandboxProvider {
     fn scrub_snapshot_tree(root: &Path) -> std::io::Result<()> {
         use std::os::unix::fs::PermissionsExt;
 
-        // Firecracker commands currently execute as root, so AI CLIs and
-        // credential helpers can leave injected secrets under /root. Runtime
-        // and platform credential state is ephemeral and must never enter a
-        // reusable snapshot. The workspace remains untouched.
-        for relative in ["root", "etc/temps", "tmp", "run", "var/tmp"] {
+        // Commands, AI CLIs and credential helpers run as the sandbox user,
+        // so they leave injected secrets in its home (`/home/temps`). A
+        // sandbox whose agent predates the sandbox user ran them as root,
+        // under `/root`. Runtime and platform credential state is ephemeral
+        // and must never enter a reusable snapshot, so both homes are
+        // emptied. The workspace remains untouched; the restored guest gives
+        // the empty home back to the sandbox user at boot.
+        let sandbox_home = SANDBOX_HOME.trim_start_matches('/');
+        for relative in ["root", sandbox_home, "etc/temps", "tmp", "run", "var/tmp"] {
+            Self::require_real_parents(root, relative)?;
             let path = root.join(relative);
             match std::fs::remove_dir_all(&path) {
                 Ok(()) => {}
@@ -1578,8 +1699,44 @@ impl FirecrackerSandboxProvider {
             std::fs::create_dir_all(&path)?;
         }
         std::fs::set_permissions(root.join("root"), std::fs::Permissions::from_mode(0o700))?;
+        std::fs::set_permissions(
+            root.join(sandbox_home),
+            std::fs::Permissions::from_mode(0o750),
+        )?;
         for relative in ["tmp", "run", "var/tmp"] {
             std::fs::set_permissions(root.join(relative), std::fs::Permissions::from_mode(0o1777))?;
+        }
+        Ok(())
+    }
+
+    /// Refuse to scrub `relative` under `root` unless each of its parents is
+    /// a real directory: the tree holds the guest's own entries, and a
+    /// guest symlink at `home` (with a host-absolute target) would make
+    /// `home/temps` name a directory outside the tree. The final component
+    /// is safe as it is (`remove_dir_all` removes a symlink, not its
+    /// target). Only the host writes this staging tree while it is
+    /// scrubbed, so the guest cannot race the check.
+    fn require_real_parents(root: &Path, relative: &str) -> std::io::Result<()> {
+        let mut parent = root.to_path_buf();
+        let components: Vec<&str> = relative.split('/').filter(|c| !c.is_empty()).collect();
+        for component in components.iter().take(components.len().saturating_sub(1)) {
+            parent.push(component);
+            match std::fs::symlink_metadata(&parent) {
+                Ok(meta) if meta.file_type().is_dir() => {}
+                // Missing: `create_dir_all` makes it a real directory.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Ok(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "refusing to scrub '{relative}' from the snapshot: '{}' is not a \
+                             directory (a symlink in the guest's filesystem)",
+                            parent.strip_prefix(root).unwrap_or(&parent).display()
+                        ),
+                    ))
+                }
+                Err(error) => return Err(error),
+            }
         }
         Ok(())
     }
@@ -2363,6 +2520,9 @@ impl SandboxProvider for FirecrackerSandboxProvider {
         self.finish_create(config, name, image, vm_rootfs).await
     }
 
+    /// Run a command as the sandbox user a sandbox VM recorded at boot, or
+    /// as root in a workload VM (and in a sandbox restored from a snapshot
+    /// whose agent predates the sandbox user).
     async fn exec(
         &self,
         handle: &SandboxHandle,
@@ -2370,46 +2530,43 @@ impl SandboxProvider for FirecrackerSandboxProvider {
         env: HashMap<String, String>,
         on_output: Option<OnEventCallback>,
     ) -> Result<SandboxExecResult, AgentError> {
-        let mut merged = self.base_env(&handle.sandbox_name);
-        merged.extend(env);
-        let response = self
-            .rpc(
-                &handle.sandbox_name,
-                &Request::Exec {
-                    cmd,
-                    env: merged,
-                    cwd: Some(handle.work_dir.to_string_lossy().into_owned()),
-                    user: None,
-                    timeout_secs: None,
-                },
-                RPC_TIMEOUT,
-            )
-            .await?;
-        match response {
-            Response::Exec {
-                exit_code,
-                stdout,
-                stderr,
-            } => {
-                // v1 delivers output post-hoc (no mid-run streaming yet) —
-                // callback consumers still see every line.
-                if let Some(cb) = on_output {
-                    for line in stdout.lines() {
-                        cb(line.to_string()).await;
-                    }
-                }
-                Ok(SandboxExecResult {
-                    exit_code,
-                    stdout,
-                    stderr,
-                })
+        let uid = super::fc_sandbox_user::recorded_uid(&self.config.vm_dir(&handle.sandbox_name))
+            .map_err(|reason| AgentError::SandboxExecFailed {
+            run_id: 0,
+            sandbox_id: handle.sandbox_id.clone(),
+            reason,
+        })?;
+        self.exec_as_uid(handle, uid, cmd, env, on_output).await
+    }
+
+    /// Root, for the platform's own maintenance inside the guest.
+    async fn exec_as_root(
+        &self,
+        handle: &SandboxHandle,
+        cmd: Vec<String>,
+        env: HashMap<String, String>,
+        on_output: Option<OnEventCallback>,
+    ) -> Result<SandboxExecResult, AgentError> {
+        self.exec_as_uid(handle, Some(0), cmd, env, on_output).await
+    }
+
+    async fn exec_as_user(
+        &self,
+        handle: &SandboxHandle,
+        user: &str,
+        cmd: Vec<String>,
+        env: HashMap<String, String>,
+        on_output: Option<OnEventCallback>,
+    ) -> Result<SandboxExecResult, AgentError> {
+        let uid = super::fc_sandbox_user::exec_uid_for(user).map_err(|reason| {
+            AgentError::SandboxExecFailed {
+                run_id: 0,
+                sandbox_id: handle.sandbox_id.clone(),
+                reason,
             }
-            Response::Err { message } => Err(self.err(&handle.sandbox_name, message)),
-            other => Err(self.err(
-                &handle.sandbox_name,
-                format!("unexpected agent response: {:?}", other),
-            )),
-        }
+        })?;
+        self.exec_as_uid(handle, Some(uid), cmd, env, on_output)
+            .await
     }
 
     async fn is_alive(&self, handle: &SandboxHandle) -> Result<bool, AgentError> {
@@ -2578,7 +2735,16 @@ impl SandboxProvider for FirecrackerSandboxProvider {
             return Err(self.err(name, "no persisted VM config; sandbox was destroyed"));
         }
         // Rootfs persisted across stop — the VM resumes its filesystem state.
-        self.spawn_vm(name).await
+        self.spawn_vm(name).await?;
+        // The guest prepares the sandbox user again at every boot.
+        if let Err(reason) = self.confirm_sandbox_user(name).await {
+            let _ = self.stop(handle).await;
+            return Err(self.err(
+                name,
+                format!("the restarted sandbox cannot run as the sandbox user: {reason}"),
+            ));
+        }
+        Ok(())
     }
 
     async fn resize_disk(
@@ -4013,6 +4179,302 @@ mod tests {
         );
         assert!(!root.path().join("root/.claude/token").exists());
         assert!(!root.path().join("etc/temps/credential-daemon.env").exists());
+    }
+
+    #[test]
+    fn snapshot_scrub_empties_the_sandbox_users_home() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("home/temps/.claude")).unwrap();
+        std::fs::write(
+            root.path().join("home/temps/.claude/.credentials.json"),
+            b"secret",
+        )
+        .unwrap();
+        std::fs::write(root.path().join("home/temps/.git-credentials"), b"secret").unwrap();
+        std::fs::create_dir_all(root.path().join("workspace")).unwrap();
+        std::fs::write(root.path().join("workspace/notes.md"), b"preserve").unwrap();
+
+        FirecrackerSandboxProvider::scrub_snapshot_tree(root.path()).unwrap();
+
+        let home = root.path().join("home/temps");
+        assert_eq!(
+            std::fs::read_dir(&home).unwrap().count(),
+            0,
+            "the home is emptied"
+        );
+        assert_eq!(
+            std::fs::metadata(&home).unwrap().permissions().mode() & 0o777,
+            0o750
+        );
+        assert_eq!(
+            std::fs::read(root.path().join("workspace/notes.md")).unwrap(),
+            b"preserve"
+        );
+    }
+
+    /// A guest symlink in a scrub target's parent (`home` → a host path)
+    /// stops the scrub before it touches anything outside the tree.
+    #[test]
+    fn snapshot_scrub_refuses_a_symlinked_parent() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(outside.path().join("temps")).unwrap();
+        std::fs::write(outside.path().join("temps/keep"), b"host file").unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("home")).unwrap();
+
+        let error = FirecrackerSandboxProvider::scrub_snapshot_tree(root.path()).unwrap_err();
+        assert!(
+            error.to_string().contains("'home' is not a directory"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read(outside.path().join("temps/keep")).unwrap(),
+            b"host file",
+            "nothing outside the tree was removed"
+        );
+    }
+
+    fn sandbox_vm_name() -> String {
+        format!("{FC_SANDBOX_NAME_PREFIX}42")
+    }
+
+    const EXEC_OK: &str = r#"{"result":"exec","exit_code":0,"stdout":"ok","stderr":""}"#;
+
+    #[tokio::test]
+    async fn a_sandbox_runs_default_commands_as_the_recorded_sandbox_user() {
+        let name = sandbox_vm_name();
+        let (provider, handle, _dir) = provider_with_vsock(&name, |stream| {
+            serve_agent_rpc(stream, |request| {
+                assert_eq!(request["op"], "exec");
+                assert_eq!(request["user"], temps_agent_core::sandbox_user::SANDBOX_UID);
+                assert_eq!(request["cwd"], WORK_DIR);
+                EXEC_OK.to_string()
+            })
+        });
+        crate::fc_sandbox_user::record(
+            &provider.config.vm_dir(&name),
+            Some(&crate::fc_sandbox_user::sandbox_user()),
+        )
+        .unwrap();
+
+        let result = provider
+            .exec(&handle, vec!["id".to_string()], HashMap::new(), None)
+            .await
+            .unwrap();
+        assert_eq!(result.stdout, "ok");
+    }
+
+    #[tokio::test]
+    async fn without_a_recorded_user_default_commands_run_as_root() {
+        let name = sandbox_vm_name();
+        let (provider, handle, _dir) = provider_with_vsock(&name, |stream| {
+            serve_agent_rpc(stream, |request| {
+                assert!(request["user"].is_null(), "{request}");
+                EXEC_OK.to_string()
+            })
+        });
+        provider
+            .exec(&handle, vec!["id".to_string()], HashMap::new(), None)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn exec_as_root_runs_maintenance_as_uid_0_even_for_a_sandbox() {
+        let name = sandbox_vm_name();
+        let (provider, handle, _dir) = provider_with_vsock(&name, |stream| {
+            serve_agent_rpc(stream, |request| {
+                assert_eq!(request["user"], 0);
+                EXEC_OK.to_string()
+            })
+        });
+        crate::fc_sandbox_user::record(
+            &provider.config.vm_dir(&name),
+            Some(&crate::fc_sandbox_user::sandbox_user()),
+        )
+        .unwrap();
+        provider
+            .exec_as_root(&handle, vec!["chown".to_string()], HashMap::new(), None)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn exec_as_user_sends_the_named_users_uid() {
+        let name = sandbox_vm_name();
+        let (provider, handle, _dir) = provider_with_vsock(&name, |stream| {
+            serve_agent_rpc(stream, |request| {
+                assert_eq!(request["user"], temps_agent_core::sandbox_user::SANDBOX_UID);
+                EXEC_OK.to_string()
+            })
+        });
+        provider
+            .exec_as_user(
+                &handle,
+                temps_agent_core::sandbox_user::SANDBOX_USER,
+                vec!["id".to_string()],
+                HashMap::new(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // A name the agent cannot map to a uid never reaches the guest.
+        let error = provider
+            .exec_as_user(
+                &handle,
+                "node",
+                vec!["id".to_string()],
+                HashMap::new(),
+                None,
+            )
+            .await
+            .err()
+            .expect("an unmappable user is refused");
+        assert!(error.to_string().contains("names no uid"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_ready_sandbox_user_is_recorded_after_boot() {
+        let name = sandbox_vm_name();
+        let (provider, _handle, _dir) = provider_with_vsock(&name, |stream| {
+            serve_agent_rpc(stream, |request| {
+                assert_eq!(request["op"], "sandbox_user");
+                r#"{"result":"sandbox_user","state":"ready",
+                    "user":{"uid":1000,"gid":1000,"name":"temps","home":"/home/temps"}}"#
+                    .to_string()
+            })
+        });
+        provider.confirm_sandbox_user(&name).await.unwrap();
+        assert_eq!(
+            crate::fc_sandbox_user::recorded_uid(&provider.config.vm_dir(&name)),
+            Ok(Some(1000))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sandbox_user_the_guest_could_not_prepare_fails_with_its_reason() {
+        let name = sandbox_vm_name();
+        let (provider, _handle, _dir) = provider_with_vsock(&name, |stream| {
+            serve_agent_rpc(stream, |_| {
+                r#"{"result":"sandbox_user","state":"failed",
+                    "reason":"the image already has a user 'temps' with uid 1001"}"#
+                    .to_string()
+            })
+        });
+        let reason = provider.confirm_sandbox_user(&name).await.unwrap_err();
+        assert!(reason.contains("uid 1001"), "{reason}");
+        assert_eq!(
+            crate::fc_sandbox_user::recorded_uid(&provider.config.vm_dir(&name)),
+            Ok(None)
+        );
+    }
+
+    /// A VM that booted with the sandbox user on its command line is never
+    /// let fall back to root because its agent says it saw none.
+    #[tokio::test]
+    async fn a_sandbox_booted_with_the_user_must_have_it_ready() {
+        let name = sandbox_vm_name();
+        let (provider, _handle, _dir) = provider_with_vsock(&name, |stream| {
+            serve_agent_rpc(stream, |_| {
+                r#"{"result":"sandbox_user","state":"not_requested"}"#.to_string()
+            })
+        });
+        let vm_dir = provider.config.vm_dir(&name);
+        std::fs::write(
+            vm_dir.join("vm.json"),
+            serde_json::json!({"boot-source": {
+                "boot_args": format!("console=ttyS0 {}", crate::fc_sandbox_user::sandbox_user().boot_arg())
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        let reason = provider.confirm_sandbox_user(&name).await.unwrap_err();
+        assert!(reason.contains("none was requested"), "{reason}");
+        assert_eq!(crate::fc_sandbox_user::recorded_uid(&vm_dir), Ok(None));
+    }
+
+    /// Without the boot argument (a VM configured before the sandbox user
+    /// existed), "not requested" keeps root, as before.
+    #[tokio::test]
+    async fn a_sandbox_booted_without_the_user_keeps_root_when_none_is_requested() {
+        let name = sandbox_vm_name();
+        let (provider, _handle, _dir) = provider_with_vsock(&name, |stream| {
+            serve_agent_rpc(stream, |_| {
+                r#"{"result":"sandbox_user","state":"not_requested"}"#.to_string()
+            })
+        });
+        let vm_dir = provider.config.vm_dir(&name);
+        std::fs::write(
+            vm_dir.join("vm.json"),
+            serde_json::json!({"boot-source": {"boot_args": "console=ttyS0"}}).to_string(),
+        )
+        .unwrap();
+        provider.confirm_sandbox_user(&name).await.unwrap();
+        assert_eq!(crate::fc_sandbox_user::recorded_uid(&vm_dir), Ok(None));
+    }
+
+    /// A record that cannot be read fails the command instead of running it
+    /// as root.
+    #[tokio::test]
+    async fn an_unreadable_user_record_fails_the_command_instead_of_running_as_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = provider_at(dir.path().to_path_buf());
+        let name = sandbox_vm_name();
+        let vm_dir = provider.config.vm_dir(&name);
+        std::fs::create_dir_all(&vm_dir).unwrap();
+        std::fs::write(
+            vm_dir.join(crate::fc_sandbox_user::SANDBOX_USER_FILE),
+            "{truncated",
+        )
+        .unwrap();
+        // No vsock listener: a command that reached the guest would fail
+        // differently.
+        let error = provider
+            .exec(
+                &provider.handle_for(&name),
+                vec!["id".to_string()],
+                HashMap::new(),
+                None,
+            )
+            .await
+            .err()
+            .expect("the command is refused");
+        assert!(error.to_string().contains("unreadable"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn an_agent_that_predates_the_sandbox_user_keeps_root() {
+        let name = sandbox_vm_name();
+        let (provider, _handle, _dir) = provider_with_vsock(&name, |stream| {
+            serve_agent_rpc(stream, |_| {
+                r#"{"result":"err","message":"bad request: unknown variant `sandbox_user`"}"#
+                    .to_string()
+            })
+        });
+        provider.confirm_sandbox_user(&name).await.unwrap();
+        assert_eq!(
+            crate::fc_sandbox_user::recorded_uid(&provider.config.vm_dir(&name)),
+            Ok(None)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_workload_vm_is_never_asked_for_the_sandbox_user() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = provider_at(dir.path().to_path_buf());
+        let name = format!(
+            "{FC_SANDBOX_NAME_PREFIX}{}my-app",
+            crate::workload_vm::WORKLOAD_VM_ID_PREFIX
+        );
+        std::fs::create_dir_all(provider.config.vm_dir(&name)).unwrap();
+        // No vsock listener: an RPC would fail the call.
+        provider.confirm_sandbox_user(&name).await.unwrap();
+        assert_eq!(
+            crate::fc_sandbox_user::recorded_uid(&provider.config.vm_dir(&name)),
+            Ok(None)
+        );
     }
 
     #[test]
