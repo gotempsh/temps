@@ -59,16 +59,22 @@ fn check_scope(
     }
     Ok(())
 }
+
+type WatchCaller = (
+    Option<Extension<AiToolCall>>,
+    Option<Extension<ChatWatchScope>>,
+    Option<Extension<VerifiedPluginApiCaller>>,
+);
+
 #[utoipa::path(get,tag="External Plugins",path="/ai/conversations/{chat}/plugin-watches",params(("chat"=String,Path)),responses((status=200,body=WatchPanel),(status=401),(status=403),(status=404),(status=500)),security(("bearer_auth"=[])))]
 pub(super) async fn list_chat_plugin_watches(
     RequireAuth(auth): RequireAuth,
     State(state): State<ExternalPluginsAppState>,
     Path(chat): Path<String>,
-    ai: Option<Extension<AiToolCall>>,
-    scope: Option<Extension<ChatWatchScope>>,
-    plugin: Option<Extension<VerifiedPluginApiCaller>>,
+    caller: WatchCaller,
 ) -> Result<Json<WatchPanel>, Problem> {
     permission_guard!(auth, ProjectsRead);
+    let (ai, scope, plugin) = caller;
     check_scope(&chat, ai, scope, plugin)?;
     Ok(Json(state.service.watch_panel(&auth, &chat).await?))
 }
@@ -78,12 +84,11 @@ pub(super) async fn change_chat_plugin_watch(
     State(state): State<ExternalPluginsAppState>,
     Path(chat): Path<String>,
     Extension(metadata): Extension<temps_core::RequestMetadata>,
-    ai: Option<Extension<AiToolCall>>,
-    scope: Option<Extension<ChatWatchScope>>,
-    plugin: Option<Extension<VerifiedPluginApiCaller>>,
+    caller: WatchCaller,
     Json(change): Json<WatchChange>,
 ) -> Result<StatusCode, Problem> {
     permission_guard!(auth, ProjectsRead);
+    let (ai, scope, plugin) = caller;
     check_scope(&chat, ai, scope, plugin)?;
     state.service.change_watch(&auth, &chat, &change).await?;
     record_audit(

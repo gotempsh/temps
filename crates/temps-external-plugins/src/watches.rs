@@ -624,14 +624,14 @@ WITH due AS (SELECT id FROM plugin_watch_deliveries WHERE status='pending' AND n
             // The notification insert or the wake-message trigger owns the
             // durable acknowledgement. HTTP acceptance alone is insufficient.
             Ok(()) => return Ok(true),
-            Err(WatchError::Rejected { status, .. })
-                if matches!(
-                    status,
+            Err(WatchError::Rejected {
+                status:
                     StatusCode::UNAUTHORIZED
-                        | StatusCode::FORBIDDEN
-                        | StatusCode::NOT_FOUND
-                        | StatusCode::BAD_REQUEST
-                ) => {}
+                    | StatusCode::FORBIDDEN
+                    | StatusCode::NOT_FOUND
+                    | StatusCode::BAD_REQUEST,
+                ..
+            }) => {}
             Err(error) => return Err(error),
         }
         self.db.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres, r#"
