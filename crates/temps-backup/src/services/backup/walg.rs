@@ -286,7 +286,9 @@ impl BackupService {
         // restorable together with the WAL written while it ran, so that WAL
         // must reach the archive. Without archiving the base backup would be
         // unrestorable, so the error ends the WAL-G attempt and the caller
-        // falls back to pg_dump.
+        // falls back to pg_dump. The settings are read first so a failed push
+        // can put back what was there (`with_archive_rollback`).
+        let archive_before = self.read_archive_settings().await?;
         self.enable_internal_wal_archiving(&docker, &container_id, &env_vars, &pgdata)
             .await
             .map_err(|e| BackupError::Internal {
@@ -297,65 +299,79 @@ impl BackupService {
                 ),
             })?;
 
-        // Run wal-g backup-push
-        info!("Running wal-g backup-push in container {}", container_id);
+        // A push that fails from inside the container (an endpoint or bucket
+        // only the Temps process can reach, a credential wal-g rejects) would
+        // otherwise leave archive_command failing on every segment, so
+        // PostgreSQL keeps all WAL again.
+        let push = async {
+            // Run wal-g backup-push
+            info!("Running wal-g backup-push in container {}", container_id);
 
-        let exec = docker
-            .create_exec(
-                &container_id,
-                CreateExecOptions {
-                    cmd: Some(vec!["wal-g", "backup-push", &pgdata]),
-                    attach_stdout: Some(false),
-                    attach_stderr: Some(false),
-                    env: Some(env_refs.clone()),
-                    user: Some("postgres"),
-                    ..Default::default()
-                },
-            )
-            .await
-            .map_err(|e| BackupError::Internal {
-                message: format!("Failed to create WAL-G exec: {}", e),
-            })?;
+            let exec = docker
+                .create_exec(
+                    &container_id,
+                    CreateExecOptions {
+                        cmd: Some(vec!["wal-g", "backup-push", &pgdata]),
+                        attach_stdout: Some(false),
+                        attach_stderr: Some(false),
+                        env: Some(env_refs.clone()),
+                        user: Some("postgres"),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(|e| BackupError::Internal {
+                    message: format!("Failed to create WAL-G exec: {}", e),
+                })?;
 
-        docker
-            .start_exec(
-                &exec.id,
-                Some(StartExecOptions {
-                    detach: true,
-                    ..Default::default()
-                }),
-            )
-            .await
-            .map_err(|e| BackupError::Internal {
-                message: format!("Failed to start WAL-G exec: {}", e),
-            })?;
+            docker
+                .start_exec(
+                    &exec.id,
+                    Some(StartExecOptions {
+                        detach: true,
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .map_err(|e| BackupError::Internal {
+                    message: format!("Failed to start WAL-G exec: {}", e),
+                })?;
 
-        // Poll for completion
-        loop {
-            let inspect =
-                docker
-                    .inspect_exec(&exec.id)
-                    .await
-                    .map_err(|e| BackupError::Internal {
-                        message: format!("Failed to inspect WAL-G exec: {}", e),
-                    })?;
-            if let Some(running) = inspect.running {
-                if !running {
-                    if let Some(exit_code) = inspect.exit_code {
-                        if exit_code != 0 {
-                            return Err(BackupError::Internal {
-                                message: format!(
-                                    "wal-g backup-push failed with exit code {} in container {}",
-                                    exit_code, container_id
-                                ),
-                            });
+            // Poll for completion
+            loop {
+                let inspect =
+                    docker
+                        .inspect_exec(&exec.id)
+                        .await
+                        .map_err(|e| BackupError::Internal {
+                            message: format!("Failed to inspect WAL-G exec: {}", e),
+                        })?;
+                if let Some(running) = inspect.running {
+                    if !running {
+                        if let Some(exit_code) = inspect.exit_code {
+                            if exit_code != 0 {
+                                return Err(BackupError::Internal {
+                                    message: format!(
+                                        "wal-g backup-push failed with exit code {} in container {}",
+                                        exit_code, container_id
+                                    ),
+                                });
+                            }
                         }
+                        break;
                     }
-                    break;
                 }
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        }
+            Ok::<(), BackupError>(())
+        };
+        self.with_archive_rollback(
+            &archive_before,
+            &internal_walg_archive_command(&pgdata),
+            &container_id,
+            push,
+        )
+        .await?;
 
         // Calculate total backup size by listing objects under the WAL-G prefix
         let s3_client = self.create_s3_client(s3_source).await?;
@@ -414,13 +430,7 @@ impl BackupService {
     ) -> Result<(), BackupError> {
         use bollard::exec::{CreateExecOptions, StartExecOptions};
 
-        // Determine the volume mount root (parent of PGDATA) for the env file location.
-        // E.g., PGDATA=/var/lib/postgresql/data -> env file at /var/lib/postgresql/walg.env
-        let volume_root = std::path::Path::new(pgdata)
-            .parent()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|| "/var/lib/postgresql".to_string());
-        let walg_env_path = format!("{}/walg.env", volume_root);
+        let walg_env_path = internal_walg_env_path(pgdata);
 
         // Filter to only S3/WAL-G env vars (no PGDATA, no PG connection vars)
         let env_file_lines: Vec<&String> = env_vars
@@ -513,7 +523,7 @@ impl BackupService {
         // Use two separate -c flags because ALTER SYSTEM cannot run inside a
         // transaction block, and psql wraps multiple statements in a single -c
         // into a transaction.
-        let archive_command = format!(". {} && wal-g wal-push %p", walg_env_path);
+        let archive_command = internal_walg_archive_command(pgdata);
         let alter_sql = format!(
             "ALTER SYSTEM SET archive_command = '{}'",
             archive_command.replace('\'', "''")
@@ -581,4 +591,20 @@ impl BackupService {
 
         Ok(())
     }
+}
+
+/// Where the internal database's WAL-G credentials are written: next to
+/// PGDATA, e.g. `/var/lib/postgresql/walg.env` for
+/// `PGDATA=/var/lib/postgresql/data`.
+fn internal_walg_env_path(pgdata: &str) -> String {
+    let volume_root = std::path::Path::new(pgdata)
+        .parent()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| "/var/lib/postgresql".to_string());
+    format!("{}/walg.env", volume_root)
+}
+
+/// The `archive_command` that ships the internal database's WAL with WAL-G.
+pub(super) fn internal_walg_archive_command(pgdata: &str) -> String {
+    format!(". {} && wal-g wal-push %p", internal_walg_env_path(pgdata))
 }

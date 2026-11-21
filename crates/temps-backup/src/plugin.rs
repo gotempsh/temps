@@ -820,9 +820,9 @@ impl TempsPlugin for BackupPlugin {
                     warn!(
                         reason = %reason,
                         "Control-plane database has WAL archiving on with no archive_command or \
-                         archive_library, so it keeps every WAL segment until one is set. It is \
-                         not a container Temps runs, so its settings were not changed: set \
-                         archive_command or archive_library, or turn archive_mode off",
+                         archive_library, so it keeps every WAL segment until one is set. Temps \
+                         left its settings unchanged (see reason): set archive_command or \
+                         archive_library, or turn archive_mode off",
                     )
                 }
                 Ok(Err(e)) => error!(

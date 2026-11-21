@@ -72,9 +72,10 @@ Backups and restores of the control plane and managed services. Adds to
 `cargo test --lib -p temps-backup <name>`; `cargo test -p temps-backup --features
 docker-tests --test workload_job_proof` (or `mariadb_pitr_e2e`).
 
-- `docker-tests` gates only those binaries and one lib test,
-  `resolve_backup_location_from_s3_finds_mariadb_physical_and_logical_backups`.
+- `docker-tests` gates only those binaries and two lib tests,
+  `resolve_backup_location_from_s3_finds_mariadb_physical_and_logical_backups`
+  and `bundled_database_stops_retaining_wal_after_the_reconcile`.
   Those and the `TestDatabase`/RustFS lib tests skip without Docker or a database.
 - CI: `docker-deployments` runs every ungated test. `docker-backups` selects
-  `workload_job_proof` and that lib test by name; `MariaDB PITR E2E` selects
+  `workload_job_proof` and those lib tests by name; `MariaDB PITR E2E` selects
   `test(mariadb_pitr_full_chain_e2e)`, so a new gated test must match a filter.
