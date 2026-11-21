@@ -311,6 +311,36 @@ struct ReloadResult {
     reloaded: bool,
 }
 
+/// How long a reloaded archive_command may take to reach the server's
+/// sessions before a base backup gives up on it.
+const ARCHIVE_COMMAND_APPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+#[derive(Debug, FromQueryResult)]
+struct RunningArchiveCommand {
+    archive_command: String,
+}
+
+/// The image every bundled Compose file runs the control-plane database
+/// with, and the only one they start with `archive_mode=on`.
+const BUNDLED_DATABASE_IMAGE: &str = "gotempsh/timescaledb-walg";
+
+/// Whether `image` (a container's configured image, with any registry, tag
+/// or digest) is [`BUNDLED_DATABASE_IMAGE`]: evidence the database is the one
+/// Temps' own deployment runs, not an operator's.
+fn is_bundled_database_image(image: &str) -> bool {
+    let name = image.split('@').next().unwrap_or("");
+    // A tag follows the last ':' after the last '/'; an earlier ':' is a
+    // registry port.
+    let name = match name.rsplit_once('/') {
+        Some((path, last)) => {
+            let last = last.split(':').next().unwrap_or("");
+            format!("{path}/{last}")
+        }
+        None => name.split(':').next().unwrap_or("").to_string(),
+    };
+    name == BUNDLED_DATABASE_IMAGE || name.ends_with(&format!("/{BUNDLED_DATABASE_IMAGE}"))
+}
+
 /// The container-side steps of a WAL-G base backup that
 /// [`BackupService::archive_then_push`] orders and undoes.
 pub(super) struct BaseBackupSteps<WriteEnv, Push, RestoreEnv, DiscardPreviousEnv> {
@@ -352,6 +382,19 @@ impl BackupService {
     ) -> Result<InternalArchiveReconcile, BackupError> {
         self.reconcile_internal_wal_archiving_with(|| async {
             let (container_id, _pgdata) = self.find_internal_db_container().await?;
+            // Being the connected server says which container it is, not
+            // whose: only the bundled deployment's database is Temps' to
+            // change on startup.
+            let image = container_image(&container_id).await?;
+            if !is_bundled_database_image(&image) {
+                return Err(BackupError::Internal {
+                    message: format!(
+                        "container '{}' runs image '{}', not the bundled {} database, so its \
+                         archiving settings belong to its operator",
+                        container_id, image, BUNDLED_DATABASE_IMAGE
+                    ),
+                });
+            }
             Ok(container_id)
         })
         .await
@@ -586,20 +629,33 @@ impl BackupService {
                 .await
             {
                 Err(error) => (enabling_failed(error), true),
-                Ok(()) => match steps.push.await {
-                    Err(error) => (error, true),
-                    Ok(value) => {
-                        if let Err(error) = steps.discard_previous_env.await {
-                            warn!(
-                                container_id = %container_id,
-                                "WAL-G base backup succeeded, but the copy of the previous \
-                                 walg.env could not be deleted: {}",
-                                error
-                            );
+                Ok(()) => {
+                    let pushed = match self
+                        .wait_for_archive_command(
+                            container_id,
+                            archiving_command,
+                            ARCHIVE_COMMAND_APPLY_TIMEOUT,
+                        )
+                        .await
+                    {
+                        Err(error) => Err(enabling_failed(error)),
+                        Ok(()) => steps.push.await,
+                    };
+                    match pushed {
+                        Err(error) => (error, true),
+                        Ok(value) => {
+                            if let Err(error) = steps.discard_previous_env.await {
+                                warn!(
+                                    container_id = %container_id,
+                                    "WAL-G base backup succeeded, but the copy of the previous \
+                                     walg.env could not be deleted: {}",
+                                    error
+                                );
+                            }
+                            return Ok(value);
                         }
-                        return Ok(value);
                     }
-                },
+                }
             },
         };
 
@@ -706,6 +762,49 @@ impl BackupService {
         })
     }
 
+    /// Wait until the server runs `archiving_command`. pg_reload_conf() only
+    /// signals the server; until the new value applies, segments the base
+    /// backup needs could still go to the previous command. A session sees
+    /// the new value once the server has passed the reload on to its
+    /// processes, the archiver among them.
+    async fn wait_for_archive_command(
+        &self,
+        container_id: &str,
+        archiving_command: &str,
+        timeout: std::time::Duration,
+    ) -> Result<(), BackupError> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let running = RunningArchiveCommand::find_by_statement(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "SELECT current_setting('archive_command') AS archive_command".to_string(),
+            ))
+            .one(self.db.as_ref())
+            .await
+            .map_err(|e| BackupError::Internal {
+                message: format!(
+                    "Failed to read the running archive_command of the control-plane database \
+                     in container '{}': {}",
+                    container_id, e
+                ),
+            })?
+            .map(|row| row.archive_command);
+            if running.as_deref() == Some(archiving_command) {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(BackupError::Internal {
+                    message: format!(
+                        "The control-plane database in container '{}' still did not run the \
+                         WAL-G archive_command {:?} after its configuration was reloaded",
+                        container_id, timeout
+                    ),
+                });
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
     /// Change the control-plane database's `archive_command` and reload.
     async fn apply_archive_command(
         &self,
@@ -781,6 +880,28 @@ impl BackupService {
                 .to_string(),
         })
     }
+}
+
+/// The image `container_id` was created from, as configured (not the
+/// resolved image ID).
+async fn container_image(container_id: &str) -> Result<String, BackupError> {
+    let docker =
+        bollard::Docker::connect_with_local_defaults().map_err(|e| BackupError::Internal {
+            message: format!("Failed to connect to Docker: {}", e),
+        })?;
+    let inspect = docker
+        .inspect_container(
+            container_id,
+            None::<bollard::query_parameters::InspectContainerOptions>,
+        )
+        .await
+        .map_err(|e| BackupError::Internal {
+            message: format!("Failed to inspect container '{}': {}", container_id, e),
+        })?;
+    Ok(inspect
+        .config
+        .and_then(|config| config.image)
+        .unwrap_or_default())
 }
 
 #[cfg(test)]

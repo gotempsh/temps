@@ -54,6 +54,14 @@ fn reload_row(reloaded: bool) -> BTreeMap<&'static str, Value> {
     BTreeMap::from([("reloaded", Value::Bool(Some(reloaded)))])
 }
 
+/// The running archive_command once the WAL-G one applied.
+fn running_walg() -> Vec<BTreeMap<&'static str, Value>> {
+    vec![BTreeMap::from([(
+        "archive_command",
+        Value::from(WALG_COMMAND),
+    )])]
+}
+
 /// The SQL a service ran on `db`, once the service has been dropped.
 fn logged_sql(db: Arc<DatabaseConnection>) -> Vec<String> {
     Arc::try_unwrap(db)
@@ -808,7 +816,7 @@ async fn base_backup_refuses_to_take_over_an_operator_archive() {
 
 #[tokio::test]
 async fn base_backup_starts_only_after_archiving_is_enabled() {
-    let db = mock(vec![vec![], vec![reload_row(true)]], 1);
+    let db = mock(vec![vec![], vec![reload_row(true)], running_walg()], 1);
     let service = make_scope_test_service(db.clone());
     let steps = Steps::default();
 
@@ -830,11 +838,15 @@ async fn base_backup_starts_only_after_archiving_is_enabled() {
     let sql = logged_sql(db);
     assert!(sql[0].contains("pg_file_settings"), "{sql:?}");
     assert_eq!(
-        sql[1..],
+        sql[1..3],
         [
             format!("ALTER SYSTEM SET archive_command = '{WALG_COMMAND}'"),
             "SELECT pg_reload_conf() AS reloaded".to_string()
         ]
+    );
+    assert_eq!(
+        sql[3],
+        "SELECT current_setting('archive_command') AS archive_command"
     );
 }
 
@@ -949,6 +961,7 @@ async fn failed_first_base_backup_puts_back_the_placeholder_and_walg_env() {
         vec![
             vec![],
             vec![reload_row(true)],
+            running_walg(),
             walg_in_auto_conf(),
             vec![reload_row(true)],
         ],
@@ -976,7 +989,7 @@ async fn failed_first_base_backup_puts_back_the_placeholder_and_walg_env() {
     drop(service);
     let sql = logged_sql(db);
     assert_eq!(
-        sql[4..],
+        sql[5..],
         [
             "ALTER SYSTEM SET archive_command = '/bin/true'",
             "SELECT pg_reload_conf() AS reloaded"
@@ -990,6 +1003,7 @@ async fn failed_base_backup_removes_the_override_of_a_pause_in_the_operator_file
         vec![
             vec![],
             vec![reload_row(true)],
+            running_walg(),
             walg_in_auto_conf(),
             vec![reload_row(true)],
         ],
@@ -1009,7 +1023,7 @@ async fn failed_base_backup_removes_the_override_of_a_pause_in_the_operator_file
 
     assert!(result.is_err());
     drop(service);
-    assert_eq!(logged_sql(db)[4], "ALTER SYSTEM RESET archive_command");
+    assert_eq!(logged_sql(db)[5], "ALTER SYSTEM RESET archive_command");
 }
 
 #[tokio::test]
@@ -1019,6 +1033,7 @@ async fn failed_base_backup_leaves_a_command_written_since_by_someone_else() {
         vec![
             vec![],
             vec![reload_row(true)],
+            running_walg(),
             vec![
                 file_entry_row(AUTO_CONF, WALG_COMMAND),
                 file_entry_row(AUTO_CONF, "cp %p /archive/%f"),
@@ -1042,7 +1057,7 @@ async fn failed_base_backup_leaves_a_command_written_since_by_someone_else() {
 
     assert!(error.contains("wal-g backup-push failed"), "{error}");
     drop(service);
-    assert_eq!(logged_sql(db).len(), 4);
+    assert_eq!(logged_sql(db).len(), 5);
 }
 
 /// A database whose pg_file_settings reads fail `failures` times while a
@@ -1053,7 +1068,7 @@ fn ownership_read_fails(failures: usize) -> Arc<DatabaseConnection> {
         || sea_orm::DbErr::Custom("permission denied for view pg_file_settings".to_string());
     Arc::new(
         MockDatabase::new(DatabaseBackend::Postgres)
-            .append_query_results([vec![], vec![reload_row(true)]])
+            .append_query_results([vec![], vec![reload_row(true)], running_walg()])
             .append_query_errors((0..failures).map(|_| permission_denied()))
             .append_query_results([walg_in_auto_conf(), vec![reload_row(true)]])
             .append_exec_results([exec_ok(), exec_ok()])
@@ -1184,7 +1199,7 @@ async fn base_backup_needs_the_configuration_files_to_be_readable() {
 async fn failed_base_backup_keeps_walg_archiving_but_puts_back_its_walg_env() {
     // walg.env is what tells WAL-G where the working archive is; the
     // command was already WAL-G's, so only the enabling change runs.
-    let db = mock(vec![vec![], vec![reload_row(true)]], 1);
+    let db = mock(vec![vec![], vec![reload_row(true)], running_walg()], 1);
     let service = make_scope_test_service(db.clone());
     let steps = Steps::default();
 
@@ -1203,12 +1218,12 @@ async fn failed_base_backup_keeps_walg_archiving_but_puts_back_its_walg_env() {
         ["write walg.env", "backup-push", "restore walg.env"]
     );
     drop(service);
-    assert_eq!(logged_sql(db).len(), 3);
+    assert_eq!(logged_sql(db).len(), 4);
 }
 
 #[tokio::test]
 async fn successful_base_backup_returns_the_push_result() {
-    let db = mock(vec![vec![], vec![reload_row(true)]], 1);
+    let db = mock(vec![vec![], vec![reload_row(true)], running_walg()], 1);
     let service = make_scope_test_service(db.clone());
 
     let value = service
@@ -1239,7 +1254,12 @@ async fn failed_rollback_still_reports_the_backup_failure() {
     let db = MockDatabase::new(DatabaseBackend::Postgres)
         .append_exec_results([exec_ok()])
         .append_exec_errors([sea_orm::DbErr::Custom("connection reset".to_string())])
-        .append_query_results([vec![], vec![reload_row(true)], walg_in_auto_conf()])
+        .append_query_results([
+            vec![],
+            vec![reload_row(true)],
+            running_walg(),
+            walg_in_auto_conf(),
+        ])
         .into_connection();
     let service = make_scope_test_service(Arc::new(db));
 
@@ -1264,4 +1284,118 @@ async fn failed_rollback_still_reports_the_backup_failure() {
         .to_string();
 
     assert!(error.contains("wal-g backup-push failed"), "{error}");
+}
+
+#[test]
+fn only_the_bundled_database_image_is_recognised() {
+    for image in [
+        "gotempsh/timescaledb-walg",
+        "gotempsh/timescaledb-walg:pg18",
+        "docker.io/gotempsh/timescaledb-walg:pg18",
+        "ghcr.io/gotempsh/timescaledb-walg:pg17",
+        "registry.local:5000/gotempsh/timescaledb-walg:pg18",
+        "gotempsh/timescaledb-walg:pg18@sha256:0123abcd",
+    ] {
+        assert!(is_bundled_database_image(image), "{image}");
+    }
+    for image in [
+        "",
+        "postgres:18",
+        "pgvector/pgvector:pg18",
+        "timescale/timescaledb-ha:pg18",
+        "gotempsh/timescaledb",
+        "gotempsh/timescaledb-walg-fork:pg18",
+        "someone/gotempsh-timescaledb-walg:pg18",
+        "registry.local:5000/timescaledb-walg:pg18",
+    ] {
+        assert!(!is_bundled_database_image(image), "{image}");
+    }
+}
+
+fn running_command(command: &str) -> Vec<BTreeMap<&'static str, Value>> {
+    vec![BTreeMap::from([("archive_command", Value::from(command))])]
+}
+
+#[tokio::test]
+async fn wait_for_archive_command_returns_once_the_reload_applies() {
+    let db = mock(
+        vec![
+            running_command(NO_ARCHIVE_DESTINATION_COMMAND),
+            running_walg(),
+        ],
+        0,
+    );
+    let service = make_scope_test_service(db.clone());
+
+    service
+        .wait_for_archive_command(
+            "temps-postgres",
+            WALG_COMMAND,
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+
+    drop(service);
+    assert_eq!(logged_sql(db).len(), 2);
+}
+
+#[tokio::test]
+async fn wait_for_archive_command_gives_up_at_its_deadline() {
+    let db = mock(vec![running_command(NO_ARCHIVE_DESTINATION_COMMAND)], 0);
+    let service = make_scope_test_service(db);
+
+    let error = service
+        .wait_for_archive_command("temps-postgres", WALG_COMMAND, std::time::Duration::ZERO)
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("temps-postgres"), "{error}");
+    assert!(error.contains("still did not run"), "{error}");
+}
+
+#[tokio::test]
+async fn base_backup_does_not_start_before_the_walg_command_runs() {
+    // The new command was written and reloaded, but the server cannot say
+    // it runs it: a base backup started now could miss segments, so it is
+    // not started, and the change is undone.
+    let db = Arc::new(
+        MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![], vec![reload_row(true)]])
+            .append_query_errors([sea_orm::DbErr::Custom("connection reset".to_string())])
+            .append_query_results([walg_in_auto_conf(), vec![reload_row(true)]])
+            .append_exec_results([exec_ok(), exec_ok()])
+            .into_connection(),
+    );
+    let service = make_scope_test_service(db.clone());
+    let steps = Steps::default();
+
+    let error = service
+        .archive_then_push(
+            &settings_in(NO_ARCHIVE_DESTINATION_COMMAND, None, AUTO_CONF),
+            WALG_COMMAND,
+            "temps-postgres",
+            recorded_steps(&steps, true, true),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("could not be enabled"), "{error}");
+    assert!(error.contains("running archive_command"), "{error}");
+    assert_eq!(
+        *steps.lock().unwrap(),
+        ["write walg.env", "restore walg.env"]
+    );
+    drop(service);
+    let sql = logged_sql(db);
+    assert_eq!(
+        sql[5..],
+        [
+            "ALTER SYSTEM SET archive_command = '/bin/true'",
+            "SELECT pg_reload_conf() AS reloaded"
+        ],
+        "{sql:?}"
+    );
 }
