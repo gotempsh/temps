@@ -31,7 +31,7 @@ describe('analytics.identify (ADR 109 D4)', () => {
   });
 
   it('reads the visitor cookie and calls the token-scoped route', async () => {
-    const result = await analytics.identify(fetchRequest('a=1; _temps_visitor_id=enc_abc%3D; b=2'), {
+    const result = await analytics.identify(fetchRequest('a=1; _temps_visitor_id=abc-_1; b=2'), {
       ...config,
       userId: 'user-42',
       traits: { plan: 'pro' },
@@ -39,7 +39,7 @@ describe('analytics.identify (ADR 109 D4)', () => {
 
     expect(result).toEqual({ applied: true, outcome: 'updated', message: 'ok' });
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-    expect(url).toBe('https://temps.example.test/api/analytics/visitors/enc_abc%3D/identify');
+    expect(url).toBe('https://temps.example.test/api/analytics/visitors/enc_abc-_1/identify');
     expect(init.method).toBe('PUT');
     expect((init.headers as Record<string, string>).Authorization).toBe('Bearer dt_test');
     expect(JSON.parse(init.body as string)).toEqual({ user_id: 'user-42', traits: { plan: 'pro' } });
@@ -49,7 +49,7 @@ describe('analytics.identify (ADR 109 D4)', () => {
     vi.stubEnv('TEMPS_API_URL', 'https://temps.example.test/api');
     vi.stubEnv('TEMPS_API_TOKEN', 'dt_env');
     await analytics.identify(
-      { headers: { cookie: '_temps_visitor_id=enc_node' } },
+      { headers: { cookie: '_temps_visitor_id=node' } },
       { userId: 'user-42' },
     );
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
@@ -101,8 +101,10 @@ describe('analytics.identify (ADR 109 D4)', () => {
 
 describe('visitorIdFromRequest', () => {
   it('finds the cookie among others in both header shapes', () => {
-    expect(visitorIdFromRequest(fetchRequest('x=1; _temps_visitor_id=enc_a'))).toBe('enc_a');
-    expect(visitorIdFromRequest({ headers: { cookie: ['_temps_visitor_id=enc_b'] } })).toBe('enc_b');
+    expect(visitorIdFromRequest(fetchRequest('x=1; _temps_visitor_id=a'))).toBe('enc_a');
+    // The proxy stores the sealed value bare, and it can begin with `enc_` itself.
+    expect(visitorIdFromRequest(fetchRequest('_temps_visitor_id=enc_q'))).toBe('enc_enc_q');
+    expect(visitorIdFromRequest({ headers: { cookie: ['_temps_visitor_id=b'] } })).toBe('enc_b');
     expect(visitorIdFromRequest({ headers: {} })).toBeUndefined();
     expect(visitorIdFromRequest(fetchRequest('_temps_visitor_idx=nope'))).toBeUndefined();
   });
