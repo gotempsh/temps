@@ -190,6 +190,17 @@ impl Api {
             retryable: true,
         })?;
         let status = response.status();
+        if status == reqwest::StatusCode::FORBIDDEN {
+            if let Some(permission) = accepted_permissions(response.headers()) {
+                return Err(fail(SourceControlError::MissingPermission {
+                    project_id: self.project_id,
+                    provider: self.flavor.name().into(),
+                    repository: self.repository(),
+                    operation,
+                    permission,
+                }));
+            }
+        }
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
             return Err(fail(SourceControlError::Forbidden {
                 project_id: self.project_id,
@@ -225,6 +236,27 @@ impl Api {
             fail(self.provider_error(operation, format!("unexpected answer: {error}")))
         })
     }
+}
+
+/// Longest permission list kept from a provider header.
+const MAX_PERMISSION_CHARS: usize = 200;
+
+/// The permissions GitHub says a refused request needs, from
+/// `X-Accepted-GitHub-Permissions` (`issues=write`, or alternatives
+/// separated by `;`). Only the characters such a list uses are kept, and
+/// it is bounded, so the header cannot carry arbitrary text into an error.
+fn accepted_permissions(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    let value = headers
+        .get("x-accepted-github-permissions")?
+        .to_str()
+        .ok()?;
+    let value: String = value
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '=' | ',' | ';' | ' '))
+        .take(MAX_PERMISSION_CHARS)
+        .collect();
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 async fn read_capped(mut response: reqwest::Response) -> Result<Vec<u8>, String> {
@@ -734,6 +766,66 @@ mod tests {
         let error = read_issue(&http, &api, 99).await.expect_err("404");
         assert!(error.to_string().contains("issue #99"), "{error}");
         assert!(error.to_string().contains("acme/shop"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn an_installation_without_the_issues_permission_is_told_what_to_grant() {
+        let mut server = Server::new_async().await;
+        let _create = server
+            .mock("POST", "/repos/acme/shop/issues")
+            .with_status(403)
+            .with_header("x-accepted-github-permissions", "issues=write")
+            .with_body(r#"{"message":"Resource not accessible by integration"}"#)
+            .create_async()
+            .await;
+        let http = reqwest::Client::new();
+        let api = api(Flavor::GitHub, &server.url());
+        let error = create_issue(&http, &api, "t", "b").await.expect_err("403");
+        match &error {
+            SourceControlError::MissingPermission {
+                project_id,
+                permission,
+                operation,
+                ..
+            } => {
+                assert_eq!(*project_id, 4);
+                assert_eq!(permission, "issues=write");
+                assert_eq!(*operation, "create an issue");
+            }
+            other => panic!("expected a missing permission, got {other:?}"),
+        }
+        let message = error.to_string();
+        assert!(message.contains("issues=write"), "{message}");
+        assert!(message.contains("acme/shop"), "{message}");
+        assert!(message.contains("installation"), "{message}");
+    }
+
+    #[test]
+    fn a_permission_header_is_bounded_and_keeps_only_permission_text() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        assert_eq!(accepted_permissions(&headers), None);
+        headers.insert(
+            "x-accepted-github-permissions",
+            reqwest::header::HeaderValue::from_static("issues=write; pull_requests=write<script>"),
+        );
+        assert_eq!(
+            accepted_permissions(&headers).as_deref(),
+            Some("issues=write; pull_requests=writescript")
+        );
+        let long = format!("issues={}", "w".repeat(1000));
+        headers.insert(
+            "x-accepted-github-permissions",
+            reqwest::header::HeaderValue::from_str(&long).expect("header"),
+        );
+        assert_eq!(
+            accepted_permissions(&headers).map(|p| p.chars().count()),
+            Some(MAX_PERMISSION_CHARS)
+        );
+        headers.insert(
+            "x-accepted-github-permissions",
+            reqwest::header::HeaderValue::from_static("  "),
+        );
+        assert_eq!(accepted_permissions(&headers), None);
     }
 
     #[tokio::test]

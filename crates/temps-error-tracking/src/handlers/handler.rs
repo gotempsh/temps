@@ -1343,6 +1343,11 @@ fn source_control_status(
             "https://temps.sh/probs/source-control-forbidden",
             "Repository Refused The Request",
         ),
+        E::MissingPermission { .. } => (
+            StatusCode::BAD_GATEWAY,
+            "https://temps.sh/probs/source-control-missing-permission",
+            "Repository Connection Lacks A Permission",
+        ),
         E::Provider { .. } => (
             StatusCode::BAD_GATEWAY,
             "https://temps.sh/probs/source-control-failed",

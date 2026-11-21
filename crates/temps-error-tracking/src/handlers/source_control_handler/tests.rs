@@ -241,6 +241,22 @@ fn repository_failures_map_to_the_status_that_says_whose_fault_it_is() {
     });
     assert_eq!(problem.status_code, StatusCode::BAD_GATEWAY);
     assert!(detail(&problem).contains("acme/shop"));
+    let problem = Problem::from(ErrorTrackingError::SourceControl {
+        project_id: 5,
+        source: E::MissingPermission {
+            project_id: 5,
+            provider: "github".into(),
+            repository: "acme/shop".into(),
+            operation: "create an issue",
+            permission: "issues=write".into(),
+        },
+    });
+    assert_eq!(problem.status_code, StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        problem.body.get("type").and_then(|v| v.as_str()),
+        Some("https://temps.sh/probs/source-control-missing-permission")
+    );
+    assert!(detail(&problem).contains("issues=write"));
     let problem = Problem::from(ErrorTrackingError::IssueAlreadyLinked {
         group_id: 2,
         url: "https://github.com/acme/shop/issues/1".into(),

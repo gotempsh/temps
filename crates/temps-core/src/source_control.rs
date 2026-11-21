@@ -29,6 +29,16 @@ pub enum SourceControlError {
         operation: &'static str,
         status: u16,
     },
+    /// The provider named the permission the request needs and the
+    /// connection does not have (GitHub's `X-Accepted-GitHub-Permissions`).
+    #[error("{provider} refused {operation} on {repository} for project {project_id}: the connection lacks the {permission} permission. For a GitHub App, add it under the app's Permissions & events on GitHub, then approve the updated permissions on its installation; for a token, give the token that permission")]
+    MissingPermission {
+        project_id: i32,
+        provider: String,
+        repository: String,
+        operation: &'static str,
+        permission: String,
+    },
     #[error("{provider} has no {what} in {repository} for project {project_id}")]
     NotFound {
         project_id: i32,
