@@ -48,6 +48,8 @@ pub enum GrantError {
     Invalid { plugin_name: String, reason: String },
     #[error("Plugin actor for '{plugin_name}' changed while grants were being approved")]
     ActorChanged { plugin_name: String },
+    #[error("Could not confirm the activation of plugin '{plugin_name}' after losing its commit acknowledgement: {source}")]
+    ActivationUnconfirmed { plugin_name: String, source: DbErr },
     #[error("Database operation '{operation}' failed for plugin '{plugin_name}': {source}")]
     Database {
         plugin_name: String,
@@ -257,15 +259,65 @@ impl PluginGrantService {
                 plugin_name: plugin_name.into(),
             });
         }
-        transaction
-            .commit()
+        match transaction.commit().await {
+            Ok(()) => Ok(()),
+            Err(source) => {
+                self.reconcile_actor_commit(plugin_name, actor_id, sha256, source_identity, source)
+                    .await
+            }
+        }
+    }
+
+    /// A lost COMMIT reply can mean that the write is already durable. Take the
+    /// writer's advisory lock on a fresh connection before inspecting its result.
+    async fn reconcile_actor_commit(
+        &self,
+        plugin_name: &str,
+        actor_id: &str,
+        sha256: &str,
+        source_identity: &str,
+        commit_error: DbErr,
+    ) -> Result<(), GrantError> {
+        tracing::warn!(plugin = plugin_name, error = %commit_error, "Checking plugin identity after an unacknowledged commit");
+        let readback = async {
+            let txn = self
+                .db
+                .begin_with_config(Some(sea_orm::IsolationLevel::ReadCommitted), None)
+                .await?;
+            txn.execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                [plugin_name.into()],
+            ))
+            .await?;
+            let row = txn.query_one(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT 1 FROM external_plugin_actors WHERE plugin_name=$1 AND id=$2::uuid AND binary_sha256=$3 AND source_identity=$4 AND active=TRUE",
+                [plugin_name.into(), actor_id.into(), sha256.into(), source_identity.into()],
+            )).await?;
+            txn.rollback().await?;
+            Ok::<bool, DbErr>(row.is_some())
+        };
+        let confirmed = tokio::time::timeout(std::time::Duration::from_secs(10), readback)
             .await
-            .map_err(|source| GrantError::Database {
+            .unwrap_or_else(|_| {
+                Err(DbErr::Custom(
+                    "timed out reading the committed actor identity".into(),
+                ))
+            })
+            .map_err(|source| GrantError::ActivationUnconfirmed {
                 plugin_name: plugin_name.into(),
-                operation: "commit actor activation",
                 source,
             })?;
-        Ok(())
+        if confirmed {
+            Ok(())
+        } else {
+            Err(GrantError::Database {
+                plugin_name: plugin_name.into(),
+                operation: "commit actor activation",
+                source: commit_error,
+            })
+        }
     }
 
     pub async fn get(&self, plugin_name: &str) -> Result<PluginGrants, GrantError> {
@@ -526,6 +578,102 @@ mod tests {
                 .unwrap_err();
             assert!(matches!(error, GrantError::ActorChanged { .. }));
         }
+    }
+
+    #[tokio::test]
+    async fn lost_commit_acknowledgement_uses_the_final_active_identity() {
+        let database = match temps_test_utils::TestDatabase::with_migrations().await {
+            Ok(database) => database,
+            Err(error)
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+            {
+                eprintln!("Skipping commit reconciliation test: Docker unavailable");
+                return;
+            }
+            Err(error) => panic!("fixture database: {error}"),
+        };
+        let db = database.connection_arc();
+        let service = PluginGrantService::new(db.clone());
+        let name = "reports";
+        let actor = uuid::Uuid::new_v4().to_string();
+        service
+            .commit_actor(name, &actor, "previous", "fixture-source")
+            .await
+            .unwrap();
+
+        let writer = db.begin().await.unwrap();
+        writer
+            .execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                [name.into()],
+            ))
+            .await
+            .unwrap();
+        writer
+            .execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "UPDATE external_plugin_actors SET binary_sha256='candidate' WHERE plugin_name=$1",
+                [name.into()],
+            ))
+            .await
+            .unwrap();
+
+        let reconcile = |id, digest, source| {
+            service.reconcile_actor_commit(
+                name,
+                id,
+                digest,
+                source,
+                DbErr::Custom("lost commit acknowledgement".into()),
+            )
+        };
+        let mut pending = Box::pin(reconcile(&actor, "candidate", "fixture-source"));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut pending)
+                .await
+                .is_err()
+        );
+        writer.commit().await.unwrap();
+        pending
+            .await
+            .expect("keep the committed candidate after losing its reply");
+
+        let different = uuid::Uuid::new_v4().to_string();
+        for (id, digest, source) in [
+            (actor.as_str(), "previous", "fixture-source"),
+            (actor.as_str(), "candidate", "different-source"),
+            (different.as_str(), "candidate", "fixture-source"),
+        ] {
+            assert!(matches!(
+                reconcile(id, digest, source).await,
+                Err(GrantError::Database { .. })
+            ));
+        }
+        service.revoke_actor(name).await.unwrap();
+        assert!(matches!(
+            reconcile(&actor, "candidate", "fixture-source").await,
+            Err(GrantError::Database { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn unreadable_actor_after_commit_has_an_unknown_outcome() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_exec_errors([DbErr::Custom("unavailable".into())])
+            .into_connection();
+        let result = PluginGrantService::new(Arc::new(db))
+            .reconcile_actor_commit(
+                "reports",
+                &uuid::Uuid::new_v4().to_string(),
+                "candidate",
+                "fixture-source",
+                DbErr::Custom("lost commit acknowledgement".into()),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(GrantError::ActivationUnconfirmed { plugin_name, .. }) if plugin_name=="reports")
+        );
     }
 
     #[tokio::test]

@@ -77,3 +77,66 @@ test('binds trust and the upload to the digest shown for the selected file', asy
     api.restore()
   }
 })
+
+test('changing the destination requires fresh approval for submission and step-up retry', async () => {
+  const oldHost = 'https://first.example.test/api'
+  const newHost = 'https://second.example.test/api'
+  const urls: string[] = []
+  let retry: (() => void) | undefined
+  const api = mockApi({
+    'POST /x/plugins/install/file': (request) => {
+      urls.push(request.url)
+      return new Response(null, { status: 428 })
+    },
+  })
+  const queries = new QueryClient()
+  const dialog = () => (
+    <QueryClientProvider client={queries}>
+      <LocalFileInstall
+        open
+        expectedName="fixture"
+        onOpenChange={() => {}}
+        onSensitiveError={(_, action) => {
+          retry = action
+          return true
+        }}
+      />
+    </QueryClientProvider>
+  )
+  try {
+    client.setConfig({ baseUrl: oldHost })
+    const view = render(dialog())
+    fireEvent.change(view.getByLabelText('Executable'), {
+      target: { files: [new File(['abc'], 'fixture')] },
+    })
+    fireEvent.change(view.getByLabelText('Manifest version'), {
+      target: { value: '1' },
+    })
+    await view.findByText(
+      'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad'
+    )
+    const trust = view.getByRole('checkbox')
+    const send = view.getByRole('button', { name: 'Install plugin' })
+    fireEvent.click(trust)
+    fireEvent.click(send)
+    await waitFor(() => expect(retry).toBeDefined())
+    client.setConfig({ baseUrl: newHost })
+    retry?.()
+    view.rerender(dialog())
+    expect(view.getByText(newHost)).toBeTruthy()
+    expect(trust.getAttribute('aria-checked')).toBe('false')
+    fireEvent.click(send)
+    await view.findByText('Confirm that you trust this executable.')
+    expect(urls).toHaveLength(1)
+    fireEvent.click(trust)
+    fireEvent.click(send)
+    await waitFor(() =>
+      expect(urls.map((url) => new URL(url).origin)).toEqual([
+        new URL(oldHost).origin,
+        new URL(newHost).origin,
+      ])
+    )
+  } finally {
+    api.restore()
+  }
+})

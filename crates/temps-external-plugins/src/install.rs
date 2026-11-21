@@ -131,12 +131,6 @@ pub(crate) struct ActivationRollback {
     previous: Option<ActiveRecord>,
 }
 
-impl ActivationRollback {
-    pub(crate) fn was_first_install(&self) -> bool {
-        self.previous.is_none()
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct ActiveInstallation {
     pub name: String,
@@ -2579,7 +2573,7 @@ mod tests {
             .capture_activation(&candidate)
             .await
             .expect("capture absent activation");
-        assert!(first_install.was_first_install());
+        assert!(first_install.previous.is_none());
         installer
             .activate(&candidate)
             .await
@@ -2608,7 +2602,7 @@ mod tests {
             .capture_activation(&candidate)
             .await
             .expect("capture previous activation");
-        assert!(!upgrade.was_first_install());
+        assert!(upgrade.previous.is_some());
         installer
             .activate(&candidate)
             .await
