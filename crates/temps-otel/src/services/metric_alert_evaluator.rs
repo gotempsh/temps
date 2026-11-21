@@ -1619,8 +1619,18 @@ impl MetricAlertEvaluator {
             track_breach(&mut starts, rule.id, breaching, Instant::now())
         };
 
+        // An alarm this evaluator opened is firing even when the stored state
+        // says otherwise: a state write that failed after the alarm opened
+        // left "ok" behind, and deciding from it would never resolve that
+        // alarm (or would open a second one on the next breach).
+        let holds_alarm = self.firing.read().await.contains_key(&rule.id);
+        let previous_state = if holds_alarm {
+            "firing"
+        } else {
+            rule.last_state.as_str()
+        };
         let transition = evaluate_transition(
-            &rule.last_state,
+            previous_state,
             breaching,
             breach_elapsed_secs,
             rule.for_duration_secs.max(0) as u64,

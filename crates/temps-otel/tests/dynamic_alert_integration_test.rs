@@ -1215,6 +1215,65 @@ async fn test_a_failed_resolve_is_retried_next_cycle() {
     );
 }
 
+/// A state write that fails after the alarm opened leaves "ok" stored behind
+/// an open alarm. The evaluator still treats the rule as firing, so the
+/// recovery that follows resolves the alarm instead of leaving it open.
+#[tokio::test]
+async fn test_an_alarm_whose_state_write_failed_is_still_resolved() {
+    use sea_orm::ConnectionTrait;
+    let Some(ctx) = setup_evaluator().await else {
+        return;
+    };
+    let saved_search_id = seed_saved_search(&ctx.db, ctx.project_id, "Payment failures").await;
+    let rule_id = create_log_rule(&ctx, saved_search_id).await;
+    let counter = Arc::new(FixedLogCount(std::sync::atomic::AtomicU64::new(42)));
+    ctx.evaluator.set_log_series(counter.clone());
+
+    ctx.evaluator.run_cycle().await.expect("cycle 1 arms");
+    tokio::time::sleep(BREACH_PERSIST_WAIT).await;
+    // Storing "firing" is refused while this constraint exists. This test's
+    // schema is its own, so nothing else sees it.
+    ctx.db
+        .execute_unprepared(
+            "ALTER TABLE metric_alert_rules ADD CONSTRAINT test_refuse_firing \
+             CHECK (last_state <> 'firing') NOT VALID",
+        )
+        .await
+        .expect("add constraint");
+    ctx.evaluator
+        .run_cycle()
+        .await
+        .expect("cycle 2 fires, its state write fails");
+    let alarms = alarms_for(&ctx.db, ctx.project_id).await;
+    assert_eq!(alarms.len(), 1);
+    assert_eq!(alarms[0].status, AlarmStatus::Firing.as_str());
+    let rule = ctx
+        .alert_service
+        .get(ctx.project_id, rule_id)
+        .await
+        .expect("rule");
+    assert_eq!(rule.last_state, "ok", "the failed write left the old state");
+    ctx.db
+        .execute_unprepared("ALTER TABLE metric_alert_rules DROP CONSTRAINT test_refuse_firing")
+        .await
+        .expect("drop constraint");
+
+    counter.0.store(5, std::sync::atomic::Ordering::Relaxed);
+    ctx.evaluator.run_cycle().await.expect("cycle 3 recovers");
+    let alarms = alarms_for(&ctx.db, ctx.project_id).await;
+    assert_eq!(
+        alarms[0].status,
+        AlarmStatus::Resolved.as_str(),
+        "the recovery resolves the alarm the failed write left open"
+    );
+    let rule = ctx
+        .alert_service
+        .get(ctx.project_id, rule_id)
+        .await
+        .expect("rule");
+    assert_eq!(rule.last_state, "ok");
+}
+
 /// A counter whose saved search is edited while it counts: the sample
 /// carries the fingerprint it counted, the search now has another.
 struct QueryEditedWhileCounting {
