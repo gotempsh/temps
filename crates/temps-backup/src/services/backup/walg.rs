@@ -607,18 +607,34 @@ fn parse_walg_env_destination(output: &str) -> Option<String> {
     value("prefix=").map(|prefix| walg_destination(prefix, value("endpoint=")))
 }
 
-/// Where WAL-G ships WAL: the S3 prefix, and the endpoint when one is set.
-/// Two destinations are the same only if both match; without an endpoint
-/// WAL-G uses AWS's default for the region, which is not assumed to equal
-/// any explicit endpoint.
+/// Where WAL-G ships WAL: the S3 prefix, and the store the endpoint names
+/// when one is set ([`endpoint_store`]). Two destinations are the same only if
+/// both match; without an endpoint WAL-G uses AWS's default for the region,
+/// which is not assumed to equal any explicit endpoint.
 fn walg_destination(prefix: &str, endpoint: Option<&str>) -> String {
-    match endpoint
-        .map(|endpoint| endpoint.trim().trim_end_matches('/'))
-        .filter(|endpoint| !endpoint.is_empty())
-    {
-        Some(endpoint) => format!("{} at {}", prefix.trim(), endpoint),
+    match endpoint.and_then(endpoint_store) {
+        Some(store) => format!("{} at {}", prefix.trim(), store),
         None => prefix.trim().to_string(),
     }
+}
+
+/// The store an endpoint names: its host, explicit non-default port and path,
+/// parsed the way every S3 client's endpoint is. The scheme is left out:
+/// walg.env written before endpoints were normalized holds the stored text
+/// (`s3.example.test`), while a backup now resolves the same store with a
+/// scheme (`http://s3.example.test`), and both name one archive.
+fn endpoint_store(endpoint: &str) -> Option<String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return None;
+    }
+    // The normalized URL omits a default port; unparseable text is compared
+    // as written. Either way the scheme is dropped.
+    let url = temps_core::s3_endpoint::S3Endpoint::parse(endpoint, None)
+        .map(|parsed| parsed.url())
+        .unwrap_or_else(|_| endpoint.to_string());
+    let store = url.split_once("://").map_or(url.as_str(), |(_, rest)| rest);
+    Some(store.trim_end_matches('/').to_ascii_lowercase())
 }
 
 /// Shell that undoes [`walg_env_replace_script`] if walg.env is the one the
@@ -871,6 +887,31 @@ mod tests {
                 "s3://backups/internal_db/walg",
                 Some("http://minio:9000")
             ))
+        );
+    }
+
+    #[test]
+    fn an_endpoint_written_before_normalization_is_the_same_destination() {
+        // walg.env from before endpoints got a scheme holds the stored text;
+        // the backup now resolves the same store with one.
+        let prefix = "s3://backups/internal_db/walg";
+        for (written, resolved) in [
+            ("s3.example.test", "http://s3.example.test"),
+            ("s3.example.test", "https://S3.Example.Test/"),
+            ("minio.lan:9000", "http://minio.lan:9000"),
+            ("http://minio.lan:80", "http://minio.lan"),
+            ("[fd00::5]:9000", "http://[fd00::5]:9000/"),
+        ] {
+            assert_eq!(
+                walg_destination(prefix, Some(written)),
+                walg_destination(prefix, Some(resolved)),
+                "{written} and {resolved}"
+            );
+        }
+        // Another port is another server.
+        assert_ne!(
+            walg_destination(prefix, Some("minio.lan:9000")),
+            walg_destination(prefix, Some("http://minio.lan:9001"))
         );
     }
 
