@@ -1647,6 +1647,8 @@ pub(crate) mod tests {
             promoted_from_deployment_id: None,
             upload_request_id: None,
             docker_socket_mounted: false,
+            runs_as_root: false,
+            image_user: None,
         }
     }
 
