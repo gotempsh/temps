@@ -555,8 +555,11 @@ impl ExternalPluginsService {
             .await
         {
             let first_install = activation_rollback.was_first_install();
-            if let Err(rollback_error) = installer.restore_activation(activation_rollback).await {
-                tracing::error!(plugin = %candidate.name, error = %rollback_error, "Failed to restore plugin activation after actor identity commit failed");
+            if let Err(rollback_error) = installer
+                .rollback_candidate(candidate, activation_rollback)
+                .await
+            {
+                tracing::error!(plugin = %candidate.name, error = %rollback_error, "Failed to roll back plugin candidate after actor identity commit failed");
             }
             self.manager.discard_candidate(pending).await;
             if first_install {
@@ -1026,8 +1029,11 @@ impl ExternalPluginsService {
             .await
         {
             let first_install = activation_rollback.was_first_install();
-            if let Err(rollback_error) = installer.restore_activation(activation_rollback).await {
-                tracing::error!(plugin = %candidate.name, error = %rollback_error, "Failed to restore plugin activation after actor identity commit failed");
+            if let Err(rollback_error) = installer
+                .rollback_candidate(&candidate, activation_rollback)
+                .await
+            {
+                tracing::error!(plugin = %candidate.name, error = %rollback_error, "Failed to roll back plugin candidate after actor identity commit failed");
             }
             self.manager.discard_candidate(pending).await;
             if first_install {

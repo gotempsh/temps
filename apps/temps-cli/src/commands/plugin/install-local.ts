@@ -5,7 +5,7 @@ import type { Command } from "commander";
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { stat } from "node:fs/promises";
-import { requireAuth, getApiUrl } from "../../config/store.js";
+import { requireAuthTarget } from "../../config/store.js";
 import { getErrorMessage, setupClient } from "../../lib/api-client.js";
 import { installLocalFile } from "../../api/sdk.gen.js";
 import { promptConfirm } from "../../ui/prompts.js";
@@ -28,8 +28,8 @@ export function registerLocalInstall(plugin: Command) {
           throw new Error(
             "Pass --yes to approve native plugin execution non-interactively.",
           );
-        await requireAuth();
-        await setupClient();
+        const { apiUrl, apiKey } = await requireAuthTarget();
+        await setupClient(apiUrl, apiKey);
         const info = await stat(path);
         if (!info.isFile() || info.size === 0 || info.size > 256 * 1024 * 1024)
           throw new Error(
@@ -39,7 +39,7 @@ export function registerLocalInstall(plugin: Command) {
         for await (const chunk of createReadStream(path)) hash.update(chunk);
         const digest = hash.digest("hex");
         console.log(
-          `Install ${options.name}@${options.pluginVersion} on ${getApiUrl()}\nSHA-256 ${digest}`,
+          `Install ${options.name}@${options.pluginVersion} on ${apiUrl}\nSHA-256 ${digest}`,
         );
         if (
           !options.yes &&

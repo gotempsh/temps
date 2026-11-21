@@ -199973,19 +199973,42 @@
                   "$ref": "#/components/schemas/InstallPluginResponse"
                 }
               }
-            }
+            },
+            "description": "Plugin verified, installed and started"
           },
-          "400": {},
-          "401": {},
-          "403": {},
-          "408": {},
-          "409": {},
-          "413": {},
-          "428": {},
-          "429": {},
-          "500": {},
-          "502": {},
-          "503": {}
+          "400": {
+            "description": "Invalid plugin identity, digest header or multipart upload"
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "Administrator permission or sensitive-action authorization required"
+          },
+          "408": {
+            "description": "Upload timed out"
+          },
+          "409": {
+            "description": "Persistent storage is required or the existing installation uses a different source"
+          },
+          "413": {
+            "description": "Executable exceeds the upload limit"
+          },
+          "428": {
+            "description": "Additional verification required for this sensitive action"
+          },
+          "429": {
+            "description": "Another file upload is in progress"
+          },
+          "500": {
+            "description": "Could not stage, activate or persist the installation"
+          },
+          "502": {
+            "description": "Plugin verification or startup failed"
+          },
+          "503": {
+            "description": "Plugin actor activation is unavailable or the service is shutting down"
+          }
         },
         "security": [
           {
