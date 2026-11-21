@@ -257,6 +257,31 @@ impl BackupService {
         same_cluster(container_id, &connected, &in_container)
     }
 
+    /// Take a WAL-G base backup in the only safe order: `enable` points
+    /// archive_command at WAL-G, then `push` runs the base backup, so the WAL
+    /// written while it runs reaches the archive.
+    ///
+    /// If `enable` fails, `push` never starts: a base backup without its WAL
+    /// cannot be restored, and the caller falls back to pg_dump. If `push`
+    /// fails, the archive_command from `before` is put back
+    /// ([`Self::with_archive_rollback`]).
+    pub(super) async fn archive_then_push<T, EnableFut, PushFut>(
+        &self,
+        before: &ArchiveSettings,
+        archiving_command: &str,
+        container_id: &str,
+        enable: EnableFut,
+        push: PushFut,
+    ) -> Result<T, BackupError>
+    where
+        EnableFut: std::future::Future<Output = Result<(), BackupError>>,
+        PushFut: std::future::Future<Output = Result<T, BackupError>>,
+    {
+        enable.await?;
+        self.with_archive_rollback(before, archiving_command, container_id, push)
+            .await
+    }
+
     /// Run a base backup `push` that needs `archiving_command` in place, and
     /// put back the command that was there before (`before`) if it fails.
     ///
@@ -780,6 +805,110 @@ mod tests {
             settings_from("on", WALG_COMMAND, None, "configuration file")
                 .command_to_restore(WALG_COMMAND),
             None
+        );
+    }
+
+    /// Steps recorded by `archive_then_push` tests, in the order they ran.
+    type Steps = Arc<std::sync::Mutex<Vec<&'static str>>>;
+
+    fn step(steps: &Steps, name: &'static str) {
+        steps.lock().unwrap().push(name);
+    }
+
+    #[tokio::test]
+    async fn base_backup_starts_only_after_archiving_is_enabled() {
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let service = make_scope_test_service(db.clone());
+        let steps = Steps::default();
+
+        service
+            .archive_then_push(
+                &settings("on", "", Some("")),
+                WALG_COMMAND,
+                "temps-postgres",
+                async {
+                    step(&steps, "enable archiving");
+                    Ok(())
+                },
+                async {
+                    step(&steps, "backup-push");
+                    Ok::<_, BackupError>(())
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(*steps.lock().unwrap(), ["enable archiving", "backup-push"]);
+        drop(service);
+        assert!(logged_sql(db).is_empty());
+    }
+
+    #[tokio::test]
+    async fn base_backup_never_starts_when_archiving_cannot_be_enabled() {
+        // No exec results are queued: a rollback ALTER SYSTEM would fail the
+        // mock, and there is nothing to roll back.
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let service = make_scope_test_service(db.clone());
+        let steps = Steps::default();
+
+        let error = service
+            .archive_then_push(
+                &settings("on", "", Some("")),
+                WALG_COMMAND,
+                "temps-postgres",
+                async {
+                    step(&steps, "enable archiving");
+                    Err(BackupError::Internal {
+                        message: "continuous WAL archiving could not be enabled".to_string(),
+                    })
+                },
+                async {
+                    step(&steps, "backup-push");
+                    Ok::<_, BackupError>(())
+                },
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("could not be enabled"), "{error}");
+        assert_eq!(*steps.lock().unwrap(), ["enable archiving"]);
+        drop(service);
+        assert!(logged_sql(db).is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_base_backup_after_archiving_was_enabled_is_rolled_back() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_exec_results([exec_ok(), exec_ok()])
+                .into_connection(),
+        );
+        let service = make_scope_test_service(db.clone());
+        let steps = Steps::default();
+
+        let result = service
+            .archive_then_push(
+                &settings("on", "", Some("")),
+                WALG_COMMAND,
+                "temps-postgres",
+                async {
+                    step(&steps, "enable archiving");
+                    Ok(())
+                },
+                async {
+                    step(&steps, "backup-push");
+                    Err::<(), _>(push_failure())
+                },
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(*steps.lock().unwrap(), ["enable archiving", "backup-push"]);
+        drop(service);
+        assert_eq!(
+            logged_sql(db)[0],
+            "ALTER SYSTEM SET archive_command = '/bin/true'"
         );
     }
 

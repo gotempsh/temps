@@ -272,17 +272,19 @@ impl BackupService {
         // must reach the archive. Without archiving the base backup would be
         // unrestorable, so the error ends the WAL-G attempt and the caller
         // falls back to pg_dump. The settings are read first so a failed push
-        // can put back what was there (`with_archive_rollback`).
+        // can put back what was there. `archive_then_push` owns that order.
         let archive_before = self.read_archive_settings().await?;
-        self.enable_internal_wal_archiving(&docker, &container_id, &env_vars, &pgdata)
-            .await
-            .map_err(|e| BackupError::Internal {
-                message: format!(
-                    "Cannot take a WAL-G base backup of the internal database in container \
-                     '{}': continuous WAL archiving could not be enabled: {}",
-                    container_id, e
-                ),
-            })?;
+        let enable = async {
+            self.enable_internal_wal_archiving(&docker, &container_id, &env_vars, &pgdata)
+                .await
+                .map_err(|e| BackupError::Internal {
+                    message: format!(
+                        "Cannot take a WAL-G base backup of the internal database in container \
+                         '{}': continuous WAL archiving could not be enabled: {}",
+                        container_id, e
+                    ),
+                })
+        };
 
         // A push that fails from inside the container (an endpoint or bucket
         // only the Temps process can reach, a credential wal-g rejects) would
@@ -350,10 +352,11 @@ impl BackupService {
             }
             Ok::<(), BackupError>(())
         };
-        self.with_archive_rollback(
+        self.archive_then_push(
             &archive_before,
             &internal_walg_archive_command(&pgdata),
             &container_id,
+            enable,
             push,
         )
         .await?;
