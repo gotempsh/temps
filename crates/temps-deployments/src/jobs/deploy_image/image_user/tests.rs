@@ -120,6 +120,10 @@ impl ImageBuilder for FakeImageStore {
     }
 
     async fn inspect_image(&self, image_name: &str) -> Result<ImageInfo, BuilderError> {
+        if image_name.ends_with("-stalled") {
+            // A node that never answers.
+            return std::future::pending().await;
+        }
         if image_name == "missing:1" {
             return Err(BuilderError::ImageNotFound(image_name.to_string()));
         }
@@ -537,6 +541,45 @@ async fn a_root_image_for_another_architecture_is_warned_about() {
         .collect();
     assert_eq!(warnings.len(), 1, "{lines:?}");
     assert!(warnings[0].contains("my-app:1-arm64"), "{}", warnings[0]);
+    drop(job);
+    let updates = deployment_updates(db);
+    assert_eq!(updates.len(), 1, "{updates:?}");
+    assert!(updates[0].contains("Bool(Some(true))"), "{}", updates[0]);
+}
+
+/// One image still pending at the deadline does not discard another's
+/// verdict: the root primary is warned about and recorded, and only the
+/// stalled image is reported as not checked.
+#[tokio::test]
+async fn a_root_verdict_survives_another_image_timing_out() {
+    let db = mock_db();
+    let job = job(FakeImageStore::with_user(None), Some(db.clone()), false);
+    let log = Arc::new(CapturedLog::default());
+    let context = WorkflowContext::new("run-42".to_string(), 42, 3, 4, log.clone());
+    let mut output = image_output();
+    output.image_tags_by_platform = HashMap::from([
+        ("linux/amd64".to_string(), "my-app:1".to_string()),
+        ("linux/arm64".to_string(), "my-app:1-stalled".to_string()),
+    ]);
+
+    let finished = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        job.check_and_record_image_user_within(
+            &output,
+            &context,
+            std::time::Duration::from_millis(400),
+        ),
+    )
+    .await;
+    assert!(finished.is_ok(), "the step outlived its deadline");
+
+    let lines = log.0.lock().unwrap().clone();
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("my-app:1 runs as root")),
+        "{lines:?}"
+    );
     drop(job);
     let updates = deployment_updates(db);
     assert_eq!(updates.len(), 1, "{updates:?}");

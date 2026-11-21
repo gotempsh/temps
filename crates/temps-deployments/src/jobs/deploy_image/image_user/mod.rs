@@ -42,9 +42,9 @@ pub(crate) const NON_ROOT_USER_DOCS_URL: &str =
 /// row cannot hold up the deploy it only advises on.
 const IMAGE_USER_STEP_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// The checks themselves (inspect plus at most two small file reads per
-/// image, every image at once), inside the step: what is left of it writes
-/// the outcome.
+/// One image's check (inspect plus at most two small file reads). Every
+/// image is checked at once, within three quarters of the step; what is
+/// left of it writes the outcome.
 const IMAGE_USER_CHECK_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// Longest `USER` recorded on the deployment row. The daemon already drops a
@@ -288,9 +288,14 @@ impl DeployImageJob {
         context: &WorkflowContext,
         deadline: Duration,
     ) {
-        if tokio::time::timeout(deadline, self.check_log_and_record(image_output, context))
-            .await
-            .is_err()
+        // The checks get most of the step; the rest writes their outcome.
+        let checks_deadline = deadline.mul_f64(0.75);
+        if tokio::time::timeout(
+            deadline,
+            self.check_log_and_record(image_output, context, checks_deadline),
+        )
+        .await
+        .is_err()
         {
             // Nothing to clean up here: a path export removes its scratch
             // container through a guard that outlives this future.
@@ -331,6 +336,7 @@ impl DeployImageJob {
         &self,
         image_output: &BuildImageOutput,
         context: &WorkflowContext,
+        checks_deadline: Duration,
     ) {
         // One image per architecture the build produced, the primary first.
         let mut images = vec![image_output.image_tag.clone()];
@@ -341,28 +347,39 @@ impl DeployImageJob {
                 images.push(tag.clone());
             }
         }
-        let checks = match tokio::time::timeout(
-            IMAGE_USER_CHECK_TIMEOUT,
-            futures::future::join_all(
-                images
-                    .iter()
-                    .map(|image| self.check_one_image(image_output, image)),
-            ),
-        )
-        .await
+        // Each check's result is kept as it lands, so one image still
+        // pending at the deadline cannot discard another's verdict (a
+        // confirmed root warning above all); only the unfinished ones are
+        // reported as not checked.
+        let deadline = tokio::time::Instant::now() + checks_deadline;
+        let mut results: Vec<Option<ImageUserCheck>> = vec![None; images.len()];
+        let mut pending: futures::stream::FuturesUnordered<_> = images
+            .iter()
+            .enumerate()
+            .map(|(index, image)| async move {
+                (index, self.check_one_image(image_output, image).await)
+            })
+            .collect();
+        while let Ok(Some((index, check))) =
+            tokio::time::timeout_at(deadline, futures::StreamExt::next(&mut pending)).await
         {
-            Ok(checks) => images.iter().cloned().zip(checks).collect(),
-            Err(_) => vec![(
-                image_output.image_tag.clone(),
-                ImageUserCheck::NotChecked {
+            results[index] = Some(check);
+        }
+        drop(pending);
+        let checks: Vec<(String, ImageUserCheck)> = images
+            .iter()
+            .cloned()
+            .zip(results)
+            .map(|(image, check)| {
+                let check = check.unwrap_or_else(|| ImageUserCheck::NotChecked {
                     reason: format!(
-                        "checking which user image '{}' runs as took longer than {}s",
-                        image_output.image_tag,
-                        IMAGE_USER_CHECK_TIMEOUT.as_secs()
+                        "checking which user image '{image}' runs as took longer than {}s",
+                        checks_deadline.as_secs()
                     ),
-                },
-            )],
-        };
+                });
+                (image, check)
+            })
+            .collect();
         let several = images.len() > 1;
         let Some((image, check)) = combine_checks(checks) else {
             return;

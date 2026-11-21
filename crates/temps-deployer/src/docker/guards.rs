@@ -249,10 +249,15 @@ mod tests {
     /// that runs in the background.
     async fn volume_removed(docker: &Docker, volume: &str) -> bool {
         for _ in 0..50 {
-            if docker.inspect_volume(volume).await.is_err() {
-                return true;
+            match docker.inspect_volume(volume).await {
+                Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404, ..
+                }) => return true,
+                // Only "not found" proves removal; any other failure would
+                // let the assertion pass without checking anything.
+                Err(error) => panic!("inspect volume {volume}: {error}"),
+                Ok(_) => tokio::time::sleep(std::time::Duration::from_millis(200)).await,
             }
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
         false
     }

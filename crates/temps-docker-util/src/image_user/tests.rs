@@ -716,7 +716,7 @@ fn an_unresolvable_named_user_is_unresolved_not_root() {
 #[test]
 fn only_names_make_the_classifier_read_identity_files() {
     let none = IdentityFilesNeeded::default();
-    for spec in ["", "0", "1000", "1000:1000", "0:0", "0:staff"] {
+    for spec in ["", "0", "1000", "1000:1000", "0:0", "0:staff", "00:staff"] {
         assert_eq!(IdentityFilesNeeded::to_classify(spec), none, "{spec}");
     }
     // `root` is a name: the image's passwd decides its uid.

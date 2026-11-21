@@ -590,9 +590,11 @@ impl IdentityFilesNeeded {
     pub fn to_classify(spec: &str) -> Self {
         let (user, group) = split_spec(spec);
         let named = |part: &str| !part.is_empty() && part.parse::<u32>().is_err();
+        // Any spelling of uid 0 (`0`, `00`) is root whatever its group.
+        let uid_zero = user.parse::<u32>() == Ok(0);
         Self {
             passwd: named(user),
-            group: user != "0" && group.is_some_and(named),
+            group: !uid_zero && group.is_some_and(named),
         }
     }
 }
