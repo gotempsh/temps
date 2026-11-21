@@ -38,6 +38,7 @@ url.workspace = true
 utoipa.workspace = true
 
 [dev-dependencies]
+tower.workspace = true
 temps-test-utils = { path = "../temps-test-utils" }
 sea-orm = { workspace = true, features = ["mock"] }
 

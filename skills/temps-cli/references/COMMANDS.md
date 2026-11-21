@@ -84,6 +84,7 @@ Use this index or search for a top-level command heading to load only the releva
 - [`otel-forward`](#otel-forward) - Manage OTel forwarding destinations that relay ingested traces, metrics, and logs to an external OTLP-compatible collector
 - [`otel`](#otel) - Inspect the OTLP ingest pipeline itself — throughput, drops and failure reasons (server-wide, not project-scoped; see "temps metrics" to query ingested application metrics)
 - [`flags`](#flags) - Manage feature flags (runtime config that changes without a redeploy)
+- [`surveys`](#surveys) - Manage in-app surveys (NPS, ratings, choices, open text) and read their answers
 - [`data`](#data) - Browse the data inside a service (tables, collections, keys, objects) — read-only
 - [`dsn`](#dsn) - Manage Data Source Names (DSNs) for error tracking and analytics
 - [`scans`](#scans) - Manage vulnerability scans
@@ -5950,6 +5951,166 @@ Archive a flag (callers fall back to their own default)
 |------|-------------|---------|----------|
 | `-p, --project <project>` | Project slug or ID | - | No |
 
+## `surveys` (alias: `survey`)
+
+Manage in-app surveys (NPS, ratings, choices, open text) and read their answers
+
+**Subcommands:**
+
+- `list` (`ls`) - List surveys
+- `get` - Show a survey: its questions and when it is shown
+- `create` - Create a survey (a draft unless --status active)
+- `update` - Change a survey; only the options given are changed
+- `launch` - Start showing a survey to visitors
+- `pause` - Stop showing a survey for now
+- `complete` - Stop showing a survey for good (its results stay)
+- `delete` - Delete a survey (answers already recorded stay in analytics events)
+- `results` - Summarise the answers: counts, averages and NPS per question
+- `responses` - List individual responses, newest first
+
+### `surveys list` (alias: `ls`)
+
+List surveys
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--status <status>` | Only surveys in this status: draft, active, paused, completed | - | No |
+| `--page <n>` | Page number (default: 1) | - | No |
+| `--page-size <n>` | Items per page (default: 20, max: 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `surveys get`
+
+Show a survey: its questions and when it is shown
+
+**Usage:** `surveys get <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `surveys create`
+
+Create a survey (a draft unless --status active)
+
+**Usage:** `surveys create <name> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `-q, --questions <json|@file|->` | Questions as a JSON array of {id, kind, prompt, optional?, choices?, scale?, lower_label?, upper_label?} | - | Yes |
+| `-t, --targeting <json|@file|->` | When to show it: {path_pattern?, trigger_event?, sample_rate?, once_per_visitor?, flag?: {key, value}} | - | No |
+| `--description <text>` | Internal description | - | No |
+| `--status <status>` | draft (default) or active | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `surveys update`
+
+Change a survey; only the options given are changed
+
+**Usage:** `surveys update <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--name <name>` | New name | - | No |
+| `--description <text>` | New description ("" clears it) | - | No |
+| `-q, --questions <json|@file|->` | Replace the questions | - | No |
+| `-t, --targeting <json|@file|->` | Replace when it is shown | - | No |
+| `--status <status>` | draft, active, paused or completed | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `surveys launch`
+
+Start showing a survey to visitors
+
+**Usage:** `surveys launch <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+
+### `surveys pause`
+
+Stop showing a survey for now
+
+**Usage:** `surveys pause <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+
+### `surveys complete`
+
+Stop showing a survey for good (its results stay)
+
+**Usage:** `surveys complete <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+
+### `surveys delete`
+
+Delete a survey (answers already recorded stay in analytics events)
+
+**Usage:** `surveys delete <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `-y, --yes` | Skip the confirmation | - | No |
+
+### `surveys results`
+
+Summarise the answers: counts, averages and NPS per question
+
+**Usage:** `surveys results <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `-e, --environment <name>` | Only answers from this environment | - | No |
+| `--days <n>` | Look back this many days (default: 30, max: 366) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `surveys responses`
+
+List individual responses, newest first
+
+**Usage:** `surveys responses <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `-e, --environment <name>` | Only answers from this environment | - | No |
+| `--days <n>` | Look back this many days (default: 30, max: 366) | - | No |
+| `--page <n>` | Page number (default: 1) | - | No |
+| `--page-size <n>` | Items per page (default: 20, max: 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
 ## `data`
 
 Browse the data inside a service (tables, collections, keys, objects) — read-only
@@ -8543,8 +8704,13 @@ View project analytics
 **Subcommands:**
 
 - `keys` - Manage analytics ingest keys (pa_...) for apps Temps does not deploy
+- `conversions` (`goals`) - Conversion goals: events or pages that count as success
+- `identity` - Whether visitors are recognised by a stored id or tracked cookieless
 - `overview` (`o`) - Show analytics dashboard overview
 - `top` - Show breakdown by dimension: pages, referrers, browsers, os, devices, countries, regions, cities, channels, events, languages, utm_source, utm_medium, utm_campaign
+- `outbound` - Show the outbound links visitors clicked (outbound_click events)
+- `downloads` - Show the files visitors downloaded (file_download events)
+- `not-found` - Show pages visitors could not find: 404s Temps answered and not_found events
 - `funnels` - Show funnel conversion metrics for all funnels
 - `performance` (`speed`) - Show real-user Web Vitals and optional dimension breakdowns
 - `ai-agents` - Show AI crawler / provider breakdown (web /analytics/ai-agents)
@@ -8642,6 +8808,126 @@ Revoke (deactivate) an analytics ingest key
 | `-f, --force` | Skip confirmation | - | No |
 | `-y, --yes` | Skip confirmation (alias for --force) | - | No |
 
+### `analytics conversions` (alias: `goals`)
+
+Conversion goals: events or pages that count as success
+
+**Subcommands:**
+
+- `list` - List conversions with visitors, rate and revenue in a period
+- `create` - Define a conversion
+- `update` - Replace a conversion's definition
+- `delete` - Delete a conversion (recorded events are kept)
+- `breakdown` - Where the visitors who converted came from
+
+#### `analytics conversions list`
+
+List conversions with visitors, rate and revenue in a period
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 7d, 30d, 3m) | `30d` | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `analytics conversions create`
+
+Define a conversion
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `-n, --name <name>` | Name shown in reports, e.g. Signup | - | No |
+| `--event <name>` | Count this event, e.g. signup | - | No |
+| `--page <path>` | Count visits to this path; * matches anything, e.g. /docs/* | - | No |
+| `--property <key=value>` | Only events whose property has this value, e.g. plan=pro | - | No |
+| `--revenue-property <key>` | Event property holding the amount, e.g. amount | - | No |
+| `--currency <code>` | ISO 4217 currency of the amount, e.g. EUR | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `analytics conversions update`
+
+Replace a conversion's definition
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--goal-id <id>` | Conversion ID (see list) | - | Yes |
+| `-n, --name <name>` | Name shown in reports, e.g. Signup | - | No |
+| `--event <name>` | Count this event, e.g. signup | - | No |
+| `--page <path>` | Count visits to this path; * matches anything, e.g. /docs/* | - | No |
+| `--property <key=value>` | Only events whose property has this value, e.g. plan=pro | - | No |
+| `--revenue-property <key>` | Event property holding the amount, e.g. amount | - | No |
+| `--currency <code>` | ISO 4217 currency of the amount, e.g. EUR | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `analytics conversions delete`
+
+Delete a conversion (recorded events are kept)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--goal-id <id>` | Conversion ID (see list) | - | Yes |
+| `-f, --force` | Skip confirmation | - | No |
+| `-y, --yes` | Skip confirmation (alias for --force) | - | No |
+
+#### `analytics conversions breakdown`
+
+Where the visitors who converted came from
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--goal-id <id>` | Conversion ID (see list) | - | Yes |
+| `--by <dimension>` | One of channel, referrer, utm_source, utm_medium, utm_campaign, page, country, device_type, browser, operating_system | `channel` | No |
+| `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 7d, 30d, 3m) | `30d` | No |
+| `--limit <n>` | Rows (default: 10, max: 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics identity`
+
+Whether visitors are recognised by a stored id or tracked cookieless
+
+**Subcommands:**
+
+- `show` - Show the identity mode and what it changes
+- `set` - Switch between persistent and cookieless tracking
+
+#### `analytics identity show`
+
+Show the identity mode and what it changes
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `analytics identity set`
+
+Switch between persistent and cookieless tracking
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--mode <mode>` | One of persistent, cookieless | - | Yes |
+| `-y, --yes` | Skip confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
 ### `analytics overview` (alias: `o`)
 
 Show analytics dashboard overview
@@ -8666,6 +8952,45 @@ Show breakdown by dimension: pages, referrers, browsers, os, devices, countries,
 |------|-------------|---------|----------|
 | `-p, --project <project>` | Project slug or ID | - | No |
 | `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `24h` | No |
+| `--limit <n>` | Number of results (default: 20, max: 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics outbound`
+
+Show the outbound links visitors clicked (outbound_click events)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `7d` | No |
+| `--limit <n>` | Number of results (default: 20, max: 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics downloads`
+
+Show the files visitors downloaded (file_download events)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `7d` | No |
+| `--limit <n>` | Number of results (default: 20, max: 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics not-found`
+
+Show pages visitors could not find: 404s Temps answered and not_found events
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `7d` | No |
 | `--limit <n>` | Number of results (default: 20, max: 100) | - | No |
 | `--json` | Output in JSON format | - | No |
 

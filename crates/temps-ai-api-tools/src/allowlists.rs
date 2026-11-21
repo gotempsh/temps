@@ -304,6 +304,14 @@ pub const AI_READ_ALLOWLIST: &[&str] = &[
     "get_funnel_metrics",
     "list_funnels",
     "get_unique_events",
+    // Conversion goals (ADR 109 D2): definitions the user wrote and
+    // aggregate counts per goal or per dimension value.
+    // Visitor identity mode (ADR 109 D3): persistent or cookieless.
+    "get_analytics_identity_settings",
+    "list_analytics_goals",
+    "get_analytics_goal",
+    "get_analytics_goal_stats",
+    "get_analytics_goal_breakdown",
     // Traffic exclusion settings, the project's own rules (referrer
     // domains, IPs/CIDR ranges, ASNs, countries the user chose to
     // exclude) and per-reason counts. No secrets; IPs here are ones the
@@ -463,6 +471,11 @@ pub const AI_READ_ALLOWLIST: &[&str] = &[
     // project_access_guard — same three-layer check the list endpoint uses.
     "get_project",
     "get_project_by_slug",
+    // Where each telemetry signal is sent and how it authenticates: public
+    // URLs, header templates such as `Bearer $TEMPS_API_KEY`, and whether an
+    // analytics key or DSN exists. It never returns a credential value, and
+    // runs the same three guards as `get_project`.
+    "get_project_ingest_setup",
     // ── External services: masked env vars only ──
     // `get_service` / `get_service_by_slug` are intentionally NOT included.
     // `get_service` calls `get_service_details`, which runs
@@ -672,6 +685,14 @@ pub const AI_READ_ALLOWLIST: &[&str] = &[
     "get_flag",
     "get_flag_snapshot",
     "list_flags",
+    // ── Surveys ──
+    // Definitions and aggregate results (counts, averages, NPS): no
+    // credentials and no free text. The individual responses
+    // (`list_survey_responses`) are withheld: open-text answers are typed by
+    // the project's visitors.
+    "list_surveys",
+    "get_survey",
+    "get_survey_results",
     // ── Project presets + templates ──
     // Built-in and community preset catalogue — no secrets.
     "list_presets",
@@ -1037,6 +1058,10 @@ pub const AI_WRITE_ALLOWLIST: &[&str] = &[
     // only (`update_ingress_connector`). Those stay in the console.
     "set_ingress_hostname_choice",
     "sync_ingress_connector",
+    // Retries DNS setup for one failed hostname on the tunnel that already
+    // carries it: a narrower `sync_ingress_connector`. It takes no
+    // credential, withdraws nothing, and refuses when the route has moved.
+    "retry_ingress_hostname_dns",
     "create_ingress_connector",
     // ── Managed external services (databases, caches, etc.) —
     //    provisioning a new container and linking an existing
@@ -1187,6 +1212,11 @@ pub const AI_WRITE_ALLOWLIST: &[&str] = &[
     // Replaces one environment's targeting rules; compare-and-set on the
     // flag's revision, like the console.
     "set_flag_rules",
+    // Launching a survey puts a question in front of the project's visitors,
+    // so each change is a confirmed write.
+    "create_survey",
+    "update_survey",
+    "delete_survey",
     "restore_flag",
     "archive_flag",
     "create_alert_rule",
@@ -1345,6 +1375,14 @@ pub const AI_WRITE_ALLOWLIST: &[&str] = &[
     "create_funnel",
     "update_funnel",
     "delete_funnel",
+    // Switching visitor identity changes how new visits are counted; history
+    // already recorded stays as it is (ADR 109 D3).
+    "update_analytics_identity_settings",
+    // Deleting a conversion goal deletes no events; defining it again
+    // brings its history back.
+    "create_analytics_goal",
+    "update_analytics_goal",
+    "delete_analytics_goal",
     "update_project_cloud_telemetry",
     // Which traffic analytics counts: reversible (a rule is deleted, a
     // switch flipped back) and takes no credential.

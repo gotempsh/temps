@@ -7,6 +7,8 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum IngressError {
+    #[error("DNS setup for {hostname} cannot be retried on connector {connector_id} in its current state. Refresh the hostname status.")]
+    RetryUnavailable { hostname: String, connector_id: i32 },
     #[error("Ingress connector {0} not found")]
     NotFound(i32),
     #[error("{0}")]
@@ -78,6 +80,9 @@ pub enum ControlPlaneTunnelsUnavailable {
 impl From<IngressError> for Problem {
     fn from(error: IngressError) -> Self {
         let (status, title) = match &error {
+            IngressError::RetryUnavailable { .. } => {
+                (StatusCode::CONFLICT, "DNS Retry Unavailable")
+            }
             IngressError::NotFound(_) => (StatusCode::NOT_FOUND, "Ingress Connector Not Found"),
             IngressError::Validation(_)
             | IngressError::UnknownNode { .. }

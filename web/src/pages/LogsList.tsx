@@ -361,7 +361,7 @@ export default function LogsList({ project }: LogsListProps) {
             description="Try adjusting your filters or time range."
           />
         ) : (
-          <LogsEmptyState projectSlug={project.slug} />
+          <LogsEmptyState project={project} />
         )
       ) : (
         <>

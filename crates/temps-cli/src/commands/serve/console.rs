@@ -77,6 +77,7 @@ use temps_revenue::RevenuePlugin;
 use temps_sandbox::plugin::SandboxPlugin;
 use temps_screenshots::ScreenshotsPlugin;
 use temps_status_page::StatusPagePlugin;
+use temps_surveys::SurveysPlugin;
 use temps_teams::TeamsPlugin;
 use temps_vulnerability_scanner::VulnerabilityScannerPlugin;
 use temps_webhooks::WebhooksPlugin;

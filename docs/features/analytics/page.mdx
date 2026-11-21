@@ -11,11 +11,14 @@ export const sections = [
   { title: 'Storage Backend', id: 'storage-backend' },
   { title: 'Visitor Analytics', id: 'visitor-analytics' },
   { title: 'Event Tracking', id: 'event-tracking' },
+  { title: 'Outbound Links, Downloads & 404s', id: 'automatic-events' },
   { title: 'Session Replay', id: 'session-replay' },
   { title: 'Performance Monitoring', id: 'performance-monitoring' },
+  { title: 'Conversions', id: 'conversions' },
   { title: 'Funnel Analysis', id: 'funnel-analysis' },
   { title: 'Sending Analytics from React', id: 'react-sdk' },
   { title: 'Enriching Visitors', id: 'enrich-visitors' },
+  { title: 'Cookieless Tracking', id: 'cookieless' },
   { title: 'Privacy & Compliance', id: 'privacy' },
 ]
 
@@ -150,14 +153,15 @@ Track custom events to understand user interactions and behavior.
 
 ### Built-in Events
 
-Temps automatically tracks:
-- Page views
-- Page exits
-- Link clicks (external)
-- Form submissions
-- File downloads
-- 404 errors
-- JavaScript errors
+The tracker sends these without any code from you:
+- Page views (`page_view`), including client-side route changes
+- Time on page (`heartbeat`, `page_leave`)
+- Core Web Vitals
+- Clicks on links to other sites (`outbound_click`)
+- File downloads (`file_download`)
+- Pages your site marks as "not found" (`not_found`)
+
+The last three are described in [Outbound Links, Downloads & 404s](#automatic-events). JavaScript errors are captured by [Error Tracking](/docs/error-tracking), not by the analytics tracker. Form submissions are not tracked automatically; send them with a custom event.
 
 ### Custom Events
 
@@ -263,6 +267,120 @@ Query and filter events in the dashboard or via API:
   },
   "groupBy": "properties.plan"
 }
+```
+
+---
+
+## Outbound Links, Downloads & 404s {{ anchor: true, id: 'automatic-events' }}
+
+Three reports most sites want and few instrument by hand. The tracker fills them in by itself; they are on by default in `@temps-sdk/analytics-core` and in every package built on it (the script tag, React, Vue and Svelte).
+
+They are ordinary events. Besides their own cards, they appear in the event list and the event detail page, and can be used as funnel steps.
+
+<Properties>
+  <Property name="outbound_click">
+    A visitor clicked a link to another host (a different hostname or port). Properties: `url` and `host` of the destination. Left and middle clicks count; right clicks don't.
+  </Property>
+  <Property name="file_download">
+    A visitor clicked a link whose path ends in a known file extension, or any link with the `download` attribute. Properties: `url`, `extension` and `host`. A file on another host is reported once, as a download, not also as an outbound click.
+  </Property>
+  <Property name="not_found">
+    A page reported itself as missing. Properties: `path` (the path the visitor asked for) and `referrer`.
+  </Property>
+</Properties>
+
+The recorded `url` is the destination's origin and path only. Query strings and fragments are dropped, because download links are often pre-signed storage URLs whose query string is a credential, and tracking parameters would otherwise split one destination into thousands of rows. Only `http` and `https` links are tracked; `mailto:`, `tel:` and `javascript:` links are ignored.
+
+One click listener on the document covers every link, including links added after the page loaded. The event goes out with `sendBeacon`, so it survives the navigation the click starts.
+
+### Where to see them
+
+In the project's **Analytics** overview, the **Events** tab has three cards: **Outbound links**, **File downloads** and **Not found**. Each card explains what it shows while it is empty.
+
+From the CLI:
+
+```bash {{ title: 'CLI' }}
+bunx @temps-sdk/cli analytics outbound --period 7d
+bunx @temps-sdk/cli analytics downloads --period 30d --limit 50
+bunx @temps-sdk/cli analytics not-found --period 7d --json
+```
+
+From the API, any event can be ranked by one of its properties:
+
+```bash {{ title: 'API' }}
+curl -G "$TEMPS_API_URL/analytics/event-properties" \
+  -H "Authorization: Bearer $TEMPS_API_KEY" \
+  --data-urlencode "project_id=1" \
+  --data-urlencode "event_name=outbound_click" \
+  --data-urlencode "property=url" \
+  --data-urlencode "start_date=2026-11-01T00:00:00Z" \
+  --data-urlencode "end_date=2026-11-08T00:00:00Z"
+```
+
+The response lists the most frequent values first, each with its count, distinct visitors and share. Crawler traffic is excluded. `property` is a top-level key of the event's properties: letters, digits, `_`, `-` and `.`, up to 64 characters.
+
+### Not found pages
+
+The **Not found** card has two tabs, because a missing page can be detected in two places:
+
+- **Answered 404.** When Temps serves your site, it already records the status code, path and referrer of every request. This tab lists the paths Temps answered with `404` to visitors that are not bots, with the page that most often linked to each. It needs no tracker change and adds no work to the request path. It covers at most the last 30 days of the selected period.
+- **Reported by the page.** A single-page app usually answers `200` for a route that does not exist, and a site Temps does not serve has no request log at all. Such a page reports itself instead, in either of two ways:
+
+<CodeGroup title="Report a missing page">
+```html {{ title: 'Marker' }}
+<!-- Any element of your 404 view. The tracker checks for it after each
+     page view, and once more a second later for views rendered late. -->
+<main data-temps-404>
+  <h1>Page not found</h1>
+</main>
+```
+
+```typescript {{ title: 'React' }}
+import { useEffect } from 'react';
+import { useTempsAnalytics } from '@temps-sdk/react-analytics';
+
+export function NotFoundPage() {
+  const { trackNotFound } = useTempsAnalytics();
+  useEffect(() => {
+    void trackNotFound();
+  }, [trackNotFound]);
+  return <h1>Page not found</h1>;
+}
+```
+
+```javascript {{ title: 'Script tag' }}
+// With the script-tag tracker, the instance is window.temps
+window.temps.trackNotFound();
+```
+</CodeGroup>
+
+Each page view reports at most one `not_found` event.
+
+### Configuration
+
+<Properties>
+  <Property name="autoTrackOutboundLinks">
+    Record `outbound_click`. Default `true`. Script tag: `data-auto-track-outbound-links="false"`.
+  </Property>
+  <Property name="autoTrackFileDownloads">
+    Record `file_download`. Default `true`. Script tag: `data-auto-track-file-downloads="false"`.
+  </Property>
+  <Property name="fileDownloadExtensions">
+    Extensions counted as downloads, without the dot. Replaces the default list of documents (pdf, docx, csv…), archives (zip, gz, 7z…), audio and video (mp3, mp4…), disk images and installers (dmg, exe, msi, deb, apk…). Extend it with `[...DEFAULT_FILE_DOWNLOAD_EXTENSIONS, 'stl']`. Script tag: `data-file-download-extensions="pdf,zip,stl"`.
+  </Property>
+  <Property name="autoTrackNotFound">
+    Look for the `data-temps-404` marker after each page view. Default `true`; pages without the marker are unaffected, and `trackNotFound()` works either way. Script tag: `data-auto-track-not-found="false"`.
+  </Property>
+</Properties>
+
+```tsx {{ title: 'React' }}
+<TempsAnalyticsProvider
+  autoTrackOutboundLinks={true}
+  autoTrackFileDownloads={true}
+  fileDownloadExtensions={['pdf', 'zip', 'stl']}
+>
+  {children}
+</TempsAnalyticsProvider>
 ```
 
 ---
@@ -453,6 +571,74 @@ Set performance budgets and get alerts when exceeded:
   }
 }
 ```
+
+---
+
+## Conversions {{ anchor: true, id: 'conversions' }}
+
+A conversion is something a visitor does that counts as success: an event such as `signup` or `purchase`, or a visit to a page such as `/thank-you`. Define it once and the overview shows how many visitors reach it, the conversion rate, the revenue it carried, and where those visitors came from.
+
+Conversions are read from the events you already record. Defining one needs no change to your site, and it covers your whole history straight away; deleting one deletes no events.
+
+<Properties>
+  <Property name="Event conversion">
+    Matches an event by name, built-in or custom: `signup`, `purchase`, `file_download`, `outbound_click`. It can be narrowed to events whose property has a given value, for example `plan` equal to `pro`.
+  </Property>
+  <Property name="Page conversion">
+    Matches page views by path. `*` matches any run of characters: `/thank-you` matches that page only, `/docs/*` every page under `/docs/`.
+  </Property>
+  <Property name="Revenue">
+    An event conversion can name a numeric property and a currency, for example `track('purchase', { amount: 49 })` with property `amount` and currency `EUR`. Each conversion then contributes its amount; events whose property is missing or not a plain number still count as conversions but add no revenue.
+  </Property>
+</Properties>
+
+### What the report shows
+
+In the project's **Analytics** overview, the **Conversions** card lists every conversion for the selected period and environment:
+
+- **Visitors**: distinct visitors who converted at least once.
+- **Total**: matching events; a visitor who buys twice counts twice.
+- **Rate**: converting visitors as a share of all visitors with a page view in the period, the visitor count of the overview.
+- **Revenue**: the sum of the revenue property, when the conversion has one.
+
+Select a conversion to see who converted, grouped by channel, referrer, UTM source, medium or campaign, the page it happened on, country, device, browser or operating system. Each row shows the visitors with that value, how many converted, the rate and the revenue. Channel, referrer and UTM values are the visitor's **first touch**: how they first arrived, as in the visitors list. Crawlers and traffic your filters exclude are never counted. Events your backend sends through the authenticated ingest route (for example a purchase recorded server-side) do count, although they carry no browser details.
+
+A project can define up to 50 conversions. Names are unique within a project, ignoring case.
+
+### From the CLI
+
+```bash {{ title: 'CLI' }}
+bunx @temps-sdk/cli analytics conversions create --name Signup --event signup
+bunx @temps-sdk/cli analytics conversions create --name "Thank you" --page /thank-you
+bunx @temps-sdk/cli analytics conversions create --name Purchase --event purchase \
+  --revenue-property amount --currency EUR
+bunx @temps-sdk/cli analytics conversions list --period 30d
+bunx @temps-sdk/cli analytics conversions breakdown --goal-id 3 --by utm-source
+```
+
+### From the API
+
+```bash {{ title: 'Define a conversion' }}
+curl -X POST "$TEMPS_API_URL/projects/1/analytics/goals" \
+  -H "Authorization: Bearer $TEMPS_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Pro signup",
+    "kind": "event",
+    "event_name": "signup",
+    "event_filter": [{ "type": "custom_data", "value": { "path": "plan", "value": "pro" } }]
+  }'
+```
+
+| Method | Path | What it does |
+|---|---|---|
+| `GET` | `/projects/{project_id}/analytics/goals` | List conversions, newest first (`page`, `page_size`) |
+| `POST` | `/projects/{project_id}/analytics/goals` | Define one |
+| `GET`, `PUT`, `DELETE` | `/projects/{project_id}/analytics/goals/{goal_id}` | Read, replace or delete one |
+| `GET` | `/projects/{project_id}/analytics/goals/stats` | Visitors, conversions, rate and revenue of every conversion (`start_date`, `end_date`, `environment_id`) |
+| `GET` | `/projects/{project_id}/analytics/goals/{goal_id}/breakdown` | One conversion by `dimension`: `channel`, `referrer`, `utm_source`, `utm_medium`, `utm_campaign`, `page`, `country`, `device_type`, `browser`, `operating_system` |
+
+Reading needs `analytics:read`; defining, changing and deleting need `analytics:write` and are recorded in the audit log. `event_filter` uses the same filters as funnel steps. The API calls these *goals*; the console calls them conversions so they are not confused with the goals of the AI activity report.
 
 ---
 
@@ -755,18 +941,20 @@ export function CheckoutButton() {
 Track events using data attributes (no JavaScript required):
 
 ```tsx
-<button data-temps-event="button_click" data-temps-button="signup">
+<button temps-event-name="button_click" temps-data-button="signup">
   Sign Up
 </button>
 
 <a
   href="/pricing"
-  data-temps-event="link_click"
-  data-temps-destination="pricing"
+  temps-event-name="link_click"
+  temps-data-destination="pricing"
 >
   View Pricing
 </a>
 ```
+
+`temps-event-name` names the event and every `temps-data-*` attribute becomes a property (`temps-data-button="signup"` sends `{ "button": "signup" }`).
 
 ---
 
@@ -1169,6 +1357,56 @@ visitors.forEach(v => {
 
 ---
 
+## Cookieless Tracking {{ anchor: true, id: 'cookieless' }}
+
+By default Temps recognises a returning visitor by an id kept on their device: the `_temps_visitor_id` cookie (365 days) when Temps serves the page, or `localStorage` when Temps is only the analytics backend. In the EU that usually needs consent before tracking starts.
+
+A project can instead be **cookieless**. Nothing is stored on the device. Temps counts a visitor by a hash of a daily salt, the project, the client address and the browser's user agent. The salt is 32 random bytes per UTC day, kept encrypted in the database so every node derives the same id, and deleted once the day is over, after which yesterday's ids cannot be recomputed from anything Temps keeps.
+
+Switch it under **Analytics → Settings → Visitor identity**, or from the CLI:
+
+```bash
+temps analytics identity show -p my-site
+temps analytics identity set -p my-site --mode cookieless
+```
+
+In cookieless mode the proxy stops setting `_temps_visitor_id` and `_temps_sid`, and expires them when a browser still sends them. Tell the tracker too, so it does not write to `localStorage` either:
+
+<CodeGroup title="Cookieless tracker">
+```tsx {{ title: 'React' }}
+<TempsAnalyticsProvider cookieless>
+  {children}
+</TempsAnalyticsProvider>
+```
+
+```html {{ title: 'Script tag' }}
+<script defer
+  src="https://cdn.jsdelivr.net/npm/@temps-sdk/analytics-browser/dist/temps.min.js"
+  data-cookieless="true"></script>
+```
+
+```ts {{ title: 'Vue, Svelte, plain JS' }}
+createAnalytics({ cookieless: true })
+```
+</CodeGroup>
+
+The tracker option also deletes the ids an earlier visit stored. The server ignores any id a browser sends for a cookieless project, so a tracker you forgot to update cannot bring stored ids back into the reports.
+
+### What changes
+
+- A returning visitor counts as a new visitor the next day.
+- Unique visitors over a period of several days are the sum of each day's unique visitors.
+- Visitor profiles and journeys cover a single day.
+- Session replay is off: a replay needs an id stored on the device.
+- Sessions still end after 30 minutes without activity, decided on the server.
+- Visitors on the same network with the same browser version are counted once per day.
+- Request logs carry no visitor, since the proxy no longer recognises one.
+- Events your backend sends with an ingest key are counted by the address that sent them, so send cookieless events from the browser.
+
+Switching applies to new visits. History recorded in either mode stays as it is.
+
+---
+
 ## Privacy & Compliance {{ anchor: true, id: 'privacy' }}
 
 Temps analytics is designed with privacy in mind and complies with GDPR, CCPA, and other regulations.
@@ -1179,8 +1417,8 @@ Temps analytics is designed with privacy in mind and complies with GDPR, CCPA, a
   <Property name="Self-Hosted">
     All data stays on your infrastructure—no data sent to third parties
   </Property>
-  <Property name="No Cookies">
-    IP-based tracking (no tracking cookies required)
+  <Property name="Cookieless Mode">
+    Per project: nothing stored on the visitor's device, visitors counted by a daily-rotating hash (see [Cookieless Tracking](#cookieless))
   </Property>
   <Property name="Anonymization">
     IP address hashing and anonymization options

@@ -20,6 +20,9 @@ import {
 import { performanceInsights } from './performance.js'
 import { enrichVisitorAction } from './enrich.js'
 import { registerAnalyticsKeysCommands } from './keys.js'
+import { registerAnalyticsConversionsCommands } from './conversions.js'
+import { registerAnalyticsIdentityCommands } from './identity.js'
+import { fileDownloads, notFound, outboundLinks } from './auto-events.js'
 
 function collect(value: string, previous: string[]): string[] {
   return [...previous, value]
@@ -32,6 +35,8 @@ export function registerAnalyticsCommands(program: Command): void {
     .description('View project analytics')
 
   registerAnalyticsKeysCommands(analytics)
+  registerAnalyticsConversionsCommands(analytics)
+  registerAnalyticsIdentityCommands(analytics)
 
   analytics
     .command('overview')
@@ -60,6 +65,45 @@ export function registerAnalyticsCommands(program: Command): void {
     .option('--limit <n>', 'Number of results (default: 20, max: 100)')
     .option('--json', 'Output in JSON format')
     .action(breakdown)
+
+  analytics
+    .command('outbound')
+    .description('Show the outbound links visitors clicked (outbound_click events)')
+    .option('-p, --project <project>', 'Project slug or ID')
+    .option(
+      '--period <period>',
+      'Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m)',
+      '7d',
+    )
+    .option('--limit <n>', 'Number of results (default: 20, max: 100)')
+    .option('--json', 'Output in JSON format')
+    .action(outboundLinks)
+
+  analytics
+    .command('downloads')
+    .description('Show the files visitors downloaded (file_download events)')
+    .option('-p, --project <project>', 'Project slug or ID')
+    .option(
+      '--period <period>',
+      'Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m)',
+      '7d',
+    )
+    .option('--limit <n>', 'Number of results (default: 20, max: 100)')
+    .option('--json', 'Output in JSON format')
+    .action(fileDownloads)
+
+  analytics
+    .command('not-found')
+    .description('Show pages visitors could not find: 404s Temps answered and not_found events')
+    .option('-p, --project <project>', 'Project slug or ID')
+    .option(
+      '--period <period>',
+      'Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m)',
+      '7d',
+    )
+    .option('--limit <n>', 'Number of results (default: 20, max: 100)')
+    .option('--json', 'Output in JSON format')
+    .action(notFound)
 
   analytics
     .command('funnels')
@@ -396,6 +440,16 @@ Examples:
   $ temps analytics enrich enc_AbC123 --data '{"user_id":"user_123","email":"ada@example.com"}'
   $ temps analytics enrich 4821 --set plan=pro --set segment=enterprise
   $ temps analytics enrich enc_AbC123 --unset trial_ends_at --json
+
+  Conversions (events or pages that count as success):
+  $ temps analytics conversions list -p my-site --period 30d
+  $ temps analytics conversions create -p my-site --name Signup --event signup
+  $ temps analytics conversions create -p my-site --name Purchase --event purchase --revenue-property amount --currency EUR
+  $ temps analytics conversions breakdown -p my-site --goal-id 3 --by channel
+
+  Visitor identity (stored ids or cookieless):
+  $ temps analytics identity show -p my-site
+  $ temps analytics identity set -p my-site --mode cookieless
 
   Ingest keys (for apps Temps does not deploy):
   $ temps analytics keys list   --project-id 7

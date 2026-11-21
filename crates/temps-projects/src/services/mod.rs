@@ -4,6 +4,7 @@
 pub mod custom_domains;
 pub mod data_purge;
 pub mod env_vars;
+pub mod ingest_setup;
 pub mod operations;
 pub mod project;
 pub mod types;
@@ -13,6 +14,7 @@ pub use data_purge::{
     PassOutcome, ProjectDataPurgeConfig, ProjectDataPurgeError, ProjectDataPurger,
 };
 pub use env_vars::{EnvVarError, EnvVarService};
+pub use ingest_setup::{IngestSetupError, IngestSetupService};
 pub use operations::{OperationsError, OperationsService};
 pub use project::*;
 pub use types::{EnvVarEnvironment, EnvVarWithEnvironments};

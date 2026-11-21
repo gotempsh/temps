@@ -11,6 +11,7 @@ import { VisitorsList } from './VisitorsList'
 import { VisitorDetail } from './VisitorDetail'
 import { SessionDetail } from './SessionDetail'
 import { SessionReplayDetail } from '@/pages/SessionReplayDetail'
+import { CookielessFactLine } from '@/components/analytics/VisitorIdentityCard'
 
 interface VisitorAnalyticsProps {
   project: ProjectResponse
@@ -55,7 +56,8 @@ export default function VisitorAnalytics({ project }: VisitorAnalyticsProps) {
     `/projects/${project.slug}/analytics/visitors`
   )
   return (
-    <div ref={containerRef} className="w-full min-w-0">
+    <div ref={containerRef} className="w-full min-w-0 space-y-3">
+      <CookielessFactLine project={project} view="visitors" />
       <Routes>
         <Route
           index

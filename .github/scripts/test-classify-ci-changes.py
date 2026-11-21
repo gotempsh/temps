@@ -99,6 +99,7 @@ class ClassificationTests(unittest.TestCase):
                 "rust": "true",
                 "web": "true",
                 "cli": "true",
+                "console": "true",
                 "code_reason": "<empty diff>",
                 "rust_reason": "<empty diff>",
             },
@@ -147,27 +148,46 @@ class AreaTests(unittest.TestCase):
     def test_web_only_change_skips_rust(self) -> None:
         self.assertEqual(
             self.outputs("web/src/App.tsx", "docs/concepts/page.mdx"),
-            {"code": "true", "rust": "false", "web": "true", "cli": "false"},
+            {"code": "true", "rust": "false", "web": "true", "cli": "false", "console": "true"},
         )
 
     def test_cli_only_change_skips_rust(self) -> None:
         self.assertEqual(
             self.outputs("apps/temps-cli/src/index.ts"),
-            {"code": "true", "rust": "false", "web": "false", "cli": "true"},
+            {"code": "true", "rust": "false", "web": "false", "cli": "true", "console": "false"},
         )
 
     def test_skills_only_change_skips_everything_but_code(self) -> None:
         self.assertEqual(
             self.outputs("skills/temps/SKILL.md"),
-            {"code": "true", "rust": "false", "web": "false", "cli": "false"},
+            {"code": "true", "rust": "false", "web": "false", "cli": "false", "console": "false"},
         )
 
     def test_any_rust_input_sets_every_area(self) -> None:
         # Consumers gate on `web` or `cli` alone; a Rust change must reach them.
         self.assertEqual(
             self.outputs("web/src/App.tsx", "crates/temps-core/src/lib.rs"),
-            {"code": "true", "rust": "true", "web": "true", "cli": "true"},
+            {"code": "true", "rust": "true", "web": "true", "cli": "true", "console": "true"},
         )
+
+    def test_rust_only_change_skips_the_console_report(self) -> None:
+        # `web` stays true so the blocking smoke suite runs; only the
+        # non-blocking full report, which tests web/ itself, is skipped.
+        self.assertEqual(
+            self.outputs("crates/temps-core/src/lib.rs", "Cargo.lock"),
+            {"code": "true", "rust": "true", "web": "true", "cli": "true", "console": "false"},
+        )
+
+    def test_files_that_run_the_console_report(self) -> None:
+        for path in sorted(classify.CONSOLE_SUITE_INPUTS):
+            with self.subTest(path=path):
+                self.assertEqual(classify.classify([path])["console"], "true")
+
+    def test_console_report_inputs_exist(self) -> None:
+        # A renamed workflow or script would silently stop running the report.
+        for path in sorted(classify.CONSOLE_SUITE_INPUTS):
+            with self.subTest(path=path):
+                self.assertTrue((REPO_ROOT / path).is_file(), path)
 
 
 
@@ -223,7 +243,7 @@ class GitDiffTests(unittest.TestCase):
         (self.repo / "docs" / "page.mdx").write_text("# Page\n\nMore.\n")
         head = self.commit("docs")
         self.assertEqual(
-            self.run_main(self.base, head), (0, "code=false\nrust=false\nweb=false\ncli=false\n")
+            self.run_main(self.base, head), (0, "code=false\nrust=false\nweb=false\ncli=false\nconsole=false\n")
         )
 
     def test_web_commit_writes_rust_false(self) -> None:
@@ -231,14 +251,14 @@ class GitDiffTests(unittest.TestCase):
         (self.repo / "web" / "App.tsx").write_text("export {}\n")
         head = self.commit("web")
         self.assertEqual(
-            self.run_main(self.base, head), (0, "code=true\nrust=false\nweb=true\ncli=false\n")
+            self.run_main(self.base, head), (0, "code=true\nrust=false\nweb=true\ncli=false\nconsole=true\n")
         )
 
     def test_code_commit_writes_everything_true(self) -> None:
         (self.repo / "crates" / "lib.rs").write_text("pub fn g() {}\n")
         head = self.commit("code")
         self.assertEqual(
-            self.run_main(self.base, head), (0, "code=true\nrust=true\nweb=true\ncli=true\n")
+            self.run_main(self.base, head), (0, "code=true\nrust=true\nweb=true\ncli=true\nconsole=false\n")
         )
 
     def test_moving_rust_into_web_still_counts_as_rust(self) -> None:
@@ -246,7 +266,8 @@ class GitDiffTests(unittest.TestCase):
         git(self.repo, "mv", "crates/lib.rs", "web/lib.rs")
         head = self.commit("move")
         self.assertEqual(
-            self.run_main(self.base, head), (0, "code=true\nrust=true\nweb=true\ncli=true\n")
+            self.run_main(self.base, head),
+            (0, "code=true\nrust=true\nweb=true\ncli=true\nconsole=true\n"),
         )
 
     def test_unreadable_diff_fails_and_leaves_output_unset(self) -> None:
@@ -470,8 +491,20 @@ class WorkflowWiringTests(unittest.TestCase):
         self.assertEqual(skipped, [])
 
     def test_a_rust_change_runs_every_job_but_the_release_suites(self) -> None:
+        # e2e-ui, the non-blocking console report, runs only when web/ changed.
         outcome = self.outcome(self.scenario("rust"))
-        self.assertEqual(self.running(outcome), set(self.jobs) - self.RELEASE_JOBS)
+        self.assertEqual(self.running(outcome), set(self.jobs) - self.RELEASE_JOBS - {"e2e-ui"})
+
+    def test_a_rust_change_that_touches_web_runs_the_console_report(self) -> None:
+        outputs = self.scenario("rust")
+        result = classify.classify(["crates/temps-core/src/lib.rs", "web/src/App.tsx"])
+        outputs.update({key: result[key] for key in classify.OUTPUTS})
+        running = self.running(self.outcome(outputs))
+        self.assertIn("e2e-ui", running)
+        self.assertIn("e2e", running)
+
+    def test_a_rust_change_keeps_the_blocking_smoke_suite(self) -> None:
+        self.assertIn("e2e", self.running(self.outcome(self.scenario("rust"))))
 
     def test_a_dockerfile_change_still_compiles_once(self) -> None:
         outputs = self.scenario("rust")
@@ -500,7 +533,7 @@ class WorkflowWiringTests(unittest.TestCase):
         self.assertNotIn("package(=temps-providers)", outputs["tests"])
         outcome = self.outcome(outputs)
         self.assertEqual(
-            self.running(outcome), set(self.jobs) - self.RELEASE_JOBS - {"mariadb-pitr-e2e"}
+            self.running(outcome), set(self.jobs) - self.RELEASE_JOBS - {"mariadb-pitr-e2e", "e2e-ui"}
         )
 
     def test_docker_tests_archive_steps_follow_docker_tests(self) -> None:
