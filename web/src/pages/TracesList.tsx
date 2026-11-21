@@ -9,7 +9,6 @@ import { TimeRangeFilter } from '@/components/ui/time-range-filter'
 
 import { ProjectResponse, SpanStatusCode, TraceSummary } from '@/api/client'
 import {
-  getEnvironmentsOptions,
   getProjectDeploymentsOptions,
   hasTracesOptions,
   queryTraceSummariesOptions,
@@ -78,7 +77,7 @@ import {
 import { PlainHttpSetup } from '@/components/project/setup/PlainHttpSetup'
 import {
   ExternalOtelEnvBlock,
-  SetupEnvironmentSelect,
+  ProjectWideOtlpNote,
 } from '@/components/project/setup/TracesSetupParts'
 import { ReactElement, useCallback, useEffect, useMemo, useState } from 'react'
 import { Link, useLocation, useNavigate, useSearchParams } from 'react-router'
@@ -407,26 +406,10 @@ function OtelSetupSection({
 }) {
   const navigate = useNavigate()
   const [wizardStep, setWizardStep] = useState<WizardStepId>('framework')
-  const [selectedEnvId, setSelectedEnvId] = useState<string>('')
   const [selectedFrameworkId, setSelectedFrameworkId] =
     useState<string>('nextjs')
   // The framework-agnostic option: any OpenTelemetry SDK or the Collector.
   const [plainHttp, setPlainHttp] = useState(false)
-
-  const { data: environments } = useQuery({
-    ...getEnvironmentsOptions({
-      path: { project_id: project.id },
-    }),
-    enabled: !!project.id,
-  })
-
-  const effectiveSelectedEnvId =
-    selectedEnvId || (environments?.[0] ? String(environments[0].id) : '')
-
-  const selectedEnv = useMemo(
-    () => environments?.find((e) => String(e.id) === effectiveSelectedEnvId),
-    [environments, effectiveSelectedEnvId]
-  )
 
   const preset =
     frameworkPresets.find((f) => f.id === selectedFrameworkId) ??
@@ -554,24 +537,9 @@ function OtelSetupSection({
 
         {wizardStep === 'install' && plainHttp && (
           <div className="space-y-6">
-            <div className="flex flex-wrap items-center justify-between gap-3">
-              <SetupEnvironmentSelect
-                id="traces-plain-http-environment"
-                environments={environments}
-                value={effectiveSelectedEnvId}
-                onValueChange={setSelectedEnvId}
-              />
-            </div>
-            <PlainHttpSetup
-              project={project}
-              signal="traces"
-              environmentId={selectedEnv?.id}
-            />
-            <PlainHttpSetup
-              project={project}
-              signal="logs"
-              environmentId={selectedEnv?.id}
-            />
+            <ProjectWideOtlpNote />
+            <PlainHttpSetup project={project} signal="traces" />
+            <PlainHttpSetup project={project} signal="logs" />
             <div className="flex items-center justify-between gap-3">
               <Button
                 variant="ghost"
@@ -652,15 +620,9 @@ function OtelSetupSection({
                 Skip this if you deploy on Temps. Required when running the app
                 on Vercel, Fly, AWS, bare metal, etc.
               </p>
-              <SetupEnvironmentSelect
-                id="traces-external-environment"
-                environments={environments}
-                value={effectiveSelectedEnvId}
-                onValueChange={setSelectedEnvId}
-              />
+              <ProjectWideOtlpNote />
               <ExternalOtelEnvBlock
                 projectId={project.id}
-                environmentId={selectedEnv?.id}
                 serviceName={project.name}
               />
               <p className="text-xs text-muted-foreground">
