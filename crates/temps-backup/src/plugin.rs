@@ -793,9 +793,49 @@ impl TempsPlugin for BackupPlugin {
                 }
             });
 
+            let backup_service = context.require_service::<BackupService>();
+
+            // The bundled database starts with archive_mode=on and no
+            // archive_command until the first internal backup, and PostgreSQL
+            // keeps every WAL segment in that state. Awaited here, before the
+            // scheduler starts, so it cannot overwrite the command a backup in
+            // this process sets.
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                backup_service.reconcile_internal_wal_archiving(),
+            )
+            .await
+            {
+                Ok(Ok(crate::services::InternalArchiveReconcile::Unaffected)) => {}
+                Ok(Ok(crate::services::InternalArchiveReconcile::Released { container_id })) => {
+                    warn!(
+                        container_id = %container_id,
+                        archive_command = crate::services::NO_ARCHIVE_DESTINATION_COMMAND,
+                        "Control-plane database had WAL archiving on with no archive_command, so it \
+                         was keeping every WAL segment. Set archive_command so WAL is recycled \
+                         normally; an internal database backup replaces it with WAL-G archiving",
+                    )
+                }
+                Ok(Ok(crate::services::InternalArchiveReconcile::LeftToOperator { reason })) => {
+                    warn!(
+                        reason = %reason,
+                        "Control-plane database has WAL archiving on with no archive_command or \
+                         archive_library, so it keeps every WAL segment until one is set. It is \
+                         not a container Temps runs, so its settings were not changed: set \
+                         archive_command or archive_library, or turn archive_mode off",
+                    )
+                }
+                Ok(Err(e)) => error!(
+                    "Failed to check WAL archiving on the control-plane database: {}",
+                    e
+                ),
+                Err(_) => error!(
+                    "Checking WAL archiving on the control-plane database timed out after 30s"
+                ),
+            }
+
             // Start the schedule loop. It ticks at the top of each hour, finds
             // due `backup_schedules`, and calls `executor.spawn` for each.
-            let backup_service = context.require_service::<BackupService>();
             let schedule_cancel = tokio_util::sync::CancellationToken::new();
             tokio::spawn({
                 let backup_service = Arc::clone(&backup_service);

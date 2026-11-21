@@ -280,6 +280,23 @@ impl BackupService {
 
         let env_refs: Vec<&str> = env_vars.iter().map(|s| s.as_str()).collect();
 
+        // Point archive_command at WAL-G before the base backup starts. Until
+        // now it may be the placeholder that discards WAL
+        // (`reconcile_internal_wal_archiving`), and a base backup is only
+        // restorable together with the WAL written while it ran, so that WAL
+        // must reach the archive. Without archiving the base backup would be
+        // unrestorable, so the error ends the WAL-G attempt and the caller
+        // falls back to pg_dump.
+        self.enable_internal_wal_archiving(&docker, &container_id, &env_vars, &pgdata)
+            .await
+            .map_err(|e| BackupError::Internal {
+                message: format!(
+                    "Cannot take a WAL-G base backup of the internal database in container \
+                     '{}': continuous WAL archiving could not be enabled: {}",
+                    container_id, e
+                ),
+            })?;
+
         // Run wal-g backup-push
         info!("Running wal-g backup-push in container {}", container_id);
 
@@ -379,21 +396,6 @@ impl BackupService {
             "WAL-G backup completed: {} ({} bytes)",
             walg_s3_prefix, total_size
         );
-
-        // Enable continuous WAL archiving for the internal database.
-        // Write S3 credentials to an env file on the shared volume, then configure
-        // archive_command to source it before running wal-g wal-push.
-        // Failures here are logged but do NOT fail the backup.
-        if let Err(e) = self
-            .enable_internal_wal_archiving(&docker, &container_id, &env_vars, &pgdata)
-            .await
-        {
-            error!(
-                "Failed to enable WAL archiving for internal DB in container '{}': {}. \
-                 Base backup succeeded but continuous WAL archiving is not active.",
-                container_id, e
-            );
-        }
 
         Ok((walg_s3_prefix, total_size))
     }

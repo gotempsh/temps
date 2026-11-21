@@ -79,6 +79,7 @@ mod deletion;
 mod error;
 mod external_service;
 mod index;
+mod internal_archive;
 mod postgres_backup;
 mod queries;
 mod recovery_set;
@@ -99,6 +100,7 @@ pub use access_scope::{
     BackupWithAccessScope, ServiceProjectScope,
 };
 pub use error::BackupError;
+pub use internal_archive::{InternalArchiveReconcile, NO_ARCHIVE_DESTINATION_COMMAND};
 pub use recovery_set::RecoverySetPublication;
 use retention::{retention_cutoff, retention_expiry, validate_retention_period};
 pub use retention::{
