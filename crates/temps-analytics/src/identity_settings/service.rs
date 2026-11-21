@@ -19,7 +19,7 @@ use chrono::Utc;
 use sea_orm::sea_query::OnConflict;
 use sea_orm::{
     ActiveModelTrait, ActiveValue::NotSet, ColumnTrait, DatabaseConnection, EntityTrait,
-    QueryFilter, Set,
+    QueryFilter, Set, TransactionTrait,
 };
 use temps_entities::analytics_identity_mode::AnalyticsIdentityMode;
 use temps_entities::{project_analytics_settings, projects};
@@ -112,6 +112,13 @@ impl AnalyticsIdentityService {
         let mut mode = previous_mode;
         let mut updated_at = project.updated_at;
 
+        // Both settings are written together or not at all: a failure on the
+        // second must not leave the first changed without its audit entry.
+        let txn = self.db.begin().await.map_err(Self::db_error(
+            project_id,
+            "start the identity settings update",
+        ))?;
+        let mut mode_changed = false;
         if let Some(requested) = patch.mode.filter(|requested| *requested != previous_mode) {
             // Only the two changed columns are written, so a concurrent edit
             // of any other project setting is not overwritten.
@@ -119,10 +126,10 @@ impl AnalyticsIdentityService {
             active.analytics_identity_mode = Set(requested);
             active.updated_at = Set(Utc::now());
             let updated = active
-                .update(self.db.as_ref())
+                .update(&txn)
                 .await
                 .map_err(Self::db_error(project_id, "update project identity mode"))?;
-            self.cookieless.forget_identity_mode(project_id).await;
+            mode_changed = true;
             mode = updated.analytics_identity_mode;
             updated_at = updated.updated_at;
         }
@@ -152,7 +159,7 @@ impl AnalyticsIdentityService {
                         ])
                         .to_owned(),
                 )
-                .exec_with_returning(self.db.as_ref())
+                .exec_with_returning(&txn)
                 .await
                 .map_err(Self::db_error(
                     project_id,
@@ -160,6 +167,13 @@ impl AnalyticsIdentityService {
                 ))?;
             accept = saved.accept_browser_identify;
             updated_at = updated_at.max(saved.updated_at);
+        }
+        txn.commit().await.map_err(Self::db_error(
+            project_id,
+            "commit the identity settings update",
+        ))?;
+        if mode_changed {
+            self.cookieless.forget_identity_mode(project_id).await;
         }
 
         Ok(AnalyticsIdentityChange {
@@ -324,6 +338,70 @@ mod tests {
         assert!(
             message.contains("load project identity settings"),
             "{message}"
+        );
+    }
+
+    /// A failure saving the browser setting leaves the identity mode as it
+    /// was: the two settings are written in one transaction.
+    #[tokio::test]
+    async fn a_failed_browser_setting_save_leaves_the_mode_unchanged() {
+        let test_db = match crate::testing::TestDatabase::new("identity_settings_atomic").await {
+            Ok(test_db) => test_db,
+            Err(error) => {
+                println!("Docker not available ({error}), skipping");
+                return;
+            }
+        };
+        use sea_orm::ConnectionTrait;
+        let db = test_db.db.clone();
+        crate::testing::test_utils::AnalyticsTestUtils::insert_test_data(&db)
+            .await
+            .expect("test data");
+        let project = projects::Entity::find()
+            .one(db.as_ref())
+            .await
+            .expect("load project")
+            .expect("a project");
+        assert_eq!(
+            project.analytics_identity_mode,
+            AnalyticsIdentityMode::Persistent
+        );
+        db.execute_unprepared(
+            "ALTER TABLE project_analytics_settings \
+             ADD CONSTRAINT reject_every_row CHECK (false) NOT VALID",
+        )
+        .await
+        .expect("make the settings write fail");
+
+        let encryption = Arc::new(
+            EncryptionService::new(
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            )
+            .expect("valid test key"),
+        );
+        let service = AnalyticsIdentityService::new(
+            db.clone(),
+            Arc::new(CookielessIdentity::new(db.clone(), encryption)),
+        );
+        let result = service
+            .set(
+                project.id,
+                &patch(Some(AnalyticsIdentityMode::Cookieless), Some(false)),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(AnalyticsIdentityError::Database { .. })),
+            "the failed save is reported"
+        );
+        let after = projects::Entity::find_by_id(project.id)
+            .one(db.as_ref())
+            .await
+            .expect("reload project")
+            .expect("the project");
+        assert_eq!(
+            after.analytics_identity_mode,
+            AnalyticsIdentityMode::Persistent,
+            "the mode change was rolled back with the failed save"
         );
     }
 }
