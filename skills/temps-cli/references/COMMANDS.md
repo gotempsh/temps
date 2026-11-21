@@ -133,7 +133,7 @@ Use this index or search for a top-level command heading to load only the releva
 - [`rollback`](#rollback) - Rollback to a previous deployment
 - [`open`](#open) - Open project URL in browser
 - [`cloud`](#cloud) - Temps Cloud
-- [`plugin`](#plugin) - Create, install, update and build TypeScript plugins
+- [`plugin`](#plugin) - Create and build TypeScript plugins, or install and manage external plugins
 - [`setup`](#setup) - PoC: install Temps on an existing Linux VPS over SSH and save a client context
 - [`start`](#start) - Run Temps on this computer, sign in the CLI and add the Temps skill for your coding agent
 - [`stop`](#stop) - Stop the Temps server and database started by `temps start`
@@ -11839,12 +11839,13 @@ Stop a Temps Cloud activation at its next chunk boundary
 
 ## `plugin`
 
-Create, install, update and build TypeScript plugins
+Create and build TypeScript plugins, or install and manage external plugins
 
 **Subcommands:**
 
 - `install` - Install a GitHub TypeScript plugin on the configured Temps server; the server uses its host Git credentials and Docker
 - `update` - Rebuild an installed GitHub plugin from its stored source; keep the current plugin if the update fails
+- `install-local` - Upload and activate a trusted native plugin on the configured Temps host
 - `grants` - Inspect or replace a plugin's host API permissions and AI limits
 - `dev` - Run a plugin with a local simulated host, UI preview, and events (no Temps server)
 - `init` - Create a TypeScript plugin project
@@ -11881,6 +11882,20 @@ Rebuild an installed GitHub plugin from its stored source; keep the current plug
 |------|-------------|---------|----------|
 | `--ref <ref>` | Use a different branch, tag, or commit | - | No |
 | `-y, --yes` | Trust the update without prompting | - | No |
+
+### `plugin install-local`
+
+Upload and activate a trusted native plugin on the configured Temps host
+
+**Usage:** `plugin install-local <file> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--name <name>` | Expected plugin manifest name | - | Yes |
+| `--plugin-version <version>` | Expected plugin manifest version | - | Yes |
+| `-y, --yes` | Approve execution of this file without prompting | - | No |
 
 ### `plugin grants`
 
