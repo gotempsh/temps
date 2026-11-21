@@ -89,6 +89,7 @@ pub mod self_update;
 pub mod sensitive_action;
 pub mod serve_profile;
 pub mod server_public_address;
+pub mod source_control;
 pub mod source_drop;
 pub mod static_files;
 pub mod tailnet;
@@ -213,6 +214,10 @@ pub use secrets_manager::SecretsManagerResolver;
 pub use sensitive_action::{
     SensitiveAction, SensitiveActionAuthorizationError, SensitiveActionAuthorizer,
     SensitiveActionDecision, SensitiveActionPrincipal,
+};
+pub use source_control::{
+    IssueState, ProjectRepository, ProjectSourceControl, RepositoryCommit, RepositoryIssue,
+    SourceControlError,
 };
 pub use source_drop::{
     SourceDropDeployer, SourceDropDeployment, SourceDropError, SourceDropRequest,

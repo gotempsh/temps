@@ -32,6 +32,7 @@ import { cn } from '@/lib/utils'
 import { hasNewGitHubInstallation } from '@/lib/git-installation-polling'
 import {
   createManifestSetupTracker,
+  githubAppManifest,
   githubAppWindowName,
   githubWindowUsable,
   openGithubAppWindow,
@@ -525,36 +526,11 @@ export function GitProviderFlow({
 
       const appName = `temps-${Math.random().toString(36).substring(2, 8)}`
 
-      const baseUrl = `${window.location.origin}`
-      const appUrl = `${baseUrl}`
-      const apiUrl = `${baseUrl}/api`
-
-      const manifestData = {
+      const manifestData = githubAppManifest({
         name: appName,
-        url: appUrl,
-        hook_attributes: {
-          url: githubEventsUrl,
-          active: true,
-        },
-        redirect_url: `${apiUrl}/webhook/git/github/auth`,
-        callback_urls: [
-          `${apiUrl}/webhook/git/github/auth`,
-          `${apiUrl}/webhook/git/github/callback`,
-        ],
-        description: 'Temps deployment platform',
-        public: true,
-        request_oauth_on_install: true,
-        setup_url: `${apiUrl}/webhook/git/github/install`,
-        default_permissions: {
-          contents: 'write',
-          metadata: 'read',
-          emails: 'read',
-          administration: 'write',
-          pull_requests: 'write',
-          members: 'read',
-        },
-        default_events: ['push', 'pull_request'],
-      }
+        origin: window.location.origin,
+        eventsUrl: githubEventsUrl,
+      })
 
       submitGitHubManifest(manifestData, manifestState, githubWindowName)
       manifestSetup.manifestPosted()

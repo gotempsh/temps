@@ -144,3 +144,51 @@ export function submitGitHubManifest(
     document.body.removeChild(form)
   }
 }
+
+/**
+ * The permissions a GitHub App created through Temps asks for. `issues`
+ * lets an error group open an issue in the project's repository; an app
+ * created before it was added gets it by adding it under the app's
+ * "Permissions & events" on GitHub and approving it on the installation.
+ */
+export const GITHUB_APP_PERMISSIONS = {
+  contents: 'write',
+  metadata: 'read',
+  emails: 'read',
+  administration: 'write',
+  pull_requests: 'write',
+  issues: 'write',
+  members: 'read',
+} as const
+
+/** The manifest posted to GitHub to create an app named `name`. */
+export function githubAppManifest({
+  name,
+  origin,
+  eventsUrl,
+}: {
+  name: string
+  origin: string
+  eventsUrl: string
+}) {
+  const apiUrl = `${origin}/api`
+  return {
+    name,
+    url: origin,
+    hook_attributes: {
+      url: eventsUrl,
+      active: true,
+    },
+    redirect_url: `${apiUrl}/webhook/git/github/auth`,
+    callback_urls: [
+      `${apiUrl}/webhook/git/github/auth`,
+      `${apiUrl}/webhook/git/github/callback`,
+    ],
+    description: 'Temps deployment platform',
+    public: true,
+    request_oauth_on_install: true,
+    setup_url: `${apiUrl}/webhook/git/github/install`,
+    default_permissions: { ...GITHUB_APP_PERMISSIONS },
+    default_events: ['push', 'pull_request'],
+  }
+}

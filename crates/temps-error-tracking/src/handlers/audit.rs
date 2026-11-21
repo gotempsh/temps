@@ -870,3 +870,135 @@ mod tests {
         );
     }
 }
+
+/// Audit event for deleting an attachment (ADR 111, D4). Identifiers and
+/// size only: the file name is what the SDK sent and may name a user.
+#[derive(Debug, Clone, Serialize)]
+pub struct ErrorAttachmentDeletedAudit {
+    pub context: AuditContext,
+    pub project_id: i32,
+    pub attachment_id: i64,
+    /// `error` or `feedback`.
+    pub owner_kind: String,
+    pub owner_id: i64,
+    pub size_bytes: i64,
+}
+
+impl AuditOperation for ErrorAttachmentDeletedAudit {
+    fn operation_type(&self) -> String {
+        "ERROR_ATTACHMENT_DELETED".into()
+    }
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
+    }
+}
+
+/// Audit event for changing a project's attachment quota (ADR 111, D4).
+#[derive(Debug, Clone, Serialize)]
+pub struct ErrorAttachmentQuotaAudit {
+    pub context: AuditContext,
+    pub project_id: i32,
+    pub previous_quota_bytes: i64,
+    pub quota_bytes: i64,
+}
+
+impl AuditOperation for ErrorAttachmentQuotaAudit {
+    fn operation_type(&self) -> String {
+        "ERROR_ATTACHMENT_QUOTA_UPDATED".into()
+    }
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
+    }
+}
+
+/// Audit event for opening an issue from an error group or linking one to
+/// it (ADR 111, D5). The issue's provider, repository and number; not its
+/// title, which repeats the error message.
+#[derive(Debug, Clone, Serialize)]
+pub struct ErrorIssueLinkAudit {
+    pub context: AuditContext,
+    pub project_id: i32,
+    pub group_id: i32,
+    pub link_id: i64,
+    /// `github`, `gitlab` or `link`.
+    pub provider: String,
+    pub repository: Option<String>,
+    pub number: Option<i64>,
+    /// `opened` (Temps opened the issue), `linked` or `unlinked`.
+    pub action: &'static str,
+}
+
+impl AuditOperation for ErrorIssueLinkAudit {
+    fn operation_type(&self) -> String {
+        match self.action {
+            "opened" => "ERROR_GROUP_ISSUE_OPENED",
+            "unlinked" => "ERROR_GROUP_ISSUE_UNLINKED",
+            _ => "ERROR_GROUP_ISSUE_LINKED",
+        }
+        .into()
+    }
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
+    }
+}
+
+/// One ownership rule as audited.
+#[derive(Debug, Clone, Serialize)]
+pub struct AuditedOwnershipRule {
+    pub pattern: String,
+    pub owner_user_id: i32,
+}
+
+/// Audit event for replacing a project's ownership rules (ADR 111, D5).
+#[derive(Debug, Clone, Serialize)]
+pub struct ErrorOwnershipRulesAudit {
+    pub context: AuditContext,
+    pub project_id: i32,
+    pub previous: Vec<AuditedOwnershipRule>,
+    pub rules: Vec<AuditedOwnershipRule>,
+}
+
+impl AuditOperation for ErrorOwnershipRulesAudit {
+    fn operation_type(&self) -> String {
+        "ERROR_OWNERSHIP_RULES_UPDATED".into()
+    }
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
+    }
+}

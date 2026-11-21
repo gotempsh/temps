@@ -61,6 +61,8 @@ pub struct ErrorTrackingApiDoc;
 pub fn configure_routes() -> Router<Arc<AppState>> {
     Router::new()
         .merge(super::feedback_handler::routes())
+        .merge(super::attachment_handler::routes())
+        .merge(super::source_control_handler::routes())
         .merge(super::group_workflow_handler::routes())
         .merge(super::assignee_handler::routes())
         .merge(super::activity_handler::routes())
@@ -452,6 +454,101 @@ impl From<ErrorTrackingError> for temps_core::problemdetails::Problem {
                 .value("group_id", group_id)
                 .value("merged_into_group_id", merged_into_group_id)
                 .build(),
+            ErrorTrackingError::AttachmentNotFound {
+                project_id,
+                attachment_id,
+            } => temps_core::error_builder::ErrorBuilder::new(StatusCode::NOT_FOUND)
+                .type_("https://temps.sh/probs/error-attachment-not-found")
+                .title("Attachment Not Found")
+                .detail(err.to_string())
+                .value("project_id", project_id)
+                .value("attachment_id", attachment_id)
+                .build(),
+            ErrorTrackingError::AttachmentStorageUnavailable { project_id, .. } => {
+                temps_core::error_builder::ErrorBuilder::new(StatusCode::SERVICE_UNAVAILABLE)
+                    .type_("https://temps.sh/probs/error-attachment-storage-unavailable")
+                    .title("Attachment Storage Unavailable")
+                    .detail(err.to_string())
+                    .value("project_id", project_id)
+                    .value("setup_path", "/storage")
+                    .build()
+            }
+            ErrorTrackingError::IssueLinkNotFound { group_id, link_id } => {
+                temps_core::error_builder::ErrorBuilder::new(StatusCode::NOT_FOUND)
+                    .type_("https://temps.sh/probs/error-issue-link-not-found")
+                    .title("Issue Link Not Found")
+                    .detail(err.to_string())
+                    .value("group_id", group_id)
+                    .value("link_id", link_id)
+                    .build()
+            }
+            ErrorTrackingError::IssueAlreadyLinked { group_id, ref url } => {
+                let url = url.clone();
+                temps_core::error_builder::ErrorBuilder::new(StatusCode::CONFLICT)
+                    .type_("https://temps.sh/probs/error-issue-already-linked")
+                    .title("Issue Already Linked")
+                    .detail(err.to_string())
+                    .value("group_id", group_id)
+                    .value("url", url)
+                    .build()
+            }
+            ErrorTrackingError::IssueLinkLimit { group_id, limit } => {
+                temps_core::error_builder::ErrorBuilder::new(StatusCode::CONFLICT)
+                    .type_("https://temps.sh/probs/error-issue-link-limit")
+                    .title("Too Many Linked Issues")
+                    .detail(err.to_string())
+                    .value("group_id", group_id)
+                    .value("limit", limit)
+                    .build()
+            }
+            ErrorTrackingError::IssueCreationInProgress { group_id } => {
+                temps_core::error_builder::ErrorBuilder::new(StatusCode::CONFLICT)
+                    .type_("https://temps.sh/probs/error-issue-creation-in-progress")
+                    .title("Issue Creation In Progress")
+                    .detail(err.to_string())
+                    .value("group_id", group_id)
+                    .build()
+            }
+            ErrorTrackingError::IssueOpenedNotLinked {
+                group_id,
+                number,
+                ref url,
+                ref source,
+            } => {
+                let url = url.clone();
+                temps_core::error_builder::ErrorBuilder::new(issue_not_linked_status(source))
+                    .type_("https://temps.sh/probs/error-issue-opened-not-linked")
+                    .title("Issue Opened But Not Linked")
+                    .detail(err.to_string())
+                    .value("group_id", group_id)
+                    .value("number", number)
+                    .value("url", url)
+                    .build()
+            }
+            ErrorTrackingError::SourceControlUnavailable { project_id, .. } => {
+                temps_core::error_builder::ErrorBuilder::new(StatusCode::SERVICE_UNAVAILABLE)
+                    .type_("https://temps.sh/probs/source-control-unavailable")
+                    .title("Source Control Unavailable")
+                    .detail(err.to_string())
+                    .value("project_id", project_id)
+                    .value(
+                        "setup_path",
+                        crate::services::source_control::GIT_PROVIDERS_PATH,
+                    )
+                    .build()
+            }
+            ErrorTrackingError::SourceControl {
+                project_id,
+                ref source,
+            } => {
+                let (status, kind, title) = source_control_status(source);
+                temps_core::error_builder::ErrorBuilder::new(status)
+                    .type_(kind)
+                    .title(title)
+                    .detail(err.to_string())
+                    .value("project_id", project_id)
+                    .build()
+            }
             ErrorTrackingError::InboundFilterNotFound {
                 project_id,
                 filter_id,
@@ -577,8 +674,29 @@ impl axum::response::IntoResponse for ErrorTrackingError {
             | ErrorTrackingError::CommentNotFound { .. }
             | ErrorTrackingError::SavedSearchNotFound { .. }
             | ErrorTrackingError::InboundFilterNotFound { .. }
+            | ErrorTrackingError::AttachmentNotFound { .. }
             | ErrorTrackingError::FingerprintsNotInGroup { .. } => {
                 (StatusCode::NOT_FOUND, self.to_string())
+            }
+            ErrorTrackingError::AttachmentStorageUnavailable { .. } => {
+                (StatusCode::SERVICE_UNAVAILABLE, self.to_string())
+            }
+            ErrorTrackingError::IssueLinkNotFound { .. } => {
+                (StatusCode::NOT_FOUND, self.to_string())
+            }
+            ErrorTrackingError::IssueAlreadyLinked { .. }
+            | ErrorTrackingError::IssueLinkLimit { .. }
+            | ErrorTrackingError::IssueCreationInProgress { .. } => {
+                (StatusCode::CONFLICT, self.to_string())
+            }
+            ErrorTrackingError::IssueOpenedNotLinked { ref source, .. } => {
+                (issue_not_linked_status(source), self.to_string())
+            }
+            ErrorTrackingError::SourceControlUnavailable { .. } => {
+                (StatusCode::SERVICE_UNAVAILABLE, self.to_string())
+            }
+            ErrorTrackingError::SourceControl { ref source, .. } => {
+                (source_control_status(source).0, self.to_string())
             }
             ErrorTrackingError::GroupAlreadyMerged { .. }
             | ErrorTrackingError::GroupIsMergeTarget { .. }
@@ -1216,6 +1334,60 @@ pub async fn list_global_error_groups(
             total_pages: total_count.div_ceil(page_size),
         },
     }))
+}
+
+/// The status of an issue opened but not linked: a conflict when the group
+/// filled up or already has the URL, an internal error otherwise.
+fn issue_not_linked_status(source: &ErrorTrackingError) -> StatusCode {
+    match source {
+        ErrorTrackingError::IssueLinkLimit { .. }
+        | ErrorTrackingError::IssueAlreadyLinked { .. } => StatusCode::CONFLICT,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+/// The HTTP status, problem type and title of a repository failure.
+fn source_control_status(
+    error: &temps_core::SourceControlError,
+) -> (StatusCode, &'static str, &'static str) {
+    use temps_core::SourceControlError as E;
+    match error {
+        E::NotConnected { .. } => (
+            StatusCode::CONFLICT,
+            "https://temps.sh/probs/source-control-not-connected",
+            "No Repository Connected",
+        ),
+        E::Unsupported { .. } => (
+            StatusCode::CONFLICT,
+            "https://temps.sh/probs/source-control-unsupported",
+            "Repository Provider Not Supported",
+        ),
+        E::NotFound { .. } => (
+            StatusCode::NOT_FOUND,
+            "https://temps.sh/probs/source-control-not-found",
+            "Not Found In The Repository",
+        ),
+        E::Forbidden { .. } => (
+            StatusCode::BAD_GATEWAY,
+            "https://temps.sh/probs/source-control-forbidden",
+            "Repository Refused The Request",
+        ),
+        E::MissingPermission { .. } => (
+            StatusCode::BAD_GATEWAY,
+            "https://temps.sh/probs/source-control-missing-permission",
+            "Repository Connection Lacks A Permission",
+        ),
+        E::Provider { .. } => (
+            StatusCode::BAD_GATEWAY,
+            "https://temps.sh/probs/source-control-failed",
+            "Repository Request Failed",
+        ),
+        E::Lookup { .. } => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "https://temps.sh/probs/source-control-lookup-failed",
+            "Repository Lookup Failed",
+        ),
+    }
 }
 
 #[cfg(test)]

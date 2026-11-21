@@ -951,6 +951,24 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
             "delete_error_saved_search",
         ],
     ),
+    (
+        "the bytes of an error or feedback attachment (ADR 111, D4) can hold anything an SDK captured (screenshots, logs, request dumps) and are served for a person to open; deleting one and setting the attachment quota are made in the console or CLI",
+        &[
+            "get_error_attachment_content",
+            "delete_error_attachment",
+            "set_error_attachment_quota",
+        ],
+    ),
+    (
+        "opening, linking and unlinking an error group's issue (ADR 111, D5) writes to the project's GitHub or GitLab repository or to the group's record, and refreshing reads every linked issue from the provider with the project's credentials; replacing the ownership rules decides who new errors are assigned to. A person does these in the console or CLI",
+        &[
+            "create_error_group_issue",
+            "link_error_group_issue",
+            "unlink_error_group_issue",
+            "refresh_error_group_issues",
+            "replace_error_ownership_rules",
+        ],
+    ),
 ];
 
 /// Allowlisted ids that are served by a plugin and so are not in the published

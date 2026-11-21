@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+/// Files sent with error events and feedback (ADR 111, D4).
+pub mod attachments;
 pub mod error_alert_service;
 pub mod error_analytics_service;
 pub mod error_crud_service;
@@ -9,6 +11,7 @@ pub mod error_tracking_service;
 pub mod group_workflow;
 pub mod inbound_filters;
 pub mod performance;
+pub mod source_control;
 pub mod source_map_service;
 pub mod types;
 
