@@ -10340,7 +10340,7 @@ async fn deployments_column(
 #[tokio::test]
 async fn test_image_user_columns_on_deployments_up_and_down() -> anyhow::Result<()> {
     const TEST: &str = "test_image_user_columns_on_deployments_up_and_down";
-    const TARGET: &str = "m20261121_000001_add_image_user_to_deployments";
+    const TARGET: &str = "m20261121_120001_add_image_user_to_deployments";
     if external_db_configured() {
         println!("⏭️  Skipping {TEST}: using external database via TEMPS_TEST_DATABASE_URL");
         return Ok(());
