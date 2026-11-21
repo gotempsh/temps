@@ -110,6 +110,19 @@ export type IdentityResetPhase = "started" | "confirmed";
 
 const identityResetListeners = new Set<(phase: IdentityResetPhase) => void>();
 
+/** True from a reset's `started` until a reset reaches `confirmed`. */
+let identityResetPending = false;
+
+/**
+ * Whether a `reset()` has started but the server has not confirmed it yet
+ * (or refused it). Until then the device may still name the previous
+ * visitor, so a session replay must not start: a recorder created or
+ * started in that window waits for `confirmed`.
+ */
+export function isIdentityResetPending(): boolean {
+  return identityResetPending;
+}
+
 /**
  * Run `listener` at each phase of a `reset()` (ADR 109 D4), so a session
  * replay in progress ends when it starts, and the next one begins only once
@@ -125,6 +138,7 @@ export function onIdentityReset(listener: (phase: IdentityResetPhase) => void): 
 
 /** Tell every `onIdentityReset` listener that a reset reached `phase`. */
 export function notifyIdentityReset(phase: IdentityResetPhase): void {
+  identityResetPending = phase === "started";
   for (const listener of Array.from(identityResetListeners)) {
     try {
       listener(phase);

@@ -4,7 +4,7 @@
 import { record, type eventWithTime } from "rrweb";
 import { pack } from "@rrweb/packer";
 import { SESSION_RECORDER_ENDPOINT, DEFAULT_BASE_PATH, DEFAULT_EXCLUDED_PATHS } from "./constants";
-import { getOrCreateVisitorId } from "./identity";
+import { getOrCreateVisitorId, isIdentityResetPending } from "./identity";
 import { beaconBlob, ingestKeyHeaders, withIngestKey } from "./utils";
 import type { SessionRecordingConfig } from "./types";
 
@@ -721,6 +721,15 @@ export class SessionRecorder {
 
   public start(): void {
     if (this.enabled && this.stopFn) return;
+    if (isIdentityResetPending()) {
+      // A reset is waiting for the server, so the device may still name the
+      // previous visitor: wait for it to confirm, then `resumeAfterReset()`
+      // starts this recording under the new one. An explicit `stop()` in the
+      // meantime cancels it.
+      this.enabled = false;
+      this.resumeAfterResetPending = true;
+      return;
+    }
     this.enabled = true;
     if (typeof window === "undefined") return;
     this.attachGlobalListeners();

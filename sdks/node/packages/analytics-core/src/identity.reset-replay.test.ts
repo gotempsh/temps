@@ -4,6 +4,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createAnalytics } from "./Analytics";
 import { SessionRecorder } from "./SessionRecorder";
+import { isIdentityResetPending, notifyIdentityReset } from "./identity";
 import type { AnalyticsApi } from "./types";
 
 describe("reset() and session replay (ADR 109 D4)", () => {
@@ -32,6 +33,8 @@ describe("reset() and session replay (ADR 109 D4)", () => {
 
   afterEach(() => {
     for (const instance of instances.splice(0)) instance.destroy();
+    // A test that ends with a reset the server refused leaves it pending.
+    notifyIdentityReset("confirmed");
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
   });
@@ -80,6 +83,50 @@ describe("reset() and session replay (ADR 109 D4)", () => {
     confirm();
     await pending;
     expect(start.mock.calls.length).toBe(startsBefore);
+  });
+
+  it("starts a recorder created while a reset is pending only once the server confirmed it", async () => {
+    const startRecording = vi
+      .spyOn(SessionRecorder.prototype as unknown as { startRecording(): Promise<void> }, "startRecording")
+      .mockResolvedValue(undefined);
+    let confirm: () => void = () => undefined;
+    resetResponse = () =>
+      new Promise<Response>((resolve) => {
+        confirm = () => resolve(new Response(null, { status: 204 }));
+      });
+    const resetter = createAnalytics(quiet);
+    instances.push(resetter);
+
+    const pending = resetter.reset();
+    expect(isIdentityResetPending()).toBe(true);
+    const lateRecorder = createAnalytics({ ...quiet, enableSessionRecording: true });
+    instances.push(lateRecorder);
+    const lateRuntime = createAnalytics(quiet);
+    instances.push(lateRuntime);
+    lateRuntime.enableSessionRecording();
+    expect(startRecording).not.toHaveBeenCalled();
+
+    confirm();
+    await pending;
+    expect(isIdentityResetPending()).toBe(false);
+    expect(startRecording).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps a recorder created after a refused reset off until a reset succeeds", async () => {
+    const startRecording = vi
+      .spyOn(SessionRecorder.prototype as unknown as { startRecording(): Promise<void> }, "startRecording")
+      .mockResolvedValue(undefined);
+    resetResponse = async () => new Response(null, { status: 503 });
+    const resetter = createAnalytics(quiet);
+    instances.push(resetter);
+    await expect(resetter.reset()).rejects.toThrow(/503/);
+
+    instances.push(createAnalytics({ ...quiet, enableSessionRecording: true }));
+    expect(startRecording).not.toHaveBeenCalled();
+
+    resetResponse = async () => new Response(null, { status: 204 });
+    await resetter.reset();
+    expect(startRecording).toHaveBeenCalledTimes(1);
   });
 
   it("follows a reset from another instance, and stops listening once destroyed", async () => {
