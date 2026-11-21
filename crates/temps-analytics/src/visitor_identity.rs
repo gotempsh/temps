@@ -265,6 +265,21 @@ fn source_of(
         .and_then(VisitorIdentitySource::from_stored)
 }
 
+/// Whether the backend owns `key`: it marked it `server`, or the key holds a
+/// value with no recorded source. Every browser write records its source, so
+/// an unmarked value came from backend enrichment, including everything a row
+/// held before sources were recorded.
+fn backend_owns(
+    data: Option<&Map<String, Value>>,
+    trait_sources: Option<&Map<String, Value>>,
+    key: &str,
+) -> bool {
+    match source_of(trait_sources, key) {
+        Some(source) => source == VisitorIdentitySource::Server,
+        None => data.is_some_and(|data| data.contains_key(key)),
+    }
+}
+
 /// Apply the trust rules to one call. Pure, so every rule is unit-tested.
 pub fn plan_identify(
     current: &CurrentIdentity,
@@ -292,7 +307,7 @@ pub fn plan_identify(
     let mut set_keys = Vec::new();
     let mut removed_keys = Vec::new();
     for (key, value) in &input.traits {
-        if source == Browser && source_of(current_sources, key) == Some(Server) {
+        if source == Browser && backend_owns(current_data, current_sources, key) {
             continue;
         }
         if value.is_null() {
@@ -637,6 +652,34 @@ mod tests {
             sources,
             Some(json!({"email": "server", "theme": "browser"}))
         );
+    }
+
+    #[test]
+    fn a_browser_cannot_change_or_remove_traits_enriched_before_sources_were_recorded() {
+        // A row enriched before this release: data, but no sources at all.
+        let current = CurrentIdentity {
+            custom_data: Some(json!({"plan": "enterprise", "company": "Example Co"})),
+            ..Default::default()
+        };
+        let plan = plan_identify(
+            &current,
+            Browser,
+            &input(
+                "u_42",
+                json!({"plan": "free", "company": null, "theme": "dark"}),
+            ),
+        );
+        let (_, _, _, data, sources) = write_parts(plan);
+        assert_eq!(
+            data,
+            Some(json!({"plan": "enterprise", "company": "Example Co", "theme": "dark"}))
+        );
+        assert_eq!(sources, Some(json!({"theme": "browser"})));
+
+        // The backend can still change them.
+        let plan = plan_identify(&current, Server, &input("u_42", json!({"plan": "free"})));
+        let (_, _, _, data, _) = write_parts(plan);
+        assert_eq!(data, Some(json!({"plan": "free", "company": "Example Co"})));
     }
 
     #[test]
