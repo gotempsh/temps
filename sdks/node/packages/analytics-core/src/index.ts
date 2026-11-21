@@ -36,6 +36,7 @@ export {
 export {
   identifyVisitor,
   resetVisitor,
+  ResetFailedError,
   IDENTIFY_ENDPOINT,
   RESET_ENDPOINT,
   type IdentifyVisitorOptions,

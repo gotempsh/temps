@@ -113,6 +113,67 @@ describe("identify and reset (ADR 109 D4)", () => {
     expect(order).toEqual(["event", "event-done", "identify"]);
   });
 
+  it("sends nothing for an identify that was waiting when reset() ran", async () => {
+    let finishPageview: () => void = () => undefined;
+    fetchMock.mockImplementation((url: string) => {
+      if (String(url).endsWith("/event")) {
+        return new Promise<Response>((resolve) => {
+          finishPageview = () => resolve(new Response(null, { status: 204 }));
+        });
+      }
+      if (String(url).endsWith("/identify")) {
+        return Promise.resolve(jsonResponse(200, { applied: true, outcome: "updated", message: "ok" }));
+      }
+      return Promise.resolve(new Response(null, { status: 204 }));
+    });
+    analytics = createAnalytics(quiet);
+    analytics.trackPageview();
+    const pending = analytics.identify("signed-out-user");
+    await analytics.reset();
+    finishPageview();
+
+    const result = await pending;
+    expect(result).toMatchObject({ applied: false, outcome: "reset" });
+    expect(identifyCalls()).toHaveLength(0);
+    expect(localStorage.getItem("temps_identified")).toBeNull();
+  });
+
+  it("does not restore the memo from an identify answered after reset()", async () => {
+    let answerIdentify: () => void = () => undefined;
+    fetchMock.mockImplementation((url: string) => {
+      if (String(url).endsWith("/identify")) {
+        return new Promise<Response>((resolve) => {
+          answerIdentify = () => resolve(jsonResponse(200, { applied: true, outcome: "updated", message: "ok" }));
+        });
+      }
+      return Promise.resolve(new Response(null, { status: 204 }));
+    });
+    analytics = createAnalytics(quiet);
+    const pending = analytics.identify("signed-out-user");
+    await vi.waitFor(() => expect(identifyCalls()).toHaveLength(1));
+    await analytics.reset();
+    answerIdentify();
+    await pending;
+    expect(localStorage.getItem("temps_identified")).toBeNull();
+  });
+
+  it("reset() rejects when the server did not confirm it, after clearing local ids", async () => {
+    analytics = createAnalytics(quiet);
+    await analytics.trackEvent("signup");
+    fetchMock.mockImplementation(async (url: string) => {
+      if (String(url).endsWith("/reset")) throw new TypeError("Failed to fetch");
+      return new Response(null, { status: 204 });
+    });
+    await expect(analytics.reset()).rejects.toMatchObject({ name: "ResetFailedError" });
+    expect(analytics.getVisitorId()).toBeUndefined();
+
+    fetchMock.mockImplementation(async () => new Response(null, { status: 503 }));
+    await expect(analytics.reset()).rejects.toThrow(/answered 503/);
+
+    fetchMock.mockImplementation(async () => new Response(null, { status: 204 }));
+    await expect(analytics.reset()).resolves.toBeUndefined();
+  });
+
   it("refuses an empty user id without a request", async () => {
     analytics = createAnalytics(quiet);
     const result = await analytics.identify("  ");

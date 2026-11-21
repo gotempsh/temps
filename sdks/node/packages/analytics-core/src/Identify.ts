@@ -36,6 +36,21 @@ export interface IdentifyVisitorOptions {
   ready?: Promise<unknown>;
 }
 
+/**
+ * Bumped by every `reset()`. An identify that was waiting for its page view
+ * when the visitor reset belongs to the signed-out user: it must not label
+ * the next visitor, nor restore the memo the reset cleared.
+ */
+let identityGeneration = 0;
+
+/** Thrown by `resetVisitor` when the server did not confirm the reset. */
+export class ResetFailedError extends Error {
+  constructor(message: string, readonly cause?: unknown) {
+    super(message);
+    this.name = "ResetFailedError";
+  }
+}
+
 function memoFor(userId: string, traits: Record<string, JsonValue> | undefined): string {
   return JSON.stringify([userId, traits ?? null]);
 }
@@ -61,7 +76,8 @@ function writeMemo(value: string | null): void {
 /**
  * Send `identify` for the current visitor. Resolves to the server's answer,
  * or to a local one when nothing was sent (`cookieless_project`,
- * `already_sent`, `invalid_user_id`, `network_error`). Never throws.
+ * `already_sent`, `invalid_user_id`, `network_error`, `reset`). Never
+ * throws.
  */
 export async function identifyVisitor(options: IdentifyVisitorOptions): Promise<IdentifyResult> {
   const { basePath, ingestKey, userId, traits, ready } = options;
@@ -79,11 +95,28 @@ export async function identifyVisitor(options: IdentifyVisitorOptions): Promise<
   if (readMemo() === memo) {
     return { applied: true, outcome: "already_sent", message: "This visitor already has this identity." };
   }
+  const generation = identityGeneration;
   try {
     await ready;
   } catch {
     // A failed page view does not stop identify; the server says if the
     // visitor is missing.
+  }
+  // Rechecked after the wait: the page may have signed out or switched to
+  // cookieless mode meanwhile.
+  if (generation !== identityGeneration) {
+    return {
+      applied: false,
+      outcome: "reset",
+      message: "reset() ran while identify was waiting; nothing was sent.",
+    };
+  }
+  if (isCookielessIdentity()) {
+    return {
+      applied: false,
+      outcome: "cookieless_project",
+      message: "Identify stores nothing in cookieless mode.",
+    };
   }
   try {
     const response = await fetch(`${basePath}/${IDENTIFY_ENDPOINT}`, {
@@ -97,7 +130,8 @@ export async function identifyVisitor(options: IdentifyVisitorOptions): Promise<
       outcome: typeof body?.outcome === "string" ? body.outcome : `http_${response.status}`,
       message: typeof body?.message === "string" ? body.message : response.statusText,
     };
-    if (response.ok && APPLIED_OUTCOMES.has(result.outcome)) writeMemo(memo);
+    const stillCurrent = generation === identityGeneration && !isCookielessIdentity();
+    if (response.ok && APPLIED_OUTCOMES.has(result.outcome) && stillCurrent) writeMemo(memo);
     return result;
   } catch (error) {
     // eslint-disable-next-line no-console
@@ -110,21 +144,32 @@ export async function identifyVisitor(options: IdentifyVisitorOptions): Promise<
  * Forget who this browser belongs to, for a sign-out: deletes the stored
  * visitor and session ids and the identify memo, and asks the server to
  * expire its tracking cookies. The next event starts a new, anonymous
- * visitor. Never throws.
+ * visitor.
+ *
+ * Rejects with `ResetFailedError` when the server did not confirm the
+ * reset (offline, or an error status): on a site Temps serves, its tracking
+ * cookie still names the signed-out visitor until the reset reaches it, so
+ * the caller should retry. The local ids are cleared either way.
  */
 export async function resetVisitor(options: { basePath: string; ingestKey?: string }): Promise<void> {
+  identityGeneration += 1;
   writeMemo(null);
   clearStoredIdentity();
   // A replay in progress belongs to the previous visitor; end it now.
   notifyIdentityReset();
   if (isCookielessIdentity()) return;
+  let response: Response;
   try {
-    await fetch(`${options.basePath}/${RESET_ENDPOINT}`, {
+    response = await fetch(`${options.basePath}/${RESET_ENDPOINT}`, {
       method: "POST",
       headers: ingestKeyHeaders(options.ingestKey),
     });
   } catch (error) {
-    // eslint-disable-next-line no-console
-    console.error("Failed to reset analytics identity:", error);
+    throw new ResetFailedError(`Could not reach ${options.basePath}/${RESET_ENDPOINT} to reset the visitor`, error);
+  }
+  if (!response.ok) {
+    throw new ResetFailedError(
+      `${options.basePath}/${RESET_ENDPOINT} answered ${response.status}; the visitor was not reset on the server`
+    );
   }
 }

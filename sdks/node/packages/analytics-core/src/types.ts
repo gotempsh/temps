@@ -214,7 +214,9 @@ export interface AnalyticsApi {
   identify(userId: string, traits?: Record<string, JsonValue>): Promise<IdentifyResult>;
   /**
    * Forget the identity on sign-out: the next event belongs to a new,
-   * anonymous visitor.
+   * anonymous visitor. Rejects with `ResetFailedError` when the server did
+   * not confirm it (its tracking cookie still names the old visitor), so
+   * retry; the ids stored in the browser are cleared either way.
    */
   reset(): Promise<void>;
   /**
@@ -258,7 +260,8 @@ export interface IdentifyResult {
    * The server's outcome (`updated`, `unchanged`, `visitor_not_found`,
    * `cookieless_project`, `browser_identify_refused`,
    * `server_identity_kept`), or a local one when nothing was sent:
-   * `already_sent`, `invalid_user_id`, `network_error`, `http_<status>`.
+   * `already_sent`, `invalid_user_id`, `network_error`, `http_<status>`,
+   * or `reset` when `reset()` ran while it waited for the page view.
    */
   outcome: string;
   message: string;
