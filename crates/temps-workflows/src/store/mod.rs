@@ -32,6 +32,43 @@ use crate::types::{RunStatus, StepKind, StepStatus, WorkflowSettings};
 pub use postgres::{PgWorkflowStore, DUE_CHANNEL};
 
 pub type RunRow = workflow_runs::Model;
+
+/// A run from the cross-project scan, with the slugs that name its project
+/// and environment. The scan inner-joins both tables, so the names come with
+/// the run in the same query and a run never costs a lookup of its own.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScannedRun {
+    pub run: RunRow,
+    pub project_slug: String,
+    pub environment_slug: String,
+}
+
+impl sea_orm::FromQueryResult for ScannedRun {
+    fn from_query_result(row: &sea_orm::QueryResult, pre: &str) -> Result<Self, sea_orm::DbErr> {
+        Ok(Self {
+            run: RunRow::from_query_result(row, pre)?,
+            project_slug: row.try_get(pre, "project_slug")?,
+            environment_slug: row.try_get(pre, "environment_slug")?,
+        })
+    }
+}
+/// An environment and its project, named by slug.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvironmentName {
+    pub project_id: i32,
+    pub environment_id: i32,
+    pub project_slug: String,
+    pub environment_slug: String,
+}
+
+/// Run counts of one workflow in one environment, for the cross-project
+/// list of workflows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvironmentWorkflowSummary {
+    pub environment: EnvironmentName,
+    pub summary: WorkflowSummary,
+}
+
 pub type StepRow = workflow_steps::Model;
 pub type EventRow = workflow_events::Model;
 pub type CredentialRow = workflow_credentials::Model;
@@ -450,13 +487,38 @@ pub trait WorkflowStore: Send + Sync {
 
     // ── Reads, metrics, retention ────────────────────────────────────
 
-    /// Bounded global scan ordered newest first. Authorization is applied before exposing rows.
+    /// Run counts per workflow and environment across every live project, in
+    /// one grouped query inner-joined to the environment and project for
+    /// their slugs. Most recently run first, at most `limit` rows.
+    /// Workflow history across projects, most recently run first, at most
+    /// `limit` rows. With `projects`, only those projects are counted, so a
+    /// caller limited to some projects is bounded among theirs alone.
+    async fn global_workflow_summaries(
+        &self,
+        limit: u64,
+        projects: Option<&[i32]>,
+    ) -> WorkflowResult<Vec<EnvironmentWorkflowSummary>>;
+
+    /// One page of the live projects with at least one workflow run, by
+    /// ascending id after `after`, at most `limit`: one row per project, not
+    /// per run, so callers walk every project in bounded batches.
+    async fn workflow_project_ids(&self, after: i32, limit: u64) -> WorkflowResult<Vec<i32>>;
+    /// Live environments among `environment_ids` with their project, in one
+    /// joined query. Deleted environments and projects are absent.
+    async fn environment_names(
+        &self,
+        environment_ids: &[i32],
+    ) -> WorkflowResult<Vec<EnvironmentName>>;
+    /// Bounded global scan ordered newest first, one query joining each run
+    /// to its live project and environment for their slugs. Runs of a
+    /// soft-deleted project or environment are skipped: their run pages are
+    /// gone. Authorization is applied before exposing rows.
     async fn scan_runs(
         &self,
         filter: &RunFilter,
         before: Option<(DateTime<Utc>, Uuid)>,
         limit: u64,
-    ) -> WorkflowResult<Vec<RunRow>>;
+    ) -> WorkflowResult<Vec<ScannedRun>>;
     async fn get_run(&self, run_id: Uuid) -> WorkflowResult<Option<RunRow>>;
     async fn find_started(
         &self,

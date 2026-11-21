@@ -13,12 +13,14 @@ import {
   listWorkflowStepsOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { WorkflowRunDetail } from './WorkflowRunDetail'
+import { failedStepQuery } from './run-failure'
 
-function render(populated = true) {
+const path = { project_id: 1, environment_id: 2, run_id: 'synthetic-run' }
+
+function render(populated = true, seed?: (client: QueryClient) => void) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false, staleTime: Infinity } },
   })
-  const path = { project_id: 1, environment_id: 2, run_id: 'synthetic-run' }
   if (populated) {
     client.setQueryData<object>(
       getProjectOptions({ path: { id: 1 } }).queryKey,
@@ -57,6 +59,7 @@ function render(populated = true) {
       }
     )
   }
+  seed?.(client)
   return renderToStaticMarkup(
     <MemoryRouter initialEntries={['/workflows/1/2/runs/synthetic-run']}>
       <QueryClientProvider client={client}>
@@ -93,4 +96,75 @@ test('loading metadata is explicit and does not present numeric IDs as names', (
   expect(html).toContain('Loading project')
   expect(html).toContain('Loading environment')
   expect(html).not.toContain('Invalid Date')
+})
+
+function failedJournal(failedSequence: number) {
+  return {
+    steps: [0, 1, 2].map((sequence) => ({
+      sequence,
+      name: `step-${sequence + 1}`,
+      kind: 'step',
+      status: sequence === failedSequence ? 'failed' : 'completed',
+      attempts: 3,
+    })),
+    total: 3,
+    total_pages: 1,
+  }
+}
+
+test('a run that failed again names the step of its latest failure, not the cached one', () => {
+  const firstFailure = {
+    id: path.run_id,
+    attempt: 1,
+    finished_at: '2026-01-01T00:01:00Z',
+    updated_at: '2026-01-01T00:01:00Z',
+  }
+  const retriedFailure = {
+    ...firstFailure,
+    attempt: 2,
+    finished_at: '2026-01-01T00:05:00Z',
+    updated_at: '2026-01-01T00:05:00Z',
+  }
+  const html = render(true, (client) => {
+    client.setQueryData<object>(getWorkflowRunOptions({ path }).queryKey, {
+      ...retriedFailure,
+      workflow: 'email/sequence',
+      status: 'failed',
+      error_kind: 'step_failed',
+      created_at: '2026-01-01T00:00:00Z',
+      step_count: 3,
+    })
+    // The first failure's lookup is still cached: step 2 failed then.
+    client.setQueryData<object>(
+      failedStepQuery(path, firstFailure, 1).queryKey,
+      failedJournal(1)
+    )
+  })
+  // The retry's journal is read afresh; until it arrives no step is named.
+  expect(html).toContain('A step failed on every attempt')
+  expect(html).not.toContain('Step 2, step-2')
+})
+
+test('the latest failure names its own failed step once its journal is read', () => {
+  const html = render(true, (client) => {
+    const run = {
+      id: path.run_id,
+      attempt: 2,
+      finished_at: '2026-01-01T00:05:00Z',
+      updated_at: '2026-01-01T00:05:00Z',
+    }
+    client.setQueryData<object>(getWorkflowRunOptions({ path }).queryKey, {
+      ...run,
+      workflow: 'email/sequence',
+      status: 'failed',
+      error_kind: 'step_failed',
+      created_at: '2026-01-01T00:00:00Z',
+      step_count: 3,
+    })
+    client.setQueryData<object>(
+      failedStepQuery(path, run, 1).queryKey,
+      failedJournal(2)
+    )
+  })
+  expect(html).toContain('Step 3, step-3, failed after 3 attempts')
 })

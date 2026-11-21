@@ -48,6 +48,7 @@ import { TimeAgo } from '@/components/utils/TimeAgo'
 import { OBSERVABILITY_PAGE_SIZE } from '@/lib/global-observability'
 import { useGlobalPageInRange } from '@/hooks/useGlobalView'
 import { useWindowQuery } from '@/hooks/useWindowQuery'
+import { ObservabilitySetupGuide } from '@/components/observability/ObservabilitySetupGuide'
 
 export default function GlobalTraces() {
   const view = useGlobalView()
@@ -183,6 +184,11 @@ export default function GlobalTraces() {
         error={query.error}
         empty={!traces.length}
         retry={() => void query.refetch()}
+        setup={
+          !view.search && status === 'all' ? (
+            <ObservabilitySetupGuide kind="traces" projectId={view.projectId} />
+          ) : undefined
+        }
       >
         <div className="rounded-lg border">
           <Table>

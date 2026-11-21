@@ -29,3 +29,24 @@ export function runHref(run: {
 }): string {
   return `/workflows/${run.project_id}/${run.environment_id}/runs/${encodeURIComponent(run.id)}`
 }
+
+/** Whether an environment's deployed executor declares a workflow. */
+export type DefinitionState = 'available' | 'missing' | 'unknown'
+
+export function definitionStatus(state: DefinitionState): {
+  tone: StatusTone
+  label: string
+} {
+  if (state === 'available') return { tone: 'ok', label: 'Deployed' }
+  if (state === 'missing') return { tone: 'warn', label: 'Not in deployment' }
+  return { tone: 'idle', label: 'Not checked yet' }
+}
+
+/** The page listing one workflow's runs in one environment. */
+export function workflowHref(workflow: {
+  project_id: number
+  environment_id: number
+  name: string
+}): string {
+  return `/workflows/${workflow.project_id}/${workflow.environment_id}?workflow=${encodeURIComponent(workflow.name)}`
+}

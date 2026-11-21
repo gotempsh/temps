@@ -38561,6 +38561,29 @@
         ],
         "type": "object"
       },
+      "GlobalWorkflowRunResponse": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/WorkflowRunResponse"
+          },
+          {
+            "properties": {
+              "environment_slug": {
+                "type": "string"
+              },
+              "project_slug": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "project_slug",
+              "environment_slug"
+            ],
+            "type": "object"
+          }
+        ],
+        "description": "A run in the cross-project listing: the run, plus the slugs that name its\nproject and environment, so the list reads `shop · production` rather than\nbare ids."
+      },
       "GlobalWorkflowRunsResponse": {
         "properties": {
           "next_cursor": {
@@ -38571,7 +38594,7 @@
           },
           "runs": {
             "items": {
-              "$ref": "#/components/schemas/WorkflowRunResponse"
+              "$ref": "#/components/schemas/GlobalWorkflowRunResponse"
             },
             "type": "array"
           }
@@ -89590,6 +89613,124 @@
         },
         "required": [
           "configured"
+        ],
+        "type": "object"
+      },
+      "WorkflowDefinitionResponse": {
+        "description": "One workflow in one environment, with its run counts.",
+        "properties": {
+          "active_runs": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "completed_runs": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "concurrency": {
+            "description": "Runs allowed to execute at once, from the manifest.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "environment_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "environment_slug": {
+            "type": "string"
+          },
+          "failed_runs": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "last_run_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "project_slug": {
+            "type": "string"
+          },
+          "state": {
+            "$ref": "#/components/schemas/WorkflowDefinitionState"
+          },
+          "version": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "name",
+          "project_id",
+          "environment_id",
+          "project_slug",
+          "environment_slug",
+          "state",
+          "active_runs",
+          "completed_runs",
+          "failed_runs"
+        ],
+        "type": "object"
+      },
+      "WorkflowDefinitionState": {
+        "description": "Whether the environment's current executor declares the workflow.",
+        "enum": [
+          "available",
+          "missing",
+          "unknown"
+        ],
+        "type": "string"
+      },
+      "WorkflowDefinitionsResponse": {
+        "properties": {
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total_pages": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "workflows": {
+            "items": {
+              "$ref": "#/components/schemas/WorkflowDefinitionResponse"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "workflows",
+          "total",
+          "page",
+          "page_size",
+          "total_pages"
         ],
         "type": "object"
       },
@@ -192569,6 +192710,70 @@
         ],
         "tags": [
           "Workflow Executor"
+        ]
+      }
+    },
+    "/workflows/definitions": {
+      "get": {
+        "operationId": "list_workflow_definitions",
+        "parameters": [
+          {
+            "description": "1-based page; default 1.",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Default 20, at most 100.",
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowDefinitionsResponse"
+                }
+              }
+            },
+            "description": "Workflows across the projects the caller may read, most recently run first"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "description": "Access or database failure"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Workflows"
         ]
       }
     },

@@ -20,7 +20,7 @@ use sea_orm::{
     TransactionTrait, Value,
 };
 use temps_entities::{
-    environments, workflow_credentials, workflow_environment_settings, workflow_events,
+    environments, projects, workflow_credentials, workflow_environment_settings, workflow_events,
     workflow_runs, workflow_steps,
 };
 use uuid::Uuid;
@@ -1604,14 +1604,145 @@ impl WorkflowStore for PgWorkflowStore {
             .map_err(WorkflowError::db("loading a workflow run"))
     }
 
+    async fn global_workflow_summaries(
+        &self,
+        limit: u64,
+        projects: Option<&[i32]>,
+    ) -> WorkflowResult<Vec<EnvironmentWorkflowSummary>> {
+        #[derive(FromQueryResult)]
+        struct Row {
+            project_id: i32,
+            environment_id: i32,
+            project_slug: String,
+            environment_slug: String,
+            workflow_name: String,
+            active: i64,
+            completed: i64,
+            failed: i64,
+            last_run_at: Option<DateTime<Utc>>,
+        }
+        let limit = i64::try_from(limit.clamp(1, 1000)).unwrap_or(1000);
+        if projects.is_some_and(<[i32]>::is_empty) {
+            return Ok(Vec::new());
+        }
+        let (scope, mut values) = match projects {
+            Some(ids) => ("WHERE r.project_id = ANY($2) ", vec![ids.to_vec().into()]),
+            None => ("", Vec::new()),
+        };
+        values.insert(0, limit.into());
+        let rows = Row::find_by_statement(stmt(
+            &format!(
+                "SELECT r.project_id, r.environment_id, p.slug AS project_slug, \
+                 e.slug AS environment_slug, r.workflow_name, \
+                 count(*) FILTER (WHERE r.status NOT IN {TERMINAL})::BIGINT AS active, \
+                 count(*) FILTER (WHERE r.status = 'completed')::BIGINT AS completed, \
+                 count(*) FILTER (WHERE r.status = 'failed')::BIGINT AS failed, \
+                 max(r.created_at) AS last_run_at \
+                 FROM workflow_runs r \
+                 INNER JOIN environments e ON e.id = r.environment_id AND e.deleted_at IS NULL \
+                 INNER JOIN projects p ON p.id = r.project_id AND p.deleted_at IS NULL \
+                 {scope}\
+                 GROUP BY r.project_id, r.environment_id, p.slug, e.slug, r.workflow_name \
+                 ORDER BY last_run_at DESC, r.workflow_name LIMIT $1"
+            ),
+            values,
+        ))
+        .all(self.db.as_ref())
+        .await
+        .map_err(WorkflowError::db("summarizing workflows across projects"))?;
+        Ok(rows
+            .into_iter()
+            .map(|row| EnvironmentWorkflowSummary {
+                environment: EnvironmentName {
+                    project_id: row.project_id,
+                    environment_id: row.environment_id,
+                    project_slug: row.project_slug,
+                    environment_slug: row.environment_slug,
+                },
+                summary: WorkflowSummary {
+                    workflow_name: row.workflow_name,
+                    active: row.active,
+                    completed: row.completed,
+                    failed: row.failed,
+                    last_run_at: row.last_run_at,
+                },
+            })
+            .collect())
+    }
+
+    async fn workflow_project_ids(&self, after: i32, limit: u64) -> WorkflowResult<Vec<i32>> {
+        #[derive(FromQueryResult)]
+        struct Row {
+            id: i32,
+        }
+        let limit = i64::try_from(limit.clamp(1, 1000)).unwrap_or(1000);
+        let rows = Row::find_by_statement(stmt(
+            "SELECT p.id FROM projects p WHERE p.deleted_at IS NULL AND p.id > $1 \
+             AND EXISTS (SELECT 1 FROM workflow_runs r \
+             INNER JOIN environments e ON e.id = r.environment_id AND e.deleted_at IS NULL \
+             WHERE r.project_id = p.id) \
+             ORDER BY p.id LIMIT $2",
+            vec![after.into(), limit.into()],
+        ))
+        .all(self.db.as_ref())
+        .await
+        .map_err(WorkflowError::db("listing projects with workflow runs"))?;
+        Ok(rows.into_iter().map(|row| row.id).collect())
+    }
+
+    async fn environment_names(
+        &self,
+        environment_ids: &[i32],
+    ) -> WorkflowResult<Vec<EnvironmentName>> {
+        if environment_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        #[derive(FromQueryResult)]
+        struct Row {
+            project_id: i32,
+            environment_id: i32,
+            project_slug: String,
+            environment_slug: String,
+        }
+        let rows = Row::find_by_statement(stmt(
+            "SELECT e.project_id, e.id AS environment_id, p.slug AS project_slug, \
+             e.slug AS environment_slug \
+             FROM environments e \
+             INNER JOIN projects p ON p.id = e.project_id AND p.deleted_at IS NULL \
+             WHERE e.id = ANY($1) AND e.deleted_at IS NULL",
+            vec![environment_ids.to_vec().into()],
+        ))
+        .all(self.db.as_ref())
+        .await
+        .map_err(WorkflowError::db("naming environments with workflows"))?;
+        Ok(rows
+            .into_iter()
+            .map(|row| EnvironmentName {
+                project_id: row.project_id,
+                environment_id: row.environment_id,
+                project_slug: row.project_slug,
+                environment_slug: row.environment_slug,
+            })
+            .collect())
+    }
+
     async fn scan_runs(
         &self,
         filter: &RunFilter,
         before: Option<(DateTime<Utc>, Uuid)>,
         limit: u64,
-    ) -> WorkflowResult<Vec<RunRow>> {
-        use sea_orm::Condition;
-        let mut query = workflow_runs::Entity::find();
+    ) -> WorkflowResult<Vec<ScannedRun>> {
+        use sea_orm::{Condition, JoinType, RelationTrait};
+        let mut query = workflow_runs::Entity::find()
+            .join(
+                JoinType::InnerJoin,
+                workflow_runs::Relation::Environment.def(),
+            )
+            .join(JoinType::InnerJoin, workflow_runs::Relation::Project.def())
+            .filter(environments::Column::DeletedAt.is_null())
+            .filter(projects::Column::DeletedAt.is_null())
+            .column_as(projects::Column::Slug, "project_slug")
+            .column_as(environments::Column::Slug, "environment_slug");
         if let Some((time, id)) = before {
             query = query.filter(
                 Condition::any()
@@ -1633,6 +1764,7 @@ impl WorkflowStore for PgWorkflowStore {
             .order_by_desc(workflow_runs::Column::CreatedAt)
             .order_by_desc(workflow_runs::Column::Id)
             .limit(limit.clamp(1, 100))
+            .into_model::<ScannedRun>()
             .all(self.db.as_ref())
             .await
             .map_err(WorkflowError::db("scanning global workflow runs"))

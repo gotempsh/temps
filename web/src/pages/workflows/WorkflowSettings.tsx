@@ -25,6 +25,7 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { Skeleton } from '@/components/ui/skeleton'
+import { usePageTitle } from '@/hooks/usePageTitle'
 import { problemDetail } from '@/lib/api-problem'
 
 const schema = z.object({
@@ -35,10 +36,30 @@ const schema = z.object({
 type Fields = z.infer<typeof schema>
 export function WorkflowSettings() {
   const params = useParams()
-  const path = {
-    project_id: Number(params.projectId),
-    environment_id: Number(params.environmentId),
-  }
+  usePageTitle('Workflow settings')
+  return (
+    <WorkflowSettingsPanel
+      path={{
+        project_id: Number(params.projectId),
+        environment_id: Number(params.environmentId),
+      }}
+    />
+  )
+}
+
+/**
+ * The environment's workflow settings form. `embedded` renders it as a section
+ * of the workflow page instead of a page of its own.
+ */
+export function WorkflowSettingsPanel({
+  path,
+  embedded = false,
+  description,
+}: {
+  path: { project_id: number; environment_id: number }
+  embedded?: boolean
+  description?: string
+}) {
   const query = useQuery(getWorkflowSettingsOptions({ path }))
   if (query.isPending) return <Skeleton className="h-64 w-full" />
   if (query.isError)
@@ -52,15 +73,25 @@ export function WorkflowSettings() {
       />
     )
   return (
-    <SettingsForm key={query.dataUpdatedAt} path={path} settings={query.data} />
+    <SettingsForm
+      key={query.dataUpdatedAt}
+      path={path}
+      settings={query.data}
+      embedded={embedded}
+      description={description}
+    />
   )
 }
 export function SettingsForm({
   path,
   settings,
+  embedded = false,
+  description,
 }: {
   path: { project_id: number; environment_id: number }
   settings: SettingsValue
+  embedded?: boolean
+  description?: string
 }) {
   const cache = useQueryClient()
   const services = useQuery(
@@ -111,6 +142,13 @@ export function SettingsForm({
   return (
     <Settings
       title="Workflow settings"
+      description={description}
+      embedded={embedded}
+      headerActions={
+        <Button asChild variant="outline">
+          <Link to="/workflows">All workflows</Link>
+        </Button>
+      }
       saving={save.isPending}
       dirty={form.formState.isDirty}
       errors={{
@@ -118,9 +156,6 @@ export function SettingsForm({
       }}
       onSubmit={form.handleSubmit((value) => save.mutate(value))}
     >
-      <Button asChild variant="outline">
-        <Link to="/workflows">All workflows</Link>
-      </Button>
       <Field
         label="Journal storage"
         description="The control-plane database needs no setup. Managed PostgreSQL stores new runs’ journals separately; existing runs keep their original store. Scheduling stays in Temps. Keep the selected database linked and backed up."
