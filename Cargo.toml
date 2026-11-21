@@ -632,45 +632,7 @@ debug = false
 #    - Fix: Requires russh to upgrade libcrux dependencies
 #    - Status: Dev-dependency only, zero production impact
 #
-# 5. RUSTSEC-2026-0235: rkyv 0.7.46 (out-of-bounds read, lockfile-only)
-#    - Path: sea-orm 1.1.20 → rust_decimal 1.42.0 → rkyv 0.7.46 (OPTIONAL)
-#    - Fix: patched in rkyv 0.8.17; upstream no longer supports the 0.7 series,
-#      and rust_decimal 1.42.1 (latest) still declares `rkyv ^0.7.46`. A
-#      [patch.crates-io] to 0.8 is semver-incompatible and rejected. Removing
-#      the entry from Cargo.lock by hand does not stick -- cargo re-adds it on
-#      the next resolve. Total upstream block until rust_decimal bumps it.
-#    - Reachability: NOT COMPILED AT ALL. rkyv is an optional feature of
-#      rust_decimal that nothing in this workspace enables. It appears in
-#      Cargo.lock because cargo resolves the lock over the maximal feature set,
-#      but `cargo tree --target all -e normal` has zero occurrences of rkyv
-#      (verified 2026-08-04, contrast rust_decimal itself with 9). The
-#      vulnerability requires validating an untrusted archive containing
-#      Rc/Arc; temps neither compiles nor calls rkyv.
-#    - Tooling note: this is a false positive of the gate, not of the advisory.
-#      cargo-audit reads Cargo.lock rather than the built artifact. Moving the
-#      job to cargo-auditable + `cargo audit bin` would remove the need for
-#      this exception entirely, and is the preferred long-term fix.
-#
 # 4. astral-tokio-tar: RESOLVED by upgrading testcontainers 0.27.1 → 0.27.2
-#
-# 5. RUSTSEC-2026-0253: lru 0.16.4 (unsound use-after-free in LruCache::pop())
-#    - Path: aws-sdk-s3 1.138.1 → lru 0.16.4 (aws-sdk-s3 declares `lru = "^0.16.3"`)
-#    - Fix: patched in lru 0.18.2.
-#    - Upstream status (checked 2026-08-24): BLOCKED. aws-sdk-s3 1.143.0
-#      (crates.io latest as of that date) still declares `lru = "^0.16.3"` --
-#      confirmed via `cargo update -p aws-sdk-s3 --precise 1.143.0 --dry-run
-#      --verbose`, which does not touch the lru entry. No newer aws-sdk-s3
-#      release has moved past lru 0.16 yet. A [patch.crates-io] override to
-#      0.18.2 would violate aws-sdk-s3's own semver requirement and risks
-#      breaking whatever internal caching it does with the crate.
-#    - Reachability review (2026-10-06, locked aws-sdk-s3 1.138.1): the only
-#      LruCache in that crate is S3ExpressIdentityCache in src/s3_express.rs.
-#      Its private key is CacheKey(String), with no custom Drop implementation;
-#      get_or_load uses get_or_insert_mut, not pop. The advisory requires a
-#      panicking key destructor during pop plus reuse after catching the panic.
-#      Those prerequisites are absent in this reviewed consumer. This does not
-#      fix the dependency or establish safety for other consumers/features;
-#      re-review the key type and operations on every aws-sdk-s3 upgrade.
 #
 # Previously resolved:
 # - zip 8.6.0 (RUSTSEC-2026-0367/-0368/-0369, GHSA-m665-v7pm-7grj): RESOLVED by
