@@ -29,6 +29,7 @@ export {
   enableCookielessIdentity,
   isCookielessIdentity,
   onCookielessIdentity,
+  onIdentityReset,
   clearStoredIdentity,
   getStoredVisitorId,
 } from "./identity";

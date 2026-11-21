@@ -737,6 +737,17 @@ export class SessionRecorder {
     this.destroy();
   }
 
+  /**
+   * End the current replay, sending what it has to that replay, and start a
+   * new session when recording was on: the page's visitor changed (`reset()`
+   * after a sign-out), so later activity must not join the earlier replay.
+   */
+  public restart(): void {
+    const wasEnabled = this.enabled;
+    this.stop();
+    if (wasEnabled) this.start();
+  }
+
   public getSessionId(): string | null {
     return this.sessionId || null;
   }

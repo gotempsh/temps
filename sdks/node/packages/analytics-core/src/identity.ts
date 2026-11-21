@@ -100,6 +100,33 @@ export function onCookielessIdentity(listener: () => void): () => void {
   };
 }
 
+const identityResetListeners = new Set<() => void>();
+
+/**
+ * Run `listener` when `reset()` drops the page's visitor and session ids
+ * (ADR 109 D4), so a session replay in progress ends and the next one starts
+ * under the new ids instead of joining two people's activity into one
+ * recording. Returns the unsubscribe function.
+ */
+export function onIdentityReset(listener: () => void): () => void {
+  identityResetListeners.add(listener);
+  return () => {
+    identityResetListeners.delete(listener);
+  };
+}
+
+/** Tell every `onIdentityReset` listener that the stored ids were dropped. */
+export function notifyIdentityReset(): void {
+  for (const listener of Array.from(identityResetListeners)) {
+    try {
+      listener();
+    } catch (error) {
+      // eslint-disable-next-line no-console
+      console.error("[temps] identity reset listener failed:", error);
+    }
+  }
+}
+
 /** Whether identity storage is off for this page (see `enableCookielessIdentity`). */
 export function isCookielessIdentity(): boolean {
   return cookieless;

@@ -18,7 +18,13 @@ import {
   notFoundEventData,
   setupLinkTracking,
 } from "./AutoTracking";
-import { enableCookielessIdentity, getStoredVisitorId, isCookielessIdentity, onCookielessIdentity } from "./identity";
+import {
+  enableCookielessIdentity,
+  getStoredVisitorId,
+  isCookielessIdentity,
+  onCookielessIdentity,
+  onIdentityReset,
+} from "./identity";
 import { exposureEventData, FeatureFlags } from "./FeatureFlags";
 import { Surveys, type Survey } from "./Surveys";
 import { renderSurveyWidget } from "./SurveyWidget";
@@ -293,6 +299,9 @@ export function createAnalytics(options: AnalyticsOptions = {}): AnalyticsApi {
       runtimeRecorder = null;
     })
   );
+  // `reset()` (from any instance) gives the page a new visitor: the replay
+  // in progress ends and the next one starts a new session.
+  cleanups.push(onIdentityReset(() => runtimeRecorder?.restart()));
 
   return {
     get enabled(): boolean {

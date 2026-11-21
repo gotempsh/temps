@@ -13,7 +13,7 @@
 
 import type { IdentifyResult, JsonValue } from "./types";
 import { ingestKeyHeaders } from "./utils";
-import { clearStoredIdentity, getOrCreateVisitorId, isCookielessIdentity } from "./identity";
+import { clearStoredIdentity, getOrCreateVisitorId, isCookielessIdentity, notifyIdentityReset } from "./identity";
 
 /** Remembers the last identify that was applied, so repeats are not resent. */
 const IDENTIFIED_KEY = "temps_identified";
@@ -115,6 +115,8 @@ export async function identifyVisitor(options: IdentifyVisitorOptions): Promise<
 export async function resetVisitor(options: { basePath: string; ingestKey?: string }): Promise<void> {
   writeMemo(null);
   clearStoredIdentity();
+  // A replay in progress belongs to the previous visitor; end it now.
+  notifyIdentityReset();
   if (isCookielessIdentity()) return;
   try {
     await fetch(`${options.basePath}/${RESET_ENDPOINT}`, {

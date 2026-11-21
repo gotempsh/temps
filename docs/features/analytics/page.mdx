@@ -991,7 +991,7 @@ await analytics.reset();
 ```
 </CodeGroup>
 
-The browser can only label the visitor it already is: the server applies the call to the visitor the request resolves to, the same way it does for events, and never takes a visitor id from the caller. Calling `identify()` again with the same user and traits sends nothing, so it is safe to call on every page load. `reset()` deletes the ids the tracker stored and expires the proxy's tracking cookies, so the next event starts a new, anonymous visitor.
+The browser can only label the visitor it already is: the server applies the call to the visitor the request resolves to, the same way it does for events, and never takes a visitor id from the caller. Calling `identify()` again with the same user and traits sends nothing, so it is safe to call on every page load. `reset()` deletes the ids the tracker stored and expires the proxy's tracking cookies, so the next event starts a new, anonymous visitor. A session replay in progress ends there, and what follows is recorded as a new replay, so two people sharing a device never appear in one recording.
 
 ### From your backend
 

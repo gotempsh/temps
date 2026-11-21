@@ -7,6 +7,7 @@ import {
   SessionRecorder as CoreSessionRecorder,
   isCookielessIdentity,
   onCookielessIdentity,
+  onIdentityReset,
   type SessionRecorderOptions,
 } from "@temps-sdk/analytics-core";
 
@@ -100,9 +101,15 @@ export function SessionRecorder(props: SessionRecorderProps): null {
       recorder.discard();
       recorderRef.current = null;
     });
+    // `reset()` after a sign-out gives the page a new visitor: end this
+    // replay and record what follows in a new session.
+    const unsubscribeReset = onIdentityReset(() => {
+      if (!discarded) recorder.restart();
+    });
 
     return () => {
       unsubscribe();
+      unsubscribeReset();
       if (!discarded) recorder.destroy();
       recorderRef.current = null;
     };
