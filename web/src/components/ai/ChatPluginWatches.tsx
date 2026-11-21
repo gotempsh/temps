@@ -6,6 +6,7 @@ import { useMutation, useQuery } from '@tanstack/react-query'
 import { ArrowUp, Bell, Pause, Play, X } from 'lucide-react'
 import { Link } from 'react-router'
 import { toast } from 'sonner'
+import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { Button } from '@/components/ui/button'
 import {
   Popover,
@@ -19,7 +20,10 @@ import {
   changeChatPluginWatch,
 } from '@/api/client/sdk.gen'
 import type { WatchChange } from '@/api/client/types.gen'
-import { CHAT_WATCH_DELIVERY_EVENT, continueChat } from './chat-blueprint'
+import {
+  refreshWatchTranscript,
+  requestChatContinuation,
+} from './chat-blueprint'
 
 export function ChatPluginWatches({
   chat,
@@ -30,6 +34,29 @@ export function ChatPluginWatches({
 }) {
   const [open, setOpen] = useState(false)
   const [request, setRequest] = useState('')
+  const [removeTarget, setRemoveTarget] = useState<{
+    id: string
+    label: string
+  } | null>(null)
+  const submitRequest = useMutation({
+    mutationFn: async (text: string) => {
+      if (
+        !(await requestChatContinuation(
+          chat,
+          `Set up a watch in this chat. ${text}`
+        ))
+      ) {
+        throw new Error(
+          'The conversation could not accept the request. Try again when the chat is ready.'
+        )
+      }
+    },
+    retry: false,
+    onSuccess: () => {
+      setRequest('')
+      setOpen(false)
+    },
+  })
   const panelRef = useRef<HTMLDivElement>(null)
   const watches = useQuery({
     queryKey: ['plugin-watches', chat],
@@ -52,29 +79,44 @@ export function ChatPluginWatches({
   })
   const panel = watches.data
   const previousDeliveries = useRef(new Map<string, number>())
+  const refreshFailure = useRef(false)
   useEffect(() => {
     if (!panel) return
-    let notify = false
-    for (const watch of panel.watches) {
-      const previous = previousDeliveries.current.get(watch.id)
-      if (
-        previous !== undefined &&
-        watch.delivered > previous &&
-        watch.mode === 'notify'
-      ) {
-        notify = true
-        toast.info(`${watch.label || watch.subject} · ${watch.source}`)
-      }
-    }
-    if (notify) {
-      window.dispatchEvent(
-        new CustomEvent(CHAT_WATCH_DELIVERY_EVENT, { detail: chat })
+    let cancelled = false
+    const changed = panel.watches.filter((watch) => {
+      const before = previousDeliveries.current.get(watch.id)
+      return (
+        watch.mode === 'notify' &&
+        before !== undefined &&
+        watch.delivered > before
       )
+    })
+    const counts = new Map(panel.watches.map((w) => [w.id, w.delivered]))
+    if (!changed.length) {
+      previousDeliveries.current = counts
+      return
     }
-    previousDeliveries.current = new Map(
-      panel.watches.map((w) => [w.id, w.delivered])
-    )
-  }, [chat, panel])
+    async function refresh() {
+      const applied = await refreshWatchTranscript(chat).catch(() => false)
+      if (cancelled) return
+      if (!applied) {
+        if (!refreshFailure.current)
+          toast.error(
+            'Could not refresh watch notifications. Retrying automatically.'
+          )
+        refreshFailure.current = true
+        return
+      }
+      previousDeliveries.current = counts
+      refreshFailure.current = false
+      for (const watch of changed)
+        toast.info(`${watch.label || watch.subject} · ${watch.source}`)
+    }
+    void refresh()
+    return () => {
+      cancelled = true
+    }
+  }, [chat, panel, watches.dataUpdatedAt])
   const active =
     panel?.watches.filter((w) => !w.paused && !w.blocked).length ?? 0
   return (
@@ -195,9 +237,7 @@ export function ChatPluginWatches({
                             disabled={mutation.isPending}
                             title="Remove watch"
                             aria-label={`Remove ${label}`}
-                            onClick={() =>
-                              mutation.mutate({ action: 'remove', id: w.id })
-                            }
+                            onClick={() => setRemoveTarget({ id: w.id, label })}
                           >
                             <X className="size-4" />
                           </Button>
@@ -225,12 +265,7 @@ export function ChatPluginWatches({
                   onSubmit={(e) => {
                     e.preventDefault()
                     if (!request.trim()) return
-                    continueChat(
-                      chat,
-                      `Set up a watch in this chat. ${request.trim()}`
-                    )
-                    setRequest('')
-                    setOpen(false)
+                    submitRequest.mutate(request.trim())
                   }}
                 >
                   <div className="rounded-xl border bg-muted/30 p-2 focus-within:border-ring">
@@ -238,6 +273,7 @@ export function ChatPluginWatches({
                       aria-label="What should the agent watch?"
                       placeholder="What should I watch, and what should I do when it changes?"
                       value={request}
+                      disabled={submitRequest.isPending}
                       onChange={(e) => setRequest(e.target.value)}
                       rows={2}
                       onKeyDown={(event) => {
@@ -256,19 +292,37 @@ export function ChatPluginWatches({
                       <Button
                         size="sm"
                         type="submit"
-                        disabled={!request.trim()}
+                        disabled={!request.trim() || submitRequest.isPending}
                         className="h-7 gap-1.5 rounded-lg px-2.5"
                       >
                         Ask agent <ArrowUp className="size-3.5" />
                       </Button>
                     </div>
                   </div>
+                  {submitRequest.error && (
+                    <p role="alert" className="text-sm text-destructive">
+                      {submitRequest.error.message}
+                    </p>
+                  )}
                 </form>
               )
             )}
           </>
         )}
       </PopoverContent>
+      <ConfirmDialog
+        open={removeTarget !== null}
+        title="Remove watch?"
+        description={`Removing ${removeTarget?.label ?? ''} stops future deliveries to this chat.`}
+        confirmLabel="Remove watch"
+        onOpenChange={(open) => {
+          if (!open) setRemoveTarget(null)
+        }}
+        onConfirm={() => {
+          if (removeTarget)
+            mutation.mutate({ action: 'remove', id: removeTarget.id })
+        }}
+      />
     </Popover>
   )
 }

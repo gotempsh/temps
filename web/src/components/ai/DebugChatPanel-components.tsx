@@ -84,6 +84,7 @@ import {
   parseBlueprintProposal,
   type BlueprintProposalReceipt,
   type ChatContinueDetail,
+  type WatchRefreshDetail,
 } from '@/components/ai/chat-blueprint'
 import { GeneratedProjectCollection } from '@/components/ai/GeneratedProjectCollection'
 import { AiHarnessLogo } from '@/components/ui/ai-harness-logo'
@@ -2392,7 +2393,7 @@ function useConversationStream(
     let resyncRequestRevision = 0
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null
 
-    const resync = async () => {
+    const resync = async (onApplied?: () => void) => {
       const requestedAtRevision = liveEventRevision
       const requestRevision = ++resyncRequestRevision
       try {
@@ -2424,6 +2425,7 @@ function useConversationStream(
           setTurnStartedAt(running ? (data.turn_started_at ?? null) : null)
           setError(conversationFailure(data))
           setContextUsage(data.context_usage ?? null)
+          onApplied?.()
           return running
         }
       } catch {
@@ -2584,7 +2586,14 @@ function useConversationStream(
 
     connect()
     const onWatchNotification = (event: Event) => {
-      if ((event as CustomEvent<string>).detail === publicId) void resync()
+      const detail = (event as CustomEvent<WatchRefreshDetail>).detail
+      if (detail?.conversationPublicId !== publicId) return
+      let applied = false
+      detail.respond(
+        resync(() => {
+          applied = true
+        }).then(() => applied)
+      )
     }
     window.addEventListener(CHAT_WATCH_DELIVERY_EVENT, onWatchNotification)
     return () => {
@@ -4136,12 +4145,16 @@ function DebugChatPanelBody({
     const onContinue = (event: Event) => {
       const detail = (event as CustomEvent<ChatContinueDetail>).detail
       if (detail?.conversationPublicId === publicId && detail.message) {
-        continueWith(detail.message)
+        if (detail.respond) {
+          detail.respond(send(detail.message, undefined, []))
+        } else {
+          continueWith(detail.message)
+        }
       }
     }
     window.addEventListener(CHAT_CONTINUE_EVENT, onContinue)
     return () => window.removeEventListener(CHAT_CONTINUE_EVENT, onContinue)
-  }, [publicId, continueWith])
+  }, [publicId, continueWith, send])
   useEffect(() => {
     const message = pendingContinueRef.current
     if (!message || turnActive || starting || !publicId) {
