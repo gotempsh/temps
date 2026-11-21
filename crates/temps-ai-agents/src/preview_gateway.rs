@@ -1303,12 +1303,10 @@ pub(crate) async fn remove_superseded_gateway_image(docker: &Docker, image_id: &
         .await;
     match ImageRemovalOutcome::from_docker(image_id, result).status {
         ImageDeleteStatus::Deleted | ImageDeleteStatus::Untagged => info!(
-            image = %previous.image,
             image_id = %image_id,
             "removed the preview gateway image this update replaced"
         ),
         ImageDeleteStatus::Retained { reason } => debug!(
-            image = %previous.image,
             image_id = %image_id,
             reason = %reason,
             "kept the replaced preview gateway image: still in use"
@@ -1318,7 +1316,6 @@ pub(crate) async fn remove_superseded_gateway_image(docker: &Docker, image_id: &
             "replaced preview gateway image already removed"
         ),
         ImageDeleteStatus::Failed { reason } => warn!(
-            image = %previous.image,
             image_id = %image_id,
             error = %reason,
             "could not remove the replaced preview gateway image; the nightly cleanup will retry"
