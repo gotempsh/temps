@@ -431,6 +431,7 @@ impl From<DomainServiceError> for Problem {
 #[derive(OpenApi)]
 #[openapi(
     paths(
+        super::public_https::public_https_status,
         get_certificate_settings,
         update_certificate_settings,
         create_domain,
@@ -456,6 +457,13 @@ impl From<DomainServiceError> for Problem {
     components(
         schemas(
             ProblemDetails,
+            super::public_https::PublicHttpsStatusResponse,
+            temps_core::public_https::PublicHttpsResult,
+            temps_core::public_https::PublicHttpsStatus,
+            temps_core::public_https::PublicTls,
+            temps_core::public_https::PublicIngress,
+            temps_core::public_https::PublicHttpsBlocker,
+            temps_core::public_https::PublicHttpsBlockerCode,
             DomainCertificateSettings,
             DomainCertificateSettingsResponse,
             CertificateRenewalMode,
@@ -3518,6 +3526,10 @@ async fn update_certificate_settings(
 
 pub fn configure_routes() -> Router<Arc<DomainAppState>> {
     Router::new()
+        .route(
+            "/domains/{domain_id}/public-https",
+            get(super::public_https::public_https_status),
+        )
         .route(
             "/domains/{domain_id}/certificate-settings",
             get(get_certificate_settings).put(update_certificate_settings),

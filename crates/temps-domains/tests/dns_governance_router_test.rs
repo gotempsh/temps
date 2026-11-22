@@ -159,7 +159,11 @@ fn metadata() -> RequestMetadata {
 fn permission_router() -> axum::Router {
     // Empty MockDatabase: if either guard is moved below service access, the
     // test fails on an unexpected query instead of producing a false-positive 403.
-    let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+    domain_router(MockDatabase::new(DatabaseBackend::Postgres))
+}
+
+fn domain_router(database: MockDatabase) -> axum::Router {
+    let db = Arc::new(database.into_connection());
     let encryption = Arc::new(temps_core::EncryptionService::new_from_password("test"));
     let repository = Arc::new(DefaultCertificateRepository::new(
         db.clone(),
@@ -182,6 +186,48 @@ fn permission_router() -> axum::Router {
         sensitive_action_authorizer: Arc::new(AllowAllSensitiveActions),
     });
     temps_domains::configure_routes().with_state(state)
+}
+
+#[tokio::test]
+async fn public_https_requires_domain_read_and_reports_unmeasured_status() {
+    use temps_entities::domain_public_https::Model;
+    let database = MockDatabase::new(DatabaseBackend::Postgres).append_query_results([
+        vec![Model {
+            id: 1,
+            domain: "example.com".into(),
+            generated_hostname: false,
+            public_https_checked_at: None,
+            public_https_result: None,
+        }],
+        vec![],
+    ]);
+    let router = domain_router(database);
+    for (permissions, expected) in [
+        (None, StatusCode::UNAUTHORIZED),
+        (Some(vec![]), StatusCode::FORBIDDEN),
+        (Some(vec![Permission::DomainsRead]), StatusCode::OK),
+        (Some(vec![Permission::DomainsRead]), StatusCode::NOT_FOUND),
+    ] {
+        let mut request = Request::builder()
+            .uri("/domains/1/public-https")
+            .body(Body::empty())
+            .unwrap();
+        if let Some(perms) = permissions {
+            request.extensions_mut().insert(auth(perms));
+        }
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), expected);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        if expected == StatusCode::OK {
+            assert_eq!(value["configured"], false);
+            assert!(value["result"].is_null());
+            assert!(value["checked_at"].is_null());
+            assert_eq!(value["setup_path"], "/settings/nodes/ingress");
+        } else {
+            assert_eq!(value["status"], expected.as_u16());
+        }
+    }
 }
 
 async fn setup_dns_status(router: axum::Router, permissions: Vec<Permission>) -> StatusCode {
