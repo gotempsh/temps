@@ -55,6 +55,7 @@ pub mod service_handlers;
 pub mod service_mariadb_handlers;
 pub mod service_observe_handlers;
 pub mod shield;
+mod stranded_start;
 pub mod tailnet_identity;
 pub mod tailscale_api;
 pub mod tailscale_serve;
