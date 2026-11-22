@@ -1268,8 +1268,8 @@ impl ReadinessProbeState {
     }
 }
 
-/// Control-plane polling only: one in-flight probe and at most 4 KiB of output
-/// per candidate. The deployment startup deadline bounds every external call.
+/// The non-HTTP probe without its exit-code observer, as the probe tests drive it.
+#[cfg(test)]
 async fn wait_for_non_http_probe(
     deployer: &dyn ContainerDeployer,
     container_id: &str,
@@ -1277,6 +1277,35 @@ async fn wait_for_non_http_probe(
     address: Option<&str>,
     budget: Duration,
     job_log: Option<(&DeployImageJob, &WorkflowContext)>,
+) -> Result<(), WorkflowError> {
+    let mut observed_exit_code = None;
+    wait_for_non_http_probe_observing(
+        deployer,
+        container_id,
+        health,
+        address,
+        budget,
+        job_log,
+        &mut observed_exit_code,
+    )
+    .await
+}
+
+/// Wait for a `process`, `tcp` or `exec` probe to pass. When an exit or a
+/// crash loop fails it, the exit code of that inspection is recorded in
+/// `observed_exit_code`: a later inspection can see another attempt (a
+/// restarted container reports `Running` with exit code 0).
+///
+/// Control-plane polling only: one in-flight probe and at most 4 KiB of output
+/// per candidate. The deployment startup deadline bounds every external call.
+async fn wait_for_non_http_probe_observing(
+    deployer: &dyn ContainerDeployer,
+    container_id: &str,
+    health: &temps_core::repo_config::HealthCheckConfig,
+    address: Option<&str>,
+    budget: Duration,
+    job_log: Option<(&DeployImageJob, &WorkflowContext)>,
+    observed_exit_code: &mut Option<i32>,
 ) -> Result<(), WorkflowError> {
     health.validate().map_err(|reason| {
         WorkflowError::JobValidationFailed(format!(
@@ -1315,6 +1344,7 @@ async fn wait_for_non_http_probe(
             info.status,
             DeployerContainerStatus::Exited | DeployerContainerStatus::Dead
         ) {
+            *observed_exit_code = info.exit_code;
             return Err(WorkflowError::JobExecutionFailed(
                 container_exit_failure_message(
                     &info,
@@ -1327,6 +1357,7 @@ async fn wait_for_non_http_probe(
             ));
         }
         if restarts >= CRASH_LOOP_RESTART_THRESHOLD {
+            *observed_exit_code = info.exit_code;
             return Err(WorkflowError::JobExecutionFailed(
                 container_crash_loop_message(&info, restarts),
             ));

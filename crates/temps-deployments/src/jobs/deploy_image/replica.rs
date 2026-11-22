@@ -1012,28 +1012,35 @@ impl DeployImageJob {
             );
             url.trim_start_matches("http://").to_string()
         });
-        if let Err(error) = wait_for_non_http_probe(
+        let mut observed_exit_code = None;
+        if let Err(error) = wait_for_non_http_probe_observing(
             replica.deployer.as_ref(),
             &replica.result.container_id,
             health,
             address.as_deref(),
             clock.remaining(),
             Some((self, replica.context)),
+            &mut observed_exit_code,
         )
         .await
         {
-            // The probe stopped on an exit or a crash loop; read the exit code
-            // it saw, best-effort, to recognise an entrypoint exec failure.
-            let exit_code = tokio::time::timeout(
-                Duration::from_secs(10),
-                replica
-                    .deployer
-                    .get_container_info(&replica.result.container_id),
-            )
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .and_then(|info| info.exit_code);
+            // Recognise an entrypoint exec failure from the exit code of the
+            // inspection that failed the probe: a later one can already see
+            // the next attempt. Only a failure without one (a probe timeout,
+            // an exec failure) reads it again, best-effort.
+            let exit_code = match observed_exit_code {
+                Some(code) => Some(code),
+                None => tokio::time::timeout(
+                    Duration::from_secs(10),
+                    replica
+                        .deployer
+                        .get_container_info(&replica.result.container_id),
+                )
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .and_then(|info| info.exit_code),
+            };
             let finding = self
                 .diagnose_startup_failure(
                     replica.context,
@@ -2237,6 +2244,53 @@ mod tests {
             assert!(message.contains(expected), "{message}");
             assert_tracked_and_removable(&job, &context, &deployer).await;
         }
+    }
+
+    #[tokio::test]
+    async fn a_process_probe_diagnoses_the_exit_it_saw_not_the_next_attempt() {
+        // The probe sees the 126 exit; by the time the failure is diagnosed
+        // the container has restarted and reports Running with exit code 0.
+        let deployer = Arc::new(ScriptedDeployer {
+            logs: Some("sh: /app/server: Operation not permitted".to_string()),
+            file_capabilities: Some(Ok(Some(net_bind_service()))),
+            ..ScriptedDeployer::inspecting([
+                state(DeployerContainerStatus::Running),
+                Ok(ContainerInfo {
+                    status: DeployerContainerStatus::Exited,
+                    exit_code: Some(126),
+                    restart_count: Some(1),
+                    ..Default::default()
+                }),
+                Ok(ContainerInfo {
+                    status: DeployerContainerStatus::Running,
+                    exit_code: Some(0),
+                    restart_count: Some(1),
+                    ..Default::default()
+                }),
+            ])
+        });
+        let job = builder()
+            .health(Some(HealthCheckConfig {
+                probe_type: Some("process".to_string()),
+                ..Default::default()
+            }))
+            .build(deployer.clone())
+            .unwrap();
+        let context = context_writing_to(&Arc::default());
+
+        let message = execution_message(
+            deploy(&job, &context, &deployer, &NodeAssignment::Local, false)
+                .await
+                .unwrap_err(),
+        );
+        assert!(
+            message.contains("[entrypoint_needs_capability: NET_BIND_SERVICE verified]"),
+            "{message}"
+        );
+        assert_eq!(
+            deployer.capability_reads.lock().unwrap().as_slice(),
+            ["/app/server"]
+        );
     }
 
     // Readiness phase.
