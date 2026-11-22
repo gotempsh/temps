@@ -41,8 +41,8 @@ pub use provider::{
 pub use service::{
     AiError, AiRequest, AiResponse, AiRouteMetadata, AiService, CredentialVerificationDiagnostic,
     CredentialVerificationStage, NativeSessionExport, NativeSessionExportRequest,
-    RuntimeProcessLogLine, RuntimeProcessOperation, RuntimeProcessRequest, RuntimeProcessResponse,
-    RuntimeProcessSnapshot,
+    ProviderFailureKind, RuntimeProcessLogLine, RuntimeProcessOperation, RuntimeProcessRequest,
+    RuntimeProcessResponse, RuntimeProcessSnapshot,
 };
 pub use streaming::{
     ChatImage, ChatMessage, ChatStreamDelta, ChatTool, ChatTurnRequest, ChatTurnResponse,

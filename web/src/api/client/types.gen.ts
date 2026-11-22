@@ -314,6 +314,12 @@ export type ActivityCategory = {
     name: string;
 };
 
+export type ActivityCooldowns = {
+    preview_secs?: number | null;
+    report_secs?: number | null;
+    website_analysis_secs?: number | null;
+};
+
 /**
  * Daily activity count for a single day
  */
@@ -381,6 +387,43 @@ export type ActivityDetails = {
      */
     status?: string | null;
 };
+
+/**
+ * RFC 7807 body of every activity error. Fields other than `title`,
+ * `detail` and `code` appear only when they apply to that code.
+ */
+export type ActivityErrorBody = {
+    code: ActivityErrorCode;
+    detail: string;
+    /**
+     * The model the AI Gateway routed the request to.
+     */
+    model?: string | null;
+    operation?: ActivityOperation | null;
+    provider_failure?: ActivityProviderFailure | null;
+    /**
+     * The upstream HTTP status, when the provider answered.
+     */
+    provider_status?: number | null;
+    /**
+     * Also sent as the `Retry-After` header.
+     */
+    retry_after_secs?: number | null;
+    /**
+     * Console path where the operator can fix the problem.
+     */
+    setup_url?: string | null;
+    /**
+     * When the running action started.
+     */
+    started_at?: string | null;
+    title: string;
+};
+
+/**
+ * Machine-readable reason in an activity error response.
+ */
+export type ActivityErrorCode = 'not_found' | 'validation' | 'analysis_running' | 'cooling_down' | 'server_busy' | 'superseded' | 'ai_unavailable' | 'provider_error' | 'site_unreadable' | 'invalid_model_output' | 'internal';
 
 /**
  * A single activity event for the real-time activity feed
@@ -527,10 +570,21 @@ export type ActivityGraphResponse = {
     total_count: number;
 };
 
+export type ActivityInProgress = {
+    operation: ActivityOperation;
+    started_at: string;
+};
+
 /**
  * What happened to the group.
  */
 export type ActivityKind = 'comment' | 'status_changed' | 'regressed' | 'assigned' | 'merged' | 'unmerged' | 'split' | 'issue_linked' | 'issue_unlinked';
+
+/**
+ * An AI-assisted activity action. Each one is limited to one at a time per
+ * project and cools down briefly after it spends provider tokens.
+ */
+export type ActivityOperation = 'website_analysis' | 'preview' | 'report';
 
 export type ActivityPreview = {
     report: ActivityReport;
@@ -555,6 +609,11 @@ export type ActivityProperty = {
     key: string;
     value: string;
 };
+
+/**
+ * Why the AI provider refused or failed the request.
+ */
+export type ActivityProviderFailure = 'authentication' | 'model_not_found' | 'model_not_allowed' | 'rate_limited' | 'budget_exceeded' | 'timeout' | 'malformed_response' | 'unreachable' | 'misconfigured' | 'rejected' | 'provider_error';
 
 export type ActivityReport = {
     categories: Array<ActivityCategory>;
@@ -615,9 +674,14 @@ export type ActivityStatus = {
     ai_provider?: string | null;
     configured: boolean;
     /**
+     * Seconds until each action can use the AI provider again.
+     */
+    cooldowns?: ActivityCooldowns;
+    /**
      * Whether tracked non-crawler visitor events exist in the previous 24 hours.
      */
     has_recent_activity: boolean;
+    in_progress?: ActivityInProgress | null;
     last_error?: string | null;
     next_run_at?: string | null;
     recent_runs: Array<ActivityRunSummary>;
@@ -79829,6 +79893,23 @@ export type GetActivityStatusData = {
     url: '/projects/{project_id}/analytics/activity';
 };
 
+export type GetActivityStatusErrors = {
+    /**
+     * Authentication required
+     */
+    401: unknown;
+    /**
+     * Access denied
+     */
+    403: unknown;
+    /**
+     * Project not found
+     */
+    404: ActivityErrorBody;
+};
+
+export type GetActivityStatusError = GetActivityStatusErrors[keyof GetActivityStatusErrors];
+
 export type GetActivityStatusResponses = {
     200: ActivityStatus;
 };
@@ -79843,6 +79924,31 @@ export type SaveActivitySettingsData = {
     query?: never;
     url: '/projects/{project_id}/analytics/activity';
 };
+
+export type SaveActivitySettingsErrors = {
+    /**
+     * Invalid settings
+     */
+    400: ActivityErrorBody;
+    /**
+     * Authentication required
+     */
+    401: unknown;
+    /**
+     * Access denied
+     */
+    403: unknown;
+    /**
+     * Project not found
+     */
+    404: ActivityErrorBody;
+    /**
+     * A report run is in progress; `Retry-After` says when its lease ends at the latest
+     */
+    409: ActivityErrorBody;
+};
+
+export type SaveActivitySettingsError = SaveActivitySettingsErrors[keyof SaveActivitySettingsErrors];
 
 export type SaveActivitySettingsResponses = {
     /**
@@ -79866,24 +79972,46 @@ export type SuggestActivityGoalsErrors = {
     /**
      * Invalid public URL or consent missing
      */
-    400: unknown;
+    400: ActivityErrorBody;
+    /**
+     * Authentication required
+     */
+    401: unknown;
     /**
      * Access denied
      */
     403: unknown;
     /**
-     * Busy
+     * Project not found
      */
-    409: unknown;
+    404: ActivityErrorBody;
     /**
-     * Site scan or AI suggestion failed
+     * An analysis is already running for this project
      */
-    502: unknown;
+    409: ActivityErrorBody;
     /**
-     * AI provider missing
+     * The public website could not be read
      */
-    503: unknown;
+    422: ActivityErrorBody;
+    /**
+     * Cooling down after spending provider tokens, or rate-limited; see `Retry-After`
+     */
+    429: ActivityErrorBody;
+    /**
+     * The AI provider failed or returned unusable output
+     */
+    502: ActivityErrorBody;
+    /**
+     * AI provider not configured, or analysis capacity busy
+     */
+    503: ActivityErrorBody;
+    /**
+     * The AI provider timed out
+     */
+    504: ActivityErrorBody;
 };
+
+export type SuggestActivityGoalsError = SuggestActivityGoalsErrors[keyof SuggestActivityGoalsErrors];
 
 export type SuggestActivityGoalsResponses = {
     200: ActivityGoals;
@@ -79904,7 +80032,11 @@ export type PreviewActivityReportErrors = {
     /**
      * Invalid goal or sharing disabled
      */
-    400: unknown;
+    400: ActivityErrorBody;
+    /**
+     * Authentication required
+     */
+    401: unknown;
     /**
      * Access denied
      */
@@ -79912,20 +80044,30 @@ export type PreviewActivityReportErrors = {
     /**
      * Project not found
      */
-    404: unknown;
+    404: ActivityErrorBody;
     /**
-     * Analysis busy or preview cooling down
+     * An analysis is already running for this project
      */
-    409: unknown;
+    409: ActivityErrorBody;
     /**
-     * AI preview failed
+     * Cooling down after spending provider tokens, or rate-limited; see `Retry-After`
      */
-    502: unknown;
+    429: ActivityErrorBody;
     /**
-     * AI provider not configured
+     * The AI provider failed or returned unusable output
      */
-    503: unknown;
+    502: ActivityErrorBody;
+    /**
+     * AI provider not configured, or analysis capacity busy
+     */
+    503: ActivityErrorBody;
+    /**
+     * The AI provider timed out
+     */
+    504: ActivityErrorBody;
 };
+
+export type PreviewActivityReportError = PreviewActivityReportErrors[keyof PreviewActivityReportErrors];
 
 export type PreviewActivityReportResponses = {
     200: ActivityPreview;
@@ -79941,6 +80083,47 @@ export type RunActivityReportData = {
     query?: never;
     url: '/projects/{project_id}/analytics/activity/run';
 };
+
+export type RunActivityReportErrors = {
+    /**
+     * Setup incomplete or sharing disabled
+     */
+    400: ActivityErrorBody;
+    /**
+     * Authentication required
+     */
+    401: unknown;
+    /**
+     * Access denied
+     */
+    403: unknown;
+    /**
+     * Project not found
+     */
+    404: ActivityErrorBody;
+    /**
+     * Analysis already running, or the run was superseded
+     */
+    409: ActivityErrorBody;
+    /**
+     * Cooling down after spending provider tokens, or rate-limited; see `Retry-After`
+     */
+    429: ActivityErrorBody;
+    /**
+     * The AI provider failed the request
+     */
+    502: ActivityErrorBody;
+    /**
+     * AI provider not configured, or analysis capacity busy
+     */
+    503: ActivityErrorBody;
+    /**
+     * The AI provider timed out
+     */
+    504: ActivityErrorBody;
+};
+
+export type RunActivityReportError = RunActivityReportErrors[keyof RunActivityReportErrors];
 
 export type RunActivityReportResponses = {
     200: ActivityReport;
