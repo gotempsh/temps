@@ -1412,6 +1412,7 @@ mod tests {
     #[cfg(feature = "docker-tests")]
     #[tokio::test]
     async fn existing_explorer_role_moves_to_the_new_password_on_next_connection() {
+        use temps_test_containers::TestContainerExt;
         use testcontainers::{
             core::ContainerPort, core::WaitFor, runners::AsyncRunner, GenericImage, ImageExt,
         };
@@ -1425,6 +1426,7 @@ mod tests {
             ))
             .with_exposed_port(ContainerPort::Tcp(5432))
             .with_env_var("POSTGRES_PASSWORD", ADMIN_PASSWORD)
+            .with_test_labels()
             .start()
             .await;
         let container = match started {

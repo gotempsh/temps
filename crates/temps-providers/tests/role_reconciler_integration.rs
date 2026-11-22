@@ -27,6 +27,7 @@ use sea_orm::Database;
 use temps_dns::{DnsRegistry, InternalOwnerKind};
 use temps_migrations::{Migrator, MigratorTrait};
 use temps_providers::externalsvc::postgres_role_reconciler::{drafts_for_snapshot, MonitorNode};
+use temps_test_containers::TestContainerExt;
 use testcontainers::{runners::AsyncRunner, GenericImage, ImageExt};
 
 async fn boot_db() -> Option<Arc<sea_orm::DatabaseConnection>> {
@@ -44,6 +45,7 @@ async fn boot_db() -> Option<Arc<sea_orm::DatabaseConnection>> {
         .with_env_var("POSTGRES_USER", "postgres")
         .with_env_var("POSTGRES_PASSWORD", "postgres")
         .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_test_labels()
         .start()
         .await
     {

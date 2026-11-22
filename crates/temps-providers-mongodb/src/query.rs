@@ -983,6 +983,7 @@ impl temps_providers_core::query::Queryable for MongoDBSource {
 mod tests {
     use super::*;
     use temps_providers_core::query::{QueryBudget, QueryOptions, Queryable};
+    use temps_test_containers::TestContainerExt;
     use testcontainers::{
         core::{ContainerPort, WaitFor},
         runners::AsyncRunner,
@@ -1051,6 +1052,7 @@ mod tests {
         let container = match GenericImage::new("mongo", "8")
             .with_exposed_port(ContainerPort::Tcp(27017))
             .with_wait_for(WaitFor::message_on_stdout("Waiting for connections"))
+            .with_test_labels()
             .start()
             .await
         {

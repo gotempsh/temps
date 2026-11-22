@@ -13,6 +13,7 @@ homepage.workspace = true
 publish = false
 
 [dependencies]
+temps-test-containers = { path = "../temps-test-containers" }
 temps-migrations = { path = "../temps-migrations" }
 temps-schema = { path = "../temps-schema" }
 sea-orm = { workspace = true, features = ["runtime-tokio-native-tls", "sqlx-postgres"] }

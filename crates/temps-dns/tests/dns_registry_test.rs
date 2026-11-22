@@ -25,6 +25,7 @@ use std::sync::Arc;
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement};
 use temps_dns::services::{DnsRegistry, EndpointDraft, OwnerKind, RecordType};
 use temps_migrations::{Migrator, MigratorTrait};
+use temps_test_containers::TestContainerExt;
 use testcontainers::{core::WaitFor, runners::AsyncRunner, GenericImage, ImageExt};
 
 async fn boot_db() -> Option<Arc<DatabaseConnection>> {
@@ -52,6 +53,7 @@ async fn boot_db() -> Option<Arc<DatabaseConnection>> {
         .with_env_var("POSTGRES_PASSWORD", "postgres")
         .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
         .with_startup_timeout(std::time::Duration::from_secs(120))
+        .with_test_labels()
         .start()
         .await
     {

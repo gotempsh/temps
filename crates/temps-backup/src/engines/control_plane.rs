@@ -681,6 +681,7 @@ mod tests {
     use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement};
     use sea_orm_migration::MigratorTrait;
     use temps_migrations::Migrator;
+    use temps_test_containers::TestContainerExt;
     use testcontainers::{core::WaitFor, runners::AsyncRunner, GenericImage, ImageExt};
 
     use super::{resolve_excluded_data, EXCLUDED_DATA_TABLES};
@@ -723,6 +724,7 @@ mod tests {
                 "timescaledb.max_background_workers=0",
             ])
             .with_startup_timeout(Duration::from_secs(120))
+            .with_test_labels()
             .start()
             .await?;
         let port = container.get_host_port_ipv4(5432).await?;

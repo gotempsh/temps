@@ -32,6 +32,7 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+temps-test-containers = { path = "../temps-test-containers" }
 temps-test-utils = { path = "../temps-test-utils" }
 testcontainers = { workspace = true }
 tower = { workspace = true }

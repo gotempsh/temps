@@ -49,6 +49,7 @@ temps-clickhouse = { path = "../temps-clickhouse" }
 temps-cloud-client = { path = "../temps-cloud-client" }
 
 [dev-dependencies]
+temps-test-containers = { path = "../temps-test-containers" }
 temps-test-utils = { path = "../temps-test-utils" }
 sea-orm = { workspace = true, features = ["mock"] }
 tempfile = { workspace = true }

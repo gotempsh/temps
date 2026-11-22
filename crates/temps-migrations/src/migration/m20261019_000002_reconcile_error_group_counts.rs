@@ -44,6 +44,7 @@ impl MigrationTrait for Migration {
 mod tests {
     use super::*;
     use sea_orm::{Database, DatabaseBackend, Statement};
+    use temps_test_containers::TestContainerExt;
     use testcontainers::{core::WaitFor, runners::AsyncRunner, GenericImage, ImageExt};
 
     #[tokio::test]
@@ -57,14 +58,18 @@ mod tests {
             eprintln!("Docker unavailable; skipping error-group reconcile migration integration");
             return Ok(());
         }
-        let listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
-        let requested_port = listener.local_addr()?.port();
-        drop(listener);
-        let container = GenericImage::new("postgres", "17-alpine")
+        // Labelling sweeps stale containers first; reserve the host port only
+        // once the request is built so another process cannot take it meanwhile.
+        let request = GenericImage::new("postgres", "17-alpine")
             .with_wait_for(WaitFor::message_on_stderr(
                 "database system is ready to accept connections",
             ))
             .with_env_var("POSTGRES_PASSWORD", "error-group-reconcile-test")
+            .with_test_labels();
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
+        let requested_port = listener.local_addr()?.port();
+        drop(listener);
+        let container = request
             .with_mapped_port(
                 requested_port,
                 testcontainers::core::ContainerPort::Tcp(5432),

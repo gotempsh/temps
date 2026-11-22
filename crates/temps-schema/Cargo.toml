@@ -23,6 +23,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+temps-test-containers = { path = "../temps-test-containers" }
 temps-test-utils = { path = "../temps-test-utils" }
 anyhow = { workspace = true }
 testcontainers = { workspace = true }

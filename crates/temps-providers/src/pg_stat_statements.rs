@@ -943,6 +943,7 @@ mod tests {
     use super::*;
     use sea_orm::{MockDatabase, MockExecResult, Value};
     use std::collections::BTreeMap;
+    use temps_test_containers::TestContainerExt;
     use testcontainers::{
         core::{ContainerPort, WaitFor},
         runners::AsyncRunner,
@@ -1130,6 +1131,7 @@ mod tests {
                 "-c".to_owned(),
                 "shared_preload_libraries=pg_stat_statements".to_owned(),
             ])
+            .with_test_labels()
             .start()
             .await
         {

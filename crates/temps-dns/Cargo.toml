@@ -72,6 +72,7 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+temps-test-containers = { path = "../temps-test-containers" }
 temps-test-utils = { path = "../temps-test-utils" }
 testcontainers = { workspace = true }
 temps-migrations = { path = "../temps-migrations" }

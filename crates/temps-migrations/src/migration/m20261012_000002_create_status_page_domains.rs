@@ -196,6 +196,7 @@ DROP FUNCTION IF EXISTS status_page_domain_tombstone();
 mod tests {
     use super::*;
     use sea_orm::{ConnectionTrait, Database, DatabaseBackend, Statement};
+    use temps_test_containers::TestContainerExt;
     use testcontainers::{core::WaitFor, runners::AsyncRunner, GenericImage, ImageExt};
 
     /// The tables and trigger function this migration builds on, reduced to
@@ -269,6 +270,7 @@ INSERT INTO status_pages (project_id, is_published) VALUES (1, TRUE);
                 "database system is ready to accept connections",
             ))
             .with_env_var("POSTGRES_PASSWORD", "migration-test")
+            .with_test_labels()
             .start()
             .await
         {

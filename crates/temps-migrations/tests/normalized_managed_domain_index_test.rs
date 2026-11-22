@@ -14,6 +14,7 @@ use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement, Transact
 use sea_orm_migration::{MigrationTrait, MigratorTrait, SchemaManager};
 use temps_migrations::Migrator;
 use temps_migrations::NormalizedManagedDomainIndexMigration;
+use temps_test_containers::TestContainerExt;
 use testcontainers::{core::WaitFor, runners::AsyncRunner, GenericImage, ImageExt};
 
 const INDEX_NAME: &str = "idx_dns_managed_domains_normalized_domain";
@@ -89,6 +90,7 @@ async fn test_normalized_managed_domain_index_migration_is_used_and_reversible(
             "timescaledb.max_background_workers=0",
         ])
         .with_startup_timeout(std::time::Duration::from_secs(120))
+        .with_test_labels()
         .start()
         .await
     {

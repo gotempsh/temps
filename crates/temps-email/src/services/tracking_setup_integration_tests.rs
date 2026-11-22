@@ -227,11 +227,13 @@ mod tests {
         testcontainers::ContainerAsync<testcontainers::GenericImage>,
         String,
     )> {
+        use temps_test_containers::TestContainerExt;
         use testcontainers::{runners::AsyncRunner, GenericImage, ImageExt};
 
         // Pinned to 3.0: newer LocalStack images require a Pro license key.
         let container = match GenericImage::new("localstack/localstack", "3.0")
             .with_env_var("SERVICES", "sns,ses,sesv2")
+            .with_test_labels()
             .start()
             .await
         {

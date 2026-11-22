@@ -47,6 +47,7 @@ arc-swap = { workspace = true }
 tower-http = { workspace = true }
 
 [dev-dependencies]
+temps-test-containers = { path = "../temps-test-containers" }
 temps-migrations = { path = "../temps-migrations" }
 temps-test-utils = { path = "../temps-test-utils" }
 # Paused-clock tests (`start_paused`, `time::advance`).

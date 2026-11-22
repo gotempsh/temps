@@ -1169,6 +1169,7 @@ mod tests {
 
     use super::*;
     use temps_providers_core::query::QueryBudget;
+    use temps_test_containers::TestContainerExt;
     use testcontainers::{core::WaitFor, runners::AsyncRunner, GenericImage};
 
     fn container_runtime_unavailable(error: &str) -> bool {
@@ -1242,6 +1243,7 @@ mod tests {
         let container = match GenericImage::new("redis", "7-alpine")
             .with_exposed_port(6379_u16.into())
             .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
+            .with_test_labels()
             .start()
             .await
         {

@@ -33,6 +33,7 @@ use temps_core::{
     AuditLogger, AuditOperation, AuditResult, EncryptionService, ExecutorEndpoint,
     ExecutorEndpointSet, ExecutorEndpoints, ExecutorEndpointsError, NoopProjectMetricsSink,
 };
+use temps_test_containers::TestContainerExt;
 use testcontainers::core::{ContainerPort, Host, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
@@ -213,6 +214,7 @@ impl Harness {
             .with_env_var("PORT", WORKER_PORT.to_string())
             .with_cmd(["node", "/worker/worker.mjs"])
             .with_startup_timeout(Duration::from_secs(120))
+            .with_test_labels()
             .start()
             .await
             .expect("the worker container starts");

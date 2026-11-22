@@ -1686,6 +1686,7 @@ mod tests {
     /// root only accepts local logins takes).
     #[tokio::test]
     async fn scrapes_a_real_mariadb_server() {
+        use temps_test_containers::TestContainerExt;
         use testcontainers::{
             core::{ContainerPort, WaitFor},
             runners::AsyncRunner,
@@ -1702,6 +1703,7 @@ mod tests {
             .with_env_var("MARIADB_DATABASE", "appdb")
             .with_env_var("MARIADB_USER", "app")
             .with_env_var("MARIADB_PASSWORD", "app-secret")
+            .with_test_labels()
             .start()
             .await
         {

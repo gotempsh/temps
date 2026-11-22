@@ -48,6 +48,7 @@ webpki-roots = { workspace = true }
 docker-tests = ["temps-providers-core/docker-tests"]
 
 [dev-dependencies]
+temps-test-containers = { path = "../temps-test-containers" }
 temps-providers-core = { path = "../temps-providers-core", features = ["test-support"] }
 temps-test-utils = { path = "../temps-test-utils" }
 anyhow = { workspace = true }

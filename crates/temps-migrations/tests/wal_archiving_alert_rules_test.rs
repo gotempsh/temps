@@ -13,6 +13,7 @@
 use sea_orm::{ConnectionTrait, Database, DatabaseTransaction, Statement, TransactionTrait};
 use sea_orm_migration::{MigrationTrait, MigratorTrait, SchemaManager};
 use temps_migrations::{Migrator, SeedPostgresWalArchivingAlertRulesMigration};
+use temps_test_containers::TestContainerExt;
 use testcontainers::{core::WaitFor, runners::AsyncRunner, GenericImage, ImageExt};
 
 async fn insert_service(
@@ -102,6 +103,7 @@ async fn existing_postgres_services_with_metrics_get_the_archiving_alarms() -> a
             "timescaledb.max_background_workers=0",
         ])
         .with_startup_timeout(std::time::Duration::from_secs(120))
+        .with_test_labels()
         .start()
         .await
     {

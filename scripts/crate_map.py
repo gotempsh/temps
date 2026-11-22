@@ -67,6 +67,7 @@ LAYERS: dict[str, str] = {
     # foundation
     "temps-core": "foundation",
     "temps-database": "foundation",
+    "temps-test-containers": "foundation",
     "temps-entities": "foundation",
     "temps-migrations": "foundation",
     "temps-schema": "foundation",

@@ -5047,6 +5047,7 @@ mod tests {
     /// - The issued certificate chains to Pebble's CA.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_provision_on_demand_real_pebble_http01_and_method_switches() {
+        use temps_test_containers::TestContainerExt;
         use testcontainers::core::{IntoContainerPort, WaitFor};
         use testcontainers::{runners::AsyncRunner, GenericImage, ImageExt};
 
@@ -5121,6 +5122,7 @@ mod tests {
                 .with_cmd(["-https01=", "-tlsalpn01=", "-doh="])
                 .with_network(network_name.clone())
                 .with_container_name(challtestsrv_alias.clone())
+                .with_test_labels()
                 .start()
                 .await
                 .expect("challtestsrv failed to start");
@@ -5223,6 +5225,7 @@ mod tests {
                 "-dnsserver",
                 &challtestsrv_dns_addr,
             ])
+            .with_test_labels()
             .start()
             .await
             .expect("Pebble container failed to start");
@@ -5519,6 +5522,7 @@ mod tests {
     /// Skips gracefully (returns) when Docker is unavailable; it is NOT #[ignore].
     #[tokio::test(flavor = "multi_thread")]
     async fn test_provision_dns01_wildcard_real_pebble() {
+        use temps_test_containers::TestContainerExt;
         use testcontainers::core::{IntoContainerPort, WaitFor};
         use testcontainers::{runners::AsyncRunner, GenericImage, ImageExt};
 
@@ -5558,6 +5562,7 @@ mod tests {
                 .with_cmd(["-https01=", "-tlsalpn01=", "-doh="])
                 .with_network(network_name.clone())
                 .with_container_name(challtestsrv_alias.clone())
+                .with_test_labels()
                 .start()
                 .await
                 .expect("challtestsrv failed to start");
@@ -5593,6 +5598,7 @@ mod tests {
                 "-dnsserver",
                 &challtestsrv_dns_addr,
             ])
+            .with_test_labels()
             .start()
             .await
             .expect("Pebble container failed to start");

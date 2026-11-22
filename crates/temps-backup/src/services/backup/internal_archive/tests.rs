@@ -222,6 +222,7 @@ async fn bundled_database_retaining_wal_gets_a_discarding_archive_command() {
 #[tokio::test]
 async fn bundled_database_stops_retaining_wal_after_the_reconcile() {
     use sea_orm::{ConnectionTrait, Database};
+    use temps_test_containers::TestContainerExt;
     use testcontainers::core::{ContainerPort, WaitFor};
     use testcontainers::runners::AsyncRunner;
     use testcontainers::{GenericImage, ImageExt};
@@ -250,6 +251,7 @@ async fn bundled_database_stops_retaining_wal_after_the_reconcile() {
             "-c",
             "archive_timeout=60",
         ])
+        .with_test_labels()
         .start()
         .await
         .expect("PostgreSQL container failed to start");

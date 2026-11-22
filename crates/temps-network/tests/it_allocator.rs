@@ -31,6 +31,7 @@ use std::sync::Arc;
 use temps_entities::{network_config, nodes};
 use temps_migrations::Migrator;
 use temps_network::allocator::{AllocatorError, ComputeNetworkAllocator, PostgresAllocator};
+use temps_test_containers::TestContainerExt;
 use testcontainers::{core::WaitFor, runners::AsyncRunner, GenericImage, ImageExt};
 
 // ---------------------------------------------------------------------------
@@ -69,6 +70,7 @@ async fn fixture_with(create_options: &str) -> Option<Fixture> {
                 .with_env_var("POSTGRES_PASSWORD", "postgres")
                 .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
                 .with_startup_timeout(std::time::Duration::from_secs(120))
+                .with_test_labels()
                 .start()
                 .await
             {

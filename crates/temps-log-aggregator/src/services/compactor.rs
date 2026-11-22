@@ -695,6 +695,7 @@ mod tests {
     use sea_orm::{ConnectionTrait, Database, DatabaseConnection, DbBackend, Statement};
     use std::collections::HashSet;
     use std::sync::Mutex;
+    use temps_test_containers::TestContainerExt;
     use testcontainers::{
         core::WaitFor, runners::AsyncRunner, ContainerAsync, GenericImage, ImageExt,
     };
@@ -971,6 +972,7 @@ mod tests {
             ))
             .with_env_var("POSTGRES_PASSWORD", "gc-test")
             .with_startup_timeout(Duration::from_secs(120))
+            .with_test_labels()
             .start()
             .await
         {

@@ -2749,6 +2749,7 @@ mod tests {
     use sea_orm::MockDatabase;
     use std::sync::{Arc, Mutex};
     use temps_entities::notification_providers;
+    use temps_test_containers::TestContainerExt;
     use temps_test_utils::TestDatabase;
     use testcontainers::{core::ContainerPort, runners::AsyncRunner, ContainerAsync, GenericImage};
 
@@ -3393,6 +3394,7 @@ mod tests {
             let mailpit_container = GenericImage::new("axllent/mailpit", "latest")
                 .with_exposed_port(ContainerPort::Tcp(1025)) // SMTP port
                 .with_exposed_port(ContainerPort::Tcp(8025)) // Web UI port
+                .with_test_labels()
                 .start()
                 .await?;
 

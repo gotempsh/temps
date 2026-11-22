@@ -65,6 +65,7 @@ hex = { workspace = true }
 docker-tests = ["temps-providers-core/docker-tests", "temps-providers-postgres/docker-tests", "temps-providers-s3/docker-tests", "temps-providers-mariadb/docker-tests", "temps-providers-mongodb/docker-tests", "temps-providers-redis/docker-tests"]
 
 [dev-dependencies]
+temps-test-containers = { path = "../temps-test-containers" }
 anyhow = { workspace = true }
 temps-providers-core = { path = "../temps-providers-core", features = ["test-support"] }
 temps-test-utils = { path = "../temps-test-utils" }

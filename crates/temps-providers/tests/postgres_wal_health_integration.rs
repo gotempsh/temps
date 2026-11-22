@@ -24,6 +24,7 @@ use std::time::Duration;
 use temps_providers::externalsvc::postgres_wal_health::{
     self, ArchiveMode, PostgresWalHealth, WalWarning,
 };
+use temps_test_containers::TestContainerExt;
 use testcontainers::{
     core::{ContainerPort, WaitFor},
     runners::AsyncRunner,
@@ -44,6 +45,7 @@ async fn boot_postgres() -> Option<(String, ContainerAsync<GenericImage>)> {
         .with_env_var("POSTGRES_USER", "postgres")
         .with_env_var("POSTGRES_PASSWORD", "postgres")
         .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_test_labels()
         .start()
         .await
     {

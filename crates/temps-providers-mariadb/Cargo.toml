@@ -42,6 +42,7 @@ uuid = { workspace = true }
 docker-tests = ["temps-providers-core/docker-tests"]
 
 [dev-dependencies]
+temps-test-containers = { path = "../temps-test-containers" }
 temps-providers-postgres = { path = "../temps-providers-postgres" }
 temps-providers-core = { path = "../temps-providers-core", features = ["test-support"] }
 anyhow = { workspace = true }

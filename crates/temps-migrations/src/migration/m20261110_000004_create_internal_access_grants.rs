@@ -126,6 +126,7 @@ impl MigrationTrait for Migration {
 mod tests {
     use super::*;
     use sea_orm::{ConnectionTrait, Database, DatabaseBackend, DatabaseConnection, Statement};
+    use temps_test_containers::TestContainerExt;
     use testcontainers::{core::WaitFor, runners::AsyncRunner, GenericImage, ImageExt};
 
     async fn grant_count(db: &DatabaseConnection) -> Result<i64, DbErr> {
@@ -157,6 +158,7 @@ mod tests {
                 "database system is ready to accept connections",
             ))
             .with_env_var("POSTGRES_PASSWORD", "internal-access-test")
+            .with_test_labels()
             .start()
             .await?;
         let port = container.get_host_port_ipv4(5432).await?;
